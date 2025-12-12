@@ -1,0 +1,3 @@
+disallowed-types = [
+    { path = "anyhow::Result", reason = "Use explicit Result<T, E> instead of an alias" },
+]
