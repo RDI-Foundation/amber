@@ -509,21 +509,21 @@ impl RawManifest {
         }
 
         let mut defined_endpoints = BTreeSet::new();
-        if let Some(program) = &self.program {
-            if let Some(network) = &program.network {
-                for endpoint in &network.endpoints {
-                    defined_endpoints.insert(endpoint.name.as_str());
-                }
+        if let Some(program) = &self.program
+            && let Some(network) = &program.network
+        {
+            for endpoint in &network.endpoints {
+                defined_endpoints.insert(endpoint.name.as_str());
             }
         }
 
         for provide in self.provides.values() {
-            if let Some(endpoint) = provide.endpoint.as_deref() {
-                if !defined_endpoints.contains(endpoint) {
-                    return Err(ValidationError::UnknownEndpoint {
-                        name: endpoint.to_string(),
-                    });
-                }
+            if let Some(endpoint) = provide.endpoint.as_deref()
+                && !defined_endpoints.contains(endpoint)
+            {
+                return Err(ValidationError::UnknownEndpoint {
+                    name: endpoint.to_string(),
+                });
             }
         }
 

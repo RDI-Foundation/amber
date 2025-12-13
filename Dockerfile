@@ -29,9 +29,9 @@ COPY node ./node
 
 ARG BUILD_MODE=release
 RUN if [ "$BUILD_MODE" = "release" ]; then \
-      cargo build --locked --release -p node; \
+      cargo build --locked --release -p amber-node; \
     else \
-      cargo build -p node; \
+      cargo build -p amber-node; \
     fi
 
 FROM debian:13-slim AS runtime
@@ -50,7 +50,7 @@ RUN groupadd --gid ${USER_GID} ${USERNAME} && \
 WORKDIR /home/${USERNAME}/app
 
 ARG BUILD_MODE=release
-COPY --from=builder --chown=${USERNAME}:${USERNAME} /app/target/${BUILD_MODE}/node /usr/local/bin/node
+COPY --from=builder --chown=${USERNAME}:${USERNAME} /app/target/${BUILD_MODE}/amber-node /usr/local/bin/node
 
 USER ${USERNAME}
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/node"]
