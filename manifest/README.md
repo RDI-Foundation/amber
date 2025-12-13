@@ -17,9 +17,6 @@ Manifests are written as **JSON5** (comments/trailing commas allowed) and parsed
 {
   manifest_version: "1.0.0",
 
-  // Optional: registry name -> base URL (used to resolve `#registry/...` refs).
-  registries: { /* ... */ },
-
   // Optional: describes how to run this component.
   program: { /* ... */ },
 
@@ -46,22 +43,34 @@ Manifests are written as **JSON5** (comments/trailing commas allowed) and parsed
 Notes:
 
 - `manifest_version` is a SemVer string (currently `"1.0.0"`).
-- `registries` values must be valid absolute URLs.
-- Duplicate keys in `registries`, `program.env`, `components`, `slots`, and `provides` are invalid.
+- Duplicate keys in `program.env`, `components`, `slots`, and `provides` are invalid.
 - `exports` entries must name something declared in `slots` or `provides`.
 
 ## Manifest references (`ManifestRef`)
 
-Child components are referenced by a string of the form:
+Child components are referenced by a URL.
 
-`#<registry>/<path>[:<tag>]`
+A manifest reference can be written as either:
+
+- URL string (sugar): `"https://..."`
+- Canonical form (optionally pinned):
+  - `{ url: "https://...", digest: "sha384:<hash-b64>" }`
+
+`digest` is optional. If present, it is used to verify the bytes fetched from `url` by hashing them and comparing.
+
+The digest string format is:
+
+`<alg>:<hash-b64>`
+
+`<alg>` is currently `sha384`.
+
+There is no separate tag field; any versioning must live in the URL itself.
 
 Examples:
 
-- `#amber/litellm:v3.8.6`
-- `#agentbeats/envs/tau2`
-
-`registries` provides the mapping from `<registry>` to a base URL.
+- `https://registry.amber-protocol.org/litellm/v3.8.6`
+- `https://registry.agentbeats.dev/envs/tau2`
+- `{ url: "https://registry.agentbeats.dev/envs/tau2", digest: "sha384:<hash-b64>" }`
 
 ## `program`
 
@@ -113,17 +122,20 @@ The `<path>` portion is dot-separated (for nested objects). Examples:
 Each child can be declared as:
 
 - A manifest reference string:
-  - `my_child: "#amber/some/component:v1"`
+  - `my_child: "https://registry.amber-protocol.org/some/component/v1"`
+- Or a manifest reference in canonical form:
+  - `my_child: { url: "https://registry.amber-protocol.org/some/component/v1", digest: "sha384:<hash-b64>" }`
 - Or an object with per-instance config:
-  - `my_child: { manifest: "#amber/some/component:v1", config: { /* ... */ } }`
+  - `my_child: { manifest: "https://registry.amber-protocol.org/some/component/v1", config: { /* ... */ } }`
+  - `my_child: { manifest: { url: "https://registry.amber-protocol.org/some/component/v1", digest: "sha384:<hash-b64>" }, config: { /* ... */ } }`
 
 Example:
 
 ```json5
 components: {
-  env: "#agentbeats/envs/tau2:v2",
+  env: "https://registry.agentbeats.dev/envs/tau2/v2",
   evaluator: {
-    manifest: "#agentbeats/tau2-evaluator:v1.0.0",
+    manifest: "https://registry.agentbeats.dev/tau2-evaluator/v1.0.0",
     config: { domain: "airline", num_trials: 1, num_tasks: 4 },
   },
 }
@@ -280,7 +292,7 @@ This component runs a router, instantiates a `wrapper` child, wires the wrapperâ
     },
   },
   components: {
-    wrapper: "#amber/litellm-wrapper:latest",
+    wrapper: "https://registry.amber-protocol.org/litellm-wrapper/latest",
   },
   provides: {
     admin_api: { kind: "http", endpoint: "admin" },
@@ -301,7 +313,7 @@ This component doesnâ€™t provide an LLM itself, but declares an `llm` slot, expo
 {
   manifest_version: "1.0.0",
   components: {
-    evaluator: "#agentbeats/tau2-evaluator:v1.0.0",
+    evaluator: "https://registry.agentbeats.dev/tau2-evaluator/v1.0.0",
   },
   slots: {
     llm: { kind: "llm" },

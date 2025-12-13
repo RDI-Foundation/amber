@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+base64 = "0.22.1"
 clap = { version = "4.5.23", features = ["derive"] }
 json5 = "0.4.1"
 jsonschema = { version = "0.37.4", default-features = false }

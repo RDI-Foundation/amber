@@ -128,8 +128,8 @@ fn components_sugar_parses() {
         {
           manifest_version: "1.0.0",
           components: {
-            a: "#amber/pkg:v1",
-            b: { manifest: "#amber/other", config: { k: 1 } },
+            a: "https://example.com/amber/pkg/v1",
+            b: { manifest: "https://example.com/amber/other", config: { k: 1 } },
           }
         }
         "##
@@ -138,20 +138,67 @@ fn components_sugar_parses() {
 
     match m.components.get("a").unwrap() {
         ComponentDecl::Reference(r) => {
-            assert_eq!(r.registry, "amber");
-            assert_eq!(r.path, "pkg");
-            assert_eq!(r.tag.as_deref(), Some("v1"));
+            assert_eq!(r.url.as_str(), "https://example.com/amber/pkg/v1");
+            assert!(r.digest.is_none());
         }
         _ => panic!("expected reference"),
     }
 
     match m.components.get("b").unwrap() {
         ComponentDecl::Object(i) => {
-            assert_eq!(i.manifest.path, "other");
+            assert_eq!(i.manifest.url.as_str(), "https://example.com/amber/other");
+            assert!(i.manifest.digest.is_none());
             assert_eq!(i.config.as_ref().unwrap()["k"], 1);
         }
         _ => panic!("expected object reference"),
     }
+}
+
+#[test]
+fn manifest_ref_canonical_form_with_digest_parses() {
+    let m: Manifest = r##"
+        {
+          manifest_version: "1.0.0",
+          components: {
+            a: {
+              url: "https://example.com/amber/pkg/v1",
+              digest: "sha384:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            }
+          }
+        }
+        "##
+    .parse()
+    .unwrap();
+
+    match m.components.get("a").unwrap() {
+        ComponentDecl::Reference(r) => {
+            assert_eq!(r.url.as_str(), "https://example.com/amber/pkg/v1");
+            let digest = r.digest.as_ref().unwrap();
+            assert_eq!(digest.alg, HashAlg::Sha384);
+            assert_eq!(digest.hash, [0u8; 48]);
+        }
+        _ => panic!("expected reference"),
+    }
+}
+
+#[test]
+fn manifest_ref_invalid_digest_errors() {
+    let err = r##"
+        {
+          manifest_version: "1.0.0",
+          components: {
+            a: { url: "https://example.com/amber/pkg/v1", digest: "sha384:not_base64" }
+          }
+        }
+        "##
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    let message = err.to_string();
+    assert!(
+        message.contains("invalid manifest digest"),
+        "expected digest error, got: {message}"
+    );
 }
 
 #[test]
@@ -200,8 +247,8 @@ fn duplicate_keys_in_components_map_errors() {
         {
           manifest_version: "1.0.0",
           components: {
-            a: "#amber/pkg:v1",
-            a: "#amber/other:v2",
+            a: "https://example.com/amber/pkg/v1",
+            a: "https://example.com/amber/other/v2",
           }
         }
         "##

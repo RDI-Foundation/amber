@@ -35,6 +35,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 name = "amber-manifest"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "json5",
  "jsonschema",

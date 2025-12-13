@@ -7,6 +7,7 @@ use std::{
     str::FromStr,
 };
 
+use base64::Engine;
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -21,6 +22,8 @@ pub enum ValidationError {
     Io(#[from] std::io::Error),
     #[error("invalid manifest reference `{0}`")]
     InvalidManifestRef(String),
+    #[error("invalid manifest digest `{0}`")]
+    InvalidManifestDigest(String),
     #[error("invalid interpolation `{0}`")]
     InvalidInterpolation(String),
     #[error("invalid binding `{input}`: {message}")]
@@ -35,13 +38,125 @@ pub enum ValidationError {
     InvalidConfigSchema(String),
 }
 
-#[derive(
-    Clone, Debug, DeserializeFromStr, Eq, Hash, Ord, PartialEq, PartialOrd, SerializeDisplay,
-)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HashAlg {
+    Sha384,
+}
+
+impl fmt::Display for HashAlg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            HashAlg::Sha384 => "sha384",
+        };
+        f.write_str(s)
+    }
+}
+
+#[derive(Clone, Debug, DeserializeFromStr, Eq, Hash, PartialEq, SerializeDisplay)]
+pub struct ManifestDigest {
+    pub alg: HashAlg,
+    pub hash: [u8; 48],
+}
+
+impl FromStr for ManifestDigest {
+    type Err = ValidationError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let trimmed = input.trim();
+        let Some((alg, hash_b64)) = trimmed.split_once(':') else {
+            return Err(ValidationError::InvalidManifestDigest(trimmed.to_string()));
+        };
+
+        let alg = match alg.trim() {
+            "sha384" => HashAlg::Sha384,
+            _ => return Err(ValidationError::InvalidManifestDigest(trimmed.to_string())),
+        };
+
+        let hash_b64 = hash_b64.trim();
+        let hash = base64::engine::general_purpose::STANDARD
+            .decode(hash_b64)
+            .map_err(|_| ValidationError::InvalidManifestDigest(trimmed.to_string()))?;
+
+        let Ok(hash) = hash.try_into() else {
+            return Err(ValidationError::InvalidManifestDigest(trimmed.to_string()));
+        };
+
+        Ok(Self { alg, hash })
+    }
+}
+
+impl fmt::Display for ManifestDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:", self.alg)?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(self.hash);
+        f.write_str(&encoded)
+    }
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct ManifestRef {
-    pub registry: String,
-    pub path: String,
-    pub tag: Option<String>,
+    pub url: Url,
+    #[serde(default)]
+    pub digest: Option<ManifestDigest>,
+}
+
+impl<'de> Deserialize<'de> for ManifestRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match value {
+            Value::String(url) => {
+                let trimmed = url.trim();
+                let url = Url::parse(trimmed).map_err(|_| {
+                    serde::de::Error::custom(ValidationError::InvalidManifestRef(
+                        trimmed.to_string(),
+                    ))
+                })?;
+                Ok(Self { url, digest: None })
+            }
+            Value::Object(mut map) => {
+                let url = match map.remove("url") {
+                    Some(Value::String(url)) => url,
+                    Some(_) => {
+                        return Err(serde::de::Error::custom(
+                            "manifest ref `url` must be a string",
+                        ));
+                    }
+                    None => return Err(serde::de::Error::custom("manifest ref missing `url`")),
+                };
+
+                let trimmed = url.trim();
+                let url = Url::parse(trimmed).map_err(|_| {
+                    serde::de::Error::custom(ValidationError::InvalidManifestRef(
+                        trimmed.to_string(),
+                    ))
+                })?;
+
+                let digest = match map.remove("digest") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(digest)) => Some(
+                        digest
+                            .parse::<ManifestDigest>()
+                            .map_err(serde::de::Error::custom)?,
+                    ),
+                    Some(_) => {
+                        return Err(serde::de::Error::custom(
+                            "manifest ref `digest` must be a string",
+                        ));
+                    }
+                };
+
+                Ok(Self { url, digest })
+            }
+            _ => Err(serde::de::Error::custom(
+                "manifest ref must be a URL string or an object",
+            )),
+        }
+    }
 }
 
 impl FromStr for ManifestRef {
@@ -49,43 +164,9 @@ impl FromStr for ManifestRef {
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let trimmed = input.trim();
-        let without_hash = trimmed
-            .strip_prefix('#')
-            .ok_or_else(|| ValidationError::InvalidManifestRef(trimmed.to_string()))?;
-
-        let (before_tag, tag) = match without_hash.split_once(':') {
-            Some((left, right)) => (left, Some(right.to_string())),
-            None => (without_hash, None),
-        };
-
-        let (registry, path) = before_tag
-            .split_once('/')
-            .ok_or_else(|| ValidationError::InvalidManifestRef(trimmed.to_string()))?;
-
-        if registry.is_empty() || path.is_empty() {
-            return Err(ValidationError::InvalidManifestRef(trimmed.to_string()));
-        }
-
-        Ok(Self {
-            registry: registry.to_string(),
-            path: path.to_string(),
-            tag,
-        })
-    }
-}
-
-impl fmt::Display for ManifestRef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut out = String::new();
-        out.push('#');
-        out.push_str(&self.registry);
-        out.push('/');
-        out.push_str(&self.path);
-        if let Some(tag) = &self.tag {
-            out.push(':');
-            out.push_str(tag);
-        }
-        f.write_str(&out)
+        let url = Url::parse(trimmed)
+            .map_err(|_| ValidationError::InvalidManifestRef(trimmed.to_string()))?;
+        Ok(Self { url, digest: None })
     }
 }
 
@@ -348,11 +429,40 @@ pub struct ProvideDecl {
     pub capability: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum ComponentDecl {
     Reference(ManifestRef),
     Object(ComponentRef),
+}
+
+impl<'de> Deserialize<'de> for ComponentDecl {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match value {
+            Value::String(url) => Ok(ComponentDecl::Reference(
+                url.parse::<ManifestRef>()
+                    .map_err(serde::de::Error::custom)?,
+            )),
+            Value::Object(map) => {
+                if map.contains_key("manifest") {
+                    let inner = serde_json::from_value(Value::Object(map))
+                        .map_err(serde::de::Error::custom)?;
+                    Ok(ComponentDecl::Object(inner))
+                } else {
+                    let inner = serde_json::from_value(Value::Object(map))
+                        .map_err(serde::de::Error::custom)?;
+                    Ok(ComponentDecl::Reference(inner))
+                }
+            }
+            _ => Err(serde::de::Error::custom(
+                "component decl must be a URL string or an object",
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -475,9 +585,6 @@ fn split_binding_side(input: &str) -> Result<(String, String), ValidationError> 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct RawManifest {
     manifest_version: Version,
-    #[serde_as(as = "MapPreventDuplicates<_, _>")]
-    #[serde(default)]
-    registries: BTreeMap<String, Url>,
     #[serde(default)]
     program: Option<Program>,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
