@@ -1,6 +1,6 @@
 [workspace]
 members = [
-  "manifest",
+  "scenario",
   "node",
 ]
 resolver = "2"

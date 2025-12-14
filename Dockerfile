@@ -16,15 +16,15 @@ FROM base-builder AS builder
 
 # Prefetch Rust dependencies for better Docker layer caching.
 COPY Cargo.toml Cargo.lock ./
-COPY manifest/Cargo.toml manifest/
+COPY scenario/Cargo.toml scenario/
 COPY node/Cargo.toml node/
 
-RUN mkdir -p manifest/src node/src && \
-    touch manifest/src/lib.rs manifest/src/main.rs node/src/main.rs
+RUN mkdir -p scenario/src node/src && \
+    touch scenario/src/lib.rs scenario/src/main.rs node/src/main.rs
 RUN cargo fetch --locked
-RUN rm -rf manifest/src node/src
+RUN rm -rf scenario/src node/src
 
-COPY manifest ./manifest
+COPY scenario ./scenario
 COPY node ./node
 
 ARG BUILD_MODE=release
