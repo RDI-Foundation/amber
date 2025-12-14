@@ -123,6 +123,28 @@ fn binding_missing_source_capability_errors() {
 }
 
 #[test]
+fn manifest_deserialize_error_includes_path() {
+    let err = r#"
+        {
+          manifest_version: "1.0.0",
+          program: {
+            image: "x",
+            network: { endpoints: [ { name: "endpoint", port: "80" } ] }
+          }
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    match err {
+        ValidationError::Json5Path(err) => {
+            assert_eq!(err.path().to_string(), "program.network.endpoints[0].port");
+        }
+        other => panic!("expected Json5Path error, got: {other}"),
+    }
+}
+
+#[test]
 fn components_sugar_parses() {
     let m: Manifest = r##"
         {

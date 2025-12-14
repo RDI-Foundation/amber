@@ -18,6 +18,8 @@ use url::Url;
 pub enum ValidationError {
     #[error("json5 parse error: {0}")]
     Json5(#[from] json5::Error),
+    #[error("json5 deserialize error: {0}")]
+    Json5Path(#[from] serde_path_to_error::Error<json5::Error>),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("invalid manifest reference `{0}`")]
@@ -657,7 +659,9 @@ impl FromStr for Manifest {
     type Err = ValidationError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        Ok(json5::from_str(input)?)
+        let mut deserializer = json5::Deserializer::from_str(input)?;
+        let raw: RawManifest = serde_path_to_error::deserialize(&mut deserializer)?;
+        raw.validate()
     }
 }
 
