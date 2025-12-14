@@ -137,7 +137,7 @@ fn manifest_deserialize_error_includes_path() {
     .unwrap_err();
 
     match err {
-        ValidationError::Json5Path(err) => {
+        Error::Json5Path(err) => {
             assert_eq!(err.path().to_string(), "program.network.endpoints[0].port");
         }
         other => panic!("expected Json5Path error, got: {other}"),

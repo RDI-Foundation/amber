@@ -15,7 +15,7 @@ use serde_with::{DeserializeFromStr, MapPreventDuplicates, SerializeDisplay, ser
 use url::Url;
 
 #[derive(Debug, thiserror::Error)]
-pub enum ValidationError {
+pub enum Error {
     #[error("json5 parse error: {0}")]
     Json5(#[from] json5::Error),
     #[error("json5 deserialize error: {0}")]
@@ -62,26 +62,26 @@ pub struct ManifestDigest {
 }
 
 impl FromStr for ManifestDigest {
-    type Err = ValidationError;
+    type Err = Error;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let trimmed = input.trim();
         let Some((alg, hash_b64)) = trimmed.split_once(':') else {
-            return Err(ValidationError::InvalidManifestDigest(trimmed.to_string()));
+            return Err(Error::InvalidManifestDigest(trimmed.to_string()));
         };
 
         let alg = match alg.trim() {
             "sha384" => HashAlg::Sha384,
-            _ => return Err(ValidationError::InvalidManifestDigest(trimmed.to_string())),
+            _ => return Err(Error::InvalidManifestDigest(trimmed.to_string())),
         };
 
         let hash_b64 = hash_b64.trim();
         let hash = base64::engine::general_purpose::STANDARD
             .decode(hash_b64)
-            .map_err(|_| ValidationError::InvalidManifestDigest(trimmed.to_string()))?;
+            .map_err(|_| Error::InvalidManifestDigest(trimmed.to_string()))?;
 
         let Ok(hash) = hash.try_into() else {
-            return Err(ValidationError::InvalidManifestDigest(trimmed.to_string()));
+            return Err(Error::InvalidManifestDigest(trimmed.to_string()));
         };
 
         Ok(Self { alg, hash })
@@ -114,9 +114,7 @@ impl<'de> Deserialize<'de> for ManifestRef {
             Value::String(url) => {
                 let trimmed = url.trim();
                 let url = Url::parse(trimmed).map_err(|_| {
-                    serde::de::Error::custom(ValidationError::InvalidManifestRef(
-                        trimmed.to_string(),
-                    ))
+                    serde::de::Error::custom(Error::InvalidManifestRef(trimmed.to_string()))
                 })?;
                 Ok(Self { url, digest: None })
             }
@@ -133,9 +131,7 @@ impl<'de> Deserialize<'de> for ManifestRef {
 
                 let trimmed = url.trim();
                 let url = Url::parse(trimmed).map_err(|_| {
-                    serde::de::Error::custom(ValidationError::InvalidManifestRef(
-                        trimmed.to_string(),
-                    ))
+                    serde::de::Error::custom(Error::InvalidManifestRef(trimmed.to_string()))
                 })?;
 
                 let digest = match map.remove("digest") {
@@ -162,12 +158,12 @@ impl<'de> Deserialize<'de> for ManifestRef {
 }
 
 impl FromStr for ManifestRef {
-    type Err = ValidationError;
+    type Err = Error;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let trimmed = input.trim();
-        let url = Url::parse(trimmed)
-            .map_err(|_| ValidationError::InvalidManifestRef(trimmed.to_string()))?;
+        let url =
+            Url::parse(trimmed).map_err(|_| Error::InvalidManifestRef(trimmed.to_string()))?;
         Ok(Self { url, digest: None })
     }
 }
@@ -198,23 +194,23 @@ pub enum InterpolatedPart {
 }
 
 impl FromStr for InterpolatedPart {
-    type Err = ValidationError;
+    type Err = Error;
 
-    fn from_str(inner: &str) -> Result<Self, ValidationError> {
+    fn from_str(inner: &str) -> Result<Self, Error> {
         let trimmed = inner.trim();
         if trimmed.is_empty() {
-            return Err(ValidationError::InvalidInterpolation(trimmed.to_string()));
+            return Err(Error::InvalidInterpolation(trimmed.to_string()));
         }
 
         let mut segments = trimmed.split('.').map(str::trim);
         let prefix = segments
             .next()
-            .ok_or_else(|| ValidationError::InvalidInterpolation(trimmed.to_string()))?;
+            .ok_or_else(|| Error::InvalidInterpolation(trimmed.to_string()))?;
 
         let source = match prefix {
             "config" => InterpolationSource::Config,
             "slots" => InterpolationSource::Slots,
-            _ => return Err(ValidationError::InvalidInterpolation(trimmed.to_string())),
+            _ => return Err(Error::InvalidInterpolation(trimmed.to_string())),
         };
 
         let rest: Vec<&str> = segments.filter(|s| !s.is_empty()).collect();
@@ -242,7 +238,7 @@ impl fmt::Display for InterpolationSource {
 }
 
 impl FromStr for InterpolatedString {
-    type Err = ValidationError;
+    type Err = Error;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let mut parts = Vec::new();
@@ -257,7 +253,7 @@ impl FromStr for InterpolatedString {
             let after_start = &rest[start + 2..];
             let end = after_start
                 .find('}')
-                .ok_or_else(|| ValidationError::InvalidInterpolation(input.to_string()))?;
+                .ok_or_else(|| Error::InvalidInterpolation(input.to_string()))?;
             let inner = &after_start[..end];
             parts.push(inner.parse()?);
             rest = &after_start[end + 1..];
@@ -310,7 +306,7 @@ impl<'de> Deserialize<'de> for ProgramArgs {
         match Sugar::deserialize(deserializer)? {
             Sugar::String(s) => {
                 let tokens = shlex::split(&s)
-                    .ok_or_else(|| serde::de::Error::custom(ValidationError::UnclosedQuote))?;
+                    .ok_or_else(|| serde::de::Error::custom(Error::UnclosedQuote))?;
                 let mut args = Vec::new();
                 for token in tokens {
                     args.push(
@@ -484,9 +480,8 @@ impl<'de> Deserialize<'de> for ConfigSchema {
         D: Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        jsonschema::validator_for(&value).map_err(|e| {
-            serde::de::Error::custom(ValidationError::InvalidConfigSchema(e.to_string()))
-        })?;
+        jsonschema::validator_for(&value)
+            .map_err(|e| serde::de::Error::custom(Error::InvalidConfigSchema(e.to_string())))?;
         Ok(ConfigSchema(value))
     }
 }
@@ -560,10 +555,10 @@ impl<'de> Deserialize<'de> for Binding {
     }
 }
 
-fn split_binding_side(input: &str) -> Result<(String, String), ValidationError> {
+fn split_binding_side(input: &str) -> Result<(String, String), Error> {
     let trimmed = input.trim();
     let Some((left, right)) = trimmed.split_once('.') else {
-        return Err(ValidationError::InvalidBinding {
+        return Err(Error::InvalidBinding {
             input: trimmed.to_string(),
             message: "expected `component.name`".to_string(),
         });
@@ -573,7 +568,7 @@ fn split_binding_side(input: &str) -> Result<(String, String), ValidationError> 
     let right = right.trim();
 
     if left.is_empty() || right.is_empty() {
-        return Err(ValidationError::InvalidBinding {
+        return Err(Error::InvalidBinding {
             input: trimmed.to_string(),
             message: "expected `component.name`".to_string(),
         });
@@ -607,13 +602,13 @@ pub struct RawManifest {
 }
 
 impl RawManifest {
-    pub fn validate(self) -> Result<Manifest, ValidationError> {
+    pub fn validate(self) -> Result<Manifest, Error> {
         let mut available: BTreeSet<&String> = self.provides.keys().collect();
         available.extend(self.slots.keys());
 
         for name in &self.exports {
             if !available.contains(name) {
-                return Err(ValidationError::UnknownExport { name: name.clone() });
+                return Err(Error::UnknownExport { name: name.clone() });
             }
         }
 
@@ -630,7 +625,7 @@ impl RawManifest {
             if let Some(endpoint) = provide.endpoint.as_deref()
                 && !defined_endpoints.contains(endpoint)
             {
-                return Err(ValidationError::UnknownEndpoint {
+                return Err(Error::UnknownEndpoint {
                     name: endpoint.to_string(),
                 });
             }
@@ -656,7 +651,7 @@ impl<'de> Deserialize<'de> for Manifest {
 }
 
 impl FromStr for Manifest {
-    type Err = ValidationError;
+    type Err = Error;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let mut deserializer = json5::Deserializer::from_str(input)?;
