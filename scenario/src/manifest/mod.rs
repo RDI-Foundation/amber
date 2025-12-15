@@ -159,7 +159,7 @@ impl FromStr for ManifestDigest {
 impl fmt::Display for ManifestDigest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:", self.alg())?;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&self);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(self);
         f.write_str(&encoded)
     }
 }
