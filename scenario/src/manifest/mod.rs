@@ -4,6 +4,7 @@ mod tests;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    io::{self, Write},
     str::FromStr,
 };
 
@@ -12,6 +13,7 @@ use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use serde_with::{DeserializeFromStr, MapPreventDuplicates, SerializeDisplay, serde_as};
+use sha2::{Digest as ShaDigest, Sha384};
 use url::Url;
 
 #[derive(Debug, thiserror::Error)]
@@ -40,28 +42,28 @@ pub enum Error {
     InvalidConfigSchema(String),
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum HashAlg {
-    Sha384,
+#[derive(Clone, Debug, DeserializeFromStr, Eq, Hash, PartialEq, SerializeDisplay)]
+pub enum Digest {
+    Sha384([u8; 48]),
 }
 
-impl fmt::Display for HashAlg {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            HashAlg::Sha384 => "sha384",
-        };
-        f.write_str(s)
+impl Digest {
+    fn alg(&self) -> &'static str {
+        match self {
+            Digest::Sha384(_) => "sha384",
+        }
     }
 }
 
-#[derive(Clone, Debug, DeserializeFromStr, Eq, Hash, PartialEq, SerializeDisplay)]
-pub struct ManifestDigest {
-    pub alg: HashAlg,
-    pub hash: [u8; 48],
+impl AsRef<[u8]> for Digest {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Digest::Sha384(bytes) => bytes,
+        }
+    }
 }
 
-impl FromStr for ManifestDigest {
+impl FromStr for Digest {
     type Err = Error;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
@@ -70,28 +72,29 @@ impl FromStr for ManifestDigest {
             return Err(Error::InvalidManifestDigest(trimmed.to_string()));
         };
 
-        let alg = match alg.trim() {
-            "sha384" => HashAlg::Sha384,
+        let alg = alg.trim();
+        let hash = base64::engine::general_purpose::STANDARD
+            .decode(hash_b64.trim())
+            .map_err(|_| Error::InvalidManifestDigest(trimmed.to_string()))?;
+
+        let digest = match alg {
+            "sha384" => {
+                let Ok(bytes) = hash.try_into() else {
+                    return Err(Error::InvalidManifestDigest(trimmed.to_string()));
+                };
+                Digest::Sha384(bytes)
+            }
             _ => return Err(Error::InvalidManifestDigest(trimmed.to_string())),
         };
 
-        let hash_b64 = hash_b64.trim();
-        let hash = base64::engine::general_purpose::STANDARD
-            .decode(hash_b64)
-            .map_err(|_| Error::InvalidManifestDigest(trimmed.to_string()))?;
-
-        let Ok(hash) = hash.try_into() else {
-            return Err(Error::InvalidManifestDigest(trimmed.to_string()));
-        };
-
-        Ok(Self { alg, hash })
+        Ok(digest)
     }
 }
 
-impl fmt::Display for ManifestDigest {
+impl fmt::Display for Digest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:", self.alg)?;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(self.hash);
+        write!(f, "{}:", self.alg())?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&self);
         f.write_str(&encoded)
     }
 }
@@ -101,7 +104,7 @@ impl fmt::Display for ManifestDigest {
 pub struct ManifestRef {
     pub url: Url,
     #[serde(default)]
-    pub digest: Option<ManifestDigest>,
+    pub digest: Option<Digest>,
 }
 
 impl<'de> Deserialize<'de> for ManifestRef {
@@ -136,11 +139,9 @@ impl<'de> Deserialize<'de> for ManifestRef {
 
                 let digest = match map.remove("digest") {
                     None | Some(Value::Null) => None,
-                    Some(Value::String(digest)) => Some(
-                        digest
-                            .parse::<ManifestDigest>()
-                            .map_err(serde::de::Error::custom)?,
-                    ),
+                    Some(Value::String(digest)) => {
+                        Some(digest.parse::<Digest>().map_err(serde::de::Error::custom)?)
+                    }
                     Some(_) => {
                         return Err(serde::de::Error::custom(
                             "manifest ref `digest` must be a string",
@@ -602,7 +603,28 @@ pub struct RawManifest {
 }
 
 impl RawManifest {
+    pub fn digest(&self) -> Digest {
+        struct HashWriter<'a>(&'a mut Sha384);
+
+        impl Write for HashWriter<'_> {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.update(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut hasher = Sha384::new();
+        serde_json::to_writer(HashWriter(&mut hasher), self)
+            .expect("RawManifest should always serialize to JSON");
+        Digest::Sha384(hasher.finalize().into())
+    }
+
     pub fn validate(self) -> Result<Manifest, Error> {
+        let digest = self.digest();
         let mut available: BTreeSet<&String> = self.provides.keys().collect();
         available.extend(self.slots.keys());
 
@@ -631,22 +653,34 @@ impl RawManifest {
             }
         }
 
-        Ok(Manifest(self))
+        Ok(Manifest { raw: self, digest })
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
-#[serde(transparent)]
-pub struct Manifest(pub RawManifest);
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(into = "RawManifest", try_from = "RawManifest")]
+pub struct Manifest {
+    raw: RawManifest,
+    digest: Digest,
+}
 
-impl<'de> Deserialize<'de> for Manifest {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        RawManifest::deserialize(deserializer)?
-            .validate()
-            .map_err(serde::de::Error::custom)
+impl Manifest {
+    pub fn digest(&self) -> &Digest {
+        &self.digest
+    }
+}
+
+impl TryFrom<RawManifest> for Manifest {
+    type Error = Error;
+
+    fn try_from(raw: RawManifest) -> Result<Self, Self::Error> {
+        raw.validate()
+    }
+}
+
+impl From<Manifest> for RawManifest {
+    fn from(manifest: Manifest) -> Self {
+        manifest.raw
     }
 }
 
@@ -655,8 +689,7 @@ impl FromStr for Manifest {
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let mut deserializer = json5::Deserializer::from_str(input)?;
-        let raw: RawManifest = serde_path_to_error::deserialize(&mut deserializer)?;
-        raw.validate()
+        Ok(serde_path_to_error::deserialize(&mut deserializer)?)
     }
 }
 
@@ -664,6 +697,6 @@ impl std::ops::Deref for Manifest {
     type Target = RawManifest;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.raw
     }
 }

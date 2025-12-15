@@ -196,8 +196,9 @@ fn manifest_ref_canonical_form_with_digest_parses() {
         ComponentDecl::Reference(r) => {
             assert_eq!(r.url.as_str(), "https://example.com/amber/pkg/v1");
             let digest = r.digest.as_ref().unwrap();
-            assert_eq!(digest.alg, HashAlg::Sha384);
-            assert_eq!(digest.hash, [0u8; 48]);
+            match digest {
+                Digest::Sha384(bytes) => assert_eq!(bytes, &[0u8; 48]),
+            }
         }
         _ => panic!("expected reference"),
     }
