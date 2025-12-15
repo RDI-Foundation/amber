@@ -299,13 +299,13 @@ impl<'de> Deserialize<'de> for ProgramArgs {
     {
         #[derive(Deserialize)]
         #[serde(untagged)]
-        enum Sugar {
+        enum ProgramArgsForm {
             String(String),
             List(Vec<InterpolatedString>),
         }
 
-        match Sugar::deserialize(deserializer)? {
-            Sugar::String(s) => {
+        match ProgramArgsForm::deserialize(deserializer)? {
+            ProgramArgsForm::String(s) => {
                 let tokens = shlex::split(&s)
                     .ok_or_else(|| serde::de::Error::custom(Error::UnclosedQuote))?;
                 let mut args = Vec::new();
@@ -318,7 +318,7 @@ impl<'de> Deserialize<'de> for ProgramArgs {
                 }
                 Ok(ProgramArgs(args))
             }
-            Sugar::List(list) => Ok(ProgramArgs(list)),
+            ProgramArgsForm::List(list) => Ok(ProgramArgs(list)),
         }
     }
 }
@@ -489,10 +489,10 @@ impl<'de> Deserialize<'de> for ConfigSchema {
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Binding {
-    pub target_component: String,
-    pub target_slot: String,
-    pub source_component: String,
-    pub source_capability: String,
+    pub to: String,
+    pub slot: String,
+    pub from: String,
+    pub capability: String,
 }
 
 impl<'de> Deserialize<'de> for Binding {
@@ -501,60 +501,53 @@ impl<'de> Deserialize<'de> for Binding {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        struct Canonical {
-            target_component: String,
-            target_slot: String,
-            source_component: String,
-            #[serde(default)]
-            source_capability: Option<String>,
+        struct ExplicitBindingForm {
+            to: String,
+            slot: String,
+            from: String,
+            capability: Option<String>,
         }
 
         #[derive(Deserialize)]
-        struct Dot {
-            target: String,
-            source: String,
+        struct DotBindingForm {
+            to: String,
+            from: String,
         }
 
         #[derive(Deserialize)]
         #[serde(untagged)]
-        enum Sugar {
-            Canonical(Canonical),
-            Dot(Dot),
+        enum BindingForm {
+            Explicit(ExplicitBindingForm),
+            Dot(DotBindingForm),
         }
 
-        let sugar = Sugar::deserialize(deserializer)?;
-        let binding = match sugar {
-            Sugar::Canonical(c) => {
-                let Some(source_capability) = c.source_capability else {
-                    return Err(serde::de::Error::custom(
-                        "binding missing `source_capability`",
-                    ));
+        match BindingForm::deserialize(deserializer)? {
+            BindingForm::Explicit(explicit) => {
+                let Some(capability) = explicit.capability else {
+                    return Err(serde::de::Error::custom("binding missing `capability`"));
                 };
 
-                Binding {
-                    target_component: parse_binding_component_ref(&c.target_component)
+                Ok(Binding {
+                    to: parse_binding_component_ref(&explicit.to)
                         .map_err(serde::de::Error::custom)?,
-                    target_slot: c.target_slot,
-                    source_component: parse_binding_component_ref(&c.source_component)
+                    slot: explicit.slot,
+                    from: parse_binding_component_ref(&explicit.from)
                         .map_err(serde::de::Error::custom)?,
-                    source_capability,
-                }
+                    capability,
+                })
             }
-            Sugar::Dot(d) => {
-                let (target_component, target_slot) =
-                    split_binding_side(&d.target).map_err(serde::de::Error::custom)?;
-                let (source_component, source_capability) =
-                    split_binding_side(&d.source).map_err(serde::de::Error::custom)?;
-                Binding {
-                    target_component,
-                    target_slot,
-                    source_component,
-                    source_capability,
-                }
+            BindingForm::Dot(dot) => {
+                let (to, slot) = split_binding_side(&dot.to).map_err(serde::de::Error::custom)?;
+                let (from, capability) =
+                    split_binding_side(&dot.from).map_err(serde::de::Error::custom)?;
+                Ok(Binding {
+                    to,
+                    slot,
+                    from,
+                    capability,
+                })
             }
-        };
-
-        Ok(binding)
+        }
     }
 }
 

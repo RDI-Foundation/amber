@@ -77,10 +77,10 @@ fn binding_sugar_forms_parse() {
         {
           manifest_version: "1.0.0",
           bindings: [
-            { target_component: "#a", target_slot: "s", source_component: "#b", source_capability: "c" },
-            { target: "#a.s", source: "#b.c" },
-            { target_component: "#a", target_slot: "s", source_component: "self", source_capability: "d" },
-            { target: "#a.s", source: "self.d" },
+            { to: "#a", slot: "s", from: "#b", capability: "c" },
+            { to: "#a.s", from: "#b.c" },
+            { to: "#a", slot: "s", from: "self", capability: "d" },
+            { to: "#a.s", from: "self.d" },
           ],
         }
         "##
@@ -89,16 +89,16 @@ fn binding_sugar_forms_parse() {
 
     let expected = BTreeSet::from([
         Binding {
-            target_component: "#a".to_string(),
-            target_slot: "s".to_string(),
-            source_component: "#b".to_string(),
-            source_capability: "c".to_string(),
+            to: "#a".to_string(),
+            slot: "s".to_string(),
+            from: "#b".to_string(),
+            capability: "c".to_string(),
         },
         Binding {
-            target_component: "#a".to_string(),
-            target_slot: "s".to_string(),
-            source_component: "self".to_string(),
-            source_capability: "d".to_string(),
+            to: "#a".to_string(),
+            slot: "s".to_string(),
+            from: "self".to_string(),
+            capability: "d".to_string(),
         },
     ]);
 
@@ -111,7 +111,7 @@ fn binding_component_refs_require_hash_for_children() {
         {
           manifest_version: "1.0.0",
           bindings: [
-            { target: "a.s", source: "self.c" },
+            { to: "a.s", from: "self.c" },
           ],
         }
         "#
@@ -122,22 +122,37 @@ fn binding_component_refs_require_hash_for_children() {
 }
 
 #[test]
-fn binding_missing_source_capability_errors() {
+fn binding_missing_capability_errors() {
     let err = r#"
         {
           manifest_version: "1.0.0",
           bindings: [
-            { target_component: "a", target_slot: "s", source_component: "b" }
+            { to: "a", slot: "s", from: "b" }
           ],
         }
         "#
     .parse::<Manifest>()
     .unwrap_err();
 
-    assert!(
-        err.to_string()
-            .contains("binding missing `source_capability`")
-    );
+    assert!(err.to_string().contains("binding missing `capability`"));
+}
+
+#[test]
+fn binding_round_trip_through_canonical_json_parses() {
+    let m: Manifest = r##"
+        {
+          manifest_version: "1.0.0",
+          bindings: [
+            { to: "#a.s", from: "self.c" },
+          ],
+        }
+        "##
+    .parse()
+    .unwrap();
+
+    let json = serde_json::to_string_pretty(&m).unwrap();
+    let round_tripped: Manifest = json.parse().unwrap();
+    assert_eq!(round_tripped, m);
 }
 
 #[test]

@@ -207,32 +207,34 @@ To export a child capability, first give it a local name in `provides` using `fr
 
 ## `bindings`
 
-`bindings` wire a **target slot** to a **source capability**:
+`bindings` wire a `to` slot to a `from` capability:
 
-`(<target_component>.<target_slot>) <- (<source_component>.<source_capability>)`
+`(<to>.<slot>) <- (<from>.<capability>)`
 
 The binding is declared in the parent that is doing the wiring:
 
-- The **target** must be a slot declared by the target component.
-- The **source** must be a capability exported by the source component (a name from its `exports` list).
+- The `to` component must declare the `slot` in its `slots`.
+- The `from` component must export the `capability` (a name from its `exports`).
 - Component refs are either `self` or a child instance (`#<name>`).
 
 Bindings can be written in either canonical form:
 
 ```json5
 {
-  target_component: "#evaluator",
-  target_slot: "llm",
-  source_component: "#router",
-  source_capability: "llm",
+  to: "#evaluator",
+  slot: "llm",
+  from: "#router",
+  capability: "llm",
 }
 ```
 
 …or dot-notation sugar:
 
 ```json5
-{ target: "#evaluator.llm", source: "#router.llm" }
+{ to: "#evaluator.llm", from: "#router.llm" }
 ```
+
+In dot form, `to` is `<component-ref>.<slot>` and `from` is `<component-ref>.<capability>`.
 
 Child refs use `#<name>` where `<name>` is a key of `components`. `self` refers to the component described by the current manifest.
 
@@ -299,7 +301,7 @@ This component runs a router, instantiates a `wrapper` child, wires the wrapper�
     llm: { kind: "llm", from: "wrapper", capability: "llm" },
   },
   bindings: [
-    { target: "#wrapper.admin_api", source: "self.admin_api" },
+    { to: "#wrapper.admin_api", from: "self.admin_api" },
   ],
   exports: ["llm"],
 }
@@ -319,7 +321,7 @@ This component doesn’t provide an LLM itself, but declares an `llm` slot, expo
     llm: { kind: "llm" },
   },
   bindings: [
-    { target: "#evaluator.llm", source: "self.llm" },
+    { to: "#evaluator.llm", from: "self.llm" },
   ],
   exports: ["llm"],
 }
