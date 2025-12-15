@@ -215,15 +215,15 @@ The binding is declared in the parent that is doing the wiring:
 
 - The **target** must be a slot declared by the target component.
 - The **source** must be a capability exported by the source component (a name from its `exports` list).
-- `self` can be used on either side to refer to the component described by the current manifest.
+- Component refs are either `self` or a child instance (`#<name>`).
 
 Bindings can be written in either canonical form:
 
 ```json5
 {
-  target_component: "evaluator",
+  target_component: "#evaluator",
   target_slot: "llm",
-  source_component: "router",
+  source_component: "#router",
   source_capability: "llm",
 }
 ```
@@ -231,10 +231,10 @@ Bindings can be written in either canonical form:
 …or dot-notation sugar:
 
 ```json5
-{ target: "evaluator.llm", source: "router.llm" }
+{ target: "#evaluator.llm", source: "#router.llm" }
 ```
 
-Component names are the keys of `components`. The reserved name `self` refers to the component described by the current manifest.
+Child refs use `#<name>` where `<name>` is a key of `components`. `self` refers to the component described by the current manifest.
 
 ## Examples
 
@@ -299,7 +299,7 @@ This component runs a router, instantiates a `wrapper` child, wires the wrapper�
     llm: { kind: "llm", from: "wrapper", capability: "llm" },
   },
   bindings: [
-    { target: "wrapper.admin_api", source: "self.admin_api" },
+    { target: "#wrapper.admin_api", source: "self.admin_api" },
   ],
   exports: ["llm"],
 }
@@ -319,7 +319,7 @@ This component doesn’t provide an LLM itself, but declares an `llm` slot, expo
     llm: { kind: "llm" },
   },
   bindings: [
-    { target: "evaluator.llm", source: "self.llm" },
+    { target: "#evaluator.llm", source: "self.llm" },
   ],
   exports: ["llm"],
 }

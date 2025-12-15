@@ -73,34 +73,52 @@ fn program_args_string_sugar_splits() {
 
 #[test]
 fn binding_sugar_forms_parse() {
-    let m: Manifest = r#"
+    let m: Manifest = r##"
         {
           manifest_version: "1.0.0",
           bindings: [
-            { target_component: "a", target_slot: "s", source_component: "b", source_capability: "c" },
-            { target: "a.s", source: "b.c" },
+            { target_component: "#a", target_slot: "s", source_component: "#b", source_capability: "c" },
+            { target: "#a.s", source: "#b.c" },
+            { target_component: "#a", target_slot: "s", source_component: "self", source_capability: "d" },
+            { target: "#a.s", source: "self.d" },
           ],
         }
-        "#
+        "##
     .parse()
     .unwrap();
 
     let expected = BTreeSet::from([
         Binding {
-            target_component: "a".to_string(),
+            target_component: "#a".to_string(),
             target_slot: "s".to_string(),
-            source_component: "b".to_string(),
+            source_component: "#b".to_string(),
             source_capability: "c".to_string(),
         },
         Binding {
-            target_component: "a".to_string(),
+            target_component: "#a".to_string(),
             target_slot: "s".to_string(),
-            source_component: "b".to_string(),
-            source_capability: "c".to_string(),
+            source_component: "self".to_string(),
+            source_capability: "d".to_string(),
         },
     ]);
 
     assert_eq!(m.bindings, expected);
+}
+
+#[test]
+fn binding_component_refs_require_hash_for_children() {
+    let err = r#"
+        {
+          manifest_version: "1.0.0",
+          bindings: [
+            { target: "a.s", source: "self.c" },
+          ],
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    assert!(err.to_string().contains("expected `self` or `#<child>`"));
 }
 
 #[test]

@@ -532,9 +532,11 @@ impl<'de> Deserialize<'de> for Binding {
                 };
 
                 Binding {
-                    target_component: c.target_component,
+                    target_component: parse_binding_component_ref(&c.target_component)
+                        .map_err(serde::de::Error::custom)?,
                     target_slot: c.target_slot,
-                    source_component: c.source_component,
+                    source_component: parse_binding_component_ref(&c.source_component)
+                        .map_err(serde::de::Error::custom)?,
                     source_capability,
                 }
             }
@@ -556,12 +558,42 @@ impl<'de> Deserialize<'de> for Binding {
     }
 }
 
+fn parse_binding_component_ref(input: &str) -> Result<String, Error> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidBinding {
+            input: input.to_string(),
+            message: "component ref cannot be empty".to_string(),
+        });
+    }
+
+    match trimmed {
+        "self" => Ok(trimmed.to_string()),
+        _ => match trimmed.strip_prefix('#') {
+            Some(name) => {
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err(Error::InvalidBinding {
+                        input: trimmed.to_string(),
+                        message: "expected `#<child>`".to_string(),
+                    });
+                }
+                Ok(format!("#{name}"))
+            }
+            None => Err(Error::InvalidBinding {
+                input: trimmed.to_string(),
+                message: "expected `self` or `#<child>`".to_string(),
+            }),
+        },
+    }
+}
+
 fn split_binding_side(input: &str) -> Result<(String, String), Error> {
     let trimmed = input.trim();
     let Some((left, right)) = trimmed.split_once('.') else {
         return Err(Error::InvalidBinding {
             input: trimmed.to_string(),
-            message: "expected `component.name`".to_string(),
+            message: "expected `<component-ref>.<name>`".to_string(),
         });
     };
 
@@ -571,11 +603,12 @@ fn split_binding_side(input: &str) -> Result<(String, String), Error> {
     if left.is_empty() || right.is_empty() {
         return Err(Error::InvalidBinding {
             input: trimmed.to_string(),
-            message: "expected `component.name`".to_string(),
+            message: "expected `<component-ref>.<name>`".to_string(),
         });
     }
 
-    Ok((left.to_string(), right.to_string()))
+    let component = parse_binding_component_ref(left)?;
+    Ok((component, right.to_string()))
 }
 
 #[serde_as]
