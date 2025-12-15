@@ -230,7 +230,8 @@ fn manifest_ref_canonical_form_with_digest_parses() {
             assert_eq!(r.url.as_str(), "https://example.com/amber/pkg/v1");
             let digest = r.digest.as_ref().unwrap();
             match digest {
-                Digest::Sha384(bytes) => assert_eq!(bytes, &[0u8; 48]),
+                ManifestDigest::Sha384(bytes) => assert_eq!(bytes, &[0u8; 48]),
+                _ => todo!("test these"),
             }
         }
         _ => panic!("expected reference"),
