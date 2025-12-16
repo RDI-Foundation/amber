@@ -54,7 +54,7 @@ A manifest reference can be written as either:
 
 - URL string (sugar): `"https://..."`
 - Canonical form (optionally pinned):
-  - `{ url: "https://...", digest: "sha384:<hash-b64>" }`
+  - `{ url: "https://...", digest: "<alg>:<hash-b64>" }`
 
 `digest` is optional. If present, it is used to verify the bytes fetched from `url` by hashing them and comparing.
 
@@ -62,15 +62,13 @@ The digest string format is:
 
 `<alg>:<hash-b64>`
 
-`<alg>` is currently `sha384`.
-
-There is no separate tag field; any versioning must live in the URL itself.
+`<alg>` can be `sha256`.
 
 Examples:
 
 - `https://registry.amber-protocol.org/litellm/v3.8.6`
 - `https://registry.agentbeats.dev/envs/tau2`
-- `{ url: "https://registry.agentbeats.dev/envs/tau2", digest: "sha384:<hash-b64>" }`
+- `{ url: "https://registry.agentbeats.dev/envs/tau2", digest: "sha256:5Ub0uXR5xZYFKKlTsOKvC43pM5gdAN1JRStAebbJ45U=" }`
 
 ## `program`
 
@@ -124,10 +122,10 @@ Each child can be declared as:
 - A manifest reference string:
   - `my_child: "https://registry.amber-protocol.org/some/component/v1"`
 - Or a manifest reference in canonical form:
-  - `my_child: { url: "https://registry.amber-protocol.org/some/component/v1", digest: "sha384:<hash-b64>" }`
+  - `my_child: { url: "...", digest: "..." }`
 - Or an object with per-instance config:
-  - `my_child: { manifest: "https://registry.amber-protocol.org/some/component/v1", config: { /* ... */ } }`
-  - `my_child: { manifest: { url: "https://registry.amber-protocol.org/some/component/v1", digest: "sha384:<hash-b64>" }, config: { /* ... */ } }`
+  - `my_child: { manifest: "...", config: { /* ... */ } }`
+  - `my_child: { manifest: { /* ... */ }, config: { /* ... */ } }`
 
 Example:
 

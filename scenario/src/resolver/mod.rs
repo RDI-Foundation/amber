@@ -87,6 +87,7 @@ pub struct Resolution {
     /// The URL where the content was actually found.
     pub url: Url,
     pub manifest: Manifest,
+    pub cacheability: crate::cache::Cacheability,
 }
 
 #[cfg(test)]
@@ -101,13 +102,12 @@ mod tests {
         url: &Url,
         manifest: &Manifest,
     ) {
-        let digest = manifest.digest(DigestAlg::Sha384);
+        let digest = manifest.digest(DigestAlg::default());
         let mismatched = match digest {
-            ManifestDigest::Sha384(mut bytes) => {
+            ManifestDigest::Sha256(mut bytes) => {
                 bytes[0] ^= 0xff;
-                ManifestDigest::Sha384(bytes)
+                ManifestDigest::Sha256(bytes)
             }
-            _ => unreachable!("digest(DigestAlg::Sha384) must return ManifestDigest::Sha384"),
         };
 
         let err = resolver.resolve(url, Some(mismatched)).await.unwrap_err();

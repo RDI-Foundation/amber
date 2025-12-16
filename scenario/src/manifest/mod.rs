@@ -42,11 +42,35 @@ pub enum Error {
     InvalidConfigSchema(String),
 }
 
+macro_rules! count {
+    ($ident:ident) => { 1 };
+    ($head:ident, $($rest:ident),+) => { 1 + count!($($rest),+) }
+}
+
+macro_rules! first {
+    ($head:expr $(, $($rest:expr),+)?) => {
+        $head
+    };
+}
+
 macro_rules! digest {
     ($( ($name:ident, $size:literal, $tag:literal) ),+ $(,)? ) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay)]
+        #[non_exhaustive]
         pub enum DigestAlg {
             $($name),+
+        }
+
+        impl DigestAlg {
+            pub fn all() -> [Self; count!($($name),+)] {
+                [$(Self::$name),+]
+            }
+        }
+
+        impl Default for DigestAlg {
+            fn default() -> Self {
+                first!(Self::$($name),+)
+            }
         }
 
         impl fmt::Display for DigestAlg {
@@ -69,6 +93,7 @@ macro_rules! digest {
         }
 
         #[derive(Clone, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay)]
+        #[non_exhaustive]
         pub enum ManifestDigest {
             $( $name([u8; $size]) ),+
         }
@@ -134,8 +159,9 @@ macro_rules! digest {
 
 digest!(
     (Sha256, 32, "sha256"),
-    (Sha384, 48, "sha384"),
-    (Sha512, 64, "sha512"),
+    // This is how to add others:
+    // (Sha384, 48, "sha384"),
+    // (Sha512, 64, "sha512"),
 );
 
 impl FromStr for ManifestDigest {
@@ -451,6 +477,7 @@ fn default_path() -> String {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum CapabilityKind {
     Mcp,
     Llm,
@@ -737,6 +764,12 @@ impl RawManifest {
 #[serde(into = "RawManifest", try_from = "RawManifest")]
 pub struct Manifest {
     raw: RawManifest,
+}
+
+impl Manifest {
+    pub fn empty() -> Self {
+        Self::from_str("{manifest_version:\"0.0.0\"}").unwrap()
+    }
 }
 
 impl TryFrom<RawManifest> for Manifest {

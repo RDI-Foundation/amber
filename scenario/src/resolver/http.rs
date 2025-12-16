@@ -3,6 +3,7 @@ use std::io;
 use url::Url;
 
 use super::{Error, Resolution};
+use crate::cache::Cacheability;
 
 #[derive(Clone, Debug, Default)]
 pub struct HttpResolver {
@@ -31,6 +32,7 @@ impl HttpResolver {
         Ok(Resolution {
             url: resolved_url,
             manifest,
+            cacheability: Cacheability::ByDigestOnly,
         })
     }
 }

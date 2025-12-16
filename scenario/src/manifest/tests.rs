@@ -1,6 +1,11 @@
 use super::*;
 
 #[test]
+fn create_empty_manifest() {
+    Manifest::empty();
+}
+
+#[test]
 fn interpolation_parsing_splits_parts() {
     let parsed: InterpolatedString = "a ${config.b} c".parse().unwrap();
     assert_eq!(
@@ -217,7 +222,7 @@ fn manifest_ref_canonical_form_with_digest_parses() {
           components: {
             a: {
               url: "https://example.com/amber/pkg/v1",
-              digest: "sha384:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+              digest: "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
             }
           }
         }
@@ -230,8 +235,7 @@ fn manifest_ref_canonical_form_with_digest_parses() {
             assert_eq!(r.url.as_str(), "https://example.com/amber/pkg/v1");
             let digest = r.digest.as_ref().unwrap();
             match digest {
-                ManifestDigest::Sha384(bytes) => assert_eq!(bytes, &[0u8; 48]),
-                _ => todo!("test these"),
+                ManifestDigest::Sha256(bytes) => assert_eq!(bytes, &[0u8; 32]),
             }
         }
         _ => panic!("expected reference"),
@@ -244,7 +248,7 @@ fn manifest_ref_invalid_digest_errors() {
         {
           manifest_version: "1.0.0",
           components: {
-            a: { url: "https://example.com/amber/pkg/v1", digest: "sha384:not_base64" }
+            a: { url: "https://example.com/amber/pkg/v1", digest: "sha256:not_base64" }
           }
         }
         "##
