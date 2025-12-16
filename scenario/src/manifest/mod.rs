@@ -17,6 +17,7 @@ use sha2::Digest as _;
 use url::Url;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("json5 parse error: {0}")]
     Json5(#[from] json5::Error),
@@ -190,8 +191,8 @@ impl fmt::Display for ManifestDigest {
     }
 }
 
-#[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[non_exhaustive]
 pub struct ManifestRef {
     pub url: Url,
     #[serde(default)]
@@ -274,11 +275,13 @@ impl FromStr for ManifestRef {
     DeserializeFromStr,
     SerializeDisplay,
 )]
+#[non_exhaustive]
 pub struct InterpolatedString {
     pub parts: Vec<InterpolatedPart>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum InterpolatedPart {
     Literal(String),
     Interpolation {
@@ -316,6 +319,7 @@ impl FromStr for InterpolatedPart {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum InterpolationSource {
     Config,
     Slots,
@@ -418,6 +422,7 @@ impl<'de> Deserialize<'de> for ProgramArgs {
 
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Program {
     pub image: String,
     #[serde(default)]
@@ -430,12 +435,14 @@ pub struct Program {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Network {
     #[serde(default)]
     pub endpoints: BTreeSet<Endpoint>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Endpoint {
     pub name: String,
     // TODO: this should be an enum tagged by `NetworkProtocol` and carrying appropriate data for the protocol
@@ -448,6 +455,7 @@ pub struct Endpoint {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum NetworkProtocol {
     Http,
     Https,
@@ -498,6 +506,7 @@ impl fmt::Display for CapabilityKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CapabilityDecl {
     pub kind: CapabilityKind,
     #[serde(default)]
@@ -505,12 +514,14 @@ pub struct CapabilityDecl {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SlotDecl {
     #[serde(flatten)]
     pub decl: CapabilityDecl,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ProvideDecl {
     #[serde(flatten)]
     pub decl: CapabilityDecl,
@@ -524,6 +535,7 @@ pub struct ProvideDecl {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum ComponentDecl {
     Reference(ManifestRef),
     Object(ComponentRef),
@@ -559,6 +571,7 @@ impl<'de> Deserialize<'de> for ComponentDecl {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ComponentRef {
     pub manifest: ManifestRef,
     #[serde(default)]
@@ -699,27 +712,27 @@ fn split_binding_side(input: &str) -> Result<(String, String), Error> {
 }
 
 #[serde_as]
-#[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RawManifest {
-    manifest_version: Version,
+    pub manifest_version: Version,
     #[serde(default)]
-    program: Option<Program>,
+    pub program: Option<Program>,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
-    components: BTreeMap<String, ComponentDecl>,
+    pub components: BTreeMap<String, ComponentDecl>,
     #[serde(default)]
-    config_schema: Option<ConfigSchema>,
+    pub config_schema: Option<ConfigSchema>,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
-    slots: BTreeMap<String, SlotDecl>,
+    pub slots: BTreeMap<String, SlotDecl>,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
-    provides: BTreeMap<String, ProvideDecl>,
+    pub provides: BTreeMap<String, ProvideDecl>,
     #[serde(default)]
-    bindings: BTreeSet<Binding>,
+    pub bindings: BTreeSet<Binding>,
     #[serde(default)]
-    exports: BTreeSet<String>,
+    pub exports: BTreeSet<String>,
 }
 
 impl RawManifest {
