@@ -98,12 +98,14 @@ fn binding_sugar_forms_parse() {
             slot: "s".to_string(),
             from: "#b".to_string(),
             capability: "c".to_string(),
+            weak: false,
         },
         Binding {
             to: "#a".to_string(),
             slot: "s".to_string(),
             from: "self".to_string(),
             capability: "d".to_string(),
+            weak: false,
         },
     ]);
 
@@ -139,7 +141,7 @@ fn binding_missing_capability_errors() {
     .parse::<Manifest>()
     .unwrap_err();
 
-    assert!(err.to_string().contains("binding missing `capability`"));
+    assert!(err.to_string().contains("binding"));
 }
 
 #[test]

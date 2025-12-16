@@ -209,6 +209,10 @@ To export a child capability, first give it a local name in `provides` using `fr
 
 `(<to>.<slot>) <- (<from>.<capability>)`
 
+Bindings are **strong** by default: the binding must exist and be stable at component startup.
+
+Set `weak: true` to make a binding **weak**: the binding does not need to exist or be stable at component startup, and the component must tolerate the bound capability being down. This is useful for cyclic component graphs and flaky remote components.
+
 The binding is declared in the parent that is doing the wiring:
 
 - The `to` component must declare the `slot` in its `slots`.
@@ -223,13 +227,15 @@ Bindings can be written in either canonical form:
   slot: "llm",
   from: "#router",
   capability: "llm",
+  // Optional; default false.
+  weak: true,
 }
 ```
 
 …or dot-notation sugar:
 
 ```json5
-{ to: "#evaluator.llm", from: "#router.llm" }
+{ to: "#evaluator.llm", from: "#router.llm", weak: true }
 ```
 
 In dot form, `to` is `<component-ref>.<slot>` and `from` is `<component-ref>.<capability>`.
@@ -322,5 +328,22 @@ This component doesn’t provide an LLM itself, but declares an `llm` slot, expo
     { to: "#evaluator.llm", from: "self.llm" },
   ],
   exports: ["llm"],
+}
+```
+
+### 5) Weak binding (optional / tolerates downtime)
+
+This component wires a child slot to another child’s capability, but does not require it to be up at startup.
+
+```json5
+{
+  manifest_version: "1.0.0",
+  components: {
+    consumer: "https://registry.amber-protocol.org/consumer/v1",
+    provider: "https://registry.amber-protocol.org/provider/v1",
+  },
+  bindings: [
+    { to: "#consumer.backend", from: "#provider.api", weak: true },
+  ],
 }
 ```

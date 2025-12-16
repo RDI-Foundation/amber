@@ -595,11 +595,14 @@ impl<'de> Deserialize<'de> for ConfigSchema {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[non_exhaustive]
 pub struct Binding {
     pub to: String,
     pub slot: String,
     pub from: String,
     pub capability: String,
+    #[serde(default)]
+    pub weak: bool,
 }
 
 impl<'de> Deserialize<'de> for Binding {
@@ -612,13 +615,17 @@ impl<'de> Deserialize<'de> for Binding {
             to: String,
             slot: String,
             from: String,
-            capability: Option<String>,
+            capability: String,
+            #[serde(default)]
+            weak: bool,
         }
 
         #[derive(Deserialize)]
         struct DotBindingForm {
             to: String,
             from: String,
+            #[serde(default)]
+            weak: bool,
         }
 
         #[derive(Deserialize)]
@@ -629,20 +636,14 @@ impl<'de> Deserialize<'de> for Binding {
         }
 
         match BindingForm::deserialize(deserializer)? {
-            BindingForm::Explicit(explicit) => {
-                let Some(capability) = explicit.capability else {
-                    return Err(serde::de::Error::custom("binding missing `capability`"));
-                };
-
-                Ok(Binding {
-                    to: parse_binding_component_ref(&explicit.to)
-                        .map_err(serde::de::Error::custom)?,
-                    slot: explicit.slot,
-                    from: parse_binding_component_ref(&explicit.from)
-                        .map_err(serde::de::Error::custom)?,
-                    capability,
-                })
-            }
+            BindingForm::Explicit(explicit) => Ok(Binding {
+                to: parse_binding_component_ref(&explicit.to).map_err(serde::de::Error::custom)?,
+                slot: explicit.slot,
+                from: parse_binding_component_ref(&explicit.from)
+                    .map_err(serde::de::Error::custom)?,
+                capability: explicit.capability,
+                weak: explicit.weak,
+            }),
             BindingForm::Dot(dot) => {
                 let (to, slot) = split_binding_side(&dot.to).map_err(serde::de::Error::custom)?;
                 let (from, capability) =
@@ -652,6 +653,7 @@ impl<'de> Deserialize<'de> for Binding {
                     slot,
                     from,
                     capability,
+                    weak: dot.weak,
                 })
             }
         }
