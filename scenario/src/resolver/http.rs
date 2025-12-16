@@ -2,7 +2,7 @@ use std::io;
 
 use url::Url;
 
-use super::{Error, Resolution, Resolver};
+use super::{Error, Resolution};
 
 #[derive(Clone, Debug, Default)]
 pub struct HttpResolver {
@@ -13,14 +13,8 @@ impl HttpResolver {
     pub fn new() -> Self {
         Default::default()
     }
-}
 
-impl Resolver for HttpResolver {
-    fn schemes() -> &'static [&'static str] {
-        &["https", "http"]
-    }
-
-    async fn resolve_url(&self, url: &Url) -> Result<Resolution, Error> {
+    pub(super) async fn resolve_url(&self, url: &Url) -> Result<Resolution, Error> {
         let res = self
             .client
             .get(url.clone())
@@ -51,7 +45,6 @@ mod tests {
 
     use url::Url;
 
-    use super::HttpResolver;
     use crate::{manifest::Manifest, resolver::Resolver};
 
     fn accept_with_deadline(listener: &TcpListener, deadline: Instant) -> std::net::TcpStream {
@@ -136,7 +129,7 @@ mod tests {
         let contents = r#"{ manifest_version: "1.0.0" }"#.to_string();
         let (url, server) = spawn_redirecting_manifest_server(contents.clone());
 
-        let resolver = HttpResolver::new();
+        let resolver = Resolver::new();
         let res = resolver.resolve(&url, None).await.unwrap();
 
         let expected: Manifest = contents.parse().unwrap();
@@ -151,7 +144,7 @@ mod tests {
         let contents = r#"{ manifest_version: "1.0.0" }"#.to_string();
         let (url, server) = spawn_redirecting_manifest_server(contents.clone());
 
-        let resolver = HttpResolver::new();
+        let resolver = Resolver::new();
         let manifest: Manifest = contents.parse().unwrap();
         crate::resolver::tests::assert_digest_mismatch_errors(&resolver, &url, &manifest).await;
 

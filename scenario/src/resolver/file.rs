@@ -2,23 +2,17 @@ use std::io;
 
 use url::Url;
 
-use super::{Error, Resolution, Resolver};
+use super::{Error, Resolution};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct FileResolver;
 
 impl FileResolver {
     pub fn new() -> Self {
         Default::default()
     }
-}
 
-impl Resolver for FileResolver {
-    fn schemes() -> &'static [&'static str] {
-        &["file"]
-    }
-
-    async fn resolve_url(&self, url: &Url) -> Result<Resolution, Error> {
+    pub(super) async fn resolve_url(&self, url: &Url) -> Result<Resolution, Error> {
         let path = url.to_file_path().map_err(|()| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -43,7 +37,6 @@ mod tests {
 
     use url::Url;
 
-    use super::FileResolver;
     use crate::{manifest::Manifest, resolver::Resolver};
 
     static FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -84,7 +77,7 @@ mod tests {
         let file = TempFile::new(contents);
         let url = file.url();
 
-        let resolver = FileResolver::new();
+        let resolver = Resolver::new();
         let res = resolver.resolve(&url, None).await.unwrap();
 
         let expected: Manifest = contents.parse().unwrap();
@@ -98,7 +91,7 @@ mod tests {
         let file = TempFile::new(contents);
         let url = file.url();
 
-        let resolver = FileResolver::new();
+        let resolver = Resolver::new();
         let manifest: Manifest = contents.parse().unwrap();
         crate::resolver::tests::assert_digest_mismatch_errors(&resolver, &url, &manifest).await;
     }

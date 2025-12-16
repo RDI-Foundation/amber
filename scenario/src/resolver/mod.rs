@@ -2,6 +2,8 @@
 pub mod file;
 #[cfg(feature = "http-resolver")]
 pub mod http;
+#[cfg(feature = "remote-resolver")]
+pub mod remote;
 
 use url::Url;
 
@@ -22,32 +24,62 @@ pub enum Error {
     Manifest(#[from] manifest::Error),
 }
 
-pub trait Resolver: Send + Sync {
-    /// The URL schemes that this resolver can resolve.
-    fn schemes() -> &'static [&'static str];
+#[derive(Clone, Debug, Default)]
+pub struct Resolver {
+    #[cfg(feature = "file-resolver")]
+    pub file: file::FileResolver,
+    #[cfg(feature = "http-resolver")]
+    pub http: http::HttpResolver,
+    #[cfg(feature = "remote-resolver")]
+    remotes: remote::RemoteDispatch,
+}
 
-    fn resolve(
-        &self,
-        url: &Url,
-        digest: Option<ManifestDigest>,
-    ) -> impl Future<Output = Result<Resolution, Error>> + Send {
-        async {
-            if !Self::schemes().contains(&url.scheme()) {
-                return Err(Error::UnsupportedScheme {
-                    scheme: url.scheme().to_string(),
-                });
-            }
-            let res = self.resolve_url(url).await?;
-            if let Some(digest) = digest
-                && res.manifest.digest(digest.alg()) != digest
-            {
-                return Err(Error::MismatchedDigest);
-            }
-            Ok(res)
+impl Resolver {
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    #[cfg(feature = "remote-resolver")]
+    pub fn with_remote(&self, resolver: remote::RemoteResolver) -> Self {
+        Self {
+            #[cfg(feature = "file-resolver")]
+            file: self.file,
+            #[cfg(feature = "http-resolver")]
+            http: self.http.clone(),
+            remotes: self.remotes.with_remote(resolver),
         }
     }
 
-    fn resolve_url(&self, url: &Url) -> impl Future<Output = Result<Resolution, Error>> + Send;
+    pub async fn resolve(
+        &self,
+        url: &Url,
+        digest: Option<ManifestDigest>,
+    ) -> Result<Resolution, Error> {
+        let res = self.resolve_url(url).await?;
+        if let Some(digest) = digest
+            && res.manifest.digest(digest.alg()) != digest
+        {
+            return Err(Error::MismatchedDigest);
+        }
+        Ok(res)
+    }
+
+    async fn resolve_url(&self, url: &Url) -> Result<Resolution, Error> {
+        #[cfg(feature = "remote-resolver")]
+        if let Some(resolver) = self.remotes.get(url.scheme()) {
+            return resolver.resolve_url(url).await;
+        }
+
+        match url.scheme() {
+            #[cfg(feature = "file-resolver")]
+            "file" => self.file.resolve_url(url).await,
+            #[cfg(feature = "http-resolver")]
+            "http" | "https" => self.http.resolve_url(url).await,
+            scheme => Err(Error::UnsupportedScheme {
+                scheme: scheme.to_string(),
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -59,12 +91,14 @@ pub struct Resolution {
 
 #[cfg(test)]
 mod tests {
+    use url::Url;
+
     use super::{Error, Resolver};
     use crate::manifest::{DigestAlg, Manifest, ManifestDigest};
 
-    pub(super) async fn assert_digest_mismatch_errors<R: Resolver>(
-        resolver: &R,
-        url: &url::Url,
+    pub(super) async fn assert_digest_mismatch_errors(
+        resolver: &Resolver,
+        url: &Url,
         manifest: &Manifest,
     ) {
         let digest = manifest.digest(DigestAlg::Sha384);
