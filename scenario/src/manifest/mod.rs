@@ -37,6 +37,16 @@ pub enum Error {
     UnclosedQuote,
     #[error("export `{name}` not provided or slotted")]
     UnknownExport { name: String },
+    #[error("capability `{name}` cannot be declared as both slot and provide")]
+    AmbiguousCapabilityName { name: String },
+    #[error("binding target `{to}.{slot}` is bound more than once")]
+    DuplicateBindingTarget { to: String, slot: String },
+    #[error("binding source `{from}.{capability}` is bound more than once")]
+    DuplicateBindingSource { from: String, capability: String },
+    #[error("slot `{name}` must be bound or exported")]
+    UnusedSlot { name: String },
+    #[error("provide `{name}` must be bound or exported")]
+    UnusedProvide { name: String },
     #[error("unknown endpoint `{name}` referenced")]
     UnknownEndpoint { name: String },
     #[error("invalid config schema: {0}")]
@@ -743,12 +753,62 @@ impl RawManifest {
     }
 
     pub fn validate(self) -> Result<Manifest, Error> {
+        if let Some(name) = self
+            .slots
+            .keys()
+            .find(|name| self.provides.contains_key(*name))
+        {
+            return Err(Error::AmbiguousCapabilityName { name: name.clone() });
+        }
+
+        let mut bound_targets = BTreeSet::new();
+        let mut bound_sources = BTreeSet::new();
+        let mut self_bound_slots = BTreeSet::new();
+        let mut self_bound_capabilities = BTreeSet::new();
+
+        for binding in &self.bindings {
+            let target = (binding.to.as_str(), binding.slot.as_str());
+            if !bound_targets.insert(target) {
+                return Err(Error::DuplicateBindingTarget {
+                    to: binding.to.clone(),
+                    slot: binding.slot.clone(),
+                });
+            }
+
+            let source = (binding.from.as_str(), binding.capability.as_str());
+            if !bound_sources.insert(source) {
+                return Err(Error::DuplicateBindingSource {
+                    from: binding.from.clone(),
+                    capability: binding.capability.clone(),
+                });
+            }
+
+            if binding.to == "self" {
+                self_bound_slots.insert(binding.slot.as_str());
+            }
+            if binding.from == "self" {
+                self_bound_capabilities.insert(binding.capability.as_str());
+            }
+        }
+
         let mut available: BTreeSet<&String> = self.provides.keys().collect();
         available.extend(self.slots.keys());
 
         for name in &self.exports {
             if !available.contains(name) {
                 return Err(Error::UnknownExport { name: name.clone() });
+            }
+        }
+
+        for name in self.slots.keys() {
+            if !self.exports.contains(name) && !self_bound_slots.contains(name.as_str()) {
+                return Err(Error::UnusedSlot { name: name.clone() });
+            }
+        }
+
+        for name in self.provides.keys() {
+            if !self.exports.contains(name) && !self_bound_capabilities.contains(name.as_str()) {
+                return Err(Error::UnusedProvide { name: name.clone() });
             }
         }
 

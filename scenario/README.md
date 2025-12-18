@@ -44,7 +44,10 @@ Notes:
 
 - `manifest_version` is a SemVer string (currently `"1.0.0"`).
 - Duplicate keys in `program.env`, `components`, `slots`, and `provides` are invalid.
+- Names must be unique across `slots` and `provides` (a name cannot be declared in both).
 - `exports` entries must name something declared in `slots` or `provides`.
+- Each binding target `(<to>.<slot>)` and binding source `(<from>.<capability>)` may only appear once.
+- Every declared slot/provide must be either bound by a `binding` or listed in `exports`.
 
 ## Manifest references (`ManifestRef`)
 
@@ -171,6 +174,7 @@ Example:
 ### `slots`
 
 `slots` declares what this component needs. A slot is fulfilled by a `binding`.
+If a slot is not exported, it must be bound by a `binding` targeting `self.<slot>`.
 
 ```json5
 slots: {
@@ -195,6 +199,8 @@ provides: {
 }
 ```
 
+If a provide is not exported, it must be used by a `binding` with `from: "self.<provide>"`.
+
 If `provides.<name>.endpoint` is set, it must match a declared `program.network.endpoints[].name`.
 
 ### `exports`
@@ -208,6 +214,8 @@ To export a child capability, first give it a local name in `provides` using `fr
 `bindings` wire a `to` slot to a `from` capability:
 
 `(<to>.<slot>) <- (<from>.<capability>)`
+
+Binding targets and sources are single-use: you cannot bind the same `(<to>.<slot>)` or `(<from>.<capability>)` more than once.
 
 Bindings are **strong** by default: the binding must exist and be stable at component startup.
 

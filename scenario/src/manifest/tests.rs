@@ -84,8 +84,8 @@ fn binding_sugar_forms_parse() {
           bindings: [
             { to: "#a", slot: "s", from: "#b", capability: "c" },
             { to: "#a.s", from: "#b.c" },
-            { to: "#a", slot: "s", from: "self", capability: "d" },
-            { to: "#a.s", from: "self.d" },
+            { to: "#a", slot: "t", from: "self", capability: "d" },
+            { to: "#a.t", from: "self.d" },
           ],
         }
         "##
@@ -102,7 +102,7 @@ fn binding_sugar_forms_parse() {
         },
         Binding {
             to: "#a".to_string(),
-            slot: "s".to_string(),
+            slot: "t".to_string(),
             from: "self".to_string(),
             capability: "d".to_string(),
             weak: false,
@@ -275,7 +275,8 @@ fn endpoint_validation_fails_for_unknown_reference() {
           },
           provides: {
             api: { kind: "http", endpoint: "missing" }
-          }
+          },
+          exports: ["api"],
         }
         "#
     .parse::<Manifest>()
@@ -295,7 +296,8 @@ fn endpoint_validation_passes_for_defined_reference() {
           },
           provides: {
             api: { kind: "http", endpoint: "endpoint" }
-          }
+          },
+          exports: ["api"],
         }
         "#
     .parse()
@@ -334,4 +336,113 @@ fn duplicate_keys_in_program_env_errors() {
     .parse();
 
     assert!(res.is_err());
+}
+
+#[test]
+fn slots_and_provides_cannot_share_names() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "1.0.0",
+          slots: { api: { kind: "http" } },
+          provides: { api: { kind: "http" } },
+          exports: ["api"],
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::AmbiguousCapabilityName { name } => assert_eq!(name, "api"),
+        other => panic!("expected AmbiguousCapabilityName error, got: {other}"),
+    }
+}
+
+#[test]
+fn binding_target_cannot_be_multiplexed() {
+    let raw = parse_raw(
+        r##"
+        {
+          manifest_version: "1.0.0",
+          bindings: [
+            { to: "#a.s", from: "#b.c" },
+            { to: "#a.s", from: "#c.d" },
+          ],
+        }
+        "##,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::DuplicateBindingTarget { to, slot } => {
+            assert_eq!(to, "#a");
+            assert_eq!(slot, "s");
+        }
+        other => panic!("expected DuplicateBindingTarget error, got: {other}"),
+    }
+}
+
+#[test]
+fn binding_source_cannot_be_multiplexed() {
+    let raw = parse_raw(
+        r##"
+        {
+          manifest_version: "1.0.0",
+          bindings: [
+            { to: "#a.s1", from: "#b.c" },
+            { to: "#a.s2", from: "#b.c" },
+          ],
+        }
+        "##,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::DuplicateBindingSource { from, capability } => {
+            assert_eq!(from, "#b");
+            assert_eq!(capability, "c");
+        }
+        other => panic!("expected DuplicateBindingSource error, got: {other}"),
+    }
+}
+
+#[test]
+fn unused_slot_is_rejected() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "1.0.0",
+          slots: { llm: { kind: "llm" } },
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::UnusedSlot { name } => assert_eq!(name, "llm"),
+        other => panic!("expected UnusedSlot error, got: {other}"),
+    }
+}
+
+#[test]
+fn unused_provide_is_rejected() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "1.0.0",
+          provides: { api: { kind: "http" } },
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::UnusedProvide { name } => assert_eq!(name, "api"),
+        other => panic!("expected UnusedProvide error, got: {other}"),
+    }
+}
+
+fn parse_raw(input: &str) -> RawManifest {
+    let mut deserializer = json5::Deserializer::from_str(input).unwrap();
+    serde_path_to_error::deserialize(&mut deserializer).unwrap()
 }
