@@ -123,6 +123,7 @@ mod tests {
     pub(super) async fn assert_digest_mismatch_errors(
         resolver: &Resolver,
         url: &Url,
+        expected_url: &Url,
         manifest: &Manifest,
     ) {
         let digest = manifest.digest(DigestAlg::default());
@@ -137,6 +138,6 @@ mod tests {
         let Error::MismatchedDigest(err_url) = err else {
             panic!("expected MismatchedDigest error");
         };
-        assert_eq!(err_url, *url);
+        assert_eq!(err_url, *expected_url);
     }
 }

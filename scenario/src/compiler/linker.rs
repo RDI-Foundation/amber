@@ -18,12 +18,6 @@ use crate::{
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    #[error("unknown child `#{child}` referenced from {component_path}")]
-    UnknownChild {
-        component_path: String,
-        child: String,
-    },
-
     #[error("unknown slot `{slot}` on {component_path}")]
     UnknownSlot {
         component_path: String,

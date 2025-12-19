@@ -260,7 +260,11 @@ mod tests {
 
         let resolver = Resolver::new();
         let manifest: Manifest = contents.parse().unwrap();
-        crate::resolver::tests::assert_digest_mismatch_errors(&resolver, &url, &manifest).await;
+        let final_url = url.join("/final").unwrap();
+        crate::resolver::tests::assert_digest_mismatch_errors(
+            &resolver, &url, &final_url, &manifest,
+        )
+        .await;
 
         server.join().unwrap();
     }

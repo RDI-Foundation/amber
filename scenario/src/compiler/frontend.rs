@@ -225,25 +225,25 @@ async fn resolve_manifest_inner(
 ) -> Result<ResolvedManifest, Error> {
     // Cache first (both modes).
     if let Some(digest) = &r.digest {
-        if let Some(m) = svc.cache.get_by_digest(digest) {
+        if let Some(entry) = svc.cache.get_by_digest(digest) {
             return Ok(ResolvedManifest {
                 digest: digest.clone(),
-                resolved_url: r.url.clone(),
-                manifest: m,
+                resolved_url: entry.resolved_url,
+                manifest: entry.manifest,
             });
         }
-        if let Some(m) = svc.cache.get_by_url(&r.url) {
+        if let Some(entry) = svc.cache.get_by_url(&r.url) {
             return Ok(ResolvedManifest {
-                digest: m.digest(svc.digest_alg),
-                resolved_url: r.url.clone(),
-                manifest: m,
+                digest: entry.manifest.digest(svc.digest_alg),
+                resolved_url: entry.resolved_url,
+                manifest: entry.manifest,
             });
         }
-    } else if let Some(m) = svc.cache.get_by_url(&r.url) {
+    } else if let Some(entry) = svc.cache.get_by_url(&r.url) {
         return Ok(ResolvedManifest {
-            digest: m.digest(svc.digest_alg),
-            resolved_url: r.url.clone(),
-            manifest: m,
+            digest: entry.manifest.digest(svc.digest_alg),
+            resolved_url: entry.resolved_url,
+            manifest: entry.manifest,
         });
     }
 
@@ -260,9 +260,13 @@ async fn resolve_manifest_inner(
     let digest = manifest.digest(svc.digest_alg);
 
     // Alias both declared URL and resolved URL to the same manifest content.
+    svc.cache.put_arc(
+        resolution.url.clone(),
+        resolution.url.clone(),
+        Arc::clone(&manifest),
+    );
     svc.cache
-        .put_arc(resolution.url.clone(), Arc::clone(&manifest));
-    svc.cache.put_arc(r.url.clone(), Arc::clone(&manifest));
+        .put_arc(r.url.clone(), resolution.url.clone(), Arc::clone(&manifest));
 
     Ok(ResolvedManifest {
         manifest,

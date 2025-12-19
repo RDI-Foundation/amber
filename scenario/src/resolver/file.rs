@@ -95,6 +95,7 @@ mod tests {
 
         let resolver = Resolver::new();
         let manifest: Manifest = contents.parse().unwrap();
-        crate::resolver::tests::assert_digest_mismatch_errors(&resolver, &url, &manifest).await;
+        crate::resolver::tests::assert_digest_mismatch_errors(&resolver, &url, &url, &manifest)
+            .await;
     }
 }
