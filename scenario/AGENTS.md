@@ -1,1 +1,2 @@
 * ALWAYS keep README.md up-to-date with the manifest schema. If you make any changes to the manifest types (schema), update README.md to include the latest specification and usage, and update any examples that need to be changed.
+* Rust raw strings will require escaping the `#` character using a `\#`. Refer to the existing code to understand how to correctly place the `#` character in raw strings. Failure to escape `#` correctly in the raw string context will cause errors.

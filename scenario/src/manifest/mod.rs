@@ -35,6 +35,8 @@ pub enum Error {
     InvalidComponentRef { input: String, message: String },
     #[error("invalid binding `{input}`: {message}")]
     InvalidBinding { input: String, message: String },
+    #[error("invalid {kind} name `{name}`: dots are reserved")]
+    InvalidName { kind: &'static str, name: String },
     #[error("unclosed quote in args string")]
     UnclosedQuote,
     #[error("export `{name}` not provided or slotted")]
@@ -45,14 +47,29 @@ pub enum Error {
     DuplicateBindingTarget { to: String, slot: String },
     #[error("binding source `{from}.{capability}` is bound more than once")]
     DuplicateBindingSource { from: String, capability: String },
+    #[error("binding references unknown child `#{child}`")]
+    UnknownBindingChild { child: String },
+    #[error("binding target `self.{slot}` references unknown slot")]
+    UnknownBindingSlot { slot: String },
+    #[error("binding source `self.{capability}` references unknown provide")]
+    UnknownBindingProvide { capability: String },
     #[error("slot `{name}` must be bound or exported")]
     UnusedSlot { name: String },
     #[error("provide `{name}` must be bound or exported")]
     UnusedProvide { name: String },
+    #[error("duplicate endpoint name `{name}`")]
+    DuplicateEndpointName { name: String },
     #[error("unknown endpoint `{name}` referenced")]
     UnknownEndpoint { name: String },
     #[error("invalid config schema: {0}")]
     InvalidConfigSchema(String),
+    #[error(
+        "unsupported manifest version `{version}` (supported major version: {supported_major})"
+    )]
+    UnsupportedManifestVersion {
+        version: Version,
+        supported_major: u64,
+    },
 }
 
 #[derive(
@@ -221,6 +238,16 @@ impl<'de> Deserialize<'de> for ManifestRef {
                         ));
                     }
                 };
+
+                if !map.is_empty() {
+                    let mut keys = map.keys().cloned().collect::<Vec<_>>();
+                    keys.sort();
+                    let suffix = if keys.len() == 1 { "" } else { "s" };
+                    return Err(serde::de::Error::custom(format!(
+                        "manifest ref contains unknown field{suffix}: {}",
+                        keys.join(", ")
+                    )));
+                }
 
                 Ok(Self { url, digest })
             }
@@ -431,8 +458,24 @@ pub struct Program {
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Network {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_endpoints")]
     pub endpoints: BTreeSet<Endpoint>,
+}
+
+fn deserialize_endpoints<'de, D>(deserializer: D) -> Result<BTreeSet<Endpoint>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let endpoints = Vec::<Endpoint>::deserialize(deserializer)?;
+    let mut names = BTreeSet::new();
+    for endpoint in &endpoints {
+        if !names.insert(endpoint.name.as_str()) {
+            return Err(serde::de::Error::custom(Error::DuplicateEndpointName {
+                name: endpoint.name.clone(),
+            }));
+        }
+    }
+    Ok(endpoints.into_iter().collect())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -668,14 +711,21 @@ impl<'de> Deserialize<'de> for Binding {
         }
 
         match BindingForm::deserialize(deserializer)? {
-            BindingForm::Explicit(explicit) => Ok(Binding {
-                to: parse_binding_component_ref(&explicit.to).map_err(serde::de::Error::custom)?,
-                slot: explicit.slot,
-                from: parse_binding_component_ref(&explicit.from)
-                    .map_err(serde::de::Error::custom)?,
-                capability: explicit.capability,
-                weak: explicit.weak,
-            }),
+            BindingForm::Explicit(explicit) => {
+                ensure_binding_name_no_dot(&explicit.slot, explicit.slot.as_str())
+                    .map_err(serde::de::Error::custom)?;
+                ensure_binding_name_no_dot(&explicit.capability, explicit.capability.as_str())
+                    .map_err(serde::de::Error::custom)?;
+                Ok(Binding {
+                    to: parse_binding_component_ref(&explicit.to)
+                        .map_err(serde::de::Error::custom)?,
+                    slot: explicit.slot,
+                    from: parse_binding_component_ref(&explicit.from)
+                        .map_err(serde::de::Error::custom)?,
+                    capability: explicit.capability,
+                    weak: explicit.weak,
+                })
+            }
             BindingForm::Dot(dot) => {
                 let (to, slot) = split_binding_side(&dot.to).map_err(serde::de::Error::custom)?;
                 let (from, capability) =
@@ -709,11 +759,15 @@ fn parse_component_ref(input: &str) -> Result<LocalComponentRef, ComponentRefPar
     match input {
         "self" => Ok(LocalComponentRef::Self_),
         _ => match input.strip_prefix('#') {
-            Some(name) if !name.is_empty() => Ok(LocalComponentRef::Child(name.to_string())),
-            Some(_) => Err(ComponentRefParseError {
+            Some("") => Err(ComponentRefParseError {
                 input: input.to_string(),
                 message: "expected `#<child>`".to_string(),
             }),
+            Some(name) if name.contains('.') => Err(ComponentRefParseError {
+                input: input.to_string(),
+                message: "child name cannot contain `.`".to_string(),
+            }),
+            Some(name) => Ok(LocalComponentRef::Child(name.to_string())),
             None => Err(ComponentRefParseError {
                 input: input.to_string(),
                 message: "expected `self` or `#<child>`".to_string(),
@@ -727,6 +781,26 @@ fn parse_binding_component_ref(input: &str) -> Result<LocalComponentRef, Error> 
         input: err.input,
         message: err.message,
     })
+}
+
+fn ensure_name_no_dot(name: &str, kind: &'static str) -> Result<(), Error> {
+    if name.contains('.') {
+        return Err(Error::InvalidName {
+            kind,
+            name: name.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_binding_name_no_dot(name: &str, input: &str) -> Result<(), Error> {
+    if name.contains('.') {
+        return Err(Error::InvalidBinding {
+            input: input.to_string(),
+            message: "binding names cannot contain `.`".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn split_binding_side(input: &str) -> Result<(LocalComponentRef, String), Error> {
@@ -745,6 +819,7 @@ fn split_binding_side(input: &str) -> Result<(LocalComponentRef, String), Error>
     }
 
     let component = parse_binding_component_ref(left)?;
+    ensure_binding_name_no_dot(right, input)?;
     Ok((component, right.to_string()))
 }
 
@@ -772,12 +847,42 @@ pub struct RawManifest {
     pub exports: BTreeSet<String>,
 }
 
+const SUPPORTED_MANIFEST_MAJOR: u64 = 1;
+
 impl RawManifest {
     pub fn digest(&self, alg: DigestAlg) -> ManifestDigest {
         ManifestDigest::digest(self, alg)
     }
 
+    fn validate_version(&self) -> Result<(), Error> {
+        if self.manifest_version.major != SUPPORTED_MANIFEST_MAJOR {
+            return Err(Error::UnsupportedManifestVersion {
+                version: self.manifest_version.clone(),
+                supported_major: SUPPORTED_MANIFEST_MAJOR,
+            });
+        }
+        Ok(())
+    }
+
     pub fn validate(self) -> Result<Manifest, Error> {
+        self.validate_version()?;
+        for name in self.components.keys() {
+            ensure_name_no_dot(name, "child")?;
+        }
+        for name in self.slots.keys() {
+            ensure_name_no_dot(name, "slot")?;
+        }
+        for name in self.provides.keys() {
+            ensure_name_no_dot(name, "provide")?;
+        }
+        for name in &self.exports {
+            ensure_name_no_dot(name, "export")?;
+        }
+        for provide in self.provides.values() {
+            if let Some(capability) = &provide.capability {
+                ensure_name_no_dot(capability, "capability")?;
+            }
+        }
         if let Some(name) = self
             .slots
             .keys()
@@ -808,11 +913,40 @@ impl RawManifest {
                 });
             }
 
-            if binding.to.is_self() {
-                self_bound_slots.insert(binding.slot.as_str());
+            match &binding.to {
+                LocalComponentRef::Self_ => {
+                    if !self.slots.contains_key(&binding.slot) {
+                        return Err(Error::UnknownBindingSlot {
+                            slot: binding.slot.clone(),
+                        });
+                    }
+                    self_bound_slots.insert(binding.slot.as_str());
+                }
+                LocalComponentRef::Child(name) => {
+                    if !self.components.contains_key(name) {
+                        return Err(Error::UnknownBindingChild {
+                            child: name.clone(),
+                        });
+                    }
+                }
             }
-            if binding.from.is_self() {
-                self_bound_capabilities.insert(binding.capability.as_str());
+
+            match &binding.from {
+                LocalComponentRef::Self_ => {
+                    if !self.provides.contains_key(&binding.capability) {
+                        return Err(Error::UnknownBindingProvide {
+                            capability: binding.capability.clone(),
+                        });
+                    }
+                    self_bound_capabilities.insert(binding.capability.as_str());
+                }
+                LocalComponentRef::Child(name) => {
+                    if !self.components.contains_key(name) {
+                        return Err(Error::UnknownBindingChild {
+                            child: name.clone(),
+                        });
+                    }
+                }
             }
         }
 
@@ -842,7 +976,11 @@ impl RawManifest {
             && let Some(network) = &program.network
         {
             for endpoint in &network.endpoints {
-                defined_endpoints.insert(endpoint.name.as_str());
+                if !defined_endpoints.insert(endpoint.name.as_str()) {
+                    return Err(Error::DuplicateEndpointName {
+                        name: endpoint.name.clone(),
+                    });
+                }
             }
         }
 
@@ -868,7 +1006,7 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn empty() -> Self {
-        Self::from_str("{manifest_version:\"0.0.0\"}").unwrap()
+        Self::from_str("{manifest_version:\"1.0.0\"}").unwrap()
     }
 }
 

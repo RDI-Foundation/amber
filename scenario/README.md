@@ -44,6 +44,7 @@ Notes:
 
 - `manifest_version` is a SemVer string (currently `"1.0.0"`).
 - Duplicate keys in `program.env`, `components`, `slots`, and `provides` are invalid.
+- Child instance names, capability names (`slots`/`provides`/`exports`), and binding slot/capability names must not contain `.` (dots are reserved).
 - Names must be unique across `slots` and `provides` (a name cannot be declared in both).
 - `exports` entries must name something declared in `slots` or `provides`.
 - Each binding target `(<to>.<slot>)` and binding source `(<from>.<capability>)` may only appear once.
@@ -60,6 +61,7 @@ A manifest reference can be written as either:
   - `{ url: "https://...", digest: "<alg>:<hash-b64>" }`
 
 `digest` is optional. If present, it is used to verify the bytes fetched from `url` by hashing them and comparing.
+Unknown fields in the object form are invalid.
 
 The digest string format is:
 

@@ -2,7 +2,8 @@ use super::*;
 
 #[test]
 fn create_empty_manifest() {
-    Manifest::empty();
+    let manifest = Manifest::empty();
+    assert_eq!(manifest.manifest_version, Version::new(1, 0, 0));
 }
 
 #[test]
@@ -59,6 +60,29 @@ fn interpolation_missing_closing_brace_errors() {
 }
 
 #[test]
+fn manifest_version_major_is_enforced() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "2.0.0",
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::UnsupportedManifestVersion {
+            version,
+            supported_major,
+        } => {
+            assert_eq!(version, Version::new(2, 0, 0));
+            assert_eq!(supported_major, 1);
+        }
+        other => panic!("expected UnsupportedManifestVersion error, got: {other}"),
+    }
+}
+
+#[test]
 fn program_args_string_sugar_splits() {
     let m: Manifest = r#"
         {
@@ -81,6 +105,13 @@ fn binding_sugar_forms_parse() {
     let m: Manifest = r##"
         {
           manifest_version: "1.0.0",
+          components: {
+            a: "https://example.com/a",
+            b: "https://example.com/b",
+          },
+          provides: {
+            d: { kind: "http" },
+          },
           bindings: [
             { to: "#a", slot: "s", from: "#b", capability: "c" },
             { to: "#a.s", from: "#b.c" },
@@ -145,10 +176,64 @@ fn binding_missing_capability_errors() {
 }
 
 #[test]
+fn binding_dot_names_are_rejected_in_dot_form() {
+    let err = r#"
+        {
+          manifest_version: "1.0.0",
+          bindings: [
+            { to: "\#a.s", from: "self.c.d" },
+          ],
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    assert!(err.to_string().contains("binding names cannot contain `.`"));
+}
+
+#[test]
+fn binding_dot_names_are_rejected_in_explicit_form() {
+    let err = r#"
+        {
+          manifest_version: "1.0.0",
+          bindings: [
+            { to: "\#a", slot: "s.t", from: "self", capability: "c" },
+          ],
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    assert!(err.to_string().contains("binding names cannot contain `.`"));
+}
+
+#[test]
+fn binding_child_names_cannot_contain_dots() {
+    let err = r#"
+        {
+          manifest_version: "1.0.0",
+          bindings: [
+            { to: "\#a.b", slot: "s", from: "self", capability: "c" },
+          ],
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    assert!(err.to_string().contains("child name cannot contain `.`"));
+}
+
+#[test]
 fn binding_round_trip_through_canonical_json_parses() {
     let m: Manifest = r##"
         {
           manifest_version: "1.0.0",
+          components: {
+            a: "https://example.com/a",
+          },
+          provides: {
+            c: { kind: "http" },
+          },
           bindings: [
             { to: "#a.s", from: "self.c" },
           ],
@@ -160,6 +245,75 @@ fn binding_round_trip_through_canonical_json_parses() {
     let json = serde_json::to_string_pretty(&m).unwrap();
     let round_tripped: Manifest = json.parse().unwrap();
     assert_eq!(round_tripped, m);
+}
+
+#[test]
+fn binding_to_self_requires_slot() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "1.0.0",
+          components: {
+            child: "https://example.com/child",
+          },
+          bindings: [
+            { to: "self.needs", from: "\#child.api" },
+          ],
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::UnknownBindingSlot { slot } => assert_eq!(slot, "needs"),
+        other => panic!("expected UnknownBindingSlot error, got: {other}"),
+    }
+}
+
+#[test]
+fn binding_from_self_requires_provide() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "1.0.0",
+          components: {
+            child: "https://example.com/child",
+          },
+          bindings: [
+            { to: "\#child.needs", from: "self.api" },
+          ],
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::UnknownBindingProvide { capability } => assert_eq!(capability, "api"),
+        other => panic!("expected UnknownBindingProvide error, got: {other}"),
+    }
+}
+
+#[test]
+fn binding_child_ref_requires_component() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "1.0.0",
+          components: {
+            other: "https://example.com/other",
+          },
+          bindings: [
+            { to: "\#missing.needs", from: "\#other.api" },
+          ],
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::UnknownBindingChild { child } => assert_eq!(child, "missing"),
+        other => panic!("expected UnknownBindingChild error, got: {other}"),
+    }
 }
 
 #[test]
@@ -265,6 +419,61 @@ fn manifest_ref_invalid_digest_errors() {
 }
 
 #[test]
+fn manifest_ref_unknown_field_errors() {
+    let err = r##"
+        {
+          manifest_version: "1.0.0",
+          components: {
+            a: {
+              url: "https://example.com/amber/pkg/v1",
+              digest: "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+              extra: "nope",
+            }
+          }
+        }
+        "##
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    let message = err.to_string();
+    assert!(
+        message.contains("unknown field") && message.contains("extra"),
+        "expected unknown field error, got: {message}"
+    );
+}
+
+#[test]
+fn manifest_digest_is_stable_across_json5_formatting() {
+    let raw_a = parse_raw(
+        r#"
+        {
+          manifest_version: "1.0.0",
+          provides: { api: { kind: "http" } },
+          exports: ["api"],
+        }
+        "#,
+    );
+
+    let raw_b = parse_raw(
+        r#"
+        {
+          exports: [
+            "api",
+          ],
+          provides: {
+            api: { kind: "http" },
+          },
+          manifest_version: "1.0.0",
+        }
+        "#,
+    );
+
+    let digest_a = raw_a.digest(DigestAlg::default());
+    let digest_b = raw_b.digest(DigestAlg::default());
+    assert_eq!(digest_a, digest_b);
+}
+
+#[test]
 fn endpoint_validation_fails_for_unknown_reference() {
     let err = r#"
         {
@@ -283,6 +492,31 @@ fn endpoint_validation_fails_for_unknown_reference() {
     .unwrap_err();
 
     assert!(err.to_string().contains("unknown endpoint `missing`"));
+}
+
+#[test]
+fn duplicate_endpoint_names_error() {
+    let err = r#"
+        {
+          manifest_version: "1.0.0",
+          program: {
+            image: "x",
+            network: {
+              endpoints: [
+                { name: "endpoint", port: 80 },
+                { name: "endpoint", port: 81 },
+              ]
+            }
+          }
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("duplicate endpoint name `endpoint`")
+    );
 }
 
 #[test]
@@ -339,6 +573,91 @@ fn duplicate_keys_in_program_env_errors() {
 }
 
 #[test]
+fn child_names_cannot_contain_dots() {
+    let err = r#"
+        {
+          manifest_version: "1.0.0",
+          components: {
+            "a.b": "https://example.com/amber/pkg/v1",
+          },
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    assert!(err.to_string().contains("invalid child name `a.b`"));
+}
+
+#[test]
+fn slot_names_cannot_contain_dots() {
+    let err = r#"
+        {
+          manifest_version: "1.0.0",
+          slots: {
+            "llm.v1": { kind: "llm" },
+          },
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    assert!(err.to_string().contains("invalid slot name `llm.v1`"));
+}
+
+#[test]
+fn provide_names_cannot_contain_dots() {
+    let err = r#"
+        {
+          manifest_version: "1.0.0",
+          provides: {
+            "api.v1": { kind: "http" },
+          },
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    assert!(err.to_string().contains("invalid provide name `api.v1`"));
+}
+
+#[test]
+fn export_names_cannot_contain_dots() {
+    let err = r#"
+        {
+          manifest_version: "1.0.0",
+          exports: ["api.v1"],
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    assert!(err.to_string().contains("invalid export name `api.v1`"));
+}
+
+#[test]
+fn provide_capability_names_cannot_contain_dots() {
+    let err = r#"
+        {
+          manifest_version: "1.0.0",
+          components: {
+            child: "https://example.com/amber/pkg/v1",
+          },
+          provides: {
+            api: { kind: "http", from: "\#child", capability: "upstream.v1" },
+          },
+          exports: ["api"],
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("invalid capability name `upstream.v1`")
+    );
+}
+
+#[test]
 fn slots_and_provides_cannot_share_names() {
     let raw = parse_raw(
         r#"
@@ -364,6 +683,11 @@ fn binding_target_cannot_be_multiplexed() {
         r##"
         {
           manifest_version: "1.0.0",
+          components: {
+            a: "https://example.com/a",
+            b: "https://example.com/b",
+            c: "https://example.com/c",
+          },
           bindings: [
             { to: "#a.s", from: "#b.c" },
             { to: "#a.s", from: "#c.d" },
@@ -388,6 +712,10 @@ fn binding_source_cannot_be_multiplexed() {
         r##"
         {
           manifest_version: "1.0.0",
+          components: {
+            a: "https://example.com/a",
+            b: "https://example.com/b",
+          },
           bindings: [
             { to: "#a.s1", from: "#b.c" },
             { to: "#a.s2", from: "#b.c" },
