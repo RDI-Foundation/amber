@@ -3,17 +3,14 @@ use std::{
     sync::Arc,
 };
 
+use amber_manifest::{CapabilityDecl, DigestAlg, LocalComponentRef, ManifestDigest};
+use amber_scenario::{
+    BindingEdge, Component, ComponentId, ProvideRef, Scenario, SlotRef, graph::component_path_for,
+};
 use jsonschema::Validator;
 use serde_json::{Map, Value};
 
 use super::frontend::{ResolvedNode, ResolvedTree};
-use crate::{
-    manifest::{CapabilityDecl, DigestAlg, LocalComponentRef, ManifestDigest},
-    scenario::{
-        BindingEdge, Component, ComponentId, ProvideRef, Scenario, SlotRef,
-        graph::component_path_for,
-    },
-};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -296,6 +293,7 @@ fn resolve_binding_component(
     match reference {
         LocalComponentRef::Self_ => realm,
         LocalComponentRef::Child(name) => components[realm.0].children[name],
+        _ => unreachable!("unsupported local component reference"),
     }
 }
 
@@ -311,6 +309,7 @@ fn resolve_local_component<'a>(
             .get(name)
             .copied()
             .ok_or(name.as_str()),
+        _ => unreachable!("unsupported local component reference"),
     }
 }
 

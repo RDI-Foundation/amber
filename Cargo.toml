@@ -1,5 +1,8 @@
 [workspace]
 members = [
+  "compiler",
+  "manifest",
+  "resolver",
   "scenario",
   "node",
 ]

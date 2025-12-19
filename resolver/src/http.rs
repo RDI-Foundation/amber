@@ -157,9 +157,10 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use amber_manifest::Manifest;
     use url::Url;
 
-    use crate::{manifest::Manifest, resolver::Resolver};
+    use crate::Resolver;
 
     fn accept_with_deadline(listener: &TcpListener, deadline: Instant) -> std::net::TcpStream {
         loop {
@@ -261,10 +262,7 @@ mod tests {
         let resolver = Resolver::new();
         let manifest: Manifest = contents.parse().unwrap();
         let final_url = url.join("/final").unwrap();
-        crate::resolver::tests::assert_digest_mismatch_errors(
-            &resolver, &url, &final_url, &manifest,
-        )
-        .await;
+        crate::tests::assert_digest_mismatch_errors(&resolver, &url, &final_url, &manifest).await;
 
         server.join().unwrap();
     }

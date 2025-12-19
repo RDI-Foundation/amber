@@ -37,9 +37,10 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
+    use amber_manifest::Manifest;
     use url::Url;
 
-    use crate::{manifest::Manifest, resolver::Resolver};
+    use crate::Resolver;
 
     static FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -95,7 +96,6 @@ mod tests {
 
         let resolver = Resolver::new();
         let manifest: Manifest = contents.parse().unwrap();
-        crate::resolver::tests::assert_digest_mismatch_errors(&resolver, &url, &url, &manifest)
-            .await;
+        crate::tests::assert_digest_mismatch_errors(&resolver, &url, &url, &manifest).await;
     }
 }

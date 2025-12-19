@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
+use amber_manifest::{DigestAlg, Manifest, ManifestDigest};
 use dashmap::DashMap;
 use url::Url;
-
-use crate::manifest::{DigestAlg, Manifest, ManifestDigest};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Cacheability {

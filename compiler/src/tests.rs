@@ -1,24 +1,17 @@
 use std::{
     fs,
-    path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
-};
-#[cfg(feature = "http-resolver")]
-use std::{
     io::{Read as _, Write as _},
     net::{Shutdown, TcpListener},
-    time::{Duration, Instant},
+    path::{Path, PathBuf},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use amber_manifest::ManifestRef;
+use amber_resolver::{Cache, Resolver};
+use amber_scenario::graph;
 use url::Url;
 
-use crate::{
-    cache::Cache,
-    compiler::{CompileOptions, Compiler, ResolveMode},
-    manifest::ManifestRef,
-    resolver::Resolver,
-    scenario::graph,
-};
+use crate::{CompileOptions, Compiler, ResolveMode};
 
 fn tmp_dir(prefix: &str) -> PathBuf {
     let mut base = std::env::temp_dir();
@@ -39,7 +32,6 @@ fn file_url(path: &Path) -> Url {
     Url::from_file_path(path).unwrap()
 }
 
-#[cfg(feature = "http-resolver")]
 fn accept_with_deadline(listener: &TcpListener, deadline: Instant) -> std::net::TcpStream {
     loop {
         match listener.accept() {
@@ -55,7 +47,6 @@ fn accept_with_deadline(listener: &TcpListener, deadline: Instant) -> std::net::
     }
 }
 
-#[cfg(feature = "http-resolver")]
 fn read_request_path(stream: &mut std::net::TcpStream) -> String {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -78,7 +69,6 @@ fn read_request_path(stream: &mut std::net::TcpStream) -> String {
     parts.next().unwrap().to_string()
 }
 
-#[cfg(feature = "http-resolver")]
 fn spawn_redirecting_manifest_server(manifest_body: String) -> (Url, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -118,7 +108,6 @@ fn spawn_redirecting_manifest_server(manifest_body: String) -> (Url, std::thread
 }
 
 #[tokio::test]
-#[cfg(feature = "file-resolver")]
 async fn compile_online_then_offline_from_cache() {
     let dir = tmp_dir("scenario-compile");
     let root_path = dir.join("root.json5");
@@ -167,17 +156,14 @@ async fn compile_online_then_offline_from_cache() {
     let cache = Cache::default();
     let compiler = Compiler::new(Resolver::new(), cache.clone());
 
-    let root_ref = ManifestRef {
-        url: file_url(&root_path),
-        digest: None,
-    };
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
 
     // Online compile fills cache.
     let scenario = compiler
         .compile(
             root_ref.clone(),
             CompileOptions {
-                resolve: crate::compiler::ResolveOptions {
+                resolve: crate::ResolveOptions {
                     mode: ResolveMode::Online,
                     max_concurrency: 8,
                 },
@@ -198,7 +184,7 @@ async fn compile_online_then_offline_from_cache() {
         .compile(
             root_ref,
             CompileOptions {
-                resolve: crate::compiler::ResolveOptions {
+                resolve: crate::ResolveOptions {
                     mode: ResolveMode::Offline,
                     max_concurrency: 8,
                 },
@@ -216,23 +202,19 @@ async fn compile_online_then_offline_from_cache() {
 }
 
 #[tokio::test]
-#[cfg(feature = "http-resolver")]
 async fn compile_online_then_offline_preserves_resolved_url() {
     let contents = r#"{ manifest_version: "1.0.0" }"#.to_string();
     let (url, server) = spawn_redirecting_manifest_server(contents);
 
     let cache = Cache::default();
     let compiler = Compiler::new(Resolver::new(), cache);
-    let root_ref = ManifestRef {
-        url: url.clone(),
-        digest: None,
-    };
+    let root_ref = ManifestRef::from_url(url.clone());
 
     let scenario = compiler
         .compile(
             root_ref.clone(),
             CompileOptions {
-                resolve: crate::compiler::ResolveOptions {
+                resolve: crate::ResolveOptions {
                     mode: ResolveMode::Online,
                     max_concurrency: 8,
                 },
@@ -251,7 +233,7 @@ async fn compile_online_then_offline_preserves_resolved_url() {
         .compile(
             root_ref,
             CompileOptions {
-                resolve: crate::compiler::ResolveOptions {
+                resolve: crate::ResolveOptions {
                     mode: ResolveMode::Offline,
                     max_concurrency: 8,
                 },
@@ -266,7 +248,6 @@ async fn compile_online_then_offline_preserves_resolved_url() {
 }
 
 #[tokio::test]
-#[cfg(feature = "file-resolver")]
 async fn binding_requires_export_on_child_slot() {
     let dir = tmp_dir("scenario-export-check");
     let root_path = dir.join("root.json5");
@@ -311,10 +292,7 @@ async fn binding_requires_export_on_child_slot() {
     );
 
     let compiler = Compiler::new(Resolver::new(), Cache::default());
-    let root_ref = ManifestRef {
-        url: file_url(&root_path),
-        digest: None,
-    };
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
 
     let err = compiler
         .compile(root_ref, CompileOptions::default())
@@ -325,7 +303,6 @@ async fn binding_requires_export_on_child_slot() {
 }
 
 #[tokio::test]
-#[cfg(feature = "file-resolver")]
 async fn binding_type_mismatch_is_an_error() {
     let dir = tmp_dir("scenario-type-mismatch");
     let root_path = dir.join("root.json5");
@@ -364,10 +341,7 @@ async fn binding_type_mismatch_is_an_error() {
     );
 
     let compiler = Compiler::new(Resolver::new(), Cache::default());
-    let root_ref = ManifestRef {
-        url: file_url(&root_path),
-        digest: None,
-    };
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
 
     let err = compiler
         .compile(root_ref, CompileOptions::default())
@@ -378,7 +352,6 @@ async fn binding_type_mismatch_is_an_error() {
 }
 
 #[tokio::test]
-#[cfg(feature = "file-resolver")]
 async fn weak_binding_missing_child_is_an_error() {
     let dir = tmp_dir("scenario-weak-missing-child");
     let root_path = dir.join("root.json5");
@@ -397,10 +370,7 @@ async fn weak_binding_missing_child_is_an_error() {
     );
 
     let compiler = Compiler::new(Resolver::new(), Cache::default());
-    let root_ref = ManifestRef {
-        url: file_url(&root_path),
-        digest: None,
-    };
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
 
     let err = compiler
         .compile(root_ref, CompileOptions::default())
@@ -411,7 +381,6 @@ async fn weak_binding_missing_child_is_an_error() {
 }
 
 #[tokio::test]
-#[cfg(feature = "file-resolver")]
 async fn weak_binding_missing_provide_is_an_error() {
     let dir = tmp_dir("scenario-weak-missing-provide");
     let root_path = dir.join("root.json5");
@@ -430,10 +399,7 @@ async fn weak_binding_missing_provide_is_an_error() {
     );
 
     let compiler = Compiler::new(Resolver::new(), Cache::default());
-    let root_ref = ManifestRef {
-        url: file_url(&root_path),
-        digest: None,
-    };
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
 
     let err = compiler
         .compile(root_ref, CompileOptions::default())
@@ -444,7 +410,6 @@ async fn weak_binding_missing_provide_is_an_error() {
 }
 
 #[tokio::test]
-#[cfg(feature = "file-resolver")]
 async fn config_schema_is_enforced() {
     let dir = tmp_dir("scenario-config-schema");
     let root_path = dir.join("root.json5");
@@ -484,10 +449,7 @@ async fn config_schema_is_enforced() {
     );
 
     let compiler = Compiler::new(Resolver::new(), Cache::default());
-    let root_ref = ManifestRef {
-        url: file_url(&root_path),
-        digest: None,
-    };
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
 
     let err = compiler
         .compile(root_ref, CompileOptions::default())
@@ -498,7 +460,6 @@ async fn config_schema_is_enforced() {
 }
 
 #[tokio::test]
-#[cfg(feature = "file-resolver")]
 async fn cycle_in_component_tree_is_detected() {
     let dir = tmp_dir("scenario-cycle");
     let a_path = dir.join("a.json5");
@@ -537,10 +498,7 @@ async fn cycle_in_component_tree_is_detected() {
     );
 
     let compiler = Compiler::new(Resolver::new(), Cache::default());
-    let root_ref = ManifestRef {
-        url: file_url(&a_path),
-        digest: None,
-    };
+    let root_ref = ManifestRef::from_url(file_url(&a_path));
 
     let err = compiler
         .compile(root_ref, CompileOptions::default())

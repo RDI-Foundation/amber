@@ -645,6 +645,16 @@ impl<'de> Deserialize<'de> for ComponentDecl {
     }
 }
 
+impl ManifestRef {
+    pub fn new(url: Url, digest: Option<ManifestDigest>) -> Self {
+        Self { url, digest }
+    }
+
+    pub fn from_url(url: Url) -> Self {
+        Self { url, digest: None }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ComponentRef {

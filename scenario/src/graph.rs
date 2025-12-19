@@ -153,13 +153,11 @@ fn find_cycle(out: &[Vec<usize>], indeg: &[usize]) -> Vec<ComponentId> {
 mod tests {
     use std::{collections::BTreeMap, sync::Arc};
 
+    use amber_manifest::{DigestAlg, Manifest, ManifestRef};
     use url::Url;
 
     use super::*;
-    use crate::{
-        manifest::{DigestAlg, Manifest, ManifestRef},
-        scenario::{BindingEdge, Component, ProvideRef, SlotRef},
-    };
+    use crate::{BindingEdge, Component, ProvideRef, SlotRef};
 
     fn component(id: usize, name: &str, manifest: Arc<Manifest>) -> Component {
         let url = Url::parse(&format!("file:///component/{name}")).unwrap();
@@ -167,10 +165,7 @@ mod tests {
             id: ComponentId(id),
             parent: None,
             name: name.to_string(),
-            declared_ref: ManifestRef {
-                url: url.clone(),
-                digest: None,
-            },
+            declared_ref: ManifestRef::from_url(url.clone()),
             resolved_url: url,
             digest: manifest.digest(DigestAlg::Sha256),
             manifest,

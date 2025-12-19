@@ -1,12 +1,9 @@
 #[cfg(test)]
 mod tests;
 
-use crate::{
-    cache::Cache,
-    manifest::{DigestAlg, ManifestRef},
-    resolver::Resolver,
-    scenario::Scenario,
-};
+use amber_manifest::{DigestAlg, ManifestRef};
+use amber_resolver::{Cache, Resolver};
+use amber_scenario::Scenario;
 
 mod frontend;
 mod linker;

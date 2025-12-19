@@ -3,15 +3,11 @@ use std::{
     sync::Arc,
 };
 
+use amber_manifest::{ComponentDecl, DigestAlg, Manifest, ManifestDigest, ManifestRef};
+use amber_resolver::{self as resolver, Cache, Resolver};
 use futures::stream::StreamExt;
 use tokio::sync::{OnceCell, Semaphore};
 use url::Url;
-
-use crate::{
-    cache::Cache,
-    manifest::{ComponentDecl, DigestAlg, Manifest, ManifestDigest, ManifestRef},
-    resolver::{self, Resolver},
-};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResolveMode {
@@ -198,6 +194,7 @@ fn extract_component_decl(decl: &ComponentDecl) -> (ManifestRef, Option<serde_js
     match decl {
         ComponentDecl::Reference(r) => (r.clone(), None),
         ComponentDecl::Object(o) => (o.manifest.clone(), o.config.clone()),
+        _ => unreachable!("unsupported component declaration"),
     }
 }
 
