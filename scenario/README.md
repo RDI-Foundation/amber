@@ -189,13 +189,14 @@ slots: {
 
 - Backed by one of this component’s own `program.network.endpoints` (via `endpoint`), and/or
 - A forwarded capability from another component (via `from` + `capability`).
+  `from` is a component ref (`self` or `#<name>`).
 
 ```json5
 provides: {
   api: { kind: "http", endpoint: "http" },
 
   // Forward the `llm` capability exported by the `router` child.
-  llm: { kind: "llm", from: "router", capability: "llm" },
+  llm: { kind: "llm", from: "#router", capability: "llm" },
 }
 ```
 
@@ -217,9 +218,9 @@ To export a child capability, first give it a local name in `provides` using `fr
 
 Binding targets and sources are single-use: you cannot bind the same `(<to>.<slot>)` or `(<from>.<capability>)` more than once.
 
-Bindings are **strong** by default: the binding must exist and be stable at component startup.
+Bindings are **strong** by default: the binding must resolve and participates in dependency ordering.
 
-Set `weak: true` to make a binding **weak**: the binding does not need to exist or be stable at component startup, and the component must tolerate the bound capability being down. This is useful for cyclic component graphs and flaky remote components.
+Set `weak: true` to make a binding **weak**: it still must resolve, but it is ignored for dependency ordering (cycle checks). This is useful for breaking cycles in the binding graph.
 
 The binding is declared in the parent that is doing the wiring:
 
@@ -310,7 +311,7 @@ This component runs a router, instantiates a `wrapper` child, wires the wrapper�
   },
   provides: {
     admin_api: { kind: "http", endpoint: "admin" },
-    llm: { kind: "llm", from: "wrapper", capability: "llm" },
+    llm: { kind: "llm", from: "#wrapper", capability: "llm" },
   },
   bindings: [
     { to: "#wrapper.admin_api", from: "self.admin_api" },
@@ -339,19 +340,20 @@ This component doesn’t provide an LLM itself, but declares an `llm` slot, expo
 }
 ```
 
-### 5) Weak binding (optional / tolerates downtime)
+### 5) Weak binding (cycle breaker)
 
-This component wires a child slot to another child’s capability, but does not require it to be up at startup.
+This component has a dependency cycle; mark one edge weak to allow link-time ordering.
 
 ```json5
 {
   manifest_version: "1.0.0",
   components: {
-    consumer: "https://registry.amber-protocol.org/consumer/v1",
-    provider: "https://registry.amber-protocol.org/provider/v1",
+    a: "https://registry.amber-protocol.org/a/v1",
+    b: "https://registry.amber-protocol.org/b/v1",
   },
   bindings: [
-    { to: "#consumer.backend", from: "#provider.api", weak: true },
+    { to: "#a.peer", from: "#b.api" },
+    { to: "#b.peer", from: "#a.api", weak: true },
   ],
 }
 ```

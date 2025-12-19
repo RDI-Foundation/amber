@@ -7,6 +7,7 @@ edition = "2024"
 base64 = "0.22.1"
 clap = { version = "4.5.23", features = ["derive"] }
 dashmap = "6.1.0"
+futures = "0.3.31"
 json5 = "0.4.1"
 jsonschema = { version = "0.37.4", default-features = false }
 reqwest = { version = "0.12.25", default-features = false, features = ["rustls-tls"], optional = true }
@@ -26,7 +27,7 @@ tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
 
 [features]
 default = ["resolvers"]
-resolvers = ["http-resolver", "file-resolver", "remote-resolver"]
+resolvers = ["http-resolver", "file-resolver", "remote-resolver"] # TODO: move resolvers to separate crate
 http-resolver = ["reqwest"]
 file-resolver = ["tokio"]
 remote-resolver = []

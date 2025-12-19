@@ -94,16 +94,16 @@ fn binding_sugar_forms_parse() {
 
     let expected = BTreeSet::from([
         Binding {
-            to: "#a".to_string(),
+            to: LocalComponentRef::Child("a".to_string()),
             slot: "s".to_string(),
-            from: "#b".to_string(),
+            from: LocalComponentRef::Child("b".to_string()),
             capability: "c".to_string(),
             weak: false,
         },
         Binding {
-            to: "#a".to_string(),
+            to: LocalComponentRef::Child("a".to_string()),
             slot: "t".to_string(),
-            from: "self".to_string(),
+            from: LocalComponentRef::Self_,
             capability: "d".to_string(),
             weak: false,
         },

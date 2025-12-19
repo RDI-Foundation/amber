@@ -31,6 +31,8 @@ pub enum Error {
     InvalidManifestDigest(String),
     #[error("invalid interpolation `{0}`")]
     InvalidInterpolation(String),
+    #[error("invalid component ref `{input}`: {message}")]
+    InvalidComponentRef { input: String, message: String },
     #[error("invalid binding `{input}`: {message}")]
     InvalidBinding { input: String, message: String },
     #[error("unclosed quote in args string")]
@@ -53,143 +55,112 @@ pub enum Error {
     InvalidConfigSchema(String),
 }
 
-macro_rules! count {
-    ($ident:ident) => { 1 };
-    ($head:ident, $($rest:ident),+) => { 1 + count!($($rest),+) }
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay,
+)]
+#[non_exhaustive]
+pub enum DigestAlg {
+    #[default]
+    Sha256,
 }
 
-macro_rules! first {
-    ($head:expr $(, $($rest:expr),+)?) => {
-        $head
-    };
+impl fmt::Display for DigestAlg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sha256 => write!(f, "sha256"),
+        }
+    }
 }
 
-macro_rules! digest {
-    ($( ($name:ident, $size:literal, $tag:literal) ),+ $(,)? ) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay)]
-        #[non_exhaustive]
-        pub enum DigestAlg {
-            $($name),+
+impl FromStr for DigestAlg {
+    type Err = Error;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        match input {
+            "sha256" => Ok(Self::Sha256),
+            alg => Err(Error::InvalidManifestDigest(format!(
+                "unknown digest alg: {alg}"
+            ))),
         }
+    }
+}
 
-        impl DigestAlg {
-            pub fn all() -> [Self; count!($($name),+)] {
-                [$(Self::$name),+]
-            }
-        }
+#[derive(Clone, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay)]
+#[non_exhaustive]
+pub enum ManifestDigest {
+    Sha256([u8; 32]),
+}
 
-        impl Default for DigestAlg {
-            fn default() -> Self {
-                first!(Self::$($name),+)
-            }
-        }
+impl ManifestDigest {
+    pub fn digest(manifest: &RawManifest, alg: DigestAlg) -> Self {
+        match alg {
+            DigestAlg::Sha256 => {
+                struct HashWriter<'a>(&'a mut sha2::Sha256);
 
-        impl fmt::Display for DigestAlg {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "{}", match self {
-                    $( Self::$name => $tag ),+
-                })
-            }
-        }
-
-        impl FromStr for DigestAlg {
-            type Err = Error;
-
-            fn from_str(input: &str) -> Result<Self, Self::Err> {
-                match input {
-                    $($tag => Ok(Self::$name)),+,
-                    alg => Err(Error::InvalidManifestDigest(format!("unknown digest alg: {alg}")))
-                }
-            }
-        }
-
-        #[derive(Clone, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay)]
-        #[non_exhaustive]
-        pub enum ManifestDigest {
-            $( $name([u8; $size]) ),+
-        }
-
-        impl ManifestDigest {
-            pub fn digest(manifest: &RawManifest, alg: DigestAlg) -> Self {
-                match alg {
-                    $(DigestAlg::$name => {
-                        struct HashWriter<'a>(&'a mut sha2::$name);
-
-                        impl Write for HashWriter<'_> {
-                            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                                self.0.update(buf);
-                                Ok(buf.len())
-                            }
-
-                            fn flush(&mut self) -> io::Result<()> {
-                                Ok(())
-                            }
-                        }
-
-                        let mut hasher = sha2::$name::new();
-                        serde_json::to_writer(HashWriter(&mut hasher), manifest).unwrap();
-                        Self::$name(hasher.finalize().into())
-                    }),+
-                }
-            }
-
-            pub fn alg(&self) -> DigestAlg {
-                match self {
-                    $( Self::$name(_) => DigestAlg::$name ),+
-                }
-            }
-        }
-
-        impl TryFrom<(DigestAlg, &[u8])> for ManifestDigest {
-            type Error = Error;
-
-            fn try_from((alg, hash): (DigestAlg, &[u8])) -> Result<Self, Self::Error> {
-                match alg {
-                    $(
-                    DigestAlg::$name => {
-                        let Ok(bytes) = hash.try_into() else {
-                            return Err(Error::InvalidManifestDigest(
-                                    format!("expected {} bytes but got {}", $size, hash.len())));
-                        };
-                        Ok(Self::$name(bytes))
+                impl Write for HashWriter<'_> {
+                    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                        self.0.update(buf);
+                        Ok(buf.len())
                     }
-                    )+,
+
+                    fn flush(&mut self) -> io::Result<()> {
+                        Ok(())
+                    }
                 }
+
+                let mut hasher = sha2::Sha256::new();
+                serde_json::to_writer(HashWriter(&mut hasher), manifest).unwrap();
+                Self::Sha256(hasher.finalize().into())
             }
         }
+    }
 
-        impl AsRef<[u8]> for ManifestDigest {
-            fn as_ref(&self) -> &[u8] {
-                match self {
-                    $( Self::$name(bytes) => &*bytes ),+
-                }
+    pub fn alg(&self) -> DigestAlg {
+        match self {
+            Self::Sha256(_) => DigestAlg::Sha256,
+        }
+    }
+}
+
+impl TryFrom<(DigestAlg, &[u8])> for ManifestDigest {
+    type Error = Error;
+
+    fn try_from((alg, hash): (DigestAlg, &[u8])) -> Result<Self, Self::Error> {
+        match alg {
+            DigestAlg::Sha256 => {
+                let Ok(bytes) = hash.try_into() else {
+                    return Err(Error::InvalidManifestDigest(format!(
+                        "expected 32 bytes but got {}",
+                        hash.len()
+                    )));
+                };
+                Ok(Self::Sha256(bytes))
             }
         }
     }
 }
 
-digest!(
-    (Sha256, 32, "sha256"),
-    // This is how to add others:
-    // (Sha384, 48, "sha384"),
-    // (Sha512, 64, "sha512"),
-);
+impl AsRef<[u8]> for ManifestDigest {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Sha256(bytes) => bytes,
+        }
+    }
+}
 
 impl FromStr for ManifestDigest {
     type Err = Error;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        let trimmed = input.trim();
-        let Some((alg, hash_b64)) = trimmed.split_once(':') else {
-            return Err(Error::InvalidManifestDigest(trimmed.to_string()));
+        let Some((alg, hash_b64)) = input.split_once(':') else {
+            return Err(Error::InvalidManifestDigest(input.to_string()));
         };
 
-        let alg = alg.trim().parse()?;
         let hash = base64::engine::general_purpose::STANDARD
-            .decode(hash_b64.trim())
-            .map_err(|_| Error::InvalidManifestDigest(trimmed.to_string()))?;
+            .decode(hash_b64)
+            .map_err(|_| Error::InvalidManifestDigest(input.to_string()))?;
 
-        (alg, hash.as_slice()).try_into()
+        (alg.parse()?, hash.as_slice()).try_into()
     }
 }
 
@@ -216,13 +187,12 @@ impl<'de> Deserialize<'de> for ManifestRef {
     {
         let value = Value::deserialize(deserializer)?;
         match value {
-            Value::String(url) => {
-                let trimmed = url.trim();
-                let url = Url::parse(trimmed).map_err(|_| {
-                    serde::de::Error::custom(Error::InvalidManifestRef(trimmed.to_string()))
-                })?;
-                Ok(Self { url, digest: None })
-            }
+            Value::String(url) => Ok(Self {
+                url: Url::parse(&url).map_err(|_| {
+                    serde::de::Error::custom(Error::InvalidManifestRef(url.clone()))
+                })?,
+                digest: None,
+            }),
             Value::Object(mut map) => {
                 let url = match map.remove("url") {
                     Some(Value::String(url)) => url,
@@ -234,9 +204,8 @@ impl<'de> Deserialize<'de> for ManifestRef {
                     None => return Err(serde::de::Error::custom("manifest ref missing `url`")),
                 };
 
-                let trimmed = url.trim();
-                let url = Url::parse(trimmed).map_err(|_| {
-                    serde::de::Error::custom(Error::InvalidManifestRef(trimmed.to_string()))
+                let url = Url::parse(&url).map_err(|_| {
+                    serde::de::Error::custom(Error::InvalidManifestRef(url.clone()))
                 })?;
 
                 let digest = match map.remove("digest") {
@@ -266,10 +235,10 @@ impl FromStr for ManifestRef {
     type Err = Error;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        let trimmed = input.trim();
-        let url =
-            Url::parse(trimmed).map_err(|_| Error::InvalidManifestRef(trimmed.to_string()))?;
-        Ok(Self { url, digest: None })
+        Ok(Self {
+            url: Url::parse(input).map_err(|_| Error::InvalidManifestRef(input.to_string()))?,
+            digest: None,
+        })
     }
 }
 
@@ -304,24 +273,25 @@ impl FromStr for InterpolatedPart {
     type Err = Error;
 
     fn from_str(inner: &str) -> Result<Self, Error> {
-        let trimmed = inner.trim();
-        if trimmed.is_empty() {
-            return Err(Error::InvalidInterpolation(trimmed.to_string()));
+        if inner.is_empty() {
+            return Err(Error::InvalidInterpolation(inner.to_string()));
         }
 
-        let mut segments = trimmed.split('.').map(str::trim);
+        let mut segments = inner.split('.');
         let prefix = segments
             .next()
-            .ok_or_else(|| Error::InvalidInterpolation(trimmed.to_string()))?;
+            .ok_or_else(|| Error::InvalidInterpolation(inner.to_string()))?;
 
         let source = match prefix {
             "config" => InterpolationSource::Config,
             "slots" => InterpolationSource::Slots,
-            _ => return Err(Error::InvalidInterpolation(trimmed.to_string())),
+            _ => return Err(Error::InvalidInterpolation(inner.to_string())),
         };
 
-        let rest: Vec<&str> = segments.filter(|s| !s.is_empty()).collect();
-        let query = rest.join(".");
+        let query = segments
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(".");
 
         Ok(InterpolatedPart::Interpolation { source, query })
     }
@@ -350,25 +320,39 @@ impl FromStr for InterpolatedString {
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let mut parts = Vec::new();
-        let mut rest = input;
+        let mut current_literal = String::new();
+        let mut chars = input.chars().peekable();
 
-        while let Some(start) = rest.find("${") {
-            let before = &rest[..start];
-            if !before.is_empty() {
-                parts.push(InterpolatedPart::Literal(before.to_string()));
+        while let Some(c) = chars.next() {
+            if c == '$' && chars.peek() == Some(&'{') {
+                chars.next(); // consume '{'
+                if !current_literal.is_empty() {
+                    parts.push(InterpolatedPart::Literal(std::mem::take(
+                        &mut current_literal,
+                    )));
+                }
+
+                let mut inner = String::new();
+                let mut closed = false;
+                for ic in chars.by_ref() {
+                    if ic == '}' {
+                        closed = true;
+                        break;
+                    }
+                    inner.push(ic);
+                }
+
+                if !closed {
+                    return Err(Error::InvalidInterpolation(input.to_string()));
+                }
+                parts.push(inner.parse()?);
+            } else {
+                current_literal.push(c);
             }
-
-            let after_start = &rest[start + 2..];
-            let end = after_start
-                .find('}')
-                .ok_or_else(|| Error::InvalidInterpolation(input.to_string()))?;
-            let inner = &after_start[..end];
-            parts.push(inner.parse()?);
-            rest = &after_start[end + 1..];
         }
 
-        if !rest.is_empty() {
-            parts.push(InterpolatedPart::Literal(rest.to_string()));
+        if !current_literal.is_empty() {
+            parts.push(InterpolatedPart::Literal(current_literal));
         }
 
         Ok(Self { parts })
@@ -530,6 +514,44 @@ pub struct SlotDecl {
     pub decl: CapabilityDecl,
 }
 
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, DeserializeFromStr, SerializeDisplay,
+)]
+#[non_exhaustive]
+pub enum LocalComponentRef {
+    Self_,
+    Child(String),
+}
+
+impl LocalComponentRef {
+    pub fn is_self(&self) -> bool {
+        matches!(self, Self::Self_)
+    }
+}
+
+impl fmt::Display for LocalComponentRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Self_ => f.write_str("self"),
+            Self::Child(name) => {
+                f.write_str("#")?;
+                f.write_str(name)
+            }
+        }
+    }
+}
+
+impl FromStr for LocalComponentRef {
+    type Err = Error;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        parse_component_ref(input).map_err(|err| Error::InvalidComponentRef {
+            input: err.input,
+            message: err.message,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ProvideDecl {
@@ -538,7 +560,7 @@ pub struct ProvideDecl {
     #[serde(default)]
     pub endpoint: Option<String>,
     #[serde(default)]
-    pub from: Option<String>,
+    pub from: Option<LocalComponentRef>,
     #[serde(default)]
     pub capability: Option<String>,
 }
@@ -607,9 +629,9 @@ impl<'de> Deserialize<'de> for ConfigSchema {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[non_exhaustive]
 pub struct Binding {
-    pub to: String,
+    pub to: LocalComponentRef,
     pub slot: String,
-    pub from: String,
+    pub from: LocalComponentRef,
     pub capability: String,
     #[serde(default)]
     pub weak: bool,
@@ -670,51 +692,54 @@ impl<'de> Deserialize<'de> for Binding {
     }
 }
 
-fn parse_binding_component_ref(input: &str) -> Result<String, Error> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Err(Error::InvalidBinding {
+#[derive(Debug)]
+struct ComponentRefParseError {
+    input: String,
+    message: String,
+}
+
+fn parse_component_ref(input: &str) -> Result<LocalComponentRef, ComponentRefParseError> {
+    if input.is_empty() {
+        return Err(ComponentRefParseError {
             input: input.to_string(),
             message: "component ref cannot be empty".to_string(),
         });
     }
 
-    match trimmed {
-        "self" => Ok(trimmed.to_string()),
-        _ => match trimmed.strip_prefix('#') {
-            Some(name) => {
-                let name = name.trim();
-                if name.is_empty() {
-                    return Err(Error::InvalidBinding {
-                        input: trimmed.to_string(),
-                        message: "expected `#<child>`".to_string(),
-                    });
-                }
-                Ok(format!("#{name}"))
-            }
-            None => Err(Error::InvalidBinding {
-                input: trimmed.to_string(),
+    match input {
+        "self" => Ok(LocalComponentRef::Self_),
+        _ => match input.strip_prefix('#') {
+            Some(name) if !name.is_empty() => Ok(LocalComponentRef::Child(name.to_string())),
+            Some(_) => Err(ComponentRefParseError {
+                input: input.to_string(),
+                message: "expected `#<child>`".to_string(),
+            }),
+            None => Err(ComponentRefParseError {
+                input: input.to_string(),
                 message: "expected `self` or `#<child>`".to_string(),
             }),
         },
     }
 }
 
-fn split_binding_side(input: &str) -> Result<(String, String), Error> {
-    let trimmed = input.trim();
-    let Some((left, right)) = trimmed.split_once('.') else {
+fn parse_binding_component_ref(input: &str) -> Result<LocalComponentRef, Error> {
+    parse_component_ref(input).map_err(|err| Error::InvalidBinding {
+        input: err.input,
+        message: err.message,
+    })
+}
+
+fn split_binding_side(input: &str) -> Result<(LocalComponentRef, String), Error> {
+    let Some((left, right)) = input.split_once('.') else {
         return Err(Error::InvalidBinding {
-            input: trimmed.to_string(),
+            input: input.to_string(),
             message: "expected `<component-ref>.<name>`".to_string(),
         });
     };
 
-    let left = left.trim();
-    let right = right.trim();
-
     if left.is_empty() || right.is_empty() {
         return Err(Error::InvalidBinding {
-            input: trimmed.to_string(),
+            input: input.to_string(),
             message: "expected `<component-ref>.<name>`".to_string(),
         });
     }
@@ -767,26 +792,26 @@ impl RawManifest {
         let mut self_bound_capabilities = BTreeSet::new();
 
         for binding in &self.bindings {
-            let target = (binding.to.as_str(), binding.slot.as_str());
+            let target = (&binding.to, binding.slot.as_str());
             if !bound_targets.insert(target) {
                 return Err(Error::DuplicateBindingTarget {
-                    to: binding.to.clone(),
+                    to: binding.to.to_string(),
                     slot: binding.slot.clone(),
                 });
             }
 
-            let source = (binding.from.as_str(), binding.capability.as_str());
+            let source = (&binding.from, binding.capability.as_str());
             if !bound_sources.insert(source) {
                 return Err(Error::DuplicateBindingSource {
-                    from: binding.from.clone(),
+                    from: binding.from.to_string(),
                     capability: binding.capability.clone(),
                 });
             }
 
-            if binding.to == "self" {
+            if binding.to.is_self() {
                 self_bound_slots.insert(binding.slot.as_str());
             }
-            if binding.from == "self" {
+            if binding.from.is_self() {
                 self_bound_capabilities.insert(binding.capability.as_str());
             }
         }
