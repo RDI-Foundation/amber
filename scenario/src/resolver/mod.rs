@@ -13,8 +13,18 @@ use crate::manifest::{self, Manifest, ManifestDigest};
 pub enum Error {
     #[error("unsupported URL scheme `{scheme}`")]
     UnsupportedScheme { scheme: String },
-    #[error("mismatched digest")]
-    MismatchedDigest,
+    #[error("response body from `{url}` exceeds max size {max_bytes} bytes (got {size} bytes)")]
+    ResponseTooLarge {
+        url: Url,
+        size: u64,
+        max_bytes: usize,
+    },
+    #[error("missing content type for `{url}`")]
+    MissingContentType { url: Url },
+    #[error("unsupported content type `{content_type}` for `{url}`")]
+    UnsupportedContentType { url: Url, content_type: String },
+    #[error("mismatched digest for `{0}`")]
+    MismatchedDigest(Url),
     #[cfg(feature = "http-resolver")]
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
@@ -56,12 +66,25 @@ impl Resolver {
         digest: Option<ManifestDigest>,
     ) -> Result<Resolution, Error> {
         let res = self.resolve_url(url).await?;
-        if let Some(digest) = digest
-            && res.manifest.digest(digest.alg()) != digest
-        {
-            return Err(Error::MismatchedDigest);
+        match digest {
+            Some(expected) => {
+                let Resolution {
+                    url,
+                    manifest,
+                    cacheability,
+                } = res;
+                let actual = manifest.digest(expected.alg());
+                if actual != expected {
+                    return Err(Error::MismatchedDigest(url));
+                }
+                Ok(Resolution {
+                    url,
+                    manifest,
+                    cacheability,
+                })
+            }
+            None => Ok(res),
         }
-        Ok(res)
     }
 
     async fn resolve_url(&self, url: &Url) -> Result<Resolution, Error> {
@@ -111,6 +134,9 @@ mod tests {
         };
 
         let err = resolver.resolve(url, Some(mismatched)).await.unwrap_err();
-        assert!(matches!(err, Error::MismatchedDigest));
+        let Error::MismatchedDigest(err_url) = err else {
+            panic!("expected MismatchedDigest error");
+        };
+        assert_eq!(err_url, *url);
     }
 }

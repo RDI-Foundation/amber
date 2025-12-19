@@ -1,18 +1,33 @@
-use std::io;
+use std::{io, time::Duration};
 
+use futures::StreamExt;
+use reqwest::header::CONTENT_TYPE;
 use url::Url;
 
 use super::{Error, Resolution};
 use crate::cache::Cacheability;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct HttpResolver {
     client: reqwest::Client,
+    options: HttpResolverOptions,
 }
 
 impl HttpResolver {
     pub fn new() -> Self {
-        Default::default()
+        Self::with_options(HttpResolverOptions::default())
+            .expect("default http resolver configuration failed")
+    }
+
+    pub fn with_options(options: HttpResolverOptions) -> Result<Self, Error> {
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(options.connect_timeout)
+            .timeout(options.request_timeout);
+        if let Some(read_timeout) = options.read_timeout {
+            builder = builder.read_timeout(read_timeout);
+        }
+        let client = builder.build()?;
+        Ok(Self { client, options })
     }
 
     pub(super) async fn resolve_url(&self, url: &Url) -> Result<Resolution, Error> {
@@ -24,8 +39,62 @@ impl HttpResolver {
             .error_for_status()?;
         let resolved_url = res.url().clone();
 
-        let bytes = res.bytes().await?;
-        let body = std::str::from_utf8(&bytes)
+        let max_body_bytes = self.options.max_body_bytes;
+        if let Some(content_length) = res.content_length()
+            && content_length > max_body_bytes as u64
+        {
+            return Err(Error::ResponseTooLarge {
+                url: resolved_url,
+                size: content_length,
+                max_bytes: max_body_bytes,
+            });
+        }
+
+        if self.options.content_type_policy == ContentTypePolicy::RequireTextOrJson {
+            let content_type =
+                res.headers()
+                    .get(CONTENT_TYPE)
+                    .ok_or_else(|| Error::MissingContentType {
+                        url: resolved_url.clone(),
+                    })?;
+            let content_type =
+                content_type
+                    .to_str()
+                    .map_err(|_| Error::UnsupportedContentType {
+                        url: resolved_url.clone(),
+                        content_type: "<invalid utf-8>".to_string(),
+                    })?;
+            let content_type = content_type
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if !is_allowed_content_type(&content_type) {
+                return Err(Error::UnsupportedContentType {
+                    url: resolved_url.clone(),
+                    content_type,
+                });
+            }
+        }
+
+        let mut body = Vec::new();
+        let mut size = 0usize;
+        let mut stream = res.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if size + chunk.len() > max_body_bytes {
+                return Err(Error::ResponseTooLarge {
+                    url: resolved_url.clone(),
+                    size: (size + chunk.len()) as u64,
+                    max_bytes: max_body_bytes,
+                });
+            }
+            body.extend_from_slice(&chunk);
+            size += chunk.len();
+        }
+
+        let body = std::str::from_utf8(&body)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         let manifest = body.parse()?;
 
@@ -35,6 +104,49 @@ impl HttpResolver {
             cacheability: Cacheability::ByDigestOnly,
         })
     }
+}
+
+impl Default for HttpResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContentTypePolicy {
+    Any,
+    RequireTextOrJson,
+}
+
+#[derive(Clone, Debug)]
+pub struct HttpResolverOptions {
+    pub connect_timeout: Duration,
+    pub request_timeout: Duration,
+    pub read_timeout: Option<Duration>,
+    pub max_body_bytes: usize,
+    pub content_type_policy: ContentTypePolicy,
+}
+
+impl Default for HttpResolverOptions {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(30),
+            read_timeout: Some(Duration::from_secs(30)),
+            max_body_bytes: 1024 * 1024,
+            content_type_policy: ContentTypePolicy::Any,
+        }
+    }
+}
+
+fn is_allowed_content_type(content_type: &str) -> bool {
+    if content_type.starts_with("text/") {
+        return true;
+    }
+    if content_type == "application/json" || content_type == "application/json5" {
+        return true;
+    }
+    content_type.ends_with("+json")
 }
 
 #[cfg(test)]
