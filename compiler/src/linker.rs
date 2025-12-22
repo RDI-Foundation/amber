@@ -264,11 +264,11 @@ fn resolve_bindings(components: &[Component]) -> Result<Vec<BindingEdge>, Error>
                 });
             }
 
+            // Normalize delegated provides so Scenario edges point at the origin.
+            let origin = canonicalize_provide(components, from_id, &b.capability)?;
+
             edges.push(BindingEdge {
-                from: ProvideRef {
-                    component: from_id,
-                    name: b.capability.clone(),
-                },
+                from: origin,
                 to: SlotRef {
                     component: to_id,
                     name: b.slot.clone(),
@@ -306,6 +306,57 @@ fn resolve_local_component<'a>(
             .copied()
             .ok_or(name.as_str()),
         _ => unreachable!("unsupported local component reference"),
+    }
+}
+
+/// Resolve a provide through delegation to its origin.
+fn canonicalize_provide(
+    components: &[Component],
+    start_component: ComponentId,
+    start_name: &str,
+) -> Result<ProvideRef, Error> {
+    let mut cur_component = start_component;
+    let mut cur_name: &str = start_name;
+    let mut remaining_in_component = components[cur_component.0].manifest.provides.len() + 1;
+
+    loop {
+        if remaining_in_component == 0 {
+            return Err(Error::InvalidProvideDelegation {
+                component_path: component_path_for(components, cur_component),
+                provide: cur_name.to_string(),
+                message: "cycle detected while resolving provide delegation".to_string(),
+            });
+        }
+
+        let manifest = &components[cur_component.0].manifest;
+        let provide_decl = &manifest.provides[cur_name];
+
+        match (
+            provide_decl.from.as_ref(),
+            provide_decl.capability.as_deref(),
+        ) {
+            (None, None) => {
+                return Ok(ProvideRef {
+                    component: cur_component,
+                    name: cur_name.to_string(),
+                });
+            }
+            (Some(from), Some(cap)) => {
+                let next_component = resolve_local_component(components, cur_component, from)
+                    .unwrap_or_else(|_| unreachable!("provide delegation validated earlier"));
+
+                if next_component == cur_component {
+                    remaining_in_component -= 1;
+                } else {
+                    cur_component = next_component;
+                    remaining_in_component =
+                        components[cur_component.0].manifest.provides.len() + 1;
+                }
+
+                cur_name = cap;
+            }
+            _ => unreachable!("provide delegation validated earlier"),
+        }
     }
 }
 

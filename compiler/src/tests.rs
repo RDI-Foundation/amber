@@ -425,6 +425,80 @@ async fn binding_type_mismatch_is_an_error() {
 }
 
 #[tokio::test]
+async fn binding_from_delegated_provide_uses_origin_component_and_name() {
+    let dir = tmp_dir("scenario-provide-delegation");
+    let root_path = dir.join("root.json5");
+    let provider_path = dir.join("provider.json5");
+    let consumer_path = dir.join("consumer.json5");
+
+    write_file(
+        &provider_path,
+        r#"
+        {
+          manifest_version: "1.0.0",
+          provides: { api: { kind: "http" } },
+          exports: ["api"],
+        }
+        "#,
+    );
+
+    write_file(
+        &consumer_path,
+        r#"
+        {
+          manifest_version: "1.0.0",
+          slots: { needs: { kind: "http" } },
+          exports: ["needs"],
+        }
+        "#,
+    );
+
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "1.0.0",
+              components: {{
+                provider: "{provider}",
+                consumer: "{consumer}",
+              }},
+              provides: {{
+                public: {{ kind: "http", from: "#provider", capability: "api" }},
+              }},
+              bindings: [
+                {{ to: "#consumer.needs", from: "self.public" }},
+              ],
+            }}
+            "##,
+            provider = file_url(&provider_path),
+            consumer = file_url(&consumer_path),
+        ),
+    );
+
+    let compiler = Compiler::new(Resolver::new(), Cache::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+
+    let scenario = compiler
+        .compile(root_ref, CompileOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(scenario.components.len(), 3);
+    assert_eq!(scenario.bindings.len(), 1);
+
+    let root_component = &scenario.components[scenario.root.0];
+    let provider_id = root_component.children["provider"];
+    let consumer_id = root_component.children["consumer"];
+
+    let b = &scenario.bindings[0];
+    assert_eq!(b.from.component, provider_id);
+    assert_eq!(b.from.name.as_str(), "api");
+    assert_eq!(b.to.component, consumer_id);
+    assert_eq!(b.to.name.as_str(), "needs");
+}
+
+#[tokio::test]
 async fn weak_binding_missing_child_is_an_error() {
     let dir = tmp_dir("scenario-weak-missing-child");
     let root_path = dir.join("root.json5");
