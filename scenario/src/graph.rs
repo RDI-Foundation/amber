@@ -153,7 +153,7 @@ fn find_cycle(out: &[Vec<usize>], indeg: &[usize]) -> Vec<ComponentId> {
 mod tests {
     use std::{collections::BTreeMap, sync::Arc};
 
-    use amber_manifest::{DigestAlg, Manifest, ManifestRef};
+    use amber_manifest::{Manifest, ManifestRef};
     use url::Url;
 
     use super::*;
@@ -167,7 +167,7 @@ mod tests {
             name: name.to_string(),
             declared_ref: ManifestRef::from_url(url.clone()),
             resolved_url: url,
-            digest: manifest.digest(DigestAlg::Sha256),
+            digest: manifest.digest(),
             manifest,
             config: None,
             children: BTreeMap::new(),

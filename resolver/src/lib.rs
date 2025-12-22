@@ -67,7 +67,7 @@ impl Resolver {
                     manifest,
                     cacheability,
                 } = res;
-                let actual = manifest.digest(expected.alg());
+                let actual = manifest.digest();
                 if actual != expected {
                     return Err(Error::MismatchedDigest(url));
                 }
@@ -106,7 +106,7 @@ pub struct Resolution {
 
 #[cfg(test)]
 mod tests {
-    use amber_manifest::{DigestAlg, Manifest, ManifestDigest};
+    use amber_manifest::{Manifest, ManifestDigest};
     use url::Url;
 
     use super::{Error, Resolver};
@@ -117,14 +117,10 @@ mod tests {
         expected_url: &Url,
         manifest: &Manifest,
     ) {
-        let digest = manifest.digest(DigestAlg::default());
-        let mismatched = match digest {
-            ManifestDigest::Sha256(mut bytes) => {
-                bytes[0] ^= 0xff;
-                ManifestDigest::Sha256(bytes)
-            }
-            _ => unreachable!("unsupported manifest digest"),
-        };
+        let digest = manifest.digest();
+        let mut bytes = digest.into_bytes();
+        bytes[0] ^= 0xff;
+        let mismatched = ManifestDigest::new(bytes);
 
         let err = resolver.resolve(url, Some(mismatched)).await.unwrap_err();
         let Error::MismatchedDigest(err_url) = err else {

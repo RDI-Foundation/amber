@@ -1,152 +1,268 @@
 # Amber Component Manifest (JSON5) Format
 
-An Amber component manifest describes **one component**. A component may:
+This document defines the **manifest file format** and the **validation performed by `manifest/src/lib.rs`**.
 
-- Run a `program` (a container image with args/env/network).
-- Contain named child `components` (each child points at another manifest).
-- Declare required inputs (`slots`) and produced outputs (`provides`).
-- Wire components together (`bindings`) and choose what is visible to its parent (`exports`).
+A manifest describes **one component**. A component may:
 
-This is intentionally similar to the Fuchsia component manifest model: **components are recursive**. A component can have both a `program` and child `components`, and those children can themselves have programs and children, and so on.
+* Run a `program` (container image + args/env + optional network endpoints).
+* Contain named child `components` (each points at another manifest).
+* Declare required inputs (`slots`) and produced outputs (`provides`).
+* Wire capabilities into slots (`bindings`).
+* Expose a public surface to its parent (`exports`).
 
-Manifests are written as **JSON5** (comments/trailing commas allowed) and parsed as a single JSON object.
+Manifests are written as **JSON5** (comments/trailing commas allowed) and parsed as a **single JSON object**.
 
-## Top-level fields
+---
+
+## Quick start
+
+Minimal leaf component exporting an HTTP API:
 
 ```json5
 {
   manifest_version: "1.0.0",
+  program: {
+    image: "ghcr.io/acme/hello:v1",
+    args: "--port 8080",
+    network: {
+      endpoints: [{ name: "http", port: 8080 }],
+    },
+  },
+  provides: {
+    api: { kind: "http", endpoint: "http" },
+  },
+  exports: ["api"],
+}
+```
 
-  // Optional: describes how to run this component.
-  program: { /* ... */ },
+---
 
-  // Optional: child component instances (recursive).
-  components: { /* ... */ },
+## Validation stages
 
-  // Optional: JSON Schema describing this component's `config` object.
-  config_schema: { /* ... */ },
+### Parse-time validation (this crate)
 
-  // Optional: required capabilities for this component.
-  slots: { /* ... */ },
+This crate **parses JSON5**, deserializes into Rust types, and validates:
 
-  // Optional: capabilities provided by this component (or forwarded from a child).
-  provides: { /* ... */ },
+* `manifest_version` must be valid SemVer and **major version must be `1`**.
+* No dots (`.`) in:
 
-  // Optional: wiring between components' slots and capabilities.
-  bindings: [ /* ... */ ],
+  * child instance names (`components` keys)
+  * capability names (`slots`/`provides` keys, and strings in `exports`)
+  * delegated capability names (`provides.<name>.capability`, if present)
+  * binding slot/capability names
+  * child refs (`#<name>`) in bindings
+* A name cannot be declared in **both** `slots` and `provides`.
+* `exports` names must refer to something declared in `slots` or `provides`.
+* Each binding target `(<to>.<slot>)` may appear **only once**.
+* Binding references must be locally well-formed:
 
-  // Optional: capabilities this component exposes to its parent.
-  exports: [ /* ... */ ],
+  * `to: "self"` requires `slot` exist in `slots`
+  * `from: "self"` requires `capability` exist in `provides`
+  * `#child` used in a binding must exist in `components`
+* Endpoint names in `program.network.endpoints[]` must be unique.
+* Any `provides.*.endpoint` must refer to a declared endpoint name.
+
+Unused declaration rule enforced by this crate:
+
+* Every declared **slot** must be either:
+
+  * **exported** (present in `exports`), or
+  * **bound into `self`** (some binding has `to: "self"` and `slot: "<name>"`)
+* Every declared **provide** must be either:
+
+  * **exported**, or
+  * **used as a binding source from `self`** (some binding has `from: "self"` and `capability: "<name>"`)
+
+### Link-time / resolution-time validation (NOT done by this crate)
+
+This crate does **not** fetch child manifests and therefore does not validate cross-manifest semantics, such as:
+
+* Whether `provides.<name>.from`/`capability` actually exist on the referenced component.
+* Whether kinds/profiles match across bindings or forwarding.
+* Whether a child has exported the slot/capability you’re trying to bind to/from.
+* Validation of `components.<name>.config` against `config_schema`.
+
+If your system resolves manifests, it should enforce those rules at link/resolve time.
+
+---
+
+## Top-level schema
+
+Top-level object:
+
+```json5
+{
+  manifest_version: "1.0.0",   // required
+
+  program: { /* ... */ },      // optional
+  components: { /* ... */ },   // optional; default {}
+  config_schema: { /* ... */ },// optional
+  slots: { /* ... */ },        // optional; default {}
+  provides: { /* ... */ },      // optional; default {}
+  bindings: [ /* ... */ ],      // optional; default []
+  exports: [ /* ... */ ],       // optional; default []
 }
 ```
 
 Notes:
 
-- `manifest_version` is a SemVer string (currently `"1.0.0"`).
-- Duplicate keys in `program.env`, `components`, `slots`, and `provides` are invalid.
-- Child instance names, capability names (`slots`/`provides`/`exports`), and binding slot/capability names must not contain `.` (dots are reserved).
-- Names must be unique across `slots` and `provides` (a name cannot be declared in both).
-- `exports` entries must name something declared in `slots` or `provides`.
-- Each binding target `(<to>.<slot>)` and binding source `(<from>.<capability>)` may only appear once.
-- Every declared slot/provide must be either bound by a `binding` or listed in `exports`.
+* Duplicate keys are rejected in: `program.env`, `components`, `slots`, `provides`.
+* `exports` and `bindings` are treated as **sets** internally:
+
+  * order is not meaningful
+  * exact duplicates may be deduplicated
+
+Unknown fields:
+
+* `ManifestRef` object form is **strict** (unknown fields are rejected).
+* Most other objects are **not strict** in this crate (unknown fields are ignored by serde).
+
+---
 
 ## Manifest references (`ManifestRef`)
 
-Child components are referenced by a URL.
+Child manifests are referenced by a URL.
 
-A manifest reference can be written as either:
+Forms:
 
-- URL string (sugar): `"https://..."`
-- Canonical form (optionally pinned):
-  - `{ url: "https://...", digest: "<alg>:<hash-b64>" }`
+* URL string (sugar):
 
-`digest` is optional. If present, it is used to verify the bytes fetched from `url` by hashing them and comparing.
-Unknown fields in the object form are invalid.
+  * `"https://registry.example.org/pkg/v1"`
+* Canonical object form (optionally pinned):
 
-The digest string format is:
+  * `{ url: "https://...", digest: "sha256:<base64>" }`
 
-`<alg>:<hash-b64>`
+Rules enforced by this crate:
 
-`<alg>` can be `sha256`.
+* `url` must be a string parseable as an absolute URL.
+* `digest` (if present) must be:
 
-Examples:
+  * algorithm `sha256`
+  * `sha256:<base64>` where base64 decodes to **32 bytes**
+* Unknown fields in the object form are invalid.
 
-- `https://registry.amber-protocol.org/litellm/v3.8.6`
-- `https://registry.agentbeats.dev/envs/tau2`
-- `{ url: "https://registry.agentbeats.dev/envs/tau2", digest: "sha256:5Ub0uXR5xZYFKKlTsOKvC43pM5gdAN1JRStAebbJ45U=" }`
+Example:
+
+```json5
+{
+  url: "https://registry.agentbeats.dev/envs/tau2",
+  digest: "sha256:5Ub0uXR5xZYFKKlTsOKvC43pM5gdAN1JRStAebbJ45U="
+}
+```
+
+---
 
 ## `program`
 
 ```json5
 program: {
-  image: "ghcr.io/acme/my-component:v1",
+  image: "ghcr.io/acme/my-component:v1", // required
 
-  // Optional; default [].
-  // Either a list of strings, or a single string that will be shell-split.
+  // args: optional; default [].
+  // Either:
+  // - a list of strings, or
+  // - a single string tokenized with shlex rules.
   args: ["--port", "8080"],
   // args: "--port 8080",
 
-  // Optional; default {}.
+  // env: optional; default {}.
+  // Values support interpolation.
   env: {
     LOG_LEVEL: "debug",
     API_URL: "${slots.backend.url}",
   },
 
-  // Optional.
+  // network: optional
   network: {
+    // endpoints: optional; default []
     endpoints: [
       {
-        name: "http",
-        port: 8080,
-        protocol: "http", // optional; default "http"
-        path: "/",        // optional; default "/"
+        name: "http",          // required; unique within endpoints
+        port: 8080,            // required
+        protocol: "http",      // optional; default "http" (http/https/tcp/udp)
+        path: "/",             // optional; default "/"
       },
     ],
   },
 }
 ```
 
-### Interpolation in `args`/`env`
+### Interpolation in `args` and `env`
 
-`args` elements and `env` values support `${...}` interpolation:
+`args` elements and `env` values support `${...}` interpolation.
 
-- `${config.<path>}` reads from the component’s config object.
-- `${slots.<slot>.<path>}` reads from the bound value of a slot.
+Supported sources:
 
-The `<path>` portion is dot-separated (for nested objects). Examples:
+* `${config.<path>}` reads from the component’s config value.
+* `${slots.<path>}` reads from resolved slot values.
 
-- `${config.domain}`
-- `${slots.llm.url}`
+`<path>` is dot-separated for nested objects.
+
+Examples:
+
+* `${config.domain}`
+* `${slots.llm.url}`
+
+Notes:
+
+* This crate **parses** interpolation syntax but does **not** validate that the referenced paths exist.
+
+---
 
 ## `components` (child components)
 
-`components` is a map from **instance name** to a component declaration.
+`components` is a map: **instance name → component declaration**.
 
-Each child can be declared as:
+Instance name rules (enforced):
 
-- A manifest reference string:
-  - `my_child: "https://registry.amber-protocol.org/some/component/v1"`
-- Or a manifest reference in canonical form:
-  - `my_child: { url: "...", digest: "..." }`
-- Or an object with per-instance config:
-  - `my_child: { manifest: "...", config: { /* ... */ } }`
-  - `my_child: { manifest: { /* ... */ }, config: { /* ... */ } }`
+* Must be unique (duplicate keys rejected).
+* Must not contain `.`.
 
-Example:
+Child declaration forms:
+
+1. Manifest ref string:
 
 ```json5
 components: {
   env: "https://registry.agentbeats.dev/envs/tau2/v2",
+}
+```
+
+2. Manifest ref object:
+
+```json5
+components: {
+  env: { url: "https://...", digest: "sha256:..." },
+}
+```
+
+3. Object with per-instance config:
+
+```json5
+components: {
   evaluator: {
     manifest: "https://registry.agentbeats.dev/tau2-evaluator/v1.0.0",
-    config: { domain: "airline", num_trials: 1, num_tasks: 4 },
+    config: { domain: "airline", num_trials: 1 },
   },
 }
 ```
 
+Notes:
+
+* `config` is accepted as any JSON value by this crate (commonly an object).
+* This crate does not validate `config` against `config_schema` (link-time concern).
+
+---
+
 ## `config_schema`
 
-`config_schema` is a JSON Schema object describing the config values a parent may pass when instantiating this component under `components`.
+`config_schema` is a JSON Schema value describing acceptable `config` values when this manifest is instantiated under `components`.
+
+Rules enforced by this crate:
+
+* The schema must be a valid JSON Schema (syntactically valid for the `jsonschema` library).
+
+Example:
 
 ```json5
 config_schema: {
@@ -160,12 +276,16 @@ config_schema: {
 }
 ```
 
+---
+
 ## Capabilities: `slots`, `provides`, `exports`
 
-Capabilities are named entries in `slots` and `provides`. The shared shape is:
+### Capability declaration shape
 
-- `kind`: one of `"mcp"`, `"llm"`, `"http"`, `"a2a"`
-- `profile` (optional): a string qualifier (commonly used for `"mcp"`)
+Both slots and provides share:
+
+* `kind`: `"mcp" | "llm" | "http" | "a2a"`
+* `profile` (optional): string qualifier (often used for `"mcp"`)
 
 Example:
 
@@ -175,8 +295,7 @@ Example:
 
 ### `slots`
 
-`slots` declares what this component needs. A slot is fulfilled by a `binding`.
-If a slot is not exported, it must be bound by a `binding` targeting `self.<slot>`.
+`slots` declares what the component requires.
 
 ```json5
 slots: {
@@ -185,52 +304,62 @@ slots: {
 }
 ```
 
+Important rule (enforced):
+
+* If a slot is **not exported**, it must be **bound into `self.<slot>`** by a binding in this manifest.
+* If a slot is **exported**, it is an input the parent is expected to bind.
+
 ### `provides`
 
-`provides` declares what this component makes available. A provide can be:
+`provides` declares what the component offers.
 
-- Backed by one of this component’s own `program.network.endpoints` (via `endpoint`), and/or
-- A forwarded capability from another component (via `from` + `capability`).
-  `from` is a component ref (`self` or `#<name>`).
+A provide may include:
+
+* `endpoint`: name of a `program.network.endpoints[].name` (must exist if set)
+* `from` + `capability`: indicates the provide is forwarded/delegated from another component (`self` or `#child`)
 
 ```json5
 provides: {
   api: { kind: "http", endpoint: "http" },
 
-  // Forward the `llm` capability exported by the `router` child.
   llm: { kind: "llm", from: "#router", capability: "llm" },
 }
 ```
 
-If a provide is not exported, it must be used by a `binding` with `from: "self.<provide>"`.
+Notes:
 
-If `provides.<name>.endpoint` is set, it must match a declared `program.network.endpoints[].name`.
+* This crate enforces only that `endpoint` (if present) refers to a declared endpoint name.
+* This crate parses `from`/`capability` but does not validate cross-manifest existence/matching (link-time concern).
 
 ### `exports`
 
-`exports` chooses which local capability names (from `slots` and/or `provides`) are visible to the parent of this component.
+`exports` lists the names (from `slots` and/or `provides`) visible to the parent.
 
-To export a child capability, first give it a local name in `provides` using `from`/`capability`, then export that local name.
+```json5
+exports: ["llm", "api"]
+```
+
+Rules enforced:
+
+* Each export must name something declared in `slots` or `provides`.
+* Export names must not contain `.`.
+
+---
 
 ## `bindings`
 
-`bindings` wire a `to` slot to a `from` capability:
+A binding wires a **target slot** to a **source provide**:
 
 `(<to>.<slot>) <- (<from>.<capability>)`
 
-Binding targets and sources are single-use: you cannot bind the same `(<to>.<slot>)` or `(<from>.<capability>)` more than once.
+Component refs:
 
-Bindings are **strong** by default: the binding must resolve and participates in dependency ordering.
+* `"self"` for the current manifest
+* `"#<child>"` for a key in `components`
 
-Set `weak: true` to make a binding **weak**: it still must resolve, but it is ignored for dependency ordering (cycle checks). This is useful for breaking cycles in the binding graph.
+Bindings forms:
 
-The binding is declared in the parent that is doing the wiring:
-
-- The `to` component must declare the `slot` in its `slots`.
-- The `from` component must export the `capability` (a name from its `exports`).
-- Component refs are either `self` or a child instance (`#<name>`).
-
-Bindings can be written in either canonical form:
+### Explicit form
 
 ```json5
 {
@@ -238,24 +367,47 @@ Bindings can be written in either canonical form:
   slot: "llm",
   from: "#router",
   capability: "llm",
-  // Optional; default false.
-  weak: true,
+  weak: true, // optional; default false
 }
 ```
 
-…or dot-notation sugar:
+### Dot-sugar form
 
 ```json5
 { to: "#evaluator.llm", from: "#router.llm", weak: true }
 ```
 
-In dot form, `to` is `<component-ref>.<slot>` and `from` is `<component-ref>.<capability>`.
+Rules enforced by this crate:
 
-Child refs use `#<name>` where `<name>` is a key of `components`. `self` refers to the component described by the current manifest.
+* Target uniqueness: you cannot bind the same `(<to>.<slot>)` more than once.
+* `to: "self"` requires `slot` exist in `slots`.
+* `from: "self"` requires `capability` exist in `provides`.
+* Any `#child` referenced in `to` or `from` must exist in `components`.
+* Slot/capability names must not contain `.`.
+
+`weak`:
+
+* This crate parses and preserves `weak`, but does not implement dependency ordering or cycle checks. Treat `weak` as a hint for downstream tooling.
+
+---
+
+## Limitation: no slot pass-through in this version
+
+This version does **not** allow binding from a local slot (`from: "self.<slot>"`). A binding source in `self.*` must refer to a **provide**, not a slot.
+
+Consequence:
+
+* You cannot express “export a slot to the parent and also pass that slot value down into a child” purely inside one manifest.
+
+Workaround:
+
+* Do the wiring at the parent level (do not hide the dependent component behind an extra composition layer), or wait until the format/runtime supports slot pass-through.
+
+---
 
 ## Examples
 
-### 1) Leaf component exporting an HTTP API
+### 1) Leaf component exporting an HTTP API (valid)
 
 ```json5
 {
@@ -272,7 +424,9 @@ Child refs use `#<name>` where `<name>` is a key of `components`. `self` refers 
 }
 ```
 
-### 2) Component that uses config + a required slot
+### 2) Component that requires an LLM slot from its parent (valid)
+
+Because the component expects its **parent** to supply `llm`, it must export that slot.
 
 ```json5
 {
@@ -290,12 +444,18 @@ Child refs use `#<name>` where `<name>` is a key of `components`. `self` refers 
   slots: {
     llm: { kind: "llm" },
   },
+  exports: ["llm"],
 }
 ```
 
-### 3) Composite component (program + child) with wiring and forwarding
+### 3) Composite component: program + child wiring + forwarding (valid)
 
-This component runs a router, instantiates a `wrapper` child, wires the wrapper’s slot to the router’s admin API, then exports the wrapper’s `llm` capability upward.
+This component:
+
+* runs a router (`program`)
+* instantiates a `wrapper` child
+* provides `admin_api` from a local endpoint and binds it into the child’s `admin_api` slot
+* forwards the child’s `llm` provide upward as `llm`
 
 ```json5
 {
@@ -322,36 +482,14 @@ This component runs a router, instantiates a `wrapper` child, wires the wrapper�
 }
 ```
 
-### 4) Pass-through slot (composite requires something its child needs)
-
-This component doesn’t provide an LLM itself, but declares an `llm` slot, exports it upward, and passes it down into a child.
+### 4) Weak binding flag (parsed and preserved; semantics are tooling-defined)
 
 ```json5
 {
   manifest_version: "1.0.0",
   components: {
-    evaluator: "https://registry.agentbeats.dev/tau2-evaluator/v1.0.0",
-  },
-  slots: {
-    llm: { kind: "llm" },
-  },
-  bindings: [
-    { to: "#evaluator.llm", from: "self.llm" },
-  ],
-  exports: ["llm"],
-}
-```
-
-### 5) Weak binding (cycle breaker)
-
-This component has a dependency cycle; mark one edge weak to allow link-time ordering.
-
-```json5
-{
-  manifest_version: "1.0.0",
-  components: {
-    a: "https://registry.amber-protocol.org/a/v1",
-    b: "https://registry.amber-protocol.org/b/v1",
+    a: "https://registry.example.org/a/v1",
+    b: "https://registry.example.org/b/v1",
   },
   bindings: [
     { to: "#a.peer", from: "#b.api" },

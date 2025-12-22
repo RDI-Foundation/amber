@@ -390,9 +390,7 @@ fn manifest_ref_canonical_form_with_digest_parses() {
         ComponentDecl::Reference(r) => {
             assert_eq!(r.url.as_str(), "https://example.com/amber/pkg/v1");
             let digest = r.digest.as_ref().unwrap();
-            match digest {
-                ManifestDigest::Sha256(bytes) => assert_eq!(bytes, &[0u8; 32]),
-            }
+            assert_eq!(digest.bytes(), &[0u8; 32]);
         }
         _ => panic!("expected reference"),
     }
@@ -468,8 +466,8 @@ fn manifest_digest_is_stable_across_json5_formatting() {
         "#,
     );
 
-    let digest_a = raw_a.digest(DigestAlg::default());
-    let digest_b = raw_b.digest(DigestAlg::default());
+    let digest_a = raw_a.digest();
+    let digest_b = raw_b.digest();
     assert_eq!(digest_a, digest_b);
 }
 
@@ -707,7 +705,7 @@ fn binding_target_cannot_be_multiplexed() {
 }
 
 #[test]
-fn binding_source_cannot_be_multiplexed() {
+fn binding_source_can_be_multiplexed() {
     let raw = parse_raw(
         r##"
         {
@@ -723,15 +721,9 @@ fn binding_source_cannot_be_multiplexed() {
         }
         "##,
     );
-    let err = raw.validate().unwrap_err();
 
-    match err {
-        Error::DuplicateBindingSource { from, capability } => {
-            assert_eq!(from, "#b");
-            assert_eq!(capability, "c");
-        }
-        other => panic!("expected DuplicateBindingSource error, got: {other}"),
-    }
+    // Fuchsia-style: a single source can be routed to multiple targets.
+    raw.validate().unwrap();
 }
 
 #[test]

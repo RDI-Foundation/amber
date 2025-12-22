@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use amber_manifest::{DigestAlg, Manifest, ManifestDigest};
+use amber_manifest::{Manifest, ManifestDigest};
 use dashmap::DashMap;
 use url::Url;
 
@@ -30,18 +30,18 @@ struct CacheInner {
 }
 
 impl Cache {
-    /// Store a manifest (owned) under `url` and all supported digests.
+    /// Store a manifest (owned) under `url` and its sha256 digest.
     /// Uses `url` as the resolved URL.
     pub fn put(&self, url: Url, manifest: Manifest) {
         self.put_arc(url.clone(), url, Arc::new(manifest));
     }
 
-    /// Store a manifest (shared) under `url` and all supported digests.
+    /// Store a manifest (shared) under `url` and its sha256 digest.
     ///
     /// This is useful when you want to alias multiple URLs to the same manifest content
-    /// without producing multiple Arcs / duplicating digest entries unnecessarily.
+    /// without producing multiple Arcs.
     pub fn put_arc(&self, url: Url, resolved_url: Url, manifest: Arc<Manifest>) {
-        let digest = manifest.digest(DigestAlg::default());
+        let digest = manifest.digest();
         let entry = CacheEntry {
             resolved_url,
             manifest: Arc::clone(&manifest),

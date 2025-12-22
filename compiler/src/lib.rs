@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests;
 
-use amber_manifest::{DigestAlg, ManifestRef};
+use amber_manifest::ManifestRef;
 use amber_resolver::{Cache, Resolver};
 use amber_scenario::Scenario;
 
@@ -13,7 +13,6 @@ pub use frontend::{ResolveMode, ResolveOptions};
 #[derive(Clone, Debug, Default)]
 pub struct CompileOptions {
     pub resolve: ResolveOptions,
-    pub digest_alg: DigestAlg,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -51,10 +50,9 @@ impl Compiler {
             self.cache.clone(),
             root,
             opts.resolve,
-            opts.digest_alg,
         )
         .await?;
 
-        Ok(linker::link(tree, opts.digest_alg)?)
+        Ok(linker::link(tree)?)
     }
 }

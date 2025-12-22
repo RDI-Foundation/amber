@@ -45,8 +45,6 @@ pub enum Error {
     AmbiguousCapabilityName { name: String },
     #[error("binding target `{to}.{slot}` is bound more than once")]
     DuplicateBindingTarget { to: String, slot: String },
-    #[error("binding source `{from}.{capability}` is bound more than once")]
-    DuplicateBindingSource { from: String, capability: String },
     #[error("binding references unknown child `#{child}`")]
     UnknownBindingChild { child: String },
     #[error("binding target `self.{slot}` references unknown slot")]
@@ -72,96 +70,49 @@ pub enum Error {
     },
 }
 
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay)]
 #[non_exhaustive]
-pub enum DigestAlg {
-    #[default]
-    Sha256,
-}
-
-impl fmt::Display for DigestAlg {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Sha256 => write!(f, "sha256"),
-        }
-    }
-}
-
-impl FromStr for DigestAlg {
-    type Err = Error;
-
-    fn from_str(input: &str) -> Result<Self, Self::Err> {
-        match input {
-            "sha256" => Ok(Self::Sha256),
-            alg => Err(Error::InvalidManifestDigest(format!(
-                "unknown digest alg: {alg}"
-            ))),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay)]
-#[non_exhaustive]
-pub enum ManifestDigest {
-    Sha256([u8; 32]),
-}
+pub struct ManifestDigest([u8; 32]);
 
 impl ManifestDigest {
-    pub fn digest(manifest: &RawManifest, alg: DigestAlg) -> Self {
-        match alg {
-            DigestAlg::Sha256 => {
-                struct HashWriter<'a>(&'a mut sha2::Sha256);
+    pub const ALG: &'static str = "sha256";
 
-                impl Write for HashWriter<'_> {
-                    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                        self.0.update(buf);
-                        Ok(buf.len())
-                    }
-
-                    fn flush(&mut self) -> io::Result<()> {
-                        Ok(())
-                    }
-                }
-
-                let mut hasher = sha2::Sha256::new();
-                serde_json::to_writer(HashWriter(&mut hasher), manifest).unwrap();
-                Self::Sha256(hasher.finalize().into())
-            }
-        }
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
     }
 
-    pub fn alg(&self) -> DigestAlg {
-        match self {
-            Self::Sha256(_) => DigestAlg::Sha256,
-        }
+    pub fn bytes(&self) -> &[u8; 32] {
+        &self.0
     }
-}
 
-impl TryFrom<(DigestAlg, &[u8])> for ManifestDigest {
-    type Error = Error;
+    pub fn into_bytes(self) -> [u8; 32] {
+        self.0
+    }
 
-    fn try_from((alg, hash): (DigestAlg, &[u8])) -> Result<Self, Self::Error> {
-        match alg {
-            DigestAlg::Sha256 => {
-                let Ok(bytes) = hash.try_into() else {
-                    return Err(Error::InvalidManifestDigest(format!(
-                        "expected 32 bytes but got {}",
-                        hash.len()
-                    )));
-                };
-                Ok(Self::Sha256(bytes))
+    pub fn digest(manifest: &RawManifest) -> Self {
+        struct HashWriter<'a>(&'a mut sha2::Sha256);
+
+        impl Write for HashWriter<'_> {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.update(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
             }
         }
+
+        let mut hasher = sha2::Sha256::new();
+        serde_json::to_writer(HashWriter(&mut hasher), manifest)
+            .expect("hashing manifest JSON cannot fail");
+        Self(hasher.finalize().into())
     }
 }
 
 impl AsRef<[u8]> for ManifestDigest {
     fn as_ref(&self) -> &[u8] {
-        match self {
-            Self::Sha256(bytes) => bytes,
-        }
+        &self.0
     }
 }
 
@@ -173,17 +124,26 @@ impl FromStr for ManifestDigest {
             return Err(Error::InvalidManifestDigest(input.to_string()));
         };
 
+        if alg != Self::ALG {
+            return Err(Error::InvalidManifestDigest(input.to_string()));
+        }
+
         let hash = base64::engine::general_purpose::STANDARD
             .decode(hash_b64)
             .map_err(|_| Error::InvalidManifestDigest(input.to_string()))?;
 
-        (alg.parse()?, hash.as_slice()).try_into()
+        let Ok(bytes) = hash.as_slice().try_into() else {
+            return Err(Error::InvalidManifestDigest(input.to_string()));
+        };
+
+        Ok(Self(bytes))
     }
 }
 
 impl fmt::Display for ManifestDigest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:", self.alg())?;
+        f.write_str(Self::ALG)?;
+        f.write_str(":")?;
         let encoded = base64::engine::general_purpose::STANDARD.encode(self);
         f.write_str(&encoded)
     }
@@ -860,8 +820,8 @@ pub struct RawManifest {
 const SUPPORTED_MANIFEST_MAJOR: u64 = 1;
 
 impl RawManifest {
-    pub fn digest(&self, alg: DigestAlg) -> ManifestDigest {
-        ManifestDigest::digest(self, alg)
+    pub fn digest(&self) -> ManifestDigest {
+        ManifestDigest::digest(self)
     }
 
     fn validate_version(&self) -> Result<(), Error> {
@@ -902,7 +862,6 @@ impl RawManifest {
         }
 
         let mut bound_targets = BTreeSet::new();
-        let mut bound_sources = BTreeSet::new();
         let mut self_bound_slots = BTreeSet::new();
         let mut self_bound_capabilities = BTreeSet::new();
 
@@ -912,14 +871,6 @@ impl RawManifest {
                 return Err(Error::DuplicateBindingTarget {
                     to: binding.to.to_string(),
                     slot: binding.slot.clone(),
-                });
-            }
-
-            let source = (&binding.from, binding.capability.as_str());
-            if !bound_sources.insert(source) {
-                return Err(Error::DuplicateBindingSource {
-                    from: binding.from.to_string(),
-                    capability: binding.capability.clone(),
                 });
             }
 

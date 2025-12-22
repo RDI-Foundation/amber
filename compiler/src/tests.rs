@@ -1,13 +1,20 @@
 use std::{
+    collections::HashSet,
     fs,
+    future::Future,
     io::{Read as _, Write as _},
     net::{Shutdown, TcpListener},
     path::{Path, PathBuf},
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use amber_manifest::ManifestRef;
-use amber_resolver::{Cache, Resolver};
+use amber_manifest::{Manifest, ManifestRef};
+use amber_resolver::{Backend, Cache, Cacheability, RemoteResolver, Resolution, Resolver};
 use amber_scenario::graph;
 use url::Url;
 
@@ -102,6 +109,70 @@ fn spawn_redirecting_manifest_server(manifest_body: String) -> (Url, std::thread
         );
         stream.write_all(response.as_bytes()).unwrap();
         stream.shutdown(Shutdown::Both).unwrap();
+    });
+
+    (start_url, handle)
+}
+
+fn spawn_alias_cycle_manifest_server() -> (Url, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let start_url = Url::parse(&format!("{base}/a")).unwrap();
+
+    // Important: /a and /a_alias must return *byte-identical* bodies so they have the same digest.
+    let a_manifest = format!(
+        r#"
+        {{
+          manifest_version: "1.0.0",
+          components: {{
+            b: "{base}/b",
+          }},
+        }}
+        "#
+    );
+
+    let b_manifest = format!(
+        r#"
+        {{
+          manifest_version: "1.0.0",
+          components: {{
+            a: "{base}/a_alias",
+          }},
+        }}
+        "#
+    );
+
+    let handle = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen: HashSet<String> = HashSet::new();
+
+        // We expect exactly these three requests, but tolerate a little extra in case of retries.
+        for _ in 0..5 {
+            let mut stream = accept_with_deadline(&listener, deadline);
+            let path = read_request_path(&mut stream);
+
+            let (status, body) = match path.as_str() {
+                "/a" | "/a_alias" => ("200 OK", a_manifest.clone()),
+                "/b" => ("200 OK", b_manifest.clone()),
+                _ => ("404 Not Found", String::new()),
+            };
+
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: \
+                 close\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.shutdown(Shutdown::Both).unwrap();
+
+            seen.insert(path);
+            if seen.contains("/a") && seen.contains("/b") && seen.contains("/a_alias") {
+                break;
+            }
+        }
     });
 
     (start_url, handle)
@@ -506,4 +577,229 @@ async fn cycle_in_component_tree_is_detected() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("cycle"));
+}
+
+#[tokio::test]
+async fn cycle_is_detected_across_url_aliases_with_same_digest() {
+    let (url, server) = spawn_alias_cycle_manifest_server();
+
+    let compiler = Compiler::new(Resolver::new(), Cache::default());
+    let root_ref = ManifestRef::from_url(url);
+
+    let err = compiler
+        .compile(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions {
+                    mode: ResolveMode::Online,
+                    max_concurrency: 8,
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("cycle"));
+
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn digest_pinned_offline_rejects_mismatched_cached_url() {
+    let dir = tmp_dir("scenario-digest-offline-mismatch");
+    let root_path = dir.join("root.json5");
+    let url = file_url(&root_path);
+
+    let v1 = r#"{ manifest_version: "1.0.0" }"#;
+    write_file(&root_path, v1);
+
+    let cache = Cache::default();
+    let compiler = Compiler::new(Resolver::new(), cache);
+
+    // First compile caches v1 by URL.
+    compiler
+        .compile(
+            ManifestRef::from_url(url.clone()),
+            CompileOptions {
+                resolve: crate::ResolveOptions {
+                    mode: ResolveMode::Online,
+                    max_concurrency: 8,
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Remove the file to ensure offline depends solely on the cache.
+    fs::remove_file(&root_path).unwrap();
+
+    // Pin a digest for different content.
+    let v2 = r#"
+        {
+          manifest_version: "1.0.0",
+          provides: { api: { kind: "http" } },
+          exports: ["api"],
+        }
+    "#;
+    let digest_v2 = v2.parse::<Manifest>().unwrap().digest();
+    let pinned = ManifestRef::new(url, Some(digest_v2));
+
+    // Offline resolution must *not* accept the URL-cached manifest (v1) when digest is pinned.
+    let err = compiler
+        .compile(
+            pinned,
+            CompileOptions {
+                resolve: crate::ResolveOptions {
+                    mode: ResolveMode::Offline,
+                    max_concurrency: 8,
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("mismatched digest"));
+}
+
+#[tokio::test]
+async fn digest_pinned_online_ignores_mismatched_cached_url_and_refetches() {
+    let dir = tmp_dir("scenario-digest-online-refetch");
+    let root_path = dir.join("root.json5");
+    let url = file_url(&root_path);
+
+    let v1 = r#"{ manifest_version: "1.0.0" }"#;
+    write_file(&root_path, v1);
+
+    let cache = Cache::default();
+    let compiler = Compiler::new(Resolver::new(), cache);
+
+    // Cache v1.
+    compiler
+        .compile(
+            ManifestRef::from_url(url.clone()),
+            CompileOptions {
+                resolve: crate::ResolveOptions {
+                    mode: ResolveMode::Online,
+                    max_concurrency: 8,
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Update the file to v2 and pin that digest.
+    let v2 = r#"
+        {
+          manifest_version: "1.0.0",
+          provides: { api: { kind: "http" } },
+          exports: ["api"],
+        }
+    "#;
+    write_file(&root_path, v2);
+    let digest_v2 = v2.parse::<Manifest>().unwrap().digest();
+    let pinned = ManifestRef::new(url.clone(), Some(digest_v2));
+
+    // Online resolution should treat the mismatched URL-cache entry as a miss and re-resolve.
+    let scenario = compiler
+        .compile(
+            pinned,
+            CompileOptions {
+                resolve: crate::ResolveOptions {
+                    mode: ResolveMode::Online,
+                    max_concurrency: 8,
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let root_component = &scenario.components[scenario.root.0];
+    assert_eq!(root_component.digest, digest_v2);
+}
+
+struct CountingBackend {
+    calls: AtomicUsize,
+}
+
+impl CountingBackend {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl Backend for CountingBackend {
+    fn resolve_url<'a>(
+        &'a self,
+        url: &'a Url,
+    ) -> Pin<Box<dyn Future<Output = Result<Resolution, amber_resolver::Error>> + Send + 'a>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let url = url.clone();
+
+        Box::pin(async move {
+            // Force at least one yield so sibling resolutions can overlap.
+            tokio::task::yield_now().await;
+
+            let manifest: Manifest = r#"{ manifest_version: "1.0.0" }"#.parse().unwrap();
+            Ok(Resolution {
+                url,
+                manifest,
+                cacheability: Cacheability::ByDigestOnly,
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn resolution_deduplicates_inflight_requests() {
+    let dir = tmp_dir("scenario-inflight-dedup");
+    let root_path = dir.join("root.json5");
+
+    write_file(
+        &root_path,
+        r#"
+        {
+          manifest_version: "1.0.0",
+          components: {
+            a: "count://same",
+            b: "count://same",
+          }
+        }
+        "#,
+    );
+
+    let backend = Arc::new(CountingBackend::new());
+    let resolver = Resolver::new().with_remote(RemoteResolver::new(["count"], backend.clone()));
+
+    let compiler = Compiler::new(resolver, Cache::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+
+    let scenario = compiler
+        .compile(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions {
+                    mode: ResolveMode::Online,
+                    max_concurrency: 8,
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(scenario.components.len(), 3);
+
+    // The shared manifest URL should have been resolved exactly once during a single compile.
+    assert_eq!(backend.call_count(), 1);
 }

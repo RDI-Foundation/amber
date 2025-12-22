@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use amber_manifest::{ComponentDecl, DigestAlg, Manifest, ManifestDigest, ManifestRef};
+use amber_manifest::{ComponentDecl, Manifest, ManifestDigest, ManifestRef};
 use amber_resolver::{self as resolver, Cache, Resolver};
 use futures::stream::StreamExt;
 use tokio::sync::{OnceCell, Semaphore};
@@ -39,8 +39,6 @@ pub enum Error {
     OfflineMiss(Url),
     #[error("component tree contains a cycle: {cycle:?}")]
     Cycle { cycle: Vec<Url> },
-    #[error("task join error: {0}")]
-    Join(#[from] tokio::task::JoinError),
 }
 
 #[derive(Clone, Debug)]
@@ -68,7 +66,7 @@ enum ResolveKey {
 impl ResolveKey {
     fn from_ref(r: &ManifestRef) -> Self {
         if let Some(d) = &r.digest {
-            ResolveKey::Digest(d.clone())
+            ResolveKey::Digest(*d)
         } else {
             ResolveKey::Url(r.url.clone())
         }
@@ -81,9 +79,8 @@ struct ResolveService {
     cache: Cache,
     mode: ResolveMode,
     max_concurrency: usize,
-    digest_alg: DigestAlg,
     sem: Arc<Semaphore>,
-    inflight: dashmap::DashMap<ResolveKey, Arc<OnceCell<ResolvedManifest>>>,
+    inflight: Arc<dashmap::DashMap<ResolveKey, Arc<OnceCell<ResolvedManifest>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -98,16 +95,15 @@ pub async fn resolve_tree(
     cache: Cache,
     root: ManifestRef,
     opts: ResolveOptions,
-    digest_alg: DigestAlg,
 ) -> Result<ResolvedTree, Error> {
+    let max = opts.max_concurrency.max(1);
     let svc = ResolveService {
         resolver,
         cache,
         mode: opts.mode,
-        max_concurrency: opts.max_concurrency.max(1),
-        digest_alg,
-        sem: Arc::new(Semaphore::new(opts.max_concurrency.max(1))),
-        inflight: dashmap::DashMap::new(),
+        max_concurrency: max,
+        sem: Arc::new(Semaphore::new(max)),
+        inflight: Arc::new(dashmap::DashMap::new()),
     };
 
     let node = resolve_component(
@@ -128,23 +124,23 @@ async fn resolve_component(
     declared_ref: ManifestRef,
     config: Option<serde_json::Value>,
     mut stack: Vec<Url>,
-    mut path_set: HashSet<Url>,
+    mut path_set: HashSet<ManifestDigest>,
 ) -> Result<ResolvedNode, Error> {
-    // Cycle detection by declared URL along the current path.
-    if path_set.contains(&declared_ref.url) {
-        stack.push(declared_ref.url.clone());
-        return Err(Error::Cycle { cycle: stack });
-    }
-    path_set.insert(declared_ref.url.clone());
-    stack.push(declared_ref.url.clone());
-
+    // Resolve first so we can detect cycles by stable identity (digest), even across URL aliasing.
     let resolved = resolve_manifest(svc, &declared_ref).await?;
-
     let ResolvedManifest {
         manifest,
         resolved_url,
         digest,
     } = resolved;
+
+    // Cycle detection by digest along the current path.
+    if path_set.contains(&digest) {
+        stack.push(declared_ref.url.clone());
+        return Err(Error::Cycle { cycle: stack });
+    }
+    path_set.insert(digest);
+    stack.push(declared_ref.url.clone());
 
     let children = {
         let children_iter = manifest.components.iter().map(|(child_name, decl)| {
@@ -221,24 +217,35 @@ async fn resolve_manifest_inner(
     r: &ManifestRef,
 ) -> Result<ResolvedManifest, Error> {
     // Cache first (both modes).
-    if let Some(digest) = &r.digest {
-        if let Some(entry) = svc.cache.get_by_digest(digest) {
+    if let Some(expected) = &r.digest {
+        if let Some(entry) = svc.cache.get_by_digest(expected) {
             return Ok(ResolvedManifest {
-                digest: digest.clone(),
+                digest: *expected,
                 resolved_url: entry.resolved_url,
                 manifest: entry.manifest,
             });
         }
+
         if let Some(entry) = svc.cache.get_by_url(&r.url) {
-            return Ok(ResolvedManifest {
-                digest: entry.manifest.digest(svc.digest_alg),
-                resolved_url: entry.resolved_url,
-                manifest: entry.manifest,
-            });
+            let actual = entry.manifest.digest();
+            if actual == *expected {
+                return Ok(ResolvedManifest {
+                    digest: actual,
+                    resolved_url: entry.resolved_url,
+                    manifest: entry.manifest,
+                });
+            }
+
+            // Cache contains an entry for the URL, but it does not match the pinned digest.
+            // - Offline: hard error.
+            // - Online: treat as a miss and re-resolve from the source (with digest verification).
+            if svc.mode == ResolveMode::Offline {
+                return Err(resolver::Error::MismatchedDigest(entry.resolved_url).into());
+            }
         }
     } else if let Some(entry) = svc.cache.get_by_url(&r.url) {
         return Ok(ResolvedManifest {
-            digest: entry.manifest.digest(svc.digest_alg),
+            digest: entry.manifest.digest(),
             resolved_url: entry.resolved_url,
             manifest: entry.manifest,
         });
@@ -252,9 +259,9 @@ async fn resolve_manifest_inner(
     // Online: resolve (concurrency-limited).
     let _permit = svc.sem.acquire().await.expect("semaphore closed");
 
-    let resolution = svc.resolver.resolve(&r.url, r.digest.clone()).await?;
+    let resolution = svc.resolver.resolve(&r.url, r.digest).await?;
     let manifest = Arc::new(resolution.manifest);
-    let digest = manifest.digest(svc.digest_alg);
+    let digest = manifest.digest();
 
     // Alias both declared URL and resolved URL to the same manifest content.
     svc.cache.put_arc(

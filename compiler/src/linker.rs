@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use amber_manifest::{CapabilityDecl, DigestAlg, LocalComponentRef, ManifestDigest};
+use amber_manifest::{CapabilityDecl, LocalComponentRef, ManifestDigest};
 use amber_scenario::{
     BindingEdge, Component, ComponentId, ProvideRef, Scenario, SlotRef, graph::component_path_for,
 };
@@ -57,7 +57,7 @@ pub enum Error {
     },
 }
 
-pub fn link(tree: ResolvedTree, digest_alg: DigestAlg) -> Result<Scenario, Error> {
+pub fn link(tree: ResolvedTree) -> Result<Scenario, Error> {
     let mut components = Vec::new();
     let root = flatten(&tree.root, None, &mut components);
 
@@ -66,7 +66,7 @@ pub fn link(tree: ResolvedTree, digest_alg: DigestAlg) -> Result<Scenario, Error
     // Validate configs and intra-realm provide delegation before binding resolution.
     for id in (0..components.len()).map(ComponentId) {
         validate_config(id, &components, &mut schema_cache)?;
-        validate_provide_delegation(id, &components, digest_alg)?;
+        validate_provide_delegation(id, &components)?;
     }
 
     let bindings = resolve_bindings(&components)?;
@@ -92,7 +92,7 @@ fn flatten(
         name: node.name.clone(),
         declared_ref: node.declared_ref.clone(),
         resolved_url: node.resolved_url.clone(),
-        digest: node.digest.clone(),
+        digest: node.digest,
         manifest: Arc::clone(&node.manifest),
         config: node.config.clone(),
         children: BTreeMap::new(),
@@ -127,7 +127,7 @@ fn validate_config(
                 message: e.to_string(),
             }
         })?);
-        schema_cache.insert(c.digest.clone(), v.clone());
+        schema_cache.insert(c.digest, v.clone());
         v
     };
 
@@ -148,11 +148,7 @@ fn validate_config(
     })
 }
 
-fn validate_provide_delegation(
-    realm: ComponentId,
-    components: &[Component],
-    _digest_alg: DigestAlg,
-) -> Result<(), Error> {
+fn validate_provide_delegation(realm: ComponentId, components: &[Component]) -> Result<(), Error> {
     let c = &components[realm.0];
     let realm_path = component_path_for(components, realm);
 
