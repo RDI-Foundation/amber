@@ -371,6 +371,115 @@ fn components_sugar_parses() {
 }
 
 #[test]
+fn component_object_environment_parses() {
+    let m: Manifest = r##"
+        {
+          manifest_version: "1.0.0",
+          environments: {
+            env: { resolvers: ["r1"] },
+          },
+          components: {
+            child: { manifest: "https://example.com/child", environment: "env" },
+          }
+        }
+        "##
+    .parse()
+    .unwrap();
+
+    let ComponentDecl::Object(obj) = m.components.get("child").unwrap() else {
+        panic!("expected object component decl");
+    };
+    assert_eq!(obj.manifest.url.as_str(), "https://example.com/child");
+    assert_eq!(obj.environment.as_deref(), Some("env"));
+}
+
+#[test]
+fn environment_reference_must_exist() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "1.0.0",
+          components: {
+            child: { manifest: "https://example.com/child", environment: "missing" },
+          },
+          environments: {
+            present: { resolvers: ["x"] },
+          },
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+    match err {
+        Error::UnknownComponentEnvironment { child, environment } => {
+            assert_eq!(child, "child");
+            assert_eq!(environment, "missing");
+        }
+        other => panic!("expected UnknownComponentEnvironment error, got: {other}"),
+    }
+}
+
+#[test]
+fn environment_extends_cycle_is_rejected() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "1.0.0",
+          environments: {
+            a: { extends: "b", resolvers: ["x"] },
+            b: { extends: "a", resolvers: ["y"] },
+          },
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+    assert!(matches!(err, Error::EnvironmentCycle { .. }));
+}
+
+#[test]
+fn environment_extends_unknown_is_rejected() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "1.0.0",
+          environments: {
+            a: { extends: "missing", resolvers: ["x"] },
+          },
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+    match err {
+        Error::UnknownEnvironmentExtends { name, extends } => {
+            assert_eq!(name, "a");
+            assert_eq!(extends, "missing");
+        }
+        other => panic!("expected UnknownEnvironmentExtends error, got: {other}"),
+    }
+}
+
+#[test]
+fn environment_duplicate_resolvers_are_rejected() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "1.0.0",
+          environments: {
+            a: { resolvers: ["x", "x"] },
+          },
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+    match err {
+        Error::DuplicateEnvironmentResolver { name, resolver } => {
+            assert_eq!(name, "a");
+            assert_eq!(resolver, "x");
+        }
+        other => panic!("expected DuplicateEnvironmentResolver error, got: {other}"),
+    }
+}
+
+#[test]
 fn manifest_ref_canonical_form_with_digest_parses() {
     let m: Manifest = r##"
         {
@@ -722,7 +831,6 @@ fn binding_source_can_be_multiplexed() {
         "##,
     );
 
-    // Fuchsia-style: a single source can be routed to multiple targets.
     raw.validate().unwrap();
 }
 

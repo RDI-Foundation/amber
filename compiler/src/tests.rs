@@ -14,11 +14,13 @@ use std::{
 };
 
 use amber_manifest::{Manifest, ManifestRef};
-use amber_resolver::{Backend, Cache, Cacheability, RemoteResolver, Resolution, Resolver};
+use amber_resolver::{
+    Backend, Cache, CacheScope, Cacheability, RemoteResolver, Resolution, Resolver,
+};
 use amber_scenario::graph;
 use url::Url;
 
-use crate::{CompileOptions, Compiler, ResolveMode};
+use crate::{CompileOptions, Compiler, ResolveMode, ResolverRegistry};
 
 fn tmp_dir(prefix: &str) -> PathBuf {
     let mut base = std::env::temp_dir();
@@ -802,4 +804,464 @@ async fn resolution_deduplicates_inflight_requests() {
 
     // The shared manifest URL should have been resolved exactly once during a single compile.
     assert_eq!(backend.call_count(), 1);
+}
+
+// ---- NEW: environments tests (compiler-level behavior) ----
+
+fn cache_root_manifest_in_default_scope(cache: &Cache, url: &Url, contents: &str) {
+    let m: Manifest = contents.parse().unwrap();
+    cache.put_arc_scoped(CacheScope::DEFAULT, url.clone(), url.clone(), Arc::new(m));
+}
+
+struct FixedBackend {
+    calls: AtomicUsize,
+    manifest: Manifest,
+}
+
+impl FixedBackend {
+    fn new(manifest: Manifest) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            manifest,
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl Backend for FixedBackend {
+    fn resolve_url<'a>(
+        &'a self,
+        url: &'a Url,
+    ) -> Pin<Box<dyn Future<Output = Result<Resolution, amber_resolver::Error>> + Send + 'a>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let url = url.clone();
+        let manifest = self.manifest.clone();
+
+        Box::pin(async move {
+            tokio::task::yield_now().await;
+            Ok(Resolution {
+                url,
+                manifest,
+                cacheability: Cacheability::ByDigestOnly,
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn resolution_environments_allow_parent_to_enable_resolvers_for_children() {
+    let dir = tmp_dir("scenario-envs");
+    let root_path = dir.join("root.json5");
+
+    // Root defines a named environment that enables the "count" resolver,
+    // and assigns both children to that environment.
+    write_file(
+        &root_path,
+        r#"
+        {
+          manifest_version: "1.0.0",
+          environments: {
+            counting: { resolvers: ["count"] },
+          },
+          components: {
+            a: { manifest: "count://same", environment: "counting" },
+            b: { manifest: "count://same", environment: "counting" },
+          }
+        }
+        "#,
+    );
+
+    let backend = Arc::new(CountingBackend::new());
+
+    // The base resolver does NOT know about the "count" scheme.
+    let base_resolver = Resolver::new();
+
+    // Provide "count" as a host-registered resolver that manifests can opt into via environments.
+    let mut registry = ResolverRegistry::new();
+    registry.insert("count", RemoteResolver::new(["count"], backend.clone()));
+
+    let compiler = Compiler::new(base_resolver, Cache::default()).with_registry(registry);
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+
+    let scenario = compiler
+        .compile(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions {
+                    mode: ResolveMode::Online,
+                    max_concurrency: 8,
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(scenario.components.len(), 3);
+
+    // The shared manifest URL should have been resolved exactly once during a single compile.
+    assert_eq!(backend.call_count(), 1);
+}
+
+#[tokio::test]
+async fn environments_unknown_resolver_is_an_error() {
+    let dir = tmp_dir("scenario-env-unknown-resolver");
+    let root_path = dir.join("root.json5");
+
+    write_file(
+        &root_path,
+        r#"
+        {
+          manifest_version: "1.0.0",
+          environments: {
+            counting: { resolvers: ["missing"] },
+          },
+          components: {
+            a: { manifest: "count://same", environment: "counting" },
+          }
+        }
+        "#,
+    );
+
+    // Empty registry: "missing" is not registered.
+    let compiler = Compiler::new(Resolver::new(), Cache::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+
+    let err = compiler
+        .compile(root_ref, CompileOptions::default())
+        .await
+        .unwrap_err();
+
+    match err {
+        crate::Error::Frontend(crate::frontend::Error::UnknownResolver {
+            environment,
+            resolver,
+            ..
+        }) => {
+            assert_eq!(environment.as_ref(), "counting");
+            assert_eq!(resolver.as_ref(), "missing");
+        }
+        other => panic!("expected UnknownResolver error, got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn environments_extends_and_override_scheme_prefers_latest_resolver() {
+    let dir = tmp_dir("scenario-env-extends-override");
+    let root_path = dir.join("root.json5");
+
+    write_file(
+        &root_path,
+        r#"
+        {
+          manifest_version: "1.0.0",
+          environments: {
+            base: { resolvers: ["a"] },
+            derived: { extends: "base", resolvers: ["b"] },
+          },
+          components: {
+            child: { manifest: "count://same", environment: "derived" },
+          }
+        }
+        "#,
+    );
+
+    let manifest_a: Manifest = r#"
+        {
+          manifest_version: "1.0.0",
+          provides: { api: { kind: "http", profile: "a" } },
+          exports: ["api"],
+        }
+    "#
+    .parse()
+    .unwrap();
+
+    let manifest_b: Manifest = r#"
+        {
+          manifest_version: "1.0.0",
+          provides: { api: { kind: "http", profile: "b" } },
+          exports: ["api"],
+        }
+    "#
+    .parse()
+    .unwrap();
+
+    let expected_digest_b = manifest_b.digest();
+
+    let backend_a = Arc::new(FixedBackend::new(manifest_a));
+    let backend_b = Arc::new(FixedBackend::new(manifest_b));
+
+    let mut registry = ResolverRegistry::new();
+    registry.insert("a", RemoteResolver::new(["count"], backend_a.clone()));
+    registry.insert("b", RemoteResolver::new(["count"], backend_b.clone()));
+
+    let compiler = Compiler::new(Resolver::new(), Cache::default()).with_registry(registry);
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+
+    let scenario = compiler
+        .compile(root_ref, CompileOptions::default())
+        .await
+        .unwrap();
+
+    // Only the derived environment's resolver should be used for scheme "count".
+    assert_eq!(backend_a.call_count(), 0);
+    assert_eq!(backend_b.call_count(), 1);
+
+    let root_component = &scenario.components[scenario.root.0];
+    let child_id = root_component.children["child"];
+    let child_component = &scenario.components[child_id.0];
+
+    assert_eq!(child_component.digest, expected_digest_b);
+}
+
+#[tokio::test]
+async fn offline_cache_is_scoped_by_environment_for_unpinned_urls() {
+    let dir = tmp_dir("scenario-env-offline-scoped");
+    let root_a_path = dir.join("root_a.json5");
+    let root_b_path = dir.join("root_b.json5");
+
+    let root_a_contents = r#"
+        {
+          manifest_version: "1.0.0",
+          environments: {
+            a: { resolvers: ["count"] },
+          },
+          components: {
+            child: { manifest: "count://same", environment: "a" },
+          }
+        }
+    "#;
+
+    // Same child URL, but different environment => different cache scope.
+    let root_b_contents = r#"
+        {
+          manifest_version: "1.0.0",
+          environments: {
+            b: { resolvers: ["count", "other"] },
+          },
+          components: {
+            child: { manifest: "count://same", environment: "b" },
+          }
+        }
+    "#;
+
+    write_file(&root_a_path, root_a_contents);
+    write_file(&root_b_path, root_b_contents);
+
+    let cache = Cache::default();
+
+    let backend_count = Arc::new(CountingBackend::new());
+    let backend_other = Arc::new(CountingBackend::new());
+
+    let mut registry = ResolverRegistry::new();
+    registry.insert(
+        "count",
+        RemoteResolver::new(["count"], backend_count.clone()),
+    );
+    registry.insert(
+        "other",
+        RemoteResolver::new(["other"], backend_other.clone()),
+    );
+
+    let compiler = Compiler::new(Resolver::new(), cache.clone()).with_registry(registry);
+
+    // Online compile of root_a resolves the child in env "a" and populates cache in env-a scope.
+    compiler
+        .compile(
+            ManifestRef::from_url(file_url(&root_a_path)),
+            CompileOptions {
+                resolve: crate::ResolveOptions {
+                    mode: ResolveMode::Online,
+                    max_concurrency: 8,
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(backend_count.call_count(), 1);
+
+    // Pre-cache root_b manifest in DEFAULT scope so offline can read root_b without touching disk.
+    let root_b_url = file_url(&root_b_path);
+    cache_root_manifest_in_default_scope(&cache, &root_b_url, root_b_contents);
+
+    // Offline compile of root_b should fail for the *child* URL (un-pinned), because env scope differs.
+    let err = compiler
+        .compile(
+            ManifestRef::from_url(root_b_url),
+            CompileOptions {
+                resolve: crate::ResolveOptions {
+                    mode: ResolveMode::Offline,
+                    max_concurrency: 8,
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+    match err {
+        crate::Error::Frontend(crate::frontend::Error::OfflineMiss(url)) => {
+            assert_eq!(url.as_str(), "count://same");
+        }
+        other => panic!("expected OfflineMiss(count://same), got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn offline_digest_pinned_can_cross_environment_scope() {
+    let dir = tmp_dir("scenario-env-offline-pinned-cross-scope");
+    let root_a_path = dir.join("root_a.json5");
+    let root_b_path = dir.join("root_b.json5");
+
+    // Child manifest is fixed; we pin its digest in root_b.
+    let child_contents = r#"{ manifest_version: "1.0.0" }"#;
+    let child_digest = child_contents.parse::<Manifest>().unwrap().digest();
+
+    let root_a_contents = r#"
+        {
+          manifest_version: "1.0.0",
+          environments: {
+            a: { resolvers: ["count"] },
+          },
+          components: {
+            child: { manifest: "count://same", environment: "a" },
+          }
+        }
+    "#;
+
+    // Different env (different scope), but child is digest-pinned.
+    let root_b_contents = format!(
+        r#"
+        {{
+          manifest_version: "1.0.0",
+          environments: {{
+            b: {{ resolvers: ["count", "other"] }},
+          }},
+          components: {{
+            child: {{
+              manifest: {{ url: "count://same", digest: "{digest}" }},
+              environment: "b",
+            }},
+          }}
+        }}
+        "#,
+        digest = child_digest.to_string()
+    );
+
+    write_file(&root_a_path, root_a_contents);
+    write_file(&root_b_path, &root_b_contents);
+
+    let cache = Cache::default();
+
+    let backend_count = Arc::new(CountingBackend::new());
+    let backend_other = Arc::new(CountingBackend::new());
+
+    let mut registry = ResolverRegistry::new();
+    registry.insert(
+        "count",
+        RemoteResolver::new(["count"], backend_count.clone()),
+    );
+    registry.insert(
+        "other",
+        RemoteResolver::new(["other"], backend_other.clone()),
+    );
+
+    let compiler = Compiler::new(Resolver::new(), cache.clone()).with_registry(registry);
+
+    // Online compile root_a: resolves child once and inserts digest entry globally.
+    compiler
+        .compile(
+            ManifestRef::from_url(file_url(&root_a_path)),
+            CompileOptions {
+                resolve: crate::ResolveOptions {
+                    mode: ResolveMode::Online,
+                    max_concurrency: 8,
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(backend_count.call_count(), 1);
+
+    // Pre-cache root_b in DEFAULT scope so offline can read it.
+    let root_b_url = file_url(&root_b_path);
+    cache_root_manifest_in_default_scope(&cache, &root_b_url, &root_b_contents);
+
+    // Offline compile root_b should succeed via global digest cache (no resolver calls).
+    let scenario = compiler
+        .compile(
+            ManifestRef::from_url(root_b_url),
+            CompileOptions {
+                resolve: crate::ResolveOptions {
+                    mode: ResolveMode::Offline,
+                    max_concurrency: 8,
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(scenario.components.len(), 2);
+
+    // Still only the one online fetch.
+    assert_eq!(backend_count.call_count(), 1);
+
+    // Ensure "other" resolver was never used.
+    assert_eq!(backend_other.call_count(), 0);
+}
+
+#[tokio::test]
+async fn inflight_requests_are_not_deduped_across_environments() {
+    let dir = tmp_dir("scenario-env-inflight-no-dedupe");
+    let root_path = dir.join("root.json5");
+
+    write_file(
+        &root_path,
+        r#"
+        {
+          manifest_version: "1.0.0",
+          environments: {
+            e1: { resolvers: ["count1"] },
+            e2: { resolvers: ["count2"] },
+          },
+          components: {
+            a: { manifest: "count://same", environment: "e1" },
+            b: { manifest: "count://same", environment: "e2" },
+          }
+        }
+        "#,
+    );
+
+    let backend = Arc::new(CountingBackend::new());
+
+    let mut registry = ResolverRegistry::new();
+    // Same scheme, same backend, but different environment scope => should resolve twice.
+    registry.insert("count1", RemoteResolver::new(["count"], backend.clone()));
+    registry.insert("count2", RemoteResolver::new(["count"], backend.clone()));
+
+    let compiler = Compiler::new(Resolver::new(), Cache::default()).with_registry(registry);
+
+    compiler
+        .compile(
+            ManifestRef::from_url(file_url(&root_path)),
+            CompileOptions {
+                resolve: crate::ResolveOptions {
+                    mode: ResolveMode::Online,
+                    max_concurrency: 8,
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(backend.call_count(), 2);
 }

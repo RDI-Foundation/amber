@@ -2,7 +2,7 @@
 mod tests;
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     io::{self, Write},
     str::FromStr,
@@ -68,6 +68,16 @@ pub enum Error {
         version: Version,
         supported_major: u64,
     },
+
+    // --- Environments (resolution environments) ---
+    #[error("environment `{name}` extends unknown environment `{extends}`")]
+    UnknownEnvironmentExtends { name: String, extends: String },
+    #[error("environment `{name}` has a cycle in `extends`")]
+    EnvironmentCycle { name: String },
+    #[error("environment `{name}` contains duplicate resolver `{resolver}`")]
+    DuplicateEnvironmentResolver { name: String, resolver: String },
+    #[error("component `#{child}` references unknown environment `{environment}`")]
+    UnknownComponentEnvironment { child: String, environment: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay)]
@@ -568,6 +578,20 @@ pub struct ProvideDecl {
     pub capability: Option<String>,
 }
 
+/// A named resolution environment, used to resolve child manifests.
+///
+/// The compiler interprets the resolver names here via an external registry (provided by the host).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct EnvironmentDecl {
+    /// Optional base environment to extend (within the same manifest).
+    #[serde(default)]
+    pub extends: Option<String>,
+    /// Names of resolvers to add (interpreted by the host/compiler).
+    #[serde(default)]
+    pub resolvers: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(untagged)]
 #[non_exhaustive]
@@ -621,6 +645,9 @@ pub struct ComponentRef {
     pub manifest: ManifestRef,
     #[serde(default)]
     pub config: Option<Value>,
+    /// Optional resolution environment name (defined in the *parent* manifest's `environments`).
+    #[serde(default)]
+    pub environment: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
@@ -803,6 +830,12 @@ pub struct RawManifest {
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
     pub components: BTreeMap<String, ComponentDecl>,
+
+    /// Optional named resolution environments for resolving child manifests.
+    #[serde_as(as = "MapPreventDuplicates<_, _>")]
+    #[serde(default)]
+    pub environments: BTreeMap<String, EnvironmentDecl>,
+
     #[serde(default)]
     pub config_schema: Option<ConfigSchema>,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
@@ -839,6 +872,9 @@ impl RawManifest {
         for name in self.components.keys() {
             ensure_name_no_dot(name, "child")?;
         }
+        for name in self.environments.keys() {
+            ensure_name_no_dot(name, "environment")?;
+        }
         for name in self.slots.keys() {
             ensure_name_no_dot(name, "slot")?;
         }
@@ -853,6 +889,72 @@ impl RawManifest {
                 ensure_name_no_dot(capability, "capability")?;
             }
         }
+
+        // Validate environments (local invariants).
+        for (env_name, env) in &self.environments {
+            if let Some(ext) = env.extends.as_deref()
+                && !self.environments.contains_key(ext)
+            {
+                return Err(Error::UnknownEnvironmentExtends {
+                    name: env_name.clone(),
+                    extends: ext.to_string(),
+                });
+            }
+
+            // Duplicate resolver names are almost certainly a bug (and can change shadowing order).
+            let mut seen = BTreeSet::new();
+            for r in &env.resolvers {
+                if !seen.insert(r.as_str()) {
+                    return Err(Error::DuplicateEnvironmentResolver {
+                        name: env_name.clone(),
+                        resolver: r.clone(),
+                    });
+                }
+            }
+        }
+
+        // Detect cycles in environment extends graph.
+        let mut state: HashMap<String, u8> = HashMap::new(); // 0/none=unvisited, 1=visiting, 2=done
+        fn dfs(
+            name: &str,
+            envs: &BTreeMap<String, EnvironmentDecl>,
+            state: &mut HashMap<String, u8>,
+        ) -> Result<(), Error> {
+            match state.get(name).copied() {
+                Some(1) => {
+                    return Err(Error::EnvironmentCycle {
+                        name: name.to_string(),
+                    });
+                }
+                Some(2) => return Ok(()),
+                _ => {}
+            }
+
+            state.insert(name.to_string(), 1);
+            if let Some(ext) = envs.get(name).and_then(|e| e.extends.as_deref()) {
+                dfs(ext, envs, state)?;
+            }
+            state.insert(name.to_string(), 2);
+            Ok(())
+        }
+
+        for name in self.environments.keys() {
+            dfs(name, &self.environments, &mut state)?;
+        }
+
+        // Validate that children referencing environments reference existing ones.
+        for (child_name, decl) in &self.components {
+            if let ComponentDecl::Object(obj) = decl
+                && let Some(env) = obj.environment.as_deref()
+                && !self.environments.contains_key(env)
+            {
+                return Err(Error::UnknownComponentEnvironment {
+                    child: child_name.clone(),
+                    environment: env.to_string(),
+                });
+            }
+        }
+
         if let Some(name) = self
             .slots
             .keys()

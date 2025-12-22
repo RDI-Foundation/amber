@@ -68,11 +68,19 @@ impl RemoteDispatch {
             .cloned()
     }
 
+    /// Return a new dispatch instance including the provided resolvers.
+    pub(super) fn with_remotes<I>(&self, resolvers: I) -> Self
+    where
+        I: IntoIterator<Item = RemoteResolver>,
+    {
+        let mut all = self.resolvers.clone();
+        all.extend(resolvers);
+        Self { resolvers: all }
+    }
+
     /// Return a new dispatch instance including the provided resolver.
     pub(super) fn with_remote(&self, resolver: RemoteResolver) -> Self {
-        let mut resolvers = self.resolvers.clone();
-        resolvers.push(resolver);
-        Self { resolvers }
+        self.with_remotes([resolver])
     }
 }
 

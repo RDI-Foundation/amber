@@ -4,7 +4,7 @@ pub mod http;
 pub mod remote;
 
 use amber_manifest::{Manifest, ManifestDigest};
-pub use cache::{Cache, CacheEntry, Cacheability};
+pub use cache::{Cache, CacheEntry, CacheScope, Cacheability};
 pub use file::FileResolver;
 pub use http::{ContentTypePolicy, HttpResolver, HttpResolverOptions};
 pub use remote::{Backend, RemoteResolver};
@@ -51,6 +51,17 @@ impl Resolver {
             file: self.file,
             http: self.http.clone(),
             remotes: self.remotes.with_remote(resolver),
+        }
+    }
+
+    pub fn with_remotes<I>(&self, resolvers: I) -> Self
+    where
+        I: IntoIterator<Item = remote::RemoteResolver>,
+    {
+        Self {
+            file: self.file,
+            http: self.http.clone(),
+            remotes: self.remotes.with_remotes(resolvers),
         }
     }
 
