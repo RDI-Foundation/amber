@@ -499,6 +499,66 @@ async fn binding_from_delegated_provide_uses_origin_component_and_name() {
 }
 
 #[tokio::test]
+async fn slot_bound_in_child_and_by_parent_is_an_error() {
+    let dir = tmp_dir("scenario-duplicate-slot-binding");
+    let root_path = dir.join("root.json5");
+    let child_path = dir.join("child.json5");
+
+    // Child exports a slot AND binds it internally. This is allowed locally.
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "1.0.0",
+          slots: { needs: { kind: "http" } },
+          provides: { internal: { kind: "http" } },
+          bindings: [
+            { to: "self.needs", from: "self.internal" },
+          ],
+          exports: ["needs"],
+        }
+        "#,
+    );
+
+    // Parent also binds into that exported slot => ambiguous fan-in, rejected by linker.
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "1.0.0",
+              components: {{
+                child: "{child}",
+              }},
+              provides: {{
+                api: {{ kind: "http" }},
+              }},
+              bindings: [
+                {{ to: "#child.needs", from: "self.api" }},
+              ],
+            }}
+            "##,
+            child = file_url(&child_path),
+        ),
+    );
+
+    let compiler = Compiler::new(Resolver::new(), Cache::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+
+    let err = compiler
+        .compile(root_ref, CompileOptions::default())
+        .await
+        .unwrap_err();
+
+    match err {
+        crate::Error::Linker(crate::linker::Error::DuplicateSlotBinding { slot, .. }) => {
+            assert_eq!(slot, "needs");
+        }
+        other => panic!("expected DuplicateSlotBinding error, got: {other}"),
+    }
+}
+
+#[tokio::test]
 async fn weak_binding_missing_child_is_an_error() {
     let dir = tmp_dir("scenario-weak-missing-child");
     let root_path = dir.join("root.json5");

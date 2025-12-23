@@ -43,6 +43,17 @@ pub enum Error {
         got: CapabilityDecl,
     },
 
+    #[error(
+        "slot `{slot}` on {to_component_path} is bound more than once (from {first_from} and \
+         {second_from})"
+    )]
+    DuplicateSlotBinding {
+        to_component_path: String,
+        slot: String,
+        first_from: String,
+        second_from: String,
+    },
+
     #[error("invalid provide delegation on {component_path}.{provide}: {message}")]
     InvalidProvideDelegation {
         component_path: String,
@@ -70,6 +81,7 @@ pub fn link(tree: ResolvedTree) -> Result<Scenario, Error> {
     }
 
     let bindings = resolve_bindings(&components)?;
+    validate_unique_slot_bindings(&components, &bindings)?;
 
     Ok(Scenario {
         root,
@@ -358,6 +370,40 @@ fn canonicalize_provide(
             _ => unreachable!("provide delegation validated earlier"),
         }
     }
+}
+
+fn validate_unique_slot_bindings(
+    components: &[Component],
+    bindings: &[BindingEdge],
+) -> Result<(), Error> {
+    let mut seen: HashMap<(ComponentId, String), ProvideRef> = HashMap::new();
+
+    for b in bindings {
+        let key = (b.to.component, b.to.name.clone());
+        if let Some(prev_from) = seen.insert(key, b.from.clone()) {
+            let to_component_path = component_path_for(components, b.to.component);
+
+            let first_from = format!(
+                "{}.{}",
+                component_path_for(components, prev_from.component),
+                prev_from.name
+            );
+            let second_from = format!(
+                "{}.{}",
+                component_path_for(components, b.from.component),
+                b.from.name
+            );
+
+            return Err(Error::DuplicateSlotBinding {
+                to_component_path,
+                slot: b.to.name.clone(),
+                first_from,
+                second_from,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn require_exported_simple(
