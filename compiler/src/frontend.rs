@@ -391,16 +391,9 @@ async fn resolve_manifest_inner(
 ) -> Result<ResolvedManifest, Error> {
     // Cache first (both modes).
     if let Some(expected) = &r.digest {
-        // Digest cache is global (safe across environments).
-        if let Some(entry) = svc.cache.get_by_digest(expected) {
-            return Ok(ResolvedManifest {
-                digest: *expected,
-                resolved_url: entry.resolved_url,
-                manifest: entry.manifest,
-            });
-        }
+        let mut mismatched_url: Option<Url> = None;
 
-        // URL cache is scoped (environment-specific).
+        // URL cache is scoped (environment-specific) and preserves per-reference provenance.
         if let Some(entry) = svc.cache.get_by_url_scoped(env.scope, &r.url) {
             let actual = entry.manifest.digest();
             if actual == *expected {
@@ -410,13 +403,23 @@ async fn resolve_manifest_inner(
                     manifest: entry.manifest,
                 });
             }
+            mismatched_url = Some(entry.resolved_url);
+        }
 
-            // Cache contains an entry for the URL (in this scope), but it does not match the pinned digest.
-            // - Offline: hard error.
-            // - Online: treat as a miss and re-resolve from the source (with digest verification).
-            if svc.mode == ResolveMode::Offline {
-                return Err(resolver::Error::MismatchedDigest(entry.resolved_url).into());
+        // Digest cache is global (safe across environments).
+        if let Some(entry) = svc.cache.get_by_digest(expected) {
+            return Ok(ResolvedManifest {
+                digest: *expected,
+                resolved_url: entry.resolved_url,
+                manifest: entry.manifest,
+            });
+        }
+
+        if svc.mode == ResolveMode::Offline {
+            if let Some(resolved_url) = mismatched_url {
+                return Err(resolver::Error::MismatchedDigest(resolved_url).into());
             }
+            return Err(Error::OfflineMiss(r.url.clone()));
         }
     } else if let Some(entry) = svc.cache.get_by_url_scoped(env.scope, &r.url) {
         return Ok(ResolvedManifest {

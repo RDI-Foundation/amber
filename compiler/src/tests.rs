@@ -798,6 +798,53 @@ async fn digest_pinned_online_ignores_mismatched_cached_url_and_refetches() {
     assert_eq!(root_component.digest, digest_v2);
 }
 
+#[tokio::test]
+async fn digest_pinned_prefers_url_scoped_cache_over_digest_cache() {
+    let cache = Cache::default();
+    let compiler = Compiler::new(Resolver::new(), cache.clone());
+
+    let manifest: Manifest = r#"{ manifest_version: "1.0.0" }"#.parse().unwrap();
+    let digest = manifest.digest();
+    let manifest = Arc::new(manifest);
+
+    let url_b = Url::parse("count://b").unwrap();
+    let url_a = Url::parse("count://a").unwrap();
+
+    cache.put_arc_scoped(
+        CacheScope::DEFAULT,
+        url_b.clone(),
+        url_b.clone(),
+        Arc::clone(&manifest),
+    );
+    cache.put_arc_scoped(
+        CacheScope::DEFAULT,
+        url_a.clone(),
+        url_a.clone(),
+        Arc::clone(&manifest),
+    );
+
+    let digest_entry = cache.get_by_digest(&digest).expect("digest entry");
+    assert_eq!(digest_entry.resolved_url, url_a);
+
+    let root_ref = ManifestRef::new(url_b.clone(), Some(digest));
+    let scenario = compiler
+        .compile(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions {
+                    mode: ResolveMode::Offline,
+                    max_concurrency: 8,
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let root_component = &scenario.components[scenario.root.0];
+    assert_eq!(root_component.resolved_url, url_b);
+}
+
 struct CountingBackend {
     calls: AtomicUsize,
 }

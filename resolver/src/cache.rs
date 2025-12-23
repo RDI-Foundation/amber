@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use amber_manifest::{Manifest, ManifestDigest};
 use dashmap::DashMap;
@@ -45,6 +45,7 @@ pub struct Cache {
 pub struct CacheEntry {
     pub resolved_url: Url,
     pub manifest: Arc<Manifest>,
+    pub observed_resolved_urls: Option<BTreeSet<Arc<str>>>,
 }
 
 #[derive(Debug, Default)]
@@ -80,13 +81,36 @@ impl Cache {
         manifest: Arc<Manifest>,
     ) {
         let digest = manifest.digest();
-        let entry = CacheEntry {
-            resolved_url,
+        let url_entry = CacheEntry {
+            resolved_url: resolved_url.clone(),
             manifest: Arc::clone(&manifest),
+            observed_resolved_urls: None,
         };
 
-        self.inner.by_url.insert((scope, url), entry.clone());
-        self.inner.by_digest.insert(digest, entry);
+        self.inner.by_url.insert((scope, url), url_entry);
+
+        let resolved_key: Arc<str> = resolved_url.as_str().into();
+        match self.inner.by_digest.entry(digest) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let entry = entry.get_mut();
+                let observed = entry
+                    .observed_resolved_urls
+                    .get_or_insert_with(BTreeSet::new);
+                observed.insert(Arc::clone(&resolved_key));
+                if resolved_url.as_str() < entry.resolved_url.as_str() {
+                    entry.resolved_url = resolved_url;
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let mut observed = BTreeSet::new();
+                observed.insert(resolved_key);
+                entry.insert(CacheEntry {
+                    resolved_url,
+                    manifest,
+                    observed_resolved_urls: Some(observed),
+                });
+            }
+        }
     }
 
     pub fn get_by_url(&self, url: &Url) -> Option<CacheEntry> {
@@ -101,5 +125,41 @@ impl Cache {
 
     pub fn get_by_digest(&self, digest: &ManifestDigest) -> Option<CacheEntry> {
         self.inner.by_digest.get(digest).map(|r| r.value().clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn digest_cache_canonicalizes_resolved_url_and_tracks_observed() {
+        let cache = Cache::default();
+        let manifest: Manifest = r#"{ manifest_version: "1.0.0" }"#.parse().unwrap();
+        let digest = manifest.digest();
+        let manifest = Arc::new(manifest);
+
+        let url_b = Url::parse("count://b").unwrap();
+        let url_a = Url::parse("count://a").unwrap();
+
+        cache.put_arc_scoped(
+            CacheScope::DEFAULT,
+            url_b.clone(),
+            url_b.clone(),
+            Arc::clone(&manifest),
+        );
+        cache.put_arc_scoped(
+            CacheScope::DEFAULT,
+            url_a.clone(),
+            url_a.clone(),
+            Arc::clone(&manifest),
+        );
+
+        let entry = cache.get_by_digest(&digest).expect("digest entry");
+        assert_eq!(entry.resolved_url.as_str(), "count://a");
+
+        let observed = entry.observed_resolved_urls.expect("observed urls");
+        assert!(observed.iter().any(|u| u.as_ref() == "count://a"));
+        assert!(observed.iter().any(|u| u.as_ref() == "count://b"));
     }
 }
