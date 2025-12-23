@@ -71,7 +71,8 @@ Unused declaration rule enforced by this crate:
 * Every declared **provide** must be either:
 
   * **exported**, or
-  * **used as a binding source from `self`** (some binding has `from: "self"` and `capability: "<name>"`)
+  * **used as a binding source from `self`** (some binding has `from: "self"` and `capability: "<name>"`), or
+  * **used as a delegation source from `self`** (some provide has `from: "self"` and `capability: "<name>"`)
 
 ### Link-time / resolution-time validation (NOT done by this crate)
 

@@ -912,6 +912,24 @@ fn unused_provide_is_rejected() {
     }
 }
 
+#[test]
+fn delegated_provide_source_is_not_unused() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "1.0.0",
+          provides: {
+            api: { kind: "http" },
+            public: { kind: "http", from: "self", capability: "api" },
+          },
+          exports: ["public"],
+        }
+        "#,
+    );
+
+    raw.validate().unwrap();
+}
+
 fn parse_raw(input: &str) -> RawManifest {
     let mut deserializer = json5::Deserializer::from_str(input).unwrap();
     serde_path_to_error::deserialize(&mut deserializer).unwrap()

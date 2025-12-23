@@ -54,7 +54,7 @@ pub enum Error {
     UnknownBindingProvide { capability: String },
     #[error("slot `{name}` must be bound or exported")]
     UnusedSlot { name: String },
-    #[error("provide `{name}` must be bound or exported")]
+    #[error("provide `{name}` must be bound, exported, or delegated")]
     UnusedProvide { name: String },
     #[error("duplicate endpoint name `{name}`")]
     DuplicateEndpointName { name: String },
@@ -1029,8 +1029,36 @@ impl RawManifest {
             }
         }
 
+        // Treat self-delegated provides as used when reachable from exports/bindings.
+        let mut used_provides: BTreeSet<&str> = BTreeSet::new();
+        let mut pending: Vec<&str> = Vec::new();
+
+        for name in &self.exports {
+            if self.provides.contains_key(name) && used_provides.insert(name.as_str()) {
+                pending.push(name.as_str());
+            }
+        }
+
+        for name in &self_bound_capabilities {
+            if used_provides.insert(name) {
+                pending.push(name);
+            }
+        }
+
+        while let Some(name) = pending.pop() {
+            let Some(provide) = self.provides.get(name) else {
+                continue;
+            };
+            if let (Some(LocalComponentRef::Self_), Some(capability)) =
+                (&provide.from, provide.capability.as_deref())
+                && used_provides.insert(capability)
+            {
+                pending.push(capability);
+            }
+        }
+
         for name in self.provides.keys() {
-            if !self.exports.contains(name) && !self_bound_capabilities.contains(name.as_str()) {
+            if !used_provides.contains(name.as_str()) {
                 return Err(Error::UnusedProvide { name: name.clone() });
             }
         }
