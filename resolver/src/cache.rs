@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::sync::Arc;
 
 use amber_manifest::{Manifest, ManifestDigest};
 use dashmap::DashMap;
@@ -41,17 +41,25 @@ pub struct Cache {
     inner: Arc<CacheInner>,
 }
 
+/// A resolved manifest result, as seen through a scoped URL alias.
 #[derive(Clone, Debug)]
 pub struct CacheEntry {
     pub resolved_url: Url,
     pub manifest: Arc<Manifest>,
-    pub observed_resolved_urls: Option<BTreeSet<Arc<str>>>,
+}
+
+#[derive(Clone, Debug)]
+struct UrlEntry {
+    resolved_url: Url,
+    digest: ManifestDigest,
 }
 
 #[derive(Debug, Default)]
 struct CacheInner {
-    by_url: DashMap<(CacheScope, Url), CacheEntry>,
-    by_digest: DashMap<ManifestDigest, CacheEntry>,
+    /// Scoped URL aliases (ephemeral / environment-sensitive).
+    by_url: DashMap<(CacheScope, Url), UrlEntry>,
+    /// Global content store by digest (the thing that becomes persistent later).
+    by_digest: DashMap<ManifestDigest, Arc<Manifest>>,
 }
 
 impl Cache {
@@ -81,36 +89,22 @@ impl Cache {
         manifest: Arc<Manifest>,
     ) {
         let digest = manifest.digest();
-        let url_entry = CacheEntry {
-            resolved_url: resolved_url.clone(),
-            manifest: Arc::clone(&manifest),
-            observed_resolved_urls: None,
-        };
 
-        self.inner.by_url.insert((scope, url), url_entry);
+        // Content store (global, de-duped by digest).
+        let _ = self
+            .inner
+            .by_digest
+            .entry(digest)
+            .or_insert_with(|| Arc::clone(&manifest));
 
-        let resolved_key: Arc<str> = resolved_url.as_str().into();
-        match self.inner.by_digest.entry(digest) {
-            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
-                let entry = entry.get_mut();
-                let observed = entry
-                    .observed_resolved_urls
-                    .get_or_insert_with(BTreeSet::new);
-                observed.insert(Arc::clone(&resolved_key));
-                if resolved_url.as_str() < entry.resolved_url.as_str() {
-                    entry.resolved_url = resolved_url;
-                }
-            }
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                let mut observed = BTreeSet::new();
-                observed.insert(resolved_key);
-                entry.insert(CacheEntry {
-                    resolved_url,
-                    manifest,
-                    observed_resolved_urls: Some(observed),
-                });
-            }
-        }
+        // Alias store (scoped, records per-reference resolved_url provenance).
+        self.inner.by_url.insert(
+            (scope, url),
+            UrlEntry {
+                resolved_url,
+                digest,
+            },
+        );
     }
 
     pub fn get_by_url(&self, url: &Url) -> Option<CacheEntry> {
@@ -120,10 +114,15 @@ impl Cache {
     pub fn get_by_url_scoped(&self, scope: CacheScope, url: &Url) -> Option<CacheEntry> {
         // DashMap doesn't support borrowed lookup for tuple keys; clone is fine here.
         let key = (scope, url.clone());
-        self.inner.by_url.get(&key).map(|r| r.value().clone())
+        let alias = self.inner.by_url.get(&key)?.value().clone();
+        let manifest = self.inner.by_digest.get(&alias.digest)?.value().clone();
+        Some(CacheEntry {
+            resolved_url: alias.resolved_url,
+            manifest,
+        })
     }
 
-    pub fn get_by_digest(&self, digest: &ManifestDigest) -> Option<CacheEntry> {
+    pub fn get_by_digest(&self, digest: &ManifestDigest) -> Option<Arc<Manifest>> {
         self.inner.by_digest.get(digest).map(|r| r.value().clone())
     }
 }
@@ -133,7 +132,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn digest_cache_canonicalizes_resolved_url_and_tracks_observed() {
+    fn alias_store_preserves_resolved_url_per_url() {
         let cache = Cache::default();
         let manifest: Manifest = r#"{ manifest_version: "1.0.0" }"#.parse().unwrap();
         let digest = manifest.digest();
@@ -155,11 +154,16 @@ mod tests {
             Arc::clone(&manifest),
         );
 
-        let entry = cache.get_by_digest(&digest).expect("digest entry");
-        assert_eq!(entry.resolved_url.as_str(), "count://a");
+        // Content store is keyed only by digest.
+        assert!(cache.get_by_digest(&digest).is_some());
 
-        let observed = entry.observed_resolved_urls.expect("observed urls");
-        assert!(observed.iter().any(|u| u.as_ref() == "count://a"));
-        assert!(observed.iter().any(|u| u.as_ref() == "count://b"));
+        // Aliases preserve per-URL resolved_url provenance.
+        let a = cache.get_by_url(&url_a).expect("url_a entry");
+        assert_eq!(a.resolved_url, url_a);
+        assert_eq!(a.manifest.digest(), digest);
+
+        let b = cache.get_by_url(&url_b).expect("url_b entry");
+        assert_eq!(b.resolved_url, url_b);
+        assert_eq!(b.manifest.digest(), digest);
     }
 }

@@ -883,9 +883,6 @@ async fn digest_pinned_prefers_url_scoped_cache_over_digest_cache() {
         Arc::clone(&manifest),
     );
 
-    let digest_entry = cache.get_by_digest(&digest).expect("digest entry");
-    assert_eq!(digest_entry.resolved_url, url_a);
-
     let root_ref = ManifestRef::new(url_b.clone(), Some(digest));
     let scenario = compiler
         .compile(

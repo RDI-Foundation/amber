@@ -410,12 +410,13 @@ async fn resolve_manifest_inner(
             mismatched_url = Some(entry.resolved_url);
         }
 
-        // Digest cache is global (safe across environments).
-        if let Some(entry) = svc.cache.get_by_digest(expected) {
+        // Digest cache is global (safe across environments) and stores only content.
+        if let Some(manifest) = svc.cache.get_by_digest(expected) {
             return Ok(ResolvedManifest {
                 digest: *expected,
-                resolved_url: entry.resolved_url,
-                manifest: entry.manifest,
+                // No scoped URL provenance when satisfied purely from digest content.
+                resolved_url: r.url.clone(),
+                manifest,
             });
         }
 
