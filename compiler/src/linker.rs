@@ -43,6 +43,12 @@ pub enum Error {
         got: CapabilityDecl,
     },
 
+    #[error("slot `{slot}` on {component_path} is not bound (non-optional slots must be filled)")]
+    UnboundSlot {
+        component_path: String,
+        slot: String,
+    },
+
     #[error(
         "slot `{slot}` on {to_component_path} is bound more than once (from {first_from} and \
          {second_from})"
@@ -82,6 +88,7 @@ pub fn link(tree: ResolvedTree) -> Result<Scenario, Error> {
 
     let bindings = resolve_bindings(&components)?;
     validate_unique_slot_bindings(&components, &bindings)?;
+    validate_all_slots_bound(&components, &bindings)?;
 
     Ok(Scenario {
         root,
@@ -370,6 +377,32 @@ fn canonicalize_provide(
             _ => unreachable!("provide delegation validated earlier"),
         }
     }
+}
+
+fn validate_all_slots_bound(
+    components: &[Component],
+    bindings: &[BindingEdge],
+) -> Result<(), Error> {
+    // Build a quick lookup of satisfied slots.
+    let mut satisfied: HashMap<(ComponentId, &str), ()> = HashMap::new();
+    for b in bindings {
+        satisfied.insert((b.to.component, b.to.name.as_str()), ());
+    }
+
+    for id in (0..components.len()).map(ComponentId) {
+        let c = &components[id.0];
+        for slot_name in c.manifest.slots.keys() {
+            if satisfied.contains_key(&(id, slot_name.as_str())) {
+                continue;
+            }
+            return Err(Error::UnboundSlot {
+                component_path: component_path_for(components, id),
+                slot: slot_name.clone(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_unique_slot_bindings(
