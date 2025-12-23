@@ -1157,7 +1157,8 @@ impl FromStr for Manifest {
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let mut deserializer = json5::Deserializer::from_str(input)?;
-        Ok(serde_path_to_error::deserialize(&mut deserializer)?)
+        let raw: RawManifest = serde_path_to_error::deserialize(&mut deserializer)?;
+        raw.validate()
     }
 }
 
