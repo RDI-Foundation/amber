@@ -10,7 +10,7 @@ use std::{
 };
 
 use base64::Engine;
-use semver::Version;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use serde_with::{DeserializeFromStr, MapPreventDuplicates, SerializeDisplay, serde_as};
@@ -62,12 +62,10 @@ pub enum Error {
     UnknownEndpoint { name: String },
     #[error("invalid config schema: {0}")]
     InvalidConfigSchema(String),
-    #[error(
-        "unsupported manifest version `{version}` (supported major version: {supported_major})"
-    )]
+    #[error("unsupported manifest version `{version}` (supported: {supported_req})")]
     UnsupportedManifestVersion {
         version: Version,
-        supported_major: u64,
+        supported_req: &'static str,
     },
 
     // --- Environments (resolution environments) ---
@@ -851,7 +849,15 @@ pub struct RawManifest {
     pub exports: BTreeSet<String>,
 }
 
-const SUPPORTED_MANIFEST_MAJOR: u64 = 1;
+const SUPPORTED_MANIFEST_VERSION_REQ: &str = "^0.1.0";
+
+fn supported_manifest_version_req() -> &'static VersionReq {
+    static REQ: OnceLock<VersionReq> = OnceLock::new();
+    REQ.get_or_init(|| {
+        VersionReq::parse(SUPPORTED_MANIFEST_VERSION_REQ)
+            .expect("supported manifest version requirement must be valid")
+    })
+}
 
 impl RawManifest {
     fn digest(&self) -> ManifestDigest {
@@ -859,10 +865,11 @@ impl RawManifest {
     }
 
     fn validate_version(&self) -> Result<(), Error> {
-        if self.manifest_version.major != SUPPORTED_MANIFEST_MAJOR {
+        let req = supported_manifest_version_req();
+        if !req.matches(&self.manifest_version) {
             return Err(Error::UnsupportedManifestVersion {
                 version: self.manifest_version.clone(),
-                supported_major: SUPPORTED_MANIFEST_MAJOR,
+                supported_req: SUPPORTED_MANIFEST_VERSION_REQ,
             });
         }
         Ok(())
@@ -1102,7 +1109,7 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn empty() -> Self {
-        Self::from_str("{manifest_version:\"1.0.0\"}").unwrap()
+        Self::from_str("{manifest_version:\"0.1.0\"}").unwrap()
     }
 
     pub fn digest(&self) -> ManifestDigest {

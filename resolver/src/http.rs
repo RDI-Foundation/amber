@@ -241,7 +241,7 @@ mod tests {
 
     #[tokio::test]
     async fn follows_redirect_and_returns_final_url() {
-        let contents = r#"{ manifest_version: "1.0.0" }"#.to_string();
+        let contents = r#"{ manifest_version: "0.1.0" }"#.to_string();
         let (url, server) = spawn_redirecting_manifest_server(contents.clone());
 
         let resolver = Resolver::new();
@@ -256,7 +256,7 @@ mod tests {
 
     #[tokio::test]
     async fn digest_mismatch_errors() {
-        let contents = r#"{ manifest_version: "1.0.0" }"#.to_string();
+        let contents = r#"{ manifest_version: "0.1.0" }"#.to_string();
         let (url, server) = spawn_redirecting_manifest_server(contents.clone());
 
         let resolver = Resolver::new();

@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn alias_store_preserves_resolved_url_per_url() {
         let cache = Cache::default();
-        let manifest: Manifest = r#"{ manifest_version: "1.0.0" }"#.parse().unwrap();
+        let manifest: Manifest = r#"{ manifest_version: "0.1.0" }"#.parse().unwrap();
         let digest = manifest.digest();
         let manifest = Arc::new(manifest);
 

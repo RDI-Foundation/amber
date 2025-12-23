@@ -76,7 +76,7 @@ mod tests {
 
     #[tokio::test]
     async fn reads_manifest() {
-        let contents = r#"{ manifest_version: "1.0.0" }"#;
+        let contents = r#"{ manifest_version: "0.1.0" }"#;
         let file = TempFile::new(contents);
         let url = file.url();
 
@@ -90,7 +90,7 @@ mod tests {
 
     #[tokio::test]
     async fn digest_mismatch_errors() {
-        let contents = r#"{ manifest_version: "1.0.0" }"#;
+        let contents = r#"{ manifest_version: "0.1.0" }"#;
         let file = TempFile::new(contents);
         let url = file.url();
 

@@ -20,7 +20,7 @@ Minimal leaf component exporting an HTTP API:
 
 ```json5
 {
-  manifest_version: "1.0.0",
+  manifest_version: "0.1.0",
   program: {
     image: "ghcr.io/acme/hello:v1",
     args: "--port 8080",
@@ -43,7 +43,7 @@ Minimal leaf component exporting an HTTP API:
 
 This crate **parses JSON5**, deserializes into Rust types, and validates:
 
-* `manifest_version` must be valid SemVer and **major version must be `1`**.
+* `manifest_version` must be valid SemVer and **satisfy `^0.1.0`**.
 * No dots (`.`) in:
 
   * child instance names (`components` keys)
@@ -93,7 +93,7 @@ Top-level object:
 
 ```json5
 {
-  manifest_version: "1.0.0",   // required
+  manifest_version: "0.1.0",   // required
 
   program: { /* ... */ },      // optional
   components: { /* ... */ },   // optional; default {}
@@ -412,7 +412,7 @@ Workaround:
 
 ```json5
 {
-  manifest_version: "1.0.0",
+  manifest_version: "0.1.0",
   program: {
     image: "ghcr.io/acme/hello:v1",
     args: "--port 8080",
@@ -431,7 +431,7 @@ Because the component expects its **parent** to supply `llm`, it must export tha
 
 ```json5
 {
-  manifest_version: "1.0.0",
+  manifest_version: "0.1.0",
   config_schema: {
     type: "object",
     properties: { domain: { type: "string" } },
@@ -460,7 +460,7 @@ This component:
 
 ```json5
 {
-  manifest_version: "1.0.0",
+  manifest_version: "0.1.0",
   program: {
     image: "docker.io/litellm/litellm:latest",
     network: {
@@ -487,7 +487,7 @@ This component:
 
 ```json5
 {
-  manifest_version: "1.0.0",
+  manifest_version: "0.1.0",
   components: {
     a: "https://registry.example.org/a/v1",
     b: "https://registry.example.org/b/v1",

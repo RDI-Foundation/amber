@@ -127,7 +127,7 @@ fn spawn_alias_cycle_manifest_server() -> (Url, std::thread::JoinHandle<()>) {
     let a_manifest = format!(
         r#"
         {{
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           components: {{
             b: "{base}/b",
           }},
@@ -138,7 +138,7 @@ fn spawn_alias_cycle_manifest_server() -> (Url, std::thread::JoinHandle<()>) {
     let b_manifest = format!(
         r#"
         {{
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           components: {{
             a: "{base}/a_alias",
           }},
@@ -191,7 +191,7 @@ async fn compile_online_then_offline_from_cache() {
         &a_path,
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           provides: { api: { kind: "http" } },
           exports: ["api"],
         }
@@ -202,7 +202,7 @@ async fn compile_online_then_offline_from_cache() {
         &b_path,
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           provides: { llm: { kind: "llm" } },
           exports: ["llm"],
         }
@@ -214,7 +214,7 @@ async fn compile_online_then_offline_from_cache() {
         &format!(
             r#"
             {{
-              manifest_version: "1.0.0",
+              manifest_version: "0.1.0",
               components: {{
                 a: "{a}",
                 b: "{b}",
@@ -276,7 +276,7 @@ async fn compile_online_then_offline_from_cache() {
 
 #[tokio::test]
 async fn compile_online_then_offline_preserves_resolved_url() {
-    let contents = r#"{ manifest_version: "1.0.0" }"#.to_string();
+    let contents = r#"{ manifest_version: "0.1.0" }"#.to_string();
     let (url, server) = spawn_redirecting_manifest_server(contents);
 
     let cache = Cache::default();
@@ -332,7 +332,7 @@ async fn binding_requires_export_on_child_slot() {
         &child_path,
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           slots: { needs: { kind: "http" } },
           provides: { internal: { kind: "http" } },
           bindings: [
@@ -348,7 +348,7 @@ async fn binding_requires_export_on_child_slot() {
         &format!(
             r##"
             {{
-              manifest_version: "1.0.0",
+              manifest_version: "0.1.0",
               components: {{
                 child: "{child}",
               }},
@@ -385,7 +385,7 @@ async fn binding_type_mismatch_is_an_error() {
         &child_path,
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           slots: { needs: { kind: "http" } },
           exports: ["needs"],
         }
@@ -397,7 +397,7 @@ async fn binding_type_mismatch_is_an_error() {
         &format!(
             r##"
             {{
-              manifest_version: "1.0.0",
+              manifest_version: "0.1.0",
               components: {{
                 child: "{child}",
               }},
@@ -435,7 +435,7 @@ async fn binding_from_delegated_provide_uses_origin_component_and_name() {
         &provider_path,
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           provides: { api: { kind: "http" } },
           exports: ["api"],
         }
@@ -446,7 +446,7 @@ async fn binding_from_delegated_provide_uses_origin_component_and_name() {
         &consumer_path,
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           slots: { needs: { kind: "http" } },
           exports: ["needs"],
         }
@@ -458,7 +458,7 @@ async fn binding_from_delegated_provide_uses_origin_component_and_name() {
         &format!(
             r##"
             {{
-              manifest_version: "1.0.0",
+              manifest_version: "0.1.0",
               components: {{
                 provider: "{provider}",
                 consumer: "{consumer}",
@@ -509,7 +509,7 @@ async fn slot_bound_in_child_and_by_parent_is_an_error() {
         &child_path,
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           slots: { needs: { kind: "http" } },
           provides: { internal: { kind: "http" } },
           bindings: [
@@ -526,7 +526,7 @@ async fn slot_bound_in_child_and_by_parent_is_an_error() {
         &format!(
             r##"
             {{
-              manifest_version: "1.0.0",
+              manifest_version: "0.1.0",
               components: {{
                 child: "{child}",
               }},
@@ -567,7 +567,7 @@ async fn weak_binding_missing_child_is_an_error() {
         &root_path,
         r##"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           slots: { needs: { kind: "http" } },
           bindings: [
             { to: "self.needs", from: "#missing.api", weak: true },
@@ -596,7 +596,7 @@ async fn weak_binding_missing_provide_is_an_error() {
         &root_path,
         r##"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           slots: { needs: { kind: "http" } },
           bindings: [
             { to: "self.needs", from: "self.missing", weak: true },
@@ -626,7 +626,7 @@ async fn config_schema_is_enforced() {
         &child_path,
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           config_schema: {
             type: "object",
             required: ["foo"],
@@ -642,7 +642,7 @@ async fn config_schema_is_enforced() {
         &format!(
             r#"
             {{
-              manifest_version: "1.0.0",
+              manifest_version: "0.1.0",
               components: {{
                 child: {{
                   manifest: "{child}",
@@ -678,7 +678,7 @@ async fn cycle_in_component_tree_is_detected() {
         &format!(
             r#"
             {{
-              manifest_version: "1.0.0",
+              manifest_version: "0.1.0",
               components: {{
                 b: "{b}",
               }},
@@ -694,7 +694,7 @@ async fn cycle_in_component_tree_is_detected() {
         &format!(
             r#"
             {{
-              manifest_version: "1.0.0",
+              manifest_version: "0.1.0",
               components: {{
                 a: "{a}",
               }},
@@ -747,7 +747,7 @@ async fn digest_pinned_offline_rejects_mismatched_cached_url() {
     let root_path = dir.join("root.json5");
     let url = file_url(&root_path);
 
-    let v1 = r#"{ manifest_version: "1.0.0" }"#;
+    let v1 = r#"{ manifest_version: "0.1.0" }"#;
     write_file(&root_path, v1);
 
     let cache = Cache::default();
@@ -774,7 +774,7 @@ async fn digest_pinned_offline_rejects_mismatched_cached_url() {
     // Pin a digest for different content.
     let v2 = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           provides: { api: { kind: "http" } },
           exports: ["api"],
         }
@@ -806,7 +806,7 @@ async fn digest_pinned_online_ignores_mismatched_cached_url_and_refetches() {
     let root_path = dir.join("root.json5");
     let url = file_url(&root_path);
 
-    let v1 = r#"{ manifest_version: "1.0.0" }"#;
+    let v1 = r#"{ manifest_version: "0.1.0" }"#;
     write_file(&root_path, v1);
 
     let cache = Cache::default();
@@ -830,7 +830,7 @@ async fn digest_pinned_online_ignores_mismatched_cached_url_and_refetches() {
     // Update the file to v2 and pin that digest.
     let v2 = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           provides: { api: { kind: "http" } },
           exports: ["api"],
         }
@@ -863,7 +863,7 @@ async fn digest_pinned_prefers_url_scoped_cache_over_digest_cache() {
     let cache = Cache::default();
     let compiler = Compiler::new(Resolver::new(), cache.clone());
 
-    let manifest: Manifest = r#"{ manifest_version: "1.0.0" }"#.parse().unwrap();
+    let manifest: Manifest = r#"{ manifest_version: "0.1.0" }"#.parse().unwrap();
     let digest = manifest.digest();
     let manifest = Arc::new(manifest);
 
@@ -930,7 +930,7 @@ impl Backend for CountingBackend {
             // Force at least one yield so sibling resolutions can overlap.
             tokio::task::yield_now().await;
 
-            let manifest: Manifest = r#"{ manifest_version: "1.0.0" }"#.parse().unwrap();
+            let manifest: Manifest = r#"{ manifest_version: "0.1.0" }"#.parse().unwrap();
             Ok(Resolution {
                 url,
                 manifest,
@@ -949,7 +949,7 @@ async fn resolution_deduplicates_inflight_requests() {
         &root_path,
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           components: {
             a: "count://same",
             b: "count://same",
@@ -1040,7 +1040,7 @@ async fn resolution_environments_allow_parent_to_enable_resolvers_for_children()
         &root_path,
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           environments: {
             counting: { resolvers: ["count"] },
           },
@@ -1093,7 +1093,7 @@ async fn environments_unknown_resolver_is_an_error() {
         &root_path,
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           environments: {
             counting: { resolvers: ["missing"] },
           },
@@ -1135,7 +1135,7 @@ async fn environments_extends_and_override_scheme_prefers_latest_resolver() {
         &root_path,
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           environments: {
             base: { resolvers: ["a"] },
             derived: { extends: "base", resolvers: ["b"] },
@@ -1149,7 +1149,7 @@ async fn environments_extends_and_override_scheme_prefers_latest_resolver() {
 
     let manifest_a: Manifest = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           provides: { api: { kind: "http", profile: "a" } },
           exports: ["api"],
         }
@@ -1159,7 +1159,7 @@ async fn environments_extends_and_override_scheme_prefers_latest_resolver() {
 
     let manifest_b: Manifest = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           provides: { api: { kind: "http", profile: "b" } },
           exports: ["api"],
         }
@@ -1203,7 +1203,7 @@ async fn offline_cache_is_scoped_by_environment_for_unpinned_urls() {
 
     let root_a_contents = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           environments: {
             a: { resolvers: ["count"] },
           },
@@ -1216,7 +1216,7 @@ async fn offline_cache_is_scoped_by_environment_for_unpinned_urls() {
     // Same child URL, but different environment => different cache scope.
     let root_b_contents = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           environments: {
             b: { resolvers: ["count", "other"] },
           },
@@ -1297,12 +1297,12 @@ async fn offline_digest_pinned_can_cross_environment_scope() {
     let root_b_path = dir.join("root_b.json5");
 
     // Child manifest is fixed; we pin its digest in root_b.
-    let child_contents = r#"{ manifest_version: "1.0.0" }"#;
+    let child_contents = r#"{ manifest_version: "0.1.0" }"#;
     let child_digest = child_contents.parse::<Manifest>().unwrap().digest();
 
     let root_a_contents = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           environments: {
             a: { resolvers: ["count"] },
           },
@@ -1316,7 +1316,7 @@ async fn offline_digest_pinned_can_cross_environment_scope() {
     let root_b_contents = format!(
         r#"
         {{
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           environments: {{
             b: {{ resolvers: ["count", "other"] }},
           }},
@@ -1405,7 +1405,7 @@ async fn inflight_requests_are_not_deduped_across_environments() {
         &root_path,
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           environments: {
             e1: { resolvers: ["count1"] },
             e2: { resolvers: ["count2"] },
@@ -1449,7 +1449,7 @@ async fn compile_is_spawnable_on_multithread_runtime() {
     let dir = tmp_dir("scenario-compile-send");
     let root_path = dir.join("root.json5");
 
-    write_file(&root_path, r#"{ manifest_version: "1.0.0" }"#);
+    write_file(&root_path, r#"{ manifest_version: "0.1.0" }"#);
     let root_ref = ManifestRef::from_url(file_url(&root_path));
 
     let compiler = Arc::new(Compiler::new(Resolver::new(), Cache::default()));

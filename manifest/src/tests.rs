@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn create_empty_manifest() {
     let manifest = Manifest::empty();
-    assert_eq!(manifest.manifest_version, Version::new(1, 0, 0));
+    assert_eq!(manifest.manifest_version, Version::new(0, 1, 0));
     assert!(manifest.program.is_none());
     assert!(manifest.components.is_empty());
     assert!(manifest.environments.is_empty());
@@ -68,11 +68,11 @@ fn interpolation_missing_closing_brace_errors() {
 }
 
 #[test]
-fn manifest_version_major_is_enforced() {
+fn manifest_version_requirement_is_enforced() {
     let raw = parse_raw(
         r#"
         {
-          manifest_version: "2.0.0",
+          manifest_version: "0.2.0",
         }
         "#,
     );
@@ -81,10 +81,10 @@ fn manifest_version_major_is_enforced() {
     match err {
         Error::UnsupportedManifestVersion {
             version,
-            supported_major,
+            supported_req,
         } => {
-            assert_eq!(version, Version::new(2, 0, 0));
-            assert_eq!(supported_major, 1);
+            assert_eq!(version, Version::new(0, 2, 0));
+            assert_eq!(supported_req, "^0.1.0");
         }
         other => panic!("expected UnsupportedManifestVersion error, got: {other}"),
     }
@@ -94,7 +94,7 @@ fn manifest_version_major_is_enforced() {
 fn program_args_string_sugar_splits() {
     let m: Manifest = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           program: { image: "x", args: "--foo ${config.bar} --baz" }
         }
         "#
@@ -112,7 +112,7 @@ fn program_args_string_sugar_splits() {
 fn binding_sugar_forms_parse() {
     let m: Manifest = r##"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           components: {
             a: "https://example.com/a",
             b: "https://example.com/b",
@@ -155,7 +155,7 @@ fn binding_sugar_forms_parse() {
 fn binding_component_refs_require_hash_for_children() {
     let err = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           bindings: [
             { to: "a.s", from: "self.c" },
           ],
@@ -171,7 +171,7 @@ fn binding_component_refs_require_hash_for_children() {
 fn binding_missing_capability_errors() {
     let err = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           bindings: [
             { to: "a", slot: "s", from: "b" }
           ],
@@ -187,7 +187,7 @@ fn binding_missing_capability_errors() {
 fn binding_dot_names_are_rejected_in_dot_form() {
     let err = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           bindings: [
             { to: "\#a.s", from: "self.c.d" },
           ],
@@ -203,7 +203,7 @@ fn binding_dot_names_are_rejected_in_dot_form() {
 fn binding_dot_names_are_rejected_in_explicit_form() {
     let err = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           bindings: [
             { to: "\#a", slot: "s.t", from: "self", capability: "c" },
           ],
@@ -219,7 +219,7 @@ fn binding_dot_names_are_rejected_in_explicit_form() {
 fn binding_child_names_cannot_contain_dots() {
     let err = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           bindings: [
             { to: "\#a.b", slot: "s", from: "self", capability: "c" },
           ],
@@ -235,7 +235,7 @@ fn binding_child_names_cannot_contain_dots() {
 fn binding_round_trip_through_canonical_json_parses() {
     let m: Manifest = r##"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           components: {
             a: "https://example.com/a",
           },
@@ -260,7 +260,7 @@ fn binding_to_self_requires_slot() {
     let raw = parse_raw(
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           components: {
             child: "https://example.com/child",
           },
@@ -283,7 +283,7 @@ fn binding_from_self_requires_provide() {
     let raw = parse_raw(
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           components: {
             child: "https://example.com/child",
           },
@@ -306,7 +306,7 @@ fn binding_child_ref_requires_component() {
     let raw = parse_raw(
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           components: {
             other: "https://example.com/other",
           },
@@ -328,7 +328,7 @@ fn binding_child_ref_requires_component() {
 fn manifest_deserialize_error_includes_path() {
     let err = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           program: {
             image: "x",
             network: { endpoints: [ { name: "endpoint", port: "80" } ] }
@@ -350,7 +350,7 @@ fn manifest_deserialize_error_includes_path() {
 fn components_sugar_parses() {
     let m: Manifest = r##"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           components: {
             a: "https://example.com/amber/pkg/v1",
             b: { manifest: "https://example.com/amber/other", config: { k: 1 } },
@@ -382,7 +382,7 @@ fn components_sugar_parses() {
 fn component_object_environment_parses() {
     let m: Manifest = r##"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           environments: {
             env: { resolvers: ["r1"] },
           },
@@ -406,7 +406,7 @@ fn environment_reference_must_exist() {
     let raw = parse_raw(
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           components: {
             child: { manifest: "https://example.com/child", environment: "missing" },
           },
@@ -431,7 +431,7 @@ fn environment_extends_cycle_is_rejected() {
     let raw = parse_raw(
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           environments: {
             a: { extends: "b", resolvers: ["x"] },
             b: { extends: "a", resolvers: ["y"] },
@@ -448,7 +448,7 @@ fn environment_extends_unknown_is_rejected() {
     let raw = parse_raw(
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           environments: {
             a: { extends: "missing", resolvers: ["x"] },
           },
@@ -470,7 +470,7 @@ fn environment_duplicate_resolvers_are_rejected() {
     let raw = parse_raw(
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           environments: {
             a: { resolvers: ["x", "x"] },
           },
@@ -491,7 +491,7 @@ fn environment_duplicate_resolvers_are_rejected() {
 fn manifest_ref_canonical_form_with_digest_parses() {
     let m: Manifest = r##"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           components: {
             a: {
               url: "https://example.com/amber/pkg/v1",
@@ -517,7 +517,7 @@ fn manifest_ref_canonical_form_with_digest_parses() {
 fn manifest_ref_invalid_digest_errors() {
     let err = r##"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           components: {
             a: { url: "https://example.com/amber/pkg/v1", digest: "sha256:not_base64" }
           }
@@ -537,7 +537,7 @@ fn manifest_ref_invalid_digest_errors() {
 fn manifest_ref_unknown_field_errors() {
     let err = r##"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           components: {
             a: {
               url: "https://example.com/amber/pkg/v1",
@@ -561,7 +561,7 @@ fn manifest_ref_unknown_field_errors() {
 fn manifest_digest_is_stable_across_json5_formatting() {
     let manifest_a = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           provides: { api: { kind: "http" } },
           exports: ["api"],
         }
@@ -577,7 +577,7 @@ fn manifest_digest_is_stable_across_json5_formatting() {
           provides: {
             api: { kind: "http" },
           },
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
         }
         "#
     .parse::<Manifest>()
@@ -592,7 +592,7 @@ fn manifest_digest_is_stable_across_json5_formatting() {
 fn endpoint_validation_fails_for_unknown_reference() {
     let err = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           program: {
             image: "x",
             network: { endpoints: [ { name: "endpoint", port: 80 } ] }
@@ -613,7 +613,7 @@ fn endpoint_validation_fails_for_unknown_reference() {
 fn duplicate_endpoint_names_error() {
     let err = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           program: {
             image: "x",
             network: {
@@ -638,7 +638,7 @@ fn duplicate_endpoint_names_error() {
 fn endpoint_validation_passes_for_defined_reference() {
     let m: Manifest = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           program: {
             image: "x",
             network: { endpoints: [ { name: "endpoint", port: 80 } ] }
@@ -674,7 +674,7 @@ fn endpoint_validation_passes_for_defined_reference() {
 fn duplicate_keys_in_components_map_errors() {
     let res: Result<Manifest, _> = r##"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           components: {
             a: "https://example.com/amber/pkg/v1",
             a: "https://example.com/amber/other/v2",
@@ -690,7 +690,7 @@ fn duplicate_keys_in_components_map_errors() {
 fn duplicate_keys_in_program_env_errors() {
     let res: Result<Manifest, _> = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           program: {
             image: "x",
             env: { FOO: "a", FOO: "b" }
@@ -706,7 +706,7 @@ fn duplicate_keys_in_program_env_errors() {
 fn child_names_cannot_contain_dots() {
     let err = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           components: {
             "a.b": "https://example.com/amber/pkg/v1",
           },
@@ -722,7 +722,7 @@ fn child_names_cannot_contain_dots() {
 fn slot_names_cannot_contain_dots() {
     let err = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           slots: {
             "llm.v1": { kind: "llm" },
           },
@@ -738,7 +738,7 @@ fn slot_names_cannot_contain_dots() {
 fn provide_names_cannot_contain_dots() {
     let err = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           provides: {
             "api.v1": { kind: "http" },
           },
@@ -754,7 +754,7 @@ fn provide_names_cannot_contain_dots() {
 fn export_names_cannot_contain_dots() {
     let err = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           exports: ["api.v1"],
         }
         "#
@@ -768,7 +768,7 @@ fn export_names_cannot_contain_dots() {
 fn provide_capability_names_cannot_contain_dots() {
     let err = r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           components: {
             child: "https://example.com/amber/pkg/v1",
           },
@@ -792,7 +792,7 @@ fn slots_and_provides_cannot_share_names() {
     let raw = parse_raw(
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           slots: { api: { kind: "http" } },
           provides: { api: { kind: "http" } },
           exports: ["api"],
@@ -812,7 +812,7 @@ fn binding_target_cannot_be_multiplexed() {
     let raw = parse_raw(
         r##"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           components: {
             a: "https://example.com/a",
             b: "https://example.com/b",
@@ -841,7 +841,7 @@ fn binding_source_can_be_multiplexed() {
     let raw = parse_raw(
         r##"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           components: {
             a: "https://example.com/a",
             b: "https://example.com/b",
@@ -881,7 +881,7 @@ fn unused_slot_is_rejected() {
     let raw = parse_raw(
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           slots: { llm: { kind: "llm" } },
         }
         "#,
@@ -899,7 +899,7 @@ fn unused_provide_is_rejected() {
     let raw = parse_raw(
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           provides: { api: { kind: "http" } },
         }
         "#,
@@ -917,7 +917,7 @@ fn delegated_provide_source_is_not_unused() {
     let raw = parse_raw(
         r#"
         {
-          manifest_version: "1.0.0",
+          manifest_version: "0.1.0",
           provides: {
             api: { kind: "http" },
             public: { kind: "http", from: "self", capability: "api" },
