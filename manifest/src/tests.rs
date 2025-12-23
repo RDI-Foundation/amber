@@ -551,18 +551,17 @@ fn manifest_ref_unknown_field_errors() {
 
 #[test]
 fn manifest_digest_is_stable_across_json5_formatting() {
-    let raw_a = parse_raw(
-        r#"
+    let manifest_a = r#"
         {
           manifest_version: "1.0.0",
           provides: { api: { kind: "http" } },
           exports: ["api"],
         }
-        "#,
-    );
+        "#
+    .parse::<Manifest>()
+    .unwrap();
 
-    let raw_b = parse_raw(
-        r#"
+    let manifest_b = r#"
         {
           exports: [
             "api",
@@ -572,11 +571,12 @@ fn manifest_digest_is_stable_across_json5_formatting() {
           },
           manifest_version: "1.0.0",
         }
-        "#,
-    );
+        "#
+    .parse::<Manifest>()
+    .unwrap();
 
-    let digest_a = raw_a.digest();
-    let digest_b = raw_b.digest();
+    let digest_a = manifest_a.digest();
+    let digest_b = manifest_b.digest();
     assert_eq!(digest_a, digest_b);
 }
 

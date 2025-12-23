@@ -6,6 +6,7 @@ use std::{
     fmt,
     io::{self, Write},
     str::FromStr,
+    sync::OnceLock,
 };
 
 use base64::Engine;
@@ -99,7 +100,7 @@ impl ManifestDigest {
         self.0
     }
 
-    pub fn digest(manifest: &RawManifest) -> Self {
+    fn digest(manifest: &RawManifest) -> Self {
         struct HashWriter<'a>(&'a mut sha2::Sha256);
 
         impl Write for HashWriter<'_> {
@@ -853,7 +854,7 @@ pub struct RawManifest {
 const SUPPORTED_MANIFEST_MAJOR: u64 = 1;
 
 impl RawManifest {
-    pub fn digest(&self) -> ManifestDigest {
+    fn digest(&self) -> ManifestDigest {
         ManifestDigest::digest(self)
     }
 
@@ -1057,19 +1058,55 @@ impl RawManifest {
             }
         }
 
-        Ok(Manifest { raw: self })
+        Ok(Manifest {
+            raw: self,
+            digest: OnceLock::new(),
+        })
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(into = "RawManifest", try_from = "RawManifest")]
 pub struct Manifest {
     raw: RawManifest,
+    digest: OnceLock<ManifestDigest>,
 }
 
 impl Manifest {
     pub fn empty() -> Self {
         Self::from_str("{manifest_version:\"1.0.0\"}").unwrap()
+    }
+
+    pub fn digest(&self) -> ManifestDigest {
+        *self.digest.get_or_init(|| self.raw.digest())
+    }
+}
+
+impl Clone for Manifest {
+    fn clone(&self) -> Self {
+        let digest = self.digest.get().copied();
+        let digest_cell = OnceLock::new();
+        if let Some(digest) = digest {
+            let _ = digest_cell.set(digest);
+        }
+        Self {
+            raw: self.raw.clone(),
+            digest: digest_cell,
+        }
+    }
+}
+
+impl PartialEq for Manifest {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+
+impl Eq for Manifest {}
+
+impl std::hash::Hash for Manifest {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.raw.hash(state);
     }
 }
 
