@@ -1446,3 +1446,24 @@ async fn inflight_requests_are_not_deduped_across_environments() {
 
     assert_eq!(backend.call_count(), 2);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compile_is_spawnable_on_multithread_runtime() {
+    let dir = tmp_dir("scenario-compile-send");
+    let root_path = dir.join("root.json5");
+
+    write_file(&root_path, r#"{ manifest_version: "1.0.0" }"#);
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+
+    let compiler = Arc::new(Compiler::new(Resolver::new(), Cache::default()));
+
+    // This fails to compile if the compile future is not Send + 'static (e.g. holding a
+    // non-Send semaphore permit across an await).
+    let handle = tokio::spawn({
+        let compiler = Arc::clone(&compiler);
+        async move { compiler.compile(root_ref, CompileOptions::default()).await }
+    });
+
+    let scenario = handle.await.unwrap().unwrap();
+    assert_eq!(scenario.components.len(), 1);
+}

@@ -201,39 +201,43 @@ async fn resolve_component(
     }
 
     let children = {
-        let children_iter = manifest.components.iter().map(|(child_name, decl)| {
-            let child_name = child_name.clone();
-            let (child_ref, child_cfg, child_env_name) = extract_component_decl(decl);
-            let svc = Arc::clone(&svc);
-            let child_stack = stack.clone();
-            let child_path_set = path_set.clone();
+        let children_futs: Vec<_> = manifest
+            .components
+            .iter()
+            .map(|(child_name, decl)| {
+                let child_name = child_name.clone();
+                let (child_ref, child_cfg, child_env_name) = extract_component_decl(decl);
+                let svc = Arc::clone(&svc);
+                let child_stack = stack.clone();
+                let child_path_set = path_set.clone();
 
-            let child_env = match child_env_name {
-                None => Arc::clone(&env),
-                Some(env_name) => env_cache.get(&env_name).cloned().unwrap_or_else(|| {
-                    // Manifest validation ensures the env exists; if it doesn't, fall back to base.
-                    // Resolution will likely fail later with UnsupportedScheme anyway.
-                    Arc::clone(&env)
-                }),
-            };
+                let child_env = match child_env_name {
+                    None => Arc::clone(&env),
+                    Some(env_name) => env_cache.get(&env_name).cloned().unwrap_or_else(|| {
+                        // Manifest validation ensures the env exists; if it doesn't, fall back to base.
+                        // Resolution will likely fail later with UnsupportedScheme anyway.
+                        Arc::clone(&env)
+                    }),
+                };
 
-            async move {
-                let child_node = resolve_component(
-                    svc,
-                    child_env,
-                    child_name.clone(),
-                    child_ref,
-                    child_cfg,
-                    child_stack,
-                    child_path_set,
-                )
-                .await?;
-                Ok::<(String, ResolvedNode), Error>((child_name, child_node))
-            }
-        });
+                async move {
+                    let child_node = resolve_component(
+                        svc,
+                        child_env,
+                        child_name.clone(),
+                        child_ref,
+                        child_cfg,
+                        child_stack,
+                        child_path_set,
+                    )
+                    .await?;
+                    Ok::<(String, ResolvedNode), Error>((child_name, child_node))
+                }
+            })
+            .collect();
 
         let mut children_stream =
-            futures::stream::iter(children_iter).buffer_unordered(svc.max_concurrency);
+            futures::stream::iter(children_futs).buffer_unordered(svc.max_concurrency);
 
         let mut children = BTreeMap::new();
         while let Some(res) = children_stream.next().await {
@@ -435,7 +439,12 @@ async fn resolve_manifest_inner(
     }
 
     // Online: resolve (concurrency-limited).
-    let _permit = svc.sem.acquire().await.expect("semaphore closed");
+    let _permit = svc
+        .sem
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("semaphore closed");
 
     let resolution = env.resolver.resolve(&r.url, r.digest).await?;
     let manifest = Arc::new(resolution.manifest);
