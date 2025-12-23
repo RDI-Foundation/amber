@@ -667,11 +667,13 @@ impl<'de> Deserialize<'de> for ConfigSchema {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[non_exhaustive]
+/// A binding wires a target slot to a source provide.
 pub struct Binding {
     pub to: LocalComponentRef,
     pub slot: String,
     pub from: LocalComponentRef,
     pub capability: String,
+    /// If true, this binding does not participate in dependency ordering or cycle detection.
     #[serde(default)]
     pub weak: bool,
 }

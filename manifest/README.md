@@ -388,7 +388,8 @@ Rules enforced by this crate:
 
 `weak`:
 
-* This crate parses and preserves `weak`, but does not implement dependency ordering or cycle checks. Treat `weak` as a hint for downstream tooling.
+* `weak: true` marks a binding as **non-ordering**: it does not participate in dependency ordering or cycle detection (i.e. weak bindings cannot create a dependency cycle), similar to `Arc` vs `Weak` in Rust.
+* This crate parses and preserves `weak`, but does not implement dependency ordering or cycle checks.
 
 ---
 
@@ -483,7 +484,9 @@ This component:
 }
 ```
 
-### 4) Weak binding flag (parsed and preserved; semantics are tooling-defined)
+### 4) Weak binding flag (non-ordering; breaks dependency cycles)
+
+In this example, `a` and `b` both bind to each other. Marking one edge as `weak: true` breaks the dependency cycle for ordering purposes while still expressing the wiring intent.
 
 ```json5
 {

@@ -12,7 +12,8 @@ pub struct CycleError {
 /// if A provides something bound into B's slot, A must come before B.
 ///
 /// Notes:
-/// - Self-bindings and weak edges are ignored for ordering.
+/// - Self-bindings are ignored.
+/// - Weak edges are ignored for ordering and cycle detection (they can point "backwards" without creating a dependency cycle).
 /// - This is intentionally separate from Scenario (graph ops live here).
 pub fn topo_order(s: &Scenario) -> Result<Vec<ComponentId>, CycleError> {
     let n = s.components.len();

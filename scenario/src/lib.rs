@@ -57,5 +57,6 @@ pub struct SlotRef {
 pub struct BindingEdge {
     pub from: ProvideRef,
     pub to: SlotRef,
+    /// If true, this edge does not participate in dependency ordering or cycle detection.
     pub weak: bool,
 }
