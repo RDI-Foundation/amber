@@ -4,6 +4,14 @@ use super::*;
 fn create_empty_manifest() {
     let manifest = Manifest::empty();
     assert_eq!(manifest.manifest_version, Version::new(1, 0, 0));
+    assert!(manifest.program.is_none());
+    assert!(manifest.components.is_empty());
+    assert!(manifest.environments.is_empty());
+    assert!(manifest.config_schema.is_none());
+    assert!(manifest.slots.is_empty());
+    assert!(manifest.provides.is_empty());
+    assert!(manifest.bindings.is_empty());
+    assert!(manifest.exports.is_empty());
 }
 
 #[test]
@@ -644,7 +652,22 @@ fn endpoint_validation_passes_for_defined_reference() {
     .parse()
     .unwrap();
 
-    let _ = m;
+    let program = m.program.as_ref().expect("program");
+    assert_eq!(program.image, "x");
+
+    let network = program.network.as_ref().expect("network");
+    assert_eq!(network.endpoints.len(), 1);
+    assert!(network.endpoints.contains(&Endpoint {
+        name: "endpoint".to_string(),
+        port: 80,
+        protocol: NetworkProtocol::Http,
+        path: "/".to_string(),
+    }));
+
+    let api = m.provides.get("api").expect("api provide");
+    assert_eq!(api.decl.kind, CapabilityKind::Http);
+    assert_eq!(api.endpoint.as_deref(), Some("endpoint"));
+    assert!(m.exports.contains("api"));
 }
 
 #[test]
@@ -831,7 +854,26 @@ fn binding_source_can_be_multiplexed() {
         "##,
     );
 
-    raw.validate().unwrap();
+    let m = raw.validate().unwrap();
+
+    let expected = BTreeSet::from([
+        Binding {
+            to: LocalComponentRef::Child("a".to_string()),
+            slot: "s1".to_string(),
+            from: LocalComponentRef::Child("b".to_string()),
+            capability: "c".to_string(),
+            weak: false,
+        },
+        Binding {
+            to: LocalComponentRef::Child("a".to_string()),
+            slot: "s2".to_string(),
+            from: LocalComponentRef::Child("b".to_string()),
+            capability: "c".to_string(),
+            weak: false,
+        },
+    ]);
+
+    assert_eq!(m.bindings, expected);
 }
 
 #[test]
