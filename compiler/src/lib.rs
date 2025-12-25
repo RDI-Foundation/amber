@@ -10,7 +10,7 @@ mod frontend;
 mod linker;
 
 pub use environment::ResolverRegistry;
-pub use frontend::{ResolveMode, ResolveOptions};
+pub use frontend::ResolveOptions;
 
 #[derive(Clone, Debug, Default)]
 pub struct CompileOptions {

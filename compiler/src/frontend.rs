@@ -12,22 +12,14 @@ use url::Url;
 
 use crate::ResolverRegistry;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ResolveMode {
-    Online,
-    Offline,
-}
-
 #[derive(Clone, Debug)]
 pub struct ResolveOptions {
-    pub mode: ResolveMode,
     pub max_concurrency: usize,
 }
 
 impl Default for ResolveOptions {
     fn default() -> Self {
         Self {
-            mode: ResolveMode::Online,
             max_concurrency: 64,
         }
     }
@@ -38,8 +30,6 @@ impl Default for ResolveOptions {
 pub enum Error {
     #[error(transparent)]
     Resolver(#[from] resolver::Error),
-    #[error("offline mode: manifest not found in cache: {0}")]
-    OfflineMiss(Url),
     #[error("component tree contains a cycle: {cycle:?}")]
     Cycle { cycle: Vec<Url> },
 
@@ -108,7 +98,6 @@ impl ResolveEnv {
 
 struct ResolveService {
     cache: Cache,
-    mode: ResolveMode,
     max_concurrency: usize,
     sem: Arc<Semaphore>,
     inflight: dashmap::DashMap<InflightKey, Arc<OnceCell<ResolvedManifest>>>,
@@ -132,7 +121,6 @@ pub async fn resolve_tree(
     let max = opts.max_concurrency.max(1);
     let svc = Arc::new(ResolveService {
         cache,
-        mode: opts.mode,
         max_concurrency: max,
         sem: Arc::new(Semaphore::new(max)),
         inflight: dashmap::DashMap::new(),
@@ -393,10 +381,8 @@ async fn resolve_manifest_inner(
     env: &ResolveEnv,
     r: &ManifestRef,
 ) -> Result<ResolvedManifest, Error> {
-    // Cache first (both modes).
+    // Cache first.
     if let Some(expected) = &r.digest {
-        let mut mismatched_url: Option<Url> = None;
-
         // URL cache is scoped (environment-specific) and preserves per-reference provenance.
         if let Some(entry) = svc.cache.get_by_url_scoped(env.scope, &r.url) {
             let actual = entry.manifest.digest();
@@ -407,7 +393,6 @@ async fn resolve_manifest_inner(
                     manifest: entry.manifest,
                 });
             }
-            mismatched_url = Some(entry.resolved_url);
         }
 
         // Digest cache is global (safe across environments) and stores only content.
@@ -419,13 +404,6 @@ async fn resolve_manifest_inner(
                 manifest,
             });
         }
-
-        if svc.mode == ResolveMode::Offline {
-            if let Some(resolved_url) = mismatched_url {
-                return Err(resolver::Error::MismatchedDigest(resolved_url).into());
-            }
-            return Err(Error::OfflineMiss(r.url.clone()));
-        }
     } else if let Some(entry) = svc.cache.get_by_url_scoped(env.scope, &r.url) {
         return Ok(ResolvedManifest {
             digest: entry.manifest.digest(),
@@ -434,12 +412,7 @@ async fn resolve_manifest_inner(
         });
     }
 
-    // Offline: no fallback.
-    if svc.mode == ResolveMode::Offline {
-        return Err(Error::OfflineMiss(r.url.clone()));
-    }
-
-    // Online: resolve (concurrency-limited).
+    // Resolve (concurrency-limited).
     let _permit = svc
         .sem
         .clone()

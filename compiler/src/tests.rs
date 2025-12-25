@@ -20,7 +20,7 @@ use amber_resolver::{
 use amber_scenario::graph;
 use url::Url;
 
-use crate::{CompileOptions, Compiler, ResolveMode, ResolverRegistry};
+use crate::{CompileOptions, Compiler, ResolverRegistry};
 
 fn tmp_dir(prefix: &str) -> PathBuf {
     let mut base = std::env::temp_dir();
@@ -181,7 +181,7 @@ fn spawn_alias_cycle_manifest_server() -> (Url, std::thread::JoinHandle<()>) {
 }
 
 #[tokio::test]
-async fn compile_online_then_offline_from_cache() {
+async fn compile_twice_uses_cache_when_sources_removed() {
     let dir = tmp_dir("scenario-compile");
     let root_path = dir.join("root.json5");
     let a_path = dir.join("a.json5");
@@ -231,16 +231,12 @@ async fn compile_online_then_offline_from_cache() {
 
     let root_ref = ManifestRef::from_url(file_url(&root_path));
 
-    // Online compile fills cache.
+    // First compile fills cache.
     let scenario = compiler
         .compile(
             root_ref.clone(),
             CompileOptions {
-                resolve: crate::ResolveOptions {
-                    mode: ResolveMode::Online,
-                    max_concurrency: 8,
-                },
-                ..Default::default()
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
             },
         )
         .await
@@ -248,7 +244,7 @@ async fn compile_online_then_offline_from_cache() {
 
     assert_eq!(scenario.components.len(), 3);
 
-    // Remove files; offline must rely on cache.
+    // Remove files; second compile must rely on cache.
     fs::remove_file(&root_path).unwrap();
     fs::remove_file(&a_path).unwrap();
     fs::remove_file(&b_path).unwrap();
@@ -257,11 +253,7 @@ async fn compile_online_then_offline_from_cache() {
         .compile(
             root_ref,
             CompileOptions {
-                resolve: crate::ResolveOptions {
-                    mode: ResolveMode::Offline,
-                    max_concurrency: 8,
-                },
-                ..Default::default()
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
             },
         )
         .await
@@ -275,7 +267,7 @@ async fn compile_online_then_offline_from_cache() {
 }
 
 #[tokio::test]
-async fn compile_online_then_offline_preserves_resolved_url() {
+async fn compile_twice_preserves_resolved_url_from_cache() {
     let contents = r#"{ manifest_version: "0.1.0" }"#.to_string();
     let (url, server) = spawn_redirecting_manifest_server(contents);
 
@@ -287,11 +279,7 @@ async fn compile_online_then_offline_preserves_resolved_url() {
         .compile(
             root_ref.clone(),
             CompileOptions {
-                resolve: crate::ResolveOptions {
-                    mode: ResolveMode::Online,
-                    max_concurrency: 8,
-                },
-                ..Default::default()
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
             },
         )
         .await
@@ -306,11 +294,7 @@ async fn compile_online_then_offline_preserves_resolved_url() {
         .compile(
             root_ref,
             CompileOptions {
-                resolve: crate::ResolveOptions {
-                    mode: ResolveMode::Offline,
-                    max_concurrency: 8,
-                },
-                ..Default::default()
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
             },
         )
         .await
@@ -726,11 +710,7 @@ async fn cycle_is_detected_across_url_aliases_with_same_digest() {
         .compile(
             root_ref,
             CompileOptions {
-                resolve: crate::ResolveOptions {
-                    mode: ResolveMode::Online,
-                    max_concurrency: 8,
-                },
-                ..Default::default()
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
             },
         )
         .await
@@ -742,67 +722,8 @@ async fn cycle_is_detected_across_url_aliases_with_same_digest() {
 }
 
 #[tokio::test]
-async fn digest_pinned_offline_rejects_mismatched_cached_url() {
-    let dir = tmp_dir("scenario-digest-offline-mismatch");
-    let root_path = dir.join("root.json5");
-    let url = file_url(&root_path);
-
-    let v1 = r#"{ manifest_version: "0.1.0" }"#;
-    write_file(&root_path, v1);
-
-    let cache = Cache::default();
-    let compiler = Compiler::new(Resolver::new(), cache);
-
-    // First compile caches v1 by URL.
-    compiler
-        .compile(
-            ManifestRef::from_url(url.clone()),
-            CompileOptions {
-                resolve: crate::ResolveOptions {
-                    mode: ResolveMode::Online,
-                    max_concurrency: 8,
-                },
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-    // Remove the file to ensure offline depends solely on the cache.
-    fs::remove_file(&root_path).unwrap();
-
-    // Pin a digest for different content.
-    let v2 = r#"
-        {
-          manifest_version: "0.1.0",
-          provides: { api: { kind: "http" } },
-          exports: ["api"],
-        }
-    "#;
-    let digest_v2 = v2.parse::<Manifest>().unwrap().digest();
-    let pinned = ManifestRef::new(url, Some(digest_v2));
-
-    // Offline resolution must *not* accept the URL-cached manifest (v1) when digest is pinned.
-    let err = compiler
-        .compile(
-            pinned,
-            CompileOptions {
-                resolve: crate::ResolveOptions {
-                    mode: ResolveMode::Offline,
-                    max_concurrency: 8,
-                },
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap_err();
-
-    assert!(err.to_string().contains("mismatched digest"));
-}
-
-#[tokio::test]
-async fn digest_pinned_online_ignores_mismatched_cached_url_and_refetches() {
-    let dir = tmp_dir("scenario-digest-online-refetch");
+async fn digest_pinned_ignores_mismatched_cached_url_and_refetches() {
+    let dir = tmp_dir("scenario-digest-refetch");
     let root_path = dir.join("root.json5");
     let url = file_url(&root_path);
 
@@ -817,11 +738,7 @@ async fn digest_pinned_online_ignores_mismatched_cached_url_and_refetches() {
         .compile(
             ManifestRef::from_url(url.clone()),
             CompileOptions {
-                resolve: crate::ResolveOptions {
-                    mode: ResolveMode::Online,
-                    max_concurrency: 8,
-                },
-                ..Default::default()
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
             },
         )
         .await
@@ -839,16 +756,12 @@ async fn digest_pinned_online_ignores_mismatched_cached_url_and_refetches() {
     let digest_v2 = v2.parse::<Manifest>().unwrap().digest();
     let pinned = ManifestRef::new(url.clone(), Some(digest_v2));
 
-    // Online resolution should treat the mismatched URL-cache entry as a miss and re-resolve.
+    // Resolution should treat the mismatched URL-cache entry as a miss and re-resolve.
     let scenario = compiler
         .compile(
             pinned,
             CompileOptions {
-                resolve: crate::ResolveOptions {
-                    mode: ResolveMode::Online,
-                    max_concurrency: 8,
-                },
-                ..Default::default()
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
             },
         )
         .await
@@ -888,11 +801,7 @@ async fn digest_pinned_prefers_url_scoped_cache_over_digest_cache() {
         .compile(
             root_ref,
             CompileOptions {
-                resolve: crate::ResolveOptions {
-                    mode: ResolveMode::Offline,
-                    max_concurrency: 8,
-                },
-                ..Default::default()
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
             },
         )
         .await
@@ -968,11 +877,7 @@ async fn resolution_deduplicates_inflight_requests() {
         .compile(
             root_ref,
             CompileOptions {
-                resolve: crate::ResolveOptions {
-                    mode: ResolveMode::Online,
-                    max_concurrency: 8,
-                },
-                ..Default::default()
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
             },
         )
         .await
@@ -985,11 +890,6 @@ async fn resolution_deduplicates_inflight_requests() {
 }
 
 // ---- NEW: environments tests (compiler-level behavior) ----
-
-fn cache_root_manifest_in_default_scope(cache: &Cache, url: &Url, contents: &str) {
-    let m: Manifest = contents.parse().unwrap();
-    cache.put_arc_scoped(CacheScope::DEFAULT, url.clone(), url.clone(), Arc::new(m));
-}
 
 struct FixedBackend {
     calls: AtomicUsize,
@@ -1068,11 +968,7 @@ async fn resolution_environments_allow_parent_to_enable_resolvers_for_children()
         .compile(
             root_ref,
             CompileOptions {
-                resolve: crate::ResolveOptions {
-                    mode: ResolveMode::Online,
-                    max_concurrency: 8,
-                },
-                ..Default::default()
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
             },
         )
         .await
@@ -1196,8 +1092,8 @@ async fn environments_extends_and_override_scheme_prefers_latest_resolver() {
 }
 
 #[tokio::test]
-async fn offline_cache_is_scoped_by_environment_for_unpinned_urls() {
-    let dir = tmp_dir("scenario-env-offline-scoped");
+async fn url_cache_is_scoped_by_environment_for_unpinned_urls() {
+    let dir = tmp_dir("scenario-env-url-cache-scoped");
     let root_a_path = dir.join("root_a.json5");
     let root_b_path = dir.join("root_b.json5");
 
@@ -1246,16 +1142,12 @@ async fn offline_cache_is_scoped_by_environment_for_unpinned_urls() {
 
     let compiler = Compiler::new(Resolver::new(), cache.clone()).with_registry(registry);
 
-    // Online compile of root_a resolves the child in env "a" and populates cache in env-a scope.
+    // Compile root_a: resolves the child in env "a" and populates cache in env-a scope.
     compiler
         .compile(
             ManifestRef::from_url(file_url(&root_a_path)),
             CompileOptions {
-                resolve: crate::ResolveOptions {
-                    mode: ResolveMode::Online,
-                    max_concurrency: 8,
-                },
-                ..Default::default()
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
             },
         )
         .await
@@ -1263,36 +1155,25 @@ async fn offline_cache_is_scoped_by_environment_for_unpinned_urls() {
 
     assert_eq!(backend_count.call_count(), 1);
 
-    // Pre-cache root_b manifest in DEFAULT scope so offline can read root_b without touching disk.
-    let root_b_url = file_url(&root_b_path);
-    cache_root_manifest_in_default_scope(&cache, &root_b_url, root_b_contents);
-
-    // Offline compile of root_b should fail for the *child* URL (un-pinned), because env scope differs.
-    let err = compiler
+    // Compile root_b: same child URL, but different environment => different cache scope.
+    let scenario_b = compiler
         .compile(
-            ManifestRef::from_url(root_b_url),
+            ManifestRef::from_url(file_url(&root_b_path)),
             CompileOptions {
-                resolve: crate::ResolveOptions {
-                    mode: ResolveMode::Offline,
-                    max_concurrency: 8,
-                },
-                ..Default::default()
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
             },
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
-    match err {
-        crate::Error::Frontend(crate::frontend::Error::OfflineMiss(url)) => {
-            assert_eq!(url.as_str(), "count://same");
-        }
-        other => panic!("expected OfflineMiss(count://same), got: {other}"),
-    }
+    assert_eq!(scenario_b.components.len(), 2);
+    assert_eq!(backend_count.call_count(), 2);
+    assert_eq!(backend_other.call_count(), 0);
 }
 
 #[tokio::test]
-async fn offline_digest_pinned_can_cross_environment_scope() {
-    let dir = tmp_dir("scenario-env-offline-pinned-cross-scope");
+async fn digest_pinned_can_cross_environment_scope() {
+    let dir = tmp_dir("scenario-env-digest-cross-scope");
     let root_a_path = dir.join("root_a.json5");
     let root_b_path = dir.join("root_b.json5");
 
@@ -1328,7 +1209,7 @@ async fn offline_digest_pinned_can_cross_environment_scope() {
           }}
         }}
         "#,
-        digest = child_digest.to_string()
+        digest = child_digest
     );
 
     write_file(&root_a_path, root_a_contents);
@@ -1351,16 +1232,12 @@ async fn offline_digest_pinned_can_cross_environment_scope() {
 
     let compiler = Compiler::new(Resolver::new(), cache.clone()).with_registry(registry);
 
-    // Online compile root_a: resolves child once and inserts digest entry globally.
+    // Compile root_a: resolves child once and inserts digest entry globally.
     compiler
         .compile(
             ManifestRef::from_url(file_url(&root_a_path)),
             CompileOptions {
-                resolve: crate::ResolveOptions {
-                    mode: ResolveMode::Online,
-                    max_concurrency: 8,
-                },
-                ..Default::default()
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
             },
         )
         .await
@@ -1368,20 +1245,12 @@ async fn offline_digest_pinned_can_cross_environment_scope() {
 
     assert_eq!(backend_count.call_count(), 1);
 
-    // Pre-cache root_b in DEFAULT scope so offline can read it.
-    let root_b_url = file_url(&root_b_path);
-    cache_root_manifest_in_default_scope(&cache, &root_b_url, &root_b_contents);
-
-    // Offline compile root_b should succeed via global digest cache (no resolver calls).
+    // Compile root_b should succeed via global digest cache (no resolver calls).
     let scenario = compiler
         .compile(
-            ManifestRef::from_url(root_b_url),
+            ManifestRef::from_url(file_url(&root_b_path)),
             CompileOptions {
-                resolve: crate::ResolveOptions {
-                    mode: ResolveMode::Offline,
-                    max_concurrency: 8,
-                },
-                ..Default::default()
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
             },
         )
         .await
@@ -1389,7 +1258,7 @@ async fn offline_digest_pinned_can_cross_environment_scope() {
 
     assert_eq!(scenario.components.len(), 2);
 
-    // Still only the one online fetch.
+    // Still only the initial fetch.
     assert_eq!(backend_count.call_count(), 1);
 
     // Ensure "other" resolver was never used.
@@ -1431,11 +1300,7 @@ async fn inflight_requests_are_not_deduped_across_environments() {
         .compile(
             ManifestRef::from_url(file_url(&root_path)),
             CompileOptions {
-                resolve: crate::ResolveOptions {
-                    mode: ResolveMode::Online,
-                    max_concurrency: 8,
-                },
-                ..Default::default()
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
             },
         )
         .await
