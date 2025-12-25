@@ -1,16 +1,18 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    hash::{Hash as _, Hasher as _},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
 use amber_manifest::{ComponentDecl, Manifest, ManifestDigest, ManifestRef};
-use amber_resolver::{self as resolver, Cache, CacheScope, RemoteResolver, Resolver};
+use amber_resolver::{self as resolver, RemoteResolver, Resolver};
 use futures::stream::StreamExt;
 use tokio::sync::{OnceCell, Semaphore};
 use url::Url;
 
-use crate::ResolverRegistry;
+use crate::{DigestStore, ResolverRegistry};
 
 #[derive(Clone, Debug)]
 pub struct ResolveOptions {
@@ -52,79 +54,61 @@ pub struct ResolvedTree {
 pub struct ResolvedNode {
     pub name: String,
     pub declared_ref: ManifestRef,
-    pub resolved_url: Url,
     pub digest: ManifestDigest,
-    pub manifest: Arc<Manifest>,
+    pub observed_url: Option<Url>,
     pub config: Option<serde_json::Value>,
     pub children: BTreeMap<String, ResolvedNode>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum ResolveKey {
-    Digest(ManifestDigest),
-    Url(Url),
-}
-
-impl ResolveKey {
-    fn from_ref(r: &ManifestRef) -> Self {
-        if let Some(d) = &r.digest {
-            ResolveKey::Digest(*d)
-        } else {
-            ResolveKey::Url(r.url.clone())
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct InflightKey {
-    scope: CacheScope,
-    key: ResolveKey,
-}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct EnvId(u32);
 
 #[derive(Clone)]
 struct ResolveEnv {
-    scope: CacheScope,
+    id: EnvId,
     resolver: Arc<Resolver>,
 }
 
 impl ResolveEnv {
     fn root(resolver: Resolver) -> Self {
         Self {
-            scope: CacheScope::DEFAULT,
+            id: EnvId(0),
             resolver: Arc::new(resolver),
         }
     }
 }
 
-struct ResolveService {
-    cache: Cache,
-    max_concurrency: usize,
-    sem: Arc<Semaphore>,
-    inflight: dashmap::DashMap<InflightKey, Arc<OnceCell<ResolvedManifest>>>,
-    registry: ResolverRegistry,
-}
-
 #[derive(Clone, Debug)]
 struct ResolvedManifest {
     manifest: Arc<Manifest>,
-    resolved_url: Url,
     digest: ManifestDigest,
+    observed_url: Option<Url>,
+}
+
+struct ResolveService {
+    store: DigestStore,
+    max_concurrency: usize,
+    sem: Arc<Semaphore>,
+    inflight: dashmap::DashMap<(EnvId, Url), Arc<OnceCell<ResolvedManifest>>>,
+    registry: ResolverRegistry,
+    next_env_id: AtomicU32,
 }
 
 pub async fn resolve_tree(
     resolver: Resolver,
-    cache: Cache,
+    store: DigestStore,
     registry: ResolverRegistry,
     root: ManifestRef,
     opts: ResolveOptions,
 ) -> Result<ResolvedTree, Error> {
     let max = opts.max_concurrency.max(1);
     let svc = Arc::new(ResolveService {
-        cache,
+        store,
         max_concurrency: max,
         sem: Arc::new(Semaphore::new(max)),
         inflight: dashmap::DashMap::new(),
         registry,
+        next_env_id: AtomicU32::new(1),
     });
 
     let root_env = Arc::new(ResolveEnv::root(resolver));
@@ -139,6 +123,7 @@ pub async fn resolve_tree(
         HashSet::new(),
     )
     .await?;
+
     Ok(ResolvedTree { root: node })
 }
 
@@ -151,15 +136,13 @@ async fn resolve_component(
     mut stack: Vec<Url>,
     mut path_set: HashSet<ManifestDigest>,
 ) -> Result<ResolvedNode, Error> {
-    // Resolve first so we can detect cycles by stable identity (digest), even across URL aliasing.
     let resolved = resolve_manifest(&svc, &env, &declared_ref).await?;
     let ResolvedManifest {
         manifest,
-        resolved_url,
         digest,
+        observed_url,
     } = resolved;
 
-    // Cycle detection by digest along the current path.
     if path_set.contains(&digest) {
         stack.push(declared_ref.url.clone());
         return Err(Error::Cycle { cycle: stack });
@@ -167,80 +150,75 @@ async fn resolve_component(
     path_set.insert(digest);
     stack.push(declared_ref.url.clone());
 
-    // Build only the environments that are actually referenced by children in this realm.
     let referenced_envs: HashSet<String> = manifest
         .components
         .values()
         .filter_map(component_decl_environment)
         .collect();
 
+    let realm_url = observed_url.as_ref().unwrap_or(&declared_ref.url);
+
     let mut env_cache: HashMap<String, Arc<ResolveEnv>> = HashMap::new();
     for env_name in &referenced_envs {
-        // Populate env_cache (memoized) so child resolution is cheap.
         let _ = compute_environment(
             &svc,
             &env,
             &manifest,
-            &resolved_url,
+            realm_url,
             env_name,
             &mut env_cache,
             &mut HashSet::new(),
         )?;
     }
 
-    let children = {
-        let children_futs: Vec<_> = manifest
-            .components
-            .iter()
-            .map(|(child_name, decl)| {
-                let child_name = child_name.clone();
-                let (child_ref, child_cfg, child_env_name) = extract_component_decl(decl);
-                let svc = Arc::clone(&svc);
-                let child_stack = stack.clone();
-                let child_path_set = path_set.clone();
+    let children_futs: Vec<_> = manifest
+        .components
+        .iter()
+        .map(|(child_name, decl)| {
+            let child_name = child_name.clone();
+            let (child_ref, child_cfg, child_env_name) = extract_component_decl(decl);
+            let svc = Arc::clone(&svc);
+            let child_stack = stack.clone();
+            let child_path_set = path_set.clone();
 
-                let child_env = match child_env_name {
-                    None => Arc::clone(&env),
-                    Some(env_name) => env_cache.get(&env_name).cloned().unwrap_or_else(|| {
-                        // Manifest validation ensures the env exists; if it doesn't, fall back to base.
-                        // Resolution will likely fail later with UnsupportedScheme anyway.
-                        Arc::clone(&env)
-                    }),
-                };
+            let child_env = match child_env_name {
+                None => Arc::clone(&env),
+                Some(env_name) => env_cache
+                    .get(&env_name)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::clone(&env)),
+            };
 
-                async move {
-                    let child_node = resolve_component(
-                        svc,
-                        child_env,
-                        child_name.clone(),
-                        child_ref,
-                        child_cfg,
-                        child_stack,
-                        child_path_set,
-                    )
-                    .await?;
-                    Ok::<(String, ResolvedNode), Error>((child_name, child_node))
-                }
-            })
-            .collect();
+            async move {
+                let child_node = resolve_component(
+                    svc,
+                    child_env,
+                    child_name.clone(),
+                    child_ref,
+                    child_cfg,
+                    child_stack,
+                    child_path_set,
+                )
+                .await?;
+                Ok::<(String, ResolvedNode), Error>((child_name, child_node))
+            }
+        })
+        .collect();
 
-        let mut children_stream =
-            futures::stream::iter(children_futs).buffer_unordered(svc.max_concurrency);
+    let mut children_stream =
+        futures::stream::iter(children_futs).buffer_unordered(svc.max_concurrency);
 
-        let mut children = BTreeMap::new();
-        while let Some(res) = children_stream.next().await {
-            let (child_name, child_node) = res?;
-            children.insert(child_name, child_node);
-        }
-        children
-    };
+    let mut children = BTreeMap::new();
+    while let Some(res) = children_stream.next().await {
+        let (child_name, child_node) = res?;
+        children.insert(child_name, child_node);
+    }
 
     Ok(ResolvedNode {
         name,
         declared_ref,
-        resolved_url,
         digest,
-        manifest,
+        observed_url,
         config,
         children,
     })
@@ -264,18 +242,6 @@ fn extract_component_decl(
     }
 }
 
-/// Compute a child resolution environment (memoized by `env_cache`) for a named environment.
-///
-/// Semantics:
-/// - `base_env` is the realm's inherited environment (the one used to resolve this realm).
-/// - A named environment extends either:
-///   - `base_env` (if `extends` is None), or
-///   - another named environment (within this manifest), recursively.
-/// - The environment adds remote resolvers by name (looked up via the host registry).
-///
-/// Performance:
-/// - Memoized per realm instance, per referenced name.
-/// - Adds all remotes in one `Resolver::with_remotes` call to avoid repeated cloning.
 fn compute_environment(
     svc: &ResolveService,
     base_env: &Arc<ResolveEnv>,
@@ -289,14 +255,11 @@ fn compute_environment(
         return Ok(Arc::clone(e));
     }
 
-    // Defensive cycle check; RawManifest validation should already reject this.
     if !visiting.insert(env_name.to_string()) {
-        // Fall back to base env; cycle is a manifest bug.
         return Ok(Arc::clone(base_env));
     }
 
     let Some(env_decl) = manifest.environments.get(env_name) else {
-        // Manifest validation should prevent this; just fall back.
         visiting.remove(env_name);
         return Ok(Arc::clone(base_env));
     };
@@ -307,7 +270,6 @@ fn compute_environment(
         Arc::clone(base_env)
     };
 
-    // Translate resolver names into actual remote resolvers using the registry.
     let mut remotes: Vec<RemoteResolver> = Vec::with_capacity(env_decl.resolvers.len());
     for resolver_name in &env_decl.resolvers {
         let Some(r) = svc.registry.get(resolver_name.as_str()) else {
@@ -320,18 +282,17 @@ fn compute_environment(
         remotes.push(r);
     }
 
-    // If this environment adds nothing, treat it as an alias for its parent environment.
     if remotes.is_empty() {
         env_cache.insert(env_name.to_string(), Arc::clone(&parent_env));
         visiting.remove(env_name);
         return Ok(parent_env);
     }
 
-    let scope = derive_scope(parent_env.scope, env_name, &env_decl.resolvers);
     let new_resolver = parent_env.resolver.as_ref().with_remotes(remotes);
+    let id = EnvId(svc.next_env_id.fetch_add(1, Ordering::Relaxed));
 
     let out = Arc::new(ResolveEnv {
-        scope,
+        id,
         resolver: Arc::new(new_resolver),
     });
 
@@ -340,29 +301,22 @@ fn compute_environment(
     Ok(out)
 }
 
-fn derive_scope(base: CacheScope, env_name: &str, resolver_names: &[String]) -> CacheScope {
-    // Must be deterministic within a process; does not need to be stable across processes
-    // until the cache becomes persistent.
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    "amber-env-v1".hash(&mut h);
-    base.id().hash(&mut h);
-    env_name.hash(&mut h);
-    for r in resolver_names {
-        r.hash(&mut h);
-    }
-    CacheScope::new(h.finish())
-}
-
 async fn resolve_manifest(
     svc: &ResolveService,
     env: &ResolveEnv,
     r: &ManifestRef,
 ) -> Result<ResolvedManifest, Error> {
-    let key = InflightKey {
-        scope: env.scope,
-        key: ResolveKey::from_ref(r),
-    };
+    if let Some(expected) = r.digest
+        && let Some(manifest) = svc.store.get(&expected)
+    {
+        return Ok(ResolvedManifest {
+            manifest,
+            digest: expected,
+            observed_url: None,
+        });
+    }
 
+    let key = (env.id, r.url.clone());
     let cell = svc
         .inflight
         .entry(key)
@@ -371,9 +325,20 @@ async fn resolve_manifest(
 
     let resolved = cell
         .get_or_try_init(|| async { resolve_manifest_inner(svc, env, r).await })
-        .await?;
+        .await?
+        .clone();
 
-    Ok(resolved.clone())
+    if let Some(expected) = r.digest
+        && resolved.digest != expected
+    {
+        let url = resolved
+            .observed_url
+            .clone()
+            .unwrap_or_else(|| r.url.clone());
+        return Err(Error::Resolver(resolver::Error::MismatchedDigest(url)));
+    }
+
+    Ok(resolved)
 }
 
 async fn resolve_manifest_inner(
@@ -381,38 +346,16 @@ async fn resolve_manifest_inner(
     env: &ResolveEnv,
     r: &ManifestRef,
 ) -> Result<ResolvedManifest, Error> {
-    // Cache first.
-    if let Some(expected) = &r.digest {
-        // URL cache is scoped (environment-specific) and preserves per-reference provenance.
-        if let Some(entry) = svc.cache.get_by_url_scoped(env.scope, &r.url) {
-            let actual = entry.manifest.digest();
-            if actual == *expected {
-                return Ok(ResolvedManifest {
-                    digest: actual,
-                    resolved_url: entry.resolved_url,
-                    manifest: entry.manifest,
-                });
-            }
-        }
-
-        // Digest cache is global (safe across environments) and stores only content.
-        if let Some(manifest) = svc.cache.get_by_digest(expected) {
-            return Ok(ResolvedManifest {
-                digest: *expected,
-                // No scoped URL provenance when satisfied purely from digest content.
-                resolved_url: r.url.clone(),
-                manifest,
-            });
-        }
-    } else if let Some(entry) = svc.cache.get_by_url_scoped(env.scope, &r.url) {
+    if let Some(expected) = r.digest
+        && let Some(manifest) = svc.store.get(&expected)
+    {
         return Ok(ResolvedManifest {
-            digest: entry.manifest.digest(),
-            resolved_url: entry.resolved_url,
-            manifest: entry.manifest,
+            manifest,
+            digest: expected,
+            observed_url: None,
         });
     }
 
-    // Resolve (concurrency-limited).
     let _permit = svc
         .sem
         .clone()
@@ -423,24 +366,13 @@ async fn resolve_manifest_inner(
     let resolution = env.resolver.resolve(&r.url, r.digest).await?;
     let manifest = Arc::new(resolution.manifest);
     let digest = manifest.digest();
+    let stored = svc.store.put(digest, manifest);
 
-    // Alias both declared URL and resolved URL to the same manifest content, in this environment scope.
-    svc.cache.put_arc_scoped(
-        env.scope,
-        resolution.url.clone(),
-        resolution.url.clone(),
-        Arc::clone(&manifest),
-    );
-    svc.cache.put_arc_scoped(
-        env.scope,
-        r.url.clone(),
-        resolution.url.clone(),
-        Arc::clone(&manifest),
-    );
+    let observed_url = (resolution.url != r.url).then_some(resolution.url);
 
     Ok(ResolvedManifest {
-        manifest,
+        manifest: stored,
         digest,
-        resolved_url: resolution.url,
+        observed_url,
     })
 }

@@ -3,7 +3,6 @@ use std::io;
 use url::Url;
 
 use super::{Error, Resolution};
-use crate::cache::Cacheability;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FileResolver;
@@ -24,7 +23,6 @@ impl FileResolver {
         Ok(Resolution {
             url: url.clone(),
             manifest,
-            cacheability: Cacheability::ByDigestOnly,
         })
     }
 }

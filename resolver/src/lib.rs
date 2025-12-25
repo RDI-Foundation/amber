@@ -1,10 +1,8 @@
-pub mod cache;
 pub mod file;
 pub mod http;
 pub mod remote;
 
 use amber_manifest::{Manifest, ManifestDigest};
-pub use cache::{Cache, CacheEntry, CacheScope, Cacheability};
 pub use file::FileResolver;
 pub use http::{ContentTypePolicy, HttpResolver, HttpResolverOptions};
 pub use remote::{Backend, RemoteResolver};
@@ -73,20 +71,12 @@ impl Resolver {
         let res = self.resolve_url(url).await?;
         match digest {
             Some(expected) => {
-                let Resolution {
-                    url,
-                    manifest,
-                    cacheability,
-                } = res;
+                let Resolution { url, manifest } = res;
                 let actual = manifest.digest();
                 if actual != expected {
                     return Err(Error::MismatchedDigest(url));
                 }
-                Ok(Resolution {
-                    url,
-                    manifest,
-                    cacheability,
-                })
+                Ok(Resolution { url, manifest })
             }
             None => Ok(res),
         }
@@ -112,7 +102,6 @@ pub struct Resolution {
     /// The URL where the content was actually found.
     pub url: Url,
     pub manifest: Manifest,
-    pub cacheability: crate::cache::Cacheability,
 }
 
 #[cfg(test)]

@@ -1,8 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
-use amber_manifest::{Manifest, ManifestDigest, ManifestRef};
+use amber_manifest::ManifestDigest;
 use serde_json::Value;
-use url::Url;
 
 pub mod graph;
 
@@ -22,17 +21,8 @@ pub struct Component {
     pub parent: Option<ComponentId>,
     pub name: String,
 
-    /// What was declared by the parent.
-    pub declared_ref: ManifestRef,
-
-    /// Where the manifest content was actually resolved from.
-    pub resolved_url: Url,
-
-    /// Digest of the resolved manifest (using the compiler's chosen algorithm).
+    /// Digest of the resolved manifest (compiler-chosen algorithm).
     pub digest: ManifestDigest,
-
-    /// The resolved manifest contents.
-    pub manifest: Arc<Manifest>,
 
     /// Optional instance config (authored at the use-site).
     pub config: Option<Value>,

@@ -152,24 +152,19 @@ fn find_cycle(out: &[Vec<usize>], indeg: &[usize]) -> Vec<ComponentId> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::collections::BTreeMap;
 
-    use amber_manifest::{Manifest, ManifestRef};
-    use url::Url;
+    use amber_manifest::ManifestDigest;
 
     use super::*;
-    use crate::{BindingEdge, Component, ProvideRef, SlotRef};
+    use crate::{BindingEdge, ProvideRef, SlotRef};
 
-    fn component(id: usize, name: &str, manifest: Arc<Manifest>) -> Component {
-        let url = Url::parse(&format!("file:///component/{name}")).unwrap();
+    fn component(id: usize, name: &str) -> Component {
         Component {
             id: ComponentId(id),
             parent: None,
             name: name.to_string(),
-            declared_ref: ManifestRef::from_url(url.clone()),
-            resolved_url: url,
-            digest: manifest.digest(),
-            manifest,
+            digest: ManifestDigest::new([id as u8; 32]),
             config: None,
             children: BTreeMap::new(),
         }
@@ -177,11 +172,7 @@ mod tests {
 
     #[test]
     fn topo_order_ignores_weak_edges() {
-        let manifest = Arc::new(Manifest::empty());
-        let components = vec![
-            component(0, "a", Arc::clone(&manifest)),
-            component(1, "b", Arc::clone(&manifest)),
-        ];
+        let components = vec![component(0, "a"), component(1, "b")];
         let bindings = vec![
             BindingEdge {
                 from: ProvideRef {
@@ -218,12 +209,7 @@ mod tests {
 
     #[test]
     fn topo_order_reports_cycle_path() {
-        let manifest = Arc::new(Manifest::empty());
-        let components = vec![
-            component(0, "a", Arc::clone(&manifest)),
-            component(1, "b", Arc::clone(&manifest)),
-            component(2, "c", Arc::clone(&manifest)),
-        ];
+        let components = vec![component(0, "a"), component(1, "b"), component(2, "c")];
         let bindings = vec![
             BindingEdge {
                 from: ProvideRef {

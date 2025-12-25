@@ -2,15 +2,19 @@
 mod tests;
 
 use amber_manifest::ManifestRef;
-use amber_resolver::{Cache, Resolver};
+use amber_resolver::Resolver;
 use amber_scenario::Scenario;
 
 mod environment;
 mod frontend;
 mod linker;
+mod provenance;
+mod store;
 
 pub use environment::ResolverRegistry;
 pub use frontend::ResolveOptions;
+pub use provenance::{ComponentProvenance, Provenance};
+pub use store::DigestStore;
 
 #[derive(Clone, Debug, Default)]
 pub struct CompileOptions {
@@ -29,21 +33,21 @@ pub enum Error {
 #[derive(Clone)]
 pub struct Compiler {
     resolver: Resolver,
-    cache: Cache,
+    store: DigestStore,
     registry: ResolverRegistry,
 }
 
 impl Compiler {
-    pub fn new(resolver: Resolver, cache: Cache) -> Self {
+    pub fn new(resolver: Resolver, store: DigestStore) -> Self {
         Self {
             resolver,
-            cache,
+            store,
             registry: ResolverRegistry::default(),
         }
     }
 
-    pub fn cache(&self) -> &Cache {
-        &self.cache
+    pub fn store(&self) -> &DigestStore {
+        &self.store
     }
 
     pub fn registry(&self) -> &ResolverRegistry {
@@ -59,21 +63,35 @@ impl Compiler {
         self
     }
 
-    /// Compile a root manifest reference into a fully linked Scenario.
+    /// Compile a root manifest reference into a fully linked Scenario plus a digest store
+    /// and per-component provenance.
     pub async fn compile(
         &self,
         root: ManifestRef,
         opts: CompileOptions,
-    ) -> Result<Scenario, Error> {
+    ) -> Result<Compilation, Error> {
         let tree = frontend::resolve_tree(
             self.resolver.clone(),
-            self.cache.clone(),
+            self.store.clone(),
             self.registry.clone(),
             root,
             opts.resolve,
         )
         .await?;
 
-        Ok(linker::link(tree)?)
+        let (scenario, provenance) = linker::link(tree, &self.store)?;
+
+        Ok(Compilation {
+            scenario,
+            store: self.store.clone(),
+            provenance,
+        })
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct Compilation {
+    pub scenario: Scenario,
+    pub store: DigestStore,
+    pub provenance: Provenance,
 }

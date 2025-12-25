@@ -74,7 +74,6 @@ name = "amber-resolver"
 version = "0.1.0"
 dependencies = [
  "amber-manifest",
- "dashmap",
  "futures",
  "reqwest",
  "thiserror",
@@ -89,7 +88,6 @@ dependencies = [
  "amber-manifest",
  "serde_json",
  "thiserror",
- "url",
 ]
 
 [[package]]
