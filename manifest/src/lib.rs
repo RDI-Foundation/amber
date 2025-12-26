@@ -36,12 +36,16 @@ pub enum Error {
     InvalidComponentRef { input: String, message: String },
     #[error("invalid binding `{input}`: {message}")]
     InvalidBinding { input: String, message: String },
+    #[error("invalid export target `{input}`: {message}")]
+    InvalidExportTarget { input: String, message: String },
     #[error("invalid {kind} name `{name}`: dots are reserved")]
     InvalidName { kind: &'static str, name: String },
     #[error("unclosed quote in args string")]
     UnclosedQuote,
-    #[error("export `{name}` not provided or slotted")]
-    UnknownExport { name: String },
+    #[error("export `{export}` references unknown capability `{target}`")]
+    UnknownExportTarget { export: String, target: String },
+    #[error("export `{export}` references unknown child `#{child}`")]
+    UnknownExportChild { export: String, child: String },
     #[error("capability `{name}` cannot be declared as both slot and provide")]
     AmbiguousCapabilityName { name: String },
     #[error("binding target `{to}.{slot}` is bound more than once")]
@@ -54,7 +58,7 @@ pub enum Error {
     UnknownBindingProvide { capability: String },
     #[error("slot `{name}` must be bound or exported")]
     UnusedSlot { name: String },
-    #[error("provide `{name}` must be bound, exported, or delegated")]
+    #[error("provide `{name}` must be bound or exported")]
     UnusedProvide { name: String },
     #[error("duplicate endpoint name `{name}`")]
     DuplicateEndpointName { name: String },
@@ -564,17 +568,85 @@ impl FromStr for LocalComponentRef {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay)]
+#[non_exhaustive]
+pub struct ExportTarget {
+    pub component: LocalComponentRef,
+    pub name: String,
+}
+
+impl ExportTarget {
+    pub fn is_self(&self) -> bool {
+        self.component.is_self()
+    }
+}
+
+impl fmt::Display for ExportTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.component {
+            LocalComponentRef::Self_ => {
+                f.write_str("self.")?;
+                f.write_str(&self.name)
+            }
+            LocalComponentRef::Child(child) => {
+                f.write_str("#")?;
+                f.write_str(child)?;
+                f.write_str(".")?;
+                f.write_str(&self.name)
+            }
+        }
+    }
+}
+
+impl FromStr for ExportTarget {
+    type Err = Error;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        if input.is_empty() {
+            return Err(Error::InvalidExportTarget {
+                input: input.to_string(),
+                message: "export target cannot be empty".to_string(),
+            });
+        }
+
+        match input.split_once('.') {
+            None => {
+                ensure_name_no_dot(input, "export target")?;
+                Ok(Self {
+                    component: LocalComponentRef::Self_,
+                    name: input.to_string(),
+                })
+            }
+            Some((left, right)) => {
+                if left.is_empty() || right.is_empty() {
+                    return Err(Error::InvalidExportTarget {
+                        input: input.to_string(),
+                        message: "expected `<component-ref>.<name>`".to_string(),
+                    });
+                }
+                let component =
+                    parse_component_ref(left).map_err(|err| Error::InvalidExportTarget {
+                        input: input.to_string(),
+                        message: err.message,
+                    })?;
+                ensure_name_no_dot(right, "export target")?;
+                Ok(Self {
+                    component,
+                    name: right.to_string(),
+                })
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ProvideDecl {
     #[serde(flatten)]
     pub decl: CapabilityDecl,
     #[serde(default)]
     pub endpoint: Option<String>,
-    #[serde(default)]
-    pub from: Option<LocalComponentRef>,
-    #[serde(default)]
-    pub capability: Option<String>,
 }
 
 /// A named resolution environment, used to resolve child manifests.
@@ -847,8 +919,9 @@ pub struct RawManifest {
     pub provides: BTreeMap<String, ProvideDecl>,
     #[serde(default)]
     pub bindings: BTreeSet<Binding>,
+    #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
-    pub exports: BTreeSet<String>,
+    pub exports: BTreeMap<String, ExportTarget>,
 }
 
 const SUPPORTED_MANIFEST_VERSION_REQ: &str = "^0.1.0";
@@ -890,14 +963,6 @@ impl RawManifest {
         }
         for name in self.provides.keys() {
             ensure_name_no_dot(name, "provide")?;
-        }
-        for name in &self.exports {
-            ensure_name_no_dot(name, "export")?;
-        }
-        for provide in self.provides.values() {
-            if let Some(capability) = &provide.capability {
-                ensure_name_no_dot(capability, "capability")?;
-            }
         }
 
         // Validate environments (local invariants).
@@ -1023,47 +1088,46 @@ impl RawManifest {
             }
         }
 
-        let mut available: BTreeSet<&String> = self.provides.keys().collect();
-        available.extend(self.slots.keys());
+        let mut exported_self_slots: BTreeSet<&str> = BTreeSet::new();
+        let mut exported_self_provides: BTreeSet<&str> = BTreeSet::new();
 
-        for name in &self.exports {
-            if !available.contains(name) {
-                return Err(Error::UnknownExport { name: name.clone() });
+        for (export, target) in &self.exports {
+            ensure_name_no_dot(export, "export")?;
+            match &target.component {
+                LocalComponentRef::Self_ => {
+                    if self.slots.contains_key(&target.name) {
+                        exported_self_slots.insert(target.name.as_str());
+                    } else if self.provides.contains_key(&target.name) {
+                        exported_self_provides.insert(target.name.as_str());
+                    } else {
+                        return Err(Error::UnknownExportTarget {
+                            export: export.clone(),
+                            target: target.name.clone(),
+                        });
+                    }
+                }
+                LocalComponentRef::Child(child) => {
+                    if !self.components.contains_key(child) {
+                        return Err(Error::UnknownExportChild {
+                            export: export.clone(),
+                            child: child.clone(),
+                        });
+                    }
+                }
             }
         }
 
         for name in self.slots.keys() {
-            if !self.exports.contains(name) && !self_bound_slots.contains(name.as_str()) {
+            if !exported_self_slots.contains(name.as_str())
+                && !self_bound_slots.contains(name.as_str())
+            {
                 return Err(Error::UnusedSlot { name: name.clone() });
             }
         }
 
-        // Treat self-delegated provides as used when reachable from exports/bindings.
-        let mut used_provides: BTreeSet<&str> = BTreeSet::new();
-        let mut pending: Vec<&str> = Vec::new();
-
-        for name in &self.exports {
-            if self.provides.contains_key(name) && used_provides.insert(name.as_str()) {
-                pending.push(name.as_str());
-            }
-        }
-
+        let mut used_provides = exported_self_provides;
         for name in &self_bound_capabilities {
-            if used_provides.insert(name) {
-                pending.push(name);
-            }
-        }
-
-        while let Some(name) = pending.pop() {
-            let Some(provide) = self.provides.get(name) else {
-                continue;
-            };
-            if let (Some(LocalComponentRef::Self_), Some(capability)) =
-                (&provide.from, provide.capability.as_deref())
-                && used_provides.insert(capability)
-            {
-                pending.push(capability);
-            }
+            used_provides.insert(name);
         }
 
         for name in self.provides.keys() {

@@ -189,7 +189,7 @@ async fn compile_twice_unpinned_fails_when_sources_removed() {
         {
           manifest_version: "0.1.0",
           provides: { api: { kind: "http" } },
-          exports: ["api"],
+          exports: { api: "api" },
         }
         "#,
     );
@@ -200,7 +200,7 @@ async fn compile_twice_unpinned_fails_when_sources_removed() {
         {
           manifest_version: "0.1.0",
           provides: { llm: { kind: "llm" } },
-          exports: ["llm"],
+          exports: { llm: "llm" },
         }
         "#,
     );
@@ -265,14 +265,14 @@ async fn compile_twice_with_digest_pins_succeeds_when_sources_removed() {
         {
           manifest_version: "0.1.0",
           provides: { api: { kind: "http" } },
-          exports: ["api"],
+          exports: { api: "api" },
         }
     "#;
     let b_contents = r#"
         {
           manifest_version: "0.1.0",
           provides: { llm: { kind: "llm" } },
-          exports: ["llm"],
+          exports: { llm: "llm" },
         }
     "#;
 
@@ -384,6 +384,173 @@ async fn cycle_is_detected_across_url_aliases_with_same_digest() {
     assert!(err.to_string().contains("cycle"));
 
     server.join().unwrap();
+}
+
+#[tokio::test]
+async fn delegated_export_requires_child_export() {
+    let dir = tmp_dir("scenario-delegated-export-missing");
+    let root_path = dir.join("root.json5");
+    let child_path = dir.join("child.json5");
+
+    write_file(&child_path, r#"{ manifest_version: "0.1.0" }"#);
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              components: {{
+                child: "{child}",
+              }},
+              exports: {{ api: "#child.api" }},
+            }}
+            "##,
+            child = file_url(&child_path),
+        ),
+    );
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+
+    let err = compiler
+        .compile(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("target references non-exported `api`")
+    );
+}
+
+#[tokio::test]
+async fn binding_rejects_export_kind_mismatch() {
+    let dir = tmp_dir("scenario-export-kind-mismatch");
+    let root_path = dir.join("root.json5");
+    let child_path = dir.join("child.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          provides: { api: { kind: "http" } },
+          exports: { api: "api" },
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              components: {{
+                child: "{child}",
+              }},
+              provides: {{ api: {{ kind: "http" }} }},
+              bindings: [
+                {{ to: "#child.api", from: "self.api" }},
+              ],
+            }}
+            "##,
+            child = file_url(&child_path),
+        ),
+    );
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+
+    let err = compiler
+        .compile(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("exported as a provide (expected slot)")
+    );
+}
+
+#[tokio::test]
+async fn delegated_export_chain_resolves_binding_source() {
+    let dir = tmp_dir("scenario-delegated-export-chain");
+    let root_path = dir.join("root.json5");
+    let child_path = dir.join("child.json5");
+    let grand_path = dir.join("grand.json5");
+
+    write_file(
+        &grand_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          provides: { api: { kind: "http" } },
+          exports: { api: "api" },
+        }
+        "#,
+    );
+    write_file(
+        &child_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              components: {{
+                grand: "{grand}",
+              }},
+              exports: {{ api: "#grand.api" }},
+            }}
+            "##,
+            grand = file_url(&grand_path),
+        ),
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              components: {{
+                child: "{child}",
+              }},
+              slots: {{ api: {{ kind: "http" }} }},
+              bindings: [
+                {{ to: "self.api", from: "#child.api" }},
+              ],
+            }}
+            "##,
+            child = file_url(&child_path),
+        ),
+    );
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+
+    let compilation = compiler
+        .compile(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+            },
+        )
+        .await
+        .unwrap();
+
+    let binding = compilation.scenario.bindings.first().expect("binding");
+    let from_path =
+        graph::component_path_for(&compilation.scenario.components, binding.from.component);
+    assert_eq!(from_path, "root/child/grand");
+    assert_eq!(binding.from.name, "api");
 }
 
 struct CountingBackend {

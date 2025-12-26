@@ -31,7 +31,7 @@ Minimal leaf component exporting an HTTP API:
   provides: {
     api: { kind: "http", endpoint: "http" },
   },
-  exports: ["api"],
+  exports: { api: "api" },
 }
 ```
 
@@ -47,12 +47,12 @@ This crate **parses JSON5**, deserializes into Rust types, and validates:
 * No dots (`.`) in:
 
   * child instance names (`components` keys)
-  * capability names (`slots`/`provides` keys, and strings in `exports`)
-  * delegated capability names (`provides.<name>.capability`, if present)
-  * binding slot/capability names
-  * child refs (`#<name>`) in bindings
+  * capability names (`slots`/`provides` keys, binding slot/capability names, and export target names)
+  * export names (keys in `exports`)
+  * child refs (`#<name>`) in bindings and export targets
 * A name cannot be declared in **both** `slots` and `provides`.
-* `exports` names must refer to something declared in `slots` or `provides`.
+* `exports` targets that point at `self` must refer to something declared in `slots` or `provides`.
+* `exports` targets that point at `#child` must refer to a declared child.
 * Each binding target `(<to>.<slot>)` may appear **only once**.
 * Binding references must be locally well-formed:
 
@@ -66,20 +66,19 @@ Unused declaration rule enforced by this crate:
 
 * Every declared **slot** must be either:
 
-  * **exported** (present in `exports`), or
+  * **exported** (some export target points at `self.<name>` or `<name>`), or
   * **bound into `self`** (some binding has `to: "self"` and `slot: "<name>"`)
 * Every declared **provide** must be either:
 
-  * **exported**, or
-  * **used as a binding source from `self`** (some binding has `from: "self"` and `capability: "<name>"`), or
-  * **used as a delegation source from `self`** (some provide has `from: "self"` and `capability: "<name>"`)
+  * **exported** (some export target points at `self.<name>` or `<name>`), or
+  * **used as a binding source from `self`** (some binding has `from: "self"` and `capability: "<name>"`)
 
 ### Link-time / resolution-time validation (NOT done by this crate)
 
 This crate does **not** fetch child manifests and therefore does not validate cross-manifest semantics, such as:
 
-* Whether `provides.<name>.from`/`capability` actually exist on the referenced component.
-* Whether kinds/profiles match across bindings or forwarding.
+* Whether an `exports` target like `#child.<name>` resolves to something actually exported by the child.
+* Whether kinds/profiles match across bindings or forwarded exports.
 * Whether a child has exported the slot/capability you’re trying to bind to/from.
 * Validation of `components.<name>.config` against `config_schema`.
 
@@ -101,21 +100,23 @@ Top-level object:
   slots: { /* ... */ },        // optional; default {}
   provides: { /* ... */ },      // optional; default {}
   bindings: [ /* ... */ ],      // optional; default []
-  exports: [ /* ... */ ],       // optional; default []
+  exports: { /* ... */ },       // optional; default {}
 }
 ```
 
 Notes:
 
-* Duplicate keys are rejected in: `program.env`, `components`, `slots`, `provides`.
-* `exports` and `bindings` are treated as **sets** internally:
+* Duplicate keys are rejected in: `program.env`, `components`, `slots`, `provides`, `exports`.
+* `bindings` are treated as **sets** internally:
 
   * order is not meaningful
   * exact duplicates may be deduplicated
+* `exports` is a map (order is not meaningful; duplicate keys are rejected).
 
 Unknown fields:
 
 * `ManifestRef` object form is **strict** (unknown fields are rejected).
+* `provides` entries are **strict** (unknown fields are rejected).
 * Most other objects are **not strict** in this crate (unknown fields are ignored by serde).
 
 ---
@@ -307,8 +308,8 @@ slots: {
 
 Important rule (enforced):
 
-* If a slot is **not exported**, it must be **bound into `self.<slot>`** by a binding in this manifest.
-* If a slot is **exported**, it is an input the parent is expected to bind.
+* If a slot is **not exported** (no `exports` target points at it), it must be **bound into `self.<slot>`** by a binding in this manifest.
+* If a slot is **exported** (via `exports`), it is an input the parent is expected to bind.
 
 ### `provides`
 
@@ -317,33 +318,41 @@ Important rule (enforced):
 A provide may include:
 
 * `endpoint`: name of a `program.network.endpoints[].name` (must exist if set)
-* `from` + `capability`: indicates the provide is forwarded/delegated from another component (`self` or `#child`)
 
 ```json5
 provides: {
   api: { kind: "http", endpoint: "http" },
-
-  llm: { kind: "llm", from: "#router", capability: "llm" },
+  llm: { kind: "llm" },
 }
 ```
 
 Notes:
 
 * This crate enforces only that `endpoint` (if present) refers to a declared endpoint name.
-* This crate parses `from`/`capability` but does not validate cross-manifest existence/matching (link-time concern).
+* To forward a child capability, use `exports` pointing at `#child.<name>`.
 
 ### `exports`
 
-`exports` lists the names (from `slots` and/or `provides`) visible to the parent.
+`exports` maps public names to internal capability targets visible to the parent.
 
 ```json5
-exports: ["llm", "api"]
+exports: {
+  llm: "llm",
+  api: "self.api",
+  tool: "#router.tool",
+}
 ```
 
 Rules enforced:
 
-* Each export must name something declared in `slots` or `provides`.
-* Export names must not contain `.`.
+* Export names (keys) must not contain `.`.
+* Targets must be one of:
+
+  * `<name>` (shorthand for `self.<name>`)
+  * `self.<name>`
+  * `#<child>.<name>`
+* Targets pointing at `self` must refer to a declared slot or provide.
+* Targets pointing at `#child` must refer to a declared child.
 
 ---
 
@@ -393,17 +402,15 @@ Rules enforced by this crate:
 
 ---
 
-## Limitation: no slot pass-through in this version
+## Limitation: no binding from local slots
 
 This version does **not** allow binding from a local slot (`from: "self.<slot>"`). A binding source in `self.*` must refer to a **provide**, not a slot.
 
-Consequence:
+To pass a slot through to a child, export the child’s slot directly:
 
-* You cannot express “export a slot to the parent and also pass that slot value down into a child” purely inside one manifest.
-
-Workaround:
-
-* Do the wiring at the parent level (do not hide the dependent component behind an extra composition layer), or wait until the format/runtime supports slot pass-through.
+```json5
+exports: { llm: "#child.llm" }
+```
 
 ---
 
@@ -422,7 +429,7 @@ Workaround:
   provides: {
     api: { kind: "http", endpoint: "http" },
   },
-  exports: ["api"],
+  exports: { api: "api" },
 }
 ```
 
@@ -446,7 +453,7 @@ Because the component expects its **parent** to supply `llm`, it must export tha
   slots: {
     llm: { kind: "llm" },
   },
-  exports: ["llm"],
+  exports: { llm: "llm" },
 }
 ```
 
@@ -475,12 +482,11 @@ This component:
   },
   provides: {
     admin_api: { kind: "http", endpoint: "admin" },
-    llm: { kind: "llm", from: "#wrapper", capability: "llm" },
   },
   bindings: [
     { to: "#wrapper.admin_api", from: "self.admin_api" },
   ],
-  exports: ["llm"],
+  exports: { llm: "#wrapper.llm" },
 }
 ```
 

@@ -563,7 +563,7 @@ fn manifest_digest_is_stable_across_json5_formatting() {
         {
           manifest_version: "0.1.0",
           provides: { api: { kind: "http" } },
-          exports: ["api"],
+          exports: { api: "api" },
         }
         "#
     .parse::<Manifest>()
@@ -571,9 +571,9 @@ fn manifest_digest_is_stable_across_json5_formatting() {
 
     let manifest_b = r#"
         {
-          exports: [
-            "api",
-          ],
+          exports: {
+            api: "api",
+          },
           provides: {
             api: { kind: "http" },
           },
@@ -600,7 +600,7 @@ fn endpoint_validation_fails_for_unknown_reference() {
           provides: {
             api: { kind: "http", endpoint: "missing" }
           },
-          exports: ["api"],
+          exports: { api: "api" },
         }
         "#
     .parse::<Manifest>()
@@ -646,7 +646,7 @@ fn endpoint_validation_passes_for_defined_reference() {
           provides: {
             api: { kind: "http", endpoint: "endpoint" }
           },
-          exports: ["api"],
+          exports: { api: "api" },
         }
         "#
     .parse()
@@ -667,7 +667,7 @@ fn endpoint_validation_passes_for_defined_reference() {
     let api = m.provides.get("api").expect("api provide");
     assert_eq!(api.decl.kind, CapabilityKind::Http);
     assert_eq!(api.endpoint.as_deref(), Some("endpoint"));
-    assert!(m.exports.contains("api"));
+    assert!(m.exports.contains_key("api"));
 }
 
 #[test]
@@ -755,7 +755,7 @@ fn export_names_cannot_contain_dots() {
     let err = r#"
         {
           manifest_version: "0.1.0",
-          exports: ["api.v1"],
+          exports: { "api.v1": "api" },
         }
         "#
     .parse::<Manifest>()
@@ -765,17 +765,11 @@ fn export_names_cannot_contain_dots() {
 }
 
 #[test]
-fn provide_capability_names_cannot_contain_dots() {
+fn export_target_names_cannot_contain_dots() {
     let err = r#"
         {
           manifest_version: "0.1.0",
-          components: {
-            child: "https://example.com/amber/pkg/v1",
-          },
-          provides: {
-            api: { kind: "http", from: "\#child", capability: "upstream.v1" },
-          },
-          exports: ["api"],
+          exports: { api: "self.api.v1" },
         }
         "#
     .parse::<Manifest>()
@@ -783,8 +777,71 @@ fn provide_capability_names_cannot_contain_dots() {
 
     assert!(
         err.to_string()
-            .contains("invalid capability name `upstream.v1`")
+            .contains("invalid export target name `api.v1`")
     );
+}
+
+#[test]
+fn export_target_unknown_capability_errors() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          exports: { api: "missing" },
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::UnknownExportTarget { export, target } => {
+            assert_eq!(export, "api");
+            assert_eq!(target, "missing");
+        }
+        other => panic!("expected UnknownExportTarget error, got: {other}"),
+    }
+}
+
+#[test]
+fn export_target_unknown_child_errors() {
+    let raw = parse_raw(
+        r##"
+        {
+          manifest_version: "0.1.0",
+          exports: { api: "#missing.api" },
+        }
+        "##,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::UnknownExportChild { export, child } => {
+            assert_eq!(export, "api");
+            assert_eq!(child, "missing");
+        }
+        other => panic!("expected UnknownExportChild error, got: {other}"),
+    }
+}
+
+#[test]
+fn export_targets_serialize_with_self_prefix() {
+    let manifest: Manifest = r#"
+        {
+          manifest_version: "0.1.0",
+          provides: { api: { kind: "http" } },
+          exports: { api: "api" },
+        }
+        "#
+    .parse()
+    .unwrap();
+
+    let value = serde_json::to_value(&manifest).unwrap();
+    let export = value
+        .get("exports")
+        .and_then(|exports| exports.get("api"))
+        .and_then(|export| export.as_str());
+
+    assert_eq!(export, Some("self.api"));
 }
 
 #[test]
@@ -795,7 +852,7 @@ fn slots_and_provides_cannot_share_names() {
           manifest_version: "0.1.0",
           slots: { api: { kind: "http" } },
           provides: { api: { kind: "http" } },
-          exports: ["api"],
+          exports: { api: "api" },
         }
         "#,
     );
@@ -913,16 +970,15 @@ fn unused_provide_is_rejected() {
 }
 
 #[test]
-fn delegated_provide_source_is_not_unused() {
+fn exported_provide_is_not_unused() {
     let raw = parse_raw(
         r#"
         {
           manifest_version: "0.1.0",
           provides: {
             api: { kind: "http" },
-            public: { kind: "http", from: "self", capability: "api" },
           },
-          exports: ["public"],
+          exports: { public: "api" },
         }
         "#,
     );
