@@ -3,7 +3,10 @@ use std::{
     sync::Arc,
 };
 
-use amber_manifest::{CapabilityDecl, LocalComponentRef, Manifest, ManifestDigest};
+use amber_manifest::{
+    BindingSource, BindingTarget, CapabilityDecl, ChildName, ExportName, ExportTarget, Manifest,
+    ManifestDigest,
+};
 use amber_scenario::{
     BindingEdge, Component, ComponentId, ProvideRef, Scenario, SlotRef, graph::component_path_for,
 };
@@ -92,6 +95,12 @@ pub enum Error {
     InvalidConfig {
         component_path: String,
         message: String,
+    },
+
+    #[error("unsupported manifest feature `{feature}` in {component_path}")]
+    UnsupportedManifestFeature {
+        component_path: String,
+        feature: &'static str,
     },
 }
 
@@ -207,7 +216,7 @@ fn validate_config(
     let c = &components[id.0];
     let m = &manifests[id.0];
 
-    let Some(schema_decl) = m.config_schema.as_ref() else {
+    let Some(schema_decl) = m.config_schema() else {
         return Ok(());
     };
 
@@ -248,32 +257,25 @@ fn validate_exports(
     let realm_manifest = &manifests[realm.0];
     let realm_path = component_path_for(components, realm);
 
-    for (export_name, target) in realm_manifest.exports.iter() {
-        match &target.component {
-            LocalComponentRef::Self_ => continue,
-            LocalComponentRef::Child(child) => {
-                let child_id = components[realm.0]
-                    .children
-                    .get(child)
-                    .copied()
-                    .unwrap_or_else(|| unreachable!("export targets validated earlier"));
+    for (export_name, target) in realm_manifest.exports().iter() {
+        let ExportTarget::ChildExport { child, export } = target else {
+            continue;
+        };
 
-                if let Err(err) = resolve_export(components, manifests, child_id, &target.name) {
-                    let message = match err {
-                        Error::NotExported {
-                            component_path,
-                            name,
-                        } => format!("target references non-exported `{name}` on {component_path}"),
-                        other => return Err(other),
-                    };
-                    return Err(Error::InvalidExport {
-                        component_path: realm_path.clone(),
-                        name: export_name.clone(),
-                        message,
-                    });
-                }
-            }
-            _ => unreachable!("unsupported local component reference"),
+        let child_id = child_component_id(components, realm, child)?;
+        if let Err(err) = resolve_export(components, manifests, child_id, export) {
+            let message = match err {
+                Error::NotExported {
+                    component_path,
+                    name,
+                } => format!("target references non-exported `{name}` on {component_path}"),
+                other => return Err(other),
+            };
+            return Err(Error::InvalidExport {
+                component_path: realm_path.clone(),
+                name: export_name.to_string(),
+                message,
+            });
         }
     }
 
@@ -289,91 +291,104 @@ fn resolve_bindings(
     for realm in (0..components.len()).map(ComponentId) {
         let realm_manifest = &manifests[realm.0];
 
-        for b in realm_manifest.bindings.iter() {
-            let to_id = resolve_binding_component(components, realm, &b.to)?;
-            let from_id = resolve_binding_component(components, realm, &b.from)?;
-
-            let (slot_ref, slot_decl) = match &b.to {
-                LocalComponentRef::Self_ => {
-                    let to_manifest = &manifests[to_id.0];
-                    let slot_decl =
-                        to_manifest
-                            .slots
-                            .get(&b.slot)
-                            .ok_or_else(|| Error::UnknownSlot {
+        for (target, binding) in realm_manifest.bindings().iter() {
+            let (slot_ref, slot_decl, to_id, slot_name_for_err) =
+                match target {
+                    BindingTarget::SelfSlot(slot_name) => {
+                        let to_id = realm;
+                        let to_manifest = &manifests[to_id.0];
+                        let slot_decl = to_manifest.slots().get(slot_name).ok_or_else(|| {
+                            Error::UnknownSlot {
                                 component_path: component_path_for(components, to_id),
-                                slot: b.slot.clone(),
-                            })?;
-                    (
-                        SlotRef {
-                            component: to_id,
-                            name: b.slot.clone(),
-                        },
-                        slot_decl.decl.clone(),
-                    )
-                }
-                LocalComponentRef::Child(_) => {
-                    let ResolvedExport {
-                        component,
-                        name,
-                        decl,
-                        kind,
-                    } = resolve_export(components, manifests, to_id, &b.slot)?;
-                    if kind != ExportKind::Slot {
-                        return Err(Error::ExportKindMismatch {
-                            component_path: component_path_for(components, to_id),
-                            name: b.slot.clone(),
-                            expected: ExportKind::Slot.as_str(),
-                            actual: kind.as_str(),
+                                slot: slot_name.to_string(),
+                            }
+                        })?;
+                        let slot_name = slot_name.to_string();
+                        (
+                            SlotRef {
+                                component: to_id,
+                                name: slot_name.clone(),
+                            },
+                            slot_decl.decl.clone(),
+                            to_id,
+                            slot_name,
+                        )
+                    }
+                    BindingTarget::ChildExport { child, export } => {
+                        let to_id = child_component_id(components, realm, child)?;
+                        let ResolvedExport {
+                            component,
+                            name,
+                            decl,
+                            kind,
+                        } = resolve_export(components, manifests, to_id, export)?;
+                        if kind != ExportKind::Slot {
+                            return Err(Error::ExportKindMismatch {
+                                component_path: component_path_for(components, to_id),
+                                name: export.to_string(),
+                                expected: ExportKind::Slot.as_str(),
+                                actual: kind.as_str(),
+                            });
+                        }
+                        (SlotRef { component, name }, decl, to_id, export.to_string())
+                    }
+                    _ => {
+                        return Err(Error::UnsupportedManifestFeature {
+                            component_path: component_path_for(components, realm),
+                            feature: "binding target",
                         });
                     }
-                    (SlotRef { component, name }, decl)
-                }
-                _ => unreachable!("unsupported local component reference"),
-            };
+                };
 
-            let (provide_ref, provide_decl) = match &b.from {
-                LocalComponentRef::Self_ => {
+            let (provide_ref, provide_decl) = match &binding.from {
+                BindingSource::SelfProvide(provide_name) => {
+                    let from_id = realm;
                     let from_manifest = &manifests[from_id.0];
                     let provide_decl =
-                        from_manifest.provides.get(&b.capability).ok_or_else(|| {
+                        from_manifest.provides().get(provide_name).ok_or_else(|| {
                             Error::UnknownProvide {
                                 component_path: component_path_for(components, from_id),
-                                provide: b.capability.clone(),
+                                provide: provide_name.to_string(),
                             }
                         })?;
                     (
                         ProvideRef {
                             component: from_id,
-                            name: b.capability.clone(),
+                            name: provide_name.to_string(),
                         },
                         provide_decl.decl.clone(),
                     )
                 }
-                LocalComponentRef::Child(_) => {
+                BindingSource::ChildExport { child, export } => {
+                    let from_id = child_component_id(components, realm, child)?;
                     let ResolvedExport {
                         component,
                         name,
                         decl,
                         kind,
-                    } = resolve_export(components, manifests, from_id, &b.capability)?;
+                    } = resolve_export(components, manifests, from_id, export)?;
                     if kind != ExportKind::Provide {
                         return Err(Error::ExportKindMismatch {
                             component_path: component_path_for(components, from_id),
-                            name: b.capability.clone(),
+                            name: export.to_string(),
                             expected: ExportKind::Provide.as_str(),
                             actual: kind.as_str(),
                         });
                     }
                     (ProvideRef { component, name }, decl)
                 }
-                _ => unreachable!("unsupported local component reference"),
+                _ => {
+                    return Err(Error::UnsupportedManifestFeature {
+                        component_path: component_path_for(components, realm),
+                        feature: "binding source",
+                    });
+                }
             };
 
             if slot_decl != provide_decl {
                 return Err(Error::TypeMismatch {
                     to_component_path: component_path_for(components, to_id),
-                    slot: b.slot.clone(),
+                    slot: slot_name_for_err,
                     expected: slot_decl,
                     got: provide_decl,
                 });
@@ -382,7 +397,7 @@ fn resolve_bindings(
             edges.push(BindingEdge {
                 from: provide_ref,
                 to: slot_ref,
-                weak: b.weak,
+                weak: binding.weak,
             });
         }
     }
@@ -390,68 +405,75 @@ fn resolve_bindings(
     Ok(edges)
 }
 
-fn resolve_binding_component(
+fn child_component_id(
     components: &[Component],
     realm: ComponentId,
-    reference: &LocalComponentRef,
+    child: &ChildName,
 ) -> Result<ComponentId, Error> {
-    match reference {
-        LocalComponentRef::Self_ => Ok(realm),
-        LocalComponentRef::Child(name) => components[realm.0]
-            .children
-            .get(name)
-            .copied()
-            .ok_or_else(|| Error::UnknownChild {
-                component_path: component_path_for(components, realm),
-                child: name.clone(),
-            }),
-        _ => unreachable!("unsupported local component reference"),
-    }
+    components[realm.0]
+        .children
+        .get(child.as_str())
+        .copied()
+        .ok_or_else(|| Error::UnknownChild {
+            component_path: component_path_for(components, realm),
+            child: child.to_string(),
+        })
 }
 
 fn resolve_export(
     components: &[Component],
     manifests: &[Arc<Manifest>],
     component: ComponentId,
-    export_name: &str,
+    export_name: &ExportName,
 ) -> Result<ResolvedExport, Error> {
     let manifest = &manifests[component.0];
-    let Some(target) = manifest.exports.get(export_name) else {
+    let Some(target) = manifest.exports().get(export_name) else {
         return Err(Error::NotExported {
             component_path: component_path_for(components, component),
             name: export_name.to_string(),
         });
     };
 
-    match &target.component {
-        LocalComponentRef::Self_ => {
-            if let Some(slot_decl) = manifest.slots.get(&target.name) {
-                return Ok(ResolvedExport {
-                    component,
-                    name: target.name.clone(),
-                    decl: slot_decl.decl.clone(),
-                    kind: ExportKind::Slot,
-                });
-            }
-            if let Some(provide_decl) = manifest.provides.get(&target.name) {
-                return Ok(ResolvedExport {
-                    component,
-                    name: target.name.clone(),
-                    decl: provide_decl.decl.clone(),
-                    kind: ExportKind::Provide,
-                });
-            }
-            unreachable!("export targets validated earlier");
+    match target {
+        ExportTarget::SelfSlot(slot_name) => {
+            let slot_decl = manifest
+                .slots()
+                .get(slot_name)
+                .ok_or_else(|| Error::UnknownSlot {
+                    component_path: component_path_for(components, component),
+                    slot: slot_name.to_string(),
+                })?;
+            Ok(ResolvedExport {
+                component,
+                name: slot_name.to_string(),
+                decl: slot_decl.decl.clone(),
+                kind: ExportKind::Slot,
+            })
         }
-        LocalComponentRef::Child(child) => {
-            let child_id = components[component.0]
-                .children
-                .get(child)
-                .copied()
-                .unwrap_or_else(|| unreachable!("export targets validated earlier"));
-            resolve_export(components, manifests, child_id, &target.name)
+        ExportTarget::SelfProvide(provide_name) => {
+            let provide_decl =
+                manifest
+                    .provides()
+                    .get(provide_name)
+                    .ok_or_else(|| Error::UnknownProvide {
+                        component_path: component_path_for(components, component),
+                        provide: provide_name.to_string(),
+                    })?;
+            Ok(ResolvedExport {
+                component,
+                name: provide_name.to_string(),
+                decl: provide_decl.decl.clone(),
+                kind: ExportKind::Provide,
+            })
         }
-        _ => unreachable!("unsupported local component reference"),
+        ExportTarget::ChildExport { child, export } => {
+            let child_id = child_component_id(components, component, child)?;
+            resolve_export(components, manifests, child_id, export)
+        }
+        _ => Err(Error::UnsupportedManifestFeature {
+            component_path: component_path_for(components, component),
+            feature: "export target",
+        }),
     }
 }
 
@@ -467,13 +489,13 @@ fn validate_all_slots_bound(
 
     for id in (0..components.len()).map(ComponentId) {
         let m = &manifests[id.0];
-        for slot_name in m.slots.keys() {
+        for slot_name in m.slots().keys() {
             if satisfied.contains_key(&(id, slot_name.as_str())) {
                 continue;
             }
             return Err(Error::UnboundSlot {
                 component_path: component_path_for(components, id),
-                slot: slot_name.clone(),
+                slot: slot_name.to_string(),
             });
         }
     }

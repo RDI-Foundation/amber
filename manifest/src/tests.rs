@@ -131,21 +131,30 @@ fn binding_sugar_forms_parse() {
     .parse()
     .unwrap();
 
-    let expected = BTreeSet::from([
-        Binding {
-            to: LocalComponentRef::Child("a".to_string()),
-            slot: "s".to_string(),
-            from: LocalComponentRef::Child("b".to_string()),
-            capability: "c".to_string(),
-            weak: false,
-        },
-        Binding {
-            to: LocalComponentRef::Child("a".to_string()),
-            slot: "t".to_string(),
-            from: LocalComponentRef::Self_,
-            capability: "d".to_string(),
-            weak: false,
-        },
+    let expected = BTreeMap::from([
+        (
+            BindingTarget::ChildExport {
+                child: ChildName::try_from("a").unwrap(),
+                export: ExportName::try_from("s").unwrap(),
+            },
+            Binding {
+                from: BindingSource::ChildExport {
+                    child: ChildName::try_from("b").unwrap(),
+                    export: ExportName::try_from("c").unwrap(),
+                },
+                weak: false,
+            },
+        ),
+        (
+            BindingTarget::ChildExport {
+                child: ChildName::try_from("a").unwrap(),
+                export: ExportName::try_from("t").unwrap(),
+            },
+            Binding {
+                from: BindingSource::SelfProvide(ProvideName::try_from("d").unwrap()),
+                weak: false,
+            },
+        ),
     ]);
 
     assert_eq!(m.bindings, expected);
@@ -913,21 +922,33 @@ fn binding_source_can_be_multiplexed() {
 
     let m = raw.validate().unwrap();
 
-    let expected = BTreeSet::from([
-        Binding {
-            to: LocalComponentRef::Child("a".to_string()),
-            slot: "s1".to_string(),
-            from: LocalComponentRef::Child("b".to_string()),
-            capability: "c".to_string(),
-            weak: false,
-        },
-        Binding {
-            to: LocalComponentRef::Child("a".to_string()),
-            slot: "s2".to_string(),
-            from: LocalComponentRef::Child("b".to_string()),
-            capability: "c".to_string(),
-            weak: false,
-        },
+    let expected = BTreeMap::from([
+        (
+            BindingTarget::ChildExport {
+                child: ChildName::try_from("a").unwrap(),
+                export: ExportName::try_from("s1").unwrap(),
+            },
+            Binding {
+                from: BindingSource::ChildExport {
+                    child: ChildName::try_from("b").unwrap(),
+                    export: ExportName::try_from("c").unwrap(),
+                },
+                weak: false,
+            },
+        ),
+        (
+            BindingTarget::ChildExport {
+                child: ChildName::try_from("a").unwrap(),
+                export: ExportName::try_from("s2").unwrap(),
+            },
+            Binding {
+                from: BindingSource::ChildExport {
+                    child: ChildName::try_from("b").unwrap(),
+                    export: ExportName::try_from("c").unwrap(),
+                },
+                weak: false,
+            },
+        ),
     ]);
 
     assert_eq!(m.bindings, expected);

@@ -2,11 +2,12 @@
 mod tests;
 
 use std::{
+    borrow::Borrow,
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     io::{self, Write},
     str::FromStr,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use base64::Engine;
@@ -82,6 +83,76 @@ pub enum Error {
     #[error("component `#{child}` references unknown environment `{environment}`")]
     UnknownComponentEnvironment { child: String, environment: String },
 }
+
+macro_rules! name_type {
+    ($name:ident, $kind:expr) => {
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(Arc<str>);
+
+        impl $name {
+            pub fn new(name: String) -> Result<Self, Error> {
+                ensure_name_no_dot(&name, $kind)?;
+                Ok(Self(Arc::from(name)))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = Error;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl TryFrom<&str> for $name {
+            type Error = Error;
+
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                ensure_name_no_dot(value, $kind)?;
+                Ok(Self(Arc::from(value)))
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(value: $name) -> Self {
+                value.0.to_string()
+            }
+        }
+
+        impl From<&$name> for String {
+            fn from(value: &$name) -> Self {
+                value.0.to_string()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl Borrow<str> for $name {
+            fn borrow(&self) -> &str {
+                &self.0
+            }
+        }
+    };
+}
+
+name_type!(ChildName, "child");
+name_type!(SlotName, "slot");
+name_type!(ProvideName, "provide");
+name_type!(ExportName, "export");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay)]
 #[non_exhaustive]
@@ -570,18 +641,18 @@ impl FromStr for LocalComponentRef {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay)]
 #[non_exhaustive]
-pub struct ExportTarget {
+pub struct RawExportTarget {
     pub component: LocalComponentRef,
     pub name: String,
 }
 
-impl ExportTarget {
+impl RawExportTarget {
     pub fn is_self(&self) -> bool {
         self.component.is_self()
     }
 }
 
-impl fmt::Display for ExportTarget {
+impl fmt::Display for RawExportTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.component {
             LocalComponentRef::Self_ => {
@@ -598,7 +669,7 @@ impl fmt::Display for ExportTarget {
     }
 }
 
-impl FromStr for ExportTarget {
+impl FromStr for RawExportTarget {
     type Err = Error;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
@@ -740,7 +811,7 @@ impl<'de> Deserialize<'de> for ConfigSchema {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[non_exhaustive]
 /// A binding wires a target slot to a source provide.
-pub struct Binding {
+pub struct RawBinding {
     pub to: LocalComponentRef,
     pub slot: String,
     pub from: LocalComponentRef,
@@ -750,7 +821,7 @@ pub struct Binding {
     pub weak: bool,
 }
 
-impl<'de> Deserialize<'de> for Binding {
+impl<'de> Deserialize<'de> for RawBinding {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -786,7 +857,7 @@ impl<'de> Deserialize<'de> for Binding {
                     .map_err(serde::de::Error::custom)?;
                 ensure_binding_name_no_dot(&explicit.capability, explicit.capability.as_str())
                     .map_err(serde::de::Error::custom)?;
-                Ok(Binding {
+                Ok(RawBinding {
                     to: parse_binding_component_ref(&explicit.to)
                         .map_err(serde::de::Error::custom)?,
                     slot: explicit.slot,
@@ -800,7 +871,7 @@ impl<'de> Deserialize<'de> for Binding {
                 let (to, slot) = split_binding_side(&dot.to).map_err(serde::de::Error::custom)?;
                 let (from, capability) =
                     split_binding_side(&dot.from).map_err(serde::de::Error::custom)?;
-                Ok(Binding {
+                Ok(RawBinding {
                     to,
                     slot,
                     from,
@@ -893,6 +964,44 @@ fn split_binding_side(input: &str) -> Result<(LocalComponentRef, String), Error>
     Ok((component, right.to_string()))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum ExportTarget {
+    SelfSlot(SlotName),
+    SelfProvide(ProvideName),
+    ChildExport {
+        child: ChildName,
+        export: ExportName,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum BindingTarget {
+    SelfSlot(SlotName),
+    ChildExport {
+        child: ChildName,
+        export: ExportName,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum BindingSource {
+    SelfProvide(ProvideName),
+    ChildExport {
+        child: ChildName,
+        export: ExportName,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct Binding {
+    pub from: BindingSource,
+    pub weak: bool,
+}
+
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -918,10 +1027,10 @@ pub struct RawManifest {
     #[serde(default)]
     pub provides: BTreeMap<String, ProvideDecl>,
     #[serde(default)]
-    pub bindings: BTreeSet<Binding>,
+    pub bindings: BTreeSet<RawBinding>,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
-    pub exports: BTreeMap<String, ExportTarget>,
+    pub exports: BTreeMap<String, RawExportTarget>,
 }
 
 const SUPPORTED_MANIFEST_VERSION_REQ: &str = "^0.1.0";
@@ -952,23 +1061,43 @@ impl RawManifest {
 
     pub fn validate(self) -> Result<Manifest, Error> {
         self.validate_version()?;
-        for name in self.components.keys() {
-            ensure_name_no_dot(name, "child")?;
-        }
-        for name in self.environments.keys() {
+        let digest = self.digest();
+
+        let RawManifest {
+            manifest_version,
+            program,
+            components,
+            environments,
+            config_schema,
+            slots,
+            provides,
+            bindings,
+            exports,
+        } = self;
+
+        for name in environments.keys() {
             ensure_name_no_dot(name, "environment")?;
         }
-        for name in self.slots.keys() {
-            ensure_name_no_dot(name, "slot")?;
-        }
-        for name in self.provides.keys() {
-            ensure_name_no_dot(name, "provide")?;
-        }
+
+        let components = components
+            .into_iter()
+            .map(|(name, decl)| Ok((ChildName::try_from(name)?, decl)))
+            .collect::<Result<BTreeMap<_, _>, Error>>()?;
+
+        let slots = slots
+            .into_iter()
+            .map(|(name, decl)| Ok((SlotName::try_from(name)?, decl)))
+            .collect::<Result<BTreeMap<_, _>, Error>>()?;
+
+        let provides = provides
+            .into_iter()
+            .map(|(name, decl)| Ok((ProvideName::try_from(name)?, decl)))
+            .collect::<Result<BTreeMap<_, _>, Error>>()?;
 
         // Validate environments (local invariants).
-        for (env_name, env) in &self.environments {
+        for (env_name, env) in &environments {
             if let Some(ext) = env.extends.as_deref()
-                && !self.environments.contains_key(ext)
+                && !environments.contains_key(ext)
             {
                 return Err(Error::UnknownEnvironmentExtends {
                     name: env_name.clone(),
@@ -1013,131 +1142,163 @@ impl RawManifest {
             Ok(())
         }
 
-        for name in self.environments.keys() {
-            dfs(name, &self.environments, &mut state)?;
+        for name in environments.keys() {
+            dfs(name, &environments, &mut state)?;
         }
 
         // Validate that children referencing environments reference existing ones.
-        for (child_name, decl) in &self.components {
+        for (child_name, decl) in &components {
             if let ComponentDecl::Object(obj) = decl
                 && let Some(env) = obj.environment.as_deref()
-                && !self.environments.contains_key(env)
+                && !environments.contains_key(env)
             {
                 return Err(Error::UnknownComponentEnvironment {
-                    child: child_name.clone(),
+                    child: child_name.to_string(),
                     environment: env.to_string(),
                 });
             }
         }
 
-        if let Some(name) = self
-            .slots
+        if let Some(name) = slots
             .keys()
-            .find(|name| self.provides.contains_key(*name))
+            .find(|name| provides.contains_key(name.as_str()))
         {
-            return Err(Error::AmbiguousCapabilityName { name: name.clone() });
+            return Err(Error::AmbiguousCapabilityName {
+                name: name.to_string(),
+            });
         }
 
-        let mut bound_targets = BTreeSet::new();
-        let mut self_bound_slots = BTreeSet::new();
-        let mut self_bound_capabilities = BTreeSet::new();
+        let mut bindings_out = BTreeMap::new();
+        let mut self_bound_slots: BTreeSet<SlotName> = BTreeSet::new();
+        let mut self_bound_provides: BTreeSet<ProvideName> = BTreeSet::new();
 
-        for binding in &self.bindings {
-            let target = (&binding.to, binding.slot.as_str());
-            if !bound_targets.insert(target) {
-                return Err(Error::DuplicateBindingTarget {
-                    to: binding.to.to_string(),
-                    slot: binding.slot.clone(),
-                });
-            }
+        for binding in bindings {
+            let RawBinding {
+                to,
+                slot,
+                from,
+                capability,
+                weak,
+            } = binding;
 
-            match &binding.to {
+            let target = match to {
                 LocalComponentRef::Self_ => {
-                    if !self.slots.contains_key(&binding.slot) {
-                        return Err(Error::UnknownBindingSlot {
-                            slot: binding.slot.clone(),
-                        });
-                    }
-                    self_bound_slots.insert(binding.slot.as_str());
+                    let (slot_name, _) = slots
+                        .get_key_value(slot.as_str())
+                        .ok_or_else(|| Error::UnknownBindingSlot { slot })?;
+                    self_bound_slots.insert(slot_name.clone());
+                    BindingTarget::SelfSlot(slot_name.clone())
                 }
-                LocalComponentRef::Child(name) => {
-                    if !self.components.contains_key(name) {
-                        return Err(Error::UnknownBindingChild {
-                            child: name.clone(),
-                        });
+                LocalComponentRef::Child(child) => {
+                    let (child_name, _) = components
+                        .get_key_value(child.as_str())
+                        .ok_or_else(|| Error::UnknownBindingChild { child })?;
+                    let export = ExportName::try_from(slot)?;
+                    BindingTarget::ChildExport {
+                        child: child_name.clone(),
+                        export,
                     }
                 }
+            };
+
+            let source = match from {
+                LocalComponentRef::Self_ => {
+                    let (provide_name, _) = provides
+                        .get_key_value(capability.as_str())
+                        .ok_or_else(|| Error::UnknownBindingProvide { capability })?;
+                    self_bound_provides.insert(provide_name.clone());
+                    BindingSource::SelfProvide(provide_name.clone())
+                }
+                LocalComponentRef::Child(child) => {
+                    let (child_name, _) = components
+                        .get_key_value(child.as_str())
+                        .ok_or_else(|| Error::UnknownBindingChild { child })?;
+                    let export = ExportName::try_from(capability)?;
+                    BindingSource::ChildExport {
+                        child: child_name.clone(),
+                        export,
+                    }
+                }
+            };
+
+            if bindings_out.contains_key(&target) {
+                let to = match &target {
+                    BindingTarget::SelfSlot(_) => "self".to_string(),
+                    BindingTarget::ChildExport { child, .. } => format!("#{child}"),
+                };
+                let slot = match &target {
+                    BindingTarget::SelfSlot(name) => name.to_string(),
+                    BindingTarget::ChildExport { export, .. } => export.to_string(),
+                };
+                return Err(Error::DuplicateBindingTarget { to, slot });
             }
 
-            match &binding.from {
-                LocalComponentRef::Self_ => {
-                    if !self.provides.contains_key(&binding.capability) {
-                        return Err(Error::UnknownBindingProvide {
-                            capability: binding.capability.clone(),
-                        });
-                    }
-                    self_bound_capabilities.insert(binding.capability.as_str());
-                }
-                LocalComponentRef::Child(name) => {
-                    if !self.components.contains_key(name) {
-                        return Err(Error::UnknownBindingChild {
-                            child: name.clone(),
-                        });
-                    }
-                }
-            }
+            bindings_out.insert(target, Binding { from: source, weak });
         }
 
-        let mut exported_self_slots: BTreeSet<&str> = BTreeSet::new();
-        let mut exported_self_provides: BTreeSet<&str> = BTreeSet::new();
+        let mut exported_self_slots: BTreeSet<SlotName> = BTreeSet::new();
+        let mut exported_self_provides: BTreeSet<ProvideName> = BTreeSet::new();
+        let mut exports_out = BTreeMap::new();
 
-        for (export, target) in &self.exports {
-            ensure_name_no_dot(export, "export")?;
-            match &target.component {
+        for (export, target) in exports {
+            let export_name = ExportName::try_from(export)?;
+            let target = match target.component {
                 LocalComponentRef::Self_ => {
-                    if self.slots.contains_key(&target.name) {
-                        exported_self_slots.insert(target.name.as_str());
-                    } else if self.provides.contains_key(&target.name) {
-                        exported_self_provides.insert(target.name.as_str());
+                    if let Some((slot_name, _)) = slots.get_key_value(target.name.as_str()) {
+                        exported_self_slots.insert(slot_name.clone());
+                        ExportTarget::SelfSlot(slot_name.clone())
+                    } else if let Some((provide_name, _)) =
+                        provides.get_key_value(target.name.as_str())
+                    {
+                        exported_self_provides.insert(provide_name.clone());
+                        ExportTarget::SelfProvide(provide_name.clone())
                     } else {
                         return Err(Error::UnknownExportTarget {
-                            export: export.clone(),
-                            target: target.name.clone(),
+                            export: export_name.to_string(),
+                            target: target.name,
                         });
                     }
                 }
                 LocalComponentRef::Child(child) => {
-                    if !self.components.contains_key(child) {
-                        return Err(Error::UnknownExportChild {
-                            export: export.clone(),
-                            child: child.clone(),
-                        });
+                    let (child_name, _) =
+                        components.get_key_value(child.as_str()).ok_or_else(|| {
+                            Error::UnknownExportChild {
+                                export: export_name.to_string(),
+                                child,
+                            }
+                        })?;
+                    let export = ExportName::try_from(target.name)?;
+                    ExportTarget::ChildExport {
+                        child: child_name.clone(),
+                        export,
                     }
                 }
-            }
+            };
+
+            exports_out.insert(export_name, target);
         }
 
-        for name in self.slots.keys() {
-            if !exported_self_slots.contains(name.as_str())
-                && !self_bound_slots.contains(name.as_str())
-            {
-                return Err(Error::UnusedSlot { name: name.clone() });
+        for name in slots.keys() {
+            if !exported_self_slots.contains(name) && !self_bound_slots.contains(name) {
+                return Err(Error::UnusedSlot {
+                    name: name.to_string(),
+                });
             }
         }
 
         let mut used_provides = exported_self_provides;
-        for name in &self_bound_capabilities {
-            used_provides.insert(name);
-        }
+        used_provides.extend(self_bound_provides);
 
-        for name in self.provides.keys() {
-            if !used_provides.contains(name.as_str()) {
-                return Err(Error::UnusedProvide { name: name.clone() });
+        for name in provides.keys() {
+            if !used_provides.contains(name) {
+                return Err(Error::UnusedProvide {
+                    name: name.to_string(),
+                });
             }
         }
 
         let mut defined_endpoints = BTreeSet::new();
-        if let Some(program) = &self.program
+        if let Some(program) = &program
             && let Some(network) = &program.network
         {
             for endpoint in &network.endpoints {
@@ -1149,7 +1310,7 @@ impl RawManifest {
             }
         }
 
-        for provide in self.provides.values() {
+        for provide in provides.values() {
             if let Some(endpoint) = provide.endpoint.as_deref()
                 && !defined_endpoints.contains(endpoint)
             {
@@ -1159,9 +1320,20 @@ impl RawManifest {
             }
         }
 
+        let digest_cell = OnceLock::new();
+        let _ = digest_cell.set(digest);
+
         Ok(Manifest {
-            raw: self,
-            digest: OnceLock::new(),
+            manifest_version,
+            program,
+            components,
+            environments,
+            config_schema,
+            slots,
+            provides,
+            bindings: bindings_out,
+            exports: exports_out,
+            digest: digest_cell,
         })
     }
 }
@@ -1169,17 +1341,73 @@ impl RawManifest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(into = "RawManifest", try_from = "RawManifest")]
 pub struct Manifest {
-    raw: RawManifest,
+    manifest_version: Version,
+    program: Option<Program>,
+    components: BTreeMap<ChildName, ComponentDecl>,
+    environments: BTreeMap<String, EnvironmentDecl>,
+    config_schema: Option<ConfigSchema>,
+    slots: BTreeMap<SlotName, SlotDecl>,
+    provides: BTreeMap<ProvideName, ProvideDecl>,
+    bindings: BTreeMap<BindingTarget, Binding>,
+    exports: BTreeMap<ExportName, ExportTarget>,
     digest: OnceLock<ManifestDigest>,
 }
 
 impl Manifest {
+    pub fn manifest_version(&self) -> &Version {
+        &self.manifest_version
+    }
+
+    pub fn program(&self) -> Option<&Program> {
+        self.program.as_ref()
+    }
+
+    pub fn components(&self) -> &BTreeMap<ChildName, ComponentDecl> {
+        &self.components
+    }
+
+    pub fn environments(&self) -> &BTreeMap<String, EnvironmentDecl> {
+        &self.environments
+    }
+
+    pub fn config_schema(&self) -> Option<&ConfigSchema> {
+        self.config_schema.as_ref()
+    }
+
+    pub fn slots(&self) -> &BTreeMap<SlotName, SlotDecl> {
+        &self.slots
+    }
+
+    pub fn provides(&self) -> &BTreeMap<ProvideName, ProvideDecl> {
+        &self.provides
+    }
+
+    pub fn bindings(&self) -> &BTreeMap<BindingTarget, Binding> {
+        &self.bindings
+    }
+
+    pub fn exports(&self) -> &BTreeMap<ExportName, ExportTarget> {
+        &self.exports
+    }
+
     pub fn empty() -> Self {
-        Self::from_str("{manifest_version:\"0.1.0\"}").unwrap()
+        RawManifest {
+            manifest_version: Version::new(0, 1, 0),
+            program: None,
+            components: BTreeMap::new(),
+            environments: BTreeMap::new(),
+            config_schema: None,
+            slots: BTreeMap::new(),
+            provides: BTreeMap::new(),
+            bindings: BTreeSet::new(),
+            exports: BTreeMap::new(),
+        }
+        .validate()
+        .expect("empty manifest is valid")
     }
 
     pub fn digest(&self) -> ManifestDigest {
-        *self.digest.get_or_init(|| self.raw.digest())
+        *self.digest.get_or_init(|| RawManifest::from(self).digest())
     }
 }
 
@@ -1191,7 +1419,15 @@ impl Clone for Manifest {
             let _ = digest_cell.set(digest);
         }
         Self {
-            raw: self.raw.clone(),
+            manifest_version: self.manifest_version.clone(),
+            program: self.program.clone(),
+            components: self.components.clone(),
+            environments: self.environments.clone(),
+            config_schema: self.config_schema.clone(),
+            slots: self.slots.clone(),
+            provides: self.provides.clone(),
+            bindings: self.bindings.clone(),
+            exports: self.exports.clone(),
             digest: digest_cell,
         }
     }
@@ -1199,7 +1435,15 @@ impl Clone for Manifest {
 
 impl PartialEq for Manifest {
     fn eq(&self, other: &Self) -> bool {
-        self.raw == other.raw
+        self.manifest_version == other.manifest_version
+            && self.program == other.program
+            && self.components == other.components
+            && self.environments == other.environments
+            && self.config_schema == other.config_schema
+            && self.slots == other.slots
+            && self.provides == other.provides
+            && self.bindings == other.bindings
+            && self.exports == other.exports
     }
 }
 
@@ -1207,7 +1451,15 @@ impl Eq for Manifest {}
 
 impl std::hash::Hash for Manifest {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.raw.hash(state);
+        self.manifest_version.hash(state);
+        self.program.hash(state);
+        self.components.hash(state);
+        self.environments.hash(state);
+        self.config_schema.hash(state);
+        self.slots.hash(state);
+        self.provides.hash(state);
+        self.bindings.hash(state);
+        self.exports.hash(state);
     }
 }
 
@@ -1221,7 +1473,96 @@ impl TryFrom<RawManifest> for Manifest {
 
 impl From<Manifest> for RawManifest {
     fn from(manifest: Manifest) -> Self {
-        manifest.raw
+        RawManifest::from(&manifest)
+    }
+}
+
+impl From<&Manifest> for RawManifest {
+    fn from(manifest: &Manifest) -> Self {
+        let components = manifest
+            .components
+            .iter()
+            .map(|(name, decl)| (name.to_string(), decl.clone()))
+            .collect();
+
+        let slots = manifest
+            .slots
+            .iter()
+            .map(|(name, decl)| (name.to_string(), decl.clone()))
+            .collect();
+
+        let provides = manifest
+            .provides
+            .iter()
+            .map(|(name, decl)| (name.to_string(), decl.clone()))
+            .collect();
+
+        let bindings = manifest
+            .bindings
+            .iter()
+            .map(|(target, binding)| {
+                let (to, slot) = match target {
+                    BindingTarget::SelfSlot(name) => (LocalComponentRef::Self_, name.to_string()),
+                    BindingTarget::ChildExport { child, export } => (
+                        LocalComponentRef::Child(child.to_string()),
+                        export.to_string(),
+                    ),
+                };
+
+                let (from, capability) = match &binding.from {
+                    BindingSource::SelfProvide(name) => {
+                        (LocalComponentRef::Self_, name.to_string())
+                    }
+                    BindingSource::ChildExport { child, export } => (
+                        LocalComponentRef::Child(child.to_string()),
+                        export.to_string(),
+                    ),
+                };
+
+                RawBinding {
+                    to,
+                    slot,
+                    from,
+                    capability,
+                    weak: binding.weak,
+                }
+            })
+            .collect();
+
+        let exports = manifest
+            .exports
+            .iter()
+            .map(|(name, target)| {
+                let target = match target {
+                    ExportTarget::SelfSlot(slot) => RawExportTarget {
+                        component: LocalComponentRef::Self_,
+                        name: slot.to_string(),
+                    },
+                    ExportTarget::SelfProvide(provide) => RawExportTarget {
+                        component: LocalComponentRef::Self_,
+                        name: provide.to_string(),
+                    },
+                    ExportTarget::ChildExport { child, export } => RawExportTarget {
+                        component: LocalComponentRef::Child(child.to_string()),
+                        name: export.to_string(),
+                    },
+                };
+
+                (name.to_string(), target)
+            })
+            .collect();
+
+        RawManifest {
+            manifest_version: manifest.manifest_version.clone(),
+            program: manifest.program.clone(),
+            components,
+            environments: manifest.environments.clone(),
+            config_schema: manifest.config_schema.clone(),
+            slots,
+            provides,
+            bindings,
+            exports,
+        }
     }
 }
 
@@ -1232,13 +1573,5 @@ impl FromStr for Manifest {
         let mut deserializer = json5::Deserializer::from_str(input)?;
         let raw: RawManifest = serde_path_to_error::deserialize(&mut deserializer)?;
         raw.validate()
-    }
-}
-
-impl std::ops::Deref for Manifest {
-    type Target = RawManifest;
-
-    fn deref(&self) -> &Self::Target {
-        &self.raw
     }
 }

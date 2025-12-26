@@ -151,7 +151,7 @@ async fn resolve_component(
     stack.push(declared_ref.url.clone());
 
     let referenced_envs: HashSet<String> = manifest
-        .components
+        .components()
         .values()
         .filter_map(component_decl_environment)
         .collect();
@@ -172,10 +172,10 @@ async fn resolve_component(
     }
 
     let children_futs: Vec<_> = manifest
-        .components
+        .components()
         .iter()
         .map(|(child_name, decl)| {
-            let child_name = child_name.clone();
+            let child_name = child_name.to_string();
             let (child_ref, child_cfg, child_env_name) = extract_component_decl(decl);
             let svc = Arc::clone(&svc);
             let child_stack = stack.clone();
@@ -259,7 +259,7 @@ fn compute_environment(
         return Ok(Arc::clone(base_env));
     }
 
-    let Some(env_decl) = manifest.environments.get(env_name) else {
+    let Some(env_decl) = manifest.environments().get(env_name) else {
         visiting.remove(env_name);
         return Ok(Arc::clone(base_env));
     };
