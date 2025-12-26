@@ -1,9 +1,9 @@
 #[cfg(test)]
 mod tests;
 
-use amber_manifest::ManifestRef;
+use amber_manifest::{ManifestRef, lint::lint_manifest};
 use amber_resolver::Resolver;
-use amber_scenario::Scenario;
+use amber_scenario::{Scenario, graph::component_path_for};
 
 mod environment;
 mod frontend;
@@ -19,6 +19,20 @@ pub use store::DigestStore;
 #[derive(Clone, Debug, Default)]
 pub struct CompileOptions {
     pub resolve: ResolveOptions,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagnosticLevel {
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub level: DiagnosticLevel,
+    pub code: &'static str,
+    pub message: String,
+    pub component_path: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -63,13 +77,13 @@ impl Compiler {
         self
     }
 
-    /// Compile a root manifest reference into a fully linked Scenario plus a digest store
-    /// and per-component provenance.
+    /// Compile a root manifest reference into a fully linked Scenario plus a digest store,
+    /// per-component provenance, and diagnostics.
     pub async fn compile(
         &self,
         root: ManifestRef,
         opts: CompileOptions,
-    ) -> Result<Compilation, Error> {
+    ) -> Result<CompileOutput, Error> {
         let tree = frontend::resolve_tree(
             self.resolver.clone(),
             self.store.clone(),
@@ -80,18 +94,47 @@ impl Compiler {
         .await?;
 
         let (scenario, provenance) = linker::link(tree, &self.store)?;
+        let diagnostics = collect_manifest_diagnostics(&scenario, &self.store);
 
-        Ok(Compilation {
+        Ok(CompileOutput {
             scenario,
             store: self.store.clone(),
             provenance,
+            diagnostics,
         })
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct Compilation {
+pub struct CompileOutput {
     pub scenario: Scenario,
     pub store: DigestStore,
     pub provenance: Provenance,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+fn collect_manifest_diagnostics(scenario: &Scenario, store: &DigestStore) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    for component in &scenario.components {
+        let manifest = store
+            .get(&component.digest)
+            .expect("manifest was resolved during linking");
+        let lints = lint_manifest(&manifest);
+        if lints.is_empty() {
+            continue;
+        }
+
+        let component_path = component_path_for(&scenario.components, component.id);
+        for lint in lints {
+            diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Warning,
+                code: lint.code().as_str(),
+                message: lint.to_string(),
+                component_path: component_path.clone(),
+            });
+        }
+    }
+
+    diagnostics
 }

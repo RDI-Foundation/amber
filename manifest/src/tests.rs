@@ -475,7 +475,7 @@ fn environment_extends_unknown_is_rejected() {
 }
 
 #[test]
-fn environment_duplicate_resolvers_are_rejected() {
+fn environment_duplicate_resolvers_are_linted() {
     let raw = parse_raw(
         r#"
         {
@@ -486,14 +486,14 @@ fn environment_duplicate_resolvers_are_rejected() {
         }
         "#,
     );
-    let err = raw.validate().unwrap_err();
-    match err {
-        Error::DuplicateEnvironmentResolver { name, resolver } => {
-            assert_eq!(name, "a");
-            assert_eq!(resolver, "x");
-        }
-        other => panic!("expected DuplicateEnvironmentResolver error, got: {other}"),
-    }
+    let manifest = raw.validate().unwrap();
+    let lints = lint::lint_manifest(&manifest);
+    assert!(
+        lints.contains(&lint::ManifestLint::DuplicateEnvironmentResolver {
+            environment: "a".to_string(),
+            resolver: "x".to_string(),
+        })
+    );
 }
 
 #[test]
@@ -955,7 +955,7 @@ fn binding_source_can_be_multiplexed() {
 }
 
 #[test]
-fn unused_slot_is_rejected() {
+fn unused_slot_is_linted() {
     let raw = parse_raw(
         r#"
         {
@@ -964,16 +964,15 @@ fn unused_slot_is_rejected() {
         }
         "#,
     );
-    let err = raw.validate().unwrap_err();
-
-    match err {
-        Error::UnusedSlot { name } => assert_eq!(name, "llm"),
-        other => panic!("expected UnusedSlot error, got: {other}"),
-    }
+    let manifest = raw.validate().unwrap();
+    let lints = lint::lint_manifest(&manifest);
+    assert!(lints.contains(&lint::ManifestLint::UnusedSlot {
+        name: "llm".to_string(),
+    }));
 }
 
 #[test]
-fn unused_provide_is_rejected() {
+fn unused_provide_is_linted() {
     let raw = parse_raw(
         r#"
         {
@@ -982,16 +981,15 @@ fn unused_provide_is_rejected() {
         }
         "#,
     );
-    let err = raw.validate().unwrap_err();
-
-    match err {
-        Error::UnusedProvide { name } => assert_eq!(name, "api"),
-        other => panic!("expected UnusedProvide error, got: {other}"),
-    }
+    let manifest = raw.validate().unwrap();
+    let lints = lint::lint_manifest(&manifest);
+    assert!(lints.contains(&lint::ManifestLint::UnusedProvide {
+        name: "api".to_string(),
+    }));
 }
 
 #[test]
-fn exported_provide_is_not_unused() {
+fn exported_provide_is_not_linted() {
     let raw = parse_raw(
         r#"
         {
@@ -1004,7 +1002,9 @@ fn exported_provide_is_not_unused() {
         "#,
     );
 
-    raw.validate().unwrap();
+    let manifest = raw.validate().unwrap();
+    let lints = lint::lint_manifest(&manifest);
+    assert!(lints.is_empty());
 }
 
 fn parse_raw(input: &str) -> RawManifest {

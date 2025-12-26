@@ -1,6 +1,6 @@
 # Amber Component Manifest (JSON5) Format
 
-This document defines the **manifest file format** and the **validation performed by `manifest/src/lib.rs`**.
+This document defines the **manifest file format** and the **validation/linting performed by `manifest/src/lib.rs` and `manifest/src/lint.rs`**.
 
 A manifest describes **one component**. A component may:
 
@@ -62,16 +62,19 @@ This crate **parses JSON5**, deserializes into Rust types, and validates:
 * Endpoint names in `program.network.endpoints[]` must be unique.
 * Any `provides.*.endpoint` must refer to a declared endpoint name.
 
-Unused declaration rule enforced by this crate:
+### Linting (this crate)
 
-* Every declared **slot** must be either:
+This crate also provides `manifest::lint::lint_manifest` for non-fatal checks:
+
+* Every declared **slot** should be either:
 
   * **exported** (some export target points at `self.<name>` or `<name>`), or
   * **bound into `self`** (some binding has `to: "self"` and `slot: "<name>"`)
-* Every declared **provide** must be either:
+* Every declared **provide** should be either:
 
   * **exported** (some export target points at `self.<name>` or `<name>`), or
   * **used as a binding source from `self`** (some binding has `from: "self"` and `capability: "<name>"`)
+* Resolver names in each environment should be unique.
 
 ### Link-time / resolution-time validation (NOT done by this crate)
 

@@ -18,7 +18,7 @@ use amber_resolver::{Backend, RemoteResolver, Resolution, Resolver};
 use amber_scenario::graph;
 use url::Url;
 
-use crate::{CompileOptions, Compiler, DigestStore, ResolverRegistry};
+use crate::{CompileOptions, Compiler, DiagnosticLevel, DigestStore, ResolverRegistry};
 
 fn tmp_dir(prefix: &str) -> PathBuf {
     let mut base = std::env::temp_dir();
@@ -230,6 +230,7 @@ async fn compile_twice_unpinned_fails_when_sources_removed() {
             root_ref.clone(),
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                ..Default::default()
             },
         )
         .await
@@ -246,6 +247,7 @@ async fn compile_twice_unpinned_fails_when_sources_removed() {
             root_ref,
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                ..Default::default()
             },
         )
         .await
@@ -309,6 +311,7 @@ async fn compile_twice_with_digest_pins_succeeds_when_sources_removed() {
             root_ref.clone(),
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                ..Default::default()
             },
         )
         .await
@@ -325,6 +328,7 @@ async fn compile_twice_with_digest_pins_succeeds_when_sources_removed() {
             root_ref,
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                ..Default::default()
             },
         )
         .await
@@ -350,6 +354,7 @@ async fn provenance_records_redirect_when_fetched() {
             root_ref,
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                ..Default::default()
             },
         )
         .await
@@ -376,6 +381,7 @@ async fn cycle_is_detected_across_url_aliases_with_same_digest() {
             root_ref,
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                ..Default::default()
             },
         )
         .await
@@ -417,6 +423,7 @@ async fn delegated_export_requires_child_export() {
             root_ref,
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                ..Default::default()
             },
         )
         .await
@@ -471,6 +478,7 @@ async fn binding_rejects_export_kind_mismatch() {
             root_ref,
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                ..Default::default()
             },
         )
         .await
@@ -541,6 +549,7 @@ async fn delegated_export_chain_resolves_binding_source() {
             root_ref,
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                ..Default::default()
             },
         )
         .await
@@ -614,6 +623,7 @@ async fn resolution_deduplicates_inflight_requests() {
             root_ref,
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                ..Default::default()
             },
         )
         .await
@@ -658,6 +668,7 @@ async fn resolution_environments_allow_parent_to_enable_resolvers_for_children()
             root_ref,
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                ..Default::default()
             },
         )
         .await
@@ -665,6 +676,42 @@ async fn resolution_environments_allow_parent_to_enable_resolvers_for_children()
 
     assert_eq!(compilation.scenario.components.len(), 3);
     assert_eq!(backend.call_count(), 1);
+}
+
+#[tokio::test]
+async fn compile_emits_manifest_lints() {
+    let dir = tmp_dir("scenario-manifest-lints");
+    let root_path = dir.join("root.json5");
+
+    write_file(
+        &root_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          provides: { api: { kind: "http" } },
+        }
+        "#,
+    );
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+
+    let output = compiler
+        .compile(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(output.diagnostics.len(), 1);
+    let diagnostic = &output.diagnostics[0];
+    assert_eq!(diagnostic.level, DiagnosticLevel::Warning);
+    assert_eq!(diagnostic.code, "manifest::unused-provide");
+    assert_eq!(diagnostic.component_path, "root");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

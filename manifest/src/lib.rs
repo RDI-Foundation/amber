@@ -1,3 +1,4 @@
+pub mod lint;
 #[cfg(test)]
 mod tests;
 
@@ -57,10 +58,6 @@ pub enum Error {
     UnknownBindingSlot { slot: String },
     #[error("binding source `self.{capability}` references unknown provide")]
     UnknownBindingProvide { capability: String },
-    #[error("slot `{name}` must be bound or exported")]
-    UnusedSlot { name: String },
-    #[error("provide `{name}` must be bound or exported")]
-    UnusedProvide { name: String },
     #[error("duplicate endpoint name `{name}`")]
     DuplicateEndpointName { name: String },
     #[error("unknown endpoint `{name}` referenced")]
@@ -78,8 +75,6 @@ pub enum Error {
     UnknownEnvironmentExtends { name: String, extends: String },
     #[error("environment `{name}` has a cycle in `extends`")]
     EnvironmentCycle { name: String },
-    #[error("environment `{name}` contains duplicate resolver `{resolver}`")]
-    DuplicateEnvironmentResolver { name: String, resolver: String },
     #[error("component `#{child}` references unknown environment `{environment}`")]
     UnknownComponentEnvironment { child: String, environment: String },
 }
@@ -1104,17 +1099,6 @@ impl RawManifest {
                     extends: ext.to_string(),
                 });
             }
-
-            // Duplicate resolver names are almost certainly a bug (and can change shadowing order).
-            let mut seen = BTreeSet::new();
-            for r in &env.resolvers {
-                if !seen.insert(r.as_str()) {
-                    return Err(Error::DuplicateEnvironmentResolver {
-                        name: env_name.clone(),
-                        resolver: r.clone(),
-                    });
-                }
-            }
         }
 
         // Detect cycles in environment extends graph.
@@ -1169,8 +1153,6 @@ impl RawManifest {
         }
 
         let mut bindings_out = BTreeMap::new();
-        let mut self_bound_slots: BTreeSet<SlotName> = BTreeSet::new();
-        let mut self_bound_provides: BTreeSet<ProvideName> = BTreeSet::new();
 
         for binding in bindings {
             let RawBinding {
@@ -1186,7 +1168,6 @@ impl RawManifest {
                     let (slot_name, _) = slots
                         .get_key_value(slot.as_str())
                         .ok_or_else(|| Error::UnknownBindingSlot { slot })?;
-                    self_bound_slots.insert(slot_name.clone());
                     BindingTarget::SelfSlot(slot_name.clone())
                 }
                 LocalComponentRef::Child(child) => {
@@ -1206,7 +1187,6 @@ impl RawManifest {
                     let (provide_name, _) = provides
                         .get_key_value(capability.as_str())
                         .ok_or_else(|| Error::UnknownBindingProvide { capability })?;
-                    self_bound_provides.insert(provide_name.clone());
                     BindingSource::SelfProvide(provide_name.clone())
                 }
                 LocalComponentRef::Child(child) => {
@@ -1236,8 +1216,6 @@ impl RawManifest {
             bindings_out.insert(target, Binding { from: source, weak });
         }
 
-        let mut exported_self_slots: BTreeSet<SlotName> = BTreeSet::new();
-        let mut exported_self_provides: BTreeSet<ProvideName> = BTreeSet::new();
         let mut exports_out = BTreeMap::new();
 
         for (export, target) in exports {
@@ -1245,12 +1223,10 @@ impl RawManifest {
             let target = match target.component {
                 LocalComponentRef::Self_ => {
                     if let Some((slot_name, _)) = slots.get_key_value(target.name.as_str()) {
-                        exported_self_slots.insert(slot_name.clone());
                         ExportTarget::SelfSlot(slot_name.clone())
                     } else if let Some((provide_name, _)) =
                         provides.get_key_value(target.name.as_str())
                     {
-                        exported_self_provides.insert(provide_name.clone());
                         ExportTarget::SelfProvide(provide_name.clone())
                     } else {
                         return Err(Error::UnknownExportTarget {
@@ -1276,25 +1252,6 @@ impl RawManifest {
             };
 
             exports_out.insert(export_name, target);
-        }
-
-        for name in slots.keys() {
-            if !exported_self_slots.contains(name) && !self_bound_slots.contains(name) {
-                return Err(Error::UnusedSlot {
-                    name: name.to_string(),
-                });
-            }
-        }
-
-        let mut used_provides = exported_self_provides;
-        used_provides.extend(self_bound_provides);
-
-        for name in provides.keys() {
-            if !used_provides.contains(name) {
-                return Err(Error::UnusedProvide {
-                    name: name.to_string(),
-                });
-            }
         }
 
         let mut defined_endpoints = BTreeSet::new();
