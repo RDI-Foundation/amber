@@ -35,11 +35,21 @@ pub enum Error {
     #[error("component tree contains a cycle: {cycle:?}")]
     Cycle { cycle: Vec<Url> },
 
+    #[error("relative manifest reference `{reference}` requires an absolute base URL")]
+    RelativeManifestRef { reference: Box<str> },
+
+    #[error("invalid manifest reference `{reference}` in {realm_url}: {message}")]
+    InvalidManifestRef {
+        realm_url: Box<Url>,
+        reference: Box<str>,
+        message: Box<str>,
+    },
+
     #[error(
         "unknown resolver `{resolver}` referenced by environment `{environment}` in {realm_url}"
     )]
     UnknownResolver {
-        realm_url: Url,
+        realm_url: Box<Url>,
         environment: Box<str>,
         resolver: Box<str>,
     },
@@ -85,6 +95,14 @@ struct ResolvedManifest {
     observed_url: Option<Url>,
 }
 
+struct ResolveContext {
+    svc: Arc<ResolveService>,
+    env: Arc<ResolveEnv>,
+    base_url: Option<Url>,
+    stack: Vec<Url>,
+    path_set: HashSet<ManifestDigest>,
+}
+
 struct ResolveService {
     store: DigestStore,
     max_concurrency: usize,
@@ -113,30 +131,57 @@ pub async fn resolve_tree(
 
     let root_env = Arc::new(ResolveEnv::root(resolver));
 
-    let node = resolve_component(
-        Arc::clone(&svc),
-        root_env,
-        "root".to_string(),
-        root,
-        None,
-        Vec::new(),
-        HashSet::new(),
-    )
-    .await?;
+    let ctx = ResolveContext {
+        svc: Arc::clone(&svc),
+        env: root_env,
+        base_url: None,
+        stack: Vec::new(),
+        path_set: HashSet::new(),
+    };
+
+    let node = resolve_component(ctx, "root".to_string(), root, None).await?;
 
     Ok(ResolvedTree { root: node })
 }
 
+fn resolve_manifest_ref(
+    declared_ref: &ManifestRef,
+    base_url: Option<&Url>,
+) -> Result<ManifestRef, Error> {
+    if !declared_ref.url.is_relative() {
+        return Ok(declared_ref.clone());
+    }
+
+    let Some(base) = base_url else {
+        return Err(Error::RelativeManifestRef {
+            reference: declared_ref.url.as_str().into(),
+        });
+    };
+
+    declared_ref
+        .resolve_against(base)
+        .map_err(|err| Error::InvalidManifestRef {
+            realm_url: Box::new(base.clone()),
+            reference: declared_ref.url.as_str().into(),
+            message: err.to_string().into(),
+        })
+}
+
 async fn resolve_component(
-    svc: Arc<ResolveService>,
-    env: Arc<ResolveEnv>,
+    ctx: ResolveContext,
     name: String,
     declared_ref: ManifestRef,
     config: Option<serde_json::Value>,
-    mut stack: Vec<Url>,
-    mut path_set: HashSet<ManifestDigest>,
 ) -> Result<ResolvedNode, Error> {
-    let resolved = resolve_manifest(&svc, &env, &declared_ref).await?;
+    let ResolveContext {
+        svc,
+        env,
+        base_url,
+        mut stack,
+        mut path_set,
+    } = ctx;
+    let resolved_ref = resolve_manifest_ref(&declared_ref, base_url.as_ref())?;
+    let resolved = resolve_manifest(&svc, &env, &resolved_ref).await?;
     let ResolvedManifest {
         manifest,
         digest,
@@ -144,11 +189,19 @@ async fn resolve_component(
     } = resolved;
 
     if path_set.contains(&digest) {
-        stack.push(declared_ref.url.clone());
+        let resolved_url = resolved_ref
+            .url
+            .as_url()
+            .expect("resolved manifest ref should be absolute");
+        stack.push(resolved_url.clone());
         return Err(Error::Cycle { cycle: stack });
     }
     path_set.insert(digest);
-    stack.push(declared_ref.url.clone());
+    let resolved_url = resolved_ref
+        .url
+        .as_url()
+        .expect("resolved manifest ref should be absolute");
+    stack.push(resolved_url.clone());
 
     let referenced_envs: HashSet<String> = manifest
         .components()
@@ -156,7 +209,7 @@ async fn resolve_component(
         .filter_map(component_decl_environment)
         .collect();
 
-    let realm_url = observed_url.as_ref().unwrap_or(&declared_ref.url);
+    let realm_url = observed_url.as_ref().unwrap_or(resolved_url).clone();
 
     let mut env_cache: HashMap<String, Arc<ResolveEnv>> = HashMap::new();
     for env_name in &referenced_envs {
@@ -164,7 +217,7 @@ async fn resolve_component(
             &svc,
             &env,
             &manifest,
-            realm_url,
+            &realm_url,
             env_name,
             &mut env_cache,
             &mut HashSet::new(),
@@ -180,6 +233,7 @@ async fn resolve_component(
             let svc = Arc::clone(&svc);
             let child_stack = stack.clone();
             let child_path_set = path_set.clone();
+            let realm_url = realm_url.clone();
 
             let child_env = match child_env_name {
                 None => Arc::clone(&env),
@@ -190,16 +244,15 @@ async fn resolve_component(
             };
 
             async move {
-                let child_node = resolve_component(
+                let child_ctx = ResolveContext {
                     svc,
-                    child_env,
-                    child_name.clone(),
-                    child_ref,
-                    child_cfg,
-                    child_stack,
-                    child_path_set,
-                )
-                .await?;
+                    env: child_env,
+                    base_url: Some(realm_url),
+                    stack: child_stack,
+                    path_set: child_path_set,
+                };
+                let child_node =
+                    resolve_component(child_ctx, child_name.clone(), child_ref, child_cfg).await?;
                 Ok::<(String, ResolvedNode), Error>((child_name, child_node))
             }
         })
@@ -274,7 +327,7 @@ fn compute_environment(
     for resolver_name in &env_decl.resolvers {
         let Some(r) = svc.registry.get(resolver_name.as_str()) else {
             return Err(Error::UnknownResolver {
-                realm_url: realm_url.clone(),
+                realm_url: Box::new(realm_url.clone()),
                 environment: env_name.into(),
                 resolver: resolver_name.as_str().into(),
             });
@@ -316,7 +369,11 @@ async fn resolve_manifest(
         });
     }
 
-    let key = (env.id, r.url.clone());
+    let url = r
+        .url
+        .as_url()
+        .expect("resolved manifest ref should be absolute");
+    let key = (env.id, url.clone());
     let cell = svc
         .inflight
         .entry(key)
@@ -331,10 +388,7 @@ async fn resolve_manifest(
     if let Some(expected) = r.digest
         && resolved.digest != expected
     {
-        let url = resolved
-            .observed_url
-            .clone()
-            .unwrap_or_else(|| r.url.clone());
+        let url = resolved.observed_url.clone().unwrap_or_else(|| url.clone());
         return Err(Error::Resolver(resolver::Error::MismatchedDigest(url)));
     }
 
@@ -363,12 +417,16 @@ async fn resolve_manifest_inner(
         .await
         .expect("semaphore closed");
 
-    let resolution = env.resolver.resolve(&r.url, r.digest).await?;
+    let url = r
+        .url
+        .as_url()
+        .expect("resolved manifest ref should be absolute");
+    let resolution = env.resolver.resolve(url, r.digest).await?;
     let manifest = Arc::new(resolution.manifest);
     let digest = manifest.digest();
     let stored = svc.store.put(digest, manifest);
 
-    let observed_url = (resolution.url != r.url).then_some(resolution.url);
+    let observed_url = (resolution.url != *url).then_some(resolution.url);
 
     Ok(ResolvedManifest {
         manifest: stored,

@@ -388,6 +388,28 @@ fn components_sugar_parses() {
 }
 
 #[test]
+fn relative_manifest_ref_parses() {
+    let m: Manifest = r##"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            child: "./child.json5",
+          }
+        }
+        "##
+    .parse()
+    .unwrap();
+
+    match m.components.get("child").unwrap() {
+        ComponentDecl::Reference(r) => {
+            assert!(r.url.is_relative());
+            assert_eq!(r.url.as_str(), "./child.json5");
+        }
+        _ => panic!("expected reference"),
+    }
+}
+
+#[test]
 fn component_object_environment_parses() {
     let m: Manifest = r##"
         {

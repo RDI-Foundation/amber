@@ -17,7 +17,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use serde_with::{DeserializeFromStr, MapPreventDuplicates, SerializeDisplay, serde_as};
 use sha2::Digest as _;
-use url::Url;
+use url::{ParseError, Url};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -231,9 +231,64 @@ impl fmt::Display for ManifestDigest {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[non_exhaustive]
 pub struct ManifestRef {
-    pub url: Url,
+    pub url: ManifestUrl,
     #[serde(default)]
     pub digest: Option<ManifestDigest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ManifestUrl {
+    Absolute(Url),
+    Relative(Arc<str>),
+}
+
+impl ManifestUrl {
+    fn parse(input: &str) -> Result<Self, Error> {
+        if input.is_empty() {
+            return Err(Error::InvalidManifestRef(input.to_string()));
+        }
+
+        match Url::parse(input) {
+            Ok(url) => Ok(Self::Absolute(url)),
+            Err(ParseError::RelativeUrlWithoutBase) => Ok(Self::Relative(Arc::from(input))),
+            Err(_) => Err(Error::InvalidManifestRef(input.to_string())),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            ManifestUrl::Absolute(url) => url.as_str(),
+            ManifestUrl::Relative(value) => value,
+        }
+    }
+
+    pub fn as_url(&self) -> Option<&Url> {
+        match self {
+            ManifestUrl::Absolute(url) => Some(url),
+            ManifestUrl::Relative(_) => None,
+        }
+    }
+
+    pub fn is_relative(&self) -> bool {
+        matches!(self, ManifestUrl::Relative(_))
+    }
+
+    pub fn resolve(&self, base: &Url) -> Result<Url, ParseError> {
+        match self {
+            ManifestUrl::Absolute(url) => Ok(url.clone()),
+            ManifestUrl::Relative(rel) => base.join(rel),
+        }
+    }
+}
+
+impl Serialize for ManifestUrl {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
 }
 
 impl<'de> Deserialize<'de> for ManifestRef {
@@ -244,9 +299,7 @@ impl<'de> Deserialize<'de> for ManifestRef {
         let value = Value::deserialize(deserializer)?;
         match value {
             Value::String(url) => Ok(Self {
-                url: Url::parse(&url).map_err(|_| {
-                    serde::de::Error::custom(Error::InvalidManifestRef(url.clone()))
-                })?,
+                url: ManifestUrl::parse(&url).map_err(serde::de::Error::custom)?,
                 digest: None,
             }),
             Value::Object(mut map) => {
@@ -260,9 +313,7 @@ impl<'de> Deserialize<'de> for ManifestRef {
                     None => return Err(serde::de::Error::custom("manifest ref missing `url`")),
                 };
 
-                let url = Url::parse(&url).map_err(|_| {
-                    serde::de::Error::custom(Error::InvalidManifestRef(url.clone()))
-                })?;
+                let url = ManifestUrl::parse(&url).map_err(serde::de::Error::custom)?;
 
                 let digest = match map.remove("digest") {
                     None | Some(Value::Null) => None,
@@ -302,7 +353,7 @@ impl FromStr for ManifestRef {
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         Ok(Self {
-            url: Url::parse(input).map_err(|_| Error::InvalidManifestRef(input.to_string()))?,
+            url: ManifestUrl::parse(input)?,
             digest: None,
         })
     }
@@ -768,11 +819,25 @@ impl<'de> Deserialize<'de> for ComponentDecl {
 
 impl ManifestRef {
     pub fn new(url: Url, digest: Option<ManifestDigest>) -> Self {
-        Self { url, digest }
+        Self {
+            url: ManifestUrl::Absolute(url),
+            digest,
+        }
     }
 
     pub fn from_url(url: Url) -> Self {
-        Self { url, digest: None }
+        Self {
+            url: ManifestUrl::Absolute(url),
+            digest: None,
+        }
+    }
+
+    pub fn resolve_against(&self, base: &Url) -> Result<Self, ParseError> {
+        let url = self.url.resolve(base)?;
+        Ok(Self {
+            url: ManifestUrl::Absolute(url),
+            digest: self.digest,
+        })
     }
 }
 

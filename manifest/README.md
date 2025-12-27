@@ -133,13 +133,14 @@ Forms:
 * URL string (sugar):
 
   * `"https://registry.example.org/pkg/v1"`
+  * `"./child.json5"` (relative to the manifest's own URL)
 * Canonical object form (optionally pinned):
 
   * `{ url: "https://...", digest: "sha256:<base64>" }`
 
 Rules enforced by this crate:
 
-* `url` must be a string parseable as an absolute URL.
+* `url` must be a string parseable as an absolute URL or a relative reference.
 * `digest` (if present) must be:
 
   * algorithm `sha256`
