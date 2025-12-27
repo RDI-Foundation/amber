@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
 
+use amber_manifest::CapabilityKind;
 use amber_scenario::{ComponentId, Scenario, graph::component_path_for};
 
 use super::{Backend, BackendError};
@@ -12,18 +13,83 @@ impl Backend for DotBackend {
     type Artifact = String;
 
     fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, BackendError> {
-        Ok(render_dot(&output.scenario))
+        Ok(render_dot_with_exports(output))
     }
 }
 
 /// Render a Scenario graph as a Graphviz DOT diagram.
 pub fn render_dot(s: &Scenario) -> String {
+    render_dot_inner(s, &[])
+}
+
+#[derive(Clone, Debug)]
+struct ExportEdge {
+    endpoint_label: String,
+    from: ComponentId,
+    kind: CapabilityKind,
+}
+
+fn render_dot_with_exports(output: &CompileOutput) -> String {
+    let s = &output.scenario;
+
+    let manifests = s
+        .components
+        .iter()
+        .map(|c| {
+            output
+                .store
+                .get(&c.digest)
+                .expect("manifest was resolved during linking")
+        })
+        .collect::<Vec<_>>();
+
+    let root = s.root;
+    let root_manifest = &manifests[root.0];
+
+    let mut exports = Vec::with_capacity(root_manifest.exports().len());
+    for export_name in root_manifest.exports().keys() {
+        let resolved = crate::linker::resolve_export(&s.components, &manifests, root, export_name)
+            .expect("export was validated during linking");
+
+        let (endpoint_component, endpoint_name) = match resolved.kind {
+            crate::linker::ExportKind::Provide => (resolved.component, resolved.name.as_str()),
+            crate::linker::ExportKind::Slot => {
+                let provide = &s
+                    .bindings
+                    .iter()
+                    .find(|b| b.to.component == resolved.component && b.to.name == resolved.name)
+                    .expect("exported slot must have a binding in a linked Scenario")
+                    .from;
+                (provide.component, provide.name.as_str())
+            }
+        };
+
+        exports.push(ExportEdge {
+            endpoint_label: endpoint_label_for_provide(
+                &manifests[endpoint_component.0],
+                endpoint_name,
+                resolved.decl.kind,
+            ),
+            from: resolved.component,
+            kind: resolved.decl.kind,
+        });
+    }
+
+    render_dot_inner(s, &exports)
+}
+
+fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
+    let root = s.root;
+    let root_has_program = s.components[root.0].has_program;
+    let root_needs_node = !root_has_program && exports.iter().any(|e| e.from == root);
+    let root_has_node = root_has_program || root_needs_node;
+
     let mut out = String::new();
     let _ = writeln!(out, "digraph scenario {{");
     let _ = writeln!(out, "  rankdir=LR;");
     let _ = writeln!(out, "  compound=true;");
-    let root = s.root;
-    render_root(s, 1, &mut out);
+
+    render_root(s, root_needs_node, 1, &mut out);
     for (id, c) in s.components.iter().enumerate() {
         let id = ComponentId(id);
         if id == root || c.parent.is_some() {
@@ -32,9 +98,15 @@ pub fn render_dot(s: &Scenario) -> String {
         render_component(s, id, 1, &mut out);
     }
 
-    let root_has_program = s.components[root.0].has_program;
+    for (i, export) in exports.iter().enumerate() {
+        write_indent(&mut out, 1);
+        let _ = write!(out, "e{i} [label=\"");
+        write_escaped_label(&mut out, &export.endpoint_label);
+        let _ = writeln!(out, "\", shape=box];");
+    }
+
     for b in &s.bindings {
-        if !root_has_program && (b.from.component == root || b.to.component == root) {
+        if !root_has_node && (b.from.component == root || b.to.component == root) {
             continue;
         }
 
@@ -52,11 +124,56 @@ pub fn render_dot(s: &Scenario) -> String {
         }
     }
 
+    for (i, export) in exports.iter().enumerate() {
+        write_indent(&mut out, 1);
+        let _ = write!(out, "c{} -> e{i} [label=\"", export.from.0);
+        write_escaped_label(&mut out, &export.kind.to_string());
+        let _ = writeln!(out, "\"];");
+    }
+
     let _ = writeln!(out, "}}");
     out
 }
 
-fn render_root(s: &Scenario, indent: usize, out: &mut String) {
+fn endpoint_label_for_provide(
+    manifest: &amber_manifest::Manifest,
+    provide_name: &str,
+    kind: CapabilityKind,
+) -> String {
+    let provide = manifest
+        .provides()
+        .iter()
+        .find(|(name, _)| name.as_str() == provide_name)
+        .map(|(_, decl)| decl);
+
+    let Some(network) = manifest.program().and_then(|p| p.network.as_ref()) else {
+        return "<no network>".to_string();
+    };
+
+    let endpoint = if let Some(endpoint_name) = provide.and_then(|p| p.endpoint.as_deref()) {
+        network.endpoints.iter().find(|e| e.name == endpoint_name)
+    } else if network.endpoints.len() == 1 {
+        network.endpoints.iter().next()
+    } else if let Some(endpoint) = network.endpoints.iter().find(|e| e.name == provide_name) {
+        Some(endpoint)
+    } else if kind == CapabilityKind::Llm {
+        network
+            .endpoints
+            .iter()
+            .find(|e| e.name == "router")
+            .or_else(|| network.endpoints.iter().find(|e| e.name == "endpoint"))
+    } else {
+        network.endpoints.iter().find(|e| e.name == "endpoint")
+    };
+
+    let Some(endpoint) = endpoint else {
+        return "<unknown endpoint>".to_string();
+    };
+
+    format!("{}:{}{}", endpoint.protocol, endpoint.port, endpoint.path)
+}
+
+fn render_root(s: &Scenario, render_root_node: bool, indent: usize, out: &mut String) {
     let root = s.root;
     let c = &s.components[root.0];
 
@@ -75,6 +192,8 @@ fn render_root(s: &Scenario, indent: usize, out: &mut String) {
 
     if c.has_program {
         render_node_with_label(root, "program", indent + 1, out);
+    } else if render_root_node {
+        render_node(s, root, indent + 1, out);
     }
 
     for child in c.children.values() {
@@ -148,10 +267,11 @@ fn write_escaped_label(out: &mut String, label: &str) {
 mod tests {
     use std::collections::BTreeMap;
 
-    use amber_manifest::ManifestDigest;
+    use amber_manifest::{Manifest, ManifestDigest};
     use amber_scenario::{BindingEdge, Component, ComponentId, ProvideRef, Scenario, SlotRef};
 
-    use super::render_dot;
+    use super::{render_dot, render_dot_with_exports};
+    use crate::CompileOutput;
 
     fn component(id: usize, name: &str) -> Component {
         Component {
@@ -262,6 +382,110 @@ mod tests {
   }
 }
 "#;
+        assert_eq!(dot, expected);
+    }
+
+    #[test]
+    fn dot_renders_root_exports_as_endpoints() {
+        let root_manifest = r##"
+            {
+              manifest_version: "0.1.0",
+              components: { a: "a.json5", b: "b.json5" },
+              bindings: [
+                { to: "#a.in", from: "#b.out" },
+              ],
+              exports: { public: "#a.in" },
+            }
+            "##
+        .parse::<Manifest>()
+        .unwrap();
+
+        let a_manifest = r#"
+            {
+              manifest_version: "0.1.0",
+              slots: { in: { kind: "http" } },
+              exports: { in: "in" },
+            }
+            "#
+        .parse::<Manifest>()
+        .unwrap();
+
+        let b_manifest = r#"
+	            {
+	              manifest_version: "0.1.0",
+	              program: {
+	                image: "b",
+	                network: {
+	                  endpoints: [{ name: "ep", port: 8080, path: "/api" }],
+	                },
+	              },
+	              provides: { out: { kind: "http", endpoint: "ep" } },
+	              exports: { out: "out" },
+	            }
+	            "#
+        .parse::<Manifest>()
+        .unwrap();
+
+        let store = crate::DigestStore::new();
+        let root_digest = root_manifest.digest();
+        let a_digest = a_manifest.digest();
+        let b_digest = b_manifest.digest();
+
+        store.put(root_digest, std::sync::Arc::new(root_manifest));
+        store.put(a_digest, std::sync::Arc::new(a_manifest));
+        store.put(b_digest, std::sync::Arc::new(b_manifest));
+
+        let mut components = vec![component(0, ""), component(1, "a"), component(2, "b")];
+        components[1].parent = Some(ComponentId(0));
+        components[2].parent = Some(ComponentId(0));
+        components[0].digest = root_digest;
+        components[1].digest = a_digest;
+        components[2].digest = b_digest;
+
+        let mut root_children = BTreeMap::new();
+        root_children.insert("a".to_string(), ComponentId(1));
+        root_children.insert("b".to_string(), ComponentId(2));
+        components[0].children = root_children;
+
+        let scenario = Scenario {
+            root: ComponentId(0),
+            components,
+            bindings: vec![BindingEdge {
+                from: ProvideRef {
+                    component: ComponentId(2),
+                    name: "out".to_string(),
+                },
+                to: SlotRef {
+                    component: ComponentId(1),
+                    name: "in".to_string(),
+                },
+                weak: false,
+            }],
+        };
+
+        let output = CompileOutput {
+            scenario,
+            store,
+            provenance: crate::Provenance::default(),
+            diagnostics: Vec::new(),
+        };
+
+        let dot = render_dot_with_exports(&output);
+        let expected = r#"digraph scenario {
+  rankdir=LR;
+  compound=true;
+  subgraph cluster_0 {
+    penwidth=2;
+    label="";
+    c1 [label="/a"];
+    c2 [label="/b"];
+  }
+  e0 [label="http:8080/api", shape=box];
+  c2 -> c1 [label="out"];
+  c1 -> e0 [label="http"];
+}
+"#;
+
         assert_eq!(dot, expected);
     }
 }
