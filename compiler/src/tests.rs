@@ -479,8 +479,8 @@ async fn delegated_export_requires_child_export() {
 }
 
 #[tokio::test]
-async fn binding_rejects_export_kind_mismatch() {
-    let dir = tmp_dir("scenario-export-kind-mismatch");
+async fn binding_rejects_missing_child_slot() {
+    let dir = tmp_dir("scenario-missing-child-slot");
     let root_path = dir.join("root.json5");
     let child_path = dir.join("child.json5");
 
@@ -505,7 +505,7 @@ async fn binding_rejects_export_kind_mismatch() {
               }},
               provides: {{ api: {{ kind: "http" }} }},
               bindings: [
-                {{ to: "#child.api", from: "self.api" }},
+                {{ to: "#child.missing", from: "self.api" }},
               ],
             }}
             "##,
@@ -527,10 +527,7 @@ async fn binding_rejects_export_kind_mismatch() {
         .await
         .unwrap_err();
 
-    assert!(
-        err.to_string()
-            .contains("exported as a provide (expected slot)")
-    );
+    assert!(err.to_string().contains("unknown slot `missing` on /child"));
 }
 
 #[tokio::test]

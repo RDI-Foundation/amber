@@ -5,7 +5,6 @@
     args: [
       "--domain", "${config.domain}",
       "--llm", "${slots.llm.url}",
-      "--agent", "${slots.agent.url}",
     ],
     env: {
       TAU2_ENV: "${slots.env.url}",
@@ -31,17 +30,9 @@
   slots: {
     env: { kind: "mcp", profile: "openenv" },
     llm: { kind: "llm" },
-    agent: { kind: "a2a" },
-    admin_api: { kind: "mcp" },
   },
   provides: {
-    tool_proxy: { kind: "mcp", endpoint: "endpoint" },
+    agent: { kind: "a2a", endpoint: "endpoint" },
   },
-  exports: {
-    env: "env",
-    llm: "llm",
-    agent: "agent",
-    admin_api: "admin_api",
-    tool_proxy: "tool_proxy",
-  },
+  exports: { agent: "agent" },
 }

@@ -51,18 +51,7 @@ fn render_dot_with_exports(output: &CompileOutput) -> String {
         let resolved = crate::linker::resolve_export(&s.components, &manifests, root, export_name)
             .expect("export was validated during linking");
 
-        let (endpoint_component, endpoint_name) = match resolved.kind {
-            crate::linker::ExportKind::Provide => (resolved.component, resolved.name.as_str()),
-            crate::linker::ExportKind::Slot => {
-                let provide = &s
-                    .bindings
-                    .iter()
-                    .find(|b| b.to.component == resolved.component && b.to.name == resolved.name)
-                    .expect("exported slot must have a binding in a linked Scenario")
-                    .from;
-                (provide.component, provide.name.as_str())
-            }
-        };
+        let (endpoint_component, endpoint_name) = (resolved.component, resolved.name.as_str());
 
         exports.push(ExportEdge {
             endpoint_label: endpoint_label_for_provide(
@@ -394,7 +383,7 @@ mod tests {
               bindings: [
                 { to: "#a.in", from: "#b.out" },
               ],
-              exports: { public: "#a.in" },
+              exports: { public: "#b.out" },
             }
             "##
         .parse::<Manifest>()
@@ -404,7 +393,6 @@ mod tests {
             {
               manifest_version: "0.1.0",
               slots: { in: { kind: "http" } },
-              exports: { in: "in" },
             }
             "#
         .parse::<Manifest>()
@@ -482,7 +470,7 @@ mod tests {
   }
   e0 [label="http:8080/api", shape=box];
   c2 -> c1 [label="out"];
-  c1 -> e0 [label="http"];
+  c2 -> e0 [label="http"];
 }
 "#;
 

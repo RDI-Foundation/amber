@@ -1027,7 +1027,6 @@ fn split_binding_side(input: &str) -> Result<(LocalComponentRef, String), Error>
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum ExportTarget {
-    SelfSlot(SlotName),
     SelfProvide(ProvideName),
     ChildExport {
         child: ChildName,
@@ -1039,10 +1038,7 @@ pub enum ExportTarget {
 #[non_exhaustive]
 pub enum BindingTarget {
     SelfSlot(SlotName),
-    ChildExport {
-        child: ChildName,
-        export: ExportName,
-    },
+    ChildSlot { child: ChildName, slot: SlotName },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1239,10 +1235,10 @@ impl RawManifest {
                     let (child_name, _) = components
                         .get_key_value(child.as_str())
                         .ok_or_else(|| Error::UnknownBindingChild { child })?;
-                    let export = ExportName::try_from(slot)?;
-                    BindingTarget::ChildExport {
+                    let slot_name = SlotName::try_from(slot)?;
+                    BindingTarget::ChildSlot {
                         child: child_name.clone(),
-                        export,
+                        slot: slot_name,
                     }
                 }
             };
@@ -1269,11 +1265,11 @@ impl RawManifest {
             if bindings_out.contains_key(&target) {
                 let to = match &target {
                     BindingTarget::SelfSlot(_) => "self".to_string(),
-                    BindingTarget::ChildExport { child, .. } => format!("#{child}"),
+                    BindingTarget::ChildSlot { child, .. } => format!("#{child}"),
                 };
                 let slot = match &target {
                     BindingTarget::SelfSlot(name) => name.to_string(),
-                    BindingTarget::ChildExport { export, .. } => export.to_string(),
+                    BindingTarget::ChildSlot { slot, .. } => slot.to_string(),
                 };
                 return Err(Error::DuplicateBindingTarget { to, slot });
             }
@@ -1287,11 +1283,7 @@ impl RawManifest {
             let export_name = ExportName::try_from(export)?;
             let target = match target.component {
                 LocalComponentRef::Self_ => {
-                    if let Some((slot_name, _)) = slots.get_key_value(target.name.as_str()) {
-                        ExportTarget::SelfSlot(slot_name.clone())
-                    } else if let Some((provide_name, _)) =
-                        provides.get_key_value(target.name.as_str())
-                    {
+                    if let Some((provide_name, _)) = provides.get_key_value(target.name.as_str()) {
                         ExportTarget::SelfProvide(provide_name.clone())
                     } else {
                         return Err(Error::UnknownExportTarget {
@@ -1525,9 +1517,9 @@ impl From<&Manifest> for RawManifest {
             .map(|(target, binding)| {
                 let (to, slot) = match target {
                     BindingTarget::SelfSlot(name) => (LocalComponentRef::Self_, name.to_string()),
-                    BindingTarget::ChildExport { child, export } => (
+                    BindingTarget::ChildSlot { child, slot } => (
                         LocalComponentRef::Child(child.to_string()),
-                        export.to_string(),
+                        slot.to_string(),
                     ),
                 };
 
@@ -1556,10 +1548,6 @@ impl From<&Manifest> for RawManifest {
             .iter()
             .map(|(name, target)| {
                 let target = match target {
-                    ExportTarget::SelfSlot(slot) => RawExportTarget {
-                        component: LocalComponentRef::Self_,
-                        name: slot.to_string(),
-                    },
                     ExportTarget::SelfProvide(provide) => RawExportTarget {
                         component: LocalComponentRef::Self_,
                         name: provide.to_string(),

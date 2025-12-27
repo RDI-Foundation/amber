@@ -3,11 +3,11 @@ use std::{
     sync::Arc,
 };
 
-use amber_manifest::{ExportTarget, InterpolatedPart, InterpolationSource, Manifest};
+use amber_manifest::{InterpolatedPart, InterpolationSource, Manifest};
 use amber_scenario::{ComponentId, Scenario};
 
 use super::{PassError, ScenarioPass};
-use crate::{DigestStore, Provenance, linker::ExportKind};
+use crate::{DigestStore, Provenance};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DcePass;
@@ -65,25 +65,12 @@ impl ScenarioPass for DcePass {
                         message: e.to_string(),
                     })?;
 
-            match resolved.kind {
-                ExportKind::Provide => {
-                    let key = CapKey {
-                        component: resolved.component.0,
-                        name: Arc::from(resolved.name),
-                    };
-                    if live_provides.insert(key.clone()) {
-                        work.push_back(WorkItem::Provide(key));
-                    }
-                }
-                ExportKind::Slot => {
-                    let key = CapKey {
-                        component: resolved.component.0,
-                        name: Arc::from(resolved.name),
-                    };
-                    if live_slots.insert(key.clone()) {
-                        work.push_back(WorkItem::Slot(key));
-                    }
-                }
+            let key = CapKey {
+                component: resolved.component.0,
+                name: Arc::from(resolved.name),
+            };
+            if live_provides.insert(key.clone()) {
+                work.push_back(WorkItem::Provide(key));
             }
         }
 
@@ -209,15 +196,6 @@ fn mark_used_slots(
             if used_all {
                 break;
             }
-        }
-    }
-
-    if !used_all {
-        for target in manifest.exports().values() {
-            let ExportTarget::SelfSlot(slot) = target else {
-                continue;
-            };
-            used.push(slot.as_str());
         }
     }
 
@@ -420,7 +398,7 @@ mod tests {
           program: { image: "wrapper" },
           slots: { litellm: { kind: "http" } },
           provides: { admin_api: { kind: "mcp" } },
-          exports: { litellm: "litellm", admin_api: "admin_api" },
+          exports: { admin_api: "admin_api" },
         }
         "##
         .parse()
@@ -593,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn dce_keeps_dependencies_for_slot_exports() {
+    fn dce_keeps_dependencies_for_program_slots() {
         let root: Manifest = r##"
         {
           manifest_version: "0.1.0",
@@ -602,7 +580,7 @@ mod tests {
             input: "file:///input.json5",
             llm: "file:///llm.json5",
           },
-          exports: { input: "#consumer.input" },
+          exports: { out: "#consumer.out" },
         }
         "##
         .parse()
@@ -613,13 +591,14 @@ mod tests {
           manifest_version: "0.1.0",
           program: {
             image: "consumer",
-            args: ["--llm", "${slots.llm.url}"],
+            args: ["--input", "${slots.input.url}", "--llm", "${slots.llm.url}"],
           },
           slots: {
             input: { kind: "mcp" },
             llm: { kind: "llm" },
           },
-          exports: { input: "input" },
+          provides: { out: { kind: "mcp" } },
+          exports: { out: "out" },
         }
         "##
         .parse()
@@ -765,7 +744,14 @@ mod tests {
 
         let (scenario, _prov) = DcePass.run(scenario, provenance, &store).unwrap();
 
+        assert!(scenario.components.iter().any(|c| c.name == "input"));
         assert!(scenario.components.iter().any(|c| c.name == "llm"));
+        assert!(
+            scenario
+                .bindings
+                .iter()
+                .any(|edge| edge.from.name == "input" && edge.to.name == "input")
+        );
         assert!(
             scenario
                 .bindings
@@ -775,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn dce_keeps_exported_slots_for_live_programs() {
+    fn dce_keeps_program_slots_from_env() {
         let root: Manifest = r##"
         {
           manifest_version: "0.1.0",
@@ -792,10 +778,13 @@ mod tests {
         let app: Manifest = r##"
         {
           manifest_version: "0.1.0",
-          program: { image: "app" },
+          program: {
+            image: "app",
+            env: { ADMIN_URL: "${slots.admin.url}" },
+          },
           slots: { admin: { kind: "mcp" } },
           provides: { out: { kind: "mcp" } },
-          exports: { out: "out", admin: "admin" },
+          exports: { out: "out" },
         }
         "##
         .parse()

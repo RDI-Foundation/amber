@@ -1,6 +1,9 @@
 use std::{collections::BTreeSet, fmt};
 
-use crate::{BindingSource, BindingTarget, ExportTarget, Manifest};
+use crate::{
+    BindingSource, BindingTarget, ExportTarget, InterpolatedPart, InterpolatedString,
+    InterpolationSource, Manifest, SlotName,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -58,7 +61,7 @@ impl fmt::Display for ManifestLint {
                 write!(f, "program is never referenced by bindings or exports")
             }
             ManifestLint::UnusedSlot { name } => {
-                write!(f, "slot `{name}` is never bound or exported")
+                write!(f, "slot `{name}` is never bound")
             }
             ManifestLint::UnusedProvide { name } => {
                 write!(f, "provide `{name}` is never used or exported")
@@ -72,6 +75,30 @@ impl fmt::Display for ManifestLint {
                     "environment `{environment}` declares resolver `{resolver}` more than once"
                 )
             }
+        }
+    }
+}
+
+fn add_program_slot_uses<'a>(
+    manifest: &'a Manifest,
+    used_slots: &mut BTreeSet<&'a SlotName>,
+    value: &'a InterpolatedString,
+) {
+    for part in &value.parts {
+        let InterpolatedPart::Interpolation { source, query } = part else {
+            continue;
+        };
+        if *source != InterpolationSource::Slots {
+            continue;
+        }
+        let slot_name = query
+            .split_once('.')
+            .map_or(query.as_str(), |(first, _)| first);
+        if slot_name.is_empty() {
+            continue;
+        }
+        if let Some((slot_key, _)) = manifest.slots().get_key_value(slot_name) {
+            used_slots.insert(slot_key);
         }
     }
 }
@@ -90,31 +117,33 @@ pub fn lint_manifest(manifest: &Manifest) -> Vec<ManifestLint> {
         }
     }
 
-    let mut exported_slots = BTreeSet::new();
+    let mut program_used_slots = BTreeSet::new();
+    if let Some(program) = manifest.program() {
+        for arg in &program.args.0 {
+            add_program_slot_uses(manifest, &mut program_used_slots, arg);
+        }
+        for value in program.env.values() {
+            add_program_slot_uses(manifest, &mut program_used_slots, value);
+        }
+    }
+
     let mut exported_provides = BTreeSet::new();
     for target in manifest.exports().values() {
-        match target {
-            ExportTarget::SelfSlot(slot_name) => {
-                exported_slots.insert(slot_name);
-            }
-            ExportTarget::SelfProvide(provide_name) => {
-                exported_provides.insert(provide_name);
-            }
-            _ => {}
+        if let ExportTarget::SelfProvide(provide_name) = target {
+            exported_provides.insert(provide_name);
         }
     }
 
     if manifest.program().is_some()
         && bound_slots.is_empty()
         && bound_provides.is_empty()
-        && exported_slots.is_empty()
         && exported_provides.is_empty()
     {
         lints.push(ManifestLint::UnusedProgram);
     }
 
     for slot_name in manifest.slots().keys() {
-        if !bound_slots.contains(slot_name) && !exported_slots.contains(slot_name) {
+        if !bound_slots.contains(slot_name) && !program_used_slots.contains(slot_name) {
             lints.push(ManifestLint::UnusedSlot {
                 name: slot_name.to_string(),
             });

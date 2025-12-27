@@ -133,9 +133,9 @@ fn binding_sugar_forms_parse() {
 
     let expected = BTreeMap::from([
         (
-            BindingTarget::ChildExport {
+            BindingTarget::ChildSlot {
                 child: ChildName::try_from("a").unwrap(),
-                export: ExportName::try_from("s").unwrap(),
+                slot: SlotName::try_from("s").unwrap(),
             },
             Binding {
                 from: BindingSource::ChildExport {
@@ -146,9 +146,9 @@ fn binding_sugar_forms_parse() {
             },
         ),
         (
-            BindingTarget::ChildExport {
+            BindingTarget::ChildSlot {
                 child: ChildName::try_from("a").unwrap(),
-                export: ExportName::try_from("t").unwrap(),
+                slot: SlotName::try_from("t").unwrap(),
             },
             Binding {
                 from: BindingSource::SelfProvide(ProvideName::try_from("d").unwrap()),
@@ -834,6 +834,28 @@ fn export_target_unknown_capability_errors() {
 }
 
 #[test]
+fn export_target_slot_errors() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { llm: { kind: "llm" } },
+          exports: { llm: "llm" },
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::UnknownExportTarget { export, target } => {
+            assert_eq!(export, "llm");
+            assert_eq!(target, "llm");
+        }
+        other => panic!("expected UnknownExportTarget error, got: {other}"),
+    }
+}
+
+#[test]
 fn export_target_unknown_child_errors() {
     let raw = parse_raw(
         r##"
@@ -946,9 +968,9 @@ fn binding_source_can_be_multiplexed() {
 
     let expected = BTreeMap::from([
         (
-            BindingTarget::ChildExport {
+            BindingTarget::ChildSlot {
                 child: ChildName::try_from("a").unwrap(),
-                export: ExportName::try_from("s1").unwrap(),
+                slot: SlotName::try_from("s1").unwrap(),
             },
             Binding {
                 from: BindingSource::ChildExport {
@@ -959,9 +981,9 @@ fn binding_source_can_be_multiplexed() {
             },
         ),
         (
-            BindingTarget::ChildExport {
+            BindingTarget::ChildSlot {
                 child: ChildName::try_from("a").unwrap(),
-                export: ExportName::try_from("s2").unwrap(),
+                slot: SlotName::try_from("s2").unwrap(),
             },
             Binding {
                 from: BindingSource::ChildExport {
@@ -989,6 +1011,48 @@ fn unused_slot_is_linted() {
     let manifest = raw.validate().unwrap();
     let lints = lint::lint_manifest(&manifest);
     assert!(lints.contains(&lint::ManifestLint::UnusedSlot {
+        name: "llm".to_string(),
+    }));
+}
+
+#[test]
+fn slot_used_in_program_args_is_not_linted() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { llm: { kind: "llm" } },
+          program: {
+            image: "x",
+            args: ["--llm", "${slots.llm.url}"],
+          },
+        }
+        "#,
+    );
+    let manifest = raw.validate().unwrap();
+    let lints = lint::lint_manifest(&manifest);
+    assert!(!lints.contains(&lint::ManifestLint::UnusedSlot {
+        name: "llm".to_string(),
+    }));
+}
+
+#[test]
+fn slot_used_in_program_env_is_not_linted() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { llm: { kind: "llm" } },
+          program: {
+            image: "x",
+            env: { LLM_URL: "${slots.llm.url}" },
+          },
+        }
+        "#,
+    );
+    let manifest = raw.validate().unwrap();
+    let lints = lint::lint_manifest(&manifest);
+    assert!(!lints.contains(&lint::ManifestLint::UnusedSlot {
         name: "llm".to_string(),
     }));
 }
@@ -1054,8 +1118,8 @@ fn program_used_by_export_is_not_linted() {
         {
           manifest_version: "0.1.0",
           program: { image: "x" },
-          slots: { llm: { kind: "llm" } },
-          exports: { llm: "llm" },
+          provides: { api: { kind: "http" } },
+          exports: { api: "api" },
         }
         "#,
     );

@@ -56,14 +56,6 @@ pub enum Error {
         message: String,
     },
 
-    #[error("`{name}` on {component_path} is exported as a {actual} (expected {expected})")]
-    ExportKindMismatch {
-        component_path: String,
-        name: String,
-        expected: &'static str,
-        actual: &'static str,
-    },
-
     #[error(
         "type mismatch binding into {to_component_path}.{slot}: expected {expected:?}, got {got:?}"
     )]
@@ -104,26 +96,10 @@ pub enum Error {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ExportKind {
-    Slot,
-    Provide,
-}
-
-impl ExportKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            ExportKind::Slot => "slot",
-            ExportKind::Provide => "provide",
-        }
-    }
-}
-
 pub(crate) struct ResolvedExport {
     pub(crate) component: ComponentId,
     pub(crate) name: String,
     pub(crate) decl: CapabilityDecl,
-    pub(crate) kind: ExportKind,
 }
 
 pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Provenance), Error> {
@@ -297,53 +273,56 @@ fn resolve_bindings(
         let realm_manifest = &manifests[realm.0];
 
         for (target, binding) in realm_manifest.bindings().iter() {
-            let (slot_ref, slot_decl, to_id, slot_name_for_err) =
-                match target {
-                    BindingTarget::SelfSlot(slot_name) => {
-                        let to_id = realm;
-                        let to_manifest = &manifests[to_id.0];
-                        let slot_decl = to_manifest.slots().get(slot_name).ok_or_else(|| {
-                            Error::UnknownSlot {
+            let (slot_ref, slot_decl, to_id, slot_name_for_err) = match target {
+                BindingTarget::SelfSlot(slot_name) => {
+                    let to_id = realm;
+                    let to_manifest = &manifests[to_id.0];
+                    let slot_decl =
+                        to_manifest
+                            .slots()
+                            .get(slot_name)
+                            .ok_or_else(|| Error::UnknownSlot {
                                 component_path: component_path_for(components, to_id),
                                 slot: slot_name.to_string(),
-                            }
-                        })?;
-                        let slot_name = slot_name.to_string();
-                        (
-                            SlotRef {
-                                component: to_id,
-                                name: slot_name.clone(),
-                            },
-                            slot_decl.decl.clone(),
-                            to_id,
-                            slot_name,
-                        )
-                    }
-                    BindingTarget::ChildExport { child, export } => {
-                        let to_id = child_component_id(components, realm, child)?;
-                        let ResolvedExport {
-                            component,
-                            name,
-                            decl,
-                            kind,
-                        } = resolve_export(components, manifests, to_id, export)?;
-                        if kind != ExportKind::Slot {
-                            return Err(Error::ExportKindMismatch {
-                                component_path: component_path_for(components, to_id),
-                                name: export.to_string(),
-                                expected: ExportKind::Slot.as_str(),
-                                actual: kind.as_str(),
-                            });
+                            })?;
+                    let slot_name = slot_name.to_string();
+                    (
+                        SlotRef {
+                            component: to_id,
+                            name: slot_name.clone(),
+                        },
+                        slot_decl.decl.clone(),
+                        to_id,
+                        slot_name,
+                    )
+                }
+                BindingTarget::ChildSlot { child, slot } => {
+                    let to_id = child_component_id(components, realm, child)?;
+                    let to_manifest = &manifests[to_id.0];
+                    let slot_decl = to_manifest.slots().get(slot.as_str()).ok_or_else(|| {
+                        Error::UnknownSlot {
+                            component_path: component_path_for(components, to_id),
+                            slot: slot.to_string(),
                         }
-                        (SlotRef { component, name }, decl, to_id, export.to_string())
-                    }
-                    _ => {
-                        return Err(Error::UnsupportedManifestFeature {
-                            component_path: component_path_for(components, realm),
-                            feature: "binding target",
-                        });
-                    }
-                };
+                    })?;
+                    let slot_name = slot.to_string();
+                    (
+                        SlotRef {
+                            component: to_id,
+                            name: slot_name.clone(),
+                        },
+                        slot_decl.decl.clone(),
+                        to_id,
+                        slot_name,
+                    )
+                }
+                _ => {
+                    return Err(Error::UnsupportedManifestFeature {
+                        component_path: component_path_for(components, realm),
+                        feature: "binding target",
+                    });
+                }
+            };
 
             let (provide_ref, provide_decl) = match &binding.from {
                 BindingSource::SelfProvide(provide_name) => {
@@ -370,16 +349,7 @@ fn resolve_bindings(
                         component,
                         name,
                         decl,
-                        kind,
                     } = resolve_export(components, manifests, from_id, export)?;
-                    if kind != ExportKind::Provide {
-                        return Err(Error::ExportKindMismatch {
-                            component_path: component_path_for(components, from_id),
-                            name: export.to_string(),
-                            expected: ExportKind::Provide.as_str(),
-                            actual: kind.as_str(),
-                        });
-                    }
                     (ProvideRef { component, name }, decl)
                 }
                 _ => {
@@ -440,21 +410,6 @@ pub(crate) fn resolve_export(
     };
 
     match target {
-        ExportTarget::SelfSlot(slot_name) => {
-            let slot_decl = manifest
-                .slots()
-                .get(slot_name)
-                .ok_or_else(|| Error::UnknownSlot {
-                    component_path: component_path_for(components, component),
-                    slot: slot_name.to_string(),
-                })?;
-            Ok(ResolvedExport {
-                component,
-                name: slot_name.to_string(),
-                decl: slot_decl.decl.clone(),
-                kind: ExportKind::Slot,
-            })
-        }
         ExportTarget::SelfProvide(provide_name) => {
             let provide_decl =
                 manifest
@@ -468,7 +423,6 @@ pub(crate) fn resolve_export(
                 component,
                 name: provide_name.to_string(),
                 decl: provide_decl.decl.clone(),
-                kind: ExportKind::Provide,
             })
         }
         ExportTarget::ChildExport { child, export } => {

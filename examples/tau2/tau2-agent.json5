@@ -15,5 +15,5 @@
   provides: {
     a2a: { kind: "a2a" },
   },
-  exports: { llm: "llm", a2a: "a2a" },
+  exports: { a2a: "a2a" },
 }

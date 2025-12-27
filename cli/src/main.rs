@@ -67,7 +67,7 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("{err}");
+            eprintln!("{err:?}");
             ExitCode::FAILURE
         }
     }
