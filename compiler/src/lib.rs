@@ -11,6 +11,9 @@ mod linker;
 mod provenance;
 mod store;
 
+pub mod backend;
+pub mod passes;
+
 pub use environment::ResolverRegistry;
 pub use frontend::ResolveOptions;
 pub use provenance::{ComponentProvenance, Provenance};
@@ -19,6 +22,18 @@ pub use store::DigestStore;
 #[derive(Clone, Debug, Default)]
 pub struct CompileOptions {
     pub resolve: ResolveOptions,
+    pub optimize: OptimizeOptions,
+}
+
+#[derive(Clone, Debug)]
+pub struct OptimizeOptions {
+    pub dce: bool,
+}
+
+impl Default for OptimizeOptions {
+    fn default() -> Self {
+        Self { dce: true }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +57,8 @@ pub enum Error {
     Frontend(#[from] frontend::Error),
     #[error(transparent)]
     Linker(#[from] linker::Error),
+    #[error(transparent)]
+    Pass(#[from] passes::PassError),
 }
 
 #[derive(Clone)]
@@ -95,6 +112,14 @@ impl Compiler {
 
         let (scenario, provenance) = linker::link(tree, &self.store)?;
         let diagnostics = collect_manifest_diagnostics(&scenario, &self.store);
+
+        let (scenario, provenance) = {
+            let mut pm = passes::PassManager::new();
+            if opts.optimize.dce {
+                pm.push(passes::DcePass);
+            }
+            pm.run(scenario, provenance, &self.store)?
+        };
 
         Ok(CompileOutput {
             scenario,

@@ -18,7 +18,9 @@ use amber_resolver::{Backend, RemoteResolver, Resolution, Resolver};
 use amber_scenario::graph;
 use url::Url;
 
-use crate::{CompileOptions, Compiler, DiagnosticLevel, DigestStore, ResolverRegistry};
+use crate::{
+    CompileOptions, Compiler, DiagnosticLevel, DigestStore, OptimizeOptions, ResolverRegistry,
+};
 
 fn tmp_dir(prefix: &str) -> PathBuf {
     let mut base = std::env::temp_dir();
@@ -230,6 +232,7 @@ async fn compile_twice_unpinned_fails_when_sources_removed() {
             root_ref.clone(),
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
             },
         )
         .await
@@ -246,6 +249,7 @@ async fn compile_twice_unpinned_fails_when_sources_removed() {
             root_ref,
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
             },
         )
         .await
@@ -309,6 +313,7 @@ async fn compile_twice_with_digest_pins_succeeds_when_sources_removed() {
             root_ref.clone(),
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
             },
         )
         .await
@@ -325,6 +330,7 @@ async fn compile_twice_with_digest_pins_succeeds_when_sources_removed() {
             root_ref,
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
             },
         )
         .await
@@ -350,6 +356,7 @@ async fn provenance_records_redirect_when_fetched() {
             root_ref,
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
             },
         )
         .await
@@ -391,6 +398,7 @@ async fn relative_manifest_refs_resolve_against_parent() {
             root_ref,
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
             },
         )
         .await
@@ -416,6 +424,7 @@ async fn cycle_is_detected_across_url_aliases_with_same_digest() {
             root_ref,
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
             },
         )
         .await
@@ -457,6 +466,7 @@ async fn delegated_export_requires_child_export() {
             root_ref,
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
             },
         )
         .await
@@ -511,6 +521,7 @@ async fn binding_rejects_export_kind_mismatch() {
             root_ref,
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
             },
         )
         .await
@@ -581,6 +592,7 @@ async fn delegated_export_chain_resolves_binding_source() {
             root_ref,
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
             },
         )
         .await
@@ -654,6 +666,7 @@ async fn resolution_deduplicates_inflight_requests() {
             root_ref,
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
             },
         )
         .await
@@ -698,6 +711,7 @@ async fn resolution_environments_allow_parent_to_enable_resolvers_for_children()
             root_ref,
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
             },
         )
         .await
@@ -730,6 +744,7 @@ async fn compile_emits_manifest_lints() {
             root_ref,
             CompileOptions {
                 resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
             },
         )
         .await

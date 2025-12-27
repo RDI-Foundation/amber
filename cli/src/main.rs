@@ -1,9 +1,11 @@
 use std::{collections::BTreeSet, path::Path, process::ExitCode};
 
-use amber_compiler::{CompileOptions, Compiler, DiagnosticLevel};
+use amber_compiler::{
+    CompileOptions, Compiler, DiagnosticLevel,
+    backend::{Backend as _, DotBackend},
+};
 use amber_manifest::ManifestRef;
 use amber_resolver::Resolver;
-use amber_scenario::graph::to_dot;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Context as _, Result, eyre};
 use tracing_error::ErrorLayer;
@@ -122,7 +124,8 @@ async fn compile(args: CompileArgs) -> Result<ExitCode> {
 
     match args.emit {
         EmitKind::Dot => {
-            print!("{}", to_dot(&output.scenario));
+            let dot = DotBackend.emit(&output)?;
+            print!("{dot}");
             Ok(ExitCode::SUCCESS)
         }
         EmitKind::DockerCompose => Err(eyre!("emit kind `docker-compose` is not implemented yet")),

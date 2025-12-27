@@ -105,7 +105,7 @@ pub enum Error {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExportKind {
+pub(crate) enum ExportKind {
     Slot,
     Provide,
 }
@@ -119,11 +119,11 @@ impl ExportKind {
     }
 }
 
-struct ResolvedExport {
-    component: ComponentId,
-    name: String,
-    decl: CapabilityDecl,
-    kind: ExportKind,
+pub(crate) struct ResolvedExport {
+    pub(crate) component: ComponentId,
+    pub(crate) name: String,
+    pub(crate) decl: CapabilityDecl,
+    pub(crate) kind: ExportKind,
 }
 
 pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Provenance), Error> {
@@ -425,7 +425,7 @@ fn child_component_id(
         })
 }
 
-fn resolve_export(
+pub(crate) fn resolve_export(
     components: &[Component],
     manifests: &[Arc<Manifest>],
     component: ComponentId,

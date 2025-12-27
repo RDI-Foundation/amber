@@ -11,7 +11,6 @@ path = "src/main.rs"
 amber-compiler = { path = "../compiler" }
 amber-manifest = { path = "../manifest" }
 amber-resolver = { path = "../resolver" }
-amber-scenario = { path = "../scenario" }
 clap = { version = "4.5.46", features = ["derive"] }
 color-eyre = "0.6.5"
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }

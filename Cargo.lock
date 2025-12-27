@@ -53,7 +53,6 @@ dependencies = [
  "amber-compiler",
  "amber-manifest",
  "amber-resolver",
- "amber-scenario",
  "clap",
  "color-eyre",
  "tokio",
