@@ -135,6 +135,10 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
 
     let manifests = build_manifest_table(&components, store)?;
 
+    for (c, m) in components.iter_mut().zip(&manifests) {
+        c.has_program = m.program().is_some();
+    }
+
     let mut schema_cache: HashMap<ManifestDigest, Arc<Validator>> = HashMap::new();
 
     for id in (0..components.len()).map(ComponentId) {
@@ -186,6 +190,7 @@ fn flatten(
         id,
         parent,
         name: node.name.clone(),
+        has_program: false,
         digest: node.digest,
         config: node.config.clone(),
         children: BTreeMap::new(),

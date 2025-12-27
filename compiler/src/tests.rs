@@ -589,7 +589,7 @@ async fn delegated_export_chain_resolves_binding_source() {
     let binding = compilation.scenario.bindings.first().expect("binding");
     let from_path =
         graph::component_path_for(&compilation.scenario.components, binding.from.component);
-    assert_eq!(from_path, "root/child/grand");
+    assert_eq!(from_path, "/child/grand");
     assert_eq!(binding.from.name, "api");
 }
 
@@ -739,7 +739,7 @@ async fn compile_emits_manifest_lints() {
     let diagnostic = &output.diagnostics[0];
     assert_eq!(diagnostic.level, DiagnosticLevel::Warning);
     assert_eq!(diagnostic.code, "manifest::unused-provide");
-    assert_eq!(diagnostic.component_path, "root");
+    assert_eq!(diagnostic.component_path, "/");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

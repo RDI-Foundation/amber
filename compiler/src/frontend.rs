@@ -139,7 +139,7 @@ pub async fn resolve_tree(
         path_set: HashSet::new(),
     };
 
-    let node = resolve_component(ctx, "root".to_string(), root, None).await?;
+    let node = resolve_component(ctx, String::new(), root, None).await?;
 
     Ok(ResolvedTree { root: node })
 }

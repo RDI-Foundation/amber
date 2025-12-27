@@ -21,6 +21,9 @@ pub struct Component {
     pub parent: Option<ComponentId>,
     pub name: String,
 
+    /// True if the manifest declares a `program`.
+    pub has_program: bool,
+
     /// Digest of the resolved manifest (compiler-chosen algorithm).
     pub digest: ManifestDigest,
 
