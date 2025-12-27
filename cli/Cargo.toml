@@ -1,0 +1,21 @@
+[package]
+name = "amber-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "amber"
+path = "src/main.rs"
+
+[dependencies]
+amber-compiler = { path = "../compiler" }
+amber-manifest = { path = "../manifest" }
+amber-resolver = { path = "../resolver" }
+amber-scenario = { path = "../scenario" }
+clap = { version = "4.5.46", features = ["derive"] }
+color-eyre = "0.6.5"
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1.41"
+tracing-error = "0.2.1"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+url = "2.5.7"
