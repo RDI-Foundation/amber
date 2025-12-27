@@ -1,0 +1,23 @@
+{
+  manifest_version: "0.1.0",
+  program: {
+    image: "docker.io/litellm/litellm:latest",
+    network: {
+      endpoints: [
+        { name: "router", port: 80, path: "/v1" },
+        { name: "admin-api", port: 80, path: "/api" },
+      ],
+    },
+  },
+  components: {
+    wrapper: "./litellm-wrapper.json5",
+  },
+  provides: {
+    llm: { kind: "llm" },
+    admin_api: { kind: "http", endpoint: "admin-api" },
+  },
+  bindings: [
+    { to: "#wrapper.litellm", from: "self.admin_api" },
+  ],
+  exports: { llm: "llm", admin_api: "#wrapper.admin_api" },
+}

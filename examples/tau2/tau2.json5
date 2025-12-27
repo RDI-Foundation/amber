@@ -1,0 +1,15 @@
+{
+  manifest_version: "0.1.0",
+  program: {
+    image: "ghcr.io/sierra-research/tau2:v2",
+    network: {
+      endpoints: [
+        { name: "endpoint", port: 8080, path: "/env" },
+      ],
+    },
+  },
+  provides: {
+    env: { kind: "mcp", profile: "openenv" },
+  },
+  exports: { env: "env" },
+}
