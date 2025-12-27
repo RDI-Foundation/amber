@@ -1011,6 +1011,60 @@ fn unused_provide_is_linted() {
 }
 
 #[test]
+fn unused_program_is_linted() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: { image: "x" },
+        }
+        "#,
+    );
+    let manifest = raw.validate().unwrap();
+    let lints = lint::lint_manifest(&manifest);
+    assert!(lints.contains(&lint::ManifestLint::UnusedProgram));
+}
+
+#[test]
+fn program_used_by_binding_is_not_linted() {
+    let raw = parse_raw(
+        r##"
+        {
+          manifest_version: "0.1.0",
+          program: { image: "x" },
+          components: {
+            worker: "https://example.com/worker",
+          },
+          provides: { api: { kind: "http" } },
+          bindings: [
+            { to: "#worker.api", from: "self.api" },
+          ],
+        }
+        "##,
+    );
+    let manifest = raw.validate().unwrap();
+    let lints = lint::lint_manifest(&manifest);
+    assert!(!lints.contains(&lint::ManifestLint::UnusedProgram));
+}
+
+#[test]
+fn program_used_by_export_is_not_linted() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: { image: "x" },
+          slots: { llm: { kind: "llm" } },
+          exports: { llm: "llm" },
+        }
+        "#,
+    );
+    let manifest = raw.validate().unwrap();
+    let lints = lint::lint_manifest(&manifest);
+    assert!(!lints.contains(&lint::ManifestLint::UnusedProgram));
+}
+
+#[test]
 fn exported_provide_is_not_linted() {
     let raw = parse_raw(
         r#"

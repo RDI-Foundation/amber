@@ -5,6 +5,7 @@ use crate::{BindingSource, BindingTarget, ExportTarget, Manifest};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum LintCode {
+    UnusedProgram,
     UnusedSlot,
     UnusedProvide,
     DuplicateEnvironmentResolver,
@@ -13,6 +14,7 @@ pub enum LintCode {
 impl LintCode {
     pub fn as_str(self) -> &'static str {
         match self {
+            LintCode::UnusedProgram => "manifest::unused-program",
             LintCode::UnusedSlot => "manifest::unused-slot",
             LintCode::UnusedProvide => "manifest::unused-provide",
             LintCode::DuplicateEnvironmentResolver => "manifest::duplicate-environment-resolver",
@@ -23,6 +25,7 @@ impl LintCode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ManifestLint {
+    UnusedProgram,
     UnusedSlot {
         name: String,
     },
@@ -38,6 +41,7 @@ pub enum ManifestLint {
 impl ManifestLint {
     pub fn code(&self) -> LintCode {
         match self {
+            ManifestLint::UnusedProgram => LintCode::UnusedProgram,
             ManifestLint::UnusedSlot { .. } => LintCode::UnusedSlot,
             ManifestLint::UnusedProvide { .. } => LintCode::UnusedProvide,
             ManifestLint::DuplicateEnvironmentResolver { .. } => {
@@ -50,6 +54,9 @@ impl ManifestLint {
 impl fmt::Display for ManifestLint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ManifestLint::UnusedProgram => {
+                write!(f, "program is never referenced by bindings or exports")
+            }
             ManifestLint::UnusedSlot { name } => {
                 write!(f, "slot `{name}` is never bound or exported")
             }
@@ -95,6 +102,15 @@ pub fn lint_manifest(manifest: &Manifest) -> Vec<ManifestLint> {
             }
             _ => {}
         }
+    }
+
+    if manifest.program().is_some()
+        && bound_slots.is_empty()
+        && bound_provides.is_empty()
+        && exported_slots.is_empty()
+        && exported_provides.is_empty()
+    {
+        lints.push(ManifestLint::UnusedProgram);
     }
 
     for slot_name in manifest.slots().keys() {

@@ -74,6 +74,7 @@ This crate also provides `manifest::lint::lint_manifest` for non-fatal checks:
 
   * **exported** (some export target points at `self.<name>` or `<name>`), or
   * **used as a binding source from `self`** (some binding has `from: "self"` and `capability: "<name>"`)
+* If a **`program`** is declared, it should be referenced by a **`self` binding or export** (otherwise the program is likely unused).
 * Resolver names in each environment should be unique.
 
 ### Link-time / resolution-time validation (NOT done by this crate)
