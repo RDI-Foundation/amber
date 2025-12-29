@@ -1,0 +1,55 @@
+linker::unknown_slot
+
+  x unknown slot `nope` on component /green
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/binding_unknown_slot.json5:19:11]
+ 18 |   bindings: [
+ 19 |     { to: "#green.nope", from: "#green_router.llm" },
+    :           ^^^^^^|^^^^^^
+    :                 `-- binding references this slot
+ 20 |     { to: "#green.env", from: "#tau2.env" },
+    `----
+  help: Valid slots on component /green: env, llm
+
+Advice: 
+  > component `green` declared on root component
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/binding_unknown_slot.json5:9:5]
+  8 |     },
+  9 |     green: {
+    :     ^^|^^
+    :       `-- component declared here
+ 10 |       manifest: "./tau2-evaluator.json5",
+    `----
+
+Advice: 
+  > slots declared on component /green
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/tau2-evaluator.json5:30:10]
+ 29 |       },
+ 30 | ,->   slots: {
+ 31 | |       env: { kind: "mcp", profile: "openenv" },
+ 32 | |       llm: { kind: "llm" },
+ 33 | |->   },
+    : `---- slots declared here
+ 34 |       provides: {
+    `----
+linker::unbound_slot
+
+  x slot `llm` on component /green is not bound (non-optional slots must be filled)
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/tau2-evaluator.json5:32:5]
+ 31 |     env: { kind: "mcp", profile: "openenv" },
+ 32 |     llm: { kind: "llm" },
+    :     ^|^
+    :      `-- slot declared here
+ 33 |   },
+    `----
+
+Advice: 
+  > component `green` declared on root component
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/binding_unknown_slot.json5:9:5]
+  8 |     },
+  9 |     green: {
+    :     ^^|^^
+    :       `-- component declared here
+ 10 |       manifest: "./tau2-evaluator.json5",
+    `----
+Error:   × check failed
+

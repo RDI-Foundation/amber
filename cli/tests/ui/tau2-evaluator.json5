@@ -1,0 +1,38 @@
+{
+  manifest_version: "0.1.0",
+  program: {
+    image: "ghcr.io/agentbeats/tau2-evaluator:v1.0.0",
+    args: [
+      "--domain", "${config.domain}",
+      "--llm", "${slots.llm.url}",
+    ],
+    env: {
+      TAU2_ENV: "${slots.env.url}",
+      NUM_TASKS: "${config.num_tasks}",
+      NUM_TRIALS: "${config.num_trials}",
+    },
+    network: {
+      endpoints: [
+        { name: "endpoint", port: 1234, path: "/" },
+      ],
+    },
+  },
+  config_schema: {
+    type: "object",
+    properties: {
+      domain: { type: "string", enum: ["airline", "other"] },
+      num_trials: { type: "integer", minimum: 1 },
+      num_tasks: { type: "integer", minimum: 1, maximum: 4 },
+    },
+    required: ["domain", "num_trials", "num_tasks"],
+    additionalProperties: false,
+  },
+  slots: {
+    env: { kind: "mcp", profile: "openenv" },
+    llm: { kind: "llm" },
+  },
+  provides: {
+    agent: { kind: "a2a", endpoint: "endpoint" },
+  },
+  exports: { agent: "agent" },
+}

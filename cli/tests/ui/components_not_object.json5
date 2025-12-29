@@ -1,0 +1,7 @@
+{
+  manifest_version: "0.1.0",
+  components: [],
+  bindings: [
+    { to: "#green.llm", from: "#green_router.llm" },
+  ],
+}

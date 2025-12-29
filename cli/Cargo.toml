@@ -18,3 +18,6 @@ tracing = "0.1.41"
 tracing-error = "0.2.1"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 url = "2.5.7"
+
+[dev-dependencies]
+similar = "2.7.0"

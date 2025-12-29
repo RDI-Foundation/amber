@@ -1,0 +1,13 @@
+Error: manifest::deserialize_error
+
+  × check failed
+  ╰─▶ json5 deserialize error at exports: invalid type: sequence, expected a
+      map
+    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/exports_not_object.json5:22:12]
+ 21 │   ],
+ 22 │   exports: [],
+    ·            ─┬
+    ·             ╰── invalid type: sequence, expected a map
+ 23 │ }
+    ╰────
+

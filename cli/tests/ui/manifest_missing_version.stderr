@@ -1,0 +1,30 @@
+Error: manifest::deserialize_error
+
+  × check failed
+  ╰─▶ json5 deserialize error at .: missing field `manifest_version`
+    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/manifest_missing_version.json5:1:1]
+  1 │ ╭─▶ {  components: {
+  2 │ │       tau2: "./tau2.json5",
+  3 │ │       green_router: {
+  4 │ │         manifest: "./litellm.json5",
+  5 │ │         config: { model: "gpt-4.1" },
+  6 │ │       },
+  7 │ │       green: {
+  8 │ │         manifest: "./tau2-evaluator.json5",
+  9 │ │         config: {
+ 10 │ │           domain: "airline",
+ 11 │ │           num_trials: 1,
+ 12 │ │           num_tasks: 4,
+ 13 │ │         },
+ 14 │ │       },
+ 15 │ │     },
+ 16 │ │     bindings: [
+ 17 │ │       { to: "#green.llm", from: "#green_router.llm" },
+ 18 │ │       { to: "#green.env", from: "#tau2.env" },
+ 19 │ │     ],
+ 20 │ │     exports: { green: "#green.agent" },
+ 21 │ ├─▶ }
+    · ╰──── missing field `manifest_version`
+    ╰────
+  help: add `manifest_version: "0.1.0"` to the root object
+

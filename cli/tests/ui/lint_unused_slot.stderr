@@ -1,0 +1,24 @@
+manifest::unused_slot
+
+  x slot `unused_llm` is never bound (in component /)
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/lint_unused_slot.json5:3:12]
+ 2 |   manifest_version: "0.1.0",
+ 3 |   slots: { unused_llm: { kind: "llm" }, },
+   :            ^^^^^|^^^^
+   :                 `-- unused slot `unused_llm`
+ 4 |   components: {
+   `----
+  help: warning treated as error because it was denied via `-D warnings`
+        Remove the slot `unused_llm` if it is not needed, or bind it to a provider.
+linker::unbound_slot
+
+  x slot `unused_llm` on root component is not bound (non-optional slots must be filled)
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/lint_unused_slot.json5:3:12]
+ 2 |   manifest_version: "0.1.0",
+ 3 |   slots: { unused_llm: { kind: "llm" }, },
+   :            ^^^^^|^^^^
+   :                 `-- slot declared here
+ 4 |   components: {
+   `----
+Error:   × check failed
+

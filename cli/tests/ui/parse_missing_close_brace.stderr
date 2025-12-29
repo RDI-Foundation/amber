@@ -1,0 +1,11 @@
+Error: manifest::json5_error
+
+  × check failed
+  ╰─▶ json5 parse error: missing closing `}` for object opened here
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/parse_missing_close_brace.json5:1:1]
+ 1 │ {
+   · ┬
+   · ╰── missing closing `}` for object opened here
+ 2 │   manifest_version: "0.1.0",
+   ╰────
+

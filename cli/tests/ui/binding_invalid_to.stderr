@@ -1,0 +1,13 @@
+Error: manifest::deserialize_error
+
+  × check failed
+  ╰─▶ json5 deserialize error at bindings[0]: invalid binding `green`:
+      expected `self` or `#<child>`
+    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/binding_invalid_to.json5:19:5]
+ 18 │   bindings: [
+ 19 │     { to: "green.llm", from: "#green_router.llm" },
+    ·     ───────────────────────┬──────────────────────
+    ·                            ╰── invalid binding `green`: expected `self` or `#<child>`
+ 20 │     { to: "#green.env", from: "#tau2.env" },
+    ╰────
+
