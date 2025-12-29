@@ -1,4 +1,6 @@
 use amber_scenario::Scenario;
+use miette::Diagnostic;
+use thiserror::Error;
 
 use crate::{DigestStore, Provenance};
 
@@ -6,10 +8,11 @@ pub mod dce;
 
 pub use dce::DcePass;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Error, Diagnostic)]
 #[non_exhaustive]
 pub enum PassError {
     #[error("pass `{pass}` failed: {message}")]
+    #[diagnostic(code(compiler::pass_failed))]
     Failed { pass: &'static str, message: String },
 }
 

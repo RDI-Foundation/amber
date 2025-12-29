@@ -531,21 +531,25 @@ mod tests {
             components: vec![
                 ComponentProvenance {
                     declared_ref: ManifestRef::from_url(url.clone()),
+                    resolved_url: url.clone(),
                     digest: root_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
                     declared_ref: ManifestRef::from_url(url.clone()),
+                    resolved_url: url.clone(),
                     digest: router_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
                     declared_ref: ManifestRef::from_url(url.clone()),
+                    resolved_url: url.clone(),
                     digest: green_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
-                    declared_ref: ManifestRef::from_url(url),
+                    declared_ref: ManifestRef::from_url(url.clone()),
+                    resolved_url: url,
                     digest: wrapper_digest,
                     observed_url: None,
                 },
@@ -721,21 +725,25 @@ mod tests {
             components: vec![
                 ComponentProvenance {
                     declared_ref: ManifestRef::from_url(url.clone()),
+                    resolved_url: url.clone(),
                     digest: root_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
                     declared_ref: ManifestRef::from_url(url.clone()),
+                    resolved_url: url.clone(),
                     digest: consumer_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
                     declared_ref: ManifestRef::from_url(url.clone()),
+                    resolved_url: url.clone(),
                     digest: input_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
-                    declared_ref: ManifestRef::from_url(url),
+                    declared_ref: ManifestRef::from_url(url.clone()),
+                    resolved_url: url,
                     digest: llm_digest,
                     observed_url: None,
                 },
@@ -869,16 +877,19 @@ mod tests {
             components: vec![
                 ComponentProvenance {
                     declared_ref: ManifestRef::from_url(url.clone()),
+                    resolved_url: url.clone(),
                     digest: root_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
                     declared_ref: ManifestRef::from_url(url.clone()),
+                    resolved_url: url.clone(),
                     digest: app_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
-                    declared_ref: ManifestRef::from_url(url),
+                    declared_ref: ManifestRef::from_url(url.clone()),
+                    resolved_url: url,
                     digest: admin_digest,
                     observed_url: None,
                 },

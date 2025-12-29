@@ -16,11 +16,20 @@ use std::{
 use amber_manifest::{Manifest, ManifestRef};
 use amber_resolver::{Backend, RemoteResolver, Resolution, Resolver};
 use amber_scenario::graph;
+use miette::Severity;
 use url::Url;
 
-use crate::{
-    CompileOptions, Compiler, DiagnosticLevel, DigestStore, OptimizeOptions, ResolverRegistry,
-};
+use crate::{CompileOptions, Compiler, DigestStore, OptimizeOptions, ResolverRegistry};
+
+fn error_contains(err: &crate::Error, needle: &str) -> bool {
+    match err {
+        crate::Error::Linker(crate::linker::Error::Multiple { errors, .. }) => {
+            errors.iter().any(|err| err.to_string().contains(needle))
+        }
+        crate::Error::Linker(err) => err.to_string().contains(needle),
+        other => other.to_string().contains(needle),
+    }
+}
 
 fn tmp_dir(prefix: &str) -> PathBuf {
     let mut base = std::env::temp_dir();
@@ -44,7 +53,10 @@ fn file_url(path: &Path) -> Url {
 fn accept_with_deadline(listener: &TcpListener, deadline: Instant) -> std::net::TcpStream {
     loop {
         match listener.accept() {
-            Ok((stream, _)) => return stream,
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                return stream;
+            }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
                     panic!("timed out waiting for client connection");
@@ -472,10 +484,8 @@ async fn delegated_export_requires_child_export() {
         .await
         .unwrap_err();
 
-    assert!(
-        err.to_string()
-            .contains("target references non-exported `api`")
-    );
+    assert!(error_contains(&err, "target references non-exported `api`"));
+    assert!(error_contains(&err, "root component"));
 }
 
 #[tokio::test]
@@ -527,7 +537,199 @@ async fn binding_rejects_missing_child_slot() {
         .await
         .unwrap_err();
 
-    assert!(err.to_string().contains("unknown slot `missing` on /child"));
+    assert!(error_contains(
+        &err,
+        "unknown slot `missing` on component /child"
+    ));
+}
+
+#[tokio::test]
+async fn config_validation_error_points_to_invalid_value() {
+    use miette::Diagnostic;
+
+    let dir = tmp_dir("scenario-invalid-config-span");
+    let root_path = dir.join("root.json5");
+    let child_path = dir.join("child.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              nested: {
+                type: "object",
+                properties: { x: { type: "number" } },
+                required: ["x"],
+              },
+            },
+            required: ["nested"],
+          },
+        }
+        "#,
+    );
+
+    let root_source = format!(
+        r##"
+        {{
+          manifest_version: "0.1.0",
+          components: {{
+            child: {{
+              manifest: "{child}",
+              config: {{ nested: {{ x: "bad" }} }},
+            }},
+          }},
+        }}
+        "##,
+        child = file_url(&child_path),
+    );
+    write_file(&root_path, &root_source);
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+    let output = compiler
+        .check(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(output.has_errors);
+
+    let report = output
+        .diagnostics
+        .iter()
+        .find(|report| {
+            let diag: &dyn Diagnostic = &***report;
+            diag.code()
+                .is_some_and(|c| c.to_string() == "linker::invalid_config")
+        })
+        .expect("expected linker::invalid_config diagnostic");
+    let diag: &dyn Diagnostic = &**report;
+    let labels: Vec<_> = diag
+        .labels()
+        .expect("invalid_config should include a label")
+        .collect();
+    assert_eq!(labels.len(), 1);
+
+    let label = &labels[0];
+    let offset = root_source.find("\"bad\"").unwrap();
+    assert_eq!(label.offset(), offset);
+    assert_eq!(label.len(), "\"bad\"".len());
+}
+
+#[tokio::test]
+async fn duplicate_slot_bindings_across_manifests_error() {
+    let dir = tmp_dir("scenario-duplicate-slot-binding");
+    let root_path = dir.join("root.json5");
+    let child_path = dir.join("child.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { api: { kind: "http" } },
+          provides: { http: { kind: "http" } },
+          bindings: [
+            { to: "self.api", from: "self.http" },
+          ],
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              components: {{
+                child: "{child}",
+              }},
+              provides: {{ api: {{ kind: "http" }} }},
+              bindings: [
+                {{ to: "#child.api", from: "self.api" }},
+              ],
+            }}
+            "##,
+            child = file_url(&child_path),
+        ),
+    );
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+
+    let err = compiler
+        .compile(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error_contains(&err, "bound more than once"));
+}
+
+#[tokio::test]
+async fn type_mismatch_reports_expected_and_got() {
+    let dir = tmp_dir("scenario-type-mismatch-message");
+    let root_path = dir.join("root.json5");
+    let child_path = dir.join("child.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          provides: { http: { kind: "http" } },
+          exports: { http: "http" },
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              components: {{
+                child: "{child}",
+              }},
+              slots: {{ llm: {{ kind: "llm" }} }},
+              bindings: [
+                {{ to: "self.llm", from: "#child.http" }},
+              ],
+            }}
+            "##,
+            child = file_url(&child_path),
+        ),
+    );
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+
+    let err = compiler
+        .compile(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error_contains(&err, "expected llm, got http"));
+    assert!(!err.to_string().contains("CapabilityDecl"));
 }
 
 #[tokio::test]
@@ -628,8 +830,15 @@ impl Backend for CountingBackend {
 
         Box::pin(async move {
             tokio::task::yield_now().await;
-            let manifest: Manifest = r#"{ manifest_version: "0.1.0" }"#.parse().unwrap();
-            Ok(Resolution { url, manifest })
+            let source: Arc<str> = r#"{ manifest_version: "0.1.0" }"#.into();
+            let spans = Arc::new(amber_manifest::ManifestSpans::parse(&source));
+            let manifest: Manifest = source.parse().unwrap();
+            Ok(Resolution {
+                url,
+                manifest,
+                source,
+                spans,
+            })
         })
     }
 }
@@ -749,9 +958,15 @@ async fn compile_emits_manifest_lints() {
 
     assert_eq!(output.diagnostics.len(), 1);
     let diagnostic = &output.diagnostics[0];
-    assert_eq!(diagnostic.level, DiagnosticLevel::Warning);
-    assert_eq!(diagnostic.code, "manifest::unused-provide");
-    assert_eq!(diagnostic.component_path, "/");
+    assert_eq!(diagnostic.severity(), Some(Severity::Warning));
+    assert_eq!(
+        diagnostic.code().map(|code| code.to_string()),
+        Some("manifest::unused_provide".to_string())
+    );
+    assert_eq!(
+        diagnostic.to_string(),
+        "provide `api` is never used or exported (in component /)"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

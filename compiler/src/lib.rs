@@ -4,6 +4,9 @@ mod tests;
 use amber_manifest::{ManifestRef, lint::lint_manifest};
 use amber_resolver::Resolver;
 use amber_scenario::{Scenario, graph::component_path_for};
+use miette::{Diagnostic, NamedSource, Report};
+use thiserror::Error;
+use url::Url;
 
 mod environment;
 mod frontend;
@@ -36,28 +39,19 @@ impl Default for OptimizeOptions {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DiagnosticLevel {
-    Warning,
-    Error,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Diagnostic {
-    pub level: DiagnosticLevel,
-    pub code: &'static str,
-    pub message: String,
-    pub component_path: String,
-}
-
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Error, Diagnostic)]
 #[non_exhaustive]
 pub enum Error {
     #[error(transparent)]
+    #[diagnostic(transparent)]
     Frontend(#[from] frontend::Error),
+
     #[error(transparent)]
+    #[diagnostic(transparent)]
     Linker(#[from] linker::Error),
+
     #[error(transparent)]
+    #[diagnostic(transparent)]
     Pass(#[from] passes::PassError),
 }
 
@@ -111,7 +105,7 @@ impl Compiler {
         .await?;
 
         let (scenario, provenance) = linker::link(tree, &self.store)?;
-        let diagnostics = collect_manifest_diagnostics(&scenario, &self.store);
+        let diagnostics = collect_manifest_diagnostics(&scenario, &provenance, &self.store);
 
         let (scenario, provenance) = {
             let mut pm = passes::PassManager::new();
@@ -128,38 +122,148 @@ impl Compiler {
             diagnostics,
         })
     }
+
+    /// Resolve and lint manifests, then attempt to link and report as many errors as possible.
+    pub async fn check(
+        &self,
+        root: ManifestRef,
+        opts: CompileOptions,
+    ) -> Result<CheckOutput, Error> {
+        let tree = frontend::resolve_tree(
+            self.resolver.clone(),
+            self.store.clone(),
+            self.registry.clone(),
+            root,
+            opts.resolve,
+        )
+        .await?;
+
+        let mut diagnostics = collect_manifest_diagnostics_from_tree(&tree, &self.store);
+        let mut has_errors = false;
+
+        match linker::link(tree, &self.store) {
+            Ok((_scenario, _provenance)) => {}
+            Err(err) => {
+                has_errors = true;
+                let mut link_errors = Vec::new();
+                match err {
+                    linker::Error::Multiple { errors, .. } => link_errors.extend(errors),
+                    other => link_errors.push(other),
+                }
+                diagnostics.extend(link_errors.into_iter().map(Report::new));
+            }
+        }
+
+        Ok(CheckOutput {
+            diagnostics,
+            has_errors,
+        })
+    }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CompileOutput {
     pub scenario: Scenario,
     pub store: DigestStore,
     pub provenance: Provenance,
-    pub diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Vec<Report>,
 }
 
-fn collect_manifest_diagnostics(scenario: &Scenario, store: &DigestStore) -> Vec<Diagnostic> {
+#[derive(Debug)]
+pub struct CheckOutput {
+    pub diagnostics: Vec<Report>,
+    pub has_errors: bool,
+}
+
+fn collect_manifest_diagnostics(
+    scenario: &Scenario,
+    provenance: &Provenance,
+    store: &DigestStore,
+) -> Vec<Report> {
     let mut diagnostics = Vec::new();
 
     for component in &scenario.components {
         let manifest = store
             .get(&component.digest)
             .expect("manifest was resolved during linking");
-        let lints = lint_manifest(&manifest);
+        let prov = provenance.for_component(component.id);
+        let url = prov.effective_url();
+        let component_path = component_path_for(&scenario.components, component.id);
+
+        let Some(stored) = store.get_source(url) else {
+            continue;
+        };
+
+        let crate::store::StoredSource {
+            source,
+            spans,
+            digest: _,
+        } = stored;
+
+        let name = display_url(url);
+        let src = NamedSource::new(name, source).with_language("json5");
+        let lints = lint_manifest(&manifest, &component_path, src, &spans);
         if lints.is_empty() {
             continue;
         }
 
-        let component_path = component_path_for(&scenario.components, component.id);
-        for lint in lints {
-            diagnostics.push(Diagnostic {
-                level: DiagnosticLevel::Warning,
-                code: lint.code().as_str(),
-                message: lint.to_string(),
-                component_path: component_path.clone(),
-            });
-        }
+        diagnostics.extend(lints.into_iter().map(Report::new));
     }
 
     diagnostics
+}
+
+fn collect_manifest_diagnostics_from_tree(
+    tree: &frontend::ResolvedTree,
+    store: &DigestStore,
+) -> Vec<Report> {
+    let mut diagnostics = Vec::new();
+    collect_tree_node_diagnostics(&tree.root, "/", store, &mut diagnostics);
+    diagnostics
+}
+
+fn collect_tree_node_diagnostics(
+    node: &frontend::ResolvedNode,
+    component_path: &str,
+    store: &DigestStore,
+    diagnostics: &mut Vec<Report>,
+) {
+    let Some(manifest) = store.get(&node.digest) else {
+        return;
+    };
+
+    let url = node.observed_url.as_ref().unwrap_or(&node.resolved_url);
+    let Some(stored) = store.get_source(url) else {
+        return;
+    };
+
+    let crate::store::StoredSource {
+        source,
+        spans,
+        digest: _,
+    } = stored;
+
+    let name = display_url(url);
+    let src = NamedSource::new(name, source).with_language("json5");
+    let lints = lint_manifest(manifest.as_ref(), component_path, src, &spans);
+    diagnostics.extend(lints.into_iter().map(Report::new));
+
+    for (child_name, child_node) in &node.children {
+        let child_path = if component_path == "/" {
+            format!("/{child_name}")
+        } else {
+            format!("{component_path}/{child_name}")
+        };
+        collect_tree_node_diagnostics(child_node, &child_path, store, diagnostics);
+    }
+}
+
+fn display_url(url: &Url) -> String {
+    if url.scheme() == "file"
+        && let Ok(path) = url.to_file_path()
+        && let Some(path) = path.to_str()
+    {
+        return path.to_string();
+    }
+    url.to_string()
 }

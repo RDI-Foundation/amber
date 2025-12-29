@@ -1,95 +1,395 @@
+#![allow(unused_assignments)]
+#![allow(clippy::result_large_err)]
+
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
 use amber_manifest::{
-    BindingSource, BindingTarget, CapabilityDecl, ChildName, ExportName, ExportTarget, Manifest,
-    ManifestDigest,
+    BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, ChildName, ExportName,
+    ExportTarget, Manifest, ManifestDigest,
 };
 use amber_scenario::{
     BindingEdge, Component, ComponentId, ProvideRef, Scenario, SlotRef, graph::component_path_for,
 };
 use jsonschema::Validator;
+use miette::{Diagnostic, NamedSource, SourceSpan};
 use serde_json::{Map, Value};
+use thiserror::Error;
+use url::Url;
 
 use super::frontend::{ResolvedNode, ResolvedTree};
 use crate::{ComponentProvenance, DigestStore, Provenance};
 
-#[derive(Debug, thiserror::Error)]
+#[allow(unused_assignments)]
+#[derive(Debug, Error, Diagnostic)]
+#[error("{message}")]
+#[diagnostic(severity(Advice))]
+pub struct RelatedSpan {
+    message: String,
+    #[source_code]
+    src: NamedSource<Arc<str>>,
+    #[label(primary, "{label}")]
+    span: SourceSpan,
+    label: String,
+}
+
+fn display_url(url: &Url) -> String {
+    if url.scheme() == "file"
+        && let Ok(path) = url.to_file_path()
+        && let Some(path) = path.to_str()
+    {
+        return path.to_string();
+    }
+    url.to_string()
+}
+
+fn describe_component_path(path: &str) -> String {
+    if path == "/" {
+        "root component".to_string()
+    } else {
+        format!("component {path}")
+    }
+}
+
+fn source_for_component(
+    provenance: &Provenance,
+    store: &DigestStore,
+    id: ComponentId,
+) -> Option<(NamedSource<Arc<str>>, Arc<amber_manifest::ManifestSpans>)> {
+    let url = provenance.for_component(id).effective_url();
+    let stored = store.get_source(url)?;
+    let crate::store::StoredSource {
+        source,
+        spans,
+        digest: _,
+    } = stored;
+    let name = display_url(url);
+    let src = NamedSource::new(name, source).with_language("json5");
+    Some((src, spans))
+}
+
+fn unknown_source() -> NamedSource<Arc<str>> {
+    NamedSource::new("<source unavailable>", Arc::from("")).with_language("json5")
+}
+
+fn component_decl_site(
+    components: &[Component],
+    provenance: &Provenance,
+    store: &DigestStore,
+    id: ComponentId,
+) -> Option<RelatedSpan> {
+    let component = &components[id.0];
+    let parent = component.parent?;
+    let (src, spans) = source_for_component(provenance, store, parent)?;
+    let span = spans.components.get(component.name.as_str())?.name;
+    let parent_path = describe_component_path(&component_path_for(components, parent));
+    Some(RelatedSpan {
+        message: format!("component `{}` declared on {}", component.name, parent_path),
+        src,
+        span,
+        label: "component declared here".to_string(),
+    })
+}
+
+fn binding_target_site(
+    provenance: &Provenance,
+    store: &DigestStore,
+    realm: ComponentId,
+    target_key: &BindingTargetKey,
+) -> Option<(NamedSource<Arc<str>>, SourceSpan)> {
+    let (src, spans) = source_for_component(provenance, store, realm)?;
+    let span = spans
+        .bindings
+        .get(target_key)
+        .map(|b| b.slot.or(b.to).unwrap_or(b.whole))
+        .unwrap_or((0usize, 0usize).into());
+    Some((src, span))
+}
+
+fn binding_source_site(
+    provenance: &Provenance,
+    store: &DigestStore,
+    realm: ComponentId,
+    target_key: &BindingTargetKey,
+) -> Option<(NamedSource<Arc<str>>, SourceSpan)> {
+    let (src, spans) = source_for_component(provenance, store, realm)?;
+    let span = spans
+        .bindings
+        .get(target_key)
+        .map(|b| b.capability.or(b.from).unwrap_or(b.whole))
+        .unwrap_or((0usize, 0usize).into());
+    Some((src, span))
+}
+
+fn binding_site(
+    provenance: &Provenance,
+    store: &DigestStore,
+    realm: ComponentId,
+    target_key: &BindingTargetKey,
+) -> Option<(NamedSource<Arc<str>>, SourceSpan)> {
+    let (src, spans) = source_for_component(provenance, store, realm)?;
+    let span = spans
+        .bindings
+        .get(target_key)
+        .map(|b| b.whole)
+        .unwrap_or((0usize, 0usize).into());
+    Some((src, span))
+}
+
+struct ConfigSite {
+    src: NamedSource<Arc<str>>,
+    span: SourceSpan,
+    label: String,
+}
+
+fn config_site_for_component(
+    components: &[Component],
+    provenance: &Provenance,
+    store: &DigestStore,
+    id: ComponentId,
+) -> Option<ConfigSite> {
+    let component = &components[id.0];
+    if let Some(parent) = component.parent {
+        let (src, spans) = source_for_component(provenance, store, parent)?;
+        let component_spans = spans.components.get(component.name.as_str())?;
+        if component.config.is_some() {
+            let span = component_spans.config.unwrap_or(component_spans.whole);
+            return Some(ConfigSite {
+                src,
+                span,
+                label: "config provided here".to_string(),
+            });
+        }
+        return Some(ConfigSite {
+            src,
+            span: component_spans.name,
+            label: "config required here".to_string(),
+        });
+    }
+
+    let (src, spans) = source_for_component(provenance, store, id)?;
+    Some(ConfigSite {
+        src,
+        span: spans.config_schema.unwrap_or((0usize, 0usize).into()),
+        label: "config required for root component".to_string(),
+    })
+}
+
+fn config_schema_site(
+    provenance: &Provenance,
+    store: &DigestStore,
+    id: ComponentId,
+    component_path: &str,
+) -> Option<RelatedSpan> {
+    let (src, spans) = source_for_component(provenance, store, id)?;
+    let span = spans.config_schema.unwrap_or((0usize, 0usize).into());
+    Some(RelatedSpan {
+        message: format!("config schema for {component_path}"),
+        src,
+        span,
+        label: "config schema declared here".to_string(),
+    })
+}
+
+fn slots_section_site(
+    provenance: &Provenance,
+    store: &DigestStore,
+    id: ComponentId,
+    component_label: &str,
+) -> Option<RelatedSpan> {
+    let (src, spans) = source_for_component(provenance, store, id)?;
+    let span = spans
+        .slots_section
+        .or_else(|| spans.slots.values().next().map(|s| s.whole))?;
+    Some(RelatedSpan {
+        message: format!("slots declared on {component_label}"),
+        src,
+        span,
+        label: "slots declared here".to_string(),
+    })
+}
+
+fn unknown_slot_help(component_label: &str, manifest: &Manifest) -> String {
+    let mut names: Vec<_> = manifest
+        .slots()
+        .keys()
+        .map(|name| name.to_string())
+        .collect();
+    if names.is_empty() {
+        return format!(
+            "No slots are declared on {component_label}. Declare slots in a `slots: {{ ... }}` \
+             block, or fix the binding target."
+        );
+    }
+    names.sort();
+    format!(
+        "Valid slots on {component_label}: {}",
+        names.into_iter().take(20).collect::<Vec<_>>().join(", ")
+    )
+}
+
+fn not_exported_help(component_path: &str, manifest: &Manifest) -> String {
+    let component_label = describe_component_path(component_path);
+    let mut names: Vec<_> = manifest
+        .exports()
+        .keys()
+        .map(|name| name.to_string())
+        .collect();
+    if names.is_empty() {
+        return format!(
+            "No exports are declared by {component_label}. Add an `exports: {{ ... }}` entry, or \
+             fix the reference."
+        );
+    }
+    names.sort();
+    format!(
+        "Valid exports on {component_label}: {}",
+        names.into_iter().take(20).collect::<Vec<_>>().join(", ")
+    )
+}
+
+#[allow(unused_assignments)]
+#[derive(Debug, Error, Diagnostic)]
 #[non_exhaustive]
 pub enum Error {
+    #[error("linker reported {count} errors")]
+    #[diagnostic(code(linker::multiple_errors))]
+    Multiple {
+        count: usize,
+        #[related]
+        errors: Vec<Error>,
+    },
+
     #[error("missing manifest content for {component_path} (digest {digest})")]
+    #[diagnostic(code(linker::missing_manifest))]
     MissingManifest {
         component_path: String,
         digest: ManifestDigest,
     },
 
     #[error("binding references unknown child `#{child}` in {component_path}")]
+    #[diagnostic(code(linker::unknown_child))]
     UnknownChild {
         component_path: String,
         child: String,
     },
 
-    #[error("unknown slot `{slot}` on {component_path}")]
+    #[error("unknown slot `{slot}` on {to_component_path}")]
+    #[diagnostic(code(linker::unknown_slot), help("{help}"))]
     UnknownSlot {
-        component_path: String,
+        to_component_path: String,
         slot: String,
+        help: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label(primary, "binding references this slot")]
+        span: SourceSpan,
+        #[related]
+        related: Vec<RelatedSpan>,
     },
 
     #[error("unknown provide `{provide}` on {component_path}")]
+    #[diagnostic(code(linker::unknown_provide))]
     UnknownProvide {
         component_path: String,
         provide: String,
     },
 
     #[error("`{name}` is not exported by {component_path}")]
+    #[diagnostic(code(linker::not_exported), help("{help}"))]
     NotExported {
         component_path: String,
         name: String,
+        help: String,
+        #[source_code]
+        src: Option<NamedSource<Arc<str>>>,
+        #[label(primary, "missing export `{name}`")]
+        span: Option<SourceSpan>,
     },
 
     #[error("invalid export `{name}` on {component_path}: {message}")]
+    #[diagnostic(code(linker::invalid_export), help("{help}"))]
     InvalidExport {
         component_path: String,
         name: String,
         message: String,
+        help: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label(primary, "export declared here")]
+        span: SourceSpan,
     },
 
-    #[error(
-        "type mismatch binding into {to_component_path}.{slot}: expected {expected:?}, got {got:?}"
+    #[error("type mismatch for slot `{to_component_path}.{slot}`: expected {expected}, got {got}")]
+    #[diagnostic(
+        code(linker::type_mismatch),
+        help(
+            "Bind a provide of type `{expected}` to `{to_component_path}.{slot}`, or change the \
+             slot/provide `kind`/`profile` so they match."
+        )
     )]
     TypeMismatch {
         to_component_path: String,
         slot: String,
         expected: CapabilityDecl,
         got: CapabilityDecl,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label(primary, "binding provides `{got}` to slot expecting `{expected}`")]
+        span: SourceSpan,
+        #[related]
+        related: Vec<RelatedSpan>,
     },
 
     #[error("slot `{slot}` on {component_path} is not bound (non-optional slots must be filled)")]
+    #[diagnostic(code(linker::unbound_slot))]
     UnboundSlot {
         component_path: String,
         slot: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label(primary, "slot declared here")]
+        span: SourceSpan,
+        #[related]
+        related: Vec<RelatedSpan>,
     },
 
     #[error(
         "slot `{slot}` on {to_component_path} is bound more than once (from {first_from} and \
          {second_from})"
     )]
+    #[diagnostic(code(linker::duplicate_slot_binding))]
     DuplicateSlotBinding {
         to_component_path: String,
         slot: String,
         first_from: String,
         second_from: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label(primary, "second binding here")]
+        span: SourceSpan,
+        #[related]
+        related: Vec<RelatedSpan>,
     },
 
     #[error("invalid config for {component_path}: {message}")]
+    #[diagnostic(code(linker::invalid_config))]
     InvalidConfig {
         component_path: String,
         message: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label(primary, "{label}")]
+        span: SourceSpan,
+        label: String,
+        #[related]
+        related: Vec<RelatedSpan>,
     },
 
     #[error("unsupported manifest feature `{feature}` in {component_path}")]
+    #[diagnostic(code(linker::unsupported_feature))]
     UnsupportedManifestFeature {
         component_path: String,
         feature: &'static str,
@@ -116,15 +416,47 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
     }
 
     let mut schema_cache: HashMap<ManifestDigest, Arc<Validator>> = HashMap::new();
+    let mut errors = Vec::new();
 
     for id in (0..components.len()).map(ComponentId) {
-        validate_config(id, &components, &manifests, &mut schema_cache)?;
-        validate_exports(id, &components, &manifests)?;
+        if let Err(err) = validate_config(
+            id,
+            &components,
+            &manifests,
+            &provenance,
+            store,
+            &mut schema_cache,
+        ) {
+            errors.push(err);
+        }
+        validate_exports(id, &components, &manifests, &provenance, store, &mut errors);
     }
 
-    let bindings = resolve_bindings(&components, &manifests)?;
-    validate_unique_slot_bindings(&components, &bindings)?;
-    validate_all_slots_bound(&components, &manifests, &bindings)?;
+    let (bindings, origins) =
+        resolve_bindings(&components, &manifests, &provenance, store, &mut errors);
+    validate_unique_slot_bindings(
+        &components,
+        &bindings,
+        &origins,
+        &provenance,
+        store,
+        &mut errors,
+    );
+    validate_all_slots_bound(
+        &components,
+        &manifests,
+        &bindings,
+        &provenance,
+        store,
+        &mut errors,
+    );
+
+    if !errors.is_empty() {
+        return Err(Error::Multiple {
+            count: errors.len(),
+            errors,
+        });
+    }
 
     Ok((
         Scenario {
@@ -174,6 +506,7 @@ fn flatten(
 
     prov.components.push(ComponentProvenance {
         declared_ref: node.declared_ref.clone(),
+        resolved_url: node.resolved_url.clone(),
         digest: node.digest,
         observed_url: node.observed_url.clone(),
     });
@@ -192,6 +525,8 @@ fn validate_config(
     id: ComponentId,
     components: &[Component],
     manifests: &[Arc<Manifest>],
+    provenance: &Provenance,
+    store: &DigestStore,
     schema_cache: &mut HashMap<ManifestDigest, Arc<Validator>>,
 ) -> Result<(), Error> {
     let c = &components[id.0];
@@ -204,12 +539,30 @@ fn validate_config(
     let validator = if let Some(v) = schema_cache.get(&c.digest) {
         Arc::clone(v)
     } else {
-        let v = Arc::new(jsonschema::validator_for(&schema_decl.0).map_err(|e| {
-            Error::InvalidConfig {
-                component_path: component_path_for(components, id),
-                message: e.to_string(),
-            }
-        })?);
+        let v =
+            Arc::new(jsonschema::validator_for(&schema_decl.0).map_err(|e| {
+                let component_path = component_path_for(components, id);
+                let site = config_site_for_component(components, provenance, store, id)
+                    .unwrap_or_else(|| ConfigSite {
+                        src: unknown_source(),
+                        span: (0usize, 0usize).into(),
+                        label: "config here".to_string(),
+                    });
+                let mut related = Vec::new();
+                if c.parent.is_some()
+                    && let Some(schema) = config_schema_site(provenance, store, id, &component_path)
+                {
+                    related.push(schema);
+                }
+                Error::InvalidConfig {
+                    component_path,
+                    message: e.to_string(),
+                    src: site.src,
+                    span: site.span,
+                    label: site.label,
+                    related,
+                }
+            })?);
         schema_cache.insert(c.digest, Arc::clone(&v));
         v
     };
@@ -222,11 +575,56 @@ fn validate_config(
         return Ok(());
     };
 
+    let instance_path = first.instance_path().to_string();
     let mut msgs = vec![first.to_string()];
     msgs.extend(errors.take(7).map(|e| e.to_string()));
+    let component_path = component_path_for(components, id);
+    let mut site =
+        config_site_for_component(components, provenance, store, id).unwrap_or_else(|| {
+            ConfigSite {
+                src: unknown_source(),
+                span: (0usize, 0usize).into(),
+                label: "config here".to_string(),
+            }
+        });
+    if let Some(parent) = c.parent
+        && c.config.is_some()
+        && let Some(stored) = store.get_source(provenance.for_component(parent).effective_url())
+        && let Some(component_spans) = stored.spans.components.get(c.name.as_str())
+        && let Some(config_span) = component_spans.config
+        && let Some(span) = amber_manifest::span_for_json_pointer(
+            stored.source.as_ref(),
+            config_span,
+            &instance_path,
+        )
+    {
+        let url = provenance.for_component(parent).effective_url();
+        let name = display_url(url);
+        site.src = NamedSource::new(name, Arc::clone(&stored.source)).with_language("json5");
+        site.span = span;
+        site.label = "invalid config value here".to_string();
+    }
+    let mut related = Vec::new();
+    if c.parent.is_some()
+        && let Some(schema) = config_schema_site(provenance, store, id, &component_path)
+    {
+        related.push(schema);
+    }
+    let message = if c.parent.is_none() && c.config.is_none() {
+        format!(
+            "{} (no config provided for root component)",
+            msgs.join("; ")
+        )
+    } else {
+        msgs.join("; ")
+    };
     Err(Error::InvalidConfig {
-        component_path: component_path_for(components, id),
-        message: msgs.join("; "),
+        component_path,
+        message,
+        src: site.src,
+        span: site.span,
+        label: site.label,
+        related,
     })
 }
 
@@ -234,57 +632,125 @@ fn validate_exports(
     realm: ComponentId,
     components: &[Component],
     manifests: &[Arc<Manifest>],
-) -> Result<(), Error> {
+    provenance: &Provenance,
+    store: &DigestStore,
+    errors: &mut Vec<Error>,
+) {
     let realm_manifest = &manifests[realm.0];
     let realm_path = component_path_for(components, realm);
+    let realm_label = describe_component_path(&realm_path);
 
     for (export_name, target) in realm_manifest.exports().iter() {
         let ExportTarget::ChildExport { child, export } = target else {
             continue;
         };
 
-        let child_id = child_component_id(components, realm, child)?;
+        let child_id = match child_component_id(components, realm, child) {
+            Ok(id) => id,
+            Err(err) => {
+                errors.push(err);
+                continue;
+            }
+        };
         if let Err(err) = resolve_export(components, manifests, child_id, export) {
-            let message = match err {
+            let (message, help) = match err {
                 Error::NotExported {
                     component_path,
                     name,
-                } => format!("target references non-exported `{name}` on {component_path}"),
-                other => return Err(other),
+                    help,
+                    ..
+                } => (
+                    format!(
+                        "target references non-exported `{name}` on {}",
+                        describe_component_path(&component_path)
+                    ),
+                    help,
+                ),
+                other => (
+                    other.to_string(),
+                    "Ensure the export target points to an existing export/provide.".to_string(),
+                ),
             };
-            return Err(Error::InvalidExport {
-                component_path: realm_path.clone(),
+
+            let (src, span) = source_for_component(provenance, store, realm).map_or_else(
+                || (unknown_source(), (0usize, 0usize).into()),
+                |(src, spans)| {
+                    let span = spans
+                        .exports
+                        .get(export_name.as_str())
+                        .map(|e| e.target)
+                        .unwrap_or((0usize, 0usize).into());
+                    (src, span)
+                },
+            );
+            errors.push(Error::InvalidExport {
+                component_path: realm_label.clone(),
                 name: export_name.to_string(),
                 message,
+                help,
+                src,
+                span,
             });
         }
     }
+}
 
-    Ok(())
+#[derive(Clone, Debug)]
+struct BindingOrigin {
+    realm: ComponentId,
+    target_key: BindingTargetKey,
 }
 
 fn resolve_bindings(
     components: &[Component],
     manifests: &[Arc<Manifest>],
-) -> Result<Vec<BindingEdge>, Error> {
+    provenance: &Provenance,
+    store: &DigestStore,
+    errors: &mut Vec<Error>,
+) -> (Vec<BindingEdge>, Vec<BindingOrigin>) {
     let mut edges = Vec::new();
+    let mut origins = Vec::new();
 
     for realm in (0..components.len()).map(ComponentId) {
         let realm_manifest = &manifests[realm.0];
 
         for (target, binding) in realm_manifest.bindings().iter() {
+            let target_key = BindingTargetKey::from(target);
             let (slot_ref, slot_decl, to_id, slot_name_for_err) = match target {
                 BindingTarget::SelfSlot(slot_name) => {
                     let to_id = realm;
                     let to_manifest = &manifests[to_id.0];
-                    let slot_decl =
-                        to_manifest
-                            .slots()
-                            .get(slot_name)
-                            .ok_or_else(|| Error::UnknownSlot {
-                                component_path: component_path_for(components, to_id),
-                                slot: slot_name.to_string(),
-                            })?;
+                    let slot_decl = to_manifest.slots().get(slot_name).ok_or_else(|| {
+                        let (src, span) =
+                            binding_target_site(provenance, store, realm, &target_key)
+                                .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                        let to_component_path = component_path_for(components, to_id);
+                        let to_component_label = describe_component_path(&to_component_path);
+                        let mut related: Vec<_> =
+                            component_decl_site(components, provenance, store, to_id)
+                                .into_iter()
+                                .collect();
+                        if let Some(site) =
+                            slots_section_site(provenance, store, to_id, &to_component_label)
+                        {
+                            related.push(site);
+                        }
+                        Error::UnknownSlot {
+                            to_component_path: to_component_label.clone(),
+                            slot: slot_name.to_string(),
+                            help: unknown_slot_help(&to_component_label, to_manifest),
+                            src,
+                            span,
+                            related,
+                        }
+                    });
+                    let slot_decl = match slot_decl {
+                        Ok(slot_decl) => slot_decl,
+                        Err(err) => {
+                            errors.push(err);
+                            continue;
+                        }
+                    };
                     let slot_name = slot_name.to_string();
                     (
                         SlotRef {
@@ -297,14 +763,45 @@ fn resolve_bindings(
                     )
                 }
                 BindingTarget::ChildSlot { child, slot } => {
-                    let to_id = child_component_id(components, realm, child)?;
+                    let to_id = match child_component_id(components, realm, child) {
+                        Ok(id) => id,
+                        Err(err) => {
+                            errors.push(err);
+                            continue;
+                        }
+                    };
                     let to_manifest = &manifests[to_id.0];
                     let slot_decl = to_manifest.slots().get(slot.as_str()).ok_or_else(|| {
-                        Error::UnknownSlot {
-                            component_path: component_path_for(components, to_id),
-                            slot: slot.to_string(),
+                        let (src, span) =
+                            binding_target_site(provenance, store, realm, &target_key)
+                                .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                        let to_component_path = component_path_for(components, to_id);
+                        let to_component_label = describe_component_path(&to_component_path);
+                        let mut related: Vec<_> =
+                            component_decl_site(components, provenance, store, to_id)
+                                .into_iter()
+                                .collect();
+                        if let Some(site) =
+                            slots_section_site(provenance, store, to_id, &to_component_label)
+                        {
+                            related.push(site);
                         }
-                    })?;
+                        Error::UnknownSlot {
+                            to_component_path: to_component_label.clone(),
+                            slot: slot.to_string(),
+                            help: unknown_slot_help(&to_component_label, to_manifest),
+                            src,
+                            span,
+                            related,
+                        }
+                    });
+                    let slot_decl = match slot_decl {
+                        Ok(slot_decl) => slot_decl,
+                        Err(err) => {
+                            errors.push(err);
+                            continue;
+                        }
+                    };
                     let slot_name = slot.to_string();
                     (
                         SlotRef {
@@ -317,10 +814,11 @@ fn resolve_bindings(
                     )
                 }
                 _ => {
-                    return Err(Error::UnsupportedManifestFeature {
+                    errors.push(Error::UnsupportedManifestFeature {
                         component_path: component_path_for(components, realm),
                         feature: "binding target",
                     });
+                    continue;
                 }
             };
 
@@ -331,10 +829,19 @@ fn resolve_bindings(
                     let provide_decl =
                         from_manifest.provides().get(provide_name).ok_or_else(|| {
                             Error::UnknownProvide {
-                                component_path: component_path_for(components, from_id),
+                                component_path: describe_component_path(&component_path_for(
+                                    components, from_id,
+                                )),
                                 provide: provide_name.to_string(),
                             }
-                        })?;
+                        });
+                    let provide_decl = match provide_decl {
+                        Ok(provide_decl) => provide_decl,
+                        Err(err) => {
+                            errors.push(err);
+                            continue;
+                        }
+                    };
                     (
                         ProvideRef {
                             component: from_id,
@@ -344,29 +851,104 @@ fn resolve_bindings(
                     )
                 }
                 BindingSource::ChildExport { child, export } => {
-                    let from_id = child_component_id(components, realm, child)?;
+                    let from_id = match child_component_id(components, realm, child) {
+                        Ok(id) => id,
+                        Err(err) => {
+                            errors.push(err);
+                            continue;
+                        }
+                    };
+                    let resolved = resolve_export(components, manifests, from_id, export);
                     let ResolvedExport {
                         component,
                         name,
                         decl,
-                    } = resolve_export(components, manifests, from_id, export)?;
+                    } = match resolved {
+                        Ok(resolved) => resolved,
+                        Err(Error::NotExported {
+                            component_path,
+                            name,
+                            help,
+                            ..
+                        }) => {
+                            let (src, span) =
+                                binding_source_site(provenance, store, realm, &target_key)
+                                    .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                            errors.push(Error::NotExported {
+                                component_path,
+                                name,
+                                help,
+                                src: Some(src),
+                                span: Some(span),
+                            });
+                            continue;
+                        }
+                        Err(other) => {
+                            errors.push(other);
+                            continue;
+                        }
+                    };
                     (ProvideRef { component, name }, decl)
                 }
                 _ => {
-                    return Err(Error::UnsupportedManifestFeature {
+                    errors.push(Error::UnsupportedManifestFeature {
                         component_path: component_path_for(components, realm),
                         feature: "binding source",
                     });
+                    continue;
                 }
             };
 
             if slot_decl != provide_decl {
-                return Err(Error::TypeMismatch {
+                let (src, span) = binding_site(provenance, store, realm, &target_key)
+                    .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+
+                let mut related = Vec::new();
+
+                if let Some((slot_src, slot_spans)) = source_for_component(provenance, store, to_id)
+                    && let Some(slot_decl_spans) = slot_spans.slots.get(slot_name_for_err.as_str())
+                {
+                    let span = slot_decl_spans.kind.unwrap_or(slot_decl_spans.whole);
+                    related.push(RelatedSpan {
+                        message: format!(
+                            "slot `{}` declared on {}",
+                            slot_name_for_err,
+                            component_path_for(components, to_id)
+                        ),
+                        src: slot_src,
+                        span,
+                        label: "slot type declared here".to_string(),
+                    });
+                }
+
+                if let Some((provide_src, provide_spans)) =
+                    source_for_component(provenance, store, provide_ref.component)
+                {
+                    let provide_name = provide_ref.name.as_str();
+                    if let Some(p) = provide_spans.provides.get(provide_name) {
+                        let span = p.capability.kind.unwrap_or(p.capability.whole);
+                        related.push(RelatedSpan {
+                            message: format!(
+                                "provide `{provide_name}` declared on {}",
+                                component_path_for(components, provide_ref.component)
+                            ),
+                            src: provide_src,
+                            span,
+                            label: "provide type declared here".to_string(),
+                        });
+                    }
+                }
+
+                errors.push(Error::TypeMismatch {
                     to_component_path: component_path_for(components, to_id),
                     slot: slot_name_for_err,
                     expected: slot_decl,
                     got: provide_decl,
+                    src,
+                    span,
+                    related,
                 });
+                continue;
             }
 
             edges.push(BindingEdge {
@@ -374,10 +956,11 @@ fn resolve_bindings(
                 to: slot_ref,
                 weak: binding.weak,
             });
+            origins.push(BindingOrigin { realm, target_key });
         }
     }
 
-    Ok(edges)
+    (edges, origins)
 }
 
 fn child_component_id(
@@ -403,9 +986,13 @@ pub(crate) fn resolve_export(
 ) -> Result<ResolvedExport, Error> {
     let manifest = &manifests[component.0];
     let Some(target) = manifest.exports().get(export_name) else {
+        let component_path = component_path_for(components, component);
         return Err(Error::NotExported {
-            component_path: component_path_for(components, component),
+            help: not_exported_help(&component_path, manifest),
+            component_path,
             name: export_name.to_string(),
+            src: None,
+            span: None,
         });
     };
 
@@ -416,7 +1003,9 @@ pub(crate) fn resolve_export(
                     .provides()
                     .get(provide_name)
                     .ok_or_else(|| Error::UnknownProvide {
-                        component_path: component_path_for(components, component),
+                        component_path: describe_component_path(&component_path_for(
+                            components, component,
+                        )),
                         provide: provide_name.to_string(),
                     })?;
             Ok(ResolvedExport {
@@ -440,37 +1029,59 @@ fn validate_all_slots_bound(
     components: &[Component],
     manifests: &[Arc<Manifest>],
     bindings: &[BindingEdge],
-) -> Result<(), Error> {
-    let mut satisfied: HashMap<(ComponentId, &str), ()> = HashMap::new();
+    provenance: &Provenance,
+    store: &DigestStore,
+    errors: &mut Vec<Error>,
+) {
+    let mut satisfied: HashSet<(ComponentId, &str)> = HashSet::new();
     for b in bindings {
-        satisfied.insert((b.to.component, b.to.name.as_str()), ());
+        satisfied.insert((b.to.component, b.to.name.as_str()));
     }
 
     for id in (0..components.len()).map(ComponentId) {
         let m = &manifests[id.0];
         for slot_name in m.slots().keys() {
-            if satisfied.contains_key(&(id, slot_name.as_str())) {
+            if satisfied.contains(&(id, slot_name.as_str())) {
                 continue;
             }
-            return Err(Error::UnboundSlot {
-                component_path: component_path_for(components, id),
+            let (src, span) = source_for_component(provenance, store, id).map_or_else(
+                || (unknown_source(), (0usize, 0usize).into()),
+                |(src, spans)| {
+                    let span = spans
+                        .slots
+                        .get(slot_name.as_str())
+                        .map(|s| s.name)
+                        .unwrap_or((0usize, 0usize).into());
+                    (src, span)
+                },
+            );
+            let related = component_decl_site(components, provenance, store, id)
+                .into_iter()
+                .collect();
+            errors.push(Error::UnboundSlot {
+                component_path: describe_component_path(&component_path_for(components, id)),
                 slot: slot_name.to_string(),
+                src,
+                span,
+                related,
             });
         }
     }
-
-    Ok(())
 }
 
 fn validate_unique_slot_bindings(
     components: &[Component],
     bindings: &[BindingEdge],
-) -> Result<(), Error> {
-    let mut seen: HashMap<(ComponentId, String), ProvideRef> = HashMap::new();
+    origins: &[BindingOrigin],
+    provenance: &Provenance,
+    store: &DigestStore,
+    errors: &mut Vec<Error>,
+) {
+    let mut seen: HashMap<(ComponentId, String), (ProvideRef, usize)> = HashMap::new();
 
-    for b in bindings {
+    for (idx, b) in bindings.iter().enumerate() {
         let key = (b.to.component, b.to.name.clone());
-        if let Some(prev_from) = seen.insert(key, b.from.clone()) {
+        if let Some((prev_from, prev_idx)) = seen.insert(key, (b.from.clone(), idx)) {
             let to_component_path = component_path_for(components, b.to.component);
 
             let first_from = format!(
@@ -484,14 +1095,39 @@ fn validate_unique_slot_bindings(
                 b.from.name
             );
 
-            return Err(Error::DuplicateSlotBinding {
+            let second_origin = origins.get(idx);
+            let first_origin = origins.get(prev_idx);
+
+            let (src, span) = second_origin
+                .and_then(|o| binding_site(provenance, store, o.realm, &o.target_key))
+                .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+
+            let mut related = Vec::new();
+            if let Some(first_origin) = first_origin
+                && let Some((first_src, first_span)) = binding_site(
+                    provenance,
+                    store,
+                    first_origin.realm,
+                    &first_origin.target_key,
+                )
+            {
+                related.push(RelatedSpan {
+                    message: "first binding".to_string(),
+                    src: first_src,
+                    span: first_span,
+                    label: "first binding here".to_string(),
+                });
+            }
+
+            errors.push(Error::DuplicateSlotBinding {
                 to_component_path,
                 slot: b.to.name.clone(),
                 first_from,
                 second_from,
+                src,
+                span,
+                related,
             });
         }
     }
-
-    Ok(())
 }

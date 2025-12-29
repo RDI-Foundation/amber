@@ -1,3 +1,6 @@
+#![allow(unused_assignments)]
+#![allow(clippy::result_large_err)]
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{
@@ -9,10 +12,12 @@ use std::{
 use amber_manifest::{ComponentDecl, Manifest, ManifestDigest, ManifestRef};
 use amber_resolver::{self as resolver, RemoteResolver, Resolver};
 use futures::stream::StreamExt;
+use miette::{Diagnostic, NamedSource, SourceSpan};
+use thiserror::Error;
 use tokio::sync::{OnceCell, Semaphore};
 use url::Url;
 
-use crate::{DigestStore, ResolverRegistry};
+use crate::{DigestStore, ResolverRegistry, store::StoredSource};
 
 #[derive(Clone, Debug)]
 pub struct ResolveOptions {
@@ -27,32 +32,72 @@ impl Default for ResolveOptions {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[allow(unused_assignments)]
+#[derive(Debug, Error, Diagnostic)]
 #[non_exhaustive]
 pub enum Error {
     #[error(transparent)]
+    #[diagnostic(transparent)]
     Resolver(#[from] resolver::Error),
+
     #[error("component tree contains a cycle: {cycle:?}")]
+    #[diagnostic(code(compiler::cycle))]
     Cycle { cycle: Vec<Url> },
 
     #[error("relative manifest reference `{reference}` requires an absolute base URL")]
+    #[diagnostic(code(compiler::relative_manifest_ref))]
     RelativeManifestRef { reference: Box<str> },
 
     #[error("invalid manifest reference `{reference}` in {realm_url}: {message}")]
+    #[diagnostic(code(compiler::invalid_manifest_ref))]
     InvalidManifestRef {
         realm_url: Box<Url>,
         reference: Box<str>,
         message: Box<str>,
+        #[source_code]
+        src: Option<NamedSource<Arc<str>>>,
+        #[label(primary, "invalid manifest reference")]
+        span: Option<SourceSpan>,
     },
 
     #[error(
         "unknown resolver `{resolver}` referenced by environment `{environment}` in {realm_url}"
     )]
+    #[diagnostic(code(compiler::unknown_resolver))]
     UnknownResolver {
         realm_url: Box<Url>,
         environment: Box<str>,
         resolver: Box<str>,
+        #[source_code]
+        src: Option<NamedSource<Arc<str>>>,
+        #[label(primary, "unknown resolver")]
+        span: Option<SourceSpan>,
     },
+}
+
+fn display_url(url: &Url) -> String {
+    if url.scheme() == "file"
+        && let Ok(path) = url.to_file_path()
+        && let Some(path) = path.to_str()
+    {
+        return path.to_string();
+    }
+    url.to_string()
+}
+
+fn source_for_url(
+    store: &DigestStore,
+    url: &Url,
+) -> Option<(NamedSource<Arc<str>>, Arc<amber_manifest::ManifestSpans>)> {
+    let stored = store.get_source(url)?;
+    let crate::store::StoredSource {
+        source,
+        spans,
+        digest: _,
+    } = stored;
+    let name = display_url(url);
+    let src = NamedSource::new(name, source).with_language("json5");
+    Some((src, spans))
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +110,7 @@ pub struct ResolvedNode {
     pub name: String,
     pub declared_ref: ManifestRef,
     pub digest: ManifestDigest,
+    pub resolved_url: Url,
     pub observed_url: Option<Url>,
     pub config: Option<serde_json::Value>,
     pub children: BTreeMap<String, ResolvedNode>,
@@ -92,6 +138,7 @@ impl ResolveEnv {
 struct ResolvedManifest {
     manifest: Arc<Manifest>,
     digest: ManifestDigest,
+    resolved_url: Url,
     observed_url: Option<Url>,
 }
 
@@ -144,29 +191,6 @@ pub async fn resolve_tree(
     Ok(ResolvedTree { root: node })
 }
 
-fn resolve_manifest_ref(
-    declared_ref: &ManifestRef,
-    base_url: Option<&Url>,
-) -> Result<ManifestRef, Error> {
-    if !declared_ref.url.is_relative() {
-        return Ok(declared_ref.clone());
-    }
-
-    let Some(base) = base_url else {
-        return Err(Error::RelativeManifestRef {
-            reference: declared_ref.url.as_str().into(),
-        });
-    };
-
-    declared_ref
-        .resolve_against(base)
-        .map_err(|err| Error::InvalidManifestRef {
-            realm_url: Box::new(base.clone()),
-            reference: declared_ref.url.as_str().into(),
-            message: err.to_string().into(),
-        })
-}
-
 async fn resolve_component(
     ctx: ResolveContext,
     name: String,
@@ -180,27 +204,49 @@ async fn resolve_component(
         mut stack,
         mut path_set,
     } = ctx;
-    let resolved_ref = resolve_manifest_ref(&declared_ref, base_url.as_ref())?;
+
+    let resolved_ref = if !declared_ref.url.is_relative() {
+        declared_ref.clone()
+    } else {
+        let Some(base) = base_url.as_ref() else {
+            return Err(Error::RelativeManifestRef {
+                reference: declared_ref.url.as_str().into(),
+            });
+        };
+
+        declared_ref.resolve_against(base).map_err(|err| {
+            let (src, span) =
+                source_for_url(&svc.store, base).map_or((None, None), |(src, spans)| {
+                    let span = spans
+                        .components
+                        .get(name.as_str())
+                        .and_then(|c| c.manifest)
+                        .unwrap_or((0usize, 0usize).into());
+                    (Some(src), Some(span))
+                });
+
+            Error::InvalidManifestRef {
+                realm_url: Box::new(base.clone()),
+                reference: declared_ref.url.as_str().into(),
+                message: err.to_string().into(),
+                src,
+                span,
+            }
+        })?
+    };
     let resolved = resolve_manifest(&svc, &env, &resolved_ref).await?;
     let ResolvedManifest {
         manifest,
         digest,
+        resolved_url,
         observed_url,
     } = resolved;
 
     if path_set.contains(&digest) {
-        let resolved_url = resolved_ref
-            .url
-            .as_url()
-            .expect("resolved manifest ref should be absolute");
         stack.push(resolved_url.clone());
         return Err(Error::Cycle { cycle: stack });
     }
     path_set.insert(digest);
-    let resolved_url = resolved_ref
-        .url
-        .as_url()
-        .expect("resolved manifest ref should be absolute");
     stack.push(resolved_url.clone());
 
     let referenced_envs: HashSet<String> = manifest
@@ -209,19 +255,11 @@ async fn resolve_component(
         .filter_map(component_decl_environment)
         .collect();
 
-    let realm_url = observed_url.as_ref().unwrap_or(resolved_url).clone();
+    let realm_url = observed_url.as_ref().unwrap_or(&resolved_url).clone();
 
     let mut env_cache: HashMap<String, Arc<ResolveEnv>> = HashMap::new();
     for env_name in &referenced_envs {
-        let _ = compute_environment(
-            &svc,
-            &env,
-            &manifest,
-            &realm_url,
-            env_name,
-            &mut env_cache,
-            &mut HashSet::new(),
-        )?;
+        let _ = compute_environment(&svc, &env, &manifest, &realm_url, env_name, &mut env_cache)?;
     }
 
     let children_futs: Vec<_> = manifest
@@ -271,6 +309,7 @@ async fn resolve_component(
         name,
         declared_ref,
         digest,
+        resolved_url,
         observed_url,
         config,
         children,
@@ -302,23 +341,18 @@ fn compute_environment(
     realm_url: &Url,
     env_name: &str,
     env_cache: &mut HashMap<String, Arc<ResolveEnv>>,
-    visiting: &mut HashSet<String>,
 ) -> Result<Arc<ResolveEnv>, Error> {
     if let Some(e) = env_cache.get(env_name) {
         return Ok(Arc::clone(e));
     }
 
-    if !visiting.insert(env_name.to_string()) {
-        return Ok(Arc::clone(base_env));
-    }
-
-    let Some(env_decl) = manifest.environments().get(env_name) else {
-        visiting.remove(env_name);
-        return Ok(Arc::clone(base_env));
-    };
+    let env_decl = manifest
+        .environments()
+        .get(env_name)
+        .expect("environment names are validated in Manifest");
 
     let parent_env = if let Some(ext) = env_decl.extends.as_deref() {
-        compute_environment(svc, base_env, manifest, realm_url, ext, env_cache, visiting)?
+        compute_environment(svc, base_env, manifest, realm_url, ext, env_cache)?
     } else {
         Arc::clone(base_env)
     };
@@ -326,10 +360,26 @@ fn compute_environment(
     let mut remotes: Vec<RemoteResolver> = Vec::with_capacity(env_decl.resolvers.len());
     for resolver_name in &env_decl.resolvers {
         let Some(r) = svc.registry.get(resolver_name.as_str()) else {
+            let (src, span) =
+                source_for_url(&svc.store, realm_url).map_or((None, None), |(src, spans)| {
+                    let env = spans.environments.get(env_name);
+                    let span = env
+                        .and_then(|e| {
+                            e.resolvers
+                                .iter()
+                                .find(|(name, _)| name.as_ref() == resolver_name.as_str())
+                                .map(|(_, span)| *span)
+                        })
+                        .or_else(|| env.map(|e| e.name))
+                        .unwrap_or((0usize, 0usize).into());
+                    (Some(src), Some(span))
+                });
             return Err(Error::UnknownResolver {
                 realm_url: Box::new(realm_url.clone()),
                 environment: env_name.into(),
                 resolver: resolver_name.as_str().into(),
+                src,
+                span,
             });
         };
         remotes.push(r);
@@ -337,7 +387,6 @@ fn compute_environment(
 
     if remotes.is_empty() {
         env_cache.insert(env_name.to_string(), Arc::clone(&parent_env));
-        visiting.remove(env_name);
         return Ok(parent_env);
     }
 
@@ -350,7 +399,6 @@ fn compute_environment(
     });
 
     env_cache.insert(env_name.to_string(), Arc::clone(&out));
-    visiting.remove(env_name);
     Ok(out)
 }
 
@@ -362,9 +410,14 @@ async fn resolve_manifest(
     if let Some(expected) = r.digest
         && let Some(manifest) = svc.store.get(&expected)
     {
+        let url = r
+            .url
+            .as_url()
+            .expect("resolved manifest ref should be absolute");
         return Ok(ResolvedManifest {
             manifest,
             digest: expected,
+            resolved_url: url.clone(),
             observed_url: None,
         });
     }
@@ -403,9 +456,14 @@ async fn resolve_manifest_inner(
     if let Some(expected) = r.digest
         && let Some(manifest) = svc.store.get(&expected)
     {
+        let url = r
+            .url
+            .as_url()
+            .expect("resolved manifest ref should be absolute");
         return Ok(ResolvedManifest {
             manifest,
             digest: expected,
+            resolved_url: url.clone(),
             observed_url: None,
         });
     }
@@ -427,10 +485,20 @@ async fn resolve_manifest_inner(
     let stored = svc.store.put(digest, manifest);
 
     let observed_url = (resolution.url != *url).then_some(resolution.url);
+    let source_record = StoredSource {
+        digest,
+        source: resolution.source,
+        spans: resolution.spans,
+    };
+    svc.store.put_source(url.clone(), source_record.clone());
+    if let Some(observed_url) = &observed_url {
+        svc.store.put_source(observed_url.clone(), source_record);
+    }
 
     Ok(ResolvedManifest {
         manifest: stored,
         digest,
+        resolved_url: url.clone(),
         observed_url,
     })
 }

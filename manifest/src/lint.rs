@@ -1,82 +1,81 @@
-use std::{collections::BTreeSet, fmt};
+#![allow(unused_assignments)]
+
+use std::{collections::BTreeSet, sync::Arc};
+
+use miette::{Diagnostic, NamedSource, SourceSpan};
+use thiserror::Error;
 
 use crate::{
     BindingSource, BindingTarget, ExportTarget, InterpolatedPart, InterpolatedString,
-    InterpolationSource, Manifest, SlotName,
+    InterpolationSource, Manifest, ManifestSpans, SlotName,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum LintCode {
-    UnusedProgram,
-    UnusedSlot,
-    UnusedProvide,
-    DuplicateEnvironmentResolver,
-}
-
-impl LintCode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            LintCode::UnusedProgram => "manifest::unused-program",
-            LintCode::UnusedSlot => "manifest::unused-slot",
-            LintCode::UnusedProvide => "manifest::unused-provide",
-            LintCode::DuplicateEnvironmentResolver => "manifest::duplicate-environment-resolver",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(unused_assignments)]
+#[derive(Clone, Debug, Error, Diagnostic)]
 #[non_exhaustive]
 pub enum ManifestLint {
-    UnusedProgram,
+    #[error("program is never referenced by bindings or exports (in component {component})")]
+    #[diagnostic(
+        code(manifest::unused_program),
+        severity(Warning),
+        help("Remove the `program` block if it is not needed, or ensure it is bound.")
+    )]
+    UnusedProgram {
+        component: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label("unused `program`")]
+        span: SourceSpan,
+    },
+
+    #[error("slot `{name}` is never bound (in component {component})")]
+    #[diagnostic(
+        code(manifest::unused_slot),
+        severity(Warning),
+        help("Remove the slot `{name}` if it is not needed, or bind it to a provider.")
+    )]
     UnusedSlot {
         name: String,
+        component: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label("unused slot `{name}`")]
+        span: SourceSpan,
     },
+
+    #[error("provide `{name}` is never used or exported (in component {component})")]
+    #[diagnostic(
+        code(manifest::unused_provide),
+        severity(Warning),
+        help("Remove the provide `{name}` if it is not needed, or export/bind it.")
+    )]
     UnusedProvide {
         name: String,
+        component: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label("unused provide `{name}`")]
+        span: SourceSpan,
     },
+
+    #[error(
+        "environment `{environment}` declares resolver `{resolver}` more than once (in component \
+         {component})"
+    )]
+    #[diagnostic(
+        code(manifest::duplicate_environment_resolver),
+        severity(Warning),
+        help("Remove duplicate resolver entries.")
+    )]
     DuplicateEnvironmentResolver {
         environment: String,
         resolver: String,
+        component: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label("duplicate resolver `{resolver}`")]
+        span: SourceSpan,
     },
-}
-
-impl ManifestLint {
-    pub fn code(&self) -> LintCode {
-        match self {
-            ManifestLint::UnusedProgram => LintCode::UnusedProgram,
-            ManifestLint::UnusedSlot { .. } => LintCode::UnusedSlot,
-            ManifestLint::UnusedProvide { .. } => LintCode::UnusedProvide,
-            ManifestLint::DuplicateEnvironmentResolver { .. } => {
-                LintCode::DuplicateEnvironmentResolver
-            }
-        }
-    }
-}
-
-impl fmt::Display for ManifestLint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ManifestLint::UnusedProgram => {
-                write!(f, "program is never referenced by bindings or exports")
-            }
-            ManifestLint::UnusedSlot { name } => {
-                write!(f, "slot `{name}` is never bound")
-            }
-            ManifestLint::UnusedProvide { name } => {
-                write!(f, "provide `{name}` is never used or exported")
-            }
-            ManifestLint::DuplicateEnvironmentResolver {
-                environment,
-                resolver,
-            } => {
-                write!(
-                    f,
-                    "environment `{environment}` declares resolver `{resolver}` more than once"
-                )
-            }
-        }
-    }
 }
 
 fn add_program_slot_uses<'a>(
@@ -103,8 +102,14 @@ fn add_program_slot_uses<'a>(
     }
 }
 
-pub fn lint_manifest(manifest: &Manifest) -> Vec<ManifestLint> {
+pub fn lint_manifest(
+    manifest: &Manifest,
+    component: &str,
+    src: NamedSource<Arc<str>>,
+    spans: &ManifestSpans,
+) -> Vec<ManifestLint> {
     let mut lints = Vec::new();
+    let component = component.to_string();
 
     let mut bound_slots = BTreeSet::new();
     let mut bound_provides = BTreeSet::new();
@@ -139,32 +144,65 @@ pub fn lint_manifest(manifest: &Manifest) -> Vec<ManifestLint> {
         && bound_provides.is_empty()
         && exported_provides.is_empty()
     {
-        lints.push(ManifestLint::UnusedProgram);
+        let span = spans
+            .program
+            .as_ref()
+            .map(|p| p.whole)
+            .unwrap_or((0usize, 0usize).into());
+        lints.push(ManifestLint::UnusedProgram {
+            component: component.clone(),
+            src: src.clone(),
+            span,
+        });
     }
 
     for slot_name in manifest.slots().keys() {
         if !bound_slots.contains(slot_name) && !program_used_slots.contains(slot_name) {
+            let span = spans
+                .slots
+                .get(slot_name.as_str())
+                .map(|s| s.name)
+                .unwrap_or((0usize, 0usize).into());
             lints.push(ManifestLint::UnusedSlot {
                 name: slot_name.to_string(),
+                component: component.clone(),
+                src: src.clone(),
+                span,
             });
         }
     }
 
     for provide_name in manifest.provides().keys() {
         if !bound_provides.contains(provide_name) && !exported_provides.contains(provide_name) {
+            let span = spans
+                .provides
+                .get(provide_name.as_str())
+                .map(|p| p.capability.name)
+                .unwrap_or((0usize, 0usize).into());
             lints.push(ManifestLint::UnusedProvide {
                 name: provide_name.to_string(),
+                component: component.clone(),
+                src: src.clone(),
+                span,
             });
         }
     }
 
     for (env_name, env) in manifest.environments() {
         let mut seen = BTreeSet::new();
-        for resolver in &env.resolvers {
+        for (idx, resolver) in env.resolvers.iter().enumerate() {
             if !seen.insert(resolver.as_str()) {
+                let span = spans
+                    .environments
+                    .get(env_name.as_str())
+                    .and_then(|e| e.resolvers.get(idx).map(|(_, s)| *s))
+                    .unwrap_or((0usize, 0usize).into());
                 lints.push(ManifestLint::DuplicateEnvironmentResolver {
                     environment: env_name.clone(),
                     resolver: resolver.clone(),
+                    component: component.clone(),
+                    src: src.clone(),
+                    span,
                 });
             }
         }

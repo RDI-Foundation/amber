@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 amber-manifest = { path = "../manifest" }
 futures = "0.3.31"
+miette = { version = "7.4.0", features = ["derive"] }
 reqwest = { version = "0.12.25", default-features = false, features = ["rustls-tls", "stream"] }
 thiserror = "2.0.9"
 tokio = { version = "1.48.0", features = ["fs"] }

@@ -1,3 +1,7 @@
+use std::sync::Arc;
+
+use miette::SourceSpan;
+
 use super::*;
 
 #[test]
@@ -65,6 +69,45 @@ fn interpolation_unknown_source_errors() {
 #[test]
 fn interpolation_missing_closing_brace_errors() {
     assert!("x ${config.a".parse::<InterpolatedString>().is_err());
+}
+
+#[test]
+fn span_for_json_pointer_finds_nested_values() {
+    let source = r#"{ foo: { bar: 42, list: ["a", "b"] } }"#;
+    let root: SourceSpan = (0usize, source.len()).into();
+
+    let bar = crate::spans::span_for_json_pointer(source, root, "/foo/bar").unwrap();
+    assert_eq!(
+        source
+            .get(bar.offset()..bar.offset() + bar.len())
+            .unwrap()
+            .trim(),
+        "42"
+    );
+
+    let list_1 = crate::spans::span_for_json_pointer(source, root, "/foo/list/1").unwrap();
+    assert_eq!(
+        source
+            .get(list_1.offset()..list_1.offset() + list_1.len())
+            .unwrap()
+            .trim(),
+        "\"b\""
+    );
+}
+
+#[test]
+fn span_for_json_pointer_unescapes_segments() {
+    let source = r#"{ "~": { "/": 1 } }"#;
+    let root: SourceSpan = (0usize, source.len()).into();
+
+    let span = crate::spans::span_for_json_pointer(source, root, "/~0/~1").unwrap();
+    assert_eq!(
+        source
+            .get(span.offset()..span.offset() + span.len())
+            .unwrap()
+            .trim(),
+        "1"
+    );
 }
 
 #[test]
@@ -356,6 +399,85 @@ fn manifest_deserialize_error_includes_path() {
 }
 
 #[test]
+fn binding_unknown_field_points_to_key() {
+    use miette::Diagnostic;
+
+    let source = r##"
+        {
+          manifest_version: "0.1.0",
+          bindings: [
+            { to: "#green.llm", form: "#green_router.llm" },
+          ],
+        }
+        "##;
+
+    let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+    let labels: Vec<_> = err.labels().unwrap().collect();
+    assert_eq!(labels.len(), 1);
+
+    let label = &labels[0];
+    let offset = source.find("form").unwrap();
+    assert_eq!(label.offset(), offset);
+    assert_eq!(label.len(), "form".len());
+}
+
+#[test]
+fn binding_dot_form_error_points_to_offending_field() {
+    use miette::Diagnostic;
+
+    let source = r##"
+        {
+          manifest_version: "0.1.0",
+          bindings: [
+            { to: "#a.s", from: "#b" },
+          ],
+        }
+        "##;
+
+    let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+    let labels: Vec<_> = err.labels().unwrap().collect();
+    assert_eq!(labels.len(), 1);
+
+    let label = &labels[0];
+    let offset = source.find("\"#b\"").unwrap();
+    assert_eq!(label.offset(), offset);
+    assert_eq!(label.len(), "\"#b\"".len());
+}
+
+#[test]
+fn program_unknown_field_points_to_key() {
+    use miette::Diagnostic;
+
+    let source = r##"
+        {
+          manifest_version: "0.1.0",
+          program: { imag: "x" }
+        }
+        "##;
+
+    let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+    let labels: Vec<_> = err.labels().unwrap().collect();
+    assert_eq!(labels.len(), 1);
+
+    let label = &labels[0];
+    let offset = source.find("imag").unwrap();
+    assert_eq!(label.offset(), offset);
+    assert_eq!(label.len(), "imag".len());
+}
+
+#[test]
+fn missing_manifest_version_has_fix_suggestion() {
+    use miette::Diagnostic;
+
+    let source = r#"{ }"#;
+
+    let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+    let help = err.help().unwrap().to_string();
+    assert!(help.contains("manifest_version"));
+    assert!(help.contains("\"0.1.0\""));
+}
+
+#[test]
 fn components_sugar_parses() {
     let m: Manifest = r##"
         {
@@ -498,24 +620,22 @@ fn environment_extends_unknown_is_rejected() {
 
 #[test]
 fn environment_duplicate_resolvers_are_linted() {
-    let raw = parse_raw(
-        r#"
+    let input = r#"
         {
           manifest_version: "0.1.0",
           environments: {
             a: { resolvers: ["x", "x"] },
           },
         }
-        "#,
-    );
+        "#;
+    let raw = parse_raw(input);
     let manifest = raw.validate().unwrap();
-    let lints = lint::lint_manifest(&manifest);
-    assert!(
-        lints.contains(&lint::ManifestLint::DuplicateEnvironmentResolver {
-            environment: "a".to_string(),
-            resolver: "x".to_string(),
-        })
-    );
+    let lints = lint_for(input, &manifest);
+    assert!(lints.iter().any(|lint| matches!(
+        lint,
+        lint::ManifestLint::DuplicateEnvironmentResolver { environment, resolver, .. }
+            if environment == "a" && resolver == "x"
+    )));
 }
 
 #[test]
@@ -947,6 +1067,38 @@ fn binding_target_cannot_be_multiplexed() {
 }
 
 #[test]
+fn duplicate_binding_target_error_shows_both_sites() {
+    use miette::Diagnostic;
+
+    let source = r##"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            a: "https://example.com/a",
+            b: "https://example.com/b",
+            c: "https://example.com/c",
+          },
+          bindings: [
+            { to: "#a.s", from: "#b.c" },
+            { to: "#a.s", from: "#c.d" },
+          ],
+        }
+        "##;
+
+    let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+    let labels: Vec<_> = err.labels().unwrap().collect();
+    assert!(labels.len() >= 2);
+
+    let starts: Vec<_> = source
+        .match_indices("{ to: \"#a.s\"")
+        .map(|(idx, _)| idx)
+        .collect();
+    assert_eq!(starts.len(), 2);
+    assert!(labels.iter().any(|l| l.offset() == starts[0]));
+    assert!(labels.iter().any(|l| l.offset() == starts[1]));
+}
+
+#[test]
 fn binding_source_can_be_multiplexed() {
     let raw = parse_raw(
         r##"
@@ -1000,25 +1152,24 @@ fn binding_source_can_be_multiplexed() {
 
 #[test]
 fn unused_slot_is_linted() {
-    let raw = parse_raw(
-        r#"
+    let input = r#"
         {
           manifest_version: "0.1.0",
           slots: { llm: { kind: "llm" } },
         }
-        "#,
-    );
+        "#;
+    let raw = parse_raw(input);
     let manifest = raw.validate().unwrap();
-    let lints = lint::lint_manifest(&manifest);
-    assert!(lints.contains(&lint::ManifestLint::UnusedSlot {
-        name: "llm".to_string(),
-    }));
+    let lints = lint_for(input, &manifest);
+    assert!(lints.iter().any(|lint| matches!(
+        lint,
+        lint::ManifestLint::UnusedSlot { name, .. } if name == "llm"
+    )));
 }
 
 #[test]
 fn slot_used_in_program_args_is_not_linted() {
-    let raw = parse_raw(
-        r#"
+    let input = r#"
         {
           manifest_version: "0.1.0",
           slots: { llm: { kind: "llm" } },
@@ -1027,19 +1178,19 @@ fn slot_used_in_program_args_is_not_linted() {
             args: ["--llm", "${slots.llm.url}"],
           },
         }
-        "#,
-    );
+        "#;
+    let raw = parse_raw(input);
     let manifest = raw.validate().unwrap();
-    let lints = lint::lint_manifest(&manifest);
-    assert!(!lints.contains(&lint::ManifestLint::UnusedSlot {
-        name: "llm".to_string(),
-    }));
+    let lints = lint_for(input, &manifest);
+    assert!(!lints.iter().any(|lint| matches!(
+        lint,
+        lint::ManifestLint::UnusedSlot { name, .. } if name == "llm"
+    )));
 }
 
 #[test]
 fn slot_used_in_program_env_is_not_linted() {
-    let raw = parse_raw(
-        r#"
+    let input = r#"
         {
           manifest_version: "0.1.0",
           slots: { llm: { kind: "llm" } },
@@ -1048,51 +1199,54 @@ fn slot_used_in_program_env_is_not_linted() {
             env: { LLM_URL: "${slots.llm.url}" },
           },
         }
-        "#,
-    );
+        "#;
+    let raw = parse_raw(input);
     let manifest = raw.validate().unwrap();
-    let lints = lint::lint_manifest(&manifest);
-    assert!(!lints.contains(&lint::ManifestLint::UnusedSlot {
-        name: "llm".to_string(),
-    }));
+    let lints = lint_for(input, &manifest);
+    assert!(!lints.iter().any(|lint| matches!(
+        lint,
+        lint::ManifestLint::UnusedSlot { name, .. } if name == "llm"
+    )));
 }
 
 #[test]
 fn unused_provide_is_linted() {
-    let raw = parse_raw(
-        r#"
+    let input = r#"
         {
           manifest_version: "0.1.0",
           provides: { api: { kind: "http" } },
         }
-        "#,
-    );
+        "#;
+    let raw = parse_raw(input);
     let manifest = raw.validate().unwrap();
-    let lints = lint::lint_manifest(&manifest);
-    assert!(lints.contains(&lint::ManifestLint::UnusedProvide {
-        name: "api".to_string(),
-    }));
+    let lints = lint_for(input, &manifest);
+    assert!(lints.iter().any(|lint| matches!(
+        lint,
+        lint::ManifestLint::UnusedProvide { name, .. } if name == "api"
+    )));
 }
 
 #[test]
 fn unused_program_is_linted() {
-    let raw = parse_raw(
-        r#"
+    let input = r#"
         {
           manifest_version: "0.1.0",
           program: { image: "x" },
         }
-        "#,
-    );
+        "#;
+    let raw = parse_raw(input);
     let manifest = raw.validate().unwrap();
-    let lints = lint::lint_manifest(&manifest);
-    assert!(lints.contains(&lint::ManifestLint::UnusedProgram));
+    let lints = lint_for(input, &manifest);
+    assert!(
+        lints
+            .iter()
+            .any(|lint| matches!(lint, lint::ManifestLint::UnusedProgram { .. }))
+    );
 }
 
 #[test]
 fn program_used_by_binding_is_not_linted() {
-    let raw = parse_raw(
-        r##"
+    let input = r##"
         {
           manifest_version: "0.1.0",
           program: { image: "x" },
@@ -1104,34 +1258,40 @@ fn program_used_by_binding_is_not_linted() {
             { to: "#worker.api", from: "self.api" },
           ],
         }
-        "##,
-    );
+        "##;
+    let raw = parse_raw(input);
     let manifest = raw.validate().unwrap();
-    let lints = lint::lint_manifest(&manifest);
-    assert!(!lints.contains(&lint::ManifestLint::UnusedProgram));
+    let lints = lint_for(input, &manifest);
+    assert!(
+        !lints
+            .iter()
+            .any(|lint| matches!(lint, lint::ManifestLint::UnusedProgram { .. }))
+    );
 }
 
 #[test]
 fn program_used_by_export_is_not_linted() {
-    let raw = parse_raw(
-        r#"
+    let input = r#"
         {
           manifest_version: "0.1.0",
           program: { image: "x" },
           provides: { api: { kind: "http" } },
           exports: { api: "api" },
         }
-        "#,
-    );
+        "#;
+    let raw = parse_raw(input);
     let manifest = raw.validate().unwrap();
-    let lints = lint::lint_manifest(&manifest);
-    assert!(!lints.contains(&lint::ManifestLint::UnusedProgram));
+    let lints = lint_for(input, &manifest);
+    assert!(
+        !lints
+            .iter()
+            .any(|lint| matches!(lint, lint::ManifestLint::UnusedProgram { .. }))
+    );
 }
 
 #[test]
 fn exported_provide_is_not_linted() {
-    let raw = parse_raw(
-        r#"
+    let input = r#"
         {
           manifest_version: "0.1.0",
           provides: {
@@ -1139,12 +1299,19 @@ fn exported_provide_is_not_linted() {
           },
           exports: { public: "api" },
         }
-        "#,
-    );
+        "#;
+    let raw = parse_raw(input);
 
     let manifest = raw.validate().unwrap();
-    let lints = lint::lint_manifest(&manifest);
+    let lints = lint_for(input, &manifest);
     assert!(lints.is_empty());
+}
+
+fn lint_for(input: &str, manifest: &Manifest) -> Vec<lint::ManifestLint> {
+    let source: Arc<str> = input.into();
+    let spans = ManifestSpans::parse(&source);
+    let src = miette::NamedSource::new("<test>", Arc::clone(&source)).with_language("json5");
+    lint::lint_manifest(manifest, "/", src, &spans)
 }
 
 fn parse_raw(input: &str) -> RawManifest {

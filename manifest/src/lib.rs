@@ -1,4 +1,6 @@
+mod document;
 pub mod lint;
+mod spans;
 #[cfg(test)]
 mod tests;
 
@@ -12,59 +14,109 @@ use std::{
 };
 
 use base64::Engine;
+pub use document::{ManifestDocError, ParsedManifest};
+use miette::Diagnostic;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use serde_with::{DeserializeFromStr, MapPreventDuplicates, SerializeDisplay, serde_as};
 use sha2::Digest as _;
+pub use spans::{
+    BindingSpans, BindingTargetKey, CapabilityDeclSpans, ComponentDeclSpans, EnvironmentSpans,
+    ExportSpans, ManifestSpans, ProgramSpans, ProvideDeclSpans, span_for_json_pointer,
+};
+use thiserror::Error;
 use url::{ParseError, Url};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Error, Diagnostic)]
 #[non_exhaustive]
 pub enum Error {
     #[error("json5 parse error: {0}")]
+    #[diagnostic(code(manifest::json5_error))]
     Json5(#[from] json5::Error),
+
     #[error("json5 deserialize error: {0}")]
+    #[diagnostic(code(manifest::deserialize_error))]
     Json5Path(#[from] serde_path_to_error::Error<json5::Error>),
+
     #[error("io error: {0}")]
+    #[diagnostic(code(manifest::io_error))]
     Io(#[from] std::io::Error),
+
     #[error("invalid manifest reference `{0}`")]
+    #[diagnostic(code(manifest::invalid_reference))]
     InvalidManifestRef(String),
+
     #[error("invalid manifest digest `{0}`")]
+    #[diagnostic(code(manifest::invalid_digest))]
     InvalidManifestDigest(String),
+
     #[error("invalid interpolation `{0}`")]
+    #[diagnostic(code(manifest::invalid_interpolation))]
     InvalidInterpolation(String),
+
     #[error("invalid component ref `{input}`: {message}")]
+    #[diagnostic(code(manifest::invalid_component_ref))]
     InvalidComponentRef { input: String, message: String },
+
     #[error("invalid binding `{input}`: {message}")]
+    #[diagnostic(code(manifest::invalid_binding))]
     InvalidBinding { input: String, message: String },
+
     #[error("invalid export target `{input}`: {message}")]
+    #[diagnostic(code(manifest::invalid_export_target))]
     InvalidExportTarget { input: String, message: String },
+
     #[error("invalid {kind} name `{name}`: dots are reserved")]
+    #[diagnostic(code(manifest::invalid_name))]
     InvalidName { kind: &'static str, name: String },
+
     #[error("unclosed quote in args string")]
+    #[diagnostic(code(manifest::unclosed_quote))]
     UnclosedQuote,
+
     #[error("export `{export}` references unknown capability `{target}`")]
+    #[diagnostic(code(manifest::unknown_export_target))]
     UnknownExportTarget { export: String, target: String },
+
     #[error("export `{export}` references unknown child `#{child}`")]
+    #[diagnostic(code(manifest::unknown_export_child))]
     UnknownExportChild { export: String, child: String },
+
     #[error("capability `{name}` cannot be declared as both slot and provide")]
+    #[diagnostic(code(manifest::ambiguous_capability_name))]
     AmbiguousCapabilityName { name: String },
+
     #[error("binding target `{to}.{slot}` is bound more than once")]
+    #[diagnostic(code(manifest::duplicate_binding_target))]
     DuplicateBindingTarget { to: String, slot: String },
+
     #[error("binding references unknown child `#{child}`")]
+    #[diagnostic(code(manifest::unknown_binding_child))]
     UnknownBindingChild { child: String },
+
     #[error("binding target `self.{slot}` references unknown slot")]
+    #[diagnostic(code(manifest::unknown_binding_slot))]
     UnknownBindingSlot { slot: String },
+
     #[error("binding source `self.{capability}` references unknown provide")]
+    #[diagnostic(code(manifest::unknown_binding_provide))]
     UnknownBindingProvide { capability: String },
+
     #[error("duplicate endpoint name `{name}`")]
+    #[diagnostic(code(manifest::duplicate_endpoint_name))]
     DuplicateEndpointName { name: String },
+
     #[error("unknown endpoint `{name}` referenced")]
+    #[diagnostic(code(manifest::unknown_endpoint))]
     UnknownEndpoint { name: String },
+
     #[error("invalid config schema: {0}")]
+    #[diagnostic(code(manifest::invalid_config_schema))]
     InvalidConfigSchema(String),
+
     #[error("unsupported manifest version `{version}` (supported: {supported_req})")]
+    #[diagnostic(code(manifest::unsupported_version))]
     UnsupportedManifestVersion {
         version: Version,
         supported_req: &'static str,
@@ -72,10 +124,15 @@ pub enum Error {
 
     // --- Environments (resolution environments) ---
     #[error("environment `{name}` extends unknown environment `{extends}`")]
+    #[diagnostic(code(manifest::unknown_environment_extends))]
     UnknownEnvironmentExtends { name: String, extends: String },
+
     #[error("environment `{name}` has a cycle in `extends`")]
+    #[diagnostic(code(manifest::environment_cycle))]
     EnvironmentCycle { name: String },
+
     #[error("component `#{child}` references unknown environment `{environment}`")]
+    #[diagnostic(code(manifest::unknown_component_environment))]
     UnknownComponentEnvironment { child: String, environment: String },
 }
 
@@ -533,6 +590,7 @@ impl<'de> Deserialize<'de> for ProgramArgs {
 
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Program {
     pub image: String,
@@ -546,6 +604,7 @@ pub struct Program {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Network {
     #[serde(default, deserialize_with = "deserialize_endpoints")]
@@ -569,6 +628,7 @@ where
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Endpoint {
     pub name: String,
@@ -633,6 +693,7 @@ impl fmt::Display for CapabilityKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct CapabilityDecl {
     pub kind: CapabilityKind,
@@ -640,7 +701,18 @@ pub struct CapabilityDecl {
     pub profile: Option<String>,
 }
 
+impl fmt::Display for CapabilityDecl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.kind)?;
+        if let Some(profile) = &self.profile {
+            write!(f, " (profile \"{profile}\")")?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct SlotDecl {
     #[serde(flatten)]
@@ -770,6 +842,7 @@ pub struct ProvideDecl {
 ///
 /// The compiler interprets the resolver names here via an external registry (provided by the host).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct EnvironmentDecl {
     /// Optional base environment to extend (within the same manifest).
@@ -842,6 +915,7 @@ impl ManifestRef {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ComponentRef {
     pub manifest: ManifestRef,
@@ -887,58 +961,67 @@ impl<'de> Deserialize<'de> for RawBinding {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        struct ExplicitBindingForm {
-            to: String,
-            slot: String,
-            from: String,
-            capability: String,
+        #[serde(deny_unknown_fields)]
+        struct BindingInput {
+            #[serde(default)]
+            to: Option<String>,
+            #[serde(default)]
+            slot: Option<String>,
+            #[serde(default)]
+            from: Option<String>,
+            #[serde(default)]
+            capability: Option<String>,
             #[serde(default)]
             weak: bool,
         }
 
-        #[derive(Deserialize)]
-        struct DotBindingForm {
-            to: String,
-            from: String,
-            #[serde(default)]
-            weak: bool,
-        }
+        let BindingInput {
+            to,
+            slot,
+            from,
+            capability,
+            weak,
+        } = BindingInput::deserialize(deserializer)?;
 
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum BindingForm {
-            Explicit(ExplicitBindingForm),
-            Dot(DotBindingForm),
-        }
+        let to =
+            to.ok_or_else(|| serde::de::Error::custom("binding is missing required field `to`"))?;
+        let from = from
+            .ok_or_else(|| serde::de::Error::custom("binding is missing required field `from`"))?;
 
-        match BindingForm::deserialize(deserializer)? {
-            BindingForm::Explicit(explicit) => {
-                ensure_binding_name_no_dot(&explicit.slot, explicit.slot.as_str())
+        match (slot, capability) {
+            (Some(slot), Some(capability)) => {
+                ensure_binding_name_no_dot(&slot, slot.as_str())
                     .map_err(serde::de::Error::custom)?;
-                ensure_binding_name_no_dot(&explicit.capability, explicit.capability.as_str())
+                ensure_binding_name_no_dot(&capability, capability.as_str())
                     .map_err(serde::de::Error::custom)?;
                 Ok(RawBinding {
-                    to: parse_binding_component_ref(&explicit.to)
-                        .map_err(serde::de::Error::custom)?,
-                    slot: explicit.slot,
-                    from: parse_binding_component_ref(&explicit.from)
-                        .map_err(serde::de::Error::custom)?,
-                    capability: explicit.capability,
-                    weak: explicit.weak,
+                    to: parse_binding_component_ref(&to).map_err(serde::de::Error::custom)?,
+                    slot,
+                    from: parse_binding_component_ref(&from).map_err(serde::de::Error::custom)?,
+                    capability,
+                    weak,
                 })
             }
-            BindingForm::Dot(dot) => {
-                let (to, slot) = split_binding_side(&dot.to).map_err(serde::de::Error::custom)?;
+            (None, None) => {
+                let (to, slot) = split_binding_side(&to).map_err(serde::de::Error::custom)?;
                 let (from, capability) =
-                    split_binding_side(&dot.from).map_err(serde::de::Error::custom)?;
+                    split_binding_side(&from).map_err(serde::de::Error::custom)?;
                 Ok(RawBinding {
                     to,
                     slot,
                     from,
                     capability,
-                    weak: dot.weak,
+                    weak,
                 })
             }
+            (Some(_), None) => Err(serde::de::Error::custom(
+                "binding has `slot` but is missing `capability` (either add `capability`, or use \
+                 dot form `to: \"<component-ref>.<slot>\", from: \"<component-ref>.<provide>\"`)",
+            )),
+            (None, Some(_)) => Err(serde::de::Error::custom(
+                "binding has `capability` but is missing `slot` (either add `slot`, or use dot \
+                 form `to: \"<component-ref>.<slot>\", from: \"<component-ref>.<provide>\"`)",
+            )),
         }
     }
 }
@@ -1060,6 +1143,7 @@ pub struct Binding {
 
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct RawManifest {
     pub manifest_version: Version,

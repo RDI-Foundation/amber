@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, sync::Arc};
 
 use url::Url;
 
@@ -19,10 +19,17 @@ impl FileResolver {
                 format!("invalid file URL: {url}"),
             )
         })?;
-        let manifest = tokio::fs::read_to_string(path).await?.parse()?;
+        let source: Arc<str> = tokio::fs::read_to_string(&path).await?.into();
+        let parsed =
+            amber_manifest::ParsedManifest::parse_named(path.display().to_string(), source)?;
+        let manifest = parsed.manifest;
+        let source = parsed.source;
+        let spans = parsed.spans;
         Ok(Resolution {
             url: url.clone(),
             manifest,
+            source,
+            spans,
         })
     }
 }

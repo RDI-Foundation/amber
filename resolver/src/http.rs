@@ -1,4 +1,4 @@
-use std::{io, time::Duration};
+use std::{io, sync::Arc, time::Duration};
 
 use futures::StreamExt;
 use reqwest::header::CONTENT_TYPE;
@@ -18,6 +18,7 @@ impl HttpResolver {
             .expect("default http resolver configuration failed")
     }
 
+    #[allow(clippy::result_large_err)]
     pub fn with_options(options: HttpResolverOptions) -> Result<Self, Error> {
         let mut builder = reqwest::Client::builder()
             .connect_timeout(options.connect_timeout)
@@ -95,11 +96,17 @@ impl HttpResolver {
 
         let body = std::str::from_utf8(&body)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        let manifest = body.parse()?;
+        let source: Arc<str> = body.into();
+        let parsed = amber_manifest::ParsedManifest::parse_named(resolved_url.as_str(), source)?;
+        let manifest = parsed.manifest;
+        let source = parsed.source;
+        let spans = parsed.spans;
 
         Ok(Resolution {
             url: resolved_url,
             manifest,
+            source,
+            spans,
         })
     }
 }

@@ -18,8 +18,16 @@ impl Provenance {
 pub struct ComponentProvenance {
     /// What was declared by the parent (URL + optional digest pin).
     pub declared_ref: ManifestRef,
+    /// The absolute URL used for resolution after applying `base_url` rules.
+    pub resolved_url: Url,
     /// Digest chosen for this component instance.
     pub digest: ManifestDigest,
     /// Optional diagnostic only: where bytes were observed to come from (e.g. final URL after redirects).
     pub observed_url: Option<Url>,
+}
+
+impl ComponentProvenance {
+    pub fn effective_url(&self) -> &Url {
+        self.observed_url.as_ref().unwrap_or(&self.resolved_url)
+    }
 }

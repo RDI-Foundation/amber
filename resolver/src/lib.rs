@@ -2,34 +2,45 @@ pub mod file;
 pub mod http;
 pub mod remote;
 
-use amber_manifest::{Manifest, ManifestDigest};
+use std::sync::Arc;
+
+use amber_manifest::{Manifest, ManifestDigest, ManifestSpans};
 pub use file::FileResolver;
 pub use http::{ContentTypePolicy, HttpResolver, HttpResolverOptions};
+use miette::Diagnostic;
 pub use remote::{Backend, RemoteResolver};
 use url::Url;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, Diagnostic)]
 pub enum Error {
     #[error("unsupported URL scheme `{scheme}`")]
+    #[diagnostic(code(resolver::unsupported_scheme))]
     UnsupportedScheme { scheme: String },
     #[error("response body from `{url}` exceeds max size {max_bytes} bytes (got {size} bytes)")]
+    #[diagnostic(code(resolver::response_too_large))]
     ResponseTooLarge {
         url: Url,
         size: u64,
         max_bytes: usize,
     },
     #[error("missing content type for `{url}`")]
+    #[diagnostic(code(resolver::missing_content_type))]
     MissingContentType { url: Url },
     #[error("unsupported content type `{content_type}` for `{url}`")]
+    #[diagnostic(code(resolver::unsupported_content_type))]
     UnsupportedContentType { url: Url, content_type: String },
     #[error("mismatched digest for `{0}`")]
+    #[diagnostic(code(resolver::mismatched_digest))]
     MismatchedDigest(Url),
     #[error("http error: {0}")]
+    #[diagnostic(code(resolver::http_error))]
     Http(#[from] reqwest::Error),
     #[error("io error: {0}")]
+    #[diagnostic(code(resolver::io_error))]
     Io(#[from] std::io::Error),
-    #[error("manifest parse error: {0}")]
-    Manifest(#[from] amber_manifest::Error),
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Manifest(#[from] amber_manifest::ManifestDocError),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -71,12 +82,22 @@ impl Resolver {
         let res = self.resolve_url(url).await?;
         match digest {
             Some(expected) => {
-                let Resolution { url, manifest } = res;
+                let Resolution {
+                    url,
+                    manifest,
+                    source,
+                    spans,
+                } = res;
                 let actual = manifest.digest();
                 if actual != expected {
                     return Err(Error::MismatchedDigest(url));
                 }
-                Ok(Resolution { url, manifest })
+                Ok(Resolution {
+                    url,
+                    manifest,
+                    source,
+                    spans,
+                })
             }
             None => Ok(res),
         }
@@ -102,6 +123,8 @@ pub struct Resolution {
     /// The URL where the content was actually found.
     pub url: Url,
     pub manifest: Manifest,
+    pub source: Arc<str>,
+    pub spans: Arc<ManifestSpans>,
 }
 
 #[cfg(test)]
