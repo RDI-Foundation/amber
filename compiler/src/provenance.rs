@@ -1,4 +1,6 @@
-use amber_manifest::{ManifestDigest, ManifestRef};
+use std::sync::Arc;
+
+use amber_manifest::{CapabilityKind, ManifestDigest, ManifestRef};
 use amber_scenario::ComponentId;
 use url::Url;
 
@@ -6,6 +8,7 @@ use url::Url;
 #[derive(Clone, Debug, Default)]
 pub struct Provenance {
     pub components: Vec<ComponentProvenance>,
+    pub root_exports: Vec<RootExportProvenance>,
 }
 
 impl Provenance {
@@ -16,6 +19,8 @@ impl Provenance {
 
 #[derive(Clone, Debug)]
 pub struct ComponentProvenance {
+    /// Stable component path as authored, before any optimization passes rewrite the tree.
+    pub authored_path: Arc<str>,
     /// What was declared by the parent (URL + optional digest pin).
     pub declared_ref: ManifestRef,
     /// The absolute URL used for resolution after applying `base_url` rules.
@@ -30,4 +35,12 @@ impl ComponentProvenance {
     pub fn effective_url(&self) -> &Url {
         self.observed_url.as_ref().unwrap_or(&self.resolved_url)
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct RootExportProvenance {
+    pub name: Arc<str>,
+    pub endpoint_component_path: Arc<str>,
+    pub endpoint_provide: Arc<str>,
+    pub kind: CapabilityKind,
 }

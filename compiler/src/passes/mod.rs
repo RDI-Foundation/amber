@@ -5,8 +5,10 @@ use thiserror::Error;
 use crate::{DigestStore, Provenance};
 
 pub mod dce;
+pub mod flatten;
 
 pub use dce::DcePass;
+pub use flatten::FlattenPass;
 
 #[derive(Debug, Error, Diagnostic)]
 #[non_exhaustive]

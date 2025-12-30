@@ -1,0 +1,7 @@
+{
+  "manifest_version": "0.1.0",
+  "provides": {
+    "cap": { "kind": "http" }
+  },
+  "exports": { "cap": "cap" }
+}

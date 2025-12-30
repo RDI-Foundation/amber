@@ -3,7 +3,7 @@ mod tests;
 
 use amber_manifest::{ManifestRef, lint::lint_manifest};
 use amber_resolver::Resolver;
-use amber_scenario::{Scenario, graph::component_path_for};
+use amber_scenario::Scenario;
 use miette::{Diagnostic, NamedSource, Report};
 use thiserror::Error;
 use url::Url;
@@ -11,6 +11,7 @@ use url::Url;
 mod environment;
 mod frontend;
 mod linker;
+mod manifest_table;
 mod provenance;
 mod store;
 
@@ -19,7 +20,7 @@ pub mod passes;
 
 pub use environment::ResolverRegistry;
 pub use frontend::ResolveOptions;
-pub use provenance::{ComponentProvenance, Provenance};
+pub use provenance::{ComponentProvenance, Provenance, RootExportProvenance};
 pub use store::DigestStore;
 
 #[derive(Clone, Debug, Default)]
@@ -111,6 +112,7 @@ impl Compiler {
             let mut pm = passes::PassManager::new();
             if opts.optimize.dce {
                 pm.push(passes::DcePass);
+                pm.push(passes::FlattenPass);
             }
             pm.run(scenario, provenance, &self.store)?
         };
@@ -188,7 +190,7 @@ fn collect_manifest_diagnostics(
             .expect("manifest was resolved during linking");
         let prov = provenance.for_component(component.id);
         let url = prov.effective_url();
-        let component_path = component_path_for(&scenario.components, component.id);
+        let component_path = prov.authored_path.as_ref();
 
         let Some(stored) = store.get_source(url) else {
             continue;
@@ -202,7 +204,7 @@ fn collect_manifest_diagnostics(
 
         let name = display_url(url);
         let src = NamedSource::new(name, source).with_language("json5");
-        let lints = lint_manifest(&manifest, &component_path, src, &spans);
+        let lints = lint_manifest(&manifest, component_path, src, &spans);
         if lints.is_empty() {
             continue;
         }

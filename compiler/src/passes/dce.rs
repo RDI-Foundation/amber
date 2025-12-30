@@ -36,10 +36,13 @@ impl ScenarioPass for DcePass {
         provenance: Provenance,
         store: &DigestStore,
     ) -> Result<(Scenario, Provenance), PassError> {
-        let manifests =
-            build_manifest_table(&scenario, store).map_err(|message| PassError::Failed {
+        let manifests = crate::manifest_table::build_manifest_table(&scenario.components, store)
+            .map_err(|e| PassError::Failed {
                 pass: self.name(),
-                message,
+                message: format!(
+                    "missing manifest for digest {} (component {})",
+                    e.digest, e.component.0
+                ),
             })?;
 
         let n = scenario.components.len();
@@ -123,17 +126,6 @@ impl ScenarioPass for DcePass {
             &live_bindings,
         ))
     }
-}
-
-fn build_manifest_table(s: &Scenario, store: &DigestStore) -> Result<Vec<Arc<Manifest>>, String> {
-    let mut out = Vec::with_capacity(s.components.len());
-    for c in &s.components {
-        let Some(m) = store.get(&c.digest) else {
-            return Err(format!("missing manifest for digest {}", c.digest));
-        };
-        out.push(m);
-    }
-    Ok(out)
 }
 
 fn mark_used_slots(
@@ -277,6 +269,10 @@ fn prune_scenario(
         components,
         bindings,
     } = scenario;
+    let Provenance {
+        components: prov_components,
+        root_exports,
+    } = provenance;
 
     let mut old_to_new = vec![None; components.len()];
     let mut next = 0usize;
@@ -330,7 +326,7 @@ fn prune_scenario(
     }
 
     let mut new_prov = Vec::new();
-    for (idx, p) in provenance.components.into_iter().enumerate() {
+    for (idx, p) in prov_components.into_iter().enumerate() {
         if old_to_new[idx].is_some() {
             new_prov.push(p);
         }
@@ -344,6 +340,7 @@ fn prune_scenario(
         },
         Provenance {
             components: new_prov,
+            root_exports,
         },
     )
 }
@@ -530,30 +527,35 @@ mod tests {
         let provenance = Provenance {
             components: vec![
                 ComponentProvenance {
+                    authored_path: Arc::from("/"),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: root_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
+                    authored_path: Arc::from("/router"),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: router_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
+                    authored_path: Arc::from("/green"),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: green_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
+                    authored_path: Arc::from("/router/wrapper"),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url,
                     digest: wrapper_digest,
                     observed_url: None,
                 },
             ],
+            root_exports: Vec::new(),
         };
 
         let (scenario, _prov) = DcePass.run(scenario, provenance, &store).unwrap();
@@ -724,30 +726,35 @@ mod tests {
         let provenance = Provenance {
             components: vec![
                 ComponentProvenance {
+                    authored_path: Arc::from("/"),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: root_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
+                    authored_path: Arc::from("/consumer"),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: consumer_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
+                    authored_path: Arc::from("/input"),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: input_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
+                    authored_path: Arc::from("/llm"),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url,
                     digest: llm_digest,
                     observed_url: None,
                 },
             ],
+            root_exports: Vec::new(),
         };
 
         let (scenario, _prov) = DcePass.run(scenario, provenance, &store).unwrap();
@@ -876,24 +883,28 @@ mod tests {
         let provenance = Provenance {
             components: vec![
                 ComponentProvenance {
+                    authored_path: Arc::from("/"),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: root_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
+                    authored_path: Arc::from("/app"),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: app_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
+                    authored_path: Arc::from("/admin"),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url,
                     digest: admin_digest,
                     observed_url: None,
                 },
             ],
+            root_exports: Vec::new(),
         };
 
         let (scenario, _prov) = DcePass.run(scenario, provenance, &store).unwrap();

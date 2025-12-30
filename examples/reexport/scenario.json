@@ -1,0 +1,7 @@
+{
+  "manifest_version": "0.1.0",
+  "components": {
+    "parent": "./parent.json"
+  },
+  "exports": { "cap": "#parent.cap" }
+}

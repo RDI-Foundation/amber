@@ -20,7 +20,7 @@ use thiserror::Error;
 use url::Url;
 
 use super::frontend::{ResolvedNode, ResolvedTree};
-use crate::{ComponentProvenance, DigestStore, Provenance};
+use crate::{ComponentProvenance, DigestStore, Provenance, RootExportProvenance};
 
 #[allow(unused_assignments)]
 #[derive(Debug, Error, Diagnostic)]
@@ -405,11 +405,17 @@ pub(crate) struct ResolvedExport {
 pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Provenance), Error> {
     let mut components = Vec::new();
     let mut provenance = Provenance::default();
-    let root = flatten(&tree.root, None, &mut components, &mut provenance);
+    let root = flatten(&tree.root, None, "/", &mut components, &mut provenance);
 
     debug_assert_eq!(components.len(), provenance.components.len());
 
-    let manifests = build_manifest_table(&components, store)?;
+    let manifests =
+        crate::manifest_table::build_manifest_table(&components, store).map_err(|e| {
+            Error::MissingManifest {
+                component_path: component_path_for(&components, e.component),
+                digest: e.digest,
+            }
+        })?;
 
     for (c, m) in components.iter_mut().zip(&manifests) {
         c.has_program = m.program().is_some();
@@ -458,6 +464,24 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         });
     }
 
+    let root_manifest = &manifests[root.0];
+    provenance.root_exports = root_manifest
+        .exports()
+        .keys()
+        .map(|export_name| {
+            let resolved = resolve_export(&components, &manifests, root, export_name)
+                .expect("export was validated during linking");
+            RootExportProvenance {
+                name: Arc::from(export_name.to_string()),
+                endpoint_component_path: Arc::clone(
+                    &provenance.for_component(resolved.component).authored_path,
+                ),
+                endpoint_provide: Arc::from(resolved.name),
+                kind: resolved.decl.kind,
+            }
+        })
+        .collect();
+
     Ok((
         Scenario {
             root,
@@ -468,31 +492,22 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
     ))
 }
 
-fn build_manifest_table(
-    components: &[Component],
-    store: &DigestStore,
-) -> Result<Vec<Arc<Manifest>>, Error> {
-    let mut out = Vec::with_capacity(components.len());
-    for id in (0..components.len()).map(ComponentId) {
-        let digest = components[id.0].digest;
-        let Some(manifest) = store.get(&digest) else {
-            return Err(Error::MissingManifest {
-                component_path: component_path_for(components, id),
-                digest,
-            });
-        };
-        out.push(manifest);
-    }
-    Ok(out)
-}
-
 fn flatten(
     node: &ResolvedNode,
     parent: Option<ComponentId>,
+    parent_path: &str,
     out: &mut Vec<Component>,
     prov: &mut Provenance,
 ) -> ComponentId {
     let id = ComponentId(out.len());
+
+    let authored_path: Arc<str> = if parent.is_none() {
+        Arc::from("/")
+    } else if parent_path == "/" {
+        Arc::from(format!("/{}", node.name))
+    } else {
+        Arc::from(format!("{parent_path}/{}", node.name))
+    };
 
     out.push(Component {
         id,
@@ -505,6 +520,7 @@ fn flatten(
     });
 
     prov.components.push(ComponentProvenance {
+        authored_path: Arc::clone(&authored_path),
         declared_ref: node.declared_ref.clone(),
         resolved_url: node.resolved_url.clone(),
         digest: node.digest,
@@ -513,7 +529,7 @@ fn flatten(
 
     let mut children = BTreeMap::new();
     for (child_name, child_node) in node.children.iter() {
-        let child_id = flatten(child_node, Some(id), out, prov);
+        let child_id = flatten(child_node, Some(id), authored_path.as_ref(), out, prov);
         children.insert(child_name.clone(), child_id);
     }
 

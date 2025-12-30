@@ -1,4 +1,4 @@
-use std::fmt::Write as _;
+use std::{collections::HashMap, fmt::Write as _};
 
 use amber_manifest::CapabilityKind;
 use amber_scenario::{ComponentId, Scenario, graph::component_path_for};
@@ -19,7 +19,7 @@ impl Backend for DotBackend {
 
 /// Render a Scenario graph as a Graphviz DOT diagram.
 pub fn render_dot(s: &Scenario) -> String {
-    render_dot_inner(s, &[])
+    render_dot_inner(s, &[], None)
 }
 
 #[derive(Clone, Debug)]
@@ -32,42 +32,56 @@ struct ExportEdge {
 fn render_dot_with_exports(output: &CompileOutput) -> String {
     let s = &output.scenario;
 
-    let manifests = s
-        .components
-        .iter()
-        .map(|c| {
-            output
-                .store
-                .get(&c.digest)
-                .expect("manifest was resolved during linking")
-        })
-        .collect::<Vec<_>>();
+    let manifests = crate::manifest_table::build_manifest_table(&s.components, &output.store)
+        .expect("manifest was resolved during linking");
 
     let root = s.root;
-    let root_manifest = &manifests[root.0];
 
-    let mut exports = Vec::with_capacity(root_manifest.exports().len());
-    for export_name in root_manifest.exports().keys() {
-        let resolved = crate::linker::resolve_export(&s.components, &manifests, root, export_name)
-            .expect("export was validated during linking");
+    let mut id_by_authored_path: HashMap<&str, ComponentId> =
+        HashMap::with_capacity(output.provenance.components.len());
+    let mut labels = Vec::with_capacity(s.components.len());
+    for (idx, _) in s.components.iter().enumerate() {
+        let id = ComponentId(idx);
+        let authored = output.provenance.for_component(id).authored_path.as_ref();
+        id_by_authored_path.insert(authored, id);
 
-        let (endpoint_component, endpoint_name) = (resolved.component, resolved.name.as_str());
+        let optimized = component_path_for(&s.components, id);
+        if optimized == authored {
+            labels.push(authored.to_string());
+        } else {
+            labels.push(format!("{authored}\n(opt: {optimized})"));
+        }
+    }
+
+    let mut exports = Vec::with_capacity(output.provenance.root_exports.len());
+    for export in &output.provenance.root_exports {
+        if let Some(&from) = id_by_authored_path.get(export.endpoint_component_path.as_ref()) {
+            exports.push(ExportEdge {
+                endpoint_label: endpoint_label_for_provide(
+                    &manifests[from.0],
+                    export.endpoint_provide.as_ref(),
+                    export.kind,
+                ),
+                from,
+                kind: export.kind,
+            });
+            continue;
+        }
 
         exports.push(ExportEdge {
-            endpoint_label: endpoint_label_for_provide(
-                &manifests[endpoint_component.0],
-                endpoint_name,
-                resolved.decl.kind,
+            endpoint_label: format!(
+                "<missing export target: {} -> {}.{}>",
+                export.name, export.endpoint_component_path, export.endpoint_provide
             ),
-            from: resolved.component,
-            kind: resolved.decl.kind,
+            from: root,
+            kind: export.kind,
         });
     }
 
-    render_dot_inner(s, &exports)
+    render_dot_inner(s, &exports, Some(&labels))
 }
 
-fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
+fn render_dot_inner(s: &Scenario, exports: &[ExportEdge], labels: Option<&[String]>) -> String {
     let root = s.root;
     let root_has_program = s.components[root.0].has_program;
     let root_needs_node = !root_has_program && exports.iter().any(|e| e.from == root);
@@ -78,13 +92,13 @@ fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
     let _ = writeln!(out, "  rankdir=LR;");
     let _ = writeln!(out, "  compound=true;");
 
-    render_root(s, root_needs_node, 1, &mut out);
+    render_root(s, root_needs_node, labels, 1, &mut out);
     for (id, c) in s.components.iter().enumerate() {
         let id = ComponentId(id);
         if id == root || c.parent.is_some() {
             continue;
         }
-        render_component(s, id, 1, &mut out);
+        render_component(s, id, labels, 1, &mut out);
     }
 
     for (i, export) in exports.iter().enumerate() {
@@ -162,7 +176,13 @@ fn endpoint_label_for_provide(
     format!("{}:{}{}", endpoint.protocol, endpoint.port, endpoint.path)
 }
 
-fn render_root(s: &Scenario, render_root_node: bool, indent: usize, out: &mut String) {
+fn render_root(
+    s: &Scenario,
+    render_root_node: bool,
+    labels: Option<&[String]>,
+    indent: usize,
+    out: &mut String,
+) {
     let root = s.root;
     let c = &s.components[root.0];
 
@@ -182,22 +202,28 @@ fn render_root(s: &Scenario, render_root_node: bool, indent: usize, out: &mut St
     if c.has_program {
         render_node_with_label(root, "program", indent + 1, out);
     } else if render_root_node {
-        render_node(s, root, indent + 1, out);
+        render_node(s, root, labels, indent + 1, out);
     }
 
     for child in c.children.values() {
-        render_component(s, *child, indent + 1, out);
+        render_component(s, *child, labels, indent + 1, out);
     }
 
     write_indent(out, indent);
     let _ = writeln!(out, "}}");
 }
 
-fn render_component(s: &Scenario, id: ComponentId, indent: usize, out: &mut String) {
+fn render_component(
+    s: &Scenario,
+    id: ComponentId,
+    labels: Option<&[String]>,
+    indent: usize,
+    out: &mut String,
+) {
     let c = &s.components[id.0];
 
     if c.children.is_empty() {
-        render_node(s, id, indent, out);
+        render_node(s, id, labels, indent, out);
         return;
     }
 
@@ -212,17 +238,28 @@ fn render_component(s: &Scenario, id: ComponentId, indent: usize, out: &mut Stri
     write_escaped_label(out, &c.name);
     let _ = writeln!(out, "\";");
 
-    render_node(s, id, indent + 1, out);
+    render_node(s, id, labels, indent + 1, out);
 
     for child in c.children.values() {
-        render_component(s, *child, indent + 1, out);
+        render_component(s, *child, labels, indent + 1, out);
     }
 
     write_indent(out, indent);
     let _ = writeln!(out, "}}");
 }
 
-fn render_node(s: &Scenario, id: ComponentId, indent: usize, out: &mut String) {
+fn render_node(
+    s: &Scenario,
+    id: ComponentId,
+    labels: Option<&[String]>,
+    indent: usize,
+    out: &mut String,
+) {
+    if let Some(labels) = labels {
+        render_node_with_label(id, labels[id.0].as_str(), indent, out);
+        return;
+    }
+
     let label = component_path_for(&s.components, id);
     render_node_with_label(id, &label, indent, out);
 }
@@ -256,8 +293,9 @@ fn write_escaped_label(out: &mut String, label: &str) {
 mod tests {
     use std::collections::BTreeMap;
 
-    use amber_manifest::{Manifest, ManifestDigest};
+    use amber_manifest::{CapabilityKind, Manifest, ManifestDigest, ManifestRef};
     use amber_scenario::{BindingEdge, Component, ComponentId, ProvideRef, Scenario, SlotRef};
+    use url::Url;
 
     use super::{render_dot, render_dot_with_exports};
     use crate::CompileOutput;
@@ -451,10 +489,41 @@ mod tests {
             }],
         };
 
+        let url = Url::parse("file:///scenario.json5").unwrap();
         let output = CompileOutput {
             scenario,
             store,
-            provenance: crate::Provenance::default(),
+            provenance: crate::Provenance {
+                components: vec![
+                    crate::ComponentProvenance {
+                        authored_path: std::sync::Arc::from("/"),
+                        declared_ref: ManifestRef::from_url(url.clone()),
+                        resolved_url: url.clone(),
+                        digest: root_digest,
+                        observed_url: None,
+                    },
+                    crate::ComponentProvenance {
+                        authored_path: std::sync::Arc::from("/a"),
+                        declared_ref: ManifestRef::from_url(url.clone()),
+                        resolved_url: url.clone(),
+                        digest: a_digest,
+                        observed_url: None,
+                    },
+                    crate::ComponentProvenance {
+                        authored_path: std::sync::Arc::from("/b"),
+                        declared_ref: ManifestRef::from_url(url.clone()),
+                        resolved_url: url,
+                        digest: b_digest,
+                        observed_url: None,
+                    },
+                ],
+                root_exports: vec![crate::RootExportProvenance {
+                    name: std::sync::Arc::from("public"),
+                    endpoint_component_path: std::sync::Arc::from("/b"),
+                    endpoint_provide: std::sync::Arc::from("out"),
+                    kind: CapabilityKind::Http,
+                }],
+            },
             diagnostics: Vec::new(),
         };
 
@@ -475,5 +544,83 @@ mod tests {
 "#;
 
         assert_eq!(dot, expected);
+    }
+
+    #[test]
+    fn dot_renders_missing_export_target_as_placeholder() {
+        let root_manifest = r#"
+            {
+              manifest_version: "0.1.0",
+              components: { a: "a.json5" },
+            }
+            "#
+        .parse::<Manifest>()
+        .unwrap();
+
+        let a_manifest = r#"
+            {
+              manifest_version: "0.1.0",
+              provides: { out: { kind: "http" } },
+              exports: { out: "out" },
+            }
+            "#
+        .parse::<Manifest>()
+        .unwrap();
+
+        let store = crate::DigestStore::new();
+        let root_digest = root_manifest.digest();
+        let a_digest = a_manifest.digest();
+        store.put(root_digest, std::sync::Arc::new(root_manifest));
+        store.put(a_digest, std::sync::Arc::new(a_manifest));
+
+        let mut components = vec![component(0, ""), component(1, "a")];
+        components[1].parent = Some(ComponentId(0));
+        components[0].digest = root_digest;
+        components[1].digest = a_digest;
+
+        components[0]
+            .children
+            .insert("a".to_string(), ComponentId(1));
+
+        let scenario = Scenario {
+            root: ComponentId(0),
+            components,
+            bindings: Vec::new(),
+        };
+
+        let url = Url::parse("file:///scenario.json5").unwrap();
+        let output = CompileOutput {
+            scenario,
+            store,
+            provenance: crate::Provenance {
+                components: vec![
+                    crate::ComponentProvenance {
+                        authored_path: std::sync::Arc::from("/"),
+                        declared_ref: ManifestRef::from_url(url.clone()),
+                        resolved_url: url.clone(),
+                        digest: root_digest,
+                        observed_url: None,
+                    },
+                    crate::ComponentProvenance {
+                        authored_path: std::sync::Arc::from("/a"),
+                        declared_ref: ManifestRef::from_url(url.clone()),
+                        resolved_url: url,
+                        digest: a_digest,
+                        observed_url: None,
+                    },
+                ],
+                root_exports: vec![crate::RootExportProvenance {
+                    name: std::sync::Arc::from("public"),
+                    endpoint_component_path: std::sync::Arc::from("/missing"),
+                    endpoint_provide: std::sync::Arc::from("out"),
+                    kind: CapabilityKind::Http,
+                }],
+            },
+            diagnostics: Vec::new(),
+        };
+
+        let dot = render_dot_with_exports(&output);
+        assert!(dot.contains("<missing export target: public -> /missing.out>"));
+        assert!(dot.contains("c0 -> e0 [label=\"http\"]"));
     }
 }
