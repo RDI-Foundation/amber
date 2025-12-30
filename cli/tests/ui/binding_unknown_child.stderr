@@ -2,11 +2,11 @@ Error: manifest::unknown_binding_child
 
   × check failed
   ╰─▶ binding references unknown child `#nope`
-    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/binding_unknown_child.json5:19:31]
- 18 │   bindings: [
- 19 │     { to: "#green.llm", from: "#nope.llm" },
+    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/binding_unknown_child.json5:24:31]
+ 23 │   bindings: [
+ 24 │     { to: "#green.llm", from: "#nope.llm" },
     ·                               ─────┬─────
     ·                                    ╰── unknown child referenced here
- 20 │     { to: "#green.env", from: "#tau2.env" },
+ 25 │     { to: "#green.env", from: "#tau2.env" },
     ╰────
 

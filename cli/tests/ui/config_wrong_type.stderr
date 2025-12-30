@@ -11,20 +11,20 @@ linker::invalid_config
 
 Advice: 
   > config schema for /green
-    ,-[<CARGO_MANIFEST_DIR>/tests/ui/tau2-evaluator.json5:20:18]
- 19 |       },
- 20 | ,->   config_schema: {
- 21 | |       type: "object",
- 22 | |       properties: {
- 23 | |         domain: { type: "string", enum: ["airline", "other"] },
- 24 | |         num_trials: { type: "integer", minimum: 1 },
- 25 | |         num_tasks: { type: "integer", minimum: 1, maximum: 4 },
- 26 | |       },
- 27 | |       required: ["domain", "num_trials", "num_tasks"],
- 28 | |       additionalProperties: false,
- 29 | |->   },
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/tau2-evaluator.json5:22:18]
+ 21 |       },
+ 22 | ,->   config_schema: {
+ 23 | |       type: "object",
+ 24 | |       properties: {
+ 25 | |         domain: { type: "string", enum: ["airline", "other"] },
+ 26 | |         num_trials: { type: "integer", minimum: 1 },
+ 27 | |         num_tasks: { type: "integer", minimum: 1, maximum: 4 },
+ 28 | |       },
+ 29 | |       required: ["domain", "num_trials", "num_tasks"],
+ 30 | |       additionalProperties: false,
+ 31 | |->   },
     : `---- config schema declared here
- 30 |       slots: {
+ 32 |       slots: {
     `----
 Error:   × check failed
 

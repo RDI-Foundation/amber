@@ -3,11 +3,11 @@ Error: manifest::deserialize_error
   × check failed
   ╰─▶ json5 deserialize error at bindings: invalid type: map, expected a
       sequence
-    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/bindings_wrong_type.json5:18:13]
- 17 │   },
- 18 │   bindings: { to: "#green.llm", from: "#green_router.llm" },
+    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/bindings_wrong_type.json5:23:13]
+ 22 │   },
+ 23 │   bindings: { to: "#green.llm", from: "#green_router.llm" },
     ·             ───────────────────────┬───────────────────────
     ·                                    ╰── invalid type: map, expected a sequence
- 19 │   exports: { green: "#green.agent" },
+ 24 │   exports: { green: "#green.agent" },
     ╰────
 

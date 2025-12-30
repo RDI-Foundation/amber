@@ -17,13 +17,21 @@ Error: manifest::deserialize_error
  12 │ │           num_tasks: 4,
  13 │ │         },
  14 │ │       },
- 15 │ │     },
- 16 │ │     bindings: [
- 17 │ │       { to: "#green.llm", from: "#green_router.llm" },
- 18 │ │       { to: "#green.env", from: "#tau2.env" },
- 19 │ │     ],
- 20 │ │     exports: { green: "#green.agent" },
- 21 │ ├─▶ }
+ 15 │ │       purple_router: {
+ 16 │ │         manifest: "./litellm.json5",
+ 17 │ │         config: { model: "gpt-4.1" },
+ 18 │ │       },
+ 19 │ │       purple: "./tau2-agent.json5",
+ 20 │ │     },
+ 21 │ │     bindings: [
+ 22 │ │       { to: "#green.llm", from: "#green_router.llm" },
+ 23 │ │       { to: "#green.env", from: "#tau2.env" },
+ 24 │ │       { to: "#green.agent", from: "#purple.a2a" },
+ 25 │ │       { to: "#green.admin_api", from: "#purple_router.admin_api" },
+ 26 │ │       { to: "#purple.llm", from: "#purple_router.llm" },
+ 27 │ │     ],
+ 28 │ │     exports: { green: "#green.agent" },
+ 29 │ ├─▶ }
     · ╰──── missing field `manifest_version`
     ╰────
   help: add `manifest_version: "0.1.0"` to the root object

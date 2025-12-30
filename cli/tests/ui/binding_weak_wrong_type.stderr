@@ -3,11 +3,11 @@ Error: manifest::deserialize_error
   × check failed
   ╰─▶ json5 deserialize error at bindings[0].weak: invalid type: string "yes",
       expected a boolean
-    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/binding_weak_wrong_type.json5:19:58]
- 18 │   bindings: [
- 19 │     { to: "#green.llm", from: "#green_router.llm", weak: "yes" },
+    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/binding_weak_wrong_type.json5:24:58]
+ 23 │   bindings: [
+ 24 │     { to: "#green.llm", from: "#green_router.llm", weak: "yes" },
     ·                                                          ──┬──
     ·                                                            ╰── invalid type: string "yes", expected a boolean
- 20 │     { to: "#green.env", from: "#tau2.env" },
+ 25 │     { to: "#green.env", from: "#tau2.env" },
     ╰────
 

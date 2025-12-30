@@ -14,10 +14,18 @@
         num_tasks: 4,
       },
     },
+    purple_router: {
+      manifest: "./litellm.json5",
+      config: { model: "gpt-4.1" },
+    },
+    purple: "./tau2-agent.json5",
   },
   bindings: [
     { to: "#green.llm", from: "#green_router.llm" },
     { to: "#green.env" },
+    { to: "#green.agent", from: "#purple.a2a" },
+    { to: "#green.admin_api", from: "#purple_router.admin_api" },
+    { to: "#purple.llm", from: "#purple_router.llm" },
   ],
   exports: { green: "#green.agent" },
 }

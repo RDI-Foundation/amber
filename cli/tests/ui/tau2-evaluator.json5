@@ -5,6 +5,8 @@
     args: [
       "--domain", "${config.domain}",
       "--llm", "${slots.llm.url}",
+      "--agent", "${slots.agent.url}",
+      "--purple-tools", "${slots.admin_api.url}",
     ],
     env: {
       TAU2_ENV: "${slots.env.url}",
@@ -30,9 +32,13 @@
   slots: {
     env: { kind: "mcp", profile: "openenv" },
     llm: { kind: "llm" },
+    agent: { kind: "a2a" },
+    admin_api: { kind: "mcp" },
   },
   provides: {
-    agent: { kind: "a2a", endpoint: "endpoint" },
+    results: { kind: "a2a", endpoint: "endpoint" },
   },
-  exports: { agent: "agent" },
+  exports: {
+    agent: "results",
+  },
 }

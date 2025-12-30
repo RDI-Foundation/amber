@@ -3,11 +3,11 @@ Error: manifest::deserialize_error
   × check failed
   ╰─▶ json5 deserialize error at bindings[1]: binding is missing required
       field `from`
-    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/binding_missing_from.json5:20:5]
- 19 │     { to: "#green.llm", from: "#green_router.llm" },
- 20 │     { to: "#green.env" },
+    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/binding_missing_from.json5:25:5]
+ 24 │     { to: "#green.llm", from: "#green_router.llm" },
+ 25 │     { to: "#green.env" },
     ·     ──────────┬─────────
     ·               ╰── binding is missing required field `from`
- 21 │   ],
+ 26 │     { to: "#green.agent", from: "#purple.a2a" },
     ╰────
 

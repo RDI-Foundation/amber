@@ -1,12 +1,12 @@
 linker::invalid_export
 
   x invalid export `green` on root component: target references non-exported `nope` on component /green
-    ,-[<CARGO_MANIFEST_DIR>/tests/ui/export_unknown_target.json5:22:21]
- 21 |   ],
- 22 |   exports: { green: "#green.nope" },
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/export_unknown_target.json5:30:21]
+ 29 |   ],
+ 30 |   exports: { green: "#green.nope" },
     :                     ^^^^^^|^^^^^^
     :                           `-- export declared here
- 23 | }
+ 31 | }
     `----
   help: Valid exports on component /green: agent
 Error:   × check failed
