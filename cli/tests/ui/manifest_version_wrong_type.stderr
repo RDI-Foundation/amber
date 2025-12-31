@@ -1,13 +1,12 @@
 Error: manifest::deserialize_error
 
   × check failed
-  ╰─▶ json5 deserialize error at manifest_version: invalid type: integer `1`,
-      expected semver version
+  ╰─▶ json5 deserialize error at manifest_version: expected string, found
+      number
    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/manifest_version_wrong_type.json5:2:21]
  1 │ {
  2 │   manifest_version: 1,
    ·                     ┬
-   ·                     ╰── invalid type: integer `1`, expected semver version
+   ·                     ╰── expected string, found number
  3 │   components: {
    ╰────
-

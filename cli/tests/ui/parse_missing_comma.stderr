@@ -1,12 +1,11 @@
 Error: manifest::json5_error
 
   × check failed
-  ╰─▶ json5 parse error: missing `,` after `manifest_version`
-   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/parse_missing_comma.json5:2:21]
- 1 │ {
+  ╰─▶ json5 parse error: missing `,`
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/parse_missing_comma.json5:3:3]
  2 │   manifest_version: "0.1.0"
-   ·                     ───┬───
-   ·                        ╰── missing `,` after `manifest_version`
  3 │   components: {
+   ·   ┬
+   ·   ╰── missing `,`
+ 4 │     tau2: "./tau2.json5",
    ╰────
-

@@ -109,7 +109,7 @@ fn normalize_output(bytes: &[u8]) -> String {
 fn normalize_text(text: &str) -> String {
     let text = text.replace("\r\n", "\n");
     let text = strip_ansi(&text);
-    normalize_paths(&text)
+    normalize_paths(&text).trim_end_matches('\n').to_string()
 }
 
 fn strip_ansi(input: &str) -> String {

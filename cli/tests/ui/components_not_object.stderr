@@ -1,13 +1,11 @@
 Error: manifest::deserialize_error
 
   × check failed
-  ╰─▶ json5 deserialize error at components: invalid type: sequence, expected
-      a map
+  ╰─▶ json5 deserialize error at components: expected object, found array
    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/components_not_object.json5:3:15]
  2 │   manifest_version: "0.1.0",
  3 │   components: [],
    ·               ─┬
-   ·                ╰── invalid type: sequence, expected a map
+   ·                ╰── expected object, found array
  4 │   bindings: [
    ╰────
-

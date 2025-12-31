@@ -1,12 +1,11 @@
 Error: manifest::json5_error
 
   × check failed
-  ╰─▶ json5 parse error: missing `:` after `manifest_version`
-   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/parse_missing_colon.json5:2:3]
+  ╰─▶ json5 parse error: missing `:`
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/parse_missing_colon.json5:2:20]
  1 │ {
  2 │   manifest_version "0.1.0",
-   ·   ────────┬───────
-   ·           ╰── missing `:` after `manifest_version`
+   ·                    ┬
+   ·                    ╰── missing `:`
  3 │   components: {
    ╰────
-

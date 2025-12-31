@@ -36,7 +36,7 @@ impl ManifestDocError {
             ManifestError::Json5(parse) => json5_hint(&source, parse),
             _ => None,
         };
-        let message = message_for_manifest_error(&kind, hint.as_ref());
+        let message = message_for_manifest_error(&kind, hint.as_ref(), &source);
         let labels = labels_for_manifest_error(&kind, &source, spans, hint.as_ref());
         let help = help_for_manifest_error(&kind);
         Self {
@@ -86,12 +86,16 @@ impl ParsedManifest {
     pub fn parse_named(name: impl AsRef<str>, source: Arc<str>) -> Result<Self, ManifestDocError> {
         let spans = Arc::new(ManifestSpans::parse(&source));
 
-        let mut deserializer = json5::Deserializer::from_str(&source).map_err(|e| {
-            ManifestDocError::new(name.as_ref(), Arc::clone(&source), &spans, e.into())
-        })?;
+        let mut deserializer = json5::Deserializer::from_str(&source);
         let raw: RawManifest =
             serde_path_to_error::deserialize(&mut deserializer).map_err(|e| {
-                ManifestDocError::new(name.as_ref(), Arc::clone(&source), &spans, e.into())
+                let kind = match e.inner().code() {
+                    Some(code) if crate::json5_error_is_parse(code) => {
+                        ManifestError::Json5(e.into_inner())
+                    }
+                    _ => ManifestError::Json5Path(e),
+                };
+                ManifestDocError::new(name.as_ref(), Arc::clone(&source), &spans, kind)
             })?;
 
         let manifest = raw
@@ -126,7 +130,7 @@ fn labels_for_manifest_error(
             vec![LabeledSpan::new_primary_with_span(Some(label), span)]
         }
         ManifestError::Json5Path(de) => {
-            let label = summarize_json5_error(de.inner());
+            let label = summarize_json5_path_error(source, de.inner());
             let span = span_for_json5_path_error(de.path(), source, spans, &label)
                 .unwrap_or_else(|| span_for_json5_error(source, de.inner()));
             vec![primary(span, Some(label))]
@@ -386,11 +390,10 @@ fn binding_target_key_for_span(span: &crate::BindingSpans) -> Option<crate::Bind
 }
 
 fn span_for_json5_error(source: &str, err: &json5::Error) -> SourceSpan {
-    let json5::Error::Message { location, .. } = err;
-    let Some(location) = location else {
-        return (0usize, 0usize).into();
+    let Some(position) = err.position() else {
+        return (source.len(), 0).into();
     };
-    span_for_line_col(source, location.line, location.column)
+    span_for_line_col(source, position.line + 1, position.column + 1)
 }
 
 fn span_for_json5_path_error(
@@ -563,7 +566,11 @@ fn backticked_values(message: &str) -> impl Iterator<Item = &str> {
     message.split('`').skip(1).step_by(2)
 }
 
-fn message_for_manifest_error(err: &ManifestError, hint: Option<&Json5Hint>) -> String {
+fn message_for_manifest_error(
+    err: &ManifestError,
+    hint: Option<&Json5Hint>,
+    source: &str,
+) -> String {
     match err {
         ManifestError::Json5(parse) => format!(
             "json5 parse error: {}",
@@ -572,7 +579,7 @@ fn message_for_manifest_error(err: &ManifestError, hint: Option<&Json5Hint>) -> 
         ManifestError::Json5Path(de) => format!(
             "json5 deserialize error at {}: {}",
             de.path(),
-            summarize_json5_error(de.inner())
+            summarize_json5_path_error(source, de.inner())
         ),
         other => other.to_string(),
     }
@@ -610,21 +617,6 @@ enum TokenKind {
 }
 
 impl TokenKind {
-    fn is_key(&self) -> bool {
-        matches!(self, TokenKind::String(_) | TokenKind::Identifier(_))
-    }
-
-    fn is_value(&self) -> bool {
-        matches!(
-            self,
-            TokenKind::String(_)
-                | TokenKind::Number
-                | TokenKind::Literal
-                | TokenKind::LBrace
-                | TokenKind::LBracket
-        )
-    }
-
     fn key_name(&self) -> Option<&str> {
         match self {
             TokenKind::String(value) | TokenKind::Identifier(value) => Some(value.as_str()),
@@ -633,34 +625,37 @@ impl TokenKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExpectedContainer {
-    Object,
-    Array,
-}
-
-fn expected_container(key: &str) -> Option<ExpectedContainer> {
-    match key {
-        "bindings" => Some(ExpectedContainer::Array),
-        "components" | "environments" | "slots" | "provides" | "exports" => {
-            Some(ExpectedContainer::Object)
-        }
-        _ => None,
-    }
-}
-
 fn json5_hint(source: &str, err: &json5::Error) -> Option<Json5Hint> {
-    let _ = err;
-    let tokens = match tokenize_json5(source) {
-        Ok(tokens) => tokens,
-        Err(TokenizeError::UnterminatedString { start }) => {
-            return Some(Json5Hint {
-                message: "unterminated string (missing closing quote)".to_string(),
-                span: (start, 1).into(),
-            });
-        }
-    };
-    parse_tokens_for_hint(&tokens)
+    let code = err.code()?;
+
+    if matches!(
+        code,
+        json5::ErrorCode::EofParsingString | json5::ErrorCode::LineTerminatorInString
+    ) && let Err(TokenizeError::UnterminatedString { start }) = tokenize_json5(source)
+    {
+        return Some(Json5Hint {
+            message: "unterminated string (missing closing quote)".to_string(),
+            span: (start, 1).into(),
+        });
+    }
+
+    if matches!(
+        code,
+        json5::ErrorCode::EofParsingArray
+            | json5::ErrorCode::EofParsingObject
+            | json5::ErrorCode::EofParsingValue
+            | json5::ErrorCode::ExpectedClosingBrace
+            | json5::ErrorCode::ExpectedClosingBracket
+    ) && let Ok(tokens) = tokenize_json5(source)
+        && let Some(hint) = unclosed_container_hint(&tokens)
+    {
+        return Some(hint);
+    }
+
+    Some(Json5Hint {
+        message: summarize_json5_error(err),
+        span: span_for_json5_error(source, err),
+    })
 }
 
 fn tokenize_json5(source: &str) -> Result<Vec<Token>, TokenizeError> {
@@ -801,397 +796,169 @@ fn tokenize_json5(source: &str) -> Result<Vec<Token>, TokenizeError> {
     Ok(tokens)
 }
 
-#[derive(Clone, Copy, Debug)]
-enum RootState {
-    ExpectValue,
-    Done,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum ObjectState {
-    KeyOrEnd,
-    Colon,
-    Value,
-    CommaOrEnd,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum ArrayState {
-    ValueOrEnd,
-    CommaOrEnd,
-}
-
-#[derive(Debug)]
-enum Context {
-    Root {
-        state: RootState,
-    },
-    Object {
-        state: ObjectState,
-        open_span: SourceSpan,
-        value_key: Option<String>,
-        pending_key: Option<(String, SourceSpan)>,
-        last_key: Option<String>,
-        last_value_span: Option<SourceSpan>,
-    },
-    Array {
-        state: ArrayState,
-        open_span: SourceSpan,
-        value_key: Option<String>,
-        last_value_span: Option<SourceSpan>,
-    },
-}
-
-fn parse_tokens_for_hint(tokens: &[Token]) -> Option<Json5Hint> {
-    let mut stack = vec![Context::Root {
-        state: RootState::ExpectValue,
-    }];
-
-    let mut idx = 0usize;
-    while idx < tokens.len() {
-        let token = &tokens[idx];
-        let next = tokens.get(idx + 1);
-        let mut ctx = stack.pop()?;
-        let mut push_child = None;
-        let mut keep_ctx = true;
-        let mut just_closed = None;
-
-        match &mut ctx {
-            Context::Root { state } => match state {
-                RootState::ExpectValue => {
-                    if token.kind.is_value() {
-                        *state = RootState::Done;
-                        match token.kind {
-                            TokenKind::LBrace => {
-                                push_child = Some(Context::Object {
-                                    state: ObjectState::KeyOrEnd,
-                                    open_span: token.span,
-                                    value_key: None,
-                                    pending_key: None,
-                                    last_key: None,
-                                    last_value_span: None,
-                                });
-                            }
-                            TokenKind::LBracket => {
-                                push_child = Some(Context::Array {
-                                    state: ArrayState::ValueOrEnd,
-                                    open_span: token.span,
-                                    value_key: None,
-                                    last_value_span: None,
-                                });
-                            }
-                            _ => {}
-                        }
-                    }
+fn unclosed_container_hint(tokens: &[Token]) -> Option<Json5Hint> {
+    let mut stack: Vec<&Token> = Vec::new();
+    for token in tokens {
+        match &token.kind {
+            TokenKind::LBrace | TokenKind::LBracket => stack.push(token),
+            TokenKind::RBrace => {
+                if stack
+                    .last()
+                    .is_some_and(|open| matches!(&open.kind, TokenKind::LBrace))
+                {
+                    stack.pop();
                 }
-                RootState::Done => {}
-            },
-            Context::Object {
-                state,
-                open_span,
-                value_key,
-                pending_key,
-                last_key,
-                last_value_span,
-            } => match state {
-                ObjectState::KeyOrEnd => match token.kind {
-                    TokenKind::RBrace => {
-                        keep_ctx = false;
-                        just_closed = Some(span_from_open(*open_span, token.span));
-                    }
-                    _ if token.kind.is_key() => {
-                        let name = token.kind.key_name()?.to_string();
-                        *pending_key = Some((name, token.span));
-                        *state = ObjectState::Colon;
-                    }
-                    _ => {
-                        return Some(Json5Hint {
-                            message: "expected an object key (identifier or string)".to_string(),
-                            span: token.span,
-                        });
-                    }
-                },
-                ObjectState::Colon => match token.kind {
-                    TokenKind::Colon => {
-                        *state = ObjectState::Value;
-                    }
-                    _ => {
-                        let (name, span) = pending_key
-                            .clone()
-                            .unwrap_or_else(|| ("object key".to_string(), token.span));
-                        return Some(Json5Hint {
-                            message: format!("missing `:` after `{name}`"),
-                            span,
-                        });
-                    }
-                },
-                ObjectState::Value => {
-                    let pending = pending_key.take();
-                    if let Some((name, _)) = pending.as_ref()
-                        && let Some(expected) = expected_container(name)
-                    {
-                        match (expected, &token.kind) {
-                            (ExpectedContainer::Array, TokenKind::LBrace) => {
-                                return Some(Json5Hint {
-                                    message: format!(
-                                        "`{name}` must be an array (use `[...]`, not `{{...}}`)"
-                                    ),
-                                    span: token.span,
-                                });
-                            }
-                            (ExpectedContainer::Object, TokenKind::LBracket) => {
-                                return Some(Json5Hint {
-                                    message: format!(
-                                        "`{name}` must be an object (use `{{...}}`, not `[...]`)"
-                                    ),
-                                    span: token.span,
-                                });
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    if !token.kind.is_value() {
-                        let name = pending
-                            .map(|(name, _)| name)
-                            .unwrap_or_else(|| "object key".to_string());
-                        return Some(Json5Hint {
-                            message: format!("expected a value for `{name}`"),
-                            span: token.span,
-                        });
-                    }
-
-                    if let Some((name, _)) = pending {
-                        *last_key = Some(name.clone());
-                        *value_key = Some(name.clone());
-                        *last_value_span = Some(token.span);
-                        match token.kind {
-                            TokenKind::LBrace => {
-                                push_child = Some(Context::Object {
-                                    state: ObjectState::KeyOrEnd,
-                                    open_span: token.span,
-                                    value_key: Some(name),
-                                    pending_key: None,
-                                    last_key: None,
-                                    last_value_span: None,
-                                });
-                            }
-                            TokenKind::LBracket => {
-                                push_child = Some(Context::Array {
-                                    state: ArrayState::ValueOrEnd,
-                                    open_span: token.span,
-                                    value_key: Some(name),
-                                    last_value_span: None,
-                                });
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        *value_key = None;
-                        *last_value_span = Some(token.span);
-                        match token.kind {
-                            TokenKind::LBrace => {
-                                push_child = Some(Context::Object {
-                                    state: ObjectState::KeyOrEnd,
-                                    open_span: token.span,
-                                    value_key: None,
-                                    pending_key: None,
-                                    last_key: None,
-                                    last_value_span: None,
-                                });
-                            }
-                            TokenKind::LBracket => {
-                                push_child = Some(Context::Array {
-                                    state: ArrayState::ValueOrEnd,
-                                    open_span: token.span,
-                                    value_key: None,
-                                    last_value_span: None,
-                                });
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    *state = ObjectState::CommaOrEnd;
-                }
-                ObjectState::CommaOrEnd => match token.kind {
-                    TokenKind::Comma => {
-                        *state = ObjectState::KeyOrEnd;
-                    }
-                    TokenKind::RBrace => {
-                        keep_ctx = false;
-                        just_closed = Some(span_from_open(*open_span, token.span));
-                    }
-                    _ => {
-                        let message = last_key
-                            .as_deref()
-                            .map(|key| format!("missing `,` after `{key}`"))
-                            .unwrap_or_else(|| "missing `,` between object fields".to_string());
-                        let span = last_value_span.unwrap_or(token.span);
-                        return Some(Json5Hint { message, span });
-                    }
-                },
-            },
-            Context::Array {
-                state,
-                open_span,
-                value_key,
-                last_value_span,
-            } => match state {
-                ArrayState::ValueOrEnd => match token.kind {
-                    TokenKind::RBracket => {
-                        keep_ctx = false;
-                        just_closed = Some(span_from_open(*open_span, token.span));
-                    }
-                    _ if token.kind.is_value() => {
-                        *last_value_span = Some(token.span);
-                        match token.kind {
-                            TokenKind::LBrace => {
-                                push_child = Some(Context::Object {
-                                    state: ObjectState::KeyOrEnd,
-                                    open_span: token.span,
-                                    value_key: None,
-                                    pending_key: None,
-                                    last_key: None,
-                                    last_value_span: None,
-                                });
-                            }
-                            TokenKind::LBracket => {
-                                push_child = Some(Context::Array {
-                                    state: ArrayState::ValueOrEnd,
-                                    open_span: token.span,
-                                    value_key: None,
-                                    last_value_span: None,
-                                });
-                            }
-                            _ => {}
-                        }
-                        *state = ArrayState::CommaOrEnd;
-                    }
-                    _ if token.kind.is_key()
-                        && next.is_some_and(|next| matches!(next.kind, TokenKind::Colon)) =>
-                    {
-                        if let Some(name) = value_key.as_deref()
-                            && expected_container(name) == Some(ExpectedContainer::Object)
-                        {
-                            return Some(Json5Hint {
-                                message: format!(
-                                    "`{name}` must be an object (use `{{...}}`, not `[...]`)"
-                                ),
-                                span: *open_span,
-                            });
-                        }
-                        return Some(Json5Hint {
-                            message: "object key used inside an array; arrays contain values"
-                                .to_string(),
-                            span: token.span,
-                        });
-                    }
-                    _ => {
-                        return Some(Json5Hint {
-                            message: "expected a value in array".to_string(),
-                            span: token.span,
-                        });
-                    }
-                },
-                ArrayState::CommaOrEnd => match token.kind {
-                    TokenKind::Comma => {
-                        *state = ArrayState::ValueOrEnd;
-                    }
-                    TokenKind::RBracket => {
-                        keep_ctx = false;
-                        just_closed = Some(span_from_open(*open_span, token.span));
-                    }
-                    _ => {
-                        let span = last_value_span.unwrap_or(token.span);
-                        return Some(Json5Hint {
-                            message: "missing `,` between array items".to_string(),
-                            span,
-                        });
-                    }
-                },
-            },
-        }
-
-        if keep_ctx {
-            stack.push(ctx);
-        }
-        if let Some(child) = push_child {
-            stack.push(child);
-        }
-        if let Some(span) = just_closed
-            && let Some(parent) = stack.last_mut()
-        {
-            match parent {
-                Context::Object {
-                    last_value_span, ..
-                }
-                | Context::Array {
-                    last_value_span, ..
-                } => {
-                    *last_value_span = Some(span);
-                }
-                Context::Root { .. } => {}
             }
-        }
-
-        idx += 1;
-    }
-
-    for ctx in stack.iter().rev() {
-        match ctx {
-            Context::Object { open_span, .. } => {
-                return Some(Json5Hint {
-                    message: "missing closing `}` for object opened here".to_string(),
-                    span: *open_span,
-                });
+            TokenKind::RBracket => {
+                if stack
+                    .last()
+                    .is_some_and(|open| matches!(&open.kind, TokenKind::LBracket))
+                {
+                    stack.pop();
+                }
             }
-            Context::Array { open_span, .. } => {
-                return Some(Json5Hint {
-                    message: "missing closing `]` for array opened here".to_string(),
-                    span: *open_span,
-                });
-            }
-            Context::Root { .. } => {}
+            _ => {}
         }
     }
 
-    None
-}
-
-fn span_from_open(open_span: SourceSpan, close_span: SourceSpan) -> SourceSpan {
-    let start = open_span.offset();
-    let end = close_span.offset().saturating_add(close_span.len());
-    (start, end.saturating_sub(start)).into()
+    let open = stack.last()?;
+    let message = match &open.kind {
+        TokenKind::LBrace => "missing closing `}` for object opened here",
+        TokenKind::LBracket => "missing closing `]` for array opened here",
+        _ => return None,
+    };
+    Some(Json5Hint {
+        message: message.to_string(),
+        span: open.span,
+    })
 }
 
 fn summarize_json5_error(err: &json5::Error) -> String {
-    let json5::Error::Message { msg, .. } = err;
-    summarize_json5_message(msg)
-}
-
-fn summarize_json5_message(msg: &str) -> String {
-    let summary = if let Some((_, tail)) = msg.rsplit_once("\n = ") {
-        tail.trim()
-    } else if let Some((_, tail)) = msg.rsplit_once("\n= ") {
-        tail.trim()
-    } else {
-        msg.lines().last().unwrap_or(msg).trim()
+    let Some(code) = err.code() else {
+        let mut message = err.to_string();
+        if let Some(idx) = message.find(" at line ") {
+            message.truncate(idx);
+        }
+        return message;
     };
 
-    let summary = summary.trim_start().strip_prefix('=').unwrap_or(summary);
-    let summary = summary.trim_start();
+    json5_error_code_summary(code).to_string()
+}
 
-    if summary.is_empty() {
-        return msg.trim().to_string();
+fn summarize_json5_path_error(source: &str, err: &json5::Error) -> String {
+    let Some(code) = err.code() else {
+        return summarize_json5_error(err);
+    };
+
+    let Some(expected) = json5_expected_value_label(code) else {
+        return summarize_json5_error(err);
+    };
+
+    let found = json5_found_value_type(source, err);
+    match found {
+        Some(found) => format!("expected {expected}, found {found}"),
+        None => format!("expected {expected}"),
     }
+}
 
-    match summary {
-        "expected char_literal" => "unterminated string (missing closing quote)".to_string(),
-        "expected identifier or string" => {
-            "expected an object key (identifier or string)".to_string()
+fn json5_expected_value_label(code: json5::ErrorCode) -> Option<&'static str> {
+    use json5::ErrorCode::*;
+
+    match code {
+        ExpectedOpeningBrace => Some("object"),
+        ExpectedOpeningBracket => Some("array"),
+        ExpectedBool => Some("boolean"),
+        ExpectedString => Some("string"),
+        ExpectedNumber => Some("number"),
+        ExpectedNull => Some("null"),
+        _ => None,
+    }
+}
+
+fn json5_found_value_type(source: &str, err: &json5::Error) -> Option<&'static str> {
+    let position = err.position()?;
+    let span = span_for_line_col(source, position.line + 1, position.column + 1);
+    let offset = span.offset();
+    let tokens = tokenize_json5(source).ok()?;
+    let token = token_at_offset(&tokens, offset)?;
+    json5_token_value_kind(source, token)
+}
+
+fn token_at_offset(tokens: &[Token], offset: usize) -> Option<&Token> {
+    let mut next = None;
+    for token in tokens {
+        let start = token.span.offset();
+        let end = span_end(token.span);
+        if offset >= start && offset < end {
+            return Some(token);
         }
-        other => other.to_string(),
+        if start >= offset && next.is_none() {
+            next = Some(token);
+        }
+    }
+    next
+}
+
+fn json5_token_value_kind(source: &str, token: &Token) -> Option<&'static str> {
+    match &token.kind {
+        TokenKind::LBrace => Some("object"),
+        TokenKind::LBracket => Some("array"),
+        TokenKind::String(_) => Some("string"),
+        TokenKind::Number => Some("number"),
+        TokenKind::Literal => json5_literal_kind(source, token.span),
+        TokenKind::Identifier(_) => Some("identifier"),
+        _ => None,
+    }
+}
+
+fn json5_literal_kind(source: &str, span: SourceSpan) -> Option<&'static str> {
+    let raw = source.get(span.offset()..span_end(span))?;
+    let raw = raw.trim();
+    Some(match raw {
+        "true" | "false" => "boolean",
+        "null" => "null",
+        "Infinity" | "NaN" => "number",
+        _ => "literal",
+    })
+}
+
+fn json5_error_code_summary(code: json5::ErrorCode) -> &'static str {
+    use json5::ErrorCode::*;
+
+    match code {
+        EofParsingArray => "unexpected EOF while parsing array",
+        EofParsingBool => "unexpected EOF while parsing bool",
+        EofParsingComment => "unexpected EOF while parsing comment",
+        EofParsingEscapeSequence => "unexpected EOF while parsing escape sequence",
+        EofParsingIdentifier => "unexpected EOF while parsing identifier",
+        EofParsingNull => "unexpected EOF while parsing null",
+        EofParsingNumber => "unexpected EOF while parsing number",
+        EofParsingObject => "unexpected EOF while parsing object",
+        EofParsingString => "unterminated string (missing closing quote)",
+        EofParsingValue => "unexpected EOF while parsing value",
+
+        ExpectedBool => "expected `true` or `false`",
+        ExpectedClosingBrace => "missing closing `}`",
+        ExpectedClosingBracket => "missing closing `]`",
+        ExpectedColon => "missing `:`",
+        ExpectedComma => "missing `,`",
+        ExpectedComment => "expected comment",
+        ExpectedIdentifier => "expected identifier",
+        ExpectedNull => "expected `null`",
+        ExpectedNumber => "expected number",
+        ExpectedOpeningBrace => "expected `{`",
+        ExpectedOpeningBracket => "expected `[`",
+        ExpectedString => "expected string",
+        ExpectedStringOrObject => "expected string or object",
+        ExpectedValue => "expected value",
+
+        InvalidBytes => "invalid bytes",
+        InvalidEscapeSequence => "invalid escape sequence",
+        InvalidKey => "invalid object key",
+        LeadingZero => "leading zero is not allowed",
+        LineTerminatorInString => "unterminated string (missing closing quote)",
+        OverflowParsingNumber => "number is too large",
+        TrailingCharacters => "trailing characters after JSON5 value",
     }
 }
 

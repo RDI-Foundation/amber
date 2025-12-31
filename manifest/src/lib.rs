@@ -136,6 +136,38 @@ pub enum Error {
     UnknownComponentEnvironment { child: String, environment: String },
 }
 
+pub(crate) fn json5_error_is_parse(code: json5::ErrorCode) -> bool {
+    use json5::ErrorCode::*;
+
+    matches!(
+        code,
+        EofParsingArray
+            | EofParsingBool
+            | EofParsingComment
+            | EofParsingEscapeSequence
+            | EofParsingIdentifier
+            | EofParsingNull
+            | EofParsingNumber
+            | EofParsingObject
+            | EofParsingString
+            | EofParsingValue
+            | ExpectedClosingBrace
+            | ExpectedClosingBracket
+            | ExpectedColon
+            | ExpectedComma
+            | ExpectedComment
+            | ExpectedIdentifier
+            | ExpectedValue
+            | InvalidBytes
+            | InvalidEscapeSequence
+            | InvalidKey
+            | LeadingZero
+            | LineTerminatorInString
+            | OverflowParsingNumber
+            | TrailingCharacters
+    )
+}
+
 macro_rules! name_type {
     ($name:ident, $kind:expr) => {
         #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1716,8 +1748,14 @@ impl FromStr for Manifest {
     type Err = Error;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        let mut deserializer = json5::Deserializer::from_str(input)?;
-        let raw: RawManifest = serde_path_to_error::deserialize(&mut deserializer)?;
+        let mut deserializer = json5::Deserializer::from_str(input);
+        let raw: RawManifest =
+            serde_path_to_error::deserialize(&mut deserializer).map_err(|e| {
+                match e.inner().code() {
+                    Some(code) if json5_error_is_parse(code) => Error::Json5(e.into_inner()),
+                    _ => Error::Json5Path(e),
+                }
+            })?;
         raw.validate()
     }
 }

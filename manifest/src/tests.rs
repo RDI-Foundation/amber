@@ -1315,6 +1315,6 @@ fn lint_for(input: &str, manifest: &Manifest) -> Vec<lint::ManifestLint> {
 }
 
 fn parse_raw(input: &str) -> RawManifest {
-    let mut deserializer = json5::Deserializer::from_str(input).unwrap();
+    let mut deserializer = json5::Deserializer::from_str(input);
     serde_path_to_error::deserialize(&mut deserializer).unwrap()
 }
