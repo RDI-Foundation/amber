@@ -433,6 +433,31 @@ pub struct InterpolatedString {
     pub parts: Vec<InterpolatedPart>,
 }
 
+impl InterpolatedString {
+    /// Visit slot names referenced by `${slots...}` interpolations.
+    ///
+    /// The visited slot name is the first query segment (e.g. `${slots.llm.url}` visits `llm`).
+    /// Returns `true` if the interpolation references all slots (e.g. `${slots}`).
+    pub fn visit_slot_uses(&self, mut visit: impl FnMut(&str)) -> bool {
+        for part in &self.parts {
+            let InterpolatedPart::Interpolation { source, query } = part else {
+                continue;
+            };
+            if *source != InterpolationSource::Slots {
+                continue;
+            }
+            let slot = query
+                .split_once('.')
+                .map_or(query.as_str(), |(first, _)| first);
+            if slot.is_empty() {
+                return true;
+            }
+            visit(slot);
+        }
+        false
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum InterpolatedPart {
@@ -1065,6 +1090,33 @@ fn parse_binding_component_ref(input: &str) -> Result<LocalComponentRef, Error> 
         input: err.input,
         message: err.message,
     })
+}
+
+fn binding_target_key_for_component_ref(
+    component: &LocalComponentRef,
+    slot: &str,
+) -> BindingTargetKey {
+    match component {
+        LocalComponentRef::Self_ => BindingTargetKey::SelfSlot(slot.into()),
+        LocalComponentRef::Child(child) => BindingTargetKey::ChildSlot {
+            child: child.as_str().into(),
+            slot: slot.into(),
+        },
+    }
+}
+
+pub(crate) fn binding_target_key_for_binding(
+    to: &str,
+    slot: Option<&str>,
+) -> Option<BindingTargetKey> {
+    if let Some(slot) = slot
+        && let Ok(component) = parse_component_ref(to)
+    {
+        return Some(binding_target_key_for_component_ref(&component, slot));
+    }
+
+    let (component, slot) = split_binding_side(to).ok()?;
+    Some(binding_target_key_for_component_ref(&component, &slot))
 }
 
 fn ensure_name_no_dot(name: &str, kind: &'static str) -> Result<(), Error> {

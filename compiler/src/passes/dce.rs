@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use amber_manifest::{InterpolatedPart, InterpolationSource, Manifest};
+use amber_manifest::Manifest;
 use amber_scenario::{ComponentId, Scenario};
 
 use super::{PassError, ScenarioPass};
@@ -138,70 +138,24 @@ fn mark_used_slots(
         return;
     };
 
-    let mut used_all = false;
-    let mut used = Vec::new();
-
-    for arg in &program.args.0 {
-        for part in &arg.parts {
-            let InterpolatedPart::Interpolation { source, query } = part else {
-                continue;
-            };
-            if *source != InterpolationSource::Slots {
-                continue;
-            }
-            if query.is_empty() {
-                used_all = true;
-                break;
-            }
-            let slot = query.split('.').next().unwrap_or_default();
-            if slot.is_empty() {
-                used_all = true;
-                break;
-            }
-            used.push(slot);
-        }
-        if used_all {
-            break;
-        }
-    }
-
-    if !used_all {
-        for v in program.env.values() {
-            for part in &v.parts {
-                let InterpolatedPart::Interpolation { source, query } = part else {
-                    continue;
-                };
-                if *source != InterpolationSource::Slots {
-                    continue;
-                }
-                if query.is_empty() {
-                    used_all = true;
-                    break;
-                }
-                let slot = query.split('.').next().unwrap_or_default();
-                if slot.is_empty() {
-                    used_all = true;
-                    break;
-                }
-                used.push(slot);
-            }
-            if used_all {
-                break;
-            }
-        }
-    }
-
-    if used_all {
+    let mark_all = |live_slots: &mut HashSet<CapKey>, work: &mut VecDeque<WorkItem>| {
         for slot in manifest.slots().keys() {
             mark_slot(component, slot.as_str(), live_slots, work);
         }
-        return;
+    };
+
+    for arg in &program.args.0 {
+        if arg.visit_slot_uses(|slot| mark_slot(component, slot, live_slots, work)) {
+            mark_all(live_slots, work);
+            return;
+        }
     }
 
-    used.sort_unstable();
-    used.dedup();
-    for slot in used {
-        mark_slot(component, slot, live_slots, work);
+    for value in program.env.values() {
+        if value.visit_slot_uses(|slot| mark_slot(component, slot, live_slots, work)) {
+            mark_all(live_slots, work);
+            return;
+        }
     }
 }
 

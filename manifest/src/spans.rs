@@ -429,27 +429,8 @@ fn binding_target_key(
     fields: &HashMap<Arc<str>, (pest::iterators::Pair<'_, Rule>, SourceSpan)>,
 ) -> Option<BindingTargetKey> {
     let to = fields.get("to").and_then(|(p, _)| string_value(p))?;
-
-    if let Some(slot) = fields.get("slot").and_then(|(p, _)| string_value(p))
-        && let Some(component) = super::parse_component_ref(&to).ok()
-    {
-        return Some(match component {
-            super::LocalComponentRef::Self_ => BindingTargetKey::SelfSlot(slot.into()),
-            super::LocalComponentRef::Child(child) => BindingTargetKey::ChildSlot {
-                child: child.into(),
-                slot: slot.into(),
-            },
-        });
-    }
-
-    let (component, slot) = super::split_binding_side(&to).ok()?;
-    Some(match component {
-        super::LocalComponentRef::Self_ => BindingTargetKey::SelfSlot(slot.into()),
-        super::LocalComponentRef::Child(child) => BindingTargetKey::ChildSlot {
-            child: child.into(),
-            slot: slot.into(),
-        },
-    })
+    let slot = fields.get("slot").and_then(|(p, _)| string_value(p));
+    crate::binding_target_key_for_binding(&to, slot.as_deref())
 }
 
 fn extract_capability_decl(

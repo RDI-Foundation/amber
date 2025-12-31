@@ -6,8 +6,8 @@ use miette::{Diagnostic, NamedSource, SourceSpan};
 use thiserror::Error;
 
 use crate::{
-    BindingSource, BindingTarget, ExportTarget, InterpolatedPart, InterpolatedString,
-    InterpolationSource, Manifest, ManifestSpans, SlotName,
+    BindingSource, BindingTarget, ExportTarget, InterpolatedString, Manifest, ManifestSpans,
+    SlotName,
 };
 
 #[allow(unused_assignments)]
@@ -82,24 +82,16 @@ fn add_program_slot_uses<'a>(
     manifest: &'a Manifest,
     used_slots: &mut BTreeSet<&'a SlotName>,
     value: &'a InterpolatedString,
-) {
-    for part in &value.parts {
-        let InterpolatedPart::Interpolation { source, query } = part else {
-            continue;
-        };
-        if *source != InterpolationSource::Slots {
-            continue;
-        }
-        let slot_name = query
-            .split_once('.')
-            .map_or(query.as_str(), |(first, _)| first);
-        if slot_name.is_empty() {
-            continue;
-        }
+) -> bool {
+    let used_all = value.visit_slot_uses(|slot_name| {
         if let Some((slot_key, _)) = manifest.slots().get_key_value(slot_name) {
             used_slots.insert(slot_key);
         }
+    });
+    if used_all {
+        used_slots.extend(manifest.slots().keys());
     }
+    used_all
 }
 
 pub fn lint_manifest(
@@ -124,11 +116,20 @@ pub fn lint_manifest(
 
     let mut program_used_slots = BTreeSet::new();
     if let Some(program) = manifest.program() {
+        let mut used_all = false;
         for arg in &program.args.0 {
-            add_program_slot_uses(manifest, &mut program_used_slots, arg);
+            used_all = add_program_slot_uses(manifest, &mut program_used_slots, arg);
+            if used_all {
+                break;
+            }
         }
-        for value in program.env.values() {
-            add_program_slot_uses(manifest, &mut program_used_slots, value);
+        if !used_all {
+            for value in program.env.values() {
+                used_all = add_program_slot_uses(manifest, &mut program_used_slots, value);
+                if used_all {
+                    break;
+                }
+            }
         }
     }
 

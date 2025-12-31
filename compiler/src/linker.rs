@@ -17,7 +17,6 @@ use jsonschema::Validator;
 use miette::{Diagnostic, NamedSource, SourceSpan};
 use serde_json::{Map, Value};
 use thiserror::Error;
-use url::Url;
 
 use super::frontend::{ResolvedNode, ResolvedTree};
 use crate::{ComponentProvenance, DigestStore, Provenance, RootExportProvenance};
@@ -35,16 +34,6 @@ pub struct RelatedSpan {
     label: String,
 }
 
-fn display_url(url: &Url) -> String {
-    if url.scheme() == "file"
-        && let Ok(path) = url.to_file_path()
-        && let Some(path) = path.to_str()
-    {
-        return path.to_string();
-    }
-    url.to_string()
-}
-
 fn describe_component_path(path: &str) -> String {
     if path == "/" {
         "root component".to_string()
@@ -59,15 +48,7 @@ fn source_for_component(
     id: ComponentId,
 ) -> Option<(NamedSource<Arc<str>>, Arc<amber_manifest::ManifestSpans>)> {
     let url = provenance.for_component(id).effective_url();
-    let stored = store.get_source(url)?;
-    let crate::store::StoredSource {
-        source,
-        spans,
-        digest: _,
-    } = stored;
-    let name = display_url(url);
-    let src = NamedSource::new(name, source).with_language("json5");
-    Some((src, spans))
+    store.diagnostic_source(url)
 }
 
 fn unknown_source() -> NamedSource<Arc<str>> {
@@ -228,6 +209,49 @@ fn unknown_slot_help(component_label: &str, manifest: &Manifest) -> String {
         "Valid slots on {component_label}: {}",
         names.into_iter().take(20).collect::<Vec<_>>().join(", ")
     )
+}
+
+#[derive(Clone, Copy)]
+struct BindingErrorSite<'a> {
+    components: &'a [Component],
+    provenance: &'a Provenance,
+    store: &'a DigestStore,
+    realm: ComponentId,
+    target_key: &'a BindingTargetKey,
+}
+
+impl BindingErrorSite<'_> {
+    fn unknown_slot(self, to_id: ComponentId, slot: &str, to_manifest: &Manifest) -> Error {
+        let (src, span) =
+            binding_target_site(self.provenance, self.store, self.realm, self.target_key)
+                .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+        let to_component_path = component_path_for(self.components, to_id);
+        let to_component_label = describe_component_path(&to_component_path);
+        let mut related: Vec<_> =
+            component_decl_site(self.components, self.provenance, self.store, to_id)
+                .into_iter()
+                .collect();
+        if let Some(site) =
+            slots_section_site(self.provenance, self.store, to_id, &to_component_label)
+        {
+            related.push(site);
+        }
+        Error::UnknownSlot {
+            to_component_path: to_component_label.clone(),
+            slot: slot.to_string(),
+            help: unknown_slot_help(&to_component_label, to_manifest),
+            src,
+            span,
+            related,
+        }
+    }
+}
+
+fn unknown_provide_error(components: &[Component], component: ComponentId, provide: &str) -> Error {
+    Error::UnknownProvide {
+        component_path: describe_component_path(&component_path_for(components, component)),
+        provide: provide.to_string(),
+    }
 }
 
 fn not_exported_help(component_path: &str, manifest: &Manifest) -> String {
@@ -615,7 +639,7 @@ fn validate_config(
         )
     {
         let url = provenance.for_component(parent).effective_url();
-        let name = display_url(url);
+        let name = crate::store::display_url(url);
         site.src = NamedSource::new(name, Arc::clone(&stored.source)).with_language("json5");
         site.span = span;
         site.label = "invalid config value here".to_string();
@@ -732,33 +756,19 @@ fn resolve_bindings(
 
         for (target, binding) in realm_manifest.bindings().iter() {
             let target_key = BindingTargetKey::from(target);
+            let site = BindingErrorSite {
+                components,
+                provenance,
+                store,
+                realm,
+                target_key: &target_key,
+            };
             let (slot_ref, slot_decl, to_id, slot_name_for_err) = match target {
                 BindingTarget::SelfSlot(slot_name) => {
                     let to_id = realm;
                     let to_manifest = &manifests[to_id.0];
                     let slot_decl = to_manifest.slots().get(slot_name).ok_or_else(|| {
-                        let (src, span) =
-                            binding_target_site(provenance, store, realm, &target_key)
-                                .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
-                        let to_component_path = component_path_for(components, to_id);
-                        let to_component_label = describe_component_path(&to_component_path);
-                        let mut related: Vec<_> =
-                            component_decl_site(components, provenance, store, to_id)
-                                .into_iter()
-                                .collect();
-                        if let Some(site) =
-                            slots_section_site(provenance, store, to_id, &to_component_label)
-                        {
-                            related.push(site);
-                        }
-                        Error::UnknownSlot {
-                            to_component_path: to_component_label.clone(),
-                            slot: slot_name.to_string(),
-                            help: unknown_slot_help(&to_component_label, to_manifest),
-                            src,
-                            span,
-                            related,
-                        }
+                        site.unknown_slot(to_id, slot_name.as_str(), to_manifest.as_ref())
                     });
                     let slot_decl = match slot_decl {
                         Ok(slot_decl) => slot_decl,
@@ -788,28 +798,7 @@ fn resolve_bindings(
                     };
                     let to_manifest = &manifests[to_id.0];
                     let slot_decl = to_manifest.slots().get(slot.as_str()).ok_or_else(|| {
-                        let (src, span) =
-                            binding_target_site(provenance, store, realm, &target_key)
-                                .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
-                        let to_component_path = component_path_for(components, to_id);
-                        let to_component_label = describe_component_path(&to_component_path);
-                        let mut related: Vec<_> =
-                            component_decl_site(components, provenance, store, to_id)
-                                .into_iter()
-                                .collect();
-                        if let Some(site) =
-                            slots_section_site(provenance, store, to_id, &to_component_label)
-                        {
-                            related.push(site);
-                        }
-                        Error::UnknownSlot {
-                            to_component_path: to_component_label.clone(),
-                            slot: slot.to_string(),
-                            help: unknown_slot_help(&to_component_label, to_manifest),
-                            src,
-                            span,
-                            related,
-                        }
+                        site.unknown_slot(to_id, slot.as_str(), to_manifest.as_ref())
                     });
                     let slot_decl = match slot_decl {
                         Ok(slot_decl) => slot_decl,
@@ -844,12 +833,7 @@ fn resolve_bindings(
                     let from_manifest = &manifests[from_id.0];
                     let provide_decl =
                         from_manifest.provides().get(provide_name).ok_or_else(|| {
-                            Error::UnknownProvide {
-                                component_path: describe_component_path(&component_path_for(
-                                    components, from_id,
-                                )),
-                                provide: provide_name.to_string(),
-                            }
+                            unknown_provide_error(components, from_id, provide_name.as_str())
                         });
                     let provide_decl = match provide_decl {
                         Ok(provide_decl) => provide_decl,
@@ -1014,16 +998,9 @@ pub(crate) fn resolve_export(
 
     match target {
         ExportTarget::SelfProvide(provide_name) => {
-            let provide_decl =
-                manifest
-                    .provides()
-                    .get(provide_name)
-                    .ok_or_else(|| Error::UnknownProvide {
-                        component_path: describe_component_path(&component_path_for(
-                            components, component,
-                        )),
-                        provide: provide_name.to_string(),
-                    })?;
+            let provide_decl = manifest.provides().get(provide_name).ok_or_else(|| {
+                unknown_provide_error(components, component, provide_name.as_str())
+            })?;
             Ok(ResolvedExport {
                 component,
                 name: provide_name.to_string(),

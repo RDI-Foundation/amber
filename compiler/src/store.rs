@@ -2,7 +2,18 @@ use std::sync::Arc;
 
 use amber_manifest::{Manifest, ManifestDigest, ManifestSpans};
 use dashmap::DashMap;
+use miette::NamedSource;
 use url::Url;
+
+pub(crate) fn display_url(url: &Url) -> String {
+    if url.scheme() == "file"
+        && let Ok(path) = url.to_file_path()
+        && let Some(path) = path.to_str()
+    {
+        return path.to_string();
+    }
+    url.to_string()
+}
 
 /// Global manifest content store keyed by digest.
 ///
@@ -40,6 +51,20 @@ impl DigestStore {
 
     pub fn get_source(&self, url: &Url) -> Option<StoredSource> {
         self.inner.by_url.get(url).map(|r| r.value().clone())
+    }
+
+    pub(crate) fn diagnostic_source(
+        &self,
+        url: &Url,
+    ) -> Option<(NamedSource<Arc<str>>, Arc<ManifestSpans>)> {
+        let StoredSource {
+            source,
+            spans,
+            digest: _,
+        } = self.get_source(url)?;
+        let name = display_url(url);
+        let src = NamedSource::new(name, source).with_language("json5");
+        Some((src, spans))
     }
 
     /// Insert a manifest under a known digest.

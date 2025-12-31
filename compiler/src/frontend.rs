@@ -75,31 +75,6 @@ pub enum Error {
     },
 }
 
-fn display_url(url: &Url) -> String {
-    if url.scheme() == "file"
-        && let Ok(path) = url.to_file_path()
-        && let Some(path) = path.to_str()
-    {
-        return path.to_string();
-    }
-    url.to_string()
-}
-
-fn source_for_url(
-    store: &DigestStore,
-    url: &Url,
-) -> Option<(NamedSource<Arc<str>>, Arc<amber_manifest::ManifestSpans>)> {
-    let stored = store.get_source(url)?;
-    let crate::store::StoredSource {
-        source,
-        spans,
-        digest: _,
-    } = stored;
-    let name = display_url(url);
-    let src = NamedSource::new(name, source).with_language("json5");
-    Some((src, spans))
-}
-
 #[derive(Clone, Debug)]
 pub struct ResolvedTree {
     pub root: ResolvedNode,
@@ -216,14 +191,16 @@ async fn resolve_component(
 
         declared_ref.resolve_against(base).map_err(|err| {
             let (src, span) =
-                source_for_url(&svc.store, base).map_or((None, None), |(src, spans)| {
-                    let span = spans
-                        .components
-                        .get(name.as_str())
-                        .and_then(|c| c.manifest)
-                        .unwrap_or((0usize, 0usize).into());
-                    (Some(src), Some(span))
-                });
+                svc.store
+                    .diagnostic_source(base)
+                    .map_or((None, None), |(src, spans)| {
+                        let span = spans
+                            .components
+                            .get(name.as_str())
+                            .and_then(|c| c.manifest)
+                            .unwrap_or((0usize, 0usize).into());
+                        (Some(src), Some(span))
+                    });
 
             Error::InvalidManifestRef {
                 realm_url: Box::new(base.clone()),
@@ -361,19 +338,21 @@ fn compute_environment(
     for resolver_name in &env_decl.resolvers {
         let Some(r) = svc.registry.get(resolver_name.as_str()) else {
             let (src, span) =
-                source_for_url(&svc.store, realm_url).map_or((None, None), |(src, spans)| {
-                    let env = spans.environments.get(env_name);
-                    let span = env
-                        .and_then(|e| {
-                            e.resolvers
-                                .iter()
-                                .find(|(name, _)| name.as_ref() == resolver_name.as_str())
-                                .map(|(_, span)| *span)
-                        })
-                        .or_else(|| env.map(|e| e.name))
-                        .unwrap_or((0usize, 0usize).into());
-                    (Some(src), Some(span))
-                });
+                svc.store
+                    .diagnostic_source(realm_url)
+                    .map_or((None, None), |(src, spans)| {
+                        let env = spans.environments.get(env_name);
+                        let span = env
+                            .and_then(|e| {
+                                e.resolvers
+                                    .iter()
+                                    .find(|(name, _)| name.as_ref() == resolver_name.as_str())
+                                    .map(|(_, span)| *span)
+                            })
+                            .or_else(|| env.map(|e| e.name))
+                            .unwrap_or((0usize, 0usize).into());
+                        (Some(src), Some(span))
+                    });
             return Err(Error::UnknownResolver {
                 realm_url: Box::new(realm_url.clone()),
                 environment: env_name.into(),

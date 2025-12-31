@@ -4,9 +4,8 @@ mod tests;
 use amber_manifest::{ManifestRef, lint::lint_manifest};
 use amber_resolver::Resolver;
 use amber_scenario::Scenario;
-use miette::{Diagnostic, NamedSource, Report};
+use miette::{Diagnostic, Report};
 use thiserror::Error;
-use url::Url;
 
 mod environment;
 mod frontend;
@@ -192,19 +191,10 @@ fn collect_manifest_diagnostics(
         let url = prov.effective_url();
         let component_path = prov.authored_path.as_ref();
 
-        let Some(stored) = store.get_source(url) else {
+        let Some((src, spans)) = store.diagnostic_source(url) else {
             continue;
         };
-
-        let crate::store::StoredSource {
-            source,
-            spans,
-            digest: _,
-        } = stored;
-
-        let name = display_url(url);
-        let src = NamedSource::new(name, source).with_language("json5");
-        let lints = lint_manifest(&manifest, component_path, src, &spans);
+        let lints = lint_manifest(&manifest, component_path, src, spans.as_ref());
         if lints.is_empty() {
             continue;
         }
@@ -235,19 +225,10 @@ fn collect_tree_node_diagnostics(
     };
 
     let url = node.observed_url.as_ref().unwrap_or(&node.resolved_url);
-    let Some(stored) = store.get_source(url) else {
+    let Some((src, spans)) = store.diagnostic_source(url) else {
         return;
     };
-
-    let crate::store::StoredSource {
-        source,
-        spans,
-        digest: _,
-    } = stored;
-
-    let name = display_url(url);
-    let src = NamedSource::new(name, source).with_language("json5");
-    let lints = lint_manifest(manifest.as_ref(), component_path, src, &spans);
+    let lints = lint_manifest(manifest.as_ref(), component_path, src, spans.as_ref());
     diagnostics.extend(lints.into_iter().map(Report::new));
 
     for (child_name, child_node) in &node.children {
@@ -258,14 +239,4 @@ fn collect_tree_node_diagnostics(
         };
         collect_tree_node_diagnostics(child_node, &child_path, store, diagnostics);
     }
-}
-
-fn display_url(url: &Url) -> String {
-    if url.scheme() == "file"
-        && let Ok(path) = url.to_file_path()
-        && let Some(path) = path.to_str()
-    {
-        return path.to_string();
-    }
-    url.to_string()
 }

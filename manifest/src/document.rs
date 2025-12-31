@@ -175,8 +175,7 @@ fn labels_for_manifest_error(
             labels
         }
         ManifestError::DuplicateBindingTarget { to, slot } => {
-            let key = binding_target_key(to, slot);
-            let Some(key) = key else {
+            let Some(key) = crate::binding_target_key_for_binding(to, Some(slot.as_str())) else {
                 return vec![primary(
                     (0usize, 0usize).into(),
                     Some("duplicate binding target".to_string()),
@@ -381,40 +380,9 @@ fn primary(span: SourceSpan, label: Option<String>) -> LabeledSpan {
     LabeledSpan::new_primary_with_span(label, span)
 }
 
-fn binding_target_key(to: &str, slot: &str) -> Option<crate::BindingTargetKey> {
-    if to == "self" {
-        return Some(crate::BindingTargetKey::SelfSlot(slot.into()));
-    }
-    let child = to.strip_prefix('#')?;
-    Some(crate::BindingTargetKey::ChildSlot {
-        child: child.into(),
-        slot: slot.into(),
-    })
-}
-
 fn binding_target_key_for_span(span: &crate::BindingSpans) -> Option<crate::BindingTargetKey> {
     let to = span.to_value.as_deref()?;
-
-    if let Some(slot) = span.slot_value.as_deref()
-        && let Ok(component) = crate::parse_component_ref(to)
-    {
-        return Some(match component {
-            crate::LocalComponentRef::Self_ => crate::BindingTargetKey::SelfSlot(slot.into()),
-            crate::LocalComponentRef::Child(child) => crate::BindingTargetKey::ChildSlot {
-                child: child.into(),
-                slot: slot.into(),
-            },
-        });
-    }
-
-    let (component, slot) = crate::split_binding_side(to).ok()?;
-    Some(match component {
-        crate::LocalComponentRef::Self_ => crate::BindingTargetKey::SelfSlot(slot.into()),
-        crate::LocalComponentRef::Child(child) => crate::BindingTargetKey::ChildSlot {
-            child: child.into(),
-            slot: slot.into(),
-        },
-    })
+    crate::binding_target_key_for_binding(to, span.slot_value.as_deref())
 }
 
 fn span_for_json5_error(source: &str, err: &json5::Error) -> SourceSpan {
