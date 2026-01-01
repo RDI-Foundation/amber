@@ -125,6 +125,71 @@ struct ConfigSite {
     label: String,
 }
 
+struct ConfigErrorSite<'a> {
+    components: &'a [Component],
+    provenance: &'a Provenance,
+    store: &'a DigestStore,
+    id: ComponentId,
+}
+
+impl<'a> ConfigErrorSite<'a> {
+    fn new(
+        components: &'a [Component],
+        provenance: &'a Provenance,
+        store: &'a DigestStore,
+        id: ComponentId,
+    ) -> Self {
+        Self {
+            components,
+            provenance,
+            store,
+            id,
+        }
+    }
+
+    fn component(&self) -> &Component {
+        &self.components[self.id.0]
+    }
+
+    fn config_site(&self) -> ConfigSite {
+        config_site_for_component(self.components, self.provenance, self.store, self.id)
+            .unwrap_or_else(|| ConfigSite {
+                src: unknown_source(),
+                span: (0usize, 0usize).into(),
+                label: "config here".to_string(),
+            })
+    }
+
+    fn invalid_value_site(&self, instance_path: &str) -> Option<ConfigSite> {
+        let component = self.component();
+        let parent = component.parent?;
+        component.config.as_ref()?;
+        let parent_prov = self.provenance.for_component(parent);
+        let stored = self.store.get_source(parent_prov.effective_url())?;
+        let component_spans = stored.spans.components.get(component.name.as_str())?;
+        let config_span = component_spans.config?;
+        let span = amber_manifest::span_for_json_pointer(
+            stored.source.as_ref(),
+            config_span,
+            instance_path,
+        )?;
+        let name = crate::store::display_url(parent_prov.effective_url());
+        Some(ConfigSite {
+            src: NamedSource::new(name, Arc::clone(&stored.source)).with_language("json5"),
+            span,
+            label: "invalid config value here".to_string(),
+        })
+    }
+
+    fn schema_related_site(&self, component_path: &str) -> Option<RelatedSpan> {
+        if self.component().parent.is_some() {
+            config_schema_site(self.provenance, self.store, self.id, component_path)
+        } else {
+            None
+        }
+    }
+}
+
 fn config_site_for_component(
     components: &[Component],
     provenance: &Provenance,
@@ -576,33 +641,27 @@ fn validate_config(
         return Ok(());
     };
 
+    let error_site = ConfigErrorSite::new(components, provenance, store, id);
+
     let validator = if let Some(v) = schema_cache.get(&c.digest) {
         Arc::clone(v)
     } else {
-        let v =
-            Arc::new(jsonschema::validator_for(&schema_decl.0).map_err(|e| {
-                let component_path = component_path_for(components, id);
-                let site = config_site_for_component(components, provenance, store, id)
-                    .unwrap_or_else(|| ConfigSite {
-                        src: unknown_source(),
-                        span: (0usize, 0usize).into(),
-                        label: "config here".to_string(),
-                    });
-                let mut related = Vec::new();
-                if c.parent.is_some()
-                    && let Some(schema) = config_schema_site(provenance, store, id, &component_path)
-                {
-                    related.push(schema);
-                }
-                Error::InvalidConfig {
-                    component_path,
-                    message: e.to_string(),
-                    src: site.src,
-                    span: site.span,
-                    label: site.label,
-                    related,
-                }
-            })?);
+        let component_path = component_path_for(components, id);
+        let site = error_site.config_site();
+        let mut related = Vec::new();
+        if let Some(schema) = error_site.schema_related_site(&component_path) {
+            related.push(schema);
+        }
+        let v = Arc::new(jsonschema::validator_for(&schema_decl.0).map_err(|e| {
+            Error::InvalidConfig {
+                component_path,
+                message: e.to_string(),
+                src: site.src,
+                span: site.span,
+                label: site.label,
+                related,
+            }
+        })?);
         schema_cache.insert(c.digest, Arc::clone(&v));
         v
     };
@@ -619,35 +678,12 @@ fn validate_config(
     let mut msgs = vec![first.to_string()];
     msgs.extend(errors.take(7).map(|e| e.to_string()));
     let component_path = component_path_for(components, id);
-    let mut site =
-        config_site_for_component(components, provenance, store, id).unwrap_or_else(|| {
-            ConfigSite {
-                src: unknown_source(),
-                span: (0usize, 0usize).into(),
-                label: "config here".to_string(),
-            }
-        });
-    if let Some(parent) = c.parent
-        && c.config.is_some()
-        && let Some(stored) = store.get_source(provenance.for_component(parent).effective_url())
-        && let Some(component_spans) = stored.spans.components.get(c.name.as_str())
-        && let Some(config_span) = component_spans.config
-        && let Some(span) = amber_manifest::span_for_json_pointer(
-            stored.source.as_ref(),
-            config_span,
-            &instance_path,
-        )
-    {
-        let url = provenance.for_component(parent).effective_url();
-        let name = crate::store::display_url(url);
-        site.src = NamedSource::new(name, Arc::clone(&stored.source)).with_language("json5");
-        site.span = span;
-        site.label = "invalid config value here".to_string();
+    let mut site = error_site.config_site();
+    if let Some(value_site) = error_site.invalid_value_site(&instance_path) {
+        site = value_site;
     }
     let mut related = Vec::new();
-    if c.parent.is_some()
-        && let Some(schema) = config_schema_site(provenance, store, id, &component_path)
-    {
+    if let Some(schema) = error_site.schema_related_site(&component_path) {
         related.push(schema);
     }
     let message = if c.parent.is_none() && c.config.is_none() {
