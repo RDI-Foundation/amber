@@ -1236,6 +1236,296 @@ fn supported_manifest_version_req() -> &'static VersionReq {
     })
 }
 
+struct ValidateCtx<'a> {
+    components: &'a BTreeMap<ChildName, ComponentDecl>,
+    slots: &'a BTreeMap<SlotName, SlotDecl>,
+    provides: &'a BTreeMap<ProvideName, ProvideDecl>,
+}
+
+fn validate_environment_names(
+    environments: &BTreeMap<String, EnvironmentDecl>,
+) -> Result<(), Error> {
+    for name in environments.keys() {
+        ensure_name_no_dot(name, "environment")?;
+    }
+    Ok(())
+}
+
+fn convert_components(
+    components: BTreeMap<String, ComponentDecl>,
+) -> Result<BTreeMap<ChildName, ComponentDecl>, Error> {
+    components
+        .into_iter()
+        .map(|(name, decl)| Ok((ChildName::try_from(name)?, decl)))
+        .collect::<Result<BTreeMap<_, _>, Error>>()
+}
+
+fn convert_slots(slots: BTreeMap<String, SlotDecl>) -> Result<BTreeMap<SlotName, SlotDecl>, Error> {
+    slots
+        .into_iter()
+        .map(|(name, decl)| Ok((SlotName::try_from(name)?, decl)))
+        .collect::<Result<BTreeMap<_, _>, Error>>()
+}
+
+fn convert_provides(
+    provides: BTreeMap<String, ProvideDecl>,
+) -> Result<BTreeMap<ProvideName, ProvideDecl>, Error> {
+    provides
+        .into_iter()
+        .map(|(name, decl)| Ok((ProvideName::try_from(name)?, decl)))
+        .collect::<Result<BTreeMap<_, _>, Error>>()
+}
+
+fn validate_environment_extends(
+    environments: &BTreeMap<String, EnvironmentDecl>,
+) -> Result<(), Error> {
+    for (env_name, env) in environments {
+        if let Some(ext) = env.extends.as_deref()
+            && !environments.contains_key(ext)
+        {
+            return Err(Error::UnknownEnvironmentExtends {
+                name: env_name.clone(),
+                extends: ext.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_environment_cycles(
+    environments: &BTreeMap<String, EnvironmentDecl>,
+) -> Result<(), Error> {
+    let mut state: HashMap<String, u8> = HashMap::new(); // 0/none=unvisited, 1=visiting, 2=done
+    fn dfs(
+        name: &str,
+        envs: &BTreeMap<String, EnvironmentDecl>,
+        state: &mut HashMap<String, u8>,
+    ) -> Result<(), Error> {
+        match state.get(name).copied() {
+            Some(1) => {
+                return Err(Error::EnvironmentCycle {
+                    name: name.to_string(),
+                });
+            }
+            Some(2) => return Ok(()),
+            _ => {}
+        }
+
+        state.insert(name.to_string(), 1);
+        if let Some(ext) = envs.get(name).and_then(|e| e.extends.as_deref()) {
+            dfs(ext, envs, state)?;
+        }
+        state.insert(name.to_string(), 2);
+        Ok(())
+    }
+
+    for name in environments.keys() {
+        dfs(name, environments, &mut state)?;
+    }
+    Ok(())
+}
+
+fn validate_component_environments(
+    components: &BTreeMap<ChildName, ComponentDecl>,
+    environments: &BTreeMap<String, EnvironmentDecl>,
+) -> Result<(), Error> {
+    for (child_name, decl) in components {
+        if let ComponentDecl::Object(obj) = decl
+            && let Some(env) = obj.environment.as_deref()
+            && !environments.contains_key(env)
+        {
+            return Err(Error::UnknownComponentEnvironment {
+                child: child_name.to_string(),
+                environment: env.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_no_ambiguous_capability(
+    slots: &BTreeMap<SlotName, SlotDecl>,
+    provides: &BTreeMap<ProvideName, ProvideDecl>,
+) -> Result<(), Error> {
+    if let Some(name) = slots
+        .keys()
+        .find(|name| provides.contains_key(name.as_str()))
+    {
+        return Err(Error::AmbiguousCapabilityName {
+            name: name.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn resolve_binding_target(
+    ctx: &ValidateCtx<'_>,
+    to: LocalComponentRef,
+    slot: String,
+) -> Result<BindingTarget, Error> {
+    match to {
+        LocalComponentRef::Self_ => {
+            let (slot_name, _) = ctx
+                .slots
+                .get_key_value(slot.as_str())
+                .ok_or_else(|| Error::UnknownBindingSlot { slot })?;
+            Ok(BindingTarget::SelfSlot(slot_name.clone()))
+        }
+        LocalComponentRef::Child(child) => {
+            let (child_name, _) = ctx
+                .components
+                .get_key_value(child.as_str())
+                .ok_or_else(|| Error::UnknownBindingChild { child })?;
+            let slot_name = SlotName::try_from(slot)?;
+            Ok(BindingTarget::ChildSlot {
+                child: child_name.clone(),
+                slot: slot_name,
+            })
+        }
+    }
+}
+
+fn resolve_binding_source(
+    ctx: &ValidateCtx<'_>,
+    from: LocalComponentRef,
+    capability: String,
+) -> Result<BindingSource, Error> {
+    match from {
+        LocalComponentRef::Self_ => {
+            let (provide_name, _) = ctx
+                .provides
+                .get_key_value(capability.as_str())
+                .ok_or_else(|| Error::UnknownBindingProvide { capability })?;
+            Ok(BindingSource::SelfProvide(provide_name.clone()))
+        }
+        LocalComponentRef::Child(child) => {
+            let (child_name, _) = ctx
+                .components
+                .get_key_value(child.as_str())
+                .ok_or_else(|| Error::UnknownBindingChild { child })?;
+            let export = ExportName::try_from(capability)?;
+            Ok(BindingSource::ChildExport {
+                child: child_name.clone(),
+                export,
+            })
+        }
+    }
+}
+
+fn build_bindings(
+    bindings: BTreeSet<RawBinding>,
+    ctx: &ValidateCtx<'_>,
+) -> Result<BTreeMap<BindingTarget, Binding>, Error> {
+    let mut bindings_out = BTreeMap::new();
+
+    for binding in bindings {
+        let RawBinding {
+            to,
+            slot,
+            from,
+            capability,
+            weak,
+        } = binding;
+
+        let target = resolve_binding_target(ctx, to, slot)?;
+        let source = resolve_binding_source(ctx, from, capability)?;
+
+        if bindings_out.contains_key(&target) {
+            let to = match &target {
+                BindingTarget::SelfSlot(_) => "self".to_string(),
+                BindingTarget::ChildSlot { child, .. } => format!("#{child}"),
+            };
+            let slot = match &target {
+                BindingTarget::SelfSlot(name) => name.to_string(),
+                BindingTarget::ChildSlot { slot, .. } => slot.to_string(),
+            };
+            return Err(Error::DuplicateBindingTarget { to, slot });
+        }
+
+        bindings_out.insert(target, Binding { from: source, weak });
+    }
+
+    Ok(bindings_out)
+}
+
+fn resolve_export_target(
+    ctx: &ValidateCtx<'_>,
+    export_name: &ExportName,
+    target: RawExportTarget,
+) -> Result<ExportTarget, Error> {
+    match target.component {
+        LocalComponentRef::Self_ => {
+            if let Some((provide_name, _)) = ctx.provides.get_key_value(target.name.as_str()) {
+                Ok(ExportTarget::SelfProvide(provide_name.clone()))
+            } else {
+                Err(Error::UnknownExportTarget {
+                    export: export_name.to_string(),
+                    target: target.name,
+                })
+            }
+        }
+        LocalComponentRef::Child(child) => {
+            let (child_name, _) =
+                ctx.components
+                    .get_key_value(child.as_str())
+                    .ok_or_else(|| Error::UnknownExportChild {
+                        export: export_name.to_string(),
+                        child,
+                    })?;
+            let export = ExportName::try_from(target.name)?;
+            Ok(ExportTarget::ChildExport {
+                child: child_name.clone(),
+                export,
+            })
+        }
+    }
+}
+
+fn build_exports(
+    exports: BTreeMap<String, RawExportTarget>,
+    ctx: &ValidateCtx<'_>,
+) -> Result<BTreeMap<ExportName, ExportTarget>, Error> {
+    let mut exports_out = BTreeMap::new();
+
+    for (export, target) in exports {
+        let export_name = ExportName::try_from(export)?;
+        let target = resolve_export_target(ctx, &export_name, target)?;
+        exports_out.insert(export_name, target);
+    }
+
+    Ok(exports_out)
+}
+
+fn validate_endpoints(
+    program: Option<&Program>,
+    provides: &BTreeMap<ProvideName, ProvideDecl>,
+) -> Result<(), Error> {
+    let mut defined_endpoints = BTreeSet::new();
+    if let Some(program) = program
+        && let Some(network) = &program.network
+    {
+        for endpoint in &network.endpoints {
+            if !defined_endpoints.insert(endpoint.name.as_str()) {
+                return Err(Error::DuplicateEndpointName {
+                    name: endpoint.name.clone(),
+                });
+            }
+        }
+    }
+
+    for provide in provides.values() {
+        if let Some(endpoint) = provide.endpoint.as_deref()
+            && !defined_endpoints.contains(endpoint)
+        {
+            return Err(Error::UnknownEndpoint {
+                name: endpoint.to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 impl RawManifest {
     fn digest(&self) -> ManifestDigest {
         ManifestDigest::digest(self)
@@ -1268,208 +1558,26 @@ impl RawManifest {
             exports,
         } = self;
 
-        for name in environments.keys() {
-            ensure_name_no_dot(name, "environment")?;
-        }
+        validate_environment_names(&environments)?;
 
-        let components = components
-            .into_iter()
-            .map(|(name, decl)| Ok((ChildName::try_from(name)?, decl)))
-            .collect::<Result<BTreeMap<_, _>, Error>>()?;
+        let components = convert_components(components)?;
+        let slots = convert_slots(slots)?;
+        let provides = convert_provides(provides)?;
 
-        let slots = slots
-            .into_iter()
-            .map(|(name, decl)| Ok((SlotName::try_from(name)?, decl)))
-            .collect::<Result<BTreeMap<_, _>, Error>>()?;
+        validate_environment_extends(&environments)?;
+        validate_environment_cycles(&environments)?;
+        validate_component_environments(&components, &environments)?;
+        validate_no_ambiguous_capability(&slots, &provides)?;
 
-        let provides = provides
-            .into_iter()
-            .map(|(name, decl)| Ok((ProvideName::try_from(name)?, decl)))
-            .collect::<Result<BTreeMap<_, _>, Error>>()?;
+        let ctx = ValidateCtx {
+            components: &components,
+            slots: &slots,
+            provides: &provides,
+        };
 
-        // Validate environments (local invariants).
-        for (env_name, env) in &environments {
-            if let Some(ext) = env.extends.as_deref()
-                && !environments.contains_key(ext)
-            {
-                return Err(Error::UnknownEnvironmentExtends {
-                    name: env_name.clone(),
-                    extends: ext.to_string(),
-                });
-            }
-        }
-
-        // Detect cycles in environment extends graph.
-        let mut state: HashMap<String, u8> = HashMap::new(); // 0/none=unvisited, 1=visiting, 2=done
-        fn dfs(
-            name: &str,
-            envs: &BTreeMap<String, EnvironmentDecl>,
-            state: &mut HashMap<String, u8>,
-        ) -> Result<(), Error> {
-            match state.get(name).copied() {
-                Some(1) => {
-                    return Err(Error::EnvironmentCycle {
-                        name: name.to_string(),
-                    });
-                }
-                Some(2) => return Ok(()),
-                _ => {}
-            }
-
-            state.insert(name.to_string(), 1);
-            if let Some(ext) = envs.get(name).and_then(|e| e.extends.as_deref()) {
-                dfs(ext, envs, state)?;
-            }
-            state.insert(name.to_string(), 2);
-            Ok(())
-        }
-
-        for name in environments.keys() {
-            dfs(name, &environments, &mut state)?;
-        }
-
-        // Validate that children referencing environments reference existing ones.
-        for (child_name, decl) in &components {
-            if let ComponentDecl::Object(obj) = decl
-                && let Some(env) = obj.environment.as_deref()
-                && !environments.contains_key(env)
-            {
-                return Err(Error::UnknownComponentEnvironment {
-                    child: child_name.to_string(),
-                    environment: env.to_string(),
-                });
-            }
-        }
-
-        if let Some(name) = slots
-            .keys()
-            .find(|name| provides.contains_key(name.as_str()))
-        {
-            return Err(Error::AmbiguousCapabilityName {
-                name: name.to_string(),
-            });
-        }
-
-        let mut bindings_out = BTreeMap::new();
-
-        for binding in bindings {
-            let RawBinding {
-                to,
-                slot,
-                from,
-                capability,
-                weak,
-            } = binding;
-
-            let target = match to {
-                LocalComponentRef::Self_ => {
-                    let (slot_name, _) = slots
-                        .get_key_value(slot.as_str())
-                        .ok_or_else(|| Error::UnknownBindingSlot { slot })?;
-                    BindingTarget::SelfSlot(slot_name.clone())
-                }
-                LocalComponentRef::Child(child) => {
-                    let (child_name, _) = components
-                        .get_key_value(child.as_str())
-                        .ok_or_else(|| Error::UnknownBindingChild { child })?;
-                    let slot_name = SlotName::try_from(slot)?;
-                    BindingTarget::ChildSlot {
-                        child: child_name.clone(),
-                        slot: slot_name,
-                    }
-                }
-            };
-
-            let source = match from {
-                LocalComponentRef::Self_ => {
-                    let (provide_name, _) = provides
-                        .get_key_value(capability.as_str())
-                        .ok_or_else(|| Error::UnknownBindingProvide { capability })?;
-                    BindingSource::SelfProvide(provide_name.clone())
-                }
-                LocalComponentRef::Child(child) => {
-                    let (child_name, _) = components
-                        .get_key_value(child.as_str())
-                        .ok_or_else(|| Error::UnknownBindingChild { child })?;
-                    let export = ExportName::try_from(capability)?;
-                    BindingSource::ChildExport {
-                        child: child_name.clone(),
-                        export,
-                    }
-                }
-            };
-
-            if bindings_out.contains_key(&target) {
-                let to = match &target {
-                    BindingTarget::SelfSlot(_) => "self".to_string(),
-                    BindingTarget::ChildSlot { child, .. } => format!("#{child}"),
-                };
-                let slot = match &target {
-                    BindingTarget::SelfSlot(name) => name.to_string(),
-                    BindingTarget::ChildSlot { slot, .. } => slot.to_string(),
-                };
-                return Err(Error::DuplicateBindingTarget { to, slot });
-            }
-
-            bindings_out.insert(target, Binding { from: source, weak });
-        }
-
-        let mut exports_out = BTreeMap::new();
-
-        for (export, target) in exports {
-            let export_name = ExportName::try_from(export)?;
-            let target = match target.component {
-                LocalComponentRef::Self_ => {
-                    if let Some((provide_name, _)) = provides.get_key_value(target.name.as_str()) {
-                        ExportTarget::SelfProvide(provide_name.clone())
-                    } else {
-                        return Err(Error::UnknownExportTarget {
-                            export: export_name.to_string(),
-                            target: target.name,
-                        });
-                    }
-                }
-                LocalComponentRef::Child(child) => {
-                    let (child_name, _) =
-                        components.get_key_value(child.as_str()).ok_or_else(|| {
-                            Error::UnknownExportChild {
-                                export: export_name.to_string(),
-                                child,
-                            }
-                        })?;
-                    let export = ExportName::try_from(target.name)?;
-                    ExportTarget::ChildExport {
-                        child: child_name.clone(),
-                        export,
-                    }
-                }
-            };
-
-            exports_out.insert(export_name, target);
-        }
-
-        let mut defined_endpoints = BTreeSet::new();
-        if let Some(program) = &program
-            && let Some(network) = &program.network
-        {
-            for endpoint in &network.endpoints {
-                if !defined_endpoints.insert(endpoint.name.as_str()) {
-                    return Err(Error::DuplicateEndpointName {
-                        name: endpoint.name.clone(),
-                    });
-                }
-            }
-        }
-
-        for provide in provides.values() {
-            if let Some(endpoint) = provide.endpoint.as_deref()
-                && !defined_endpoints.contains(endpoint)
-            {
-                return Err(Error::UnknownEndpoint {
-                    name: endpoint.to_string(),
-                });
-            }
-        }
+        let bindings_out = build_bindings(bindings, &ctx)?;
+        let exports_out = build_exports(exports, &ctx)?;
+        validate_endpoints(program.as_ref(), &provides)?;
 
         let digest_cell = OnceLock::new();
         let _ = digest_cell.set(digest);
