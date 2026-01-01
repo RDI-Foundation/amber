@@ -153,81 +153,33 @@ fn span_for_json5_deserialize_error(
     path: &serde_path_to_error::Path,
     message: &str,
 ) -> Option<SourceSpan> {
-    let root: SourceSpan = (0usize, source.len()).into();
-
-    let segments = serde_path_segments(path)?;
-    let pointer = json_pointer_from_segments(&segments);
+    let lookup = SpanLookup::new(source, path)?;
 
     if message.starts_with("unknown field")
         && let Some(field) = backticked_values(message).next()
+        && let Some(span) = lookup.span_for_parent_key(field)
     {
-        let mut parent = segments.clone();
-        if parent
-            .last()
-            .is_some_and(|s| matches!(s, SerdePathSegment::Key(key) if *key == field))
-        {
-            parent.pop();
-        }
-        let parent_pointer = json_pointer_from_segments(&parent);
-        if let Some(parent_span) =
-            crate::spans::span_for_json_pointer(source, root, &parent_pointer)
-            && let Some(span) = crate::spans::span_for_object_key(source, parent_span, field)
-        {
-            return Some(span);
-        }
+        return Some(span);
     }
 
     if message.contains("has `")
         && message.contains("` but is missing `")
         && let Some(field) = missing_field_present_field(message)
+        && let Some(span) = lookup.span_for_present_field(field)
     {
-        let mut ptr = pointer.clone();
-        ptr.push('/');
-        push_json_pointer_segment(&mut ptr, field);
-        if let Some(span) = crate::spans::span_for_json_pointer(source, root, &ptr) {
-            return Some(span);
-        }
-    }
-
-    if let Some(span) = crate::spans::span_for_json_pointer(source, root, &pointer) {
-        if let Some(object_span) = object_span_for_value_path(source, root, &segments, &span) {
-            for needle in backticked_values(message) {
-                if let Some(value_span) = find_string_value_in_object(source, object_span, needle) {
-                    return Some(value_span);
-                }
-            }
-        }
         return Some(span);
     }
 
-    None
-}
-
-fn object_span_for_value_path(
-    source: &str,
-    root: SourceSpan,
-    segments: &[SerdePathSegment<'_>],
-    value_span: &SourceSpan,
-) -> Option<SourceSpan> {
-    if segments.is_empty() {
-        return None;
+    let span = lookup.value_span()?;
+    if let Some(object_span) = lookup.object_span_for_value(&span) {
+        for needle in backticked_values(message) {
+            if let Some(value_span) = find_string_value_in_object(source, object_span, needle) {
+                return Some(value_span);
+            }
+        }
     }
 
-    // If we pointed at a scalar value, look for the nearest containing object span.
-    let mut parent = segments.to_vec();
-    if matches!(parent.last(), Some(SerdePathSegment::Key(_))) {
-        parent.pop();
-    }
-    let parent_pointer = json_pointer_from_segments(&parent);
-    let parent_span = crate::spans::span_for_json_pointer(source, root, &parent_pointer)?;
-
-    // If the parent span actually contains the value span, use it as the object span.
-    if parent_span.offset() <= value_span.offset() && span_end(parent_span) >= span_end(*value_span)
-    {
-        return Some(parent_span);
-    }
-
-    None
+    Some(span)
 }
 
 fn find_string_value_in_object(
@@ -285,10 +237,6 @@ fn serde_path_segments(path: &serde_path_to_error::Path) -> Option<Vec<SerdePath
 }
 
 fn json_pointer_from_segments(segments: &[SerdePathSegment<'_>]) -> String {
-    if segments.is_empty() {
-        return String::new();
-    }
-
     let mut out = String::new();
     for segment in segments {
         out.push('/');
@@ -310,6 +258,76 @@ fn push_json_pointer_segment(out: &mut String, segment: &str) {
             '/' => out.push_str("~1"),
             other => out.push(other),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SpanLookup<'s, 'p> {
+    source: &'s str,
+    root: SourceSpan,
+    segments: Vec<SerdePathSegment<'p>>,
+    pointer: String,
+}
+
+impl<'s, 'p> SpanLookup<'s, 'p> {
+    fn new(source: &'s str, path: &'p serde_path_to_error::Path) -> Option<Self> {
+        let segments = serde_path_segments(path)?;
+        let pointer = json_pointer_from_segments(&segments);
+        Some(Self {
+            source,
+            root: (0usize, source.len()).into(),
+            segments,
+            pointer,
+        })
+    }
+
+    fn span_for_pointer(&self, pointer: &str) -> Option<SourceSpan> {
+        crate::spans::span_for_json_pointer(self.source, self.root, pointer)
+    }
+
+    fn value_span(&self) -> Option<SourceSpan> {
+        self.span_for_pointer(&self.pointer)
+    }
+
+    fn span_for_parent_key(&self, field: &str) -> Option<SourceSpan> {
+        let mut parent = self.segments.clone();
+        if parent
+            .last()
+            .is_some_and(|s| matches!(s, SerdePathSegment::Key(key) if *key == field))
+        {
+            parent.pop();
+        }
+        let parent_pointer = json_pointer_from_segments(&parent);
+        let parent_span = self.span_for_pointer(&parent_pointer)?;
+        crate::spans::span_for_object_key(self.source, parent_span, field)
+    }
+
+    fn span_for_present_field(&self, field: &str) -> Option<SourceSpan> {
+        let mut pointer = self.pointer.clone();
+        pointer.push('/');
+        push_json_pointer_segment(&mut pointer, field);
+        self.span_for_pointer(&pointer)
+    }
+
+    fn object_span_for_value(&self, value_span: &SourceSpan) -> Option<SourceSpan> {
+        if self.segments.is_empty() {
+            return None;
+        }
+
+        let mut parent = self.segments.clone();
+        if matches!(parent.last(), Some(SerdePathSegment::Key(_))) {
+            parent.pop();
+        }
+        let parent_pointer = json_pointer_from_segments(&parent);
+        let parent_span = self.span_for_pointer(&parent_pointer)?;
+
+        if parent_span.offset() <= value_span.offset()
+            && span_end(parent_span) >= span_end(*value_span)
+        {
+            return Some(parent_span);
+        }
+
+        None
     }
 }
 
@@ -356,31 +374,45 @@ enum TokenKind {
     Literal,
 }
 
-fn json5_hint(source: &str, err: &json5::Error) -> Option<Json5Hint> {
-    let code = err.code()?;
-
-    if matches!(
+fn needs_unterminated_string_hint(code: json5::ErrorCode) -> bool {
+    matches!(
         code,
         json5::ErrorCode::EofParsingString | json5::ErrorCode::LineTerminatorInString
-    ) && let Err(TokenizeError::UnterminatedString { start }) = tokenize_json5(source)
-    {
-        return Some(Json5Hint {
-            message: "unterminated string (missing closing quote)".to_string(),
-            span: (start, 1).into(),
-        });
-    }
+    )
+}
 
-    if matches!(
+fn needs_container_hint(code: json5::ErrorCode) -> bool {
+    matches!(
         code,
         json5::ErrorCode::EofParsingArray
             | json5::ErrorCode::EofParsingObject
             | json5::ErrorCode::EofParsingValue
             | json5::ErrorCode::ExpectedClosingBrace
             | json5::ErrorCode::ExpectedClosingBracket
-    ) && let Ok(tokens) = tokenize_json5(source)
-        && let Some(hint) = unclosed_container_hint(&tokens)
-    {
-        return Some(hint);
+    )
+}
+
+fn json5_hint(source: &str, err: &json5::Error) -> Option<Json5Hint> {
+    let code = err.code()?;
+
+    let wants_unterminated = needs_unterminated_string_hint(code);
+    let wants_container = needs_container_hint(code);
+
+    if wants_unterminated || wants_container {
+        match tokenize_json5(source) {
+            Err(TokenizeError::UnterminatedString { start }) if wants_unterminated => {
+                return Some(Json5Hint {
+                    message: "unterminated string (missing closing quote)".to_string(),
+                    span: (start, 1).into(),
+                });
+            }
+            Ok(tokens) if wants_container => {
+                if let Some(hint) = unclosed_container_hint(&tokens) {
+                    return Some(hint);
+                }
+            }
+            _ => {}
+        }
     }
 
     Some(Json5Hint {

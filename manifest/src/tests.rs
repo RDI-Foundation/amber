@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use miette::SourceSpan;
+use miette::{Diagnostic as _, SourceSpan};
 
 use super::*;
 
@@ -1399,6 +1399,95 @@ fn program_used_by_export_is_not_linted() {
 }
 
 #[test]
+fn manifest_spans_capture_program_endpoint_names() {
+    let source = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "example",
+            network: {
+              endpoints: [
+                { name: "http", port: 80 },
+                { name: "admin", port: 8080 },
+              ],
+            },
+          },
+        }
+        "#;
+    let spans = ManifestSpans::parse(source);
+    let program = spans.program.expect("program spans");
+
+    let http_span = program
+        .endpoints
+        .iter()
+        .find(|(name, _)| name.as_ref() == "http")
+        .map(|(_, span)| *span)
+        .expect("http endpoint span");
+    assert_eq!(span_text(source, http_span), "\"http\"");
+
+    let admin_span = program
+        .endpoints
+        .iter()
+        .find(|(name, _)| name.as_ref() == "admin")
+        .map(|(_, span)| *span)
+        .expect("admin endpoint span");
+    assert_eq!(span_text(source, admin_span), "\"admin\"");
+}
+
+#[test]
+fn manifest_doc_error_unknown_export_target_points_to_target() {
+    let source = r#"
+        {
+          manifest_version: "0.1.0",
+          provides: {
+            api: { kind: "http" },
+          },
+          exports: { public: "missing" },
+        }
+        "#;
+    let source: Arc<str> = Arc::from(source);
+    let err = ParsedManifest::parse_named("<test>", Arc::clone(&source)).unwrap_err();
+    assert!(matches!(err.kind, Error::UnknownExportTarget { .. }));
+
+    let labels: Vec<_> = err.labels().expect("labels").collect();
+    let has_target = labels
+        .iter()
+        .any(|label| labeled_span_text(source.as_ref(), label).trim() == "\"missing\"");
+    assert!(has_target);
+}
+
+#[test]
+fn manifest_doc_error_duplicate_binding_target_marks_second_binding() {
+    let source = r#"
+        {
+          manifest_version: "0.1.0",
+          slots: {
+            api: { kind: "http" },
+          },
+          provides: {
+            a: { kind: "http" },
+            b: { kind: "http" },
+          },
+          bindings: [
+            { to: "self.api", from: "self.a" },
+            { to: "self.api", from: "self.b" },
+          ],
+        }
+        "#;
+    let source: Arc<str> = Arc::from(source);
+    let err = ParsedManifest::parse_named("<test>", Arc::clone(&source)).unwrap_err();
+    assert!(matches!(err.kind, Error::DuplicateBindingTarget { .. }));
+
+    let labels: Vec<_> = err.labels().expect("labels").collect();
+    let second = labels
+        .iter()
+        .find(|label| label.label() == Some("second binding here"))
+        .expect("second binding label");
+    let second_text = labeled_span_text(source.as_ref(), second);
+    assert!(second_text.contains("self.b"));
+}
+
+#[test]
 fn exported_provide_is_not_linted() {
     let input = r#"
         {
@@ -1414,6 +1503,18 @@ fn exported_provide_is_not_linted() {
     let manifest = raw.validate().unwrap();
     let lints = lint_for(input, &manifest);
     assert!(lints.is_empty());
+}
+
+fn span_text(source: &str, span: SourceSpan) -> &str {
+    let start = span.offset();
+    let end = start + span.len();
+    source.get(start..end).expect("span within source")
+}
+
+fn labeled_span_text<'a>(source: &'a str, label: &miette::LabeledSpan) -> &'a str {
+    let start = label.offset();
+    let end = start + label.len();
+    source.get(start..end).expect("label span within source")
 }
 
 fn lint_for(input: &str, manifest: &Manifest) -> Vec<lint::ManifestLint> {

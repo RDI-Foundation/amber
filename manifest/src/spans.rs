@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 pub use amber_json5::spans::span_for_json_pointer;
 use amber_json5::spans::span_for_object_key;
 use miette::SourceSpan;
+use serde_json::{Map, Value};
 
 #[derive(Clone, Debug, Default)]
 pub struct ManifestSpans {
@@ -121,310 +122,330 @@ impl BindingTargetKey {
     }
 }
 
+#[derive(Clone, Debug)]
+struct SpanCursor<'a> {
+    source: &'a str,
+    span: SourceSpan,
+}
+
+impl<'a> SpanCursor<'a> {
+    fn new(source: &'a str, span: SourceSpan) -> Self {
+        Self { source, span }
+    }
+
+    fn child_span(&self, key: &str) -> Option<SourceSpan> {
+        span_for_json_pointer(self.source, self.span, &pointer_for_key(key))
+    }
+
+    fn child_cursor(&self, key: &str) -> Option<Self> {
+        Some(Self::new(self.source, self.child_span(key)?))
+    }
+
+    fn index_span(&self, index: usize) -> Option<SourceSpan> {
+        span_for_json_pointer(self.source, self.span, &pointer_for_index(index))
+    }
+
+    fn index_cursor(&self, index: usize) -> Option<Self> {
+        Some(Self::new(self.source, self.index_span(index)?))
+    }
+}
+
+fn default_span() -> SourceSpan {
+    (0usize, 0usize).into()
+}
+
+fn span_or_default(span: Option<SourceSpan>) -> SourceSpan {
+    span.unwrap_or_else(default_span)
+}
+
+fn key_span(source: &str, object_span: SourceSpan, key: &str) -> SourceSpan {
+    span_for_object_key(source, object_span, key).unwrap_or_else(default_span)
+}
+
+fn object_section<'a>(
+    root: &SpanCursor<'a>,
+    root_obj: &'a Map<String, Value>,
+    key: &str,
+) -> Option<(SpanCursor<'a>, &'a Map<String, Value>)> {
+    let value = root_obj.get(key)?;
+    let obj = value.as_object()?;
+    let span = root.child_span(key)?;
+    Some((SpanCursor::new(root.source, span), obj))
+}
+
+fn array_section<'a>(
+    root: &SpanCursor<'a>,
+    root_obj: &'a Map<String, Value>,
+    key: &str,
+) -> Option<(SpanCursor<'a>, &'a Vec<Value>)> {
+    let value = root_obj.get(key)?;
+    let array = value.as_array()?;
+    let span = root.child_span(key)?;
+    Some((SpanCursor::new(root.source, span), array))
+}
+
 pub(crate) fn parse_manifest_spans(source: &str) -> Option<ManifestSpans> {
-    let root_value: serde_json::Value = amber_json5::from_str(source).ok()?;
+    let root_value: Value = amber_json5::from_str(source).ok()?;
     let Some(root_obj) = root_value.as_object() else {
         return Some(ManifestSpans::default());
     };
 
-    let root_span: SourceSpan = (0usize, source.len()).into();
+    let root = SpanCursor::new(source, (0usize, source.len()).into());
     let mut out = ManifestSpans {
-        manifest_version: span_for_json_pointer(source, root_span, "/manifest_version"),
-        config_schema: span_for_json_pointer(source, root_span, "/config_schema"),
+        manifest_version: root.child_span("manifest_version"),
+        config_schema: root.child_span("config_schema"),
         ..ManifestSpans::default()
     };
 
-    if root_obj.get("program").is_some()
-        && let Some(whole) = span_for_json_pointer(source, root_span, "/program")
+    if let Some(program_value) = root_obj.get("program")
+        && let Some(program) = root.child_cursor("program")
     {
-        out.program = Some(extract_program_spans(source, root_span, whole, root_obj));
+        out.program = Some(extract_program_spans(program_value, program));
     }
 
-    if let Some(components_value) = root_obj.get("components")
-        && let Some(components_obj) = components_value.as_object()
-        && let Some(components_span) = span_for_json_pointer(source, root_span, "/components")
-    {
-        for (name, value) in components_obj {
-            let name_span = span_for_object_key(source, components_span, name)
-                .unwrap_or((0usize, 0usize).into());
-            let value_span =
-                span_for_json_pointer(source, root_span, &pointer(["components", name]))
-                    .unwrap_or((0usize, 0usize).into());
+    collect_components(&root, root_obj, &mut out);
+    collect_environments(&root, root_obj, &mut out);
+    collect_slots(&root, root_obj, &mut out);
+    collect_provides(&root, root_obj, &mut out);
+    collect_bindings(&root, root_obj, &mut out);
+    collect_exports(&root, root_obj, &mut out);
 
-            let mut spans = ComponentDeclSpans {
-                name: name_span,
-                whole: value_span,
-                manifest: None,
-                environment: None,
-                config: None,
-            };
+    Some(out)
+}
 
-            match value {
-                serde_json::Value::String(_) => {
-                    spans.manifest = Some(value_span);
-                }
-                serde_json::Value::Object(obj) => {
-                    spans.manifest = obj.get("manifest").and_then(|_| {
-                        span_for_json_pointer(
-                            source,
-                            root_span,
-                            &pointer(["components", name, "manifest"]),
-                        )
-                    });
-                    spans.environment = obj.get("environment").and_then(|_| {
-                        span_for_json_pointer(
-                            source,
-                            root_span,
-                            &pointer(["components", name, "environment"]),
-                        )
-                    });
-                    spans.config = obj.get("config").and_then(|_| {
-                        span_for_json_pointer(
-                            source,
-                            root_span,
-                            &pointer(["components", name, "config"]),
-                        )
-                    });
-                }
-                _ => {}
+fn collect_components(
+    root: &SpanCursor<'_>,
+    root_obj: &Map<String, Value>,
+    out: &mut ManifestSpans,
+) {
+    let Some((components, components_obj)) = object_section(root, root_obj, "components") else {
+        return;
+    };
+
+    for (name, value) in components_obj {
+        let name_span = key_span(root.source, components.span, name);
+        let whole = span_or_default(components.child_span(name));
+        let mut spans = ComponentDeclSpans {
+            name: name_span,
+            whole,
+            manifest: None,
+            environment: None,
+            config: None,
+        };
+
+        match value {
+            Value::String(_) => {
+                spans.manifest = Some(whole);
             }
-
-            out.components.insert(name.as_str().into(), spans);
+            Value::Object(obj) => {
+                let component = SpanCursor::new(root.source, whole);
+                if obj.contains_key("manifest") {
+                    spans.manifest = component.child_span("manifest");
+                }
+                if obj.contains_key("environment") {
+                    spans.environment = component.child_span("environment");
+                }
+                if obj.contains_key("config") {
+                    spans.config = component.child_span("config");
+                }
+            }
+            _ => {}
         }
+
+        out.components.insert(name.as_str().into(), spans);
     }
+}
 
-    if let Some(environments_value) = root_obj.get("environments")
-        && let Some(environments_obj) = environments_value.as_object()
-        && let Some(environments_span) = span_for_json_pointer(source, root_span, "/environments")
-    {
-        for (env_name, env_value) in environments_obj {
-            let env_name_span = span_for_object_key(source, environments_span, env_name)
-                .unwrap_or((0usize, 0usize).into());
-            let env_whole =
-                span_for_json_pointer(source, root_span, &pointer(["environments", env_name]))
-                    .unwrap_or((0usize, 0usize).into());
+fn collect_environments(
+    root: &SpanCursor<'_>,
+    root_obj: &Map<String, Value>,
+    out: &mut ManifestSpans,
+) {
+    let Some((environments, environments_obj)) = object_section(root, root_obj, "environments")
+    else {
+        return;
+    };
 
-            let mut env_spans = EnvironmentSpans {
-                name: env_name_span,
-                whole: env_whole,
-                extends: None,
-                resolvers: Vec::new(),
-            };
+    for (env_name, env_value) in environments_obj {
+        let name_span = key_span(root.source, environments.span, env_name);
+        let whole = span_or_default(environments.child_span(env_name));
+        let mut env_spans = EnvironmentSpans {
+            name: name_span,
+            whole,
+            extends: None,
+            resolvers: Vec::new(),
+        };
 
-            if let serde_json::Value::Object(env_obj) = env_value {
-                env_spans.extends = env_obj.get("extends").and_then(|_| {
-                    span_for_json_pointer(
-                        source,
-                        root_span,
-                        &pointer(["environments", env_name, "extends"]),
-                    )
-                });
-
-                if let Some(resolvers) = env_obj.get("resolvers").and_then(|v| v.as_array()) {
-                    env_spans.resolvers = resolvers
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, v)| {
-                            let s = v.as_str()?;
-                            let span = span_for_json_pointer(
-                                source,
-                                root_span,
-                                &pointer(["environments", env_name, "resolvers", &i.to_string()]),
-                            )?;
-                            Some((s.into(), span))
-                        })
-                        .collect();
-                }
-            }
-
+        let Value::Object(env_obj) = env_value else {
             out.environments.insert(env_name.as_str().into(), env_spans);
+            continue;
+        };
+
+        let env = SpanCursor::new(root.source, whole);
+        if env_obj.contains_key("extends") {
+            env_spans.extends = env.child_span("extends");
         }
+
+        if let Some(resolvers) = env_obj.get("resolvers").and_then(Value::as_array)
+            && let Some(resolver_list) = env.child_cursor("resolvers")
+        {
+            for (idx, resolver) in resolvers.iter().enumerate() {
+                let Some(name) = resolver.as_str() else {
+                    continue;
+                };
+                let Some(span) = resolver_list.index_span(idx) else {
+                    continue;
+                };
+                env_spans.resolvers.push((name.into(), span));
+            }
+        }
+
+        out.environments.insert(env_name.as_str().into(), env_spans);
     }
+}
 
-    if let Some(slots_value) = root_obj.get("slots")
-        && let Some(slots_obj) = slots_value.as_object()
-        && let Some(slots_span) = span_for_json_pointer(source, root_span, "/slots")
-    {
-        out.slots_section = Some(slots_span);
+fn collect_slots(root: &SpanCursor<'_>, root_obj: &Map<String, Value>, out: &mut ManifestSpans) {
+    let Some((slots, slots_obj)) = object_section(root, root_obj, "slots") else {
+        return;
+    };
 
-        for (slot_name, slot_value) in slots_obj {
-            let slot_name_span = span_for_object_key(source, slots_span, slot_name)
-                .unwrap_or((0usize, 0usize).into());
-            let whole = span_for_json_pointer(source, root_span, &pointer(["slots", slot_name]))
-                .unwrap_or((0usize, 0usize).into());
+    out.slots_section = Some(slots.span);
 
-            let mut decl = CapabilityDeclSpans {
-                name: slot_name_span,
+    for (slot_name, slot_value) in slots_obj {
+        let name_span = key_span(root.source, slots.span, slot_name);
+        let whole = span_or_default(slots.child_span(slot_name));
+        let mut decl = CapabilityDeclSpans {
+            name: name_span,
+            whole,
+            kind: None,
+            profile: None,
+        };
+
+        let Value::Object(obj) = slot_value else {
+            out.slots.insert(slot_name.as_str().into(), decl);
+            continue;
+        };
+
+        let slot = SpanCursor::new(root.source, whole);
+        if obj.contains_key("kind") {
+            decl.kind = slot.child_span("kind");
+        }
+        if obj.contains_key("profile") {
+            decl.profile = slot.child_span("profile");
+        }
+
+        out.slots.insert(slot_name.as_str().into(), decl);
+    }
+}
+
+fn collect_provides(root: &SpanCursor<'_>, root_obj: &Map<String, Value>, out: &mut ManifestSpans) {
+    let Some((provides, provides_obj)) = object_section(root, root_obj, "provides") else {
+        return;
+    };
+
+    for (provide_name, provide_value) in provides_obj {
+        let name_span = key_span(root.source, provides.span, provide_name);
+        let whole = span_or_default(provides.child_span(provide_name));
+        let mut provide = ProvideDeclSpans {
+            capability: CapabilityDeclSpans {
+                name: name_span,
                 whole,
                 kind: None,
                 profile: None,
-            };
+            },
+            endpoint: None,
+            endpoint_value: None,
+        };
 
-            if let serde_json::Value::Object(obj) = slot_value {
-                decl.kind = obj.get("kind").and_then(|_| {
-                    span_for_json_pointer(source, root_span, &pointer(["slots", slot_name, "kind"]))
-                });
-                decl.profile = obj.get("profile").and_then(|_| {
-                    span_for_json_pointer(
-                        source,
-                        root_span,
-                        &pointer(["slots", slot_name, "profile"]),
-                    )
-                });
-            }
-
-            out.slots.insert(slot_name.as_str().into(), decl);
-        }
-    }
-
-    if let Some(provides_value) = root_obj.get("provides")
-        && let Some(provides_obj) = provides_value.as_object()
-        && let Some(provides_span) = span_for_json_pointer(source, root_span, "/provides")
-    {
-        for (provide_name, provide_value) in provides_obj {
-            let provide_name_span = span_for_object_key(source, provides_span, provide_name)
-                .unwrap_or((0usize, 0usize).into());
-            let whole =
-                span_for_json_pointer(source, root_span, &pointer(["provides", provide_name]))
-                    .unwrap_or((0usize, 0usize).into());
-
-            let mut provide = ProvideDeclSpans {
-                capability: CapabilityDeclSpans {
-                    name: provide_name_span,
-                    whole,
-                    kind: None,
-                    profile: None,
-                },
-                endpoint: None,
-                endpoint_value: None,
-            };
-
-            if let serde_json::Value::Object(obj) = provide_value {
-                provide.capability.kind = obj.get("kind").and_then(|_| {
-                    span_for_json_pointer(
-                        source,
-                        root_span,
-                        &pointer(["provides", provide_name, "kind"]),
-                    )
-                });
-                provide.capability.profile = obj.get("profile").and_then(|_| {
-                    span_for_json_pointer(
-                        source,
-                        root_span,
-                        &pointer(["provides", provide_name, "profile"]),
-                    )
-                });
-
-                if let Some(endpoint) = obj.get("endpoint") {
-                    provide.endpoint = span_for_json_pointer(
-                        source,
-                        root_span,
-                        &pointer(["provides", provide_name, "endpoint"]),
-                    );
-                    provide.endpoint_value = endpoint.as_str().map(Into::into);
-                }
-            }
-
+        let Value::Object(obj) = provide_value else {
             out.provides.insert(provide_name.as_str().into(), provide);
+            continue;
+        };
+
+        let decl = SpanCursor::new(root.source, whole);
+        if obj.contains_key("kind") {
+            provide.capability.kind = decl.child_span("kind");
         }
+        if obj.contains_key("profile") {
+            provide.capability.profile = decl.child_span("profile");
+        }
+
+        if let Some(endpoint) = obj.get("endpoint") {
+            provide.endpoint = decl.child_span("endpoint");
+            provide.endpoint_value = endpoint.as_str().map(Into::into);
+        }
+
+        out.provides.insert(provide_name.as_str().into(), provide);
     }
+}
 
-    if let Some(bindings_value) = root_obj.get("bindings")
-        && let Some(bindings_array) = bindings_value.as_array()
-    {
-        for (idx, binding_value) in bindings_array.iter().enumerate() {
-            let whole =
-                span_for_json_pointer(source, root_span, &pointer(["bindings", &idx.to_string()]))
-                    .unwrap_or((0usize, 0usize).into());
+fn collect_bindings(root: &SpanCursor<'_>, root_obj: &Map<String, Value>, out: &mut ManifestSpans) {
+    let Some((bindings, bindings_array)) = array_section(root, root_obj, "bindings") else {
+        return;
+    };
 
-            let mut spans = BindingSpans {
-                whole,
-                ..BindingSpans::default()
-            };
+    for (idx, binding_value) in bindings_array.iter().enumerate() {
+        let whole = span_or_default(bindings.index_span(idx));
+        let mut spans = BindingSpans {
+            whole,
+            ..BindingSpans::default()
+        };
 
-            let serde_json::Value::Object(fields) = binding_value else {
-                out.bindings_by_index.push(spans);
-                continue;
-            };
-
-            let get_string = |k: &str| fields.get(k).and_then(|v| v.as_str()).map(Into::into);
-
-            spans.to = fields.get("to").and_then(|_| {
-                span_for_json_pointer(
-                    source,
-                    root_span,
-                    &pointer(["bindings", &idx.to_string(), "to"]),
-                )
-            });
-            spans.to_value = get_string("to");
-
-            spans.from = fields.get("from").and_then(|_| {
-                span_for_json_pointer(
-                    source,
-                    root_span,
-                    &pointer(["bindings", &idx.to_string(), "from"]),
-                )
-            });
-            spans.from_value = get_string("from");
-
-            spans.slot = fields.get("slot").and_then(|_| {
-                span_for_json_pointer(
-                    source,
-                    root_span,
-                    &pointer(["bindings", &idx.to_string(), "slot"]),
-                )
-            });
-            spans.slot_value = get_string("slot");
-
-            spans.capability = fields.get("capability").and_then(|_| {
-                span_for_json_pointer(
-                    source,
-                    root_span,
-                    &pointer(["bindings", &idx.to_string(), "capability"]),
-                )
-            });
-            spans.capability_value = get_string("capability");
-
-            spans.weak = fields.get("weak").and_then(|_| {
-                span_for_json_pointer(
-                    source,
-                    root_span,
-                    &pointer(["bindings", &idx.to_string(), "weak"]),
-                )
-            });
-
-            if let Some(to) = spans.to_value.as_deref() {
-                let slot = spans.slot_value.as_deref();
-                if let Some(key) = crate::binding_target_key_for_binding(to, slot) {
-                    out.bindings.insert(key, spans.clone());
-                }
-            }
-
+        let Value::Object(fields) = binding_value else {
             out.bindings_by_index.push(spans);
-        }
-    }
+            continue;
+        };
 
-    if let Some(exports_value) = root_obj.get("exports")
-        && let Some(exports_obj) = exports_value.as_object()
-        && let Some(exports_span) = span_for_json_pointer(source, root_span, "/exports")
-    {
-        for (export_name, _export_value) in exports_obj {
-            let name_span = span_for_object_key(source, exports_span, export_name)
-                .unwrap_or((0usize, 0usize).into());
-            let target =
-                span_for_json_pointer(source, root_span, &pointer(["exports", export_name]))
-                    .unwrap_or((0usize, 0usize).into());
-            out.exports.insert(
-                export_name.as_str().into(),
-                ExportSpans {
-                    name: name_span,
-                    target,
-                },
-            );
-        }
-    }
+        let binding = SpanCursor::new(root.source, whole);
+        let span_for = |key: &str| {
+            fields
+                .contains_key(key)
+                .then(|| binding.child_span(key))
+                .flatten()
+        };
+        let get_string = |key: &str| fields.get(key).and_then(|v| v.as_str()).map(Into::into);
 
-    Some(out)
+        spans.to = span_for("to");
+        spans.to_value = get_string("to");
+
+        spans.from = span_for("from");
+        spans.from_value = get_string("from");
+
+        spans.slot = span_for("slot");
+        spans.slot_value = get_string("slot");
+
+        spans.capability = span_for("capability");
+        spans.capability_value = get_string("capability");
+
+        spans.weak = span_for("weak");
+
+        if let Some(to) = spans.to_value.as_deref() {
+            let slot = spans.slot_value.as_deref();
+            if let Some(key) = crate::binding_target_key_for_binding(to, slot) {
+                out.bindings.insert(key, spans.clone());
+            }
+        }
+
+        out.bindings_by_index.push(spans);
+    }
+}
+
+fn collect_exports(root: &SpanCursor<'_>, root_obj: &Map<String, Value>, out: &mut ManifestSpans) {
+    let Some((exports, exports_obj)) = object_section(root, root_obj, "exports") else {
+        return;
+    };
+
+    for (export_name, _export_value) in exports_obj {
+        let name_span = key_span(root.source, exports.span, export_name);
+        let target = span_or_default(exports.child_span(export_name));
+        out.exports.insert(
+            export_name.as_str().into(),
+            ExportSpans {
+                name: name_span,
+                target,
+            },
+        );
+    }
 }
 
 impl ManifestSpans {
@@ -436,20 +457,22 @@ impl ManifestSpans {
     }
 }
 
-fn extract_program_spans(
-    source: &str,
-    root_span: SourceSpan,
-    whole: SourceSpan,
-    root_obj: &serde_json::Map<String, serde_json::Value>,
-) -> ProgramSpans {
+fn extract_program_spans(program_value: &Value, program: SpanCursor<'_>) -> ProgramSpans {
     let mut endpoints = Vec::new();
-    let Some(program) = root_obj.get("program") else {
+    let whole = program.span;
+    let Some(program_obj) = program_value.as_object() else {
         return ProgramSpans { whole, endpoints };
     };
-    let Some(network) = program.get("network") else {
+    let Some(network) = program_obj.get("network") else {
         return ProgramSpans { whole, endpoints };
     };
-    let Some(endpoint_array) = network.get("endpoints").and_then(|v| v.as_array()) else {
+    let Some(endpoint_array) = network.get("endpoints").and_then(Value::as_array) else {
+        return ProgramSpans { whole, endpoints };
+    };
+    let Some(network) = program.child_cursor("network") else {
+        return ProgramSpans { whole, endpoints };
+    };
+    let Some(endpoints_span) = network.child_cursor("endpoints") else {
         return ProgramSpans { whole, endpoints };
     };
 
@@ -457,11 +480,10 @@ fn extract_program_spans(
         let Some(name) = endpoint.get("name").and_then(|v| v.as_str()) else {
             continue;
         };
-        let Some(span) = span_for_json_pointer(
-            source,
-            root_span,
-            &pointer(["program", "network", "endpoints", &idx.to_string(), "name"]),
-        ) else {
+        let Some(endpoint_span) = endpoints_span.index_cursor(idx) else {
+            continue;
+        };
+        let Some(span) = endpoint_span.child_span("name") else {
             continue;
         };
         endpoints.push((name.into(), span));
@@ -470,12 +492,18 @@ fn extract_program_spans(
     ProgramSpans { whole, endpoints }
 }
 
-fn pointer<const N: usize>(segments: [&str; N]) -> String {
+fn pointer_for_key(key: &str) -> String {
+    let mut out = String::with_capacity(key.len() + 1);
+    out.push('/');
+    push_json_pointer_segment(&mut out, key);
+    out
+}
+
+fn pointer_for_index(index: usize) -> String {
     let mut out = String::new();
-    for segment in segments {
-        out.push('/');
-        push_json_pointer_segment(&mut out, segment);
-    }
+    out.push('/');
+    use std::fmt::Write as _;
+    let _ = write!(out, "{index}");
     out
 }
 

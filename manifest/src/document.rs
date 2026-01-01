@@ -108,237 +108,44 @@ fn labels_for_manifest_error(err: &ManifestError, spans: &ManifestSpans) -> Vec<
         ManifestError::Json5(parse) => vec![primary(parse.span(), Some(parse.label().to_string()))],
         ManifestError::Json5Path(de) => vec![primary(de.span(), Some(de.label().to_string()))],
         ManifestError::UnsupportedManifestVersion { .. } => vec![primary(
-            spans.manifest_version.unwrap_or((0usize, 0usize).into()),
+            span_or_default(spans.manifest_version),
             Some("unsupported `manifest_version`".to_string()),
         )],
-        ManifestError::InvalidName { kind, name } => {
-            let span = match *kind {
-                "environment" => spans.environments.get(name.as_str()).map(|s| s.name),
-                "child" => spans.components.get(name.as_str()).map(|s| s.name),
-                "slot" => spans.slots.get(name.as_str()).map(|s| s.name),
-                "provide" => spans.provides.get(name.as_str()).map(|s| s.capability.name),
-                "export" => spans.exports.get(name.as_str()).map(|s| s.name),
-                _ => None,
-            };
-            vec![primary(
-                span.unwrap_or((0usize, 0usize).into()),
-                Some("invalid name".to_string()),
-            )]
-        }
+        ManifestError::InvalidName { kind, name } => labels_for_invalid_name(spans, kind, name),
         ManifestError::UnknownExportTarget { export, .. }
         | ManifestError::UnknownExportChild { export, .. } => {
-            let span = spans
-                .exports
-                .get(export.as_str())
-                .map(|s| s.target)
-                .unwrap_or((0usize, 0usize).into());
-            vec![primary(span, Some("export target here".to_string()))]
+            vec![primary(
+                span_or_default(spans.exports.get(export.as_str()).map(|s| s.target)),
+                Some("export target here".to_string()),
+            )]
         }
         ManifestError::AmbiguousCapabilityName { name } => {
-            let mut labels = Vec::new();
-            if let Some(slot) = spans.slots.get(name.as_str()) {
-                labels.push(primary(
-                    slot.name,
-                    Some("declared as a slot here".to_string()),
-                ));
-            }
-            if let Some(provide) = spans.provides.get(name.as_str()) {
-                labels.push(LabeledSpan::new_with_span(
-                    Some("declared as a provide here".to_string()),
-                    provide.capability.name,
-                ));
-            }
-            labels
+            labels_for_ambiguous_capability_name(spans, name)
         }
         ManifestError::DuplicateBindingTarget { to, slot } => {
-            let Some(key) = crate::binding_target_key_for_binding(to, Some(slot.as_str())) else {
-                return vec![primary(
-                    (0usize, 0usize).into(),
-                    Some("duplicate binding target".to_string()),
-                )];
-            };
-
-            let matches: Vec<_> = spans
-                .bindings_by_index
-                .iter()
-                .filter(|b| {
-                    binding_target_key_for_span(b)
-                        .as_ref()
-                        .is_some_and(|k| k == &key)
-                })
-                .map(|b| b.whole)
-                .collect();
-
-            if matches.is_empty() {
-                return vec![primary(
-                    (0usize, 0usize).into(),
-                    Some("duplicate binding target".to_string()),
-                )];
-            }
-
-            if matches.len() == 1 {
-                return vec![primary(
-                    matches[0],
-                    Some("duplicate binding target".to_string()),
-                )];
-            }
-
-            let mut labels = Vec::new();
-            labels.push(primary(matches[1], Some("second binding here".to_string())));
-            labels.push(LabeledSpan::new_with_span(
-                Some("first binding here".to_string()),
-                matches[0],
-            ));
-            for &s in &matches[2..] {
-                labels.push(LabeledSpan::new_with_span(None, s));
-            }
-            labels
+            labels_for_duplicate_binding_target(spans, to, slot)
         }
-        ManifestError::UnknownBindingSlot { slot } => {
-            let needle = slot.as_str();
-            let label = Some("unknown slot referenced here".to_string());
-            let span = spans
-                .bindings
-                .values()
-                .find_map(|b| {
-                    (b.slot_value.as_deref() == Some(needle))
-                        .then_some(b.slot.or(b.to).or(Some(b.whole)))
-                        .flatten()
-                })
-                .unwrap_or((0usize, 0usize).into());
-            vec![primary(span, label)]
-        }
+        ManifestError::UnknownBindingSlot { slot } => labels_for_unknown_binding_slot(spans, slot),
         ManifestError::UnknownBindingProvide { capability } => {
-            let needle = capability.as_str();
-            let label = Some("unknown provide referenced here".to_string());
-            let span = spans
-                .bindings
-                .values()
-                .find_map(|b| {
-                    if b.capability_value.as_deref() == Some(needle) {
-                        return b.capability.or(b.from).or(Some(b.whole));
-                    }
-                    if b.from_value
-                        .as_deref()
-                        .and_then(|from| from.strip_prefix("self."))
-                        .is_some_and(|name| name == needle)
-                    {
-                        return b.from.or(Some(b.whole));
-                    }
-                    None
-                })
-                .unwrap_or((0usize, 0usize).into());
-            vec![primary(span, label)]
+            labels_for_unknown_binding_provide(spans, capability)
         }
         ManifestError::UnknownBindingChild { child } => {
-            let needle = format!("#{child}");
-            let needle_dot = format!("{needle}.");
-            let span = spans
-                .bindings
-                .values()
-                .find_map(|b| {
-                    if b.to_value.as_deref() == Some(needle.as_str())
-                        || b.to_value
-                            .as_deref()
-                            .is_some_and(|to| to.starts_with(&needle_dot))
-                    {
-                        return b.to.or(Some(b.whole));
-                    }
-                    if b.from_value.as_deref() == Some(needle.as_str())
-                        || b.from_value
-                            .as_deref()
-                            .is_some_and(|from| from.starts_with(&needle_dot))
-                    {
-                        return b.from.or(Some(b.whole));
-                    }
-                    None
-                })
-                .unwrap_or((0usize, 0usize).into());
-            vec![primary(
-                span,
-                Some("unknown child referenced here".to_string()),
-            )]
+            labels_for_unknown_binding_child(spans, child)
         }
         ManifestError::DuplicateEndpointName { name } => {
-            let Some(program) = &spans.program else {
-                return Vec::new();
-            };
-
-            let matches: Vec<_> = program
-                .endpoints
-                .iter()
-                .filter_map(|(n, s)| (n.as_ref() == name).then_some(*s))
-                .collect();
-
-            if matches.is_empty() {
-                return Vec::new();
-            }
-
-            let mut labels = Vec::new();
-            let (primary_span, rest) = matches
-                .get(1)
-                .copied()
-                .map(|s| (s, &matches[..]))
-                .unwrap_or((matches[0], &matches[..]));
-            labels.push(primary(
-                primary_span,
-                Some("duplicate endpoint name".to_string()),
-            ));
-            for &s in rest {
-                if s == primary_span {
-                    continue;
-                }
-                labels.push(LabeledSpan::new_with_span(None, s));
-            }
-            labels
+            labels_for_duplicate_endpoint_name(spans, name)
         }
-        ManifestError::UnknownEndpoint { name } => {
-            let span = spans
-                .provides
-                .values()
-                .find_map(|p| {
-                    (p.endpoint_value.as_deref() == Some(name.as_str()))
-                        .then_some(p.endpoint)
-                        .flatten()
-                })
-                .unwrap_or_else(|| {
-                    spans
-                        .program
-                        .as_ref()
-                        .map(|p| p.whole)
-                        .unwrap_or((0usize, 0usize).into())
-                });
-            vec![primary(
-                span,
-                Some("unknown endpoint referenced here".to_string()),
-            )]
-        }
+        ManifestError::UnknownEndpoint { name } => labels_for_unknown_endpoint(spans, name),
         ManifestError::InvalidConfigSchema(_) => vec![primary(
-            spans.config_schema.unwrap_or((0usize, 0usize).into()),
+            span_or_default(spans.config_schema),
             Some("invalid schema here".to_string()),
         )],
         ManifestError::UnknownEnvironmentExtends { name, .. } => {
-            let env = spans.environments.get(name.as_str());
-            let span = env
-                .and_then(|e| e.extends)
-                .unwrap_or((0usize, 0usize).into());
-            vec![primary(span, Some("unknown environment here".to_string()))]
+            labels_for_unknown_environment_extends(spans, name)
         }
-        ManifestError::EnvironmentCycle { name } => {
-            let env = spans.environments.get(name.as_str());
-            let span = env.map(|e| e.name).unwrap_or((0usize, 0usize).into());
-            vec![primary(span, Some("cycle originates here".to_string()))]
-        }
+        ManifestError::EnvironmentCycle { name } => labels_for_environment_cycle(spans, name),
         ManifestError::UnknownComponentEnvironment { child, .. } => {
-            let span = spans
-                .components
-                .get(child.as_str())
-                .and_then(|c| c.environment.or(Some(c.name)))
-                .unwrap_or((0usize, 0usize).into());
-            vec![primary(
-                span,
-                Some("unknown environment referenced here".to_string()),
-            )]
+            labels_for_unknown_component_environment(spans, child)
         }
         _ => Vec::new(),
     }
@@ -356,6 +163,245 @@ fn help_for_manifest_error(err: &ManifestError) -> Option<String> {
 
 fn primary(span: SourceSpan, label: Option<String>) -> LabeledSpan {
     LabeledSpan::new_primary_with_span(label, span)
+}
+
+fn span_or_default(span: Option<SourceSpan>) -> SourceSpan {
+    span.unwrap_or_else(default_span)
+}
+
+fn default_span() -> SourceSpan {
+    (0usize, 0usize).into()
+}
+
+fn labels_for_invalid_name(
+    spans: &ManifestSpans,
+    kind: &'static str,
+    name: &str,
+) -> Vec<LabeledSpan> {
+    let span = match kind {
+        "environment" => spans.environments.get(name).map(|s| s.name),
+        "child" => spans.components.get(name).map(|s| s.name),
+        "slot" => spans.slots.get(name).map(|s| s.name),
+        "provide" => spans.provides.get(name).map(|s| s.capability.name),
+        "export" => spans.exports.get(name).map(|s| s.name),
+        _ => None,
+    };
+    vec![primary(
+        span_or_default(span),
+        Some("invalid name".to_string()),
+    )]
+}
+
+fn labels_for_ambiguous_capability_name(spans: &ManifestSpans, name: &str) -> Vec<LabeledSpan> {
+    let mut labels = Vec::new();
+    if let Some(slot) = spans.slots.get(name) {
+        labels.push(primary(
+            slot.name,
+            Some("declared as a slot here".to_string()),
+        ));
+    }
+    if let Some(provide) = spans.provides.get(name) {
+        labels.push(LabeledSpan::new_with_span(
+            Some("declared as a provide here".to_string()),
+            provide.capability.name,
+        ));
+    }
+    labels
+}
+
+fn labels_for_duplicate_binding_target(
+    spans: &ManifestSpans,
+    to: &str,
+    slot: &str,
+) -> Vec<LabeledSpan> {
+    let Some(key) = crate::binding_target_key_for_binding(to, Some(slot)) else {
+        return vec![primary(
+            default_span(),
+            Some("duplicate binding target".to_string()),
+        )];
+    };
+
+    let matches: Vec<_> = spans
+        .bindings_by_index
+        .iter()
+        .filter(|b| {
+            binding_target_key_for_span(b)
+                .as_ref()
+                .is_some_and(|k| k == &key)
+        })
+        .map(|b| b.whole)
+        .collect();
+
+    match matches.as_slice() {
+        [] => vec![primary(
+            default_span(),
+            Some("duplicate binding target".to_string()),
+        )],
+        [only] => vec![primary(*only, Some("duplicate binding target".to_string()))],
+        [first, second, rest @ ..] => {
+            let mut labels = Vec::new();
+            labels.push(primary(*second, Some("second binding here".to_string())));
+            labels.push(LabeledSpan::new_with_span(
+                Some("first binding here".to_string()),
+                *first,
+            ));
+            for span in rest {
+                labels.push(LabeledSpan::new_with_span(None, *span));
+            }
+            labels
+        }
+    }
+}
+
+fn binding_span_or_default(
+    spans: &ManifestSpans,
+    choose: impl FnMut(&crate::BindingSpans) -> Option<SourceSpan>,
+) -> SourceSpan {
+    spans
+        .bindings
+        .values()
+        .find_map(choose)
+        .unwrap_or_else(default_span)
+}
+
+fn labels_for_unknown_binding_slot(spans: &ManifestSpans, slot: &str) -> Vec<LabeledSpan> {
+    let span = binding_span_or_default(spans, |binding| {
+        (binding.slot_value.as_deref() == Some(slot))
+            .then_some(binding.slot.or(binding.to).or(Some(binding.whole)))
+            .flatten()
+    });
+    vec![primary(
+        span,
+        Some("unknown slot referenced here".to_string()),
+    )]
+}
+
+fn labels_for_unknown_binding_provide(spans: &ManifestSpans, capability: &str) -> Vec<LabeledSpan> {
+    let span = binding_span_or_default(spans, |binding| {
+        if binding.capability_value.as_deref() == Some(capability) {
+            return binding.capability.or(binding.from).or(Some(binding.whole));
+        }
+        if binding
+            .from_value
+            .as_deref()
+            .and_then(|from| from.strip_prefix("self."))
+            .is_some_and(|name| name == capability)
+        {
+            return binding.from.or(Some(binding.whole));
+        }
+        None
+    });
+    vec![primary(
+        span,
+        Some("unknown provide referenced here".to_string()),
+    )]
+}
+
+fn labels_for_unknown_binding_child(spans: &ManifestSpans, child: &str) -> Vec<LabeledSpan> {
+    let needle = format!("#{child}");
+    let needle_dot = format!("{needle}.");
+    let span = binding_span_or_default(spans, |binding| {
+        if binding.to_value.as_deref() == Some(needle.as_str())
+            || binding
+                .to_value
+                .as_deref()
+                .is_some_and(|to| to.starts_with(&needle_dot))
+        {
+            return binding.to.or(Some(binding.whole));
+        }
+        if binding.from_value.as_deref() == Some(needle.as_str())
+            || binding
+                .from_value
+                .as_deref()
+                .is_some_and(|from| from.starts_with(&needle_dot))
+        {
+            return binding.from.or(Some(binding.whole));
+        }
+        None
+    });
+    vec![primary(
+        span,
+        Some("unknown child referenced here".to_string()),
+    )]
+}
+
+fn labels_for_duplicate_endpoint_name(spans: &ManifestSpans, name: &str) -> Vec<LabeledSpan> {
+    let Some(program) = &spans.program else {
+        return Vec::new();
+    };
+
+    let matches: Vec<_> = program
+        .endpoints
+        .iter()
+        .filter_map(|(n, s)| (n.as_ref() == name).then_some(*s))
+        .collect();
+
+    match matches.as_slice() {
+        [] => Vec::new(),
+        [only] => vec![primary(*only, Some("duplicate endpoint name".to_string()))],
+        [first, second, rest @ ..] => {
+            let mut labels = Vec::new();
+            labels.push(primary(
+                *second,
+                Some("duplicate endpoint name".to_string()),
+            ));
+            labels.push(LabeledSpan::new_with_span(None, *first));
+            for span in rest {
+                if *span == *second {
+                    continue;
+                }
+                labels.push(LabeledSpan::new_with_span(None, *span));
+            }
+            labels
+        }
+    }
+}
+
+fn labels_for_unknown_endpoint(spans: &ManifestSpans, name: &str) -> Vec<LabeledSpan> {
+    let span = spans
+        .provides
+        .values()
+        .find_map(|p| {
+            (p.endpoint_value.as_deref() == Some(name))
+                .then_some(p.endpoint)
+                .flatten()
+        })
+        .or_else(|| spans.program.as_ref().map(|p| p.whole))
+        .unwrap_or_else(default_span);
+    vec![primary(
+        span,
+        Some("unknown endpoint referenced here".to_string()),
+    )]
+}
+
+fn labels_for_unknown_environment_extends(spans: &ManifestSpans, name: &str) -> Vec<LabeledSpan> {
+    let span = spans.environments.get(name).and_then(|e| e.extends);
+    vec![primary(
+        span_or_default(span),
+        Some("unknown environment here".to_string()),
+    )]
+}
+
+fn labels_for_environment_cycle(spans: &ManifestSpans, name: &str) -> Vec<LabeledSpan> {
+    let span = spans.environments.get(name).map(|e| e.name);
+    vec![primary(
+        span_or_default(span),
+        Some("cycle originates here".to_string()),
+    )]
+}
+
+fn labels_for_unknown_component_environment(
+    spans: &ManifestSpans,
+    child: &str,
+) -> Vec<LabeledSpan> {
+    let span = spans
+        .components
+        .get(child)
+        .and_then(|c| c.environment.or(Some(c.name)));
+    vec![primary(
+        span_or_default(span),
+        Some("unknown environment referenced here".to_string()),
+    )]
 }
 
 fn binding_target_key_for_span(span: &crate::BindingSpans) -> Option<crate::BindingTargetKey> {
