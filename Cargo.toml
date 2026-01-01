@@ -10,6 +10,21 @@ members = [
 ]
 resolver = "2"
 
+[workspace.dependencies]
+amber-compiler = { path = "compiler" }
+amber-json5 = { path = "json5" }
+amber-manifest = { path = "manifest" }
+amber-resolver = { path = "resolver" }
+amber-scenario = { path = "scenario" }
+futures = "0.3.31"
+jsonschema = { version = "0.38.1", default-features = false }
+miette = "7.4.0"
+serde = "1.0.217"
+serde_json = "1.0.148"
+thiserror = "2.0.9"
+tokio = "1.48.0"
+url = "2.5.7"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-amber-manifest = { path = "../manifest" }
-serde_json = "1.0.148"
-thiserror = "2.0.9"
+amber-manifest = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

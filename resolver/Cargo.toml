@@ -4,13 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-amber-manifest = { path = "../manifest" }
-futures = "0.3.31"
-miette = { version = "7.4.0", features = ["derive"] }
+amber-manifest = { workspace = true }
+futures = { workspace = true }
+miette = { workspace = true, features = ["derive"] }
 reqwest = { version = "0.13.1", default-features = false, features = ["rustls", "stream"] }
-thiserror = "2.0.9"
-tokio = { version = "1.48.0", features = ["fs"] }
-url = "2.5.7"
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+url = { workspace = true }
 
 [dev-dependencies]
-tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
