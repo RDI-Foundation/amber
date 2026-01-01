@@ -741,6 +741,203 @@ struct BindingOrigin {
     target_key: BindingTargetKey,
 }
 
+struct ResolvedBindingTarget {
+    slot_ref: SlotRef,
+    slot_decl: CapabilityDecl,
+}
+
+struct ResolvedBindingSource {
+    provide_ref: ProvideRef,
+    provide_decl: CapabilityDecl,
+}
+
+fn push_error<T>(errors: &mut Vec<Error>, res: Result<T, Error>) -> Option<T> {
+    match res {
+        Ok(value) => Some(value),
+        Err(err) => {
+            errors.push(err);
+            None
+        }
+    }
+}
+
+fn resolve_binding_target(
+    components: &[Component],
+    manifests: &[Arc<Manifest>],
+    site: BindingErrorSite<'_>,
+    target: &BindingTarget,
+) -> Result<ResolvedBindingTarget, Error> {
+    match target {
+        BindingTarget::SelfSlot(slot_name) => {
+            let to_id = site.realm;
+            let to_manifest = &manifests[to_id.0];
+            let slot_decl = to_manifest.slots().get(slot_name).ok_or_else(|| {
+                site.unknown_slot(to_id, slot_name.as_str(), to_manifest.as_ref())
+            })?;
+            let slot_name = slot_name.to_string();
+            Ok(ResolvedBindingTarget {
+                slot_ref: SlotRef {
+                    component: to_id,
+                    name: slot_name.clone(),
+                },
+                slot_decl: slot_decl.decl.clone(),
+            })
+        }
+        BindingTarget::ChildSlot { child, slot } => {
+            let to_id = child_component_id(components, site.realm, child)?;
+            let to_manifest = &manifests[to_id.0];
+            let slot_decl = to_manifest
+                .slots()
+                .get(slot.as_str())
+                .ok_or_else(|| site.unknown_slot(to_id, slot.as_str(), to_manifest.as_ref()))?;
+            let slot_name = slot.to_string();
+            Ok(ResolvedBindingTarget {
+                slot_ref: SlotRef {
+                    component: to_id,
+                    name: slot_name.clone(),
+                },
+                slot_decl: slot_decl.decl.clone(),
+            })
+        }
+        _ => Err(Error::UnsupportedManifestFeature {
+            component_path: component_path_for(components, site.realm),
+            feature: "binding target",
+        }),
+    }
+}
+
+fn resolve_binding_source(
+    components: &[Component],
+    manifests: &[Arc<Manifest>],
+    provenance: &Provenance,
+    store: &DigestStore,
+    realm: ComponentId,
+    target_key: &BindingTargetKey,
+    source: &BindingSource,
+) -> Result<ResolvedBindingSource, Error> {
+    match source {
+        BindingSource::SelfProvide(provide_name) => {
+            let from_id = realm;
+            let from_manifest = &manifests[from_id.0];
+            let provide_decl = from_manifest
+                .provides()
+                .get(provide_name)
+                .ok_or_else(|| unknown_provide_error(components, from_id, provide_name.as_str()))?;
+            Ok(ResolvedBindingSource {
+                provide_ref: ProvideRef {
+                    component: from_id,
+                    name: provide_name.to_string(),
+                },
+                provide_decl: provide_decl.decl.clone(),
+            })
+        }
+        BindingSource::ChildExport { child, export } => {
+            let from_id = child_component_id(components, realm, child)?;
+            let resolved = resolve_export(components, manifests, from_id, export).map_err(
+                |err| match err {
+                    Error::NotExported {
+                        component_path,
+                        name,
+                        help,
+                        ..
+                    } => {
+                        let (src, span) = binding_source_site(provenance, store, realm, target_key)
+                            .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                        Error::NotExported {
+                            component_path,
+                            name,
+                            help,
+                            src: Some(src),
+                            span: Some(span),
+                        }
+                    }
+                    other => other,
+                },
+            )?;
+            Ok(ResolvedBindingSource {
+                provide_ref: ProvideRef {
+                    component: resolved.component,
+                    name: resolved.name,
+                },
+                provide_decl: resolved.decl,
+            })
+        }
+        _ => Err(Error::UnsupportedManifestFeature {
+            component_path: component_path_for(components, realm),
+            feature: "binding source",
+        }),
+    }
+}
+
+fn type_mismatch_error(
+    components: &[Component],
+    provenance: &Provenance,
+    store: &DigestStore,
+    realm: ComponentId,
+    target_key: &BindingTargetKey,
+    target: ResolvedBindingTarget,
+    source: ResolvedBindingSource,
+) -> Error {
+    let ResolvedBindingTarget {
+        slot_ref,
+        slot_decl,
+    } = target;
+    let ResolvedBindingSource {
+        provide_ref,
+        provide_decl,
+    } = source;
+    let (src, span) = binding_site(provenance, store, realm, target_key)
+        .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+
+    let mut related = Vec::new();
+
+    let to_id = slot_ref.component;
+    let slot_name = slot_ref.name.as_str();
+    if let Some((slot_src, slot_spans)) = source_for_component(provenance, store, to_id)
+        && let Some(slot_decl_spans) = slot_spans.slots.get(slot_name)
+    {
+        let span = slot_decl_spans.kind.unwrap_or(slot_decl_spans.whole);
+        related.push(RelatedSpan {
+            message: format!(
+                "slot `{}` declared on {}",
+                slot_name,
+                component_path_for(components, to_id)
+            ),
+            src: slot_src,
+            span,
+            label: "slot type declared here".to_string(),
+        });
+    }
+
+    if let Some((provide_src, provide_spans)) =
+        source_for_component(provenance, store, provide_ref.component)
+    {
+        let provide_name = provide_ref.name.as_str();
+        if let Some(p) = provide_spans.provides.get(provide_name) {
+            let span = p.capability.kind.unwrap_or(p.capability.whole);
+            related.push(RelatedSpan {
+                message: format!(
+                    "provide `{provide_name}` declared on {}",
+                    component_path_for(components, provide_ref.component)
+                ),
+                src: provide_src,
+                span,
+                label: "provide type declared here".to_string(),
+            });
+        }
+    }
+
+    Error::TypeMismatch {
+        to_component_path: component_path_for(components, to_id),
+        slot: slot_ref.name,
+        expected: slot_decl,
+        got: provide_decl,
+        src,
+        span,
+        related,
+    }
+}
+
 fn resolve_bindings(
     components: &[Component],
     manifests: &[Arc<Manifest>],
@@ -763,197 +960,45 @@ fn resolve_bindings(
                 realm,
                 target_key: &target_key,
             };
-            let (slot_ref, slot_decl, to_id, slot_name_for_err) = match target {
-                BindingTarget::SelfSlot(slot_name) => {
-                    let to_id = realm;
-                    let to_manifest = &manifests[to_id.0];
-                    let slot_decl = to_manifest.slots().get(slot_name).ok_or_else(|| {
-                        site.unknown_slot(to_id, slot_name.as_str(), to_manifest.as_ref())
-                    });
-                    let slot_decl = match slot_decl {
-                        Ok(slot_decl) => slot_decl,
-                        Err(err) => {
-                            errors.push(err);
-                            continue;
-                        }
-                    };
-                    let slot_name = slot_name.to_string();
-                    (
-                        SlotRef {
-                            component: to_id,
-                            name: slot_name.clone(),
-                        },
-                        slot_decl.decl.clone(),
-                        to_id,
-                        slot_name,
-                    )
-                }
-                BindingTarget::ChildSlot { child, slot } => {
-                    let to_id = match child_component_id(components, realm, child) {
-                        Ok(id) => id,
-                        Err(err) => {
-                            errors.push(err);
-                            continue;
-                        }
-                    };
-                    let to_manifest = &manifests[to_id.0];
-                    let slot_decl = to_manifest.slots().get(slot.as_str()).ok_or_else(|| {
-                        site.unknown_slot(to_id, slot.as_str(), to_manifest.as_ref())
-                    });
-                    let slot_decl = match slot_decl {
-                        Ok(slot_decl) => slot_decl,
-                        Err(err) => {
-                            errors.push(err);
-                            continue;
-                        }
-                    };
-                    let slot_name = slot.to_string();
-                    (
-                        SlotRef {
-                            component: to_id,
-                            name: slot_name.clone(),
-                        },
-                        slot_decl.decl.clone(),
-                        to_id,
-                        slot_name,
-                    )
-                }
-                _ => {
-                    errors.push(Error::UnsupportedManifestFeature {
-                        component_path: component_path_for(components, realm),
-                        feature: "binding target",
-                    });
-                    continue;
-                }
+            let target = match push_error(
+                errors,
+                resolve_binding_target(components, manifests, site, target),
+            ) {
+                Some(target) => target,
+                None => continue,
+            };
+            let source = match push_error(
+                errors,
+                resolve_binding_source(
+                    components,
+                    manifests,
+                    provenance,
+                    store,
+                    realm,
+                    &target_key,
+                    &binding.from,
+                ),
+            ) {
+                Some(source) => source,
+                None => continue,
             };
 
-            let (provide_ref, provide_decl) = match &binding.from {
-                BindingSource::SelfProvide(provide_name) => {
-                    let from_id = realm;
-                    let from_manifest = &manifests[from_id.0];
-                    let provide_decl =
-                        from_manifest.provides().get(provide_name).ok_or_else(|| {
-                            unknown_provide_error(components, from_id, provide_name.as_str())
-                        });
-                    let provide_decl = match provide_decl {
-                        Ok(provide_decl) => provide_decl,
-                        Err(err) => {
-                            errors.push(err);
-                            continue;
-                        }
-                    };
-                    (
-                        ProvideRef {
-                            component: from_id,
-                            name: provide_name.to_string(),
-                        },
-                        provide_decl.decl.clone(),
-                    )
-                }
-                BindingSource::ChildExport { child, export } => {
-                    let from_id = match child_component_id(components, realm, child) {
-                        Ok(id) => id,
-                        Err(err) => {
-                            errors.push(err);
-                            continue;
-                        }
-                    };
-                    let resolved = resolve_export(components, manifests, from_id, export);
-                    let ResolvedExport {
-                        component,
-                        name,
-                        decl,
-                    } = match resolved {
-                        Ok(resolved) => resolved,
-                        Err(Error::NotExported {
-                            component_path,
-                            name,
-                            help,
-                            ..
-                        }) => {
-                            let (src, span) =
-                                binding_source_site(provenance, store, realm, &target_key)
-                                    .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
-                            errors.push(Error::NotExported {
-                                component_path,
-                                name,
-                                help,
-                                src: Some(src),
-                                span: Some(span),
-                            });
-                            continue;
-                        }
-                        Err(other) => {
-                            errors.push(other);
-                            continue;
-                        }
-                    };
-                    (ProvideRef { component, name }, decl)
-                }
-                _ => {
-                    errors.push(Error::UnsupportedManifestFeature {
-                        component_path: component_path_for(components, realm),
-                        feature: "binding source",
-                    });
-                    continue;
-                }
-            };
-
-            if slot_decl != provide_decl {
-                let (src, span) = binding_site(provenance, store, realm, &target_key)
-                    .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
-
-                let mut related = Vec::new();
-
-                if let Some((slot_src, slot_spans)) = source_for_component(provenance, store, to_id)
-                    && let Some(slot_decl_spans) = slot_spans.slots.get(slot_name_for_err.as_str())
-                {
-                    let span = slot_decl_spans.kind.unwrap_or(slot_decl_spans.whole);
-                    related.push(RelatedSpan {
-                        message: format!(
-                            "slot `{}` declared on {}",
-                            slot_name_for_err,
-                            component_path_for(components, to_id)
-                        ),
-                        src: slot_src,
-                        span,
-                        label: "slot type declared here".to_string(),
-                    });
-                }
-
-                if let Some((provide_src, provide_spans)) =
-                    source_for_component(provenance, store, provide_ref.component)
-                {
-                    let provide_name = provide_ref.name.as_str();
-                    if let Some(p) = provide_spans.provides.get(provide_name) {
-                        let span = p.capability.kind.unwrap_or(p.capability.whole);
-                        related.push(RelatedSpan {
-                            message: format!(
-                                "provide `{provide_name}` declared on {}",
-                                component_path_for(components, provide_ref.component)
-                            ),
-                            src: provide_src,
-                            span,
-                            label: "provide type declared here".to_string(),
-                        });
-                    }
-                }
-
-                errors.push(Error::TypeMismatch {
-                    to_component_path: component_path_for(components, to_id),
-                    slot: slot_name_for_err,
-                    expected: slot_decl,
-                    got: provide_decl,
-                    src,
-                    span,
-                    related,
-                });
+            if target.slot_decl != source.provide_decl {
+                errors.push(type_mismatch_error(
+                    components,
+                    provenance,
+                    store,
+                    realm,
+                    &target_key,
+                    target,
+                    source,
+                ));
                 continue;
             }
 
             edges.push(BindingEdge {
-                from: provide_ref,
-                to: slot_ref,
+                from: source.provide_ref,
+                to: target.slot_ref,
                 weak: binding.weak,
             });
             origins.push(BindingOrigin { realm, target_key });
