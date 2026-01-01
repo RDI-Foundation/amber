@@ -13,6 +13,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use amber_json5::DiagnosticError;
 use base64::Engine;
 pub use document::{ManifestDocError, ParsedManifest};
 use miette::Diagnostic;
@@ -31,13 +32,13 @@ use url::{ParseError, Url};
 #[derive(Debug, Error, Diagnostic)]
 #[non_exhaustive]
 pub enum Error {
-    #[error("json5 parse error: {0}")]
+    #[error("{0}")]
     #[diagnostic(code(manifest::json5_error))]
-    Json5(#[from] json5::Error),
+    Json5(DiagnosticError),
 
-    #[error("json5 deserialize error: {0}")]
+    #[error("{0}")]
     #[diagnostic(code(manifest::deserialize_error))]
-    Json5Path(#[from] serde_path_to_error::Error<json5::Error>),
+    Json5Path(DiagnosticError),
 
     #[error("io error: {0}")]
     #[diagnostic(code(manifest::io_error))]
@@ -134,38 +135,6 @@ pub enum Error {
     #[error("component `#{child}` references unknown environment `{environment}`")]
     #[diagnostic(code(manifest::unknown_component_environment))]
     UnknownComponentEnvironment { child: String, environment: String },
-}
-
-pub(crate) fn json5_error_is_parse(code: json5::ErrorCode) -> bool {
-    use json5::ErrorCode::*;
-
-    matches!(
-        code,
-        EofParsingArray
-            | EofParsingBool
-            | EofParsingComment
-            | EofParsingEscapeSequence
-            | EofParsingIdentifier
-            | EofParsingNull
-            | EofParsingNumber
-            | EofParsingObject
-            | EofParsingString
-            | EofParsingValue
-            | ExpectedClosingBrace
-            | ExpectedClosingBracket
-            | ExpectedColon
-            | ExpectedComma
-            | ExpectedComment
-            | ExpectedIdentifier
-            | ExpectedValue
-            | InvalidBytes
-            | InvalidEscapeSequence
-            | InvalidKey
-            | LeadingZero
-            | LineTerminatorInString
-            | OverflowParsingNumber
-            | TrailingCharacters
-    )
 }
 
 macro_rules! name_type {
@@ -1748,14 +1717,10 @@ impl FromStr for Manifest {
     type Err = Error;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        let mut deserializer = json5::Deserializer::from_str(input);
-        let raw: RawManifest =
-            serde_path_to_error::deserialize(&mut deserializer).map_err(|e| {
-                match e.inner().code() {
-                    Some(code) if json5_error_is_parse(code) => Error::Json5(e.into_inner()),
-                    _ => Error::Json5Path(e),
-                }
-            })?;
+        let raw: RawManifest = amber_json5::parse(input).map_err(|e| match e.kind() {
+            amber_json5::DiagnosticKind::Parse => Error::Json5(e),
+            amber_json5::DiagnosticKind::Deserialize => Error::Json5Path(e),
+        })?;
         raw.validate()
     }
 }

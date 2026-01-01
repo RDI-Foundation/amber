@@ -2,10 +2,11 @@
 members = [
   "cli",
   "compiler",
+  "json5",
   "manifest",
+  "node",
   "resolver",
   "scenario",
-  "node",
 ]
 resolver = "2"
 

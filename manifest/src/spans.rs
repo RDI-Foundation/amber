@@ -1,12 +1,8 @@
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
+pub use amber_json5::spans::span_for_json_pointer;
+use amber_json5::spans::span_for_object_key;
 use miette::SourceSpan;
-use pest::Parser as _;
-use pest_derive::Parser;
-
-#[derive(Parser)]
-#[grammar = "json5.pest"]
-struct Json5Parser;
 
 #[derive(Clone, Debug, Default)]
 pub struct ManifestSpans {
@@ -126,32 +122,306 @@ impl BindingTargetKey {
 }
 
 pub(crate) fn parse_manifest_spans(source: &str) -> Option<ManifestSpans> {
-    let mut pairs = Json5Parser::parse(Rule::text, source).ok()?;
-    let root = pairs.next()?;
-    if root.as_rule() != Rule::object {
+    let root_value: serde_json::Value = amber_json5::from_str(source).ok()?;
+    let Some(root_obj) = root_value.as_object() else {
         return Some(ManifestSpans::default());
+    };
+
+    let root_span: SourceSpan = (0usize, source.len()).into();
+    let mut out = ManifestSpans {
+        manifest_version: span_for_json_pointer(source, root_span, "/manifest_version"),
+        config_schema: span_for_json_pointer(source, root_span, "/config_schema"),
+        ..ManifestSpans::default()
+    };
+
+    if root_obj.get("program").is_some()
+        && let Some(whole) = span_for_json_pointer(source, root_span, "/program")
+    {
+        out.program = Some(extract_program_spans(source, root_span, whole, root_obj));
     }
 
-    let mut out = ManifestSpans::default();
-    for (key, key_span, value) in object_fields(root) {
-        match key.as_ref() {
-            "manifest_version" => out.manifest_version = Some(span(&value)),
-            "program" => out.program = Some(extract_program(value)),
-            "config_schema" => out.config_schema = Some(span(&value)),
-            "components" => extract_components(&mut out, value),
-            "environments" => extract_environments(&mut out, value),
-            "slots" => {
-                out.slots_section = Some(span(&value));
-                extract_slots(&mut out, value);
-            }
-            "provides" => extract_provides(&mut out, value),
-            "bindings" => extract_bindings(&mut out, value),
-            "exports" => extract_exports(&mut out, value),
-            _ => {}
-        }
+    if let Some(components_value) = root_obj.get("components")
+        && let Some(components_obj) = components_value.as_object()
+        && let Some(components_span) = span_for_json_pointer(source, root_span, "/components")
+    {
+        for (name, value) in components_obj {
+            let name_span = span_for_object_key(source, components_span, name)
+                .unwrap_or((0usize, 0usize).into());
+            let value_span =
+                span_for_json_pointer(source, root_span, &pointer(["components", name]))
+                    .unwrap_or((0usize, 0usize).into());
 
-        // Keep lint spans stable even if key is ignored.
-        let _ = key_span;
+            let mut spans = ComponentDeclSpans {
+                name: name_span,
+                whole: value_span,
+                manifest: None,
+                environment: None,
+                config: None,
+            };
+
+            match value {
+                serde_json::Value::String(_) => {
+                    spans.manifest = Some(value_span);
+                }
+                serde_json::Value::Object(obj) => {
+                    spans.manifest = obj.get("manifest").and_then(|_| {
+                        span_for_json_pointer(
+                            source,
+                            root_span,
+                            &pointer(["components", name, "manifest"]),
+                        )
+                    });
+                    spans.environment = obj.get("environment").and_then(|_| {
+                        span_for_json_pointer(
+                            source,
+                            root_span,
+                            &pointer(["components", name, "environment"]),
+                        )
+                    });
+                    spans.config = obj.get("config").and_then(|_| {
+                        span_for_json_pointer(
+                            source,
+                            root_span,
+                            &pointer(["components", name, "config"]),
+                        )
+                    });
+                }
+                _ => {}
+            }
+
+            out.components.insert(name.as_str().into(), spans);
+        }
+    }
+
+    if let Some(environments_value) = root_obj.get("environments")
+        && let Some(environments_obj) = environments_value.as_object()
+        && let Some(environments_span) = span_for_json_pointer(source, root_span, "/environments")
+    {
+        for (env_name, env_value) in environments_obj {
+            let env_name_span = span_for_object_key(source, environments_span, env_name)
+                .unwrap_or((0usize, 0usize).into());
+            let env_whole =
+                span_for_json_pointer(source, root_span, &pointer(["environments", env_name]))
+                    .unwrap_or((0usize, 0usize).into());
+
+            let mut env_spans = EnvironmentSpans {
+                name: env_name_span,
+                whole: env_whole,
+                extends: None,
+                resolvers: Vec::new(),
+            };
+
+            if let serde_json::Value::Object(env_obj) = env_value {
+                env_spans.extends = env_obj.get("extends").and_then(|_| {
+                    span_for_json_pointer(
+                        source,
+                        root_span,
+                        &pointer(["environments", env_name, "extends"]),
+                    )
+                });
+
+                if let Some(resolvers) = env_obj.get("resolvers").and_then(|v| v.as_array()) {
+                    env_spans.resolvers = resolvers
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, v)| {
+                            let s = v.as_str()?;
+                            let span = span_for_json_pointer(
+                                source,
+                                root_span,
+                                &pointer(["environments", env_name, "resolvers", &i.to_string()]),
+                            )?;
+                            Some((s.into(), span))
+                        })
+                        .collect();
+                }
+            }
+
+            out.environments.insert(env_name.as_str().into(), env_spans);
+        }
+    }
+
+    if let Some(slots_value) = root_obj.get("slots")
+        && let Some(slots_obj) = slots_value.as_object()
+        && let Some(slots_span) = span_for_json_pointer(source, root_span, "/slots")
+    {
+        out.slots_section = Some(slots_span);
+
+        for (slot_name, slot_value) in slots_obj {
+            let slot_name_span = span_for_object_key(source, slots_span, slot_name)
+                .unwrap_or((0usize, 0usize).into());
+            let whole = span_for_json_pointer(source, root_span, &pointer(["slots", slot_name]))
+                .unwrap_or((0usize, 0usize).into());
+
+            let mut decl = CapabilityDeclSpans {
+                name: slot_name_span,
+                whole,
+                kind: None,
+                profile: None,
+            };
+
+            if let serde_json::Value::Object(obj) = slot_value {
+                decl.kind = obj.get("kind").and_then(|_| {
+                    span_for_json_pointer(source, root_span, &pointer(["slots", slot_name, "kind"]))
+                });
+                decl.profile = obj.get("profile").and_then(|_| {
+                    span_for_json_pointer(
+                        source,
+                        root_span,
+                        &pointer(["slots", slot_name, "profile"]),
+                    )
+                });
+            }
+
+            out.slots.insert(slot_name.as_str().into(), decl);
+        }
+    }
+
+    if let Some(provides_value) = root_obj.get("provides")
+        && let Some(provides_obj) = provides_value.as_object()
+        && let Some(provides_span) = span_for_json_pointer(source, root_span, "/provides")
+    {
+        for (provide_name, provide_value) in provides_obj {
+            let provide_name_span = span_for_object_key(source, provides_span, provide_name)
+                .unwrap_or((0usize, 0usize).into());
+            let whole =
+                span_for_json_pointer(source, root_span, &pointer(["provides", provide_name]))
+                    .unwrap_or((0usize, 0usize).into());
+
+            let mut provide = ProvideDeclSpans {
+                capability: CapabilityDeclSpans {
+                    name: provide_name_span,
+                    whole,
+                    kind: None,
+                    profile: None,
+                },
+                endpoint: None,
+                endpoint_value: None,
+            };
+
+            if let serde_json::Value::Object(obj) = provide_value {
+                provide.capability.kind = obj.get("kind").and_then(|_| {
+                    span_for_json_pointer(
+                        source,
+                        root_span,
+                        &pointer(["provides", provide_name, "kind"]),
+                    )
+                });
+                provide.capability.profile = obj.get("profile").and_then(|_| {
+                    span_for_json_pointer(
+                        source,
+                        root_span,
+                        &pointer(["provides", provide_name, "profile"]),
+                    )
+                });
+
+                if let Some(endpoint) = obj.get("endpoint") {
+                    provide.endpoint = span_for_json_pointer(
+                        source,
+                        root_span,
+                        &pointer(["provides", provide_name, "endpoint"]),
+                    );
+                    provide.endpoint_value = endpoint.as_str().map(Into::into);
+                }
+            }
+
+            out.provides.insert(provide_name.as_str().into(), provide);
+        }
+    }
+
+    if let Some(bindings_value) = root_obj.get("bindings")
+        && let Some(bindings_array) = bindings_value.as_array()
+    {
+        for (idx, binding_value) in bindings_array.iter().enumerate() {
+            let whole =
+                span_for_json_pointer(source, root_span, &pointer(["bindings", &idx.to_string()]))
+                    .unwrap_or((0usize, 0usize).into());
+
+            let mut spans = BindingSpans {
+                whole,
+                ..BindingSpans::default()
+            };
+
+            let serde_json::Value::Object(fields) = binding_value else {
+                out.bindings_by_index.push(spans);
+                continue;
+            };
+
+            let get_string = |k: &str| fields.get(k).and_then(|v| v.as_str()).map(Into::into);
+
+            spans.to = fields.get("to").and_then(|_| {
+                span_for_json_pointer(
+                    source,
+                    root_span,
+                    &pointer(["bindings", &idx.to_string(), "to"]),
+                )
+            });
+            spans.to_value = get_string("to");
+
+            spans.from = fields.get("from").and_then(|_| {
+                span_for_json_pointer(
+                    source,
+                    root_span,
+                    &pointer(["bindings", &idx.to_string(), "from"]),
+                )
+            });
+            spans.from_value = get_string("from");
+
+            spans.slot = fields.get("slot").and_then(|_| {
+                span_for_json_pointer(
+                    source,
+                    root_span,
+                    &pointer(["bindings", &idx.to_string(), "slot"]),
+                )
+            });
+            spans.slot_value = get_string("slot");
+
+            spans.capability = fields.get("capability").and_then(|_| {
+                span_for_json_pointer(
+                    source,
+                    root_span,
+                    &pointer(["bindings", &idx.to_string(), "capability"]),
+                )
+            });
+            spans.capability_value = get_string("capability");
+
+            spans.weak = fields.get("weak").and_then(|_| {
+                span_for_json_pointer(
+                    source,
+                    root_span,
+                    &pointer(["bindings", &idx.to_string(), "weak"]),
+                )
+            });
+
+            if let Some(to) = spans.to_value.as_deref() {
+                let slot = spans.slot_value.as_deref();
+                if let Some(key) = crate::binding_target_key_for_binding(to, slot) {
+                    out.bindings.insert(key, spans.clone());
+                }
+            }
+
+            out.bindings_by_index.push(spans);
+        }
+    }
+
+    if let Some(exports_value) = root_obj.get("exports")
+        && let Some(exports_obj) = exports_value.as_object()
+        && let Some(exports_span) = span_for_json_pointer(source, root_span, "/exports")
+    {
+        for (export_name, _export_value) in exports_obj {
+            let name_span = span_for_object_key(source, exports_span, export_name)
+                .unwrap_or((0usize, 0usize).into());
+            let target =
+                span_for_json_pointer(source, root_span, &pointer(["exports", export_name]))
+                    .unwrap_or((0usize, 0usize).into());
+            out.exports.insert(
+                export_name.as_str().into(),
+                ExportSpans {
+                    name: name_span,
+                    target,
+                },
+            );
+        }
     }
 
     Some(out)
@@ -166,410 +436,55 @@ impl ManifestSpans {
     }
 }
 
-/// Find the `SourceSpan` for a JSON Pointer within a JSON5 value span.
-///
-/// This is intended for diagnostics: given a span of a value (typically an object like a
-/// `config: { ... }` block) and a JSON Pointer (like `/foo/0/bar`), returns the span of the
-/// referenced value.
-pub fn span_for_json_pointer(
+fn extract_program_spans(
     source: &str,
-    value_span: SourceSpan,
-    pointer: &str,
-) -> Option<SourceSpan> {
-    let value_start = value_span.offset();
-    let value_end = span_end(value_span);
-    let value_src = source.get(value_start..value_end)?;
-
-    let mut pairs = Json5Parser::parse(Rule::text, value_src).ok()?;
-    let mut current = pairs.next()?;
-    let mut out = shift_span(span(&current), value_start);
-
-    for segment in pointer.split('/').filter(|s| !s.is_empty()) {
-        let segment = unescape_json_pointer_segment(segment);
-        match current.as_rule() {
-            Rule::object => {
-                let mut found = None;
-                for (key, _key_span, value) in object_fields(current.clone()) {
-                    if key.as_ref() == segment.as_ref() {
-                        found = Some(value);
-                        break;
-                    }
-                }
-                let value = found?;
-                out = shift_span(span(&value), value_start);
-                current = value;
-            }
-            Rule::array => {
-                let index = segment.parse::<usize>().ok()?;
-                let value = current.clone().into_inner().nth(index)?;
-                out = shift_span(span(&value), value_start);
-                current = value;
-            }
-            _ => return None,
-        }
-    }
-
-    Some(out)
-}
-
-pub(crate) fn span_for_object_key(
-    source: &str,
-    object_span: SourceSpan,
-    key: &str,
-) -> Option<SourceSpan> {
-    let value_start = object_span.offset();
-    let value_end = span_end(object_span);
-    let value_src = source.get(value_start..value_end)?;
-
-    let mut pairs = Json5Parser::parse(Rule::text, value_src).ok()?;
-    let object = pairs.next()?;
-    if object.as_rule() != Rule::object {
-        return None;
-    }
-
-    for (field, field_span, _value) in object_fields(object) {
-        if field.as_ref() == key {
-            return Some(shift_span(field_span, value_start));
-        }
-    }
-
-    None
-}
-
-fn extract_components(out: &mut ManifestSpans, value: pest::iterators::Pair<'_, Rule>) {
-    if value.as_rule() != Rule::object {
-        return;
-    }
-    for (name, name_span, value) in object_fields(value) {
-        let spans = extract_component_decl(name_span, value);
-        out.components.insert(name, spans);
-    }
-}
-
-fn extract_component_decl(
-    name: SourceSpan,
-    value: pest::iterators::Pair<'_, Rule>,
-) -> ComponentDeclSpans {
-    let whole = span(&value);
-    let mut out = ComponentDeclSpans {
-        name,
-        whole,
-        manifest: None,
-        environment: None,
-        config: None,
+    root_span: SourceSpan,
+    whole: SourceSpan,
+    root_obj: &serde_json::Map<String, serde_json::Value>,
+) -> ProgramSpans {
+    let mut endpoints = Vec::new();
+    let Some(program) = root_obj.get("program") else {
+        return ProgramSpans { whole, endpoints };
+    };
+    let Some(network) = program.get("network") else {
+        return ProgramSpans { whole, endpoints };
+    };
+    let Some(endpoint_array) = network.get("endpoints").and_then(|v| v.as_array()) else {
+        return ProgramSpans { whole, endpoints };
     };
 
-    match value.as_rule() {
-        Rule::string => {
-            out.manifest = Some(span(&value));
-        }
-        Rule::object => {
-            for (k, _k_span, v) in object_fields(value) {
-                match k.as_ref() {
-                    "manifest" => out.manifest = Some(span(&v)),
-                    "environment" => out.environment = Some(span(&v)),
-                    "config" => out.config = Some(span(&v)),
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
-
-    out
-}
-
-fn extract_program(value: pest::iterators::Pair<'_, Rule>) -> ProgramSpans {
-    let whole = span(&value);
-    if value.as_rule() != Rule::object {
-        return ProgramSpans {
-            whole,
-            endpoints: Vec::new(),
-        };
-    }
-
-    let mut endpoints = Vec::new();
-    for (k, _k_span, v) in object_fields(value) {
-        if k.as_ref() != "network" || v.as_rule() != Rule::object {
+    for (idx, endpoint) in endpoint_array.iter().enumerate() {
+        let Some(name) = endpoint.get("name").and_then(|v| v.as_str()) else {
             continue;
-        }
-
-        for (nk, _nk_span, nv) in object_fields(v) {
-            if nk.as_ref() != "endpoints" || nv.as_rule() != Rule::array {
-                continue;
-            }
-
-            for ep in nv.into_inner() {
-                if ep.as_rule() != Rule::object {
-                    continue;
-                }
-
-                for (ek, _ek_span, ev) in object_fields(ep) {
-                    if ek.as_ref() != "name" {
-                        continue;
-                    }
-                    if let Some(name) = string_value(&ev) {
-                        endpoints.push((name.into(), span(&ev)));
-                    }
-                    break;
-                }
-            }
-        }
+        };
+        let Some(span) = span_for_json_pointer(
+            source,
+            root_span,
+            &pointer(["program", "network", "endpoints", &idx.to_string(), "name"]),
+        ) else {
+            continue;
+        };
+        endpoints.push((name.into(), span));
     }
 
     ProgramSpans { whole, endpoints }
 }
 
-fn extract_environments(out: &mut ManifestSpans, value: pest::iterators::Pair<'_, Rule>) {
-    if value.as_rule() != Rule::object {
-        return;
-    }
-    for (env_name, env_name_span, env_val) in object_fields(value) {
-        if env_val.as_rule() != Rule::object {
-            continue;
-        }
-        let whole = span(&env_val);
-        let mut env_spans = EnvironmentSpans {
-            name: env_name_span,
-            whole,
-            extends: None,
-            resolvers: Vec::new(),
-        };
-
-        for (k, _k_span, v) in object_fields(env_val) {
-            match k.as_ref() {
-                "extends" => env_spans.extends = Some(span(&v)),
-                "resolvers" => env_spans.resolvers = array_string_items(v),
-                _ => {}
-            }
-        }
-
-        out.environments.insert(env_name, env_spans);
-    }
-}
-
-fn extract_slots(out: &mut ManifestSpans, value: pest::iterators::Pair<'_, Rule>) {
-    if value.as_rule() != Rule::object {
-        return;
-    }
-    for (slot_name, slot_name_span, slot_val) in object_fields(value) {
-        let decl = extract_capability_decl(slot_name_span, slot_val);
-        out.slots.insert(slot_name, decl);
-    }
-}
-
-fn extract_provides(out: &mut ManifestSpans, value: pest::iterators::Pair<'_, Rule>) {
-    if value.as_rule() != Rule::object {
-        return;
-    }
-    for (provide_name, provide_name_span, provide_val) in object_fields(value) {
-        let mut provide = ProvideDeclSpans {
-            capability: extract_capability_decl(provide_name_span, provide_val.clone()),
-            endpoint: None,
-            endpoint_value: None,
-        };
-        if provide_val.as_rule() == Rule::object {
-            for (k, _k_span, v) in object_fields(provide_val) {
-                if k.as_ref() == "endpoint" {
-                    provide.endpoint = Some(span(&v));
-                    provide.endpoint_value = string_value(&v).map(Into::into);
-                }
-            }
-        }
-        out.provides.insert(provide_name, provide);
-    }
-}
-
-fn extract_exports(out: &mut ManifestSpans, value: pest::iterators::Pair<'_, Rule>) {
-    if value.as_rule() != Rule::object {
-        return;
-    }
-    for (export_name, export_name_span, export_val) in object_fields(value) {
-        out.exports.insert(
-            export_name,
-            ExportSpans {
-                name: export_name_span,
-                target: span(&export_val),
-            },
-        );
-    }
-}
-
-fn extract_bindings(out: &mut ManifestSpans, value: pest::iterators::Pair<'_, Rule>) {
-    if value.as_rule() != Rule::array {
-        return;
-    }
-
-    for item in value.into_inner() {
-        if item.as_rule() != Rule::object {
-            continue;
-        }
-
-        let whole = span(&item);
-        let mut fields = HashMap::<Arc<str>, (pest::iterators::Pair<'_, Rule>, SourceSpan)>::new();
-        for (key, _key_span, value) in object_fields(item.clone()) {
-            fields.insert(key, (value.clone(), span(&value)));
-        }
-
-        let to_value = fields
-            .get("to")
-            .and_then(|(p, _)| string_value(p))
-            .map(Into::into);
-        let from_value = fields
-            .get("from")
-            .and_then(|(p, _)| string_value(p))
-            .map(Into::into);
-        let slot_value = fields
-            .get("slot")
-            .and_then(|(p, _)| string_value(p))
-            .map(Into::into);
-        let capability_value = fields
-            .get("capability")
-            .and_then(|(p, _)| string_value(p))
-            .map(Into::into);
-
-        let spans = BindingSpans {
-            whole,
-            to: fields.get("to").map(|(_, s)| *s),
-            to_value,
-            from: fields.get("from").map(|(_, s)| *s),
-            from_value,
-            slot: fields.get("slot").map(|(_, s)| *s),
-            slot_value,
-            capability: fields.get("capability").map(|(_, s)| *s),
-            capability_value,
-            weak: fields.get("weak").map(|(_, s)| *s),
-        };
-
-        if let Some(key) = binding_target_key(&fields) {
-            out.bindings.insert(key, spans.clone());
-        }
-
-        out.bindings_by_index.push(spans);
-    }
-}
-
-fn binding_target_key(
-    fields: &HashMap<Arc<str>, (pest::iterators::Pair<'_, Rule>, SourceSpan)>,
-) -> Option<BindingTargetKey> {
-    let to = fields.get("to").and_then(|(p, _)| string_value(p))?;
-    let slot = fields.get("slot").and_then(|(p, _)| string_value(p));
-    crate::binding_target_key_for_binding(&to, slot.as_deref())
-}
-
-fn extract_capability_decl(
-    name: SourceSpan,
-    value: pest::iterators::Pair<'_, Rule>,
-) -> CapabilityDeclSpans {
-    let whole = span(&value);
-    if value.as_rule() != Rule::object {
-        return CapabilityDeclSpans {
-            name,
-            whole,
-            kind: None,
-            profile: None,
-        };
-    }
-
-    let mut out = CapabilityDeclSpans {
-        name,
-        whole,
-        kind: None,
-        profile: None,
-    };
-    for (k, _k_span, v) in object_fields(value) {
-        match k.as_ref() {
-            "kind" => out.kind = Some(span(&v)),
-            "profile" => out.profile = Some(span(&v)),
-            _ => {}
-        }
+fn pointer<const N: usize>(segments: [&str; N]) -> String {
+    let mut out = String::new();
+    for segment in segments {
+        out.push('/');
+        push_json_pointer_segment(&mut out, segment);
     }
     out
 }
 
-fn array_string_items(array: pest::iterators::Pair<'_, Rule>) -> Vec<(Arc<str>, SourceSpan)> {
-    if array.as_rule() != Rule::array {
-        return Vec::new();
-    }
-
-    array
-        .into_inner()
-        .filter_map(|item| {
-            let span = span(&item);
-            let s = string_value(&item)?;
-            Some((s.into(), span))
-        })
-        .collect()
-}
-
-fn object_fields(
-    object: pest::iterators::Pair<'_, Rule>,
-) -> impl Iterator<Item = (Arc<str>, SourceSpan, pest::iterators::Pair<'_, Rule>)> {
-    debug_assert_eq!(object.as_rule(), Rule::object);
-
-    let mut inner = object.into_inner();
-    std::iter::from_fn(move || {
-        let key_pair = inner.next()?;
-        let value_pair = inner.next()?;
-        let (key, key_span) = key_text(key_pair)?;
-        Some((key, key_span, value_pair))
-    })
-}
-
-fn key_text(pair: pest::iterators::Pair<'_, Rule>) -> Option<(Arc<str>, SourceSpan)> {
-    let key_span = span(&pair);
-    let out = match pair.as_rule() {
-        Rule::identifier => pair.as_str().to_string(),
-        Rule::string => json5::from_str::<String>(pair.as_str()).ok()?,
-        _ => return None,
-    };
-    Some((out.into(), key_span))
-}
-
-fn string_value(pair: &pest::iterators::Pair<'_, Rule>) -> Option<String> {
-    if pair.as_rule() != Rule::string {
-        return None;
-    }
-    json5::from_str::<String>(pair.as_str()).ok()
-}
-
-fn span(pair: &pest::iterators::Pair<'_, Rule>) -> SourceSpan {
-    let s = pair.as_span();
-    (s.start(), s.end() - s.start()).into()
-}
-
-fn span_end(span: SourceSpan) -> usize {
-    span.offset().saturating_add(span.len())
-}
-
-fn shift_span(span: SourceSpan, base: usize) -> SourceSpan {
-    (base.saturating_add(span.offset()), span.len()).into()
-}
-
-fn unescape_json_pointer_segment(input: &str) -> Cow<'_, str> {
-    if !input.contains('~') {
-        return Cow::Borrowed(input);
-    }
-
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars();
-
-    while let Some(c) = chars.next() {
-        if c != '~' {
-            out.push(c);
-            continue;
-        }
-
-        match chars.next() {
-            Some('0') => out.push('~'),
-            Some('1') => out.push('/'),
-            Some(other) => {
-                out.push('~');
-                out.push(other);
-            }
-            None => out.push('~'),
+fn push_json_pointer_segment(out: &mut String, segment: &str) {
+    for c in segment.chars() {
+        match c {
+            '~' => out.push_str("~0"),
+            '/' => out.push_str("~1"),
+            other => out.push(other),
         }
     }
-
-    Cow::Owned(out)
 }

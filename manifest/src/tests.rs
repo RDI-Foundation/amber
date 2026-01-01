@@ -392,7 +392,7 @@ fn manifest_deserialize_error_includes_path() {
 
     match err {
         Error::Json5Path(err) => {
-            assert_eq!(err.path().to_string(), "program.network.endpoints[0].port");
+            assert_eq!(err.path(), Some("program.network.endpoints[0].port"));
         }
         other => panic!("expected Json5Path error, got: {other}"),
     }
@@ -1424,6 +1424,5 @@ fn lint_for(input: &str, manifest: &Manifest) -> Vec<lint::ManifestLint> {
 }
 
 fn parse_raw(input: &str) -> RawManifest {
-    let mut deserializer = json5::Deserializer::from_str(input);
-    serde_path_to_error::deserialize(&mut deserializer).unwrap()
+    amber_json5::parse(input).unwrap()
 }

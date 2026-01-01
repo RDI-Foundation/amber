@@ -81,19 +81,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "amber-manifest"
+name = "amber-json5"
 version = "0.1.0"
 dependencies = [
- "base64",
  "json5",
- "jsonschema",
  "miette",
  "pest",
  "pest_derive",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "serde_path_to_error",
+]
+
+[[package]]
+name = "amber-manifest"
+version = "0.1.0"
+dependencies = [
+ "amber-json5",
+ "base64",
+ "jsonschema",
+ "miette",
  "semver",
  "serde",
  "serde_json",
- "serde_path_to_error",
  "serde_with",
  "sha2",
  "shlex",
