@@ -212,6 +212,30 @@ pub fn span_for_json_pointer(
     Some(out)
 }
 
+pub(crate) fn span_for_object_key(
+    source: &str,
+    object_span: SourceSpan,
+    key: &str,
+) -> Option<SourceSpan> {
+    let value_start = object_span.offset();
+    let value_end = span_end(object_span);
+    let value_src = source.get(value_start..value_end)?;
+
+    let mut pairs = Json5Parser::parse(Rule::text, value_src).ok()?;
+    let object = pairs.next()?;
+    if object.as_rule() != Rule::object {
+        return None;
+    }
+
+    for (field, field_span, _value) in object_fields(object) {
+        if field.as_ref() == key {
+            return Some(shift_span(field_span, value_start));
+        }
+    }
+
+    None
+}
+
 fn extract_components(out: &mut ManifestSpans, value: pest::iterators::Pair<'_, Rule>) {
     if value.as_rule() != Rule::object {
         return;

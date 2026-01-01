@@ -445,6 +445,52 @@ fn binding_dot_form_error_points_to_offending_field() {
 }
 
 #[test]
+fn binding_missing_capability_points_to_slot_value() {
+    use miette::Diagnostic;
+
+    let source = r#"
+        {
+          manifest_version: "0.1.0",
+          bindings: [
+            { to: "self", slot: "s", from: "self" },
+          ],
+        }
+        "#;
+
+    let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+    let labels: Vec<_> = err.labels().unwrap().collect();
+    assert_eq!(labels.len(), 1);
+
+    let label = &labels[0];
+    let offset = source.find("\"s\"").unwrap();
+    assert_eq!(label.offset(), offset);
+    assert_eq!(label.len(), "\"s\"".len());
+}
+
+#[test]
+fn binding_missing_slot_points_to_capability_value() {
+    use miette::Diagnostic;
+
+    let source = r#"
+        {
+          manifest_version: "0.1.0",
+          bindings: [
+            { to: "self", from: "self", capability: "c" },
+          ],
+        }
+        "#;
+
+    let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+    let labels: Vec<_> = err.labels().unwrap().collect();
+    assert_eq!(labels.len(), 1);
+
+    let label = &labels[0];
+    let offset = source.find("\"c\"").unwrap();
+    assert_eq!(label.offset(), offset);
+    assert_eq!(label.len(), "\"c\"".len());
+}
+
+#[test]
 fn program_unknown_field_points_to_key() {
     use miette::Diagnostic;
 
@@ -463,6 +509,69 @@ fn program_unknown_field_points_to_key() {
     let offset = source.find("imag").unwrap();
     assert_eq!(label.offset(), offset);
     assert_eq!(label.len(), "imag".len());
+}
+
+#[test]
+fn json5_missing_close_bracket_points_to_array_open() {
+    use miette::Diagnostic;
+
+    let source = r#"
+        {
+          manifest_version: "0.1.0",
+          bindings: [
+            { to: "self.a", from: "self.b" }
+        "#;
+
+    let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+    let labels: Vec<_> = err.labels().unwrap().collect();
+    assert_eq!(labels.len(), 1);
+
+    let label = &labels[0];
+    let offset = source.find('[').unwrap();
+    assert_eq!(label.offset(), offset);
+}
+
+#[test]
+fn json5_missing_close_brace_ignores_comment_and_string() {
+    use miette::Diagnostic;
+
+    let source = r#"
+        {
+          // { brace in comment should be ignored
+          manifest_version: "0.1.0",
+          program: { image: "{not", args: [] }
+        "#;
+
+    let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+    let labels: Vec<_> = err.labels().unwrap().collect();
+    assert_eq!(labels.len(), 1);
+
+    let label = &labels[0];
+    let offset = source.find('{').unwrap();
+    assert_eq!(label.offset(), offset);
+}
+
+#[test]
+fn components_bool_type_error_points_to_value() {
+    use miette::Diagnostic;
+
+    let source = r#"
+        {
+          manifest_version: "0.1.0",
+          components: true,
+        }
+        "#;
+
+    let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+    assert!(err.to_string().contains("expected object, found boolean"));
+
+    let labels: Vec<_> = err.labels().unwrap().collect();
+    assert_eq!(labels.len(), 1);
+
+    let label = &labels[0];
+    let offset = source.find("true").unwrap();
+    assert_eq!(label.offset(), offset);
+    assert_eq!(label.len(), "true".len());
 }
 
 #[test]

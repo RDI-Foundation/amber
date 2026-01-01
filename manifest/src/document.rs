@@ -1,6 +1,6 @@
 #![allow(clippy::result_large_err)]
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use miette::{Diagnostic, LabeledSpan, NamedSource, SourceCode, SourceSpan};
 use thiserror::Error;
@@ -402,21 +402,76 @@ fn span_for_json5_path_error(
     spans: &ManifestSpans,
     message: &str,
 ) -> Option<SourceSpan> {
-    let path = path.to_string();
-    if let Some((idx, rest)) = binding_index_from_path(&path) {
+    if let Some((idx, rest)) = binding_index_from_path(path) {
         let binding = spans.bindings_by_index.get(idx)?;
-        return Some(span_for_binding_path(source, binding, rest, message));
+        return Some(span_for_binding_path(
+            source,
+            binding,
+            rest.as_ref(),
+            message,
+        ));
     }
 
-    span_for_non_binding_path_error(source, &path, message)
+    span_for_non_binding_path_error(source, path, message)
 }
 
-fn binding_index_from_path(path: &str) -> Option<(usize, &str)> {
-    let rest = path.strip_prefix("bindings[")?;
-    let (idx, rest) = rest.split_once(']')?;
-    let idx = idx.parse::<usize>().ok()?;
-    let rest = rest.strip_prefix('.').unwrap_or(rest);
-    Some((idx, rest))
+fn binding_index_from_path(path: &serde_path_to_error::Path) -> Option<(usize, Cow<'_, str>)> {
+    use serde_path_to_error::Segment;
+
+    let mut segments = path.iter();
+    let Segment::Map { key } = segments.next()? else {
+        return None;
+    };
+    if key != "bindings" {
+        return None;
+    }
+
+    let Segment::Seq { index } = segments.next()? else {
+        return None;
+    };
+    let idx = *index;
+
+    let Some(first) = segments.next() else {
+        return Some((idx, Cow::Borrowed("")));
+    };
+
+    if segments.len() == 0 {
+        match first {
+            Segment::Map { key } => return Some((idx, Cow::Borrowed(key.as_str()))),
+            Segment::Enum { variant } => return Some((idx, Cow::Borrowed(variant.as_str()))),
+            Segment::Seq { .. } | Segment::Unknown => {}
+        }
+    }
+
+    let mut rest = String::new();
+    for segment in std::iter::once(first).chain(segments) {
+        match segment {
+            Segment::Seq { index } => {
+                use std::fmt::Write as _;
+                let _ = write!(rest, "[{index}]");
+            }
+            Segment::Map { key } => {
+                if !rest.is_empty() {
+                    rest.push('.');
+                }
+                rest.push_str(key);
+            }
+            Segment::Enum { variant } => {
+                if !rest.is_empty() {
+                    rest.push('.');
+                }
+                rest.push_str(variant);
+            }
+            Segment::Unknown => {
+                if !rest.is_empty() {
+                    rest.push('.');
+                }
+                rest.push('?');
+            }
+        }
+    }
+
+    Some((idx, Cow::Owned(rest)))
 }
 
 fn span_for_binding_path(
@@ -434,7 +489,7 @@ fn span_for_binding_path(
 
     if message.starts_with("unknown field") {
         if !rest.is_empty()
-            && let Some(span) = find_object_key_span(source, binding.whole, rest)
+            && let Some(span) = crate::spans::span_for_object_key(source, binding.whole, rest)
         {
             return span;
         }
@@ -478,7 +533,11 @@ fn span_for_binding_root_error(binding: &crate::BindingSpans, message: &str) -> 
     binding.whole
 }
 
-fn span_for_non_binding_path_error(source: &str, path: &str, message: &str) -> Option<SourceSpan> {
+fn span_for_non_binding_path_error(
+    source: &str,
+    path: &serde_path_to_error::Path,
+    message: &str,
+) -> Option<SourceSpan> {
     let root: SourceSpan = (0usize, source.len()).into();
     let segments = serde_path_segments(path)?;
     let pointer = json_pointer_from_segments(&segments);
@@ -487,12 +546,15 @@ fn span_for_non_binding_path_error(source: &str, path: &str, message: &str) -> O
         && let Some(field) = backticked_values(message).next()
     {
         let mut parent = segments.clone();
-        if parent.last().is_some_and(|s| s == field) {
+        if parent
+            .last()
+            .is_some_and(|s| matches!(s, SerdePathSegment::Key(key) if *key == field))
+        {
             parent.pop();
         }
         let parent_pointer = json_pointer_from_segments(&parent);
         if let Some(parent_span) = crate::span_for_json_pointer(source, root, &parent_pointer)
-            && let Some(span) = find_object_key_span(source, parent_span, field)
+            && let Some(span) = crate::spans::span_for_object_key(source, parent_span, field)
         {
             return Some(span);
         }
@@ -501,45 +563,28 @@ fn span_for_non_binding_path_error(source: &str, path: &str, message: &str) -> O
     crate::span_for_json_pointer(source, root, &pointer)
 }
 
-fn serde_path_segments(path: &str) -> Option<Vec<String>> {
-    if path.is_empty() {
-        return Some(Vec::new());
-    }
+#[derive(Clone, Copy, Debug)]
+enum SerdePathSegment<'a> {
+    Key(&'a str),
+    Index(usize),
+}
+
+fn serde_path_segments(path: &serde_path_to_error::Path) -> Option<Vec<SerdePathSegment<'_>>> {
+    use serde_path_to_error::Segment;
 
     let mut out = Vec::new();
-    let mut idx = 0usize;
-    while idx < path.len() {
-        match path.as_bytes()[idx] {
-            b'.' => {
-                idx += 1;
-            }
-            b'[' => {
-                let rest = path.get(idx + 1..)?;
-                let end = rest.find(']')?;
-                let inner = rest.get(..end)?;
-                if inner.starts_with('"') || inner.starts_with('\'') {
-                    let key: String = json5::from_str(inner).ok()?;
-                    out.push(key);
-                } else {
-                    out.push(inner.to_string());
-                }
-                idx += end + 2;
-            }
-            _ => {
-                let start = idx;
-                idx += 1;
-                while idx < path.len() && !matches!(path.as_bytes()[idx], b'.' | b'[') {
-                    idx += 1;
-                }
-                out.push(path.get(start..idx)?.to_string());
-            }
+    for segment in path.iter() {
+        match segment {
+            Segment::Seq { index } => out.push(SerdePathSegment::Index(*index)),
+            Segment::Map { key } => out.push(SerdePathSegment::Key(key.as_str())),
+            Segment::Enum { variant } => out.push(SerdePathSegment::Key(variant.as_str())),
+            Segment::Unknown => return None,
         }
     }
-
     Some(out)
 }
 
-fn json_pointer_from_segments(segments: &[String]) -> String {
+fn json_pointer_from_segments(segments: &[SerdePathSegment<'_>]) -> String {
     if segments.is_empty() {
         return String::new();
     }
@@ -547,7 +592,13 @@ fn json_pointer_from_segments(segments: &[String]) -> String {
     let mut out = String::new();
     for segment in segments {
         out.push('/');
-        push_json_pointer_segment(&mut out, segment);
+        match segment {
+            SerdePathSegment::Key(key) => push_json_pointer_segment(&mut out, key),
+            SerdePathSegment::Index(index) => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{index}");
+            }
+        }
     }
     out
 }
@@ -610,19 +661,10 @@ enum TokenKind {
     RBracket,
     Colon,
     Comma,
-    String(String),
-    Identifier(String),
+    String,
+    Identifier,
     Number,
     Literal,
-}
-
-impl TokenKind {
-    fn key_name(&self) -> Option<&str> {
-        match self {
-            TokenKind::String(value) | TokenKind::Identifier(value) => Some(value.as_str()),
-            _ => None,
-        }
-    }
 }
 
 fn json5_hint(source: &str, err: &json5::Error) -> Option<Json5Hint> {
@@ -748,12 +790,8 @@ fn tokenize_json5(source: &str) -> Result<Vec<Token>, TokenizeError> {
                 if i > bytes.len() || bytes[i - 1] != quote {
                     return Err(TokenizeError::UnterminatedString { start });
                 }
-                let raw = &source[start..i];
-                let parsed = json5::from_str::<String>(raw)
-                    .ok()
-                    .unwrap_or_else(|| raw[1..raw.len() - 1].to_string());
                 tokens.push(Token {
-                    kind: TokenKind::String(parsed),
+                    kind: TokenKind::String,
                     span: (start, i - start).into(),
                 });
             }
@@ -781,7 +819,7 @@ fn tokenize_json5(source: &str) -> Result<Vec<Token>, TokenizeError> {
                 let ident = &source[start..i];
                 let kind = match ident {
                     "true" | "false" | "null" | "Infinity" | "NaN" => TokenKind::Literal,
-                    _ => TokenKind::Identifier(ident.to_string()),
+                    _ => TokenKind::Identifier,
                 };
                 tokens.push(Token {
                     kind,
@@ -903,10 +941,10 @@ fn json5_token_value_kind(source: &str, token: &Token) -> Option<&'static str> {
     match &token.kind {
         TokenKind::LBrace => Some("object"),
         TokenKind::LBracket => Some("array"),
-        TokenKind::String(_) => Some("string"),
+        TokenKind::String => Some("string"),
         TokenKind::Number => Some("number"),
         TokenKind::Literal => json5_literal_kind(source, token.span),
-        TokenKind::Identifier(_) => Some("identifier"),
+        TokenKind::Identifier => Some("identifier"),
         _ => None,
     }
 }
@@ -1010,55 +1048,4 @@ fn span_for_line_col(source: &str, line: usize, column: usize) -> SourceSpan {
 
 fn span_end(span: SourceSpan) -> usize {
     span.offset().saturating_add(span.len())
-}
-
-fn span_in_range(span: SourceSpan, start: usize, end: usize) -> bool {
-    let span_start = span.offset();
-    let span_end = span_end(span);
-    span_start >= start && span_end <= end
-}
-
-fn find_object_key_span(source: &str, range: SourceSpan, key: &str) -> Option<SourceSpan> {
-    let tokens = tokenize_json5(source).ok()?;
-    let start = range.offset();
-    let end = span_end(range);
-    let mut depth = 0usize;
-
-    for (idx, token) in tokens.iter().enumerate() {
-        if !span_in_range(token.span, start, end) {
-            continue;
-        }
-
-        match token.kind {
-            TokenKind::LBrace | TokenKind::LBracket => {
-                depth += 1;
-                continue;
-            }
-            TokenKind::RBrace | TokenKind::RBracket => {
-                depth = depth.saturating_sub(1);
-                continue;
-            }
-            _ => {}
-        }
-
-        if depth != 1 {
-            continue;
-        }
-
-        let Some(name) = token.kind.key_name() else {
-            continue;
-        };
-        if name != key {
-            continue;
-        }
-
-        if let Some(next) = tokens.get(idx + 1)
-            && matches!(next.kind, TokenKind::Colon)
-            && span_in_range(next.span, start, end)
-        {
-            return Some(token.span);
-        }
-    }
-
-    None
 }
