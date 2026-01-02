@@ -7,3 +7,4 @@
 * Run `cargo fmt`, `cargo clippy`, and `cargo test` after any non-trivial change.
 * There may be other agents working on this repo concurrently
 * Add a dependency to the cargo workspace root iff it is used by more than one crate in the workspace.
+* Always keep READMEs up-to-date
