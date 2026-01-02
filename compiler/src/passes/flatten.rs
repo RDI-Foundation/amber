@@ -69,37 +69,14 @@ impl ScenarioPass for FlattenPass {
                 nearest_kept_ancestor(&scenario.components, &remove, component.parent);
         }
 
-        for (idx, component) in scenario.components.iter_mut().enumerate() {
-            if remove[idx] {
-                *component = None;
-                continue;
-            }
-            let component = component.as_mut().expect("kept component should exist");
-            component.parent = new_parent[idx];
-            component.children.clear();
-        }
-
-        let mut edges = Vec::new();
-        for (idx, component) in scenario.components.iter().enumerate() {
-            let Some(component) = component.as_ref() else {
-                continue;
-            };
-            let Some(parent_id) = component.parent else {
-                continue;
-            };
-            if remove[parent_id.0] {
-                continue;
-            }
-            edges.push((parent_id, ComponentId(idx)));
-        }
-        for (parent_id, child_id) in edges {
-            let parent = scenario.components[parent_id.0]
-                .as_mut()
-                .expect("parent should exist");
-            parent.children.push(child_id);
-        }
-
-        scenario.normalize_child_order_by_moniker();
+        scenario = super::prune_and_rebuild_scenario(
+            scenario,
+            &remove,
+            |id, component| {
+                component.parent = new_parent[id.0];
+            },
+            |_, _| true,
+        );
         scenario.assert_invariants();
 
         Ok((scenario, provenance))

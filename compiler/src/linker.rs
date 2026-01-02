@@ -97,19 +97,31 @@ fn component_decl_site(
     })
 }
 
+fn binding_site_with(
+    provenance: &Provenance,
+    store: &DigestStore,
+    realm: ComponentId,
+    target_key: &BindingTargetKey,
+    select: impl FnOnce(&amber_manifest::BindingSpans) -> SourceSpan,
+) -> Option<(NamedSource<Arc<str>>, SourceSpan)> {
+    let (src, spans) = source_for_component(provenance, store, realm)?;
+    let span = spans
+        .bindings
+        .get(target_key)
+        .map(select)
+        .unwrap_or((0usize, 0usize).into());
+    Some((src, span))
+}
+
 fn binding_target_site(
     provenance: &Provenance,
     store: &DigestStore,
     realm: ComponentId,
     target_key: &BindingTargetKey,
 ) -> Option<(NamedSource<Arc<str>>, SourceSpan)> {
-    let (src, spans) = source_for_component(provenance, store, realm)?;
-    let span = spans
-        .bindings
-        .get(target_key)
-        .map(|b| b.slot.or(b.to).unwrap_or(b.whole))
-        .unwrap_or((0usize, 0usize).into());
-    Some((src, span))
+    binding_site_with(provenance, store, realm, target_key, |b| {
+        b.slot.or(b.to).unwrap_or(b.whole)
+    })
 }
 
 fn binding_source_site(
@@ -118,13 +130,9 @@ fn binding_source_site(
     realm: ComponentId,
     target_key: &BindingTargetKey,
 ) -> Option<(NamedSource<Arc<str>>, SourceSpan)> {
-    let (src, spans) = source_for_component(provenance, store, realm)?;
-    let span = spans
-        .bindings
-        .get(target_key)
-        .map(|b| b.capability.or(b.from).unwrap_or(b.whole))
-        .unwrap_or((0usize, 0usize).into());
-    Some((src, span))
+    binding_site_with(provenance, store, realm, target_key, |b| {
+        b.capability.or(b.from).unwrap_or(b.whole)
+    })
 }
 
 fn binding_site(
@@ -133,13 +141,7 @@ fn binding_site(
     realm: ComponentId,
     target_key: &BindingTargetKey,
 ) -> Option<(NamedSource<Arc<str>>, SourceSpan)> {
-    let (src, spans) = source_for_component(provenance, store, realm)?;
-    let span = spans
-        .bindings
-        .get(target_key)
-        .map(|b| b.whole)
-        .unwrap_or((0usize, 0usize).into());
-    Some((src, span))
+    binding_site_with(provenance, store, realm, target_key, |b| b.whole)
 }
 
 struct ConfigSite {

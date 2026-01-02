@@ -294,7 +294,7 @@ pub struct ManifestRef {
     pub digest: Option<ManifestDigest>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay)]
 #[non_exhaustive]
 pub enum ManifestUrl {
     Absolute(Url),
@@ -340,13 +340,37 @@ impl ManifestUrl {
     }
 }
 
-impl Serialize for ManifestUrl {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
+impl fmt::Display for ManifestUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
+}
+
+impl FromStr for ManifestUrl {
+    type Err = Error;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        Self::parse(input)
+    }
+}
+
+impl FromStr for ManifestRef {
+    type Err = Error;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        Ok(Self {
+            url: ManifestUrl::parse(input)?,
+            digest: None,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestRefObject {
+    url: ManifestUrl,
+    #[serde(default)]
+    digest: Option<ManifestDigest>,
 }
 
 impl<'de> Deserialize<'de> for ManifestRef {
@@ -360,60 +384,18 @@ impl<'de> Deserialize<'de> for ManifestRef {
                 url: ManifestUrl::parse(&url).map_err(serde::de::Error::custom)?,
                 digest: None,
             }),
-            Value::Object(mut map) => {
-                let url = match map.remove("url") {
-                    Some(Value::String(url)) => url,
-                    Some(_) => {
-                        return Err(serde::de::Error::custom(
-                            "manifest ref `url` must be a string",
-                        ));
-                    }
-                    None => return Err(serde::de::Error::custom("manifest ref missing `url`")),
-                };
-
-                let url = ManifestUrl::parse(&url).map_err(serde::de::Error::custom)?;
-
-                let digest = match map.remove("digest") {
-                    None | Some(Value::Null) => None,
-                    Some(Value::String(digest)) => Some(
-                        digest
-                            .parse::<ManifestDigest>()
-                            .map_err(serde::de::Error::custom)?,
-                    ),
-                    Some(_) => {
-                        return Err(serde::de::Error::custom(
-                            "manifest ref `digest` must be a string",
-                        ));
-                    }
-                };
-
-                if !map.is_empty() {
-                    let mut keys = map.keys().cloned().collect::<Vec<_>>();
-                    keys.sort();
-                    let suffix = if keys.len() == 1 { "" } else { "s" };
-                    return Err(serde::de::Error::custom(format!(
-                        "manifest ref contains unknown field{suffix}: {}",
-                        keys.join(", ")
-                    )));
-                }
-
-                Ok(Self { url, digest })
+            Value::Object(map) => {
+                let obj = serde_json::from_value::<ManifestRefObject>(Value::Object(map))
+                    .map_err(serde::de::Error::custom)?;
+                Ok(Self {
+                    url: obj.url,
+                    digest: obj.digest,
+                })
             }
             _ => Err(serde::de::Error::custom(
                 "manifest ref must be a URL string or an object",
             )),
         }
-    }
-}
-
-impl FromStr for ManifestRef {
-    type Err = Error;
-
-    fn from_str(input: &str) -> Result<Self, Self::Err> {
-        Ok(Self {
-            url: ManifestUrl::parse(input)?,
-            digest: None,
-        })
     }
 }
 
@@ -1579,9 +1561,6 @@ impl RawManifest {
         let exports_out = build_exports(exports, &ctx)?;
         validate_endpoints(program.as_ref(), &provides)?;
 
-        let digest_cell = OnceLock::new();
-        let _ = digest_cell.set(digest);
-
         Ok(Manifest {
             manifest_version,
             program,
@@ -1592,12 +1571,12 @@ impl RawManifest {
             provides,
             bindings: bindings_out,
             exports: exports_out,
-            digest: digest_cell,
+            digest,
         })
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(into = "RawManifest", try_from = "RawManifest")]
 pub struct Manifest {
     manifest_version: Version,
@@ -1609,7 +1588,7 @@ pub struct Manifest {
     provides: BTreeMap<ProvideName, ProvideDecl>,
     bindings: BTreeMap<BindingTarget, Binding>,
     exports: BTreeMap<ExportName, ExportTarget>,
-    digest: OnceLock<ManifestDigest>,
+    digest: ManifestDigest,
 }
 
 impl Manifest {
@@ -1666,59 +1645,7 @@ impl Manifest {
     }
 
     pub fn digest(&self) -> ManifestDigest {
-        *self.digest.get_or_init(|| RawManifest::from(self).digest())
-    }
-}
-
-impl Clone for Manifest {
-    fn clone(&self) -> Self {
-        let digest = self.digest.get().copied();
-        let digest_cell = OnceLock::new();
-        if let Some(digest) = digest {
-            let _ = digest_cell.set(digest);
-        }
-        Self {
-            manifest_version: self.manifest_version.clone(),
-            program: self.program.clone(),
-            components: self.components.clone(),
-            environments: self.environments.clone(),
-            config_schema: self.config_schema.clone(),
-            slots: self.slots.clone(),
-            provides: self.provides.clone(),
-            bindings: self.bindings.clone(),
-            exports: self.exports.clone(),
-            digest: digest_cell,
-        }
-    }
-}
-
-impl PartialEq for Manifest {
-    fn eq(&self, other: &Self) -> bool {
-        self.manifest_version == other.manifest_version
-            && self.program == other.program
-            && self.components == other.components
-            && self.environments == other.environments
-            && self.config_schema == other.config_schema
-            && self.slots == other.slots
-            && self.provides == other.provides
-            && self.bindings == other.bindings
-            && self.exports == other.exports
-    }
-}
-
-impl Eq for Manifest {}
-
-impl std::hash::Hash for Manifest {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.manifest_version.hash(state);
-        self.program.hash(state);
-        self.components.hash(state);
-        self.environments.hash(state);
-        self.config_schema.hash(state);
-        self.slots.hash(state);
-        self.provides.hash(state);
-        self.bindings.hash(state);
-        self.exports.hash(state);
+        self.digest
     }
 }
 

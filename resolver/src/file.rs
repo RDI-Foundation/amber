@@ -36,46 +36,32 @@ impl FileResolver {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-        sync::atomic::{AtomicUsize, Ordering},
-    };
+    use std::io::Write;
 
     use amber_manifest::Manifest;
+    use tempfile::NamedTempFile;
     use url::Url;
 
     use crate::Resolver;
 
-    static FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    fn test_tmp_dir() -> PathBuf {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-tmp");
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     struct TempFile {
-        path: PathBuf,
+        file: NamedTempFile,
     }
 
     impl TempFile {
         fn new(contents: &str) -> Self {
-            let id = FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path =
-                test_tmp_dir().join(format!("file-resolver-{}-{id}.json5", std::process::id()));
-            fs::write(&path, contents).unwrap();
-            Self { path }
+            let mut file = tempfile::Builder::new()
+                .prefix("file-resolver-")
+                .suffix(".json5")
+                .tempfile()
+                .unwrap();
+            file.write_all(contents.as_bytes()).unwrap();
+            file.flush().unwrap();
+            Self { file }
         }
 
         fn url(&self) -> Url {
-            Url::from_file_path(&self.path).unwrap()
-        }
-    }
-
-    impl Drop for TempFile {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.path);
+            Url::from_file_path(self.file.path()).unwrap()
         }
     }
 

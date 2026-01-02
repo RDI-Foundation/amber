@@ -4,19 +4,20 @@ use std::{
     future::Future,
     io::{Read as _, Write as _},
     net::{Shutdown, TcpListener},
-    path::{Path, PathBuf},
+    path::Path,
     pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use amber_manifest::{Manifest, ManifestRef};
 use amber_resolver::{Backend, RemoteResolver, Resolution, Resolver};
 use amber_scenario::graph;
 use miette::Severity;
+use tempfile::TempDir;
 use url::Url;
 
 use crate::{CompileOptions, Compiler, DigestStore, OptimizeOptions, ResolverRegistry};
@@ -31,15 +32,8 @@ fn error_contains(err: &crate::Error, needle: &str) -> bool {
     }
 }
 
-fn tmp_dir(prefix: &str) -> PathBuf {
-    let mut base = std::env::temp_dir();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    base.push(format!("{prefix}-{nanos}-{}", std::process::id()));
-    fs::create_dir_all(&base).unwrap();
-    base
+fn tmp_dir(prefix: &str) -> TempDir {
+    tempfile::Builder::new().prefix(prefix).tempdir().unwrap()
 }
 
 fn write_file(path: &Path, contents: &str) {
@@ -193,9 +187,9 @@ fn spawn_alias_cycle_manifest_server() -> (Url, std::thread::JoinHandle<()>) {
 #[tokio::test]
 async fn compile_twice_unpinned_fails_when_sources_removed() {
     let dir = tmp_dir("scenario-compile");
-    let root_path = dir.join("root.json5");
-    let a_path = dir.join("a.json5");
-    let b_path = dir.join("b.json5");
+    let root_path = dir.path().join("root.json5");
+    let a_path = dir.path().join("a.json5");
+    let b_path = dir.path().join("b.json5");
 
     write_file(
         &a_path,
@@ -273,9 +267,9 @@ async fn compile_twice_unpinned_fails_when_sources_removed() {
 #[tokio::test]
 async fn compile_twice_with_digest_pins_succeeds_when_sources_removed() {
     let dir = tmp_dir("scenario-compile-digest-pins");
-    let root_path = dir.join("root.json5");
-    let a_path = dir.join("a.json5");
-    let b_path = dir.join("b.json5");
+    let root_path = dir.path().join("root.json5");
+    let a_path = dir.path().join("a.json5");
+    let b_path = dir.path().join("b.json5");
 
     let a_contents = r#"
         {
@@ -386,8 +380,8 @@ async fn provenance_records_redirect_when_fetched() {
 #[tokio::test]
 async fn relative_manifest_refs_resolve_against_parent() {
     let dir = tmp_dir("scenario-relative-manifest-ref");
-    let root_path = dir.join("root.json5");
-    let child_path = dir.join("child.json5");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
 
     write_file(&child_path, r#"{ manifest_version: "0.1.0" }"#);
     write_file(
@@ -465,8 +459,8 @@ async fn cycle_is_detected_across_url_aliases_with_same_digest() {
 #[tokio::test]
 async fn delegated_export_requires_child_export() {
     let dir = tmp_dir("scenario-delegated-export-missing");
-    let root_path = dir.join("root.json5");
-    let child_path = dir.join("child.json5");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
 
     write_file(&child_path, r#"{ manifest_version: "0.1.0" }"#);
     write_file(
@@ -506,8 +500,8 @@ async fn delegated_export_requires_child_export() {
 #[tokio::test]
 async fn binding_rejects_missing_child_slot() {
     let dir = tmp_dir("scenario-missing-child-slot");
-    let root_path = dir.join("root.json5");
-    let child_path = dir.join("child.json5");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
 
     write_file(
         &child_path,
@@ -563,8 +557,8 @@ async fn config_validation_error_points_to_invalid_value() {
     use miette::Diagnostic;
 
     let dir = tmp_dir("scenario-invalid-config-span");
-    let root_path = dir.join("root.json5");
-    let child_path = dir.join("child.json5");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
 
     write_file(
         &child_path,
@@ -642,8 +636,8 @@ async fn config_validation_error_points_to_invalid_value() {
 #[tokio::test]
 async fn duplicate_slot_bindings_across_manifests_error() {
     let dir = tmp_dir("scenario-duplicate-slot-binding");
-    let root_path = dir.join("root.json5");
-    let child_path = dir.join("child.json5");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
 
     write_file(
         &child_path,
@@ -697,8 +691,8 @@ async fn duplicate_slot_bindings_across_manifests_error() {
 #[tokio::test]
 async fn type_mismatch_reports_expected_and_got() {
     let dir = tmp_dir("scenario-type-mismatch-message");
-    let root_path = dir.join("root.json5");
-    let child_path = dir.join("child.json5");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
 
     write_file(
         &child_path,
@@ -750,9 +744,9 @@ async fn type_mismatch_reports_expected_and_got() {
 #[tokio::test]
 async fn delegated_export_chain_resolves_binding_source() {
     let dir = tmp_dir("scenario-delegated-export-chain");
-    let root_path = dir.join("root.json5");
-    let child_path = dir.join("child.json5");
-    let grand_path = dir.join("grand.json5");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+    let grand_path = dir.path().join("grand.json5");
 
     write_file(
         &grand_path,
@@ -861,7 +855,7 @@ impl Backend for CountingBackend {
 #[tokio::test]
 async fn resolution_deduplicates_inflight_requests() {
     let dir = tmp_dir("scenario-inflight-dedup");
-    let root_path = dir.join("root.json5");
+    let root_path = dir.path().join("root.json5");
 
     write_file(
         &root_path,
@@ -900,7 +894,7 @@ async fn resolution_deduplicates_inflight_requests() {
 #[tokio::test]
 async fn resolution_environments_allow_parent_to_enable_resolvers_for_children() {
     let dir = tmp_dir("scenario-envs");
-    let root_path = dir.join("root.json5");
+    let root_path = dir.path().join("root.json5");
 
     write_file(
         &root_path,
@@ -945,7 +939,7 @@ async fn resolution_environments_allow_parent_to_enable_resolvers_for_children()
 #[tokio::test]
 async fn compile_emits_manifest_lints() {
     let dir = tmp_dir("scenario-manifest-lints");
-    let root_path = dir.join("root.json5");
+    let root_path = dir.path().join("root.json5");
 
     write_file(
         &root_path,
@@ -987,7 +981,7 @@ async fn compile_emits_manifest_lints() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compile_is_spawnable_on_multithread_runtime() {
     let dir = tmp_dir("scenario-compile-send");
-    let root_path = dir.join("root.json5");
+    let root_path = dir.path().join("root.json5");
 
     write_file(&root_path, r#"{ manifest_version: "0.1.0" }"#);
     let root_ref = ManifestRef::from_url(file_url(&root_path));

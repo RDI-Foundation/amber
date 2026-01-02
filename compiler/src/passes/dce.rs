@@ -234,60 +234,20 @@ fn prune_scenario(
     live_program: &[bool],
     live_bindings: &[bool],
 ) -> (Scenario, Provenance) {
-    let Scenario {
-        root,
-        mut components,
-        bindings,
-    } = scenario;
+    let removed: Vec<bool> = keep
+        .iter()
+        .enumerate()
+        .map(|(idx, &keep_component)| !keep_component || scenario.components[idx].is_none())
+        .collect();
 
-    let mut removed = vec![false; components.len()];
-    for (idx, keep_component) in keep.iter().copied().enumerate() {
-        if !keep_component || components[idx].is_none() {
-            removed[idx] = true;
-        }
-    }
-
-    for (idx, c) in components.iter_mut().enumerate() {
-        if removed[idx] {
-            *c = None;
-            continue;
-        }
-        let c = c.as_mut().expect("kept component should exist");
-        c.has_program = c.has_program && live_program[idx];
-        c.children.clear();
-    }
-
-    let mut edges = Vec::new();
-    for (idx, c) in components.iter().enumerate() {
-        let Some(c) = c.as_ref() else {
-            continue;
-        };
-        if let Some(parent) = c.parent {
-            if removed[parent.0] {
-                continue;
-            }
-            edges.push((parent, ComponentId(idx)));
-        }
-    }
-    for (parent, child) in edges {
-        let parent_component = components[parent.0].as_mut().expect("parent should exist");
-        parent_component.children.push(child);
-    }
-
-    let mut new_bindings = Vec::new();
-    for (idx, b) in bindings.into_iter().enumerate() {
-        if !live_bindings[idx] {
-            continue;
-        }
-        new_bindings.push(b);
-    }
-
-    let mut scenario = Scenario {
-        root,
-        components,
-        bindings: new_bindings,
-    };
-    scenario.normalize_child_order_by_moniker();
+    let scenario = super::prune_and_rebuild_scenario(
+        scenario,
+        &removed,
+        |id, component| {
+            component.has_program &= live_program[id.0];
+        },
+        |idx, _binding| live_bindings[idx],
+    );
     scenario.assert_invariants();
 
     (scenario, provenance)

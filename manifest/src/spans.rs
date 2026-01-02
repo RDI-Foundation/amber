@@ -162,6 +162,34 @@ fn key_span(source: &str, object_span: SourceSpan, key: &str) -> SourceSpan {
     span_for_object_key(source, object_span, key).unwrap_or_else(default_span)
 }
 
+fn capability_decl_spans(
+    root: &SpanCursor<'_>,
+    section: &SpanCursor<'_>,
+    name: &str,
+    value: &Value,
+) -> CapabilityDeclSpans {
+    let name_span = key_span(root.source, section.span, name);
+    let whole = span_or_default(section.child_span(name));
+    let mut decl = CapabilityDeclSpans {
+        name: name_span,
+        whole,
+        kind: None,
+        profile: None,
+    };
+
+    if let Value::Object(obj) = value {
+        let cursor = SpanCursor::new(root.source, whole);
+        if obj.contains_key("kind") {
+            decl.kind = cursor.child_span("kind");
+        }
+        if obj.contains_key("profile") {
+            decl.profile = cursor.child_span("profile");
+        }
+    }
+
+    decl
+}
+
 fn object_section<'a>(
     root: &SpanCursor<'a>,
     root_obj: &'a Map<String, Value>,
@@ -312,28 +340,7 @@ fn collect_slots(root: &SpanCursor<'_>, root_obj: &Map<String, Value>, out: &mut
     out.slots_section = Some(slots.span);
 
     for (slot_name, slot_value) in slots_obj {
-        let name_span = key_span(root.source, slots.span, slot_name);
-        let whole = span_or_default(slots.child_span(slot_name));
-        let mut decl = CapabilityDeclSpans {
-            name: name_span,
-            whole,
-            kind: None,
-            profile: None,
-        };
-
-        let Value::Object(obj) = slot_value else {
-            out.slots.insert(slot_name.as_str().into(), decl);
-            continue;
-        };
-
-        let slot = SpanCursor::new(root.source, whole);
-        if obj.contains_key("kind") {
-            decl.kind = slot.child_span("kind");
-        }
-        if obj.contains_key("profile") {
-            decl.profile = slot.child_span("profile");
-        }
-
+        let decl = capability_decl_spans(root, &slots, slot_name, slot_value);
         out.slots.insert(slot_name.as_str().into(), decl);
     }
 }
@@ -344,35 +351,18 @@ fn collect_provides(root: &SpanCursor<'_>, root_obj: &Map<String, Value>, out: &
     };
 
     for (provide_name, provide_value) in provides_obj {
-        let name_span = key_span(root.source, provides.span, provide_name);
-        let whole = span_or_default(provides.child_span(provide_name));
         let mut provide = ProvideDeclSpans {
-            capability: CapabilityDeclSpans {
-                name: name_span,
-                whole,
-                kind: None,
-                profile: None,
-            },
+            capability: capability_decl_spans(root, &provides, provide_name, provide_value),
             endpoint: None,
             endpoint_value: None,
         };
 
-        let Value::Object(obj) = provide_value else {
-            out.provides.insert(provide_name.as_str().into(), provide);
-            continue;
-        };
-
-        let decl = SpanCursor::new(root.source, whole);
-        if obj.contains_key("kind") {
-            provide.capability.kind = decl.child_span("kind");
-        }
-        if obj.contains_key("profile") {
-            provide.capability.profile = decl.child_span("profile");
-        }
-
-        if let Some(endpoint) = obj.get("endpoint") {
-            provide.endpoint = decl.child_span("endpoint");
-            provide.endpoint_value = endpoint.as_str().map(Into::into);
+        if let Value::Object(obj) = provide_value {
+            let decl = SpanCursor::new(root.source, provide.capability.whole);
+            if let Some(endpoint) = obj.get("endpoint") {
+                provide.endpoint = decl.child_span("endpoint");
+                provide.endpoint_value = endpoint.as_str().map(Into::into);
+            }
         }
 
         out.provides.insert(provide_name.as_str().into(), provide);

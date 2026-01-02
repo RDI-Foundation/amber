@@ -381,30 +381,30 @@ fn compute_environment(
     Ok(out)
 }
 
+fn cached_manifest(svc: &ResolveService, r: &ManifestRef, url: &Url) -> Option<ResolvedManifest> {
+    let expected = r.digest?;
+    let manifest = svc.store.get(&expected)?;
+    Some(ResolvedManifest {
+        manifest,
+        digest: expected,
+        resolved_url: url.clone(),
+        observed_url: None,
+    })
+}
+
 async fn resolve_manifest(
     svc: &ResolveService,
     env: &ResolveEnv,
     r: &ManifestRef,
 ) -> Result<ResolvedManifest, Error> {
-    if let Some(expected) = r.digest
-        && let Some(manifest) = svc.store.get(&expected)
-    {
-        let url = r
-            .url
-            .as_url()
-            .expect("resolved manifest ref should be absolute");
-        return Ok(ResolvedManifest {
-            manifest,
-            digest: expected,
-            resolved_url: url.clone(),
-            observed_url: None,
-        });
-    }
-
     let url = r
         .url
         .as_url()
         .expect("resolved manifest ref should be absolute");
+    if let Some(resolved) = cached_manifest(svc, r, url) {
+        return Ok(resolved);
+    }
+
     let key = (env.id, url.clone());
     let cell = svc
         .inflight
@@ -432,21 +432,6 @@ async fn resolve_manifest_inner(
     env: &ResolveEnv,
     r: &ManifestRef,
 ) -> Result<ResolvedManifest, Error> {
-    if let Some(expected) = r.digest
-        && let Some(manifest) = svc.store.get(&expected)
-    {
-        let url = r
-            .url
-            .as_url()
-            .expect("resolved manifest ref should be absolute");
-        return Ok(ResolvedManifest {
-            manifest,
-            digest: expected,
-            resolved_url: url.clone(),
-            observed_url: None,
-        });
-    }
-
     let _permit = svc
         .sem
         .clone()
@@ -458,6 +443,9 @@ async fn resolve_manifest_inner(
         .url
         .as_url()
         .expect("resolved manifest ref should be absolute");
+    if let Some(resolved) = cached_manifest(svc, r, url) {
+        return Ok(resolved);
+    }
     let resolution = env.resolver.resolve(url, r.digest).await?;
     let manifest = Arc::new(resolution.manifest);
     let digest = manifest.digest();
