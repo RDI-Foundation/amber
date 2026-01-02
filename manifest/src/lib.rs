@@ -1176,12 +1176,21 @@ pub struct Binding {
     pub weak: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct Runtime {
+    pub version: VersionReq,
+}
+
 #[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct RawManifest {
     pub manifest_version: Version,
+    #[serde(default)]
+    pub runtime: Option<Runtime>,
     #[serde(default)]
     pub program: Option<Program>,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
@@ -1530,6 +1539,7 @@ impl RawManifest {
 
         let RawManifest {
             manifest_version,
+            runtime,
             program,
             components,
             environments,
@@ -1563,6 +1573,7 @@ impl RawManifest {
 
         Ok(Manifest {
             manifest_version,
+            runtime,
             program,
             components,
             environments,
@@ -1580,6 +1591,7 @@ impl RawManifest {
 #[serde(into = "RawManifest", try_from = "RawManifest")]
 pub struct Manifest {
     manifest_version: Version,
+    runtime: Option<Runtime>,
     program: Option<Program>,
     components: BTreeMap<ChildName, ComponentDecl>,
     environments: BTreeMap<String, EnvironmentDecl>,
@@ -1598,6 +1610,10 @@ impl Manifest {
 
     pub fn program(&self) -> Option<&Program> {
         self.program.as_ref()
+    }
+
+    pub fn runtime(&self) -> Option<&Runtime> {
+        self.runtime.as_ref()
     }
 
     pub fn components(&self) -> &BTreeMap<ChildName, ComponentDecl> {
@@ -1631,6 +1647,7 @@ impl Manifest {
     pub fn empty() -> Self {
         RawManifest {
             manifest_version: Version::new(0, 1, 0),
+            runtime: None,
             program: None,
             components: BTreeMap::new(),
             environments: BTreeMap::new(),
@@ -1736,6 +1753,7 @@ impl From<&Manifest> for RawManifest {
 
         RawManifest {
             manifest_version: manifest.manifest_version.clone(),
+            runtime: manifest.runtime.clone(),
             program: manifest.program.clone(),
             components,
             environments: manifest.environments.clone(),

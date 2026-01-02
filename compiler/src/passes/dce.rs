@@ -298,6 +298,7 @@ mod tests {
         let green: Manifest = r#"
         {
           manifest_version: "0.1.0",
+          runtime: { version: "^1.0.0" },
           program: {
             image: "green",
             args: ["--llm", "${slots.llm.url}"],
@@ -316,6 +317,7 @@ mod tests {
         let wrapper: Manifest = r##"
         {
           manifest_version: "0.1.0",
+          runtime: { version: "^1.0.0" },
           program: { image: "wrapper" },
           slots: { litellm: { kind: "http" } },
           provides: { admin_api: { kind: "mcp" } },
@@ -520,6 +522,7 @@ mod tests {
         let consumer: Manifest = r##"
         {
           manifest_version: "0.1.0",
+          runtime: { version: "^1.0.0" },
           program: {
             image: "consumer",
             args: ["--input", "${slots.input.url}", "--llm", "${slots.llm.url}"],
@@ -538,6 +541,7 @@ mod tests {
         let input: Manifest = r##"
         {
           manifest_version: "0.1.0",
+          runtime: { version: ">=1.0.0, <2.0.0" },
           program: { image: "input" },
           provides: { input: { kind: "mcp" } },
           exports: { input: "input" },

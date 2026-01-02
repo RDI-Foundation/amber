@@ -8,6 +8,7 @@ use super::*;
 fn create_empty_manifest() {
     let manifest = Manifest::empty();
     assert_eq!(manifest.manifest_version, Version::new(0, 1, 0));
+    assert!(manifest.runtime.is_none());
     assert!(manifest.program.is_none());
     assert!(manifest.components.is_empty());
     assert!(manifest.environments.is_empty());
@@ -16,6 +17,51 @@ fn create_empty_manifest() {
     assert!(manifest.provides.is_empty());
     assert!(manifest.bindings.is_empty());
     assert!(manifest.exports.is_empty());
+}
+
+#[test]
+fn runtime_version_req_parses() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          runtime: { version: ">=1.2.0, <2.0.0" },
+        }
+        "#,
+    );
+
+    let manifest = raw.validate().unwrap();
+    let runtime = manifest.runtime.as_ref().unwrap();
+    assert!(runtime.version.matches(&Version::new(1, 2, 0)));
+    assert!(runtime.version.matches(&Version::new(1, 9, 0)));
+    assert!(!runtime.version.matches(&Version::new(2, 0, 0)));
+}
+
+#[test]
+fn runtime_version_req_accepts_various_ranges() {
+    let ranges = [
+        "^1.2.3",
+        "~1.4.0",
+        "1.2.3",
+        ">=1.2.0",
+        ">=1.2.0, <2.0.0",
+        "<=2.0.0",
+    ];
+
+    for range in ranges {
+        let source = format!(
+            r#"
+            {{
+              manifest_version: "0.1.0",
+              runtime: {{ version: "{range}" }},
+            }}
+            "#
+        );
+
+        let manifest = source.parse::<Manifest>().unwrap();
+        let runtime = manifest.runtime.expect("runtime");
+        assert_eq!(runtime.version, VersionReq::parse(range).unwrap());
+    }
 }
 
 #[test]
