@@ -107,6 +107,35 @@ single_quote_char = _{
 
 string = ${ "\"" ~ double_quote_char* ~ "\"" | "'" ~ single_quote_char* ~ "'" }
 
+unterminated_string = @{
+  "\"" ~ double_quote_char* ~ (line_terminator | EOI) |
+  "'" ~ single_quote_char* ~ (line_terminator | EOI)
+}
+
+l_brace = { "{" }
+r_brace = { "}" }
+l_bracket = { "[" }
+r_bracket = { "]" }
+colon = { ":" }
+comma = { "," }
+
+token = {
+  string |
+  unterminated_string |
+  number |
+  boolean |
+  null |
+  identifier |
+  l_brace |
+  r_brace |
+  l_bracket |
+  r_bracket |
+  colon |
+  comma
+}
+
+tokens = { SOI ~ (token | COMMENT | WHITESPACE)* ~ EOI }
+
 text = _{ SOI ~ value ~ EOI }
 
 unicode_escape_sequence = @{ ASCII_HEX_DIGIT{4} }

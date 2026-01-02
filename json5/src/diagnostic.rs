@@ -349,18 +349,7 @@ struct Json5Hint {
     span: SourceSpan,
 }
 
-#[derive(Debug)]
-enum TokenizeError {
-    UnterminatedString { start: usize },
-}
-
-#[derive(Clone, Debug)]
-struct Token {
-    kind: TokenKind,
-    span: SourceSpan,
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TokenKind {
     LBrace,
     RBrace,
@@ -369,9 +358,62 @@ enum TokenKind {
     Colon,
     Comma,
     String,
-    Identifier,
+    UnterminatedString,
     Number,
-    Literal,
+    Boolean,
+    Null,
+    Identifier,
+}
+
+#[derive(Clone, Debug)]
+struct Token {
+    kind: TokenKind,
+    span: SourceSpan,
+}
+
+fn lex_json5_tokens(source: &str) -> Option<Vec<Token>> {
+    use crate::spans::Rule;
+
+    let mut pairs = crate::spans::Json5Parser::parse(Rule::tokens, source).ok()?;
+    let tokens = pairs.next()?;
+    let mut out = Vec::new();
+
+    for token in tokens.into_inner() {
+        if token.as_rule() != Rule::token {
+            continue;
+        }
+        let Some(inner) = token.into_inner().next() else {
+            continue;
+        };
+        let kind = match inner.as_rule() {
+            Rule::l_brace => TokenKind::LBrace,
+            Rule::r_brace => TokenKind::RBrace,
+            Rule::l_bracket => TokenKind::LBracket,
+            Rule::r_bracket => TokenKind::RBracket,
+            Rule::colon => TokenKind::Colon,
+            Rule::comma => TokenKind::Comma,
+            Rule::string => TokenKind::String,
+            Rule::unterminated_string => TokenKind::UnterminatedString,
+            Rule::number => TokenKind::Number,
+            Rule::boolean => TokenKind::Boolean,
+            Rule::null => TokenKind::Null,
+            Rule::identifier => TokenKind::Identifier,
+            _ => continue,
+        };
+        out.push(Token {
+            kind,
+            span: crate::spans::span(&inner),
+        });
+    }
+
+    Some(out)
+}
+
+fn unterminated_string_span(tokens: &[Token]) -> Option<SourceSpan> {
+    tokens
+        .iter()
+        .find(|token| token.kind == TokenKind::UnterminatedString)
+        .map(|token| (token.span.offset(), 1).into())
 }
 
 fn needs_unterminated_string_hint(code: json5::ErrorCode) -> bool {
@@ -398,20 +440,17 @@ fn json5_hint(source: &str, err: &json5::Error) -> Option<Json5Hint> {
     let wants_unterminated = needs_unterminated_string_hint(code);
     let wants_container = needs_container_hint(code);
 
-    if wants_unterminated || wants_container {
-        match tokenize_json5(source) {
-            Err(TokenizeError::UnterminatedString { start }) if wants_unterminated => {
-                return Some(Json5Hint {
-                    message: "unterminated string (missing closing quote)".to_string(),
-                    span: (start, 1).into(),
-                });
-            }
-            Ok(tokens) if wants_container => {
-                if let Some(hint) = unclosed_container_hint(&tokens) {
-                    return Some(hint);
-                }
-            }
-            _ => {}
+    if (wants_unterminated || wants_container)
+        && let Some(tokens) = lex_json5_tokens(source)
+    {
+        if wants_unterminated && let Some(span) = unterminated_string_span(&tokens) {
+            return Some(Json5Hint {
+                message: "unterminated string (missing closing quote)".to_string(),
+                span,
+            });
+        }
+        if wants_container && let Some(hint) = unclosed_container_hint(&tokens) {
+            return Some(hint);
         }
     }
 
@@ -419,147 +458,6 @@ fn json5_hint(source: &str, err: &json5::Error) -> Option<Json5Hint> {
         message: summarize_json5_error(err),
         span: span_for_json5_error(source, err),
     })
-}
-
-fn tokenize_json5(source: &str) -> Result<Vec<Token>, TokenizeError> {
-    let bytes = source.as_bytes();
-    let mut tokens = Vec::new();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b' ' | b'\n' | b'\r' | b'\t' => {
-                i += 1;
-            }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                i += 2;
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                if i + 1 < bytes.len() {
-                    i += 2;
-                }
-            }
-            b'{' => {
-                tokens.push(Token {
-                    kind: TokenKind::LBrace,
-                    span: (i, 1).into(),
-                });
-                i += 1;
-            }
-            b'}' => {
-                tokens.push(Token {
-                    kind: TokenKind::RBrace,
-                    span: (i, 1).into(),
-                });
-                i += 1;
-            }
-            b'[' => {
-                tokens.push(Token {
-                    kind: TokenKind::LBracket,
-                    span: (i, 1).into(),
-                });
-                i += 1;
-            }
-            b']' => {
-                tokens.push(Token {
-                    kind: TokenKind::RBracket,
-                    span: (i, 1).into(),
-                });
-                i += 1;
-            }
-            b':' => {
-                tokens.push(Token {
-                    kind: TokenKind::Colon,
-                    span: (i, 1).into(),
-                });
-                i += 1;
-            }
-            b',' => {
-                tokens.push(Token {
-                    kind: TokenKind::Comma,
-                    span: (i, 1).into(),
-                });
-                i += 1;
-            }
-            b'"' | b'\'' => {
-                let quote = bytes[i];
-                let start = i;
-                i += 1;
-                while i < bytes.len() {
-                    match bytes[i] {
-                        b'\\' => {
-                            i += 2;
-                        }
-                        c if c == quote => {
-                            i += 1;
-                            tokens.push(Token {
-                                kind: TokenKind::String,
-                                span: (start, i - start).into(),
-                            });
-                            break;
-                        }
-                        b'\n' | b'\r' => break,
-                        _ => i += 1,
-                    }
-                }
-                if i >= bytes.len() || bytes[i.saturating_sub(1)] != quote {
-                    return Err(TokenizeError::UnterminatedString { start });
-                }
-            }
-            b'0'..=b'9' | b'.' | b'+' | b'-' => {
-                let start = i;
-                i += 1;
-                while i < bytes.len() {
-                    match bytes[i] {
-                        b'0'..=b'9'
-                        | b'.'
-                        | b'e'
-                        | b'E'
-                        | b'+'
-                        | b'-'
-                        | b'x'
-                        | b'X'
-                        | b'a'..=b'f'
-                        | b'A'..=b'F' => i += 1,
-                        _ => break,
-                    }
-                }
-                tokens.push(Token {
-                    kind: TokenKind::Number,
-                    span: (start, i - start).into(),
-                });
-            }
-            b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'$' => {
-                let start = i;
-                i += 1;
-                while i < bytes.len() {
-                    match bytes[i] {
-                        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$' => i += 1,
-                        _ => break,
-                    }
-                }
-                tokens.push(Token {
-                    kind: TokenKind::Identifier,
-                    span: (start, i - start).into(),
-                });
-            }
-            _ => {
-                let start = i;
-                i += 1;
-                tokens.push(Token {
-                    kind: TokenKind::Literal,
-                    span: (start, 1).into(),
-                });
-            }
-        }
-    }
-    Ok(tokens)
 }
 
 fn unclosed_container_hint(tokens: &[Token]) -> Option<Json5Hint> {
@@ -646,7 +544,7 @@ fn json5_found_value_type(source: &str, err: &json5::Error) -> Option<&'static s
     let position = err.position()?;
     let span = span_for_line_col(source, position.line + 1, position.column + 1);
     let offset = span.offset();
-    let tokens = tokenize_json5(source).ok()?;
+    let tokens = lex_json5_tokens(source)?;
     let token = token_at_offset(&tokens, offset)?;
     json5_token_value_kind(source, token)
 }
@@ -670,23 +568,13 @@ fn json5_token_value_kind(source: &str, token: &Token) -> Option<&'static str> {
     match &token.kind {
         TokenKind::LBrace => Some("object"),
         TokenKind::LBracket => Some("array"),
-        TokenKind::String => Some("string"),
+        TokenKind::String | TokenKind::UnterminatedString => Some("string"),
         TokenKind::Number => Some("number"),
-        TokenKind::Literal => json5_literal_kind(source, token.span),
+        TokenKind::Boolean => Some("boolean"),
+        TokenKind::Null => Some("null"),
         TokenKind::Identifier => json5_identifier_kind(source, token.span),
         _ => None,
     }
-}
-
-fn json5_literal_kind(source: &str, span: SourceSpan) -> Option<&'static str> {
-    let raw = source.get(span.offset()..span_end(span))?;
-    let raw = raw.trim();
-    Some(match raw {
-        "true" | "false" => "boolean",
-        "null" => "null",
-        "Infinity" | "NaN" => "number",
-        _ => "literal",
-    })
 }
 
 fn json5_identifier_kind(source: &str, span: SourceSpan) -> Option<&'static str> {
