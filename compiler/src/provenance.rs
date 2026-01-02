@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use amber_manifest::{CapabilityKind, ManifestDigest, ManifestRef};
-use amber_scenario::ComponentId;
+use amber_scenario::{ComponentId, Moniker};
 use url::Url;
 
 /// Per-compilation provenance captured alongside the Scenario graph.
@@ -19,8 +19,8 @@ impl Provenance {
 
 #[derive(Clone, Debug)]
 pub struct ComponentProvenance {
-    /// Stable component path as authored, before any optimization passes rewrite the tree.
-    pub authored_path: Arc<str>,
+    /// Stable component moniker as authored, before any optimization passes rewrite the tree.
+    pub authored_moniker: Moniker,
     /// What was declared by the parent (URL + optional digest pin).
     pub declared_ref: ManifestRef,
     /// The absolute URL used for resolution after applying `base_url` rules.
@@ -40,7 +40,7 @@ impl ComponentProvenance {
 #[derive(Clone, Debug)]
 pub struct RootExportProvenance {
     pub name: Arc<str>,
-    pub endpoint_component_path: Arc<str>,
+    pub endpoint_component_moniker: Moniker,
     pub endpoint_provide: Arc<str>,
     pub kind: CapabilityKind,
 }

@@ -17,6 +17,12 @@ pub struct CycleError {
 /// - This is intentionally separate from Scenario (graph ops live here).
 pub fn topo_order(s: &Scenario) -> Result<Vec<ComponentId>, CycleError> {
     let n = s.components.len();
+    let mut live = vec![false; n];
+    let mut live_count = 0usize;
+    for (id, _) in s.components_iter() {
+        live[id.0] = true;
+        live_count += 1;
+    }
     let mut indeg = vec![0usize; n];
     let mut out: Vec<Vec<usize>> = vec![Vec::new(); n];
 
@@ -42,6 +48,9 @@ pub fn topo_order(s: &Scenario) -> Result<Vec<ComponentId>, CycleError> {
 
     let mut q = VecDeque::new();
     for (i, &d) in indeg.iter().enumerate() {
+        if !live[i] {
+            continue;
+        }
         if d == 0 {
             q.push_back(i);
         }
@@ -58,11 +67,11 @@ pub fn topo_order(s: &Scenario) -> Result<Vec<ComponentId>, CycleError> {
         }
     }
 
-    if order.len() == n {
+    if order.len() == live_count {
         return Ok(order);
     }
 
-    let cycle = find_cycle(&out, &indeg);
+    let cycle = find_cycle(&out, &indeg, &live);
     Err(CycleError { cycle })
 }
 
@@ -72,31 +81,12 @@ pub fn component_path(s: &Scenario, id: ComponentId) -> String {
 }
 
 /// Convenience: compute a stable "path" name for a component like `/a/b`.
-pub fn component_path_for(components: &[Component], id: ComponentId) -> String {
-    let mut parts = Vec::new();
-    let mut cur = Some(id);
-    while let Some(cid) = cur {
-        let c = &components[cid.0];
-        if c.parent.is_some() {
-            parts.push(c.name.as_str());
-        }
-        cur = c.parent;
-    }
-
-    if parts.is_empty() {
-        return "/".to_string();
-    }
-
-    let len = parts.iter().map(|p| p.len()).sum::<usize>() + parts.len();
-    let mut out = String::with_capacity(len);
-    out.push('/');
-    for (i, part) in parts.iter().rev().enumerate() {
-        if i > 0 {
-            out.push('/');
-        }
-        out.push_str(part);
-    }
-    out
+pub fn component_path_for(components: &[Option<Component>], id: ComponentId) -> String {
+    components[id.0]
+        .as_ref()
+        .expect("component should exist")
+        .moniker
+        .to_string()
 }
 
 /// Convenience: list direct dependencies (providers) of a component, by id.
@@ -110,7 +100,7 @@ pub fn providers_of(s: &Scenario, id: ComponentId) -> BTreeSet<ComponentId> {
     set
 }
 
-fn find_cycle(out: &[Vec<usize>], indeg: &[usize]) -> Vec<ComponentId> {
+fn find_cycle(out: &[Vec<usize>], indeg: &[usize], live: &[bool]) -> Vec<ComponentId> {
     let n = out.len();
     let mut state = vec![0u8; n];
     let mut stack = Vec::new();
@@ -154,7 +144,7 @@ fn find_cycle(out: &[Vec<usize>], indeg: &[usize]) -> Vec<ComponentId> {
     }
 
     for u in 0..n {
-        if indeg[u] == 0 || state[u] != 0 {
+        if !live[u] || indeg[u] == 0 || state[u] != 0 {
             continue;
         }
         if let Some(cycle) = dfs(u, out, indeg, &mut state, &mut stack) {
@@ -167,28 +157,28 @@ fn find_cycle(out: &[Vec<usize>], indeg: &[usize]) -> Vec<ComponentId> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use amber_manifest::ManifestDigest;
 
     use super::*;
-    use crate::{BindingEdge, ProvideRef, SlotRef};
+    use crate::{BindingEdge, Moniker, ProvideRef, SlotRef};
 
-    fn component(id: usize, name: &str) -> Component {
+    fn component(id: usize, moniker: &str) -> Component {
         Component {
             id: ComponentId(id),
             parent: None,
-            name: name.to_string(),
+            moniker: Moniker::from(Arc::from(moniker)),
             has_program: false,
             digest: ManifestDigest::new([id as u8; 32]),
             config: None,
-            children: BTreeMap::new(),
+            children: Vec::new(),
         }
     }
 
     #[test]
     fn topo_order_ignores_weak_edges() {
-        let components = vec![component(0, "a"), component(1, "b")];
+        let components = vec![Some(component(0, "/a")), Some(component(1, "/b"))];
         let bindings = vec![
             BindingEdge {
                 from: ProvideRef {
@@ -225,7 +215,11 @@ mod tests {
 
     #[test]
     fn topo_order_reports_cycle_path() {
-        let components = vec![component(0, "a"), component(1, "b"), component(2, "c")];
+        let components = vec![
+            Some(component(0, "/a")),
+            Some(component(1, "/b")),
+            Some(component(2, "/c")),
+        ];
         let bindings = vec![
             BindingEdge {
                 from: ProvideRef {

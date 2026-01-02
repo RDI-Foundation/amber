@@ -183,13 +183,13 @@ fn collect_manifest_diagnostics(
 ) -> Vec<Report> {
     let mut diagnostics = Vec::new();
 
-    for component in &scenario.components {
+    for (_, component) in scenario.components_iter() {
         let manifest = store
             .get(&component.digest)
             .expect("manifest was resolved during linking");
         let prov = provenance.for_component(component.id);
         let url = prov.effective_url();
-        let component_path = prov.authored_path.as_ref();
+        let component_path = prov.authored_moniker.as_str();
 
         let Some((src, spans)) = store.diagnostic_source(url) else {
             continue;

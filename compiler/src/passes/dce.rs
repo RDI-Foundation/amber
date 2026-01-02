@@ -1,10 +1,10 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
 use amber_manifest::Manifest;
-use amber_scenario::{ComponentId, Scenario};
+use amber_scenario::{ComponentId, Moniker, Scenario};
 
 use super::{PassError, ScenarioPass};
 use crate::{DigestStore, Provenance};
@@ -36,6 +36,8 @@ impl ScenarioPass for DcePass {
         provenance: Provenance,
         store: &DigestStore,
     ) -> Result<(Scenario, Provenance), PassError> {
+        scenario.assert_invariants();
+
         let manifests = crate::manifest_table::build_manifest_table(&scenario.components, store)
             .map_err(|e| PassError::Failed {
                 pass: self.name(),
@@ -48,6 +50,8 @@ impl ScenarioPass for DcePass {
         let n = scenario.components.len();
         let mut incoming = vec![Vec::new(); n];
         for (idx, b) in scenario.bindings.iter().enumerate() {
+            let _ = scenario.component(b.to.component);
+            let _ = scenario.component(b.from.component);
             incoming[b.to.component.0].push(idx);
         }
 
@@ -58,19 +62,24 @@ impl ScenarioPass for DcePass {
 
         let mut work = VecDeque::new();
 
-        let root = scenario.root;
-        let root_manifest = &manifests[root.0];
-        for export in root_manifest.exports().keys() {
-            let resolved =
-                crate::linker::resolve_export(&scenario.components, &manifests, root, export)
-                    .map_err(|e| PassError::Failed {
-                        pass: self.name(),
-                        message: e.to_string(),
-                    })?;
-
+        let mut id_by_moniker: HashMap<Moniker, ComponentId> =
+            HashMap::with_capacity(scenario.components.len());
+        for (id, component) in scenario.components_iter() {
+            id_by_moniker.insert(component.moniker.clone(), id);
+        }
+        for export in &provenance.root_exports {
+            let Some(&component_id) = id_by_moniker.get(&export.endpoint_component_moniker) else {
+                return Err(PassError::Failed {
+                    pass: self.name(),
+                    message: format!(
+                        "root export `{}` targets missing component `{}`",
+                        export.name, export.endpoint_component_moniker
+                    ),
+                });
+            };
             let key = CapKey {
-                component: resolved.component.0,
-                name: Arc::from(resolved.name),
+                component: component_id.0,
+                name: Arc::clone(&export.endpoint_provide),
             };
             if live_provides.insert(key.clone()) {
                 work.push_back(WorkItem::Provide(key));
@@ -81,17 +90,24 @@ impl ScenarioPass for DcePass {
             match item {
                 WorkItem::Provide(key) => {
                     let component = key.component;
-                    if scenario.components[component].has_program && !live_program[component] {
+                    if scenario.component(ComponentId(component)).has_program
+                        && !live_program[component]
+                    {
                         live_program[component] = true;
                         work.push_back(WorkItem::Program(component));
                     }
                 }
                 WorkItem::Program(component) => {
-                    mark_used_slots(component, &manifests[component], &mut live_slots, &mut work);
+                    let manifest = manifests[component]
+                        .as_ref()
+                        .expect("manifest should exist");
+                    mark_used_slots(component, manifest, &mut live_slots, &mut work);
                 }
                 WorkItem::Slot(key) => {
                     let component = key.component;
-                    if scenario.components[component].has_program && !live_program[component] {
+                    if scenario.component(ComponentId(component)).has_program
+                        && !live_program[component]
+                    {
                         live_program[component] = true;
                         work.push_back(WorkItem::Program(component));
                     }
@@ -198,13 +214,13 @@ fn compute_keep_set(
         if !keep[idx] {
             continue;
         }
-        let mut cur = scenario.components[idx].parent;
+        let mut cur = scenario.component(ComponentId(idx)).parent;
         while let Some(parent) = cur {
             if keep[parent.0] {
                 break;
             }
             keep[parent.0] = true;
-            cur = scenario.components[parent.0].parent;
+            cur = scenario.component(parent).parent;
         }
     }
 
@@ -220,95 +236,89 @@ fn prune_scenario(
 ) -> (Scenario, Provenance) {
     let Scenario {
         root,
-        components,
+        mut components,
         bindings,
     } = scenario;
-    let Provenance {
-        components: prov_components,
-        root_exports,
-    } = provenance;
 
-    let mut old_to_new = vec![None; components.len()];
-    let mut next = 0usize;
-    for (old_idx, keep_component) in keep.iter().copied().enumerate() {
-        if !keep_component {
-            continue;
+    let mut removed = vec![false; components.len()];
+    for (idx, keep_component) in keep.iter().copied().enumerate() {
+        if !keep_component || components[idx].is_none() {
+            removed[idx] = true;
         }
-        old_to_new[old_idx] = Some(next);
-        next += 1;
     }
 
-    let mut new_components = Vec::with_capacity(next);
-    for (old_idx, mut c) in components.into_iter().enumerate() {
-        if old_to_new[old_idx].is_none() {
+    for (idx, c) in components.iter_mut().enumerate() {
+        if removed[idx] {
+            *c = None;
             continue;
         }
-
-        let new_idx = old_to_new[old_idx].expect("checked is_some");
-        c.id = ComponentId(new_idx);
-        c.has_program = c.has_program && live_program[old_idx];
-        c.parent = c.parent.and_then(|p| old_to_new[p.0].map(ComponentId));
-
-        c.children = c
-            .children
-            .into_iter()
-            .filter_map(|(name, child)| {
-                old_to_new[child.0].map(|mapped| (name, ComponentId(mapped)))
-            })
-            .collect();
-
-        new_components.push(c);
+        let c = c.as_mut().expect("kept component should exist");
+        c.has_program = c.has_program && live_program[idx];
+        c.children.clear();
     }
 
-    let new_root = ComponentId(old_to_new[root.0].expect("root is always kept"));
+    let mut edges = Vec::new();
+    for (idx, c) in components.iter().enumerate() {
+        let Some(c) = c.as_ref() else {
+            continue;
+        };
+        if let Some(parent) = c.parent {
+            if removed[parent.0] {
+                continue;
+            }
+            edges.push((parent, ComponentId(idx)));
+        }
+    }
+    for (parent, child) in edges {
+        let parent_component = components[parent.0].as_mut().expect("parent should exist");
+        parent_component.children.push(child);
+    }
 
     let mut new_bindings = Vec::new();
-    for (idx, mut b) in bindings.into_iter().enumerate() {
+    for (idx, b) in bindings.into_iter().enumerate() {
         if !live_bindings[idx] {
             continue;
         }
-        let from = old_to_new[b.from.component.0]
-            .map(ComponentId)
-            .expect("live bindings only reference kept components");
-        let to = old_to_new[b.to.component.0]
-            .map(ComponentId)
-            .expect("live bindings only reference kept components");
-
-        b.from.component = from;
-        b.to.component = to;
         new_bindings.push(b);
     }
 
-    let mut new_prov = Vec::new();
-    for (idx, p) in prov_components.into_iter().enumerate() {
-        if old_to_new[idx].is_some() {
-            new_prov.push(p);
-        }
-    }
+    let mut scenario = Scenario {
+        root,
+        components,
+        bindings: new_bindings,
+    };
+    scenario.normalize_child_order_by_moniker();
+    scenario.assert_invariants();
 
-    (
-        Scenario {
-            root: new_root,
-            components: new_components,
-            bindings: new_bindings,
-        },
-        Provenance {
-            components: new_prov,
-            root_exports,
-        },
-    )
+    (scenario, provenance)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::sync::Arc;
 
-    use amber_manifest::{Manifest, ManifestRef};
-    use amber_scenario::{BindingEdge, Component, ComponentId, ProvideRef, Scenario, SlotRef};
+    use amber_manifest::{CapabilityKind, Manifest, ManifestRef};
+    use amber_scenario::{
+        BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, SlotRef,
+    };
     use url::Url;
 
     use super::DcePass;
-    use crate::{ComponentProvenance, DigestStore, Provenance, passes::ScenarioPass};
+    use crate::{
+        ComponentProvenance, DigestStore, Provenance, RootExportProvenance, passes::ScenarioPass,
+    };
+
+    fn component(id: usize, moniker: &str) -> Component {
+        Component {
+            id: ComponentId(id),
+            parent: None,
+            moniker: Moniker::from(Arc::from(moniker)),
+            has_program: false,
+            digest: amber_manifest::ManifestDigest::new([id as u8; 32]),
+            config: None,
+            children: Vec::new(),
+        }
+    }
 
     #[test]
     fn dce_prunes_unused_transitive_subtree() {
@@ -384,53 +394,33 @@ mod tests {
         store.put(wrapper_digest, Arc::new(wrapper));
 
         let mut components = vec![
-            Component {
-                id: ComponentId(0),
-                parent: None,
-                name: String::new(),
-                has_program: false,
-                digest: root_digest,
-                config: None,
-                children: BTreeMap::new(),
-            },
-            Component {
-                id: ComponentId(1),
-                parent: Some(ComponentId(0)),
-                name: "router".to_string(),
-                has_program: true,
-                digest: router_digest,
-                config: None,
-                children: BTreeMap::new(),
-            },
-            Component {
-                id: ComponentId(2),
-                parent: Some(ComponentId(0)),
-                name: "green".to_string(),
-                has_program: true,
-                digest: green_digest,
-                config: None,
-                children: BTreeMap::new(),
-            },
-            Component {
-                id: ComponentId(3),
-                parent: Some(ComponentId(1)),
-                name: "wrapper".to_string(),
-                has_program: true,
-                digest: wrapper_digest,
-                config: None,
-                children: BTreeMap::new(),
-            },
+            Some(component(0, "/")),
+            Some(component(1, "/router")),
+            Some(component(2, "/green")),
+            Some(component(3, "/router/wrapper")),
         ];
+        components[0].as_mut().unwrap().digest = root_digest;
+        components[1].as_mut().unwrap().digest = router_digest;
+        components[2].as_mut().unwrap().digest = green_digest;
+        components[3].as_mut().unwrap().digest = wrapper_digest;
+
+        components[1].as_mut().unwrap().parent = Some(ComponentId(0));
+        components[2].as_mut().unwrap().parent = Some(ComponentId(0));
+        components[3].as_mut().unwrap().parent = Some(ComponentId(1));
+        components[1].as_mut().unwrap().has_program = true;
+        components[2].as_mut().unwrap().has_program = true;
+        components[3].as_mut().unwrap().has_program = true;
 
         components[0]
+            .as_mut()
+            .unwrap()
             .children
-            .insert("router".to_string(), ComponentId(1));
-        components[0]
-            .children
-            .insert("green".to_string(), ComponentId(2));
+            .extend([ComponentId(1), ComponentId(2)]);
         components[1]
+            .as_mut()
+            .unwrap()
             .children
-            .insert("wrapper".to_string(), ComponentId(3));
+            .push(ComponentId(3));
 
         let bindings = vec![
             // Root wiring: green.llm <- router.llm
@@ -471,63 +461,84 @@ mod tests {
             },
         ];
 
-        let scenario = Scenario {
+        let mut scenario = Scenario {
             root: ComponentId(0),
             components,
             bindings,
         };
+        scenario.normalize_child_order_by_moniker();
 
         let url = Url::parse("file:///root.json5").unwrap();
         let provenance = Provenance {
             components: vec![
                 ComponentProvenance {
-                    authored_path: Arc::from("/"),
+                    authored_moniker: Moniker::from(Arc::from("/")),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: root_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
-                    authored_path: Arc::from("/router"),
+                    authored_moniker: Moniker::from(Arc::from("/router")),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: router_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
-                    authored_path: Arc::from("/green"),
+                    authored_moniker: Moniker::from(Arc::from("/green")),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: green_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
-                    authored_path: Arc::from("/router/wrapper"),
+                    authored_moniker: Moniker::from(Arc::from("/router/wrapper")),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url,
                     digest: wrapper_digest,
                     observed_url: None,
                 },
             ],
-            root_exports: Vec::new(),
+            root_exports: vec![RootExportProvenance {
+                name: Arc::from("tool_proxy"),
+                endpoint_component_moniker: Moniker::from(Arc::from("/green")),
+                endpoint_provide: Arc::from("tool_proxy"),
+                kind: CapabilityKind::Mcp,
+            }],
         };
 
         let (scenario, _prov) = DcePass.run(scenario, provenance, &store).unwrap();
 
-        assert_eq!(scenario.components.len(), 3);
+        assert_eq!(scenario.components.iter().flatten().count(), 3);
         assert!(
-            scenario
+            !scenario
                 .components
                 .iter()
-                .all(|c| c.name.as_str() != "wrapper")
+                .flatten()
+                .any(|c| c.moniker.local_name() == Some("wrapper"))
         );
 
         assert_eq!(scenario.bindings.len(), 1);
         let edge = &scenario.bindings[0];
         assert_eq!(edge.from.name, "llm");
         assert_eq!(edge.to.name, "llm");
-        assert_eq!(scenario.components[edge.to.component.0].name, "green");
-        assert_eq!(scenario.components[edge.from.component.0].name, "router");
+        assert_eq!(
+            scenario.components[edge.to.component.0]
+                .as_ref()
+                .unwrap()
+                .moniker
+                .local_name(),
+            Some("green")
+        );
+        assert_eq!(
+            scenario.components[edge.from.component.0]
+                .as_ref()
+                .unwrap()
+                .moniker
+                .local_name(),
+            Some("router")
+        );
     }
 
     #[test]
@@ -597,53 +608,28 @@ mod tests {
         store.put(llm_digest, Arc::new(llm));
 
         let mut components = vec![
-            Component {
-                id: ComponentId(0),
-                parent: None,
-                name: String::new(),
-                has_program: false,
-                digest: root_digest,
-                config: None,
-                children: BTreeMap::new(),
-            },
-            Component {
-                id: ComponentId(1),
-                parent: Some(ComponentId(0)),
-                name: "consumer".to_string(),
-                has_program: true,
-                digest: consumer_digest,
-                config: None,
-                children: BTreeMap::new(),
-            },
-            Component {
-                id: ComponentId(2),
-                parent: Some(ComponentId(0)),
-                name: "input".to_string(),
-                has_program: true,
-                digest: input_digest,
-                config: None,
-                children: BTreeMap::new(),
-            },
-            Component {
-                id: ComponentId(3),
-                parent: Some(ComponentId(0)),
-                name: "llm".to_string(),
-                has_program: true,
-                digest: llm_digest,
-                config: None,
-                children: BTreeMap::new(),
-            },
+            Some(component(0, "/")),
+            Some(component(1, "/consumer")),
+            Some(component(2, "/input")),
+            Some(component(3, "/llm")),
         ];
+        components[0].as_mut().unwrap().digest = root_digest;
+        components[1].as_mut().unwrap().digest = consumer_digest;
+        components[2].as_mut().unwrap().digest = input_digest;
+        components[3].as_mut().unwrap().digest = llm_digest;
 
-        components[0]
-            .children
-            .insert("consumer".to_string(), ComponentId(1));
-        components[0]
-            .children
-            .insert("input".to_string(), ComponentId(2));
-        components[0]
-            .children
-            .insert("llm".to_string(), ComponentId(3));
+        components[1].as_mut().unwrap().parent = Some(ComponentId(0));
+        components[2].as_mut().unwrap().parent = Some(ComponentId(0));
+        components[3].as_mut().unwrap().parent = Some(ComponentId(0));
+        components[1].as_mut().unwrap().has_program = true;
+        components[2].as_mut().unwrap().has_program = true;
+        components[3].as_mut().unwrap().has_program = true;
+
+        components[0].as_mut().unwrap().children.extend([
+            ComponentId(1),
+            ComponentId(2),
+            ComponentId(3),
+        ]);
 
         let bindings = vec![
             BindingEdge {
@@ -670,51 +656,69 @@ mod tests {
             },
         ];
 
-        let scenario = Scenario {
+        let mut scenario = Scenario {
             root: ComponentId(0),
             components,
             bindings,
         };
+        scenario.normalize_child_order_by_moniker();
 
         let url = Url::parse("file:///root.json5").unwrap();
         let provenance = Provenance {
             components: vec![
                 ComponentProvenance {
-                    authored_path: Arc::from("/"),
+                    authored_moniker: Moniker::from(Arc::from("/")),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: root_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
-                    authored_path: Arc::from("/consumer"),
+                    authored_moniker: Moniker::from(Arc::from("/consumer")),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: consumer_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
-                    authored_path: Arc::from("/input"),
+                    authored_moniker: Moniker::from(Arc::from("/input")),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: input_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
-                    authored_path: Arc::from("/llm"),
+                    authored_moniker: Moniker::from(Arc::from("/llm")),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url,
                     digest: llm_digest,
                     observed_url: None,
                 },
             ],
-            root_exports: Vec::new(),
+            root_exports: vec![RootExportProvenance {
+                name: Arc::from("out"),
+                endpoint_component_moniker: Moniker::from(Arc::from("/consumer")),
+                endpoint_provide: Arc::from("out"),
+                kind: CapabilityKind::Mcp,
+            }],
         };
 
         let (scenario, _prov) = DcePass.run(scenario, provenance, &store).unwrap();
 
-        assert!(scenario.components.iter().any(|c| c.name == "input"));
-        assert!(scenario.components.iter().any(|c| c.name == "llm"));
+        assert!(
+            scenario
+                .components
+                .iter()
+                .flatten()
+                .any(|c| c.moniker.local_name() == Some("input"))
+        );
+        assert!(
+            scenario
+                .components
+                .iter()
+                .flatten()
+                .any(|c| c.moniker.local_name() == Some("llm"))
+        );
         assert!(
             scenario
                 .bindings
@@ -779,41 +783,24 @@ mod tests {
         store.put(admin_digest, Arc::new(admin));
 
         let mut components = vec![
-            Component {
-                id: ComponentId(0),
-                parent: None,
-                name: String::new(),
-                has_program: false,
-                digest: root_digest,
-                config: None,
-                children: BTreeMap::new(),
-            },
-            Component {
-                id: ComponentId(1),
-                parent: Some(ComponentId(0)),
-                name: "app".to_string(),
-                has_program: true,
-                digest: app_digest,
-                config: None,
-                children: BTreeMap::new(),
-            },
-            Component {
-                id: ComponentId(2),
-                parent: Some(ComponentId(0)),
-                name: "admin".to_string(),
-                has_program: true,
-                digest: admin_digest,
-                config: None,
-                children: BTreeMap::new(),
-            },
+            Some(component(0, "/")),
+            Some(component(1, "/app")),
+            Some(component(2, "/admin")),
         ];
+        components[0].as_mut().unwrap().digest = root_digest;
+        components[1].as_mut().unwrap().digest = app_digest;
+        components[2].as_mut().unwrap().digest = admin_digest;
+
+        components[1].as_mut().unwrap().parent = Some(ComponentId(0));
+        components[2].as_mut().unwrap().parent = Some(ComponentId(0));
+        components[1].as_mut().unwrap().has_program = true;
+        components[2].as_mut().unwrap().has_program = true;
 
         components[0]
+            .as_mut()
+            .unwrap()
             .children
-            .insert("app".to_string(), ComponentId(1));
-        components[0]
-            .children
-            .insert("admin".to_string(), ComponentId(2));
+            .extend([ComponentId(1), ComponentId(2)]);
 
         let bindings = vec![BindingEdge {
             from: ProvideRef {
@@ -827,43 +814,55 @@ mod tests {
             weak: false,
         }];
 
-        let scenario = Scenario {
+        let mut scenario = Scenario {
             root: ComponentId(0),
             components,
             bindings,
         };
+        scenario.normalize_child_order_by_moniker();
 
         let url = Url::parse("file:///root.json5").unwrap();
         let provenance = Provenance {
             components: vec![
                 ComponentProvenance {
-                    authored_path: Arc::from("/"),
+                    authored_moniker: Moniker::from(Arc::from("/")),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: root_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
-                    authored_path: Arc::from("/app"),
+                    authored_moniker: Moniker::from(Arc::from("/app")),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: app_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
-                    authored_path: Arc::from("/admin"),
+                    authored_moniker: Moniker::from(Arc::from("/admin")),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url,
                     digest: admin_digest,
                     observed_url: None,
                 },
             ],
-            root_exports: Vec::new(),
+            root_exports: vec![RootExportProvenance {
+                name: Arc::from("out"),
+                endpoint_component_moniker: Moniker::from(Arc::from("/app")),
+                endpoint_provide: Arc::from("out"),
+                kind: CapabilityKind::Mcp,
+            }],
         };
 
         let (scenario, _prov) = DcePass.run(scenario, provenance, &store).unwrap();
 
-        assert!(scenario.components.iter().any(|c| c.name == "admin"));
+        assert!(
+            scenario
+                .components
+                .iter()
+                .flatten()
+                .any(|c| c.moniker.local_name() == Some("admin"))
+        );
         assert!(
             scenario
                 .bindings

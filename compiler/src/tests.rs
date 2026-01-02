@@ -419,7 +419,22 @@ async fn relative_manifest_refs_resolve_against_parent() {
     assert_eq!(compilation.scenario.components.len(), 2);
 
     let root_id = compilation.scenario.root;
-    let child_id = compilation.scenario.components[root_id.0].children["child"];
+    let root = compilation.scenario.components[root_id.0]
+        .as_ref()
+        .expect("root component should exist");
+    let child_id = root
+        .children
+        .iter()
+        .copied()
+        .find(|id| {
+            compilation.scenario.components[id.0]
+                .as_ref()
+                .expect("child should exist")
+                .moniker
+                .local_name()
+                == Some("child")
+        })
+        .expect("child component");
     let prov = &compilation.provenance.components[child_id.0];
     assert_eq!(prov.declared_ref.url.as_str(), "./child.json5");
 }

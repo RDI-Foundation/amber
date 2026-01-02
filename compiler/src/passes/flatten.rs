@@ -18,140 +18,91 @@ impl ScenarioPass for FlattenPass {
         provenance: Provenance,
         store: &DigestStore,
     ) -> Result<(Scenario, Provenance), PassError> {
-        let Scenario {
-            root,
-            components,
-            bindings,
-        } = scenario;
-        let Provenance {
-            components: prov_components,
-            root_exports,
-        } = provenance;
+        let mut scenario = scenario;
+        scenario.assert_invariants();
 
-        let manifests =
-            crate::manifest_table::build_manifest_table(&components, store).map_err(|e| {
-                PassError::Failed {
-                    pass: self.name(),
-                    message: format!(
-                        "missing manifest for digest {} (component {})",
-                        e.digest, e.component.0
-                    ),
-                }
+        let manifests = crate::manifest_table::build_manifest_table(&scenario.components, store)
+            .map_err(|e| PassError::Failed {
+                pass: self.name(),
+                message: format!(
+                    "missing manifest for digest {} (component {})",
+                    e.digest, e.component.0
+                ),
             })?;
 
-        let n = components.len();
+        let n = scenario.components.len();
         let mut referenced_by_binding = vec![false; n];
-        for b in &bindings {
+        for b in &scenario.bindings {
             referenced_by_binding[b.from.component.0] = true;
             referenced_by_binding[b.to.component.0] = true;
         }
 
+        let root = scenario.root;
         let mut remove = vec![false; n];
         for idx in 0..n {
             let id = ComponentId(idx);
             if id == root {
                 continue;
             }
+            let Some(component) = scenario.components[idx].as_ref() else {
+                remove[idx] = true;
+                continue;
+            };
             if referenced_by_binding[idx] {
                 continue;
             }
-            if is_pure_routing(&components[idx], &manifests[idx]) {
+            let manifest = manifests[idx].as_ref().expect("manifest should exist");
+            if is_pure_routing(component, manifest) {
                 remove[idx] = true;
             }
         }
-
-        resolve_name_collisions(&components, root, &mut remove).map_err(|message| {
-            PassError::Failed {
-                pass: self.name(),
-                message,
-            }
-        })?;
 
         let mut new_parent: Vec<Option<ComponentId>> = vec![None; n];
         for idx in 0..n {
             if remove[idx] {
                 continue;
             }
-            new_parent[idx] = nearest_kept_ancestor(&components, &remove, components[idx].parent);
-        }
-
-        let mut old_to_new = vec![None; n];
-        let mut next = 0usize;
-        for (old_idx, &is_removed) in remove.iter().enumerate() {
-            if is_removed {
-                continue;
-            }
-            old_to_new[old_idx] = Some(next);
-            next += 1;
-        }
-
-        let new_root = ComponentId(old_to_new[root.0].expect("root is never removed"));
-
-        let mut new_components = Vec::with_capacity(next);
-        for (old_idx, mut c) in components.into_iter().enumerate() {
-            let Some(new_idx) = old_to_new[old_idx] else {
+            let Some(component) = scenario.components[idx].as_ref() else {
                 continue;
             };
-            c.id = ComponentId(new_idx);
-            c.parent = new_parent[old_idx].and_then(|p| old_to_new[p.0].map(ComponentId));
-            c.children = Default::default();
-            new_components.push(c);
+            new_parent[idx] =
+                nearest_kept_ancestor(&scenario.components, &remove, component.parent);
         }
 
-        let mut edges = Vec::with_capacity(new_components.len().saturating_sub(1));
-        for (child_idx, child) in new_components.iter().enumerate() {
-            let Some(parent_id) = child.parent else {
+        for (idx, component) in scenario.components.iter_mut().enumerate() {
+            if remove[idx] {
+                *component = None;
+                continue;
+            }
+            let component = component.as_mut().expect("kept component should exist");
+            component.parent = new_parent[idx];
+            component.children.clear();
+        }
+
+        let mut edges = Vec::new();
+        for (idx, component) in scenario.components.iter().enumerate() {
+            let Some(component) = component.as_ref() else {
                 continue;
             };
-            let name = child.name.clone();
-            edges.push((parent_id, name, ComponentId(child_idx)));
-        }
-        for (parent_id, name, child_id) in edges {
-            let prev = new_components[parent_id.0]
-                .children
-                .insert(name.clone(), child_id);
-            if prev.is_some() {
-                return Err(PassError::Failed {
-                    pass: self.name(),
-                    message: format!(
-                        "flatten would create duplicate child name `{name}` under component {}",
-                        parent_id.0
-                    ),
-                });
+            let Some(parent_id) = component.parent else {
+                continue;
+            };
+            if remove[parent_id.0] {
+                continue;
             }
+            edges.push((parent_id, ComponentId(idx)));
+        }
+        for (parent_id, child_id) in edges {
+            let parent = scenario.components[parent_id.0]
+                .as_mut()
+                .expect("parent should exist");
+            parent.children.push(child_id);
         }
 
-        let mut new_bindings = Vec::with_capacity(bindings.len());
-        for mut b in bindings.into_iter() {
-            let from = old_to_new[b.from.component.0]
-                .map(ComponentId)
-                .expect("flatten does not remove components referenced by bindings");
-            let to = old_to_new[b.to.component.0]
-                .map(ComponentId)
-                .expect("flatten does not remove components referenced by bindings");
-            b.from.component = from;
-            b.to.component = to;
-            new_bindings.push(b);
-        }
+        scenario.normalize_child_order_by_moniker();
+        scenario.assert_invariants();
 
-        let mut new_prov_components = Vec::with_capacity(next);
-        for (old_idx, p) in prov_components.into_iter().enumerate() {
-            if old_to_new[old_idx].is_some() {
-                new_prov_components.push(p);
-            }
-        }
-
-        Ok((
-            Scenario {
-                root: new_root,
-                components: new_components,
-                bindings: new_bindings,
-            },
-            Provenance {
-                components: new_prov_components,
-                root_exports,
-            },
-        ))
+        Ok((scenario, provenance))
     }
 }
 
@@ -165,101 +116,27 @@ fn is_pure_routing(component: &Component, manifest: &Manifest) -> bool {
 }
 
 fn nearest_kept_ancestor(
-    components: &[Component],
+    components: &[Option<Component>],
     remove: &[bool],
     mut cur: Option<ComponentId>,
 ) -> Option<ComponentId> {
     while let Some(id) = cur {
-        if !remove[id.0] {
+        if !remove[id.0] && components[id.0].is_some() {
             break;
         }
-        cur = components[id.0].parent;
+        cur = components[id.0].as_ref().and_then(|c| c.parent);
     }
     cur
 }
 
-fn resolve_name_collisions(
-    components: &[Component],
-    root: ComponentId,
-    remove: &mut [bool],
-) -> Result<(), String> {
-    use std::collections::HashMap;
-
-    loop {
-        let mut seen: HashMap<(ComponentId, &str), ComponentId> =
-            HashMap::with_capacity(components.len());
-        let mut fix: Option<ComponentId> = None;
-
-        for idx in 0..components.len() {
-            let id = ComponentId(idx);
-            if id == root || remove[idx] {
-                continue;
-            }
-
-            let Some(parent) = nearest_kept_ancestor(components, remove, components[idx].parent)
-            else {
-                continue;
-            };
-
-            let name = components[idx].name.as_str();
-            let key = (parent, name);
-            let Some(&prev) = seen.get(&key) else {
-                seen.insert(key, id);
-                continue;
-            };
-
-            fix =
-                first_removed_ancestor_on_path(components, remove, components[idx].parent, parent)
-                    .or_else(|| {
-                        first_removed_ancestor_on_path(
-                            components,
-                            remove,
-                            components[prev.0].parent,
-                            parent,
-                        )
-                    });
-
-            if fix.is_none() {
-                return Err(format!(
-                    "flatten cannot resolve name collision `{name}` under component {} \
-                     (components {} and {})",
-                    parent.0, prev.0, id.0
-                ));
-            }
-            break;
-        }
-
-        let Some(fix) = fix else {
-            return Ok(());
-        };
-        remove[fix.0] = false;
-    }
-}
-
-fn first_removed_ancestor_on_path(
-    components: &[Component],
-    remove: &[bool],
-    mut cur: Option<ComponentId>,
-    stop: ComponentId,
-) -> Option<ComponentId> {
-    while let Some(id) = cur {
-        if id == stop {
-            return None;
-        }
-        if remove[id.0] {
-            return Some(id);
-        }
-        cur = components[id.0].parent;
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::sync::Arc;
 
     use amber_manifest::{CapabilityKind, Manifest, ManifestRef};
-    use amber_scenario::{BindingEdge, Component, ComponentId, ProvideRef, Scenario, SlotRef};
+    use amber_scenario::{
+        BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, SlotRef,
+    };
     use url::Url;
 
     use super::FlattenPass;
@@ -269,15 +146,15 @@ mod tests {
         passes::ScenarioPass,
     };
 
-    fn component(id: usize, name: &str) -> Component {
+    fn component(id: usize, moniker: &str) -> Component {
         Component {
             id: ComponentId(id),
             parent: None,
-            name: name.to_string(),
+            moniker: Moniker::from(Arc::from(moniker)),
             has_program: false,
             digest: amber_manifest::ManifestDigest::new([id as u8; 32]),
             config: None,
-            children: BTreeMap::new(),
+            children: Vec::new(),
         }
     }
 
@@ -322,25 +199,29 @@ mod tests {
         store.put(child_digest, Arc::new(child_manifest));
 
         let mut components = vec![
-            component(0, ""),
-            component(1, "parent"),
-            component(2, "child"),
+            Some(component(0, "/")),
+            Some(component(1, "/parent")),
+            Some(component(2, "/parent/child")),
         ];
-        components[0].digest = root_digest;
-        components[1].digest = parent_digest;
-        components[2].digest = child_digest;
+        components[0].as_mut().unwrap().digest = root_digest;
+        components[1].as_mut().unwrap().digest = parent_digest;
+        components[2].as_mut().unwrap().digest = child_digest;
 
-        components[1].parent = Some(ComponentId(0));
-        components[2].parent = Some(ComponentId(1));
+        components[1].as_mut().unwrap().parent = Some(ComponentId(0));
+        components[2].as_mut().unwrap().parent = Some(ComponentId(1));
 
         components[0]
+            .as_mut()
+            .unwrap()
             .children
-            .insert("parent".to_string(), ComponentId(1));
+            .push(ComponentId(1));
         components[1]
+            .as_mut()
+            .unwrap()
             .children
-            .insert("child".to_string(), ComponentId(2));
+            .push(ComponentId(2));
 
-        let scenario = Scenario {
+        let mut scenario = Scenario {
             root: ComponentId(0),
             components,
             bindings: vec![BindingEdge {
@@ -355,26 +236,27 @@ mod tests {
                 weak: true,
             }],
         };
+        scenario.normalize_child_order_by_moniker();
 
         let url = Url::parse("file:///scenario.json5").unwrap();
         let provenance = Provenance {
             components: vec![
                 ComponentProvenance {
-                    authored_path: Arc::from("/"),
+                    authored_moniker: Moniker::from(Arc::from("/")),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: root_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
-                    authored_path: Arc::from("/parent"),
+                    authored_moniker: Moniker::from(Arc::from("/parent")),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: parent_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
-                    authored_path: Arc::from("/parent/child"),
+                    authored_moniker: Moniker::from(Arc::from("/parent/child")),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url,
                     digest: child_digest,
@@ -383,7 +265,7 @@ mod tests {
             ],
             root_exports: vec![RootExportProvenance {
                 name: Arc::from("cap"),
-                endpoint_component_path: Arc::from("/parent/child"),
+                endpoint_component_moniker: Moniker::from(Arc::from("/parent/child")),
                 endpoint_provide: Arc::from("cap"),
                 kind: CapabilityKind::Http,
             }],
@@ -391,27 +273,37 @@ mod tests {
 
         let (scenario, provenance) = FlattenPass.run(scenario, provenance, &store).unwrap();
 
-        assert_eq!(scenario.components.len(), 2);
-        assert_eq!(provenance.components.len(), 2);
+        assert_eq!(scenario.components.iter().flatten().count(), 2);
+        assert_eq!(provenance.components.len(), 3);
 
         assert_eq!(
             provenance
-                .for_component(ComponentId(1))
-                .authored_path
-                .as_ref(),
+                .for_component(ComponentId(2))
+                .authored_moniker
+                .as_str(),
             "/parent/child"
         );
         assert_eq!(provenance.root_exports.len(), 1);
         assert_eq!(
-            provenance.root_exports[0].endpoint_component_path.as_ref(),
+            provenance.root_exports[0]
+                .endpoint_component_moniker
+                .as_str(),
             "/parent/child"
         );
 
-        assert_eq!(scenario.components[scenario.root.0].children.len(), 1);
-        assert!(
-            scenario.components[scenario.root.0]
-                .children
-                .contains_key("child")
+        let root_children = &scenario.components[scenario.root.0]
+            .as_ref()
+            .unwrap()
+            .children;
+        assert_eq!(root_children.len(), 1);
+        let child_id = root_children[0];
+        assert_eq!(
+            scenario.components[child_id.0]
+                .as_ref()
+                .unwrap()
+                .moniker
+                .as_str(),
+            "/parent/child"
         );
 
         let output = CompileOutput {
@@ -421,15 +313,12 @@ mod tests {
             diagnostics: Vec::new(),
         };
         let dot = DotBackend.emit(&output).unwrap();
-        assert!(
-            dot.contains("c1 [label=\"/parent/child\\n(opt: /child)\""),
-            "{dot}"
-        );
-        assert!(dot.contains("c1 -> e0 [label=\"http\"]"));
+        assert!(dot.contains("c2 [label=\"/parent/child\"]"), "{dot}");
+        assert!(dot.contains("c2 -> e0 [label=\"http\"]"));
     }
 
     #[test]
-    fn flatten_keeps_routing_node_to_avoid_sibling_name_collision() {
+    fn flatten_allows_same_name_siblings() {
         let root_manifest: Manifest = r#"
         {
           manifest_version: "0.1.0",
@@ -482,62 +371,64 @@ mod tests {
         store.put(child_b_digest, Arc::new(child_b_manifest));
 
         let mut components = vec![
-            component(0, ""),
-            component(1, "child"),  // nested; would be reparented to root
-            component(2, "parent"), // routing
-            component(3, "child"),  // existing root child
+            Some(component(0, "/")),
+            Some(component(1, "/parent/child")), // nested; will be reparented to root
+            Some(component(2, "/parent")),       // routing
+            Some(component(3, "/child")),        // existing root child
         ];
-        components[0].digest = root_digest;
-        components[1].digest = child_b_digest;
-        components[2].digest = parent_digest;
-        components[3].digest = child_a_digest;
+        components[0].as_mut().unwrap().digest = root_digest;
+        components[1].as_mut().unwrap().digest = child_b_digest;
+        components[2].as_mut().unwrap().digest = parent_digest;
+        components[3].as_mut().unwrap().digest = child_a_digest;
 
-        components[1].parent = Some(ComponentId(2));
-        components[2].parent = Some(ComponentId(0));
-        components[3].parent = Some(ComponentId(0));
+        components[1].as_mut().unwrap().parent = Some(ComponentId(2));
+        components[2].as_mut().unwrap().parent = Some(ComponentId(0));
+        components[3].as_mut().unwrap().parent = Some(ComponentId(0));
 
         components[0]
+            .as_mut()
+            .unwrap()
             .children
-            .insert("parent".to_string(), ComponentId(2));
-        components[0]
-            .children
-            .insert("child".to_string(), ComponentId(3));
+            .extend([ComponentId(2), ComponentId(3)]);
         components[2]
+            .as_mut()
+            .unwrap()
             .children
-            .insert("child".to_string(), ComponentId(1));
+            .push(ComponentId(1));
 
-        let scenario = Scenario {
+        let mut scenario = Scenario {
             root: ComponentId(0),
             components,
             bindings: Vec::new(),
         };
+        scenario.normalize_child_order_by_moniker();
 
         let url = Url::parse("file:///scenario.json5").unwrap();
         let provenance = Provenance {
             components: vec![
                 ComponentProvenance {
-                    authored_path: Arc::from("/"),
+                    authored_moniker: Moniker::from(Arc::from("/")),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: root_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
-                    authored_path: Arc::from("/parent/child"),
+                    authored_moniker: Moniker::from(Arc::from("/parent/child")),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: child_b_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
-                    authored_path: Arc::from("/parent"),
+                    authored_moniker: Moniker::from(Arc::from("/parent")),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url.clone(),
                     digest: parent_digest,
                     observed_url: None,
                 },
                 ComponentProvenance {
-                    authored_path: Arc::from("/child"),
+                    authored_moniker: Moniker::from(Arc::from("/child")),
                     declared_ref: ManifestRef::from_url(url.clone()),
                     resolved_url: url,
                     digest: child_a_digest,
@@ -552,15 +443,15 @@ mod tests {
         assert_eq!(provenance.components.len(), 4);
 
         let root = scenario.root;
-        assert!(scenario.components[root.0].children.contains_key("parent"));
-        assert!(scenario.components[root.0].children.contains_key("child"));
-
-        let parent_id = scenario.components[root.0].children["parent"];
-        assert_eq!(scenario.components[parent_id.0].parent, Some(root));
-        assert!(
-            scenario.components[parent_id.0]
-                .children
-                .contains_key("child")
-        );
+        let root_children = &scenario.components[root.0].as_ref().unwrap().children;
+        assert_eq!(root_children.len(), 2);
+        let mut child_monikers: Vec<_> = root_children
+            .iter()
+            .map(|id| scenario.components[id.0].as_ref().unwrap().moniker.as_str())
+            .collect();
+        child_monikers.sort();
+        assert_eq!(child_monikers, vec!["/child", "/parent/child"]);
+        assert!(scenario.components[2].is_none());
+        assert_eq!(scenario.components[1].as_ref().unwrap().parent, Some(root));
     }
 }

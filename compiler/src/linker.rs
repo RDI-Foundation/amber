@@ -42,6 +42,28 @@ fn describe_component_path(path: &str) -> String {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct LinkIndex {
+    child_by_name: BTreeMap<ChildName, ComponentId>,
+}
+
+impl LinkIndex {
+    fn child_id(&self, child: &ChildName) -> ComponentId {
+        *self.child_by_name.get(child).expect("child should exist")
+    }
+}
+
+fn component(components: &[Option<Component>], id: ComponentId) -> &Component {
+    components[id.0].as_ref().expect("component should exist")
+}
+
+fn component_local_name(component: &Component) -> &str {
+    component
+        .moniker
+        .local_name()
+        .expect("component should have a local name")
+}
+
 fn source_for_component(
     provenance: &Provenance,
     store: &DigestStore,
@@ -56,18 +78,19 @@ fn unknown_source() -> NamedSource<Arc<str>> {
 }
 
 fn component_decl_site(
-    components: &[Component],
+    components: &[Option<Component>],
     provenance: &Provenance,
     store: &DigestStore,
     id: ComponentId,
 ) -> Option<RelatedSpan> {
-    let component = &components[id.0];
+    let component = component(components, id);
     let parent = component.parent?;
     let (src, spans) = source_for_component(provenance, store, parent)?;
-    let span = spans.components.get(component.name.as_str())?.name;
+    let name = component_local_name(component);
+    let span = spans.components.get(name)?.name;
     let parent_path = describe_component_path(&component_path_for(components, parent));
     Some(RelatedSpan {
-        message: format!("component `{}` declared on {}", component.name, parent_path),
+        message: format!("component `{}` declared on {}", name, parent_path),
         src,
         span,
         label: "component declared here".to_string(),
@@ -126,7 +149,7 @@ struct ConfigSite {
 }
 
 struct ConfigErrorSite<'a> {
-    components: &'a [Component],
+    components: &'a [Option<Component>],
     provenance: &'a Provenance,
     store: &'a DigestStore,
     id: ComponentId,
@@ -134,7 +157,7 @@ struct ConfigErrorSite<'a> {
 
 impl<'a> ConfigErrorSite<'a> {
     fn new(
-        components: &'a [Component],
+        components: &'a [Option<Component>],
         provenance: &'a Provenance,
         store: &'a DigestStore,
         id: ComponentId,
@@ -148,7 +171,7 @@ impl<'a> ConfigErrorSite<'a> {
     }
 
     fn component(&self) -> &Component {
-        &self.components[self.id.0]
+        component(self.components, self.id)
     }
 
     fn config_site(&self) -> ConfigSite {
@@ -166,7 +189,10 @@ impl<'a> ConfigErrorSite<'a> {
         component.config.as_ref()?;
         let parent_prov = self.provenance.for_component(parent);
         let stored = self.store.get_source(parent_prov.effective_url())?;
-        let component_spans = stored.spans.components.get(component.name.as_str())?;
+        let component_spans = stored
+            .spans
+            .components
+            .get(component_local_name(component))?;
         let config_span = component_spans.config?;
         let span = amber_manifest::span_for_json_pointer(
             stored.source.as_ref(),
@@ -191,15 +217,15 @@ impl<'a> ConfigErrorSite<'a> {
 }
 
 fn config_site_for_component(
-    components: &[Component],
+    components: &[Option<Component>],
     provenance: &Provenance,
     store: &DigestStore,
     id: ComponentId,
 ) -> Option<ConfigSite> {
-    let component = &components[id.0];
+    let component = component(components, id);
     if let Some(parent) = component.parent {
         let (src, spans) = source_for_component(provenance, store, parent)?;
-        let component_spans = spans.components.get(component.name.as_str())?;
+        let component_spans = spans.components.get(component_local_name(component))?;
         if component.config.is_some() {
             let span = component_spans.config.unwrap_or(component_spans.whole);
             return Some(ConfigSite {
@@ -278,7 +304,7 @@ fn unknown_slot_help(component_label: &str, manifest: &Manifest) -> String {
 
 #[derive(Clone, Copy)]
 struct BindingErrorSite<'a> {
-    components: &'a [Component],
+    components: &'a [Option<Component>],
     provenance: &'a Provenance,
     store: &'a DigestStore,
     realm: ComponentId,
@@ -309,13 +335,6 @@ impl BindingErrorSite<'_> {
             span,
             related,
         }
-    }
-}
-
-fn unknown_provide_error(components: &[Component], component: ComponentId, provide: &str) -> Error {
-    Error::UnknownProvide {
-        component_path: describe_component_path(&component_path_for(components, component)),
-        provide: provide.to_string(),
     }
 }
 
@@ -358,13 +377,6 @@ pub enum Error {
         digest: ManifestDigest,
     },
 
-    #[error("binding references unknown child `#{child}` in {component_path}")]
-    #[diagnostic(code(linker::unknown_child))]
-    UnknownChild {
-        component_path: String,
-        child: String,
-    },
-
     #[error("unknown slot `{slot}` on {to_component_path}")]
     #[diagnostic(code(linker::unknown_slot), help("{help}"))]
     UnknownSlot {
@@ -377,13 +389,6 @@ pub enum Error {
         span: SourceSpan,
         #[related]
         related: Vec<RelatedSpan>,
-    },
-
-    #[error("unknown provide `{provide}` on {component_path}")]
-    #[diagnostic(code(linker::unknown_provide))]
-    UnknownProvide {
-        component_path: String,
-        provide: String,
     },
 
     #[error("`{name}` is not exported by {component_path}")]
@@ -493,10 +498,19 @@ pub(crate) struct ResolvedExport {
 
 pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Provenance), Error> {
     let mut components = Vec::new();
+    let mut link_index = Vec::new();
     let mut provenance = Provenance::default();
-    let root = flatten(&tree.root, None, "/", &mut components, &mut provenance);
+    let root = flatten(
+        &tree.root,
+        None,
+        "/",
+        &mut components,
+        &mut provenance,
+        &mut link_index,
+    );
 
     debug_assert_eq!(components.len(), provenance.components.len());
+    debug_assert_eq!(components.len(), link_index.len());
 
     let manifests =
         crate::manifest_table::build_manifest_table(&components, store).map_err(|e| {
@@ -507,6 +521,9 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         })?;
 
     for (c, m) in components.iter_mut().zip(&manifests) {
+        let (Some(c), Some(m)) = (c.as_mut(), m.as_ref()) else {
+            continue;
+        };
         c.has_program = m.program().is_some();
     }
 
@@ -524,11 +541,25 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         ) {
             errors.push(err);
         }
-        validate_exports(id, &components, &manifests, &provenance, store, &mut errors);
+        validate_exports(
+            id,
+            &components,
+            &manifests,
+            &link_index,
+            &provenance,
+            store,
+            &mut errors,
+        );
     }
 
-    let (bindings, origins) =
-        resolve_bindings(&components, &manifests, &provenance, store, &mut errors);
+    let (bindings, origins) = resolve_bindings(
+        &components,
+        &manifests,
+        &link_index,
+        &provenance,
+        store,
+        &mut errors,
+    );
     validate_unique_slot_bindings(
         &components,
         &bindings,
@@ -553,44 +584,49 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         });
     }
 
-    let root_manifest = &manifests[root.0];
+    let root_manifest = manifests[root.0]
+        .as_ref()
+        .expect("root manifest should exist");
     provenance.root_exports = root_manifest
         .exports()
         .keys()
         .map(|export_name| {
-            let resolved = resolve_export(&components, &manifests, root, export_name)
+            let resolved = resolve_export(&components, &manifests, &link_index, root, export_name)
                 .expect("export was validated during linking");
             RootExportProvenance {
                 name: Arc::from(export_name.to_string()),
-                endpoint_component_path: Arc::clone(
-                    &provenance.for_component(resolved.component).authored_path,
-                ),
+                endpoint_component_moniker: provenance
+                    .for_component(resolved.component)
+                    .authored_moniker
+                    .clone(),
                 endpoint_provide: Arc::from(resolved.name),
                 kind: resolved.decl.kind,
             }
         })
         .collect();
 
-    Ok((
-        Scenario {
-            root,
-            components,
-            bindings,
-        },
-        provenance,
-    ))
+    let mut scenario = Scenario {
+        root,
+        components,
+        bindings,
+    };
+    scenario.normalize_child_order_by_moniker();
+    scenario.assert_invariants();
+
+    Ok((scenario, provenance))
 }
 
 fn flatten(
     node: &ResolvedNode,
     parent: Option<ComponentId>,
     parent_path: &str,
-    out: &mut Vec<Component>,
+    out: &mut Vec<Option<Component>>,
     prov: &mut Provenance,
+    link_index: &mut Vec<LinkIndex>,
 ) -> ComponentId {
     let id = ComponentId(out.len());
 
-    let authored_path: Arc<str> = if parent.is_none() {
+    let authored_moniker: Arc<str> = if parent.is_none() {
         Arc::from("/")
     } else if parent_path == "/" {
         Arc::from(format!("/{}", node.name))
@@ -598,44 +634,59 @@ fn flatten(
         Arc::from(format!("{parent_path}/{}", node.name))
     };
 
-    out.push(Component {
+    let moniker = Arc::clone(&authored_moniker).into();
+
+    out.push(Some(Component {
         id,
         parent,
-        name: node.name.clone(),
+        moniker,
         has_program: false,
         digest: node.digest,
         config: node.config.clone(),
-        children: BTreeMap::new(),
-    });
+        children: Vec::new(),
+    }));
+    link_index.push(LinkIndex::default());
 
     prov.components.push(ComponentProvenance {
-        authored_path: Arc::clone(&authored_path),
+        authored_moniker: Arc::clone(&authored_moniker).into(),
         declared_ref: node.declared_ref.clone(),
         resolved_url: node.resolved_url.clone(),
         digest: node.digest,
         observed_url: node.observed_url.clone(),
     });
 
-    let mut children = BTreeMap::new();
+    let mut children = Vec::with_capacity(node.children.len());
+    let mut child_by_name = BTreeMap::new();
     for (child_name, child_node) in node.children.iter() {
-        let child_id = flatten(child_node, Some(id), authored_path.as_ref(), out, prov);
-        children.insert(child_name.clone(), child_id);
+        let child_id = flatten(
+            child_node,
+            Some(id),
+            authored_moniker.as_ref(),
+            out,
+            prov,
+            link_index,
+        );
+        children.push(child_id);
+        let child_name =
+            ChildName::try_from(child_name.as_str()).expect("child name should be validated");
+        child_by_name.insert(child_name, child_id);
     }
 
-    out[id.0].children = children;
+    out[id.0].as_mut().expect("component should exist").children = children;
+    link_index[id.0].child_by_name = child_by_name;
     id
 }
 
 fn validate_config(
     id: ComponentId,
-    components: &[Component],
-    manifests: &[Arc<Manifest>],
+    components: &[Option<Component>],
+    manifests: &[Option<Arc<Manifest>>],
     provenance: &Provenance,
     store: &DigestStore,
     schema_cache: &mut HashMap<ManifestDigest, Arc<Validator>>,
 ) -> Result<(), Error> {
-    let c = &components[id.0];
-    let m = &manifests[id.0];
+    let c = component(components, id);
+    let m = manifests[id.0].as_ref().expect("manifest should exist");
 
     let Some(schema_decl) = m.config_schema() else {
         return Ok(());
@@ -706,13 +757,14 @@ fn validate_config(
 
 fn validate_exports(
     realm: ComponentId,
-    components: &[Component],
-    manifests: &[Arc<Manifest>],
+    components: &[Option<Component>],
+    manifests: &[Option<Arc<Manifest>>],
+    link_index: &[LinkIndex],
     provenance: &Provenance,
     store: &DigestStore,
     errors: &mut Vec<Error>,
 ) {
-    let realm_manifest = &manifests[realm.0];
+    let realm_manifest = manifests[realm.0].as_ref().expect("manifest should exist");
     let realm_path = component_path_for(components, realm);
     let realm_label = describe_component_path(&realm_path);
 
@@ -721,14 +773,8 @@ fn validate_exports(
             continue;
         };
 
-        let child_id = match child_component_id(components, realm, child) {
-            Ok(id) => id,
-            Err(err) => {
-                errors.push(err);
-                continue;
-            }
-        };
-        if let Err(err) = resolve_export(components, manifests, child_id, export) {
+        let child_id = child_component_id(link_index, realm, child);
+        if let Err(err) = resolve_export(components, manifests, link_index, child_id, export) {
             let (message, help) = match err {
                 Error::NotExported {
                     component_path,
@@ -798,18 +844,19 @@ fn push_error<T>(errors: &mut Vec<Error>, res: Result<T, Error>) -> Option<T> {
 }
 
 fn resolve_binding_target(
-    components: &[Component],
-    manifests: &[Arc<Manifest>],
+    manifests: &[Option<Arc<Manifest>>],
+    link_index: &[LinkIndex],
     site: BindingErrorSite<'_>,
     target: &BindingTarget,
 ) -> Result<ResolvedBindingTarget, Error> {
     match target {
         BindingTarget::SelfSlot(slot_name) => {
             let to_id = site.realm;
-            let to_manifest = &manifests[to_id.0];
-            let slot_decl = to_manifest.slots().get(slot_name).ok_or_else(|| {
-                site.unknown_slot(to_id, slot_name.as_str(), to_manifest.as_ref())
-            })?;
+            let to_manifest = manifests[to_id.0].as_ref().expect("manifest should exist");
+            let slot_decl = to_manifest
+                .slots()
+                .get(slot_name)
+                .expect("manifest invariant: self slot exists");
             let slot_name = slot_name.to_string();
             Ok(ResolvedBindingTarget {
                 slot_ref: SlotRef {
@@ -820,8 +867,8 @@ fn resolve_binding_target(
             })
         }
         BindingTarget::ChildSlot { child, slot } => {
-            let to_id = child_component_id(components, site.realm, child)?;
-            let to_manifest = &manifests[to_id.0];
+            let to_id = child_component_id(link_index, site.realm, child);
+            let to_manifest = manifests[to_id.0].as_ref().expect("manifest should exist");
             let slot_decl = to_manifest
                 .slots()
                 .get(slot.as_str())
@@ -836,29 +883,28 @@ fn resolve_binding_target(
             })
         }
         _ => Err(Error::UnsupportedManifestFeature {
-            component_path: component_path_for(components, site.realm),
+            component_path: component_path_for(site.components, site.realm),
             feature: "binding target",
         }),
     }
 }
 
 fn resolve_binding_source(
-    components: &[Component],
-    manifests: &[Arc<Manifest>],
-    provenance: &Provenance,
-    store: &DigestStore,
-    realm: ComponentId,
-    target_key: &BindingTargetKey,
+    manifests: &[Option<Arc<Manifest>>],
+    link_index: &[LinkIndex],
+    site: BindingErrorSite<'_>,
     source: &BindingSource,
 ) -> Result<ResolvedBindingSource, Error> {
     match source {
         BindingSource::SelfProvide(provide_name) => {
-            let from_id = realm;
-            let from_manifest = &manifests[from_id.0];
+            let from_id = site.realm;
+            let from_manifest = manifests[from_id.0]
+                .as_ref()
+                .expect("manifest should exist");
             let provide_decl = from_manifest
                 .provides()
                 .get(provide_name)
-                .ok_or_else(|| unknown_provide_error(components, from_id, provide_name.as_str()))?;
+                .expect("manifest invariant: self provide exists");
             Ok(ResolvedBindingSource {
                 provide_ref: ProvideRef {
                     component: from_id,
@@ -868,17 +914,22 @@ fn resolve_binding_source(
             })
         }
         BindingSource::ChildExport { child, export } => {
-            let from_id = child_component_id(components, realm, child)?;
-            let resolved = resolve_export(components, manifests, from_id, export).map_err(
-                |err| match err {
+            let from_id = child_component_id(link_index, site.realm, child);
+            let resolved = resolve_export(site.components, manifests, link_index, from_id, export)
+                .map_err(|err| match err {
                     Error::NotExported {
                         component_path,
                         name,
                         help,
                         ..
                     } => {
-                        let (src, span) = binding_source_site(provenance, store, realm, target_key)
-                            .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                        let (src, span) = binding_source_site(
+                            site.provenance,
+                            site.store,
+                            site.realm,
+                            site.target_key,
+                        )
+                        .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
                         Error::NotExported {
                             component_path,
                             name,
@@ -888,8 +939,7 @@ fn resolve_binding_source(
                         }
                     }
                     other => other,
-                },
-            )?;
+                })?;
             Ok(ResolvedBindingSource {
                 provide_ref: ProvideRef {
                     component: resolved.component,
@@ -899,14 +949,14 @@ fn resolve_binding_source(
             })
         }
         _ => Err(Error::UnsupportedManifestFeature {
-            component_path: component_path_for(components, realm),
+            component_path: component_path_for(site.components, site.realm),
             feature: "binding source",
         }),
     }
 }
 
 fn type_mismatch_error(
-    components: &[Component],
+    components: &[Option<Component>],
     provenance: &Provenance,
     store: &DigestStore,
     realm: ComponentId,
@@ -975,8 +1025,9 @@ fn type_mismatch_error(
 }
 
 fn resolve_bindings(
-    components: &[Component],
-    manifests: &[Arc<Manifest>],
+    components: &[Option<Component>],
+    manifests: &[Option<Arc<Manifest>>],
+    link_index: &[LinkIndex],
     provenance: &Provenance,
     store: &DigestStore,
     errors: &mut Vec<Error>,
@@ -985,7 +1036,7 @@ fn resolve_bindings(
     let mut origins = Vec::new();
 
     for realm in (0..components.len()).map(ComponentId) {
-        let realm_manifest = &manifests[realm.0];
+        let realm_manifest = manifests[realm.0].as_ref().expect("manifest should exist");
 
         for (target, binding) in realm_manifest.bindings().iter() {
             let target_key = BindingTargetKey::from(target);
@@ -998,22 +1049,14 @@ fn resolve_bindings(
             };
             let target = match push_error(
                 errors,
-                resolve_binding_target(components, manifests, site, target),
+                resolve_binding_target(manifests, link_index, site, target),
             ) {
                 Some(target) => target,
                 None => continue,
             };
             let source = match push_error(
                 errors,
-                resolve_binding_source(
-                    components,
-                    manifests,
-                    provenance,
-                    store,
-                    realm,
-                    &target_key,
-                    &binding.from,
-                ),
+                resolve_binding_source(manifests, link_index, site, &binding.from),
             ) {
                 Some(source) => source,
                 None => continue,
@@ -1045,27 +1088,23 @@ fn resolve_bindings(
 }
 
 fn child_component_id(
-    components: &[Component],
+    link_index: &[LinkIndex],
     realm: ComponentId,
     child: &ChildName,
-) -> Result<ComponentId, Error> {
-    components[realm.0]
-        .children
-        .get(child.as_str())
-        .copied()
-        .ok_or_else(|| Error::UnknownChild {
-            component_path: component_path_for(components, realm),
-            child: child.to_string(),
-        })
+) -> ComponentId {
+    link_index[realm.0].child_id(child)
 }
 
-pub(crate) fn resolve_export(
-    components: &[Component],
-    manifests: &[Arc<Manifest>],
+fn resolve_export(
+    components: &[Option<Component>],
+    manifests: &[Option<Arc<Manifest>>],
+    link_index: &[LinkIndex],
     component: ComponentId,
     export_name: &ExportName,
 ) -> Result<ResolvedExport, Error> {
-    let manifest = &manifests[component.0];
+    let manifest = manifests[component.0]
+        .as_ref()
+        .expect("manifest should exist");
     let Some(target) = manifest.exports().get(export_name) else {
         let component_path = component_path_for(components, component);
         return Err(Error::NotExported {
@@ -1079,9 +1118,10 @@ pub(crate) fn resolve_export(
 
     match target {
         ExportTarget::SelfProvide(provide_name) => {
-            let provide_decl = manifest.provides().get(provide_name).ok_or_else(|| {
-                unknown_provide_error(components, component, provide_name.as_str())
-            })?;
+            let provide_decl = manifest
+                .provides()
+                .get(provide_name)
+                .expect("manifest invariant: self provide exists");
             Ok(ResolvedExport {
                 component,
                 name: provide_name.to_string(),
@@ -1089,8 +1129,8 @@ pub(crate) fn resolve_export(
             })
         }
         ExportTarget::ChildExport { child, export } => {
-            let child_id = child_component_id(components, component, child)?;
-            resolve_export(components, manifests, child_id, export)
+            let child_id = child_component_id(link_index, component, child);
+            resolve_export(components, manifests, link_index, child_id, export)
         }
         _ => Err(Error::UnsupportedManifestFeature {
             component_path: component_path_for(components, component),
@@ -1100,8 +1140,8 @@ pub(crate) fn resolve_export(
 }
 
 fn validate_all_slots_bound(
-    components: &[Component],
-    manifests: &[Arc<Manifest>],
+    components: &[Option<Component>],
+    manifests: &[Option<Arc<Manifest>>],
     bindings: &[BindingEdge],
     provenance: &Provenance,
     store: &DigestStore,
@@ -1113,7 +1153,7 @@ fn validate_all_slots_bound(
     }
 
     for id in (0..components.len()).map(ComponentId) {
-        let m = &manifests[id.0];
+        let m = manifests[id.0].as_ref().expect("manifest should exist");
         for slot_name in m.slots().keys() {
             if satisfied.contains(&(id, slot_name.as_str())) {
                 continue;
@@ -1144,7 +1184,7 @@ fn validate_all_slots_bound(
 }
 
 fn validate_unique_slot_bindings(
-    components: &[Component],
+    components: &[Option<Component>],
     bindings: &[BindingEdge],
     origins: &[BindingOrigin],
     provenance: &Provenance,

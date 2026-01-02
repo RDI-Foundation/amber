@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fmt::Write as _};
 
 use amber_manifest::CapabilityKind;
-use amber_scenario::{ComponentId, Scenario, graph::component_path_for};
+use amber_scenario::{ComponentId, Scenario};
 
 use super::{Backend, BackendError};
 use crate::CompileOutput;
@@ -19,7 +19,7 @@ impl Backend for DotBackend {
 
 /// Render a Scenario graph as a Graphviz DOT diagram.
 pub fn render_dot(s: &Scenario) -> String {
-    render_dot_inner(s, &[], None)
+    render_dot_inner(s, &[])
 }
 
 #[derive(Clone, Debug)]
@@ -37,28 +37,18 @@ fn render_dot_with_exports(output: &CompileOutput) -> String {
 
     let root = s.root;
 
-    let mut id_by_authored_path: HashMap<&str, ComponentId> =
+    let mut id_by_moniker: HashMap<&str, ComponentId> =
         HashMap::with_capacity(output.provenance.components.len());
-    let mut labels = Vec::with_capacity(s.components.len());
-    for (idx, _) in s.components.iter().enumerate() {
-        let id = ComponentId(idx);
-        let authored = output.provenance.for_component(id).authored_path.as_ref();
-        id_by_authored_path.insert(authored, id);
-
-        let optimized = component_path_for(&s.components, id);
-        if optimized == authored {
-            labels.push(authored.to_string());
-        } else {
-            labels.push(format!("{authored}\n(opt: {optimized})"));
-        }
+    for (id, component) in s.components_iter() {
+        id_by_moniker.insert(component.moniker.as_str(), id);
     }
 
     let mut exports = Vec::with_capacity(output.provenance.root_exports.len());
     for export in &output.provenance.root_exports {
-        if let Some(&from) = id_by_authored_path.get(export.endpoint_component_path.as_ref()) {
+        if let Some(&from) = id_by_moniker.get(export.endpoint_component_moniker.as_str()) {
             exports.push(ExportEdge {
                 endpoint_label: endpoint_label_for_provide(
-                    &manifests[from.0],
+                    manifests[from.0].as_ref().expect("manifest should exist"),
                     export.endpoint_provide.as_ref(),
                     export.kind,
                 ),
@@ -71,19 +61,19 @@ fn render_dot_with_exports(output: &CompileOutput) -> String {
         exports.push(ExportEdge {
             endpoint_label: format!(
                 "<missing export target: {} -> {}.{}>",
-                export.name, export.endpoint_component_path, export.endpoint_provide
+                export.name, export.endpoint_component_moniker, export.endpoint_provide
             ),
             from: root,
             kind: export.kind,
         });
     }
 
-    render_dot_inner(s, &exports, Some(&labels))
+    render_dot_inner(s, &exports)
 }
 
-fn render_dot_inner(s: &Scenario, exports: &[ExportEdge], labels: Option<&[String]>) -> String {
+fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
     let root = s.root;
-    let root_has_program = s.components[root.0].has_program;
+    let root_has_program = s.component(root).has_program;
     let root_needs_node = !root_has_program && exports.iter().any(|e| e.from == root);
     let root_has_node = root_has_program || root_needs_node;
 
@@ -92,13 +82,12 @@ fn render_dot_inner(s: &Scenario, exports: &[ExportEdge], labels: Option<&[Strin
     let _ = writeln!(out, "  rankdir=LR;");
     let _ = writeln!(out, "  compound=true;");
 
-    render_root(s, root_needs_node, labels, 1, &mut out);
-    for (id, c) in s.components.iter().enumerate() {
-        let id = ComponentId(id);
+    render_root(s, root_needs_node, 1, &mut out);
+    for (id, c) in s.components_iter() {
         if id == root || c.parent.is_some() {
             continue;
         }
-        render_component(s, id, labels, 1, &mut out);
+        render_component(s, id, 1, &mut out);
     }
 
     for (i, export) in exports.iter().enumerate() {
@@ -176,54 +165,38 @@ fn endpoint_label_for_provide(
     format!("{}:{}{}", endpoint.protocol, endpoint.port, endpoint.path)
 }
 
-fn render_root(
-    s: &Scenario,
-    render_root_node: bool,
-    labels: Option<&[String]>,
-    indent: usize,
-    out: &mut String,
-) {
+fn render_root(s: &Scenario, render_root_node: bool, indent: usize, out: &mut String) {
     let root = s.root;
-    let c = &s.components[root.0];
+    let c = s.component(root);
 
     write_indent(out, indent);
     let _ = writeln!(out, "subgraph cluster_{} {{", root.0);
     write_indent(out, indent + 1);
     let _ = writeln!(out, "penwidth=2;");
     write_indent(out, indent + 1);
-    if c.name.is_empty() {
-        let _ = writeln!(out, "label=\"\";");
-    } else {
-        let _ = write!(out, "label=\"");
-        write_escaped_label(out, &c.name);
-        let _ = writeln!(out, "\";");
-    }
+    let _ = write!(out, "label=\"");
+    write_escaped_label(out, c.moniker.as_str());
+    let _ = writeln!(out, "\";");
 
     if c.has_program {
         render_node_with_label(root, "program", indent + 1, out);
     } else if render_root_node {
-        render_node(s, root, labels, indent + 1, out);
+        render_node(s, root, indent + 1, out);
     }
 
-    for child in c.children.values() {
-        render_component(s, *child, labels, indent + 1, out);
+    for child in &c.children {
+        render_component(s, *child, indent + 1, out);
     }
 
     write_indent(out, indent);
     let _ = writeln!(out, "}}");
 }
 
-fn render_component(
-    s: &Scenario,
-    id: ComponentId,
-    labels: Option<&[String]>,
-    indent: usize,
-    out: &mut String,
-) {
-    let c = &s.components[id.0];
+fn render_component(s: &Scenario, id: ComponentId, indent: usize, out: &mut String) {
+    let c = s.component(id);
 
     if c.children.is_empty() {
-        render_node(s, id, labels, indent, out);
+        render_node(s, id, indent, out);
         return;
     }
 
@@ -235,33 +208,22 @@ fn render_component(
 
     write_indent(out, indent + 1);
     let _ = write!(out, "label=\"");
-    write_escaped_label(out, &c.name);
+    write_escaped_label(out, c.moniker.as_str());
     let _ = writeln!(out, "\";");
 
-    render_node(s, id, labels, indent + 1, out);
+    render_node(s, id, indent + 1, out);
 
-    for child in c.children.values() {
-        render_component(s, *child, labels, indent + 1, out);
+    for child in &c.children {
+        render_component(s, *child, indent + 1, out);
     }
 
     write_indent(out, indent);
     let _ = writeln!(out, "}}");
 }
 
-fn render_node(
-    s: &Scenario,
-    id: ComponentId,
-    labels: Option<&[String]>,
-    indent: usize,
-    out: &mut String,
-) {
-    if let Some(labels) = labels {
-        render_node_with_label(id, labels[id.0].as_str(), indent, out);
-        return;
-    }
-
-    let label = component_path_for(&s.components, id);
-    render_node_with_label(id, &label, indent, out);
+fn render_node(s: &Scenario, id: ComponentId, indent: usize, out: &mut String) {
+    let label = s.component(id).moniker.as_str().to_string();
+    render_node_with_label(id, label.as_str(), indent, out);
 }
 
 fn render_node_with_label(id: ComponentId, label: &str, indent: usize, out: &mut String) {
@@ -291,47 +253,49 @@ fn write_escaped_label(out: &mut String, label: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use amber_manifest::{CapabilityKind, Manifest, ManifestDigest, ManifestRef};
-    use amber_scenario::{BindingEdge, Component, ComponentId, ProvideRef, Scenario, SlotRef};
+    use amber_scenario::{
+        BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, SlotRef,
+    };
     use url::Url;
 
     use super::{render_dot, render_dot_with_exports};
     use crate::CompileOutput;
 
-    fn component(id: usize, name: &str) -> Component {
+    fn component(id: usize, moniker: &str) -> Component {
         Component {
             id: ComponentId(id),
             parent: None,
-            name: name.to_string(),
+            moniker: Moniker::from(moniker.to_string()),
             has_program: false,
             digest: ManifestDigest::new([id as u8; 32]),
             config: None,
-            children: BTreeMap::new(),
+            children: Vec::new(),
         }
     }
 
     #[test]
     fn dot_renders_clusters_and_edges() {
         let mut components = vec![
-            component(0, ""),
-            component(1, "alpha"),
-            component(2, "beta"),
-            component(3, "gamma"),
+            Some(component(0, "/")),
+            Some(component(1, "/alpha")),
+            Some(component(2, "/beta")),
+            Some(component(3, "/alpha/gamma")),
         ];
-        components[1].parent = Some(ComponentId(0));
-        components[2].parent = Some(ComponentId(0));
-        components[3].parent = Some(ComponentId(1));
+        components[1].as_mut().unwrap().parent = Some(ComponentId(0));
+        components[2].as_mut().unwrap().parent = Some(ComponentId(0));
+        components[3].as_mut().unwrap().parent = Some(ComponentId(1));
 
-        let mut root_children = BTreeMap::new();
-        root_children.insert("alpha".to_string(), ComponentId(1));
-        root_children.insert("beta".to_string(), ComponentId(2));
-        components[0].children = root_children;
-
-        let mut alpha_children = BTreeMap::new();
-        alpha_children.insert("gamma".to_string(), ComponentId(3));
-        components[1].children = alpha_children;
+        components[0]
+            .as_mut()
+            .unwrap()
+            .children
+            .extend([ComponentId(1), ComponentId(2)]);
+        components[1]
+            .as_mut()
+            .unwrap()
+            .children
+            .push(ComponentId(3));
 
         let bindings = vec![
             BindingEdge {
@@ -370,10 +334,10 @@ mod tests {
   compound=true;
   subgraph cluster_0 {
     penwidth=2;
-    label="";
+    label="/";
     subgraph cluster_1 {
       penwidth=1;
-      label="alpha";
+      label="/alpha";
       c1 [label="/alpha"];
       c3 [label="/alpha/gamma"];
     }
@@ -389,8 +353,8 @@ mod tests {
 
     #[test]
     fn dot_renders_root_program_node() {
-        let mut components = vec![component(0, "")];
-        components[0].has_program = true;
+        let mut components = vec![Some(component(0, "/"))];
+        components[0].as_mut().unwrap().has_program = true;
 
         let scenario = Scenario {
             root: ComponentId(0),
@@ -404,7 +368,7 @@ mod tests {
   compound=true;
   subgraph cluster_0 {
     penwidth=2;
-    label="";
+    label="/";
     c0 [label="program"];
   }
 }
@@ -461,17 +425,22 @@ mod tests {
         store.put(a_digest, std::sync::Arc::new(a_manifest));
         store.put(b_digest, std::sync::Arc::new(b_manifest));
 
-        let mut components = vec![component(0, ""), component(1, "a"), component(2, "b")];
-        components[1].parent = Some(ComponentId(0));
-        components[2].parent = Some(ComponentId(0));
-        components[0].digest = root_digest;
-        components[1].digest = a_digest;
-        components[2].digest = b_digest;
+        let mut components = vec![
+            Some(component(0, "/")),
+            Some(component(1, "/a")),
+            Some(component(2, "/b")),
+        ];
+        components[1].as_mut().unwrap().parent = Some(ComponentId(0));
+        components[2].as_mut().unwrap().parent = Some(ComponentId(0));
+        components[0].as_mut().unwrap().digest = root_digest;
+        components[1].as_mut().unwrap().digest = a_digest;
+        components[2].as_mut().unwrap().digest = b_digest;
 
-        let mut root_children = BTreeMap::new();
-        root_children.insert("a".to_string(), ComponentId(1));
-        root_children.insert("b".to_string(), ComponentId(2));
-        components[0].children = root_children;
+        components[0]
+            .as_mut()
+            .unwrap()
+            .children
+            .extend([ComponentId(1), ComponentId(2)]);
 
         let scenario = Scenario {
             root: ComponentId(0),
@@ -496,21 +465,21 @@ mod tests {
             provenance: crate::Provenance {
                 components: vec![
                     crate::ComponentProvenance {
-                        authored_path: std::sync::Arc::from("/"),
+                        authored_moniker: Moniker::from("/".to_string()),
                         declared_ref: ManifestRef::from_url(url.clone()),
                         resolved_url: url.clone(),
                         digest: root_digest,
                         observed_url: None,
                     },
                     crate::ComponentProvenance {
-                        authored_path: std::sync::Arc::from("/a"),
+                        authored_moniker: Moniker::from("/a".to_string()),
                         declared_ref: ManifestRef::from_url(url.clone()),
                         resolved_url: url.clone(),
                         digest: a_digest,
                         observed_url: None,
                     },
                     crate::ComponentProvenance {
-                        authored_path: std::sync::Arc::from("/b"),
+                        authored_moniker: Moniker::from("/b".to_string()),
                         declared_ref: ManifestRef::from_url(url.clone()),
                         resolved_url: url,
                         digest: b_digest,
@@ -519,7 +488,7 @@ mod tests {
                 ],
                 root_exports: vec![crate::RootExportProvenance {
                     name: std::sync::Arc::from("public"),
-                    endpoint_component_path: std::sync::Arc::from("/b"),
+                    endpoint_component_moniker: Moniker::from("/b".to_string()),
                     endpoint_provide: std::sync::Arc::from("out"),
                     kind: CapabilityKind::Http,
                 }],
@@ -533,7 +502,7 @@ mod tests {
   compound=true;
   subgraph cluster_0 {
     penwidth=2;
-    label="";
+    label="/";
     c1 [label="/a"];
     c2 [label="/b"];
   }
@@ -573,14 +542,16 @@ mod tests {
         store.put(root_digest, std::sync::Arc::new(root_manifest));
         store.put(a_digest, std::sync::Arc::new(a_manifest));
 
-        let mut components = vec![component(0, ""), component(1, "a")];
-        components[1].parent = Some(ComponentId(0));
-        components[0].digest = root_digest;
-        components[1].digest = a_digest;
+        let mut components = vec![Some(component(0, "/")), Some(component(1, "/a"))];
+        components[1].as_mut().unwrap().parent = Some(ComponentId(0));
+        components[0].as_mut().unwrap().digest = root_digest;
+        components[1].as_mut().unwrap().digest = a_digest;
 
         components[0]
+            .as_mut()
+            .unwrap()
             .children
-            .insert("a".to_string(), ComponentId(1));
+            .push(ComponentId(1));
 
         let scenario = Scenario {
             root: ComponentId(0),
@@ -595,14 +566,14 @@ mod tests {
             provenance: crate::Provenance {
                 components: vec![
                     crate::ComponentProvenance {
-                        authored_path: std::sync::Arc::from("/"),
+                        authored_moniker: Moniker::from("/".to_string()),
                         declared_ref: ManifestRef::from_url(url.clone()),
                         resolved_url: url.clone(),
                         digest: root_digest,
                         observed_url: None,
                     },
                     crate::ComponentProvenance {
-                        authored_path: std::sync::Arc::from("/a"),
+                        authored_moniker: Moniker::from("/a".to_string()),
                         declared_ref: ManifestRef::from_url(url.clone()),
                         resolved_url: url,
                         digest: a_digest,
@@ -611,7 +582,7 @@ mod tests {
                 ],
                 root_exports: vec![crate::RootExportProvenance {
                     name: std::sync::Arc::from("public"),
-                    endpoint_component_path: std::sync::Arc::from("/missing"),
+                    endpoint_component_moniker: Moniker::from("/missing".to_string()),
                     endpoint_provide: std::sync::Arc::from("out"),
                     kind: CapabilityKind::Http,
                 }],
