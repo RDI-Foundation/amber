@@ -108,27 +108,11 @@ fn normalize_output(bytes: &[u8]) -> String {
 
 fn normalize_text(text: &str) -> String {
     let text = text.replace("\r\n", "\n");
-    let text = strip_ansi(&text);
-    normalize_paths(&text).trim_end_matches('\n').to_string()
-}
-
-fn strip_ansi(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' && matches!(chars.peek(), Some('[')) {
-            let _ = chars.next();
-            while let Some(next) = chars.next() {
-                let code = next as u32;
-                if (0x40..=0x7e).contains(&code) {
-                    break;
-                }
-            }
-            continue;
-        }
-        out.push(ch);
-    }
-    out
+    let stripped = strip_ansi_escapes::strip(text.as_bytes());
+    let stripped = String::from_utf8_lossy(&stripped);
+    normalize_paths(&stripped)
+        .trim_end_matches('\n')
+        .to_string()
 }
 
 fn normalize_paths(text: &str) -> String {
