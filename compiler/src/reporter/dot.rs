@@ -3,16 +3,16 @@ use std::{collections::HashMap, fmt::Write as _};
 use amber_manifest::CapabilityKind;
 use amber_scenario::{ComponentId, Scenario};
 
-use super::{Backend, BackendError};
+use super::{Reporter, ReporterError};
 use crate::CompileOutput;
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct DotBackend;
+pub struct DotReporter;
 
-impl Backend for DotBackend {
+impl Reporter for DotReporter {
     type Artifact = String;
 
-    fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, BackendError> {
+    fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError> {
         Ok(render_dot_with_exports(output))
     }
 }
@@ -381,6 +381,7 @@ mod tests {
         let root_manifest = r##"
             {
               manifest_version: "0.1.0",
+              runtime: "^1.0.0",
               components: { a: "a.json5", b: "b.json5" },
               bindings: [
                 { to: "#a.in", from: "#b.out" },
@@ -394,6 +395,7 @@ mod tests {
         let a_manifest = r#"
             {
               manifest_version: "0.1.0",
+              runtime: "^1.0.0",
               slots: { in: { kind: "http" } },
             }
             "#
@@ -403,6 +405,7 @@ mod tests {
         let b_manifest = r#"
 	            {
 	              manifest_version: "0.1.0",
+	              runtime: "^1.0.0",
 	              program: {
 	                image: "b",
 	                network: {
@@ -520,6 +523,7 @@ mod tests {
         let root_manifest = r#"
             {
               manifest_version: "0.1.0",
+              runtime: "^1.0.0",
               components: { a: "a.json5" },
             }
             "#
@@ -529,6 +533,7 @@ mod tests {
         let a_manifest = r#"
             {
               manifest_version: "0.1.0",
+              runtime: "^1.0.0",
               provides: { out: { kind: "http" } },
               exports: { out: "out" },
             }

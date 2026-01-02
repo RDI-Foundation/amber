@@ -119,8 +119,8 @@ mod tests {
     use super::FlattenPass;
     use crate::{
         CompileOutput, ComponentProvenance, DigestStore, Provenance, RootExportProvenance,
-        backend::{Backend as _, DotBackend},
         passes::ScenarioPass,
+        reporter::{DotReporter, Reporter as _},
     };
 
     fn component(id: usize, moniker: &str) -> Component {
@@ -289,7 +289,7 @@ mod tests {
             provenance,
             diagnostics: Vec::new(),
         };
-        let dot = DotBackend.emit(&output).unwrap();
+        let dot = DotReporter.emit(&output).unwrap();
         assert!(dot.contains("c2 [label=\"/parent/child\"]"), "{dot}");
         assert!(dot.contains("c2 -> e0 [label=\"http\"]"));
     }

@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, fmt, path::Path};
 
 use amber_compiler::{
     CompileOptions, Compiler,
-    backend::{Backend as _, DotBackend},
+    reporter::{DotReporter, Reporter as _},
 };
 use amber_manifest::ManifestRef;
 use amber_resolver::Resolver;
@@ -116,7 +116,7 @@ async fn compile(args: CompileArgs) -> Result<()> {
 
     match args.emit {
         EmitKind::Dot => {
-            let dot = DotBackend.emit(&output).into_diagnostic()?;
+            let dot = DotReporter.emit(&output).into_diagnostic()?;
             print!("{dot}");
             Ok(())
         }

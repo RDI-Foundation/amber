@@ -14,8 +14,8 @@ mod manifest_table;
 mod provenance;
 mod store;
 
-pub mod backend;
 pub mod passes;
+pub mod reporter;
 
 pub use environment::ResolverRegistry;
 pub use frontend::ResolveOptions;
