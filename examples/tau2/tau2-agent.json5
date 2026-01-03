@@ -13,7 +13,7 @@
     llm: { kind: "llm" },
   },
   provides: {
-    a2a: { kind: "a2a" },
+    a2a: { kind: "a2a", endpoint: "endpoint" },
   },
   exports: { a2a: "a2a" },
 }

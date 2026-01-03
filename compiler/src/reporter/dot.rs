@@ -534,7 +534,11 @@ mod tests {
             {
               manifest_version: "0.1.0",
               runtime: { version: "^1.0.0" },
-              provides: { out: { kind: "http" } },
+              program: {
+                image: "a",
+                network: { endpoints: [{ name: "out", port: 80 }] },
+              },
+              provides: { out: { kind: "http", endpoint: "out" } },
               exports: { out: "out" },
             }
             "#

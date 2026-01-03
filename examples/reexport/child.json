@@ -1,7 +1,13 @@
 {
   "manifest_version": "0.1.0",
+  "program": {
+    "image": "example/child",
+    "network": {
+      "endpoints": [{ "name": "endpoint", "port": 8080, "path": "/" }]
+    }
+  },
   "provides": {
-    "cap": { "kind": "http" }
+    "cap": { "kind": "http", "endpoint": "endpoint" }
   },
   "exports": { "cap": "cap" }
 }

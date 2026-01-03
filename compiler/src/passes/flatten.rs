@@ -160,7 +160,11 @@ mod tests {
         let child_manifest: Manifest = r#"
         {
           manifest_version: "0.1.0",
-          provides: { cap: { kind: "http" } },
+          program: {
+            image: "child",
+            network: { endpoints: [{ name: "cap", port: 80 }] },
+          },
+          provides: { cap: { kind: "http", endpoint: "cap" } },
           exports: { cap: "cap" },
         }
         "#
@@ -320,7 +324,11 @@ mod tests {
         let child_a_manifest: Manifest = r#"
         {
           manifest_version: "0.1.0",
-          provides: { cap: { kind: "http" } },
+          program: {
+            image: "child_a",
+            network: { endpoints: [{ name: "cap", port: 80 }] },
+          },
+          provides: { cap: { kind: "http", endpoint: "cap" } },
           exports: { cap: "cap" },
         }
         "#
@@ -330,7 +338,11 @@ mod tests {
         let child_b_manifest: Manifest = r#"
         {
           manifest_version: "0.1.0",
-          provides: { cap: { kind: "http" } },
+          program: {
+            image: "child_b",
+            network: { endpoints: [{ name: "cap", port: 80 }] },
+          },
+          provides: { cap: { kind: "http", endpoint: "cap" } },
           exports: { cap: "cap" },
         }
         "#

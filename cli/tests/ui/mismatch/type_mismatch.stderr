@@ -23,7 +23,7 @@ Advice:
 Advice: 
   > provide `admin_api` declared on /green_router
     ,-[<CARGO_MANIFEST_DIR>/tests/ui/mismatch/litellm.json5:17:24]
- 16 |     llm: { kind: "llm" },
+ 16 |     llm: { kind: "llm", endpoint: "router" },
  17 |     admin_api: { kind: "http", endpoint: "admin-api" },
     :                        ^^^|^^
     :                           `-- provide type declared here
@@ -54,7 +54,7 @@ Advice:
 Advice: 
   > provide `admin_api` declared on /purple_router
     ,-[<CARGO_MANIFEST_DIR>/tests/ui/mismatch/litellm.json5:17:24]
- 16 |     llm: { kind: "llm" },
+ 16 |     llm: { kind: "llm", endpoint: "router" },
  17 |     admin_api: { kind: "http", endpoint: "admin-api" },
     :                        ^^^|^^
     :                           `-- provide type declared here
@@ -101,4 +101,3 @@ Advice:
  14 |   },
     `----
 Error:   × check failed
-

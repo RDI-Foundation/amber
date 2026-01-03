@@ -112,6 +112,10 @@ pub enum Error {
     #[diagnostic(code(manifest::unknown_endpoint))]
     UnknownEndpoint { name: String },
 
+    #[error("provide `{name}` must declare an endpoint")]
+    #[diagnostic(code(manifest::missing_provide_endpoint))]
+    MissingProvideEndpoint { name: String },
+
     #[error("invalid config schema: {0}")]
     #[diagnostic(code(manifest::invalid_config_schema))]
     InvalidConfigSchema(String),
@@ -1504,10 +1508,14 @@ fn validate_endpoints(
         }
     }
 
-    for provide in provides.values() {
-        if let Some(endpoint) = provide.endpoint.as_deref()
-            && !defined_endpoints.contains(endpoint)
-        {
+    for (provide_name, provide) in provides {
+        let Some(endpoint) = provide.endpoint.as_deref() else {
+            return Err(Error::MissingProvideEndpoint {
+                name: provide_name.to_string(),
+            });
+        };
+
+        if !defined_endpoints.contains(endpoint) {
             return Err(Error::UnknownEndpoint {
                 name: endpoint.to_string(),
             });

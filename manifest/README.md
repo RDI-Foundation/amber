@@ -4,7 +4,7 @@ This document defines the **manifest file format** and the **validation/linting 
 
 A manifest describes **one component**. A component may:
 
-* Run a `program` (container image + args/env + optional network endpoints).
+* Run a `program` (container image + args/env + optional network endpoints; required when providing capabilities).
 * Contain named child `components` (each points at another manifest).
 * Declare required inputs (`slots`) and produced outputs (`provides`).
 * Wire capabilities into slots (`bindings`).
@@ -60,7 +60,7 @@ This crate **parses JSON5**, deserializes into Rust types, and validates:
   * `from: "self"` requires `capability` exist in `provides`
   * `#child` used in a binding must exist in `components`
 * Endpoint names in `program.network.endpoints[]` must be unique.
-* Any `provides.*.endpoint` must refer to a declared endpoint name.
+* Each `provides` entry must declare an `endpoint`, and it must refer to a declared endpoint name.
 
 ### Linting (this crate)
 
@@ -337,20 +337,20 @@ Important rule (enforced):
 
 `provides` declares what the component offers.
 
-A provide may include:
+A provide must include:
 
-* `endpoint`: name of a `program.network.endpoints[].name` (must exist if set)
+* `endpoint`: name of a `program.network.endpoints[].name`
 
 ```json5
 provides: {
   api: { kind: "http", endpoint: "http" },
-  llm: { kind: "llm" },
+  llm: { kind: "llm", endpoint: "llm" },
 }
 ```
 
 Notes:
 
-* This crate enforces only that `endpoint` (if present) refers to a declared endpoint name.
+* This crate enforces that each provide declares an `endpoint` and that it refers to a declared endpoint name.
 * To forward a child capability, use `exports` pointing at `#child.<name>`.
 
 ### `exports`

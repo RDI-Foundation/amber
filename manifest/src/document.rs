@@ -136,6 +136,9 @@ fn labels_for_manifest_error(err: &ManifestError, spans: &ManifestSpans) -> Vec<
             labels_for_duplicate_endpoint_name(spans, name)
         }
         ManifestError::UnknownEndpoint { name } => labels_for_unknown_endpoint(spans, name),
+        ManifestError::MissingProvideEndpoint { name } => {
+            labels_for_missing_provide_endpoint(spans, name)
+        }
         ManifestError::InvalidConfigSchema(_) => vec![primary(
             span_or_default(spans.config_schema),
             Some("invalid schema here".to_string()),
@@ -371,6 +374,18 @@ fn labels_for_unknown_endpoint(spans: &ManifestSpans, name: &str) -> Vec<Labeled
     vec![primary(
         span,
         Some("unknown endpoint referenced here".to_string()),
+    )]
+}
+
+fn labels_for_missing_provide_endpoint(spans: &ManifestSpans, name: &str) -> Vec<LabeledSpan> {
+    let span = spans
+        .provides
+        .get(name)
+        .map(|p| p.capability.name)
+        .unwrap_or_else(default_span);
+    vec![primary(
+        span,
+        Some("missing endpoint for this provide".to_string()),
     )]
 }
 

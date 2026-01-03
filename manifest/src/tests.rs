@@ -202,12 +202,16 @@ fn binding_sugar_forms_parse() {
     let m: Manifest = r##"
         {
           manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
           components: {
             a: "https://example.com/a",
             b: "https://example.com/b",
           },
           provides: {
-            d: { kind: "http" },
+            d: { kind: "http", endpoint: "endpoint" },
           },
           bindings: [
             { to: "#a", slot: "s", from: "#b", capability: "c" },
@@ -334,11 +338,15 @@ fn binding_round_trip_through_canonical_json_parses() {
     let m: Manifest = r##"
         {
           manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
           components: {
             a: "https://example.com/a",
           },
           provides: {
-            c: { kind: "http" },
+            c: { kind: "http", endpoint: "endpoint" },
           },
           bindings: [
             { to: "#a.s", from: "self.c" },
@@ -868,7 +876,11 @@ fn manifest_digest_is_stable_across_json5_formatting() {
     let manifest_a = r#"
         {
           manifest_version: "0.1.0",
-          provides: { api: { kind: "http" } },
+          program: {
+            image: "x",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          provides: { api: { kind: "http", endpoint: "endpoint" } },
           exports: { api: "api" },
         }
         "#
@@ -881,7 +893,11 @@ fn manifest_digest_is_stable_across_json5_formatting() {
             api: "api",
           },
           provides: {
-            api: { kind: "http" },
+            api: { kind: "http", endpoint: "endpoint" },
+          },
+          program: {
+            image: "x",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           manifest_version: "0.1.0",
         }
@@ -913,6 +929,30 @@ fn endpoint_validation_fails_for_unknown_reference() {
     .unwrap_err();
 
     assert!(err.to_string().contains("unknown endpoint `missing`"));
+}
+
+#[test]
+fn endpoint_validation_fails_for_missing_provide_endpoint() {
+    let err = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            network: { endpoints: [ { name: "endpoint", port: 80 } ] }
+          },
+          provides: {
+            api: { kind: "http" }
+          },
+          exports: { api: "api" },
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("provide `api` must declare an endpoint")
+    );
 }
 
 #[test]
@@ -1046,7 +1086,11 @@ fn provide_names_cannot_contain_dots() {
         {
           manifest_version: "0.1.0",
           provides: {
-            "api.v1": { kind: "http" },
+            "api.v1": { kind: "http", endpoint: "endpoint" },
+          },
+          program: {
+            image: "x",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
         }
         "#
@@ -1156,7 +1200,11 @@ fn export_targets_serialize_with_self_prefix() {
     let manifest: Manifest = r#"
         {
           manifest_version: "0.1.0",
-          provides: { api: { kind: "http" } },
+          program: {
+            image: "x",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          provides: { api: { kind: "http", endpoint: "endpoint" } },
           exports: { api: "api" },
         }
         "#
@@ -1178,8 +1226,12 @@ fn slots_and_provides_cannot_share_names() {
         r#"
         {
           manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
           slots: { api: { kind: "http" } },
-          provides: { api: { kind: "http" } },
+          provides: { api: { kind: "http", endpoint: "endpoint" } },
           exports: { api: "api" },
         }
         "#,
@@ -1369,7 +1421,11 @@ fn unused_provide_is_linted() {
     let input = r#"
         {
           manifest_version: "0.1.0",
-          provides: { api: { kind: "http" } },
+          program: {
+            image: "x",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          provides: { api: { kind: "http", endpoint: "endpoint" } },
         }
         "#;
     let raw = parse_raw(input);
@@ -1404,11 +1460,14 @@ fn program_used_by_binding_is_not_linted() {
     let input = r##"
         {
           manifest_version: "0.1.0",
-          program: { image: "x" },
+          program: {
+            image: "x",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
           components: {
             worker: "https://example.com/worker",
           },
-          provides: { api: { kind: "http" } },
+          provides: { api: { kind: "http", endpoint: "endpoint" } },
           bindings: [
             { to: "#worker.api", from: "self.api" },
           ],
@@ -1429,8 +1488,11 @@ fn program_used_by_export_is_not_linted() {
     let input = r#"
         {
           manifest_version: "0.1.0",
-          program: { image: "x" },
-          provides: { api: { kind: "http" } },
+          program: {
+            image: "x",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          provides: { api: { kind: "http", endpoint: "endpoint" } },
           exports: { api: "api" },
         }
         "#;
@@ -1485,8 +1547,12 @@ fn manifest_doc_error_unknown_export_target_points_to_target() {
     let source = r#"
         {
           manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
           provides: {
-            api: { kind: "http" },
+            api: { kind: "http", endpoint: "endpoint" },
           },
           exports: { public: "missing" },
         }
@@ -1507,12 +1573,16 @@ fn manifest_doc_error_duplicate_binding_target_marks_second_binding() {
     let source = r#"
         {
           manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            network: { endpoints: [{ name: "a", port: 80 }, { name: "b", port: 81 }] },
+          },
           slots: {
             api: { kind: "http" },
           },
           provides: {
-            a: { kind: "http" },
-            b: { kind: "http" },
+            a: { kind: "http", endpoint: "a" },
+            b: { kind: "http", endpoint: "b" },
           },
           bindings: [
             { to: "self.api", from: "self.a" },
@@ -1538,8 +1608,12 @@ fn exported_provide_is_not_linted() {
     let input = r#"
         {
           manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
           provides: {
-            api: { kind: "http" },
+            api: { kind: "http", endpoint: "endpoint" },
           },
           exports: { public: "api" },
         }

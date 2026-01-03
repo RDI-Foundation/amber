@@ -196,7 +196,11 @@ async fn compile_twice_unpinned_fails_when_sources_removed() {
         r#"
         {
           manifest_version: "0.1.0",
-          provides: { api: { kind: "http" } },
+          program: {
+            image: "a",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          provides: { api: { kind: "http", endpoint: "endpoint" } },
           exports: { api: "api" },
         }
         "#,
@@ -207,7 +211,11 @@ async fn compile_twice_unpinned_fails_when_sources_removed() {
         r#"
         {
           manifest_version: "0.1.0",
-          provides: { llm: { kind: "llm" } },
+          program: {
+            image: "b",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          provides: { llm: { kind: "llm", endpoint: "endpoint" } },
           exports: { llm: "llm" },
         }
         "#,
@@ -274,14 +282,22 @@ async fn compile_twice_with_digest_pins_succeeds_when_sources_removed() {
     let a_contents = r#"
         {
           manifest_version: "0.1.0",
-          provides: { api: { kind: "http" } },
+          program: {
+            image: "a",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          provides: { api: { kind: "http", endpoint: "endpoint" } },
           exports: { api: "api" },
         }
     "#;
     let b_contents = r#"
         {
           manifest_version: "0.1.0",
-          provides: { llm: { kind: "llm" } },
+          program: {
+            image: "b",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          provides: { llm: { kind: "llm", endpoint: "endpoint" } },
           exports: { llm: "llm" },
         }
     "#;
@@ -508,7 +524,11 @@ async fn binding_rejects_missing_child_slot() {
         r#"
         {
           manifest_version: "0.1.0",
-          provides: { api: { kind: "http" } },
+          program: {
+            image: "child",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          provides: { api: { kind: "http", endpoint: "endpoint" } },
           exports: { api: "api" },
         }
         "#,
@@ -522,7 +542,11 @@ async fn binding_rejects_missing_child_slot() {
               components: {{
                 child: "{child}",
               }},
-              provides: {{ api: {{ kind: "http" }} }},
+              program: {{
+                image: "root",
+                network: {{ endpoints: [{{ name: "endpoint", port: 80 }}] }},
+              }},
+              provides: {{ api: {{ kind: "http", endpoint: "endpoint" }} }},
               bindings: [
                 {{ to: "#child.missing", from: "self.api" }},
               ],
@@ -644,8 +668,12 @@ async fn duplicate_slot_bindings_across_manifests_error() {
         r#"
         {
           manifest_version: "0.1.0",
+          program: {
+            image: "child",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
           slots: { api: { kind: "http" } },
-          provides: { http: { kind: "http" } },
+          provides: { http: { kind: "http", endpoint: "endpoint" } },
           bindings: [
             { to: "self.api", from: "self.http" },
           ],
@@ -661,7 +689,11 @@ async fn duplicate_slot_bindings_across_manifests_error() {
               components: {{
                 child: "{child}",
               }},
-              provides: {{ api: {{ kind: "http" }} }},
+              program: {{
+                image: "root",
+                network: {{ endpoints: [{{ name: "endpoint", port: 80 }}] }},
+              }},
+              provides: {{ api: {{ kind: "http", endpoint: "endpoint" }} }},
               bindings: [
                 {{ to: "#child.api", from: "self.api" }},
               ],
@@ -699,7 +731,11 @@ async fn type_mismatch_reports_expected_and_got() {
         r#"
         {
           manifest_version: "0.1.0",
-          provides: { http: { kind: "http" } },
+          program: {
+            image: "child",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          provides: { http: { kind: "http", endpoint: "endpoint" } },
           exports: { http: "http" },
         }
         "#,
@@ -753,7 +789,11 @@ async fn delegated_export_chain_resolves_binding_source() {
         r#"
         {
           manifest_version: "0.1.0",
-          provides: { api: { kind: "http" } },
+          program: {
+            image: "grand",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          provides: { api: { kind: "http", endpoint: "endpoint" } },
           exports: { api: "api" },
         }
         "#,
@@ -946,7 +986,11 @@ async fn compile_emits_manifest_lints() {
         r#"
         {
           manifest_version: "0.1.0",
-          provides: { api: { kind: "http" } },
+          program: {
+            image: "root",
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          provides: { api: { kind: "http", endpoint: "endpoint" } },
         }
         "#,
     );
@@ -965,17 +1009,22 @@ async fn compile_emits_manifest_lints() {
         .await
         .unwrap();
 
-    assert_eq!(output.diagnostics.len(), 1);
-    let diagnostic = &output.diagnostics[0];
-    assert_eq!(diagnostic.severity(), Some(Severity::Warning));
-    assert_eq!(
-        diagnostic.code().map(|code| code.to_string()),
-        Some("manifest::unused_provide".to_string())
+    assert_eq!(output.diagnostics.len(), 2);
+    let diagnostics: Vec<_> = output.diagnostics.iter().collect();
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diag| diag.severity() == Some(Severity::Warning))
     );
-    assert_eq!(
-        diagnostic.to_string(),
-        "provide `api` is never used or exported (in component /)"
-    );
+    let codes: Vec<_> = diagnostics
+        .iter()
+        .filter_map(|diag| diag.code().map(|code| code.to_string()))
+        .collect();
+    assert!(codes.contains(&"manifest::unused_program".to_string()));
+    assert!(codes.contains(&"manifest::unused_provide".to_string()));
+    assert!(diagnostics.iter().any(|diag| {
+        diag.to_string() == "provide `api` is never used or exported (in component /)"
+    }));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

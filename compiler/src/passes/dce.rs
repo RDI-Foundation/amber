@@ -302,12 +302,13 @@ mod tests {
           program: {
             image: "green",
             args: ["--llm", "${slots.llm.url}"],
+            network: { endpoints: [{ name: "tool_proxy", port: 80 }] },
           },
           slots: {
             llm: { kind: "llm" },
             admin_api: { kind: "mcp" },
           },
-          provides: { tool_proxy: { kind: "mcp" } },
+          provides: { tool_proxy: { kind: "mcp", endpoint: "tool_proxy" } },
           exports: { tool_proxy: "tool_proxy" },
         }
         "#
@@ -318,9 +319,12 @@ mod tests {
         {
           manifest_version: "0.1.0",
           runtime: { version: "^1.0.0" },
-          program: { image: "wrapper" },
+          program: {
+            image: "wrapper",
+            network: { endpoints: [{ name: "admin_api", port: 80 }] },
+          },
           slots: { litellm: { kind: "http" } },
-          provides: { admin_api: { kind: "mcp" } },
+          provides: { admin_api: { kind: "mcp", endpoint: "admin_api" } },
           exports: { admin_api: "admin_api" },
         }
         "##
@@ -330,11 +334,19 @@ mod tests {
         let router: Manifest = r##"
         {
           manifest_version: "0.1.0",
-          program: { image: "router" },
+          program: {
+            image: "router",
+            network: {
+              endpoints: [
+                { name: "llm", port: 80 },
+                { name: "admin_api", port: 81 },
+              ],
+            },
+          },
           components: { wrapper: "file:///wrapper.json5" },
           provides: {
-            llm: { kind: "llm" },
-            admin_api: { kind: "http" },
+            llm: { kind: "llm", endpoint: "llm" },
+            admin_api: { kind: "http", endpoint: "admin_api" },
           },
           bindings: [
             { to: "#wrapper.litellm", from: "self.admin_api" },
@@ -526,12 +538,13 @@ mod tests {
           program: {
             image: "consumer",
             args: ["--input", "${slots.input.url}", "--llm", "${slots.llm.url}"],
+            network: { endpoints: [{ name: "out", port: 80 }] },
           },
           slots: {
             input: { kind: "mcp" },
             llm: { kind: "llm" },
           },
-          provides: { out: { kind: "mcp" } },
+          provides: { out: { kind: "mcp", endpoint: "out" } },
           exports: { out: "out" },
         }
         "##
@@ -542,8 +555,11 @@ mod tests {
         {
           manifest_version: "0.1.0",
           runtime: { version: ">=1.0.0, <2.0.0" },
-          program: { image: "input" },
-          provides: { input: { kind: "mcp" } },
+          program: {
+            image: "input",
+            network: { endpoints: [{ name: "input", port: 80 }] },
+          },
+          provides: { input: { kind: "mcp", endpoint: "input" } },
           exports: { input: "input" },
         }
         "##
@@ -553,8 +569,11 @@ mod tests {
         let llm: Manifest = r##"
         {
           manifest_version: "0.1.0",
-          program: { image: "llm" },
-          provides: { llm: { kind: "llm" } },
+          program: {
+            image: "llm",
+            network: { endpoints: [{ name: "llm", port: 80 }] },
+          },
+          provides: { llm: { kind: "llm", endpoint: "llm" } },
           exports: { llm: "llm" },
         }
         "##
@@ -718,9 +737,10 @@ mod tests {
           program: {
             image: "app",
             env: { ADMIN_URL: "${slots.admin.url}" },
+            network: { endpoints: [{ name: "out", port: 80 }] },
           },
           slots: { admin: { kind: "mcp" } },
-          provides: { out: { kind: "mcp" } },
+          provides: { out: { kind: "mcp", endpoint: "out" } },
           exports: { out: "out" },
         }
         "##
@@ -730,8 +750,11 @@ mod tests {
         let admin: Manifest = r##"
         {
           manifest_version: "0.1.0",
-          program: { image: "admin" },
-          provides: { admin: { kind: "mcp" } },
+          program: {
+            image: "admin",
+            network: { endpoints: [{ name: "admin", port: 80 }] },
+          },
+          provides: { admin: { kind: "mcp", endpoint: "admin" } },
           exports: { admin: "admin" },
         }
         "##

@@ -13,7 +13,7 @@
     wrapper: "./litellm-wrapper.json5",
   },
   provides: {
-    llm: { kind: "llm" },
+    llm: { kind: "llm", endpoint: "router" },
     admin_api: { kind: "http", endpoint: "admin-api" },
   },
   bindings: [

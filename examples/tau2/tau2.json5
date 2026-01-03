@@ -9,7 +9,7 @@
     },
   },
   provides: {
-    env: { kind: "mcp", profile: "openenv" },
+    env: { kind: "mcp", profile: "openenv", endpoint: "endpoint" },
   },
   exports: { env: "env" },
 }
