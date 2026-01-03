@@ -57,6 +57,7 @@ dependencies = [
  "miette",
  "similar",
  "strip-ansi-escapes",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-error",

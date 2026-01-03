@@ -22,3 +22,4 @@ url = { workspace = true }
 [dev-dependencies]
 similar = "2.7.0"
 strip-ansi-escapes = "0.2"
+tempfile = { workspace = true }

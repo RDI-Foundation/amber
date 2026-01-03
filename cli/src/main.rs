@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, fmt, path::Path};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use amber_compiler::{
     CompileOptions, Compiler,
@@ -6,7 +10,7 @@ use amber_compiler::{
 };
 use amber_manifest::ManifestRef;
 use amber_resolver::Resolver;
-use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand};
 use miette::{
     Context as _, Diagnostic, GraphicalReportHandler, IntoDiagnostic as _, Result, Severity,
 };
@@ -38,9 +42,25 @@ struct CompileArgs {
     #[arg(short = 'D', long = "deny", value_name = "LINT")]
     deny: Vec<String>,
 
-    /// Select the emitted output.
-    #[arg(long = "emit", value_enum, default_value_t = EmitKind::Dot)]
-    emit: EmitKind,
+    /// Directory for default output files (defaults to the current directory).
+    #[arg(long = "out-dir", value_name = "DIR", conflicts_with = "output")]
+    out_dir: Option<PathBuf>,
+
+    /// Write the primary output to this path.
+    #[arg(short = 'o', long = "output", value_name = "FILE")]
+    output: Option<PathBuf>,
+
+    /// Write Graphviz DOT output to this path, or `-` for stdout.
+    ///
+    /// If omitted, defaults to next to the primary output.
+    #[arg(
+        long = "dot",
+        value_name = "FILE",
+        num_args = 0..=1,
+        require_equals = true,
+        allow_hyphen_values = true
+    )]
+    dot: Option<Option<PathBuf>>,
 
     /// Root manifest to compile (URL or local path).
     #[arg(value_name = "MANIFEST")]
@@ -56,12 +76,6 @@ struct CheckArgs {
     /// Root manifest to check (URL or local path).
     #[arg(value_name = "MANIFEST")]
     manifest: String,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum EmitKind {
-    Dot,
-    DockerCompose,
 }
 
 #[tokio::main]
@@ -104,7 +118,7 @@ async fn compile(args: CompileArgs) -> Result<()> {
     let compiler = Compiler::new(Resolver::new(), Default::default());
 
     let output = compiler
-        .compile(manifest, CompileOptions::default())
+        .compile(manifest.clone(), CompileOptions::default())
         .await
         .wrap_err("compile failed")?;
 
@@ -114,16 +128,18 @@ async fn compile(args: CompileArgs) -> Result<()> {
         return Err(miette::miette!("compilation failed"));
     }
 
-    match args.emit {
-        EmitKind::Dot => {
-            let dot = DotReporter.emit(&output).into_diagnostic()?;
-            print!("{dot}");
-            Ok(())
+    let outputs = resolve_output_paths(&args, &manifest)?;
+    write_primary_output(&outputs.primary, &manifest)?;
+
+    if let Some(dot_dest) = outputs.dot {
+        let dot = DotReporter.emit(&output).into_diagnostic()?;
+        match dot_dest {
+            DotOutput::Stdout => print!("{dot}"),
+            DotOutput::File(path) => write_artifact(&path, dot.as_bytes())?,
         }
-        EmitKind::DockerCompose => Err(miette::miette!(
-            "emit kind `docker-compose` is not implemented yet"
-        )),
     }
+
+    Ok(())
 }
 
 async fn check(args: CheckArgs) -> Result<()> {
@@ -296,4 +312,97 @@ fn parse_manifest_ref(input: &str) -> Result<ManifestRef> {
         .map_err(|_| miette::miette!("could not convert `{}` into a file URL", abs.display()))?;
 
     Ok(ManifestRef::from_url(url))
+}
+
+enum DotOutput {
+    Stdout,
+    File(PathBuf),
+}
+
+struct OutputPaths {
+    primary: PathBuf,
+    dot: Option<DotOutput>,
+}
+
+fn resolve_output_paths(args: &CompileArgs, manifest: &ManifestRef) -> Result<OutputPaths> {
+    let primary = match args.output.as_ref() {
+        Some(path) => path.clone(),
+        None => {
+            let dir = args.out_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+            dir.join(default_output_stem(manifest))
+        }
+    };
+
+    let dot = match args.dot.as_ref() {
+        None => None,
+        Some(None) => Some(DotOutput::File(primary.with_extension("dot"))),
+        Some(Some(path)) if path.as_path() == Path::new("-") => Some(DotOutput::Stdout),
+        Some(Some(path)) => Some(DotOutput::File(path.clone())),
+    };
+
+    if let Some(DotOutput::File(dot_path)) = dot.as_ref()
+        && dot_path == &primary
+    {
+        return Err(miette::miette!(
+            "dot output path `{}` must not match the primary output path",
+            dot_path.display()
+        ));
+    }
+
+    Ok(OutputPaths { primary, dot })
+}
+
+fn default_output_stem(manifest: &ManifestRef) -> String {
+    let url = manifest
+        .url
+        .as_url()
+        .expect("CLI resolves manifest refs into absolute URLs");
+
+    let file_name = if url.scheme() == "file" {
+        url.to_file_path().ok().and_then(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+    } else {
+        url.path_segments()
+            .and_then(|mut segments| segments.next_back())
+            .map(str::to_string)
+    };
+
+    file_name
+        .as_deref()
+        .and_then(|name| Path::new(name).file_stem().and_then(|s| s.to_str()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or("amber")
+        .to_string()
+}
+
+fn write_primary_output(path: &Path, manifest: &ManifestRef) -> Result<()> {
+    let url = manifest
+        .url
+        .as_url()
+        .expect("CLI resolves manifest refs into absolute URLs");
+
+    let contents = format!(
+        "amber output placeholder\nmanifest: {url}\n\nNOTE: the primary output format is not \
+         implemented yet.\n"
+    );
+
+    write_artifact(path, contents.as_bytes())
+        .wrap_err_with(|| format!("failed to write primary output `{}`", path.display()))
+}
+
+fn write_artifact(path: &Path, contents: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to create directory `{}`", parent.display()))?;
+    }
+
+    std::fs::write(path, contents)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write `{}`", path.display()))
 }
