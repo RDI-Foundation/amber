@@ -16,6 +16,7 @@ amber-json5 = { path = "json5" }
 amber-manifest = { path = "manifest" }
 amber-resolver = { path = "resolver" }
 amber-scenario = { path = "scenario" }
+base64 = "0.22.1"
 futures = "0.3.31"
 jsonschema = { version = "0.38.1", default-features = false }
 miette = "7.4.0"

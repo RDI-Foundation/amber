@@ -51,7 +51,7 @@ This crate **parses JSON5**, deserializes into Rust types, and validates:
   * export names (keys in `exports`)
   * child refs (`#<name>`) in bindings and export targets
 * A name cannot be declared in **both** `slots` and `provides`.
-* `exports` targets that point at `self` must refer to something declared in `slots` or `provides`.
+* `exports` targets that point at `self` must refer to something declared in `provides`.
 * `exports` targets that point at `#child` must refer to a declared child.
 * Each binding target `(<to>.<slot>)` may appear **only once**.
 * Binding references must be locally well-formed:
@@ -68,8 +68,8 @@ This crate also provides `manifest::lint::lint_manifest` for non-fatal checks:
 
 * Every declared **slot** should be either:
 
-  * **exported** (some export target points at `self.<name>` or `<name>`), or
-  * **bound into `self`** (some binding has `to: "self"` and `slot: "<name>"`)
+  * **bound into `self`** (some binding has `to: "self"` and `slot: "<name>"`), or
+  * **referenced by the program** (via `${slots.<name>...}` in `program.args` or `program.env`)
 * Every declared **provide** should be either:
 
   * **exported** (some export target points at `self.<name>` or `<name>`), or
@@ -83,7 +83,7 @@ This crate does **not** fetch child manifests and therefore does not validate cr
 
 * Whether an `exports` target like `#child.<name>` resolves to something actually exported by the child.
 * Whether kinds/profiles match across bindings or forwarded exports.
-* Whether a child has exported the slot/capability you’re trying to bind to/from.
+* Whether a child has exported the capability you’re trying to bind from.
 * Validation of `components.<name>.config` against `config_schema`.
 
 If your system resolves manifests, it should enforce those rules at link/resolve time.
@@ -312,10 +312,9 @@ slots: {
 }
 ```
 
-Important rule (enforced):
+Important rule (enforced at link time):
 
-* If a slot is **not exported** (no `exports` target points at it), it must be **bound into `self.<slot>`** by a binding in this manifest.
-* If a slot is **exported** (via `exports`), it is an input the parent is expected to bind.
+* Slots are inputs to the component. Each slot must be satisfied by a binding into `self.<slot>`.
 
 ### `provides`
 
@@ -339,7 +338,7 @@ Notes:
 
 ### `exports`
 
-`exports` maps public names to internal capability targets visible to the parent.
+`exports` maps public names to provides in this manifest or to child exports.
 
 ```json5
 exports: {
@@ -354,10 +353,10 @@ Rules enforced:
 * Export names (keys) must not contain `.`.
 * Targets must be one of:
 
-  * `<name>` (shorthand for `self.<name>`)
-  * `self.<name>`
-  * `#<child>.<name>`
-* Targets pointing at `self` must refer to a declared slot or provide.
+  * `<name>` (shorthand for `self.<provide>`)
+  * `self.<provide>`
+  * `#<child>.<export>`
+* Targets pointing at `self` must refer to a declared provide.
 * Targets pointing at `#child` must refer to a declared child.
 
 ---
@@ -372,6 +371,9 @@ Component refs:
 
 * `"self"` for the current manifest
 * `"#<child>"` for a key in `components`
+
+To satisfy a child slot, create a binding with `to: "#<child>.<slot>"` and a provide source
+(`from: "self.<provide>"` or `from: "#<other>.<export>"`).
 
 Bindings forms:
 
@@ -412,11 +414,8 @@ Rules enforced by this crate:
 
 This version does **not** allow binding from a local slot (`from: "self.<slot>"`). A binding source in `self.*` must refer to a **provide**, not a slot.
 
-To pass a slot through to a child, export the child’s slot directly:
-
-```json5
-exports: { llm: "#child.llm" }
-```
+If you need to forward an input, restructure the component tree so the slot is declared on the
+component that consumes it, or introduce an adapter component that turns the input into a provide.
 
 ---
 
@@ -441,7 +440,8 @@ exports: { llm: "#child.llm" }
 
 ### 2) Component that requires an LLM slot from its parent (valid)
 
-Because the component expects its **parent** to supply `llm`, it must export that slot.
+Because the component expects its **parent** to supply `llm`, the parent must bind a provider into
+`#child.llm` when it instantiates this component.
 
 ```json5
 {
@@ -459,7 +459,6 @@ Because the component expects its **parent** to supply `llm`, it must export tha
   slots: {
     llm: { kind: "llm" },
   },
-  exports: { llm: "llm" },
 }
 ```
 

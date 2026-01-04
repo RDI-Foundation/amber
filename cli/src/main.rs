@@ -5,7 +5,8 @@ use std::{
 };
 
 use amber_compiler::{
-    CompileOptions, CompileOutput, Compiler,
+    CompileOptions, CompileOutput, Compiler, ResolverRegistry,
+    bundle::{BundleBuilder, BundleLoader},
     reporter::{DotReporter, Reporter as _, ScenarioIrReporter},
 };
 use amber_manifest::ManifestRef;
@@ -16,6 +17,7 @@ use miette::{
 };
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{EnvFilter, fmt as tracing_fmt, prelude::*};
+use url::Url;
 
 #[derive(Parser)]
 #[command(name = "amber")]
@@ -62,7 +64,11 @@ struct CompileArgs {
     )]
     dot: Option<Option<PathBuf>>,
 
-    /// Root manifest to compile (URL or local path).
+    /// Write a manifest bundle to this directory.
+    #[arg(long = "bundle", value_name = "DIR")]
+    bundle: Option<PathBuf>,
+
+    /// Root manifest or bundle to compile (URL or local path).
     #[arg(value_name = "MANIFEST")]
     manifest: String,
 }
@@ -73,7 +79,7 @@ struct CheckArgs {
     #[arg(short = 'D', long = "deny", value_name = "LINT")]
     deny: Vec<String>,
 
-    /// Root manifest to check (URL or local path).
+    /// Root manifest or bundle to check (URL or local path).
     #[arg(value_name = "MANIFEST")]
     manifest: String,
 }
@@ -114,12 +120,19 @@ fn init_tracing(verbose: u8) -> Result<()> {
 }
 
 async fn compile(args: CompileArgs) -> Result<()> {
-    let manifest = parse_manifest_ref(&args.manifest)?;
-    let compiler = Compiler::new(Resolver::new(), Default::default());
+    let resolved = resolve_input(&args.manifest).await?;
+    let compiler =
+        Compiler::new(resolved.resolver, Default::default()).with_registry(resolved.registry);
+    let opts = CompileOptions::default();
+
+    let tree = compiler
+        .resolve_tree(resolved.manifest.clone(), opts.resolve)
+        .await
+        .wrap_err("compile failed")?;
+    let bundle_tree = args.bundle.as_ref().map(|_| tree.clone());
 
     let output = compiler
-        .compile(manifest.clone(), CompileOptions::default())
-        .await
+        .compile_from_tree(tree, opts.optimize)
         .wrap_err("compile failed")?;
 
     let deny = DenySet::new(&args.deny);
@@ -128,7 +141,7 @@ async fn compile(args: CompileArgs) -> Result<()> {
         return Err(miette::miette!("compilation failed"));
     }
 
-    let outputs = resolve_output_paths(&args, &manifest)?;
+    let outputs = resolve_output_paths(&args, &resolved.manifest)?;
     write_primary_output(&outputs.primary, &output)?;
 
     if let Some(dot_dest) = outputs.dot {
@@ -139,15 +152,23 @@ async fn compile(args: CompileArgs) -> Result<()> {
         }
     }
 
+    if let Some(bundle_root) = resolve_bundle_root(&args)? {
+        let tree = bundle_tree.expect("bundle requested");
+        prepare_bundle_dir(&bundle_root)?;
+        BundleBuilder::build(&tree, compiler.store(), &bundle_root)
+            .wrap_err("bundle generation failed")?;
+    }
+
     Ok(())
 }
 
 async fn check(args: CheckArgs) -> Result<()> {
-    let manifest = parse_manifest_ref(&args.manifest)?;
-    let compiler = Compiler::new(Resolver::new(), Default::default());
+    let resolved = resolve_input(&args.manifest).await?;
+    let compiler =
+        Compiler::new(resolved.resolver, Default::default()).with_registry(resolved.registry);
 
     let output = compiler
-        .check(manifest, CompileOptions::default())
+        .check(resolved.manifest, CompileOptions::default())
         .await
         .wrap_err("check failed")?;
 
@@ -314,6 +335,70 @@ fn parse_manifest_ref(input: &str) -> Result<ManifestRef> {
     Ok(ManifestRef::from_url(url))
 }
 
+struct ResolvedInput {
+    manifest: ManifestRef,
+    resolver: Resolver,
+    registry: ResolverRegistry,
+}
+
+async fn resolve_input(input: &str) -> Result<ResolvedInput> {
+    if let Some(path) = local_input_path(input)?
+        && let Some(loader) = BundleLoader::from_path(&path)?
+    {
+        let bundle = loader.load().await?;
+        return Ok(ResolvedInput {
+            manifest: bundle.root,
+            resolver: bundle.resolver,
+            registry: bundle.registry,
+        });
+    }
+
+    let manifest = parse_manifest_ref(input)?;
+    Ok(ResolvedInput {
+        manifest,
+        resolver: Resolver::new(),
+        registry: ResolverRegistry::default(),
+    })
+}
+
+fn local_input_path(input: &str) -> Result<Option<PathBuf>> {
+    if let Ok(url) = Url::parse(input) {
+        if url.scheme() == "file" {
+            let path = url
+                .to_file_path()
+                .map_err(|_| miette::miette!("could not convert `{input}` into a file path"))?;
+            if !path.exists() {
+                return Ok(None);
+            }
+            let path = path.canonicalize().map_err(|e| {
+                miette::miette!("failed to resolve input path `{}`: {}", path.display(), e)
+            })?;
+            return Ok(Some(path));
+        }
+
+        let is_windows_drive_path = !input.contains("://")
+            && url.scheme().len() == 1
+            && input.as_bytes().get(1) == Some(&b':');
+        if !is_windows_drive_path {
+            return Ok(None);
+        }
+    }
+
+    let path = Path::new(input);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().into_diagnostic()?.join(path)
+    };
+    let abs = abs
+        .canonicalize()
+        .map_err(|e| miette::miette!("failed to resolve input path `{}`: {}", abs.display(), e))?;
+    Ok(Some(abs))
+}
+
 enum DotOutput {
     Stdout,
     File(PathBuf),
@@ -350,6 +435,41 @@ fn resolve_output_paths(args: &CompileArgs, manifest: &ManifestRef) -> Result<Ou
     }
 
     Ok(OutputPaths { primary, dot })
+}
+
+fn resolve_bundle_root(args: &CompileArgs) -> Result<Option<PathBuf>> {
+    let Some(path) = args.bundle.as_ref() else {
+        return Ok(None);
+    };
+
+    if path.is_absolute() {
+        return Ok(Some(path.clone()));
+    }
+
+    let base = args.out_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+    Ok(Some(base.join(path)))
+}
+
+fn prepare_bundle_dir(path: &Path) -> Result<()> {
+    if path.exists() {
+        if path.is_dir() {
+            std::fs::remove_dir_all(path)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!("failed to remove bundle directory `{}`", path.display())
+                })?;
+        } else {
+            return Err(miette::miette!(
+                "bundle output path `{}` is not a directory",
+                path.display()
+            ));
+        }
+    }
+
+    std::fs::create_dir_all(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create bundle directory `{}`", path.display()))?;
+    Ok(())
 }
 
 fn default_output_stem(manifest: &ManifestRef) -> String {

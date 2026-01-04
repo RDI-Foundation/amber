@@ -7,6 +7,7 @@ edition = "2024"
 amber-manifest = { workspace = true }
 amber-resolver = { workspace = true }
 amber-scenario = { workspace = true }
+base64 = { workspace = true }
 dashmap = "6.1.0"
 futures = { workspace = true }
 jsonschema = { workspace = true }
@@ -14,8 +15,8 @@ miette = { workspace = true, features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "sync"] }
-url = { workspace = true }
+tokio = { workspace = true, features = ["fs", "rt", "sync"] }
+url = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

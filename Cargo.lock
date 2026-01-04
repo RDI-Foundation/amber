@@ -73,6 +73,7 @@ dependencies = [
  "amber-manifest",
  "amber-resolver",
  "amber-scenario",
+ "base64",
  "dashmap",
  "futures",
  "jsonschema",

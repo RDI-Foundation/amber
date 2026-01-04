@@ -14,11 +14,12 @@ mod manifest_table;
 mod provenance;
 mod store;
 
+pub mod bundle;
 pub mod passes;
 pub mod reporter;
 
 pub use environment::ResolverRegistry;
-pub use frontend::ResolveOptions;
+pub use frontend::{ResolveOptions, ResolvedNode, ResolvedTree};
 pub use provenance::{ComponentProvenance, Provenance};
 pub use store::DigestStore;
 
@@ -88,28 +89,33 @@ impl Compiler {
         self
     }
 
-    /// Compile a root manifest reference into a fully linked Scenario plus a digest store,
-    /// per-component provenance, and diagnostics.
-    pub async fn compile(
+    pub async fn resolve_tree(
         &self,
         root: ManifestRef,
-        opts: CompileOptions,
-    ) -> Result<CompileOutput, Error> {
-        let tree = frontend::resolve_tree(
+        opts: ResolveOptions,
+    ) -> Result<ResolvedTree, Error> {
+        Ok(frontend::resolve_tree(
             self.resolver.clone(),
             self.store.clone(),
             self.registry.clone(),
             root,
-            opts.resolve,
+            opts,
         )
-        .await?;
+        .await?)
+    }
 
+    #[allow(clippy::result_large_err)]
+    pub fn compile_from_tree(
+        &self,
+        tree: ResolvedTree,
+        opts: OptimizeOptions,
+    ) -> Result<CompileOutput, Error> {
         let (scenario, provenance) = linker::link(tree, &self.store)?;
         let diagnostics = collect_manifest_diagnostics(&scenario, &provenance, &self.store);
 
         let (scenario, provenance) = {
             let mut pm = passes::PassManager::new();
-            if opts.optimize.dce {
+            if opts.dce {
                 pm.push(passes::DcePass);
                 pm.push(passes::FlattenPass);
             }
@@ -124,21 +130,8 @@ impl Compiler {
         })
     }
 
-    /// Resolve and lint manifests, then attempt to link and report as many errors as possible.
-    pub async fn check(
-        &self,
-        root: ManifestRef,
-        opts: CompileOptions,
-    ) -> Result<CheckOutput, Error> {
-        let tree = frontend::resolve_tree(
-            self.resolver.clone(),
-            self.store.clone(),
-            self.registry.clone(),
-            root,
-            opts.resolve,
-        )
-        .await?;
-
+    #[allow(clippy::result_large_err)]
+    pub fn check_from_tree(&self, tree: ResolvedTree) -> Result<CheckOutput, Error> {
         let mut diagnostics = collect_manifest_diagnostics_from_tree(&tree, &self.store);
         let mut has_errors = false;
 
@@ -159,6 +152,27 @@ impl Compiler {
             diagnostics,
             has_errors,
         })
+    }
+
+    /// Compile a root manifest reference into a fully linked Scenario plus a digest store,
+    /// per-component provenance, and diagnostics.
+    pub async fn compile(
+        &self,
+        root: ManifestRef,
+        opts: CompileOptions,
+    ) -> Result<CompileOutput, Error> {
+        let tree = self.resolve_tree(root, opts.resolve).await?;
+        self.compile_from_tree(tree, opts.optimize)
+    }
+
+    /// Resolve and lint manifests, then attempt to link and report as many errors as possible.
+    pub async fn check(
+        &self,
+        root: ManifestRef,
+        opts: CompileOptions,
+    ) -> Result<CheckOutput, Error> {
+        let tree = self.resolve_tree(root, opts.resolve).await?;
+        self.check_from_tree(tree)
     }
 }
 
