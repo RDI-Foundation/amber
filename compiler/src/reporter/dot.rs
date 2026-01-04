@@ -381,7 +381,6 @@ mod tests {
         let root_manifest = r##"
             {
               manifest_version: "0.1.0",
-              runtime: { version: "^1.0.0" },
               components: { a: "a.json5", b: "b.json5" },
               bindings: [
                 { to: "#a.in", from: "#b.out" },
@@ -395,7 +394,6 @@ mod tests {
         let a_manifest = r#"
             {
               manifest_version: "0.1.0",
-              runtime: { version: "^1.0.0" },
               slots: { in: { kind: "http" } },
             }
             "#
@@ -405,7 +403,6 @@ mod tests {
         let b_manifest = r#"
 	            {
 	              manifest_version: "0.1.0",
-	              runtime: { version: "^1.0.0" },
 	              program: {
 	                image: "b",
 	                network: {
@@ -523,7 +520,6 @@ mod tests {
         let root_manifest = r#"
             {
               manifest_version: "0.1.0",
-              runtime: { version: "^1.0.0" },
               components: { a: "a.json5" },
             }
             "#
@@ -533,7 +529,6 @@ mod tests {
         let a_manifest = r#"
             {
               manifest_version: "0.1.0",
-              runtime: { version: "^1.0.0" },
               program: {
                 image: "a",
                 network: { endpoints: [{ name: "out", port: 80 }] },

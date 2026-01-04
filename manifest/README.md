@@ -98,7 +98,6 @@ Top-level object:
 {
   manifest_version: "0.1.0",   // required
 
-  runtime: { /* ... */ },      // optional
   program: { /* ... */ },      // optional
   components: { /* ... */ },   // optional; default {}
   config_schema: { /* ... */ },// optional
@@ -123,22 +122,6 @@ Unknown fields:
 * `ManifestRef` object form is **strict** (unknown fields are rejected).
 * `provides` entries are **strict** (unknown fields are rejected).
 * Most other objects are **not strict** in this crate (unknown fields are ignored by serde).
-
----
-
-## `runtime`
-
-`runtime` declares a required runtime version range.
-
-Rules enforced by this crate:
-
-* `version` must be a valid SemVer range (parsed by `semver::VersionReq`).
-
-Example:
-
-```json5
-runtime: { version: ">=1.2.0, <2.0.0" }
-```
 
 ---
 

@@ -2,13 +2,14 @@ Error: manifest::deserialize_error
 
   × check failed
   ╰─▶ json5 deserialize error at componentz: unknown field `componentz`,
-      expected one of `manifest_version`, `runtime`, `program`, `components`,
+      expected one of `manifest_version`, `program`, `components`,
       `environments`, `config_schema`, `slots`, `provides`, `bindings`,
       `exports`
    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/typo_components_key.json5:3:3]
  2 │   manifest_version: "0.1.0",
  3 │   componentz: {
    ·   ─────┬────
-   ·        ╰── unknown field `componentz`, expected one of `manifest_version`, `runtime`, `program`, `components`, `environments`, `config_schema`, `slots`, `provides`, `bindings`, `exports`
+   ·        ╰── unknown field `componentz`, expected one of `manifest_version`, `program`, `components`, `environments`, `config_schema`, `slots`, `provides`, `bindings`, `exports`
  4 │     tau2: "./tau2.json5",
    ╰────
+
