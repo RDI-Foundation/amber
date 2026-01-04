@@ -527,7 +527,17 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         let (Some(c), Some(m)) = (c.as_mut(), m.as_ref()) else {
             continue;
         };
-        c.has_program = m.program().is_some();
+        c.program = m.program().cloned();
+        c.slots = m
+            .slots()
+            .iter()
+            .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
+            .collect();
+        c.provides = m
+            .provides()
+            .iter()
+            .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
+            .collect();
     }
 
     let mut schema_cache: HashMap<ManifestDigest, Arc<Validator>> = HashMap::new();
@@ -644,9 +654,11 @@ fn flatten(
         id,
         parent,
         moniker,
-        has_program: false,
         digest: node.digest,
         config: node.config.clone(),
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
         children: Vec::new(),
     }));
     link_index.push(LinkIndex::default());

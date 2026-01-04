@@ -157,7 +157,7 @@ fn find_cycle(out: &[Vec<usize>], indeg: &[usize], live: &[bool]) -> Vec<Compone
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::BTreeMap, sync::Arc};
 
     use amber_manifest::ManifestDigest;
 
@@ -169,9 +169,11 @@ mod tests {
             id: ComponentId(id),
             parent: None,
             moniker: Moniker::from(Arc::from(moniker)),
-            has_program: false,
             digest: ManifestDigest::new([id as u8; 32]),
             config: None,
+            program: None,
+            slots: BTreeMap::new(),
+            provides: BTreeMap::new(),
             children: Vec::new(),
         }
     }

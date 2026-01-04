@@ -1,14 +1,23 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
-use amber_manifest::{CapabilityDecl, ManifestDigest};
+use amber_manifest::{CapabilityDecl, ManifestDigest, Program, ProvideDecl, SlotDecl};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod graph;
+pub mod ir;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub use ir::{SCENARIO_IR_SCHEMA, SCENARIO_IR_VERSION, ScenarioIr, ScenarioIrError};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ComponentId(pub usize);
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
 pub struct Moniker(Arc<str>);
 
 impl Moniker {
@@ -34,6 +43,12 @@ impl From<Arc<str>> for Moniker {
 impl From<String> for Moniker {
     fn from(value: String) -> Self {
         Self(Arc::from(value))
+    }
+}
+
+impl From<Moniker> for String {
+    fn from(value: Moniker) -> Self {
+        value.0.to_string()
     }
 }
 
@@ -172,14 +187,20 @@ pub struct Component {
     pub parent: Option<ComponentId>,
     pub moniker: Moniker,
 
-    /// True if the manifest declares a `program`.
-    pub has_program: bool,
-
     /// Digest of the resolved manifest (compiler-chosen algorithm).
     pub digest: ManifestDigest,
 
     /// Optional instance config (authored at the use-site).
     pub config: Option<Value>,
+
+    /// Program definition (image/args/env/network) extracted from the manifest.
+    pub program: Option<Program>,
+
+    /// Declared input slots (capability requirements).
+    pub slots: BTreeMap<String, SlotDecl>,
+
+    /// Declared output provides (capability outputs).
+    pub provides: BTreeMap<String, ProvideDecl>,
 
     /// Containment edges (component tree).
     pub children: Vec<ComponentId>,

@@ -84,11 +84,11 @@ impl ScenarioPass for FlattenPass {
 }
 
 fn is_pure_routing(component: &Component, manifest: &Manifest) -> bool {
-    !component.has_program
+    component.program.is_none()
         && component.config.is_none()
         && !component.children.is_empty()
-        && manifest.slots().is_empty()
-        && manifest.provides().is_empty()
+        && component.slots.is_empty()
+        && component.provides.is_empty()
         && manifest.bindings().is_empty()
 }
 
@@ -108,7 +108,7 @@ fn nearest_kept_ancestor(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::BTreeMap, sync::Arc};
 
     use amber_manifest::{Manifest, ManifestRef};
     use amber_scenario::{
@@ -128,11 +128,27 @@ mod tests {
             id: ComponentId(id),
             parent: None,
             moniker: Moniker::from(Arc::from(moniker)),
-            has_program: false,
             digest: amber_manifest::ManifestDigest::new([id as u8; 32]),
             config: None,
+            program: None,
+            slots: BTreeMap::new(),
+            provides: BTreeMap::new(),
             children: Vec::new(),
         }
+    }
+
+    fn apply_manifest(component: &mut Component, manifest: &Manifest) {
+        component.program = manifest.program().cloned();
+        component.slots = manifest
+            .slots()
+            .iter()
+            .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
+            .collect();
+        component.provides = manifest
+            .provides()
+            .iter()
+            .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
+            .collect();
     }
 
     #[test]
@@ -182,10 +198,6 @@ mod tests {
         let root_digest = root_manifest.digest();
         let parent_digest = parent_manifest.digest();
         let child_digest = child_manifest.digest();
-        store.put(root_digest, Arc::new(root_manifest));
-        store.put(parent_digest, Arc::new(parent_manifest));
-        store.put(child_digest, Arc::new(child_manifest));
-
         let mut components = vec![
             Some(component(0, "/")),
             Some(component(1, "/parent")),
@@ -208,6 +220,13 @@ mod tests {
             .unwrap()
             .children
             .push(ComponentId(2));
+        apply_manifest(components[0].as_mut().unwrap(), &root_manifest);
+        apply_manifest(components[1].as_mut().unwrap(), &parent_manifest);
+        apply_manifest(components[2].as_mut().unwrap(), &child_manifest);
+
+        store.put(root_digest, Arc::new(root_manifest));
+        store.put(parent_digest, Arc::new(parent_manifest));
+        store.put(child_digest, Arc::new(child_manifest));
 
         let mut scenario = Scenario {
             root: ComponentId(0),
@@ -360,11 +379,6 @@ mod tests {
         let parent_digest = parent_manifest.digest();
         let child_a_digest = child_a_manifest.digest();
         let child_b_digest = child_b_manifest.digest();
-        store.put(root_digest, Arc::new(root_manifest));
-        store.put(parent_digest, Arc::new(parent_manifest));
-        store.put(child_a_digest, Arc::new(child_a_manifest));
-        store.put(child_b_digest, Arc::new(child_b_manifest));
-
         let mut components = vec![
             Some(component(0, "/")),
             Some(component(1, "/parent/child")), // nested; will be reparented to root
@@ -390,6 +404,15 @@ mod tests {
             .unwrap()
             .children
             .push(ComponentId(1));
+        apply_manifest(components[0].as_mut().unwrap(), &root_manifest);
+        apply_manifest(components[1].as_mut().unwrap(), &child_b_manifest);
+        apply_manifest(components[2].as_mut().unwrap(), &parent_manifest);
+        apply_manifest(components[3].as_mut().unwrap(), &child_a_manifest);
+
+        store.put(root_digest, Arc::new(root_manifest));
+        store.put(parent_digest, Arc::new(parent_manifest));
+        store.put(child_a_digest, Arc::new(child_a_manifest));
+        store.put(child_b_digest, Arc::new(child_b_manifest));
 
         let mut scenario = Scenario {
             root: ComponentId(0),

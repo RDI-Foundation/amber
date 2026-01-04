@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 
 use amber_manifest::CapabilityKind;
-use amber_scenario::{ComponentId, Scenario};
+use amber_scenario::{Component, ComponentId, Scenario};
 
 use super::{Reporter, ReporterError};
 use crate::CompileOutput;
@@ -32,16 +32,13 @@ struct ExportEdge {
 fn render_dot_with_exports(output: &CompileOutput) -> String {
     let s = &output.scenario;
 
-    let manifests = crate::manifest_table::build_manifest_table(&s.components, &output.store)
-        .expect("manifest was resolved during linking");
-
     let mut exports = Vec::with_capacity(s.exports.len());
     for export in &s.exports {
         let from = export.from.component;
         let kind = export.capability.kind;
         exports.push(ExportEdge {
             endpoint_label: endpoint_label_for_provide(
-                manifests[from.0].as_ref().expect("manifest should exist"),
+                s.component(from),
                 export.from.name.as_str(),
             ),
             from,
@@ -54,7 +51,7 @@ fn render_dot_with_exports(output: &CompileOutput) -> String {
 
 fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
     let root = s.root;
-    let root_has_program = s.component(root).has_program;
+    let root_has_program = s.component(root).program.is_some();
     let root_needs_node = !root_has_program && exports.iter().any(|e| e.from == root);
     let root_has_node = root_has_program || root_needs_node;
 
@@ -108,27 +105,28 @@ fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
     out
 }
 
-fn endpoint_label_for_provide(manifest: &amber_manifest::Manifest, provide_name: &str) -> String {
-    let provide = manifest
-        .provides()
+fn endpoint_label_for_provide(component: &Component, provide_name: &str) -> String {
+    let provide = component
+        .provides
         .get(provide_name)
-        .expect("manifest invariant: provide exists");
+        .expect("scenario invariant: provide exists");
 
-    let network = manifest
-        .program()
+    let network = component
+        .program
+        .as_ref()
         .and_then(|p| p.network.as_ref())
-        .expect("manifest invariant: provide requires a network");
+        .expect("scenario invariant: provide requires a network");
 
     let endpoint_name = provide
         .endpoint
         .as_deref()
-        .expect("manifest invariant: provide declares an endpoint");
+        .expect("scenario invariant: provide declares an endpoint");
 
     let endpoint = network
         .endpoints
         .iter()
         .find(|e| e.name == endpoint_name)
-        .expect("manifest invariant: endpoint exists");
+        .expect("scenario invariant: endpoint exists");
 
     format!("{}:{}{}", endpoint.protocol, endpoint.port, endpoint.path)
 }
@@ -146,7 +144,7 @@ fn render_root(s: &Scenario, render_root_node: bool, indent: usize, out: &mut St
     write_escaped_label(out, c.moniker.as_str());
     let _ = writeln!(out, "\";");
 
-    if c.has_program {
+    if c.program.is_some() {
         render_node_with_label(root, "program", indent + 1, out);
     } else if render_root_node {
         render_node(s, root, indent + 1, out);
@@ -221,6 +219,8 @@ fn write_escaped_label(out: &mut String, label: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use amber_manifest::{Manifest, ManifestDigest, ManifestRef};
     use amber_scenario::{
         BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, ScenarioExport, SlotRef,
@@ -235,11 +235,27 @@ mod tests {
             id: ComponentId(id),
             parent: None,
             moniker: Moniker::from(moniker.to_string()),
-            has_program: false,
             digest: ManifestDigest::new([id as u8; 32]),
             config: None,
+            program: None,
+            slots: BTreeMap::new(),
+            provides: BTreeMap::new(),
             children: Vec::new(),
         }
+    }
+
+    fn apply_manifest(component: &mut Component, manifest: &Manifest) {
+        component.program = manifest.program().cloned();
+        component.slots = manifest
+            .slots()
+            .iter()
+            .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
+            .collect();
+        component.provides = manifest
+            .provides()
+            .iter()
+            .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
+            .collect();
     }
 
     #[test]
@@ -322,8 +338,17 @@ mod tests {
 
     #[test]
     fn dot_renders_root_program_node() {
+        let root_manifest: Manifest = r#"
+        {
+          manifest_version: "0.1.0",
+          program: { image: "root" },
+        }
+        "#
+        .parse()
+        .unwrap();
+
         let mut components = vec![Some(component(0, "/"))];
-        components[0].as_mut().unwrap().has_program = true;
+        apply_manifest(components[0].as_mut().unwrap(), &root_manifest);
 
         let scenario = Scenario {
             root: ComponentId(0),
@@ -398,10 +423,6 @@ mod tests {
         let a_digest = a_manifest.digest();
         let b_digest = b_manifest.digest();
 
-        store.put(root_digest, std::sync::Arc::new(root_manifest));
-        store.put(a_digest, std::sync::Arc::new(a_manifest));
-        store.put(b_digest, std::sync::Arc::new(b_manifest));
-
         let mut components = vec![
             Some(component(0, "/")),
             Some(component(1, "/a")),
@@ -418,6 +439,13 @@ mod tests {
             .unwrap()
             .children
             .extend([ComponentId(1), ComponentId(2)]);
+        apply_manifest(components[0].as_mut().unwrap(), &root_manifest);
+        apply_manifest(components[1].as_mut().unwrap(), &a_manifest);
+        apply_manifest(components[2].as_mut().unwrap(), &b_manifest);
+
+        store.put(root_digest, std::sync::Arc::new(root_manifest));
+        store.put(a_digest, std::sync::Arc::new(a_manifest));
+        store.put(b_digest, std::sync::Arc::new(b_manifest));
 
         let scenario = Scenario {
             root: ComponentId(0),
@@ -519,11 +547,12 @@ mod tests {
 
         let store = crate::DigestStore::new();
         let root_digest = root_manifest.digest();
-        store.put(root_digest, std::sync::Arc::new(root_manifest));
 
         let mut components = vec![Some(component(0, "/"))];
         components[0].as_mut().unwrap().digest = root_digest;
-        components[0].as_mut().unwrap().has_program = true;
+        apply_manifest(components[0].as_mut().unwrap(), &root_manifest);
+
+        store.put(root_digest, std::sync::Arc::new(root_manifest));
 
         let scenario = Scenario {
             root: ComponentId(0),

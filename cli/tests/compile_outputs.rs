@@ -62,6 +62,45 @@ fn compile_writes_primary_output_and_dot_artifact() {
         components.iter().any(|c| c["moniker"] == "/parent/child"),
         "scenario IR missing child component"
     );
+    for component in components {
+        assert!(
+            component.get("program").is_some(),
+            "scenario IR missing component program field"
+        );
+        assert!(
+            component.get("slots").is_some(),
+            "scenario IR missing component slots field"
+        );
+        assert!(
+            component.get("provides").is_some(),
+            "scenario IR missing component provides field"
+        );
+    }
+
+    let child_component = components
+        .iter()
+        .find(|c| c["moniker"] == "/parent/child")
+        .expect("child component should exist");
+    let child_program = child_component["program"]
+        .as_object()
+        .expect("child program should be an object");
+    assert_eq!(
+        child_program.get("image").and_then(Value::as_str),
+        Some("example/child")
+    );
+    let child_slots = child_component["slots"]
+        .as_object()
+        .expect("child slots should be an object");
+    assert!(child_slots.is_empty(), "expected child slots to be empty");
+    let child_provides = child_component["provides"]
+        .as_object()
+        .expect("child provides should be an object");
+    assert!(
+        child_provides.contains_key("cap"),
+        "child provides missing cap"
+    );
+    assert_eq!(child_component["provides"]["cap"]["kind"], "http");
+    assert_eq!(child_component["provides"]["cap"]["endpoint"], "endpoint");
 
     let exports = primary_json["exports"]
         .as_array()

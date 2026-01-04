@@ -3,7 +3,6 @@ use std::{
     sync::Arc,
 };
 
-use amber_manifest::Manifest;
 use amber_scenario::{ComponentId, Scenario};
 
 use super::{PassError, ScenarioPass};
@@ -34,18 +33,9 @@ impl ScenarioPass for DcePass {
         &self,
         scenario: Scenario,
         provenance: Provenance,
-        store: &DigestStore,
+        _store: &DigestStore,
     ) -> Result<(Scenario, Provenance), PassError> {
         scenario.assert_invariants();
-
-        let manifests = crate::manifest_table::build_manifest_table(&scenario.components, store)
-            .map_err(|e| PassError::Failed {
-                pass: self.name(),
-                message: format!(
-                    "missing manifest for digest {} (component {})",
-                    e.digest, e.component.0
-                ),
-            })?;
 
         let n = scenario.components.len();
         let mut incoming = vec![Vec::new(); n];
@@ -76,7 +66,7 @@ impl ScenarioPass for DcePass {
             match item {
                 WorkItem::Provide(key) => {
                     let component = key.component;
-                    if scenario.component(ComponentId(component)).has_program
+                    if scenario.component(ComponentId(component)).program.is_some()
                         && !live_program[component]
                     {
                         live_program[component] = true;
@@ -84,14 +74,12 @@ impl ScenarioPass for DcePass {
                     }
                 }
                 WorkItem::Program(component) => {
-                    let manifest = manifests[component]
-                        .as_ref()
-                        .expect("manifest should exist");
-                    mark_used_slots(component, manifest, &mut live_slots, &mut work);
+                    let component = scenario.component(ComponentId(component));
+                    mark_used_slots(component, &mut live_slots, &mut work);
                 }
                 WorkItem::Slot(key) => {
                     let component = key.component;
-                    if scenario.component(ComponentId(component)).has_program
+                    if scenario.component(ComponentId(component)).program.is_some()
                         && !live_program[component]
                     {
                         live_program[component] = true;
@@ -131,30 +119,29 @@ impl ScenarioPass for DcePass {
 }
 
 fn mark_used_slots(
-    component: usize,
-    manifest: &Manifest,
+    component: &amber_scenario::Component,
     live_slots: &mut HashSet<CapKey>,
     work: &mut VecDeque<WorkItem>,
 ) {
-    let Some(program) = manifest.program() else {
+    let Some(program) = component.program.as_ref() else {
         return;
     };
 
     let mark_all = |live_slots: &mut HashSet<CapKey>, work: &mut VecDeque<WorkItem>| {
-        for slot in manifest.slots().keys() {
-            mark_slot(component, slot.as_str(), live_slots, work);
+        for slot in component.slots.keys() {
+            mark_slot(component.id.0, slot, live_slots, work);
         }
     };
 
     for arg in &program.args.0 {
-        if arg.visit_slot_uses(|slot| mark_slot(component, slot, live_slots, work)) {
+        if arg.visit_slot_uses(|slot| mark_slot(component.id.0, slot, live_slots, work)) {
             mark_all(live_slots, work);
             return;
         }
     }
 
     for value in program.env.values() {
-        if value.visit_slot_uses(|slot| mark_slot(component, slot, live_slots, work)) {
+        if value.visit_slot_uses(|slot| mark_slot(component.id.0, slot, live_slots, work)) {
             mark_all(live_slots, work);
             return;
         }
@@ -230,7 +217,11 @@ fn prune_scenario(
         scenario,
         &removed,
         |id, component| {
-            component.has_program &= live_program[id.0];
+            if !live_program[id.0] {
+                component.program = None;
+                component.slots.clear();
+                component.provides.clear();
+            }
         },
         |idx, _binding| live_bindings[idx],
     );
@@ -241,7 +232,7 @@ fn prune_scenario(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::BTreeMap, sync::Arc};
 
     use amber_manifest::{Manifest, ManifestRef};
     use amber_scenario::{
@@ -257,11 +248,27 @@ mod tests {
             id: ComponentId(id),
             parent: None,
             moniker: Moniker::from(Arc::from(moniker)),
-            has_program: false,
             digest: amber_manifest::ManifestDigest::new([id as u8; 32]),
             config: None,
+            program: None,
+            slots: BTreeMap::new(),
+            provides: BTreeMap::new(),
             children: Vec::new(),
         }
+    }
+
+    fn apply_manifest(component: &mut Component, manifest: &Manifest) {
+        component.program = manifest.program().cloned();
+        component.slots = manifest
+            .slots()
+            .iter()
+            .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
+            .collect();
+        component.provides = manifest
+            .provides()
+            .iter()
+            .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
+            .collect();
     }
 
     #[test]
@@ -351,11 +358,6 @@ mod tests {
         let green_digest = green.digest();
         let router_digest = router.digest();
         let wrapper_digest = wrapper.digest();
-        store.put(root_digest, Arc::new(root));
-        store.put(green_digest, Arc::new(green));
-        store.put(router_digest, Arc::new(router));
-        store.put(wrapper_digest, Arc::new(wrapper));
-
         let mut components = vec![
             Some(component(0, "/")),
             Some(component(1, "/router")),
@@ -370,9 +372,15 @@ mod tests {
         components[1].as_mut().unwrap().parent = Some(ComponentId(0));
         components[2].as_mut().unwrap().parent = Some(ComponentId(0));
         components[3].as_mut().unwrap().parent = Some(ComponentId(1));
-        components[1].as_mut().unwrap().has_program = true;
-        components[2].as_mut().unwrap().has_program = true;
-        components[3].as_mut().unwrap().has_program = true;
+        apply_manifest(components[0].as_mut().unwrap(), &root);
+        apply_manifest(components[1].as_mut().unwrap(), &router);
+        apply_manifest(components[2].as_mut().unwrap(), &green);
+        apply_manifest(components[3].as_mut().unwrap(), &wrapper);
+
+        store.put(root_digest, Arc::new(root));
+        store.put(green_digest, Arc::new(green));
+        store.put(router_digest, Arc::new(router));
+        store.put(wrapper_digest, Arc::new(wrapper));
 
         components[0]
             .as_mut()
@@ -581,11 +589,6 @@ mod tests {
         let consumer_digest = consumer.digest();
         let input_digest = input.digest();
         let llm_digest = llm.digest();
-        store.put(root_digest, Arc::new(root));
-        store.put(consumer_digest, Arc::new(consumer));
-        store.put(input_digest, Arc::new(input));
-        store.put(llm_digest, Arc::new(llm));
-
         let mut components = vec![
             Some(component(0, "/")),
             Some(component(1, "/consumer")),
@@ -600,9 +603,15 @@ mod tests {
         components[1].as_mut().unwrap().parent = Some(ComponentId(0));
         components[2].as_mut().unwrap().parent = Some(ComponentId(0));
         components[3].as_mut().unwrap().parent = Some(ComponentId(0));
-        components[1].as_mut().unwrap().has_program = true;
-        components[2].as_mut().unwrap().has_program = true;
-        components[3].as_mut().unwrap().has_program = true;
+        apply_manifest(components[0].as_mut().unwrap(), &root);
+        apply_manifest(components[1].as_mut().unwrap(), &consumer);
+        apply_manifest(components[2].as_mut().unwrap(), &input);
+        apply_manifest(components[3].as_mut().unwrap(), &llm);
+
+        store.put(root_digest, Arc::new(root));
+        store.put(consumer_digest, Arc::new(consumer));
+        store.put(input_digest, Arc::new(input));
+        store.put(llm_digest, Arc::new(llm));
 
         components[0].as_mut().unwrap().children.extend([
             ComponentId(1),
@@ -770,10 +779,6 @@ mod tests {
         let root_digest = root.digest();
         let app_digest = app.digest();
         let admin_digest = admin.digest();
-        store.put(root_digest, Arc::new(root));
-        store.put(app_digest, Arc::new(app));
-        store.put(admin_digest, Arc::new(admin));
-
         let mut components = vec![
             Some(component(0, "/")),
             Some(component(1, "/app")),
@@ -785,8 +790,13 @@ mod tests {
 
         components[1].as_mut().unwrap().parent = Some(ComponentId(0));
         components[2].as_mut().unwrap().parent = Some(ComponentId(0));
-        components[1].as_mut().unwrap().has_program = true;
-        components[2].as_mut().unwrap().has_program = true;
+        apply_manifest(components[0].as_mut().unwrap(), &root);
+        apply_manifest(components[1].as_mut().unwrap(), &app);
+        apply_manifest(components[2].as_mut().unwrap(), &admin);
+
+        store.put(root_digest, Arc::new(root));
+        store.put(app_digest, Arc::new(app));
+        store.put(admin_digest, Arc::new(admin));
 
         components[0]
             .as_mut()
