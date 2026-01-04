@@ -43,7 +43,6 @@ fn render_dot_with_exports(output: &CompileOutput) -> String {
             endpoint_label: endpoint_label_for_provide(
                 manifests[from.0].as_ref().expect("manifest should exist"),
                 export.from.name.as_str(),
-                kind,
             ),
             from,
             kind,
@@ -109,40 +108,27 @@ fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
     out
 }
 
-fn endpoint_label_for_provide(
-    manifest: &amber_manifest::Manifest,
-    provide_name: &str,
-    kind: CapabilityKind,
-) -> String {
+fn endpoint_label_for_provide(manifest: &amber_manifest::Manifest, provide_name: &str) -> String {
     let provide = manifest
         .provides()
+        .get(provide_name)
+        .expect("manifest invariant: provide exists");
+
+    let network = manifest
+        .program()
+        .and_then(|p| p.network.as_ref())
+        .expect("manifest invariant: provide requires a network");
+
+    let endpoint_name = provide
+        .endpoint
+        .as_deref()
+        .expect("manifest invariant: provide declares an endpoint");
+
+    let endpoint = network
+        .endpoints
         .iter()
-        .find(|(name, _)| name.as_str() == provide_name)
-        .map(|(_, decl)| decl);
-
-    let Some(network) = manifest.program().and_then(|p| p.network.as_ref()) else {
-        return "<no network>".to_string();
-    };
-
-    let endpoint = if let Some(endpoint_name) = provide.and_then(|p| p.endpoint.as_deref()) {
-        network.endpoints.iter().find(|e| e.name == endpoint_name)
-    } else if network.endpoints.len() == 1 {
-        network.endpoints.iter().next()
-    } else if let Some(endpoint) = network.endpoints.iter().find(|e| e.name == provide_name) {
-        Some(endpoint)
-    } else if kind == CapabilityKind::Llm {
-        network
-            .endpoints
-            .iter()
-            .find(|e| e.name == "router")
-            .or_else(|| network.endpoints.iter().find(|e| e.name == "endpoint"))
-    } else {
-        network.endpoints.iter().find(|e| e.name == "endpoint")
-    };
-
-    let Some(endpoint) = endpoint else {
-        return "<unknown endpoint>".to_string();
-    };
+        .find(|e| e.name == endpoint_name)
+        .expect("manifest invariant: endpoint exists");
 
     format!("{}:{}{}", endpoint.protocol, endpoint.port, endpoint.path)
 }
