@@ -129,6 +129,11 @@ struct ResolveService {
     store: DigestStore,
     max_concurrency: usize,
     sem: Arc<Semaphore>,
+    /// Per-compilation cache of resolved manifests, keyed by environment + URL.
+    ///
+    /// We intentionally do not cache by URL across compilations: URLs are mutable and not identity.
+    /// Within a single compilation we assume a given URL is stable, so this memoizes successful
+    /// resolutions and coalesces concurrent requests.
     inflight: dashmap::DashMap<(EnvId, Url), Arc<OnceCell<ResolvedManifest>>>,
     registry: ResolverRegistry,
     next_env_id: AtomicU32,
