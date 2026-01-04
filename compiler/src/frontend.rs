@@ -44,7 +44,7 @@ pub enum Error {
     #[diagnostic(code(compiler::cycle))]
     Cycle { cycle: Vec<Url> },
 
-    #[error("relative manifest reference `{reference}` requires an absolute base URL")]
+    #[error("relative manifest reference `{reference}` requires a file:// base URL")]
     #[diagnostic(code(compiler::relative_manifest_ref))]
     RelativeManifestRef { reference: Box<str> },
 
@@ -193,6 +193,11 @@ async fn resolve_component(
                 reference: declared_ref.url.as_str().into(),
             });
         };
+        if base.scheme() != "file" {
+            return Err(Error::RelativeManifestRef {
+                reference: declared_ref.url.as_str().into(),
+            });
+        }
 
         declared_ref.resolve_against(base).map_err(|err| {
             let (src, span) =
@@ -237,7 +242,7 @@ async fn resolve_component(
         .filter_map(component_decl_environment)
         .collect();
 
-    let realm_url = observed_url.as_ref().unwrap_or(&resolved_url).clone();
+    let realm_url = resolved_url.clone();
 
     let mut env_cache: HashMap<String, Arc<ResolveEnv>> = HashMap::new();
     for env_name in &referenced_envs {
@@ -425,8 +430,9 @@ async fn resolve_manifest(
     if let Some(expected) = r.digest
         && resolved.digest != expected
     {
-        let url = resolved.observed_url.clone().unwrap_or_else(|| url.clone());
-        return Err(Error::Resolver(resolver::Error::MismatchedDigest(url)));
+        return Err(Error::Resolver(resolver::Error::MismatchedDigest(
+            url.clone(),
+        )));
     }
 
     Ok(resolved)
@@ -462,10 +468,7 @@ async fn resolve_manifest_inner(
         source: resolution.source,
         spans: resolution.spans,
     };
-    svc.store.put_source(url.clone(), source_record.clone());
-    if let Some(observed_url) = &observed_url {
-        svc.store.put_source(observed_url.clone(), source_record);
-    }
+    svc.store.put_source(url.clone(), source_record);
 
     Ok(ResolvedManifest {
         manifest: stored,

@@ -188,7 +188,7 @@ fn collect_manifest_diagnostics(
             .get(&component.digest)
             .expect("manifest was resolved during linking");
         let prov = provenance.for_component(component.id);
-        let url = prov.effective_url();
+        let url = &prov.resolved_url;
         let component_path = prov.authored_moniker.as_str();
 
         let Some((src, spans)) = store.diagnostic_source(url) else {
@@ -224,7 +224,7 @@ fn collect_tree_node_diagnostics(
         return;
     };
 
-    let url = node.observed_url.as_ref().unwrap_or(&node.resolved_url);
+    let url = &node.resolved_url;
     let Some((src, spans)) = store.diagnostic_source(url) else {
         return;
     };

@@ -27,9 +27,3 @@ pub struct ComponentProvenance {
     /// Optional diagnostic only: where bytes were observed to come from (e.g. final URL after redirects).
     pub observed_url: Option<Url>,
 }
-
-impl ComponentProvenance {
-    pub fn effective_url(&self) -> &Url {
-        self.observed_url.as_ref().unwrap_or(&self.resolved_url)
-    }
-}

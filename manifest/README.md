@@ -134,7 +134,7 @@ Forms:
 * URL string (sugar):
 
   * `"https://registry.example.org/pkg/v1"`
-  * `"./child.json5"` (relative to the manifest's own URL)
+  * `"./child.json5"` (relative to the manifest's own `file://` URL)
 * Canonical object form (optionally pinned):
 
   * `{ url: "https://...", digest: "sha256:<base64>" }`
@@ -142,6 +142,7 @@ Forms:
 Rules enforced by this crate:
 
 * `url` must be a string parseable as an absolute URL or a relative reference.
+  Relative references are only resolved against `file://` base URLs by the compiler.
 * `digest` (if present) must be:
 
   * algorithm `sha256`

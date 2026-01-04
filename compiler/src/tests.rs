@@ -450,6 +450,38 @@ async fn relative_manifest_refs_resolve_against_parent() {
 }
 
 #[tokio::test]
+async fn relative_manifest_refs_require_file_base() {
+    let source: Arc<str> = r#"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            child: "./child.json5"
+          }
+        }
+        "#
+    .into();
+    let backend = Arc::new(StaticBackend::new(Arc::clone(&source)));
+    let resolver = Resolver::new().with_remote(RemoteResolver::new(["test"], backend));
+    let compiler = Compiler::new(resolver, DigestStore::default());
+    let root_ref = ManifestRef::from_url("test://root".parse().unwrap());
+
+    let err = compiler
+        .compile(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
+            },
+        )
+        .await
+        .unwrap_err();
+
+    let crate::Error::Frontend(crate::frontend::Error::RelativeManifestRef { .. }) = err else {
+        panic!("expected relative manifest ref error");
+    };
+}
+
+#[tokio::test]
 async fn cycle_is_detected_across_url_aliases_with_same_digest() {
     let (url, server) = spawn_alias_cycle_manifest_server();
 
@@ -866,6 +898,38 @@ impl CountingBackend {
 
     fn call_count(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+}
+
+struct StaticBackend {
+    source: Arc<str>,
+}
+
+impl StaticBackend {
+    fn new(source: Arc<str>) -> Self {
+        Self { source }
+    }
+}
+
+impl Backend for StaticBackend {
+    fn resolve_url<'a>(
+        &'a self,
+        url: &'a Url,
+    ) -> Pin<Box<dyn Future<Output = Result<Resolution, amber_resolver::Error>> + Send + 'a>> {
+        let url = url.clone();
+        let source = Arc::clone(&self.source);
+
+        Box::pin(async move {
+            tokio::task::yield_now().await;
+            let spans = Arc::new(amber_manifest::ManifestSpans::parse(&source));
+            let manifest: Manifest = source.parse().unwrap();
+            Ok(Resolution {
+                url,
+                manifest,
+                source,
+                spans,
+            })
+        })
     }
 }
 

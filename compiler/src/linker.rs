@@ -70,7 +70,7 @@ fn source_for_component(
     store: &DigestStore,
     id: ComponentId,
 ) -> Option<(NamedSource<Arc<str>>, Arc<amber_manifest::ManifestSpans>)> {
-    let url = provenance.for_component(id).effective_url();
+    let url = &provenance.for_component(id).resolved_url;
     store.diagnostic_source(url)
 }
 
@@ -191,7 +191,7 @@ impl<'a> ConfigErrorSite<'a> {
         let parent = component.parent?;
         component.config.as_ref()?;
         let parent_prov = self.provenance.for_component(parent);
-        let stored = self.store.get_source(parent_prov.effective_url())?;
+        let stored = self.store.get_source(&parent_prov.resolved_url)?;
         let component_spans = stored
             .spans
             .components
@@ -202,7 +202,7 @@ impl<'a> ConfigErrorSite<'a> {
             config_span,
             instance_path,
         )?;
-        let name = crate::store::display_url(parent_prov.effective_url());
+        let name = crate::store::display_url(&parent_prov.resolved_url);
         Some(ConfigSite {
             src: NamedSource::new(name, Arc::clone(&stored.source)).with_language("json5"),
             span,
