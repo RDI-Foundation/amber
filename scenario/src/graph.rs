@@ -207,6 +207,7 @@ mod tests {
             root: ComponentId(0),
             components,
             bindings,
+            exports: Vec::new(),
         };
 
         let order = topo_order(&scenario).unwrap();
@@ -259,6 +260,7 @@ mod tests {
             root: ComponentId(0),
             components,
             bindings,
+            exports: Vec::new(),
         };
 
         let cycle = topo_order(&scenario).unwrap_err().cycle;

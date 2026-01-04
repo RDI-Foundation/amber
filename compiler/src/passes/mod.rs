@@ -20,11 +20,18 @@ fn prune_and_rebuild_scenario(
         root,
         mut components,
         bindings,
+        exports,
     } = scenario;
 
     debug_assert_eq!(removed.len(), components.len());
     debug_assert!(!removed[root.0], "root must not be removed");
     debug_assert!(components[root.0].is_some(), "root component should exist");
+    debug_assert!(
+        exports
+            .iter()
+            .all(|export| !removed[export.from.component.0]),
+        "scenario export target must not be removed"
+    );
 
     for (idx, component) in components.iter_mut().enumerate() {
         if removed[idx] {
@@ -71,8 +78,9 @@ fn prune_and_rebuild_scenario(
         root,
         components,
         bindings: new_bindings,
+        exports,
     };
-    scenario.normalize_child_order_by_moniker();
+    scenario.normalize_order();
     scenario
 }
 

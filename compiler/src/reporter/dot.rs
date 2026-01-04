@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Write as _};
+use std::fmt::Write as _;
 
 use amber_manifest::CapabilityKind;
 use amber_scenario::{ComponentId, Scenario};
@@ -35,36 +35,18 @@ fn render_dot_with_exports(output: &CompileOutput) -> String {
     let manifests = crate::manifest_table::build_manifest_table(&s.components, &output.store)
         .expect("manifest was resolved during linking");
 
-    let root = s.root;
-
-    let mut id_by_moniker: HashMap<&str, ComponentId> =
-        HashMap::with_capacity(output.provenance.components.len());
-    for (id, component) in s.components_iter() {
-        id_by_moniker.insert(component.moniker.as_str(), id);
-    }
-
-    let mut exports = Vec::with_capacity(output.provenance.root_exports.len());
-    for export in &output.provenance.root_exports {
-        if let Some(&from) = id_by_moniker.get(export.endpoint_component_moniker.as_str()) {
-            exports.push(ExportEdge {
-                endpoint_label: endpoint_label_for_provide(
-                    manifests[from.0].as_ref().expect("manifest should exist"),
-                    export.endpoint_provide.as_ref(),
-                    export.kind,
-                ),
-                from,
-                kind: export.kind,
-            });
-            continue;
-        }
-
+    let mut exports = Vec::with_capacity(s.exports.len());
+    for export in &s.exports {
+        let from = export.from.component;
+        let kind = export.capability.kind;
         exports.push(ExportEdge {
-            endpoint_label: format!(
-                "<missing export target: {} -> {}.{}>",
-                export.name, export.endpoint_component_moniker, export.endpoint_provide
+            endpoint_label: endpoint_label_for_provide(
+                manifests[from.0].as_ref().expect("manifest should exist"),
+                export.from.name.as_str(),
+                kind,
             ),
-            from: root,
-            kind: export.kind,
+            from,
+            kind,
         });
     }
 
@@ -253,9 +235,9 @@ fn write_escaped_label(out: &mut String, label: &str) {
 
 #[cfg(test)]
 mod tests {
-    use amber_manifest::{CapabilityKind, Manifest, ManifestDigest, ManifestRef};
+    use amber_manifest::{Manifest, ManifestDigest, ManifestRef};
     use amber_scenario::{
-        BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, SlotRef,
+        BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, ScenarioExport, SlotRef,
     };
     use url::Url;
 
@@ -326,6 +308,7 @@ mod tests {
             root: ComponentId(0),
             components,
             bindings,
+            exports: Vec::new(),
         };
 
         let dot = render_dot(&scenario);
@@ -360,6 +343,7 @@ mod tests {
             root: ComponentId(0),
             components,
             bindings: Vec::new(),
+            exports: Vec::new(),
         };
 
         let dot = render_dot(&scenario);
@@ -416,6 +400,13 @@ mod tests {
         .parse::<Manifest>()
         .unwrap();
 
+        let out_decl = b_manifest
+            .provides()
+            .get("out")
+            .expect("b provides out")
+            .decl
+            .clone();
+
         let store = crate::DigestStore::new();
         let root_digest = root_manifest.digest();
         let a_digest = a_manifest.digest();
@@ -456,6 +447,14 @@ mod tests {
                 },
                 weak: false,
             }],
+            exports: vec![ScenarioExport {
+                name: "public".to_string(),
+                capability: out_decl,
+                from: ProvideRef {
+                    component: ComponentId(2),
+                    name: "out".to_string(),
+                },
+            }],
         };
 
         let url = Url::parse("file:///scenario.json5").unwrap();
@@ -486,12 +485,6 @@ mod tests {
                         observed_url: None,
                     },
                 ],
-                root_exports: vec![crate::RootExportProvenance {
-                    name: std::sync::Arc::from("public"),
-                    endpoint_component_moniker: Moniker::from("/b".to_string()),
-                    endpoint_provide: std::sync::Arc::from("out"),
-                    kind: CapabilityKind::Http,
-                }],
             },
             diagnostics: Vec::new(),
         };
@@ -516,51 +509,48 @@ mod tests {
     }
 
     #[test]
-    fn dot_renders_missing_export_target_as_placeholder() {
+    fn dot_renders_root_exports_from_root_component() {
         let root_manifest = r#"
             {
               manifest_version: "0.1.0",
-              components: { a: "a.json5" },
-            }
-            "#
-        .parse::<Manifest>()
-        .unwrap();
-
-        let a_manifest = r#"
-            {
-              manifest_version: "0.1.0",
               program: {
-                image: "a",
+                image: "root",
                 network: { endpoints: [{ name: "out", port: 80 }] },
               },
               provides: { out: { kind: "http", endpoint: "out" } },
-              exports: { out: "out" },
+              exports: { public: "out" },
             }
             "#
         .parse::<Manifest>()
         .unwrap();
 
+        let out_decl = root_manifest
+            .provides()
+            .get("out")
+            .expect("root provides out")
+            .decl
+            .clone();
+
         let store = crate::DigestStore::new();
         let root_digest = root_manifest.digest();
-        let a_digest = a_manifest.digest();
         store.put(root_digest, std::sync::Arc::new(root_manifest));
-        store.put(a_digest, std::sync::Arc::new(a_manifest));
 
-        let mut components = vec![Some(component(0, "/")), Some(component(1, "/a"))];
-        components[1].as_mut().unwrap().parent = Some(ComponentId(0));
+        let mut components = vec![Some(component(0, "/"))];
         components[0].as_mut().unwrap().digest = root_digest;
-        components[1].as_mut().unwrap().digest = a_digest;
-
-        components[0]
-            .as_mut()
-            .unwrap()
-            .children
-            .push(ComponentId(1));
+        components[0].as_mut().unwrap().has_program = true;
 
         let scenario = Scenario {
             root: ComponentId(0),
             components,
             bindings: Vec::new(),
+            exports: vec![ScenarioExport {
+                name: "public".to_string(),
+                capability: out_decl,
+                from: ProvideRef {
+                    component: ComponentId(0),
+                    name: "out".to_string(),
+                },
+            }],
         };
 
         let url = Url::parse("file:///scenario.json5").unwrap();
@@ -568,34 +558,20 @@ mod tests {
             scenario,
             store,
             provenance: crate::Provenance {
-                components: vec![
-                    crate::ComponentProvenance {
-                        authored_moniker: Moniker::from("/".to_string()),
-                        declared_ref: ManifestRef::from_url(url.clone()),
-                        resolved_url: url.clone(),
-                        digest: root_digest,
-                        observed_url: None,
-                    },
-                    crate::ComponentProvenance {
-                        authored_moniker: Moniker::from("/a".to_string()),
-                        declared_ref: ManifestRef::from_url(url.clone()),
-                        resolved_url: url,
-                        digest: a_digest,
-                        observed_url: None,
-                    },
-                ],
-                root_exports: vec![crate::RootExportProvenance {
-                    name: std::sync::Arc::from("public"),
-                    endpoint_component_moniker: Moniker::from("/missing".to_string()),
-                    endpoint_provide: std::sync::Arc::from("out"),
-                    kind: CapabilityKind::Http,
+                components: vec![crate::ComponentProvenance {
+                    authored_moniker: Moniker::from("/".to_string()),
+                    declared_ref: ManifestRef::from_url(url.clone()),
+                    resolved_url: url,
+                    digest: root_digest,
+                    observed_url: None,
                 }],
             },
             diagnostics: Vec::new(),
         };
 
         let dot = render_dot_with_exports(&output);
-        assert!(dot.contains("<missing export target: public -> /missing.out>"));
+        assert!(dot.contains("c0 [label=\"program\"]"));
+        assert!(dot.contains("e0 [label=\"http:80/\", shape=box]"));
         assert!(dot.contains("c0 -> e0 [label=\"http\"]"));
     }
 }

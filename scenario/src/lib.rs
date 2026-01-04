@@ -1,6 +1,6 @@
 use std::{collections::HashSet, sync::Arc};
 
-use amber_manifest::ManifestDigest;
+use amber_manifest::{CapabilityDecl, ManifestDigest};
 use serde_json::Value;
 
 pub mod graph;
@@ -54,6 +54,7 @@ pub struct Scenario {
     pub root: ComponentId,
     pub components: Vec<Option<Component>>,
     pub bindings: Vec<BindingEdge>,
+    pub exports: Vec<ScenarioExport>,
 }
 
 impl Scenario {
@@ -83,6 +84,10 @@ impl Scenario {
             .filter_map(|(idx, component)| component.as_mut().map(|c| (ComponentId(idx), c)))
     }
 
+    pub fn normalize_export_order_by_name(&mut self) {
+        self.exports.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
     pub fn normalize_child_order_by_moniker(&mut self) {
         let monikers: Vec<Option<Moniker>> = self
             .components
@@ -101,6 +106,11 @@ impl Scenario {
                 left.cmp(right)
             });
         }
+    }
+
+    pub fn normalize_order(&mut self) {
+        self.normalize_child_order_by_moniker();
+        self.normalize_export_order_by_name();
     }
 
     /// Debug-only validation for post-link invariants.
@@ -144,6 +154,15 @@ impl Scenario {
             let _ = self.component(binding.from.component);
             let _ = self.component(binding.to.component);
         }
+
+        let mut export_names = HashSet::new();
+        for export in &self.exports {
+            debug_assert!(
+                export_names.insert(&export.name),
+                "duplicate scenario export name"
+            );
+            let _ = self.component(export.from.component);
+        }
     }
 }
 
@@ -184,4 +203,11 @@ pub struct BindingEdge {
     pub to: SlotRef,
     /// If true, this edge does not participate in dependency ordering or cycle detection.
     pub weak: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ScenarioExport {
+    pub name: String,
+    pub capability: CapabilityDecl,
+    pub from: ProvideRef,
 }

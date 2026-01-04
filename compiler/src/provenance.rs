@@ -1,6 +1,4 @@
-use std::sync::Arc;
-
-use amber_manifest::{CapabilityKind, ManifestDigest, ManifestRef};
+use amber_manifest::{ManifestDigest, ManifestRef};
 use amber_scenario::{ComponentId, Moniker};
 use url::Url;
 
@@ -8,7 +6,6 @@ use url::Url;
 #[derive(Clone, Debug, Default)]
 pub struct Provenance {
     pub components: Vec<ComponentProvenance>,
-    pub root_exports: Vec<RootExportProvenance>,
 }
 
 impl Provenance {
@@ -35,12 +32,4 @@ impl ComponentProvenance {
     pub fn effective_url(&self) -> &Url {
         self.observed_url.as_ref().unwrap_or(&self.resolved_url)
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct RootExportProvenance {
-    pub name: Arc<str>,
-    pub endpoint_component_moniker: Moniker,
-    pub endpoint_provide: Arc<str>,
-    pub kind: CapabilityKind,
 }

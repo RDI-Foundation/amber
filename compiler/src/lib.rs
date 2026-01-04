@@ -19,7 +19,7 @@ pub mod reporter;
 
 pub use environment::ResolverRegistry;
 pub use frontend::ResolveOptions;
-pub use provenance::{ComponentProvenance, Provenance, RootExportProvenance};
+pub use provenance::{ComponentProvenance, Provenance};
 pub use store::DigestStore;
 
 #[derive(Clone, Debug, Default)]

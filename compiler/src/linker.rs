@@ -11,7 +11,8 @@ use amber_manifest::{
     ExportTarget, Manifest, ManifestDigest,
 };
 use amber_scenario::{
-    BindingEdge, Component, ComponentId, ProvideRef, Scenario, SlotRef, graph::component_path_for,
+    BindingEdge, Component, ComponentId, ProvideRef, Scenario, ScenarioExport, SlotRef,
+    graph::component_path_for,
 };
 use jsonschema::Validator;
 use miette::{Diagnostic, NamedSource, SourceSpan};
@@ -19,7 +20,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use super::frontend::{ResolvedNode, ResolvedTree};
-use crate::{ComponentProvenance, DigestStore, Provenance, RootExportProvenance};
+use crate::{ComponentProvenance, DigestStore, Provenance};
 
 #[allow(unused_assignments)]
 #[derive(Debug, Error, Diagnostic)]
@@ -589,20 +590,20 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
     let root_manifest = manifests[root.0]
         .as_ref()
         .expect("root manifest should exist");
-    provenance.root_exports = root_manifest
+    let exports = root_manifest
         .exports()
         .keys()
         .map(|export_name| {
-            let resolved = resolve_export(&components, &manifests, &link_index, root, export_name)
+            let ResolvedExport {
+                component,
+                name,
+                decl,
+            } = resolve_export(&components, &manifests, &link_index, root, export_name)
                 .expect("export was validated during linking");
-            RootExportProvenance {
-                name: Arc::from(export_name.to_string()),
-                endpoint_component_moniker: provenance
-                    .for_component(resolved.component)
-                    .authored_moniker
-                    .clone(),
-                endpoint_provide: Arc::from(resolved.name),
-                kind: resolved.decl.kind,
+            ScenarioExport {
+                name: export_name.to_string(),
+                capability: decl,
+                from: ProvideRef { component, name },
             }
         })
         .collect();
@@ -611,8 +612,9 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         root,
         components,
         bindings,
+        exports,
     };
-    scenario.normalize_child_order_by_moniker();
+    scenario.normalize_order();
     scenario.assert_invariants();
 
     Ok((scenario, provenance))

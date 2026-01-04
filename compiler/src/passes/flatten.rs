@@ -110,15 +110,15 @@ fn nearest_kept_ancestor(
 mod tests {
     use std::sync::Arc;
 
-    use amber_manifest::{CapabilityKind, Manifest, ManifestRef};
+    use amber_manifest::{Manifest, ManifestRef};
     use amber_scenario::{
-        BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, SlotRef,
+        BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, ScenarioExport, SlotRef,
     };
     use url::Url;
 
     use super::FlattenPass;
     use crate::{
-        CompileOutput, ComponentProvenance, DigestStore, Provenance, RootExportProvenance,
+        CompileOutput, ComponentProvenance, DigestStore, Provenance,
         passes::ScenarioPass,
         reporter::{DotReporter, Reporter as _},
     };
@@ -171,6 +171,13 @@ mod tests {
         .parse()
         .unwrap();
 
+        let cap_decl = child_manifest
+            .provides()
+            .get("cap")
+            .expect("child provides cap")
+            .decl
+            .clone();
+
         let store = DigestStore::new();
         let root_digest = root_manifest.digest();
         let parent_digest = parent_manifest.digest();
@@ -216,8 +223,16 @@ mod tests {
                 },
                 weak: true,
             }],
+            exports: vec![ScenarioExport {
+                name: "cap".to_string(),
+                capability: cap_decl,
+                from: ProvideRef {
+                    component: ComponentId(2),
+                    name: "cap".to_string(),
+                },
+            }],
         };
-        scenario.normalize_child_order_by_moniker();
+        scenario.normalize_order();
 
         let url = Url::parse("file:///scenario.json5").unwrap();
         let provenance = Provenance {
@@ -244,12 +259,6 @@ mod tests {
                     observed_url: None,
                 },
             ],
-            root_exports: vec![RootExportProvenance {
-                name: Arc::from("cap"),
-                endpoint_component_moniker: Moniker::from(Arc::from("/parent/child")),
-                endpoint_provide: Arc::from("cap"),
-                kind: CapabilityKind::Http,
-            }],
         };
 
         let (scenario, provenance) = FlattenPass.run(scenario, provenance, &store).unwrap();
@@ -264,13 +273,10 @@ mod tests {
                 .as_str(),
             "/parent/child"
         );
-        assert_eq!(provenance.root_exports.len(), 1);
-        assert_eq!(
-            provenance.root_exports[0]
-                .endpoint_component_moniker
-                .as_str(),
-            "/parent/child"
-        );
+        assert_eq!(scenario.exports.len(), 1);
+        assert_eq!(scenario.exports[0].name, "cap");
+        assert_eq!(scenario.exports[0].from.component, ComponentId(2));
+        assert_eq!(scenario.exports[0].from.name, "cap");
 
         let root_children = &scenario.components[scenario.root.0]
             .as_ref()
@@ -389,8 +395,9 @@ mod tests {
             root: ComponentId(0),
             components,
             bindings: Vec::new(),
+            exports: Vec::new(),
         };
-        scenario.normalize_child_order_by_moniker();
+        scenario.normalize_order();
 
         let url = Url::parse("file:///scenario.json5").unwrap();
         let provenance = Provenance {
@@ -424,7 +431,6 @@ mod tests {
                     observed_url: None,
                 },
             ],
-            root_exports: Vec::new(),
         };
 
         let (scenario, provenance) = FlattenPass.run(scenario, provenance, &store).unwrap();

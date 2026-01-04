@@ -12,7 +12,7 @@ Compiles a root component manifest into a linked `Scenario` plus provenance and 
 - `Compiler`: entry point; `compile` returns a `Scenario`, `Provenance`, and `DigestStore`, while `check` reports diagnostics without producing a scenario.
 - `CompileOptions` / `ResolveOptions`: control resolution limits and optimization passes.
 - `DigestStore`: digest-keyed manifest store plus source/spans for diagnostics.
-- `Provenance`: mapping from authored component paths to resolved URLs and exports.
+- `Provenance`: resolution provenance per component instance: authored moniker, declared ref, resolved/observed URL, digest.
 - `ResolverRegistry`: host-provided resolvers referenced by manifest environments.
 
 ## Module map

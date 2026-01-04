@@ -1,10 +1,10 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     sync::Arc,
 };
 
 use amber_manifest::Manifest;
-use amber_scenario::{ComponentId, Moniker, Scenario};
+use amber_scenario::{ComponentId, Scenario};
 
 use super::{PassError, ScenarioPass};
 use crate::{DigestStore, Provenance};
@@ -62,24 +62,10 @@ impl ScenarioPass for DcePass {
 
         let mut work = VecDeque::new();
 
-        let mut id_by_moniker: HashMap<Moniker, ComponentId> =
-            HashMap::with_capacity(scenario.components.len());
-        for (id, component) in scenario.components_iter() {
-            id_by_moniker.insert(component.moniker.clone(), id);
-        }
-        for export in &provenance.root_exports {
-            let Some(&component_id) = id_by_moniker.get(&export.endpoint_component_moniker) else {
-                return Err(PassError::Failed {
-                    pass: self.name(),
-                    message: format!(
-                        "root export `{}` targets missing component `{}`",
-                        export.name, export.endpoint_component_moniker
-                    ),
-                });
-            };
+        for export in &scenario.exports {
             let key = CapKey {
-                component: component_id.0,
-                name: Arc::clone(&export.endpoint_provide),
+                component: export.from.component.0,
+                name: Arc::from(export.from.name.as_str()),
             };
             if live_provides.insert(key.clone()) {
                 work.push_back(WorkItem::Provide(key));
@@ -257,16 +243,14 @@ fn prune_scenario(
 mod tests {
     use std::sync::Arc;
 
-    use amber_manifest::{CapabilityKind, Manifest, ManifestRef};
+    use amber_manifest::{Manifest, ManifestRef};
     use amber_scenario::{
-        BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, SlotRef,
+        BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, ScenarioExport, SlotRef,
     };
     use url::Url;
 
     use super::DcePass;
-    use crate::{
-        ComponentProvenance, DigestStore, Provenance, RootExportProvenance, passes::ScenarioPass,
-    };
+    use crate::{ComponentProvenance, DigestStore, Provenance, passes::ScenarioPass};
 
     fn component(id: usize, moniker: &str) -> Component {
         Component {
@@ -313,6 +297,13 @@ mod tests {
         "#
         .parse()
         .unwrap();
+
+        let tool_proxy_decl = green
+            .provides()
+            .get("tool_proxy")
+            .expect("green provides tool_proxy")
+            .decl
+            .clone();
 
         let wrapper: Manifest = r##"
         {
@@ -437,8 +428,16 @@ mod tests {
             root: ComponentId(0),
             components,
             bindings,
+            exports: vec![ScenarioExport {
+                name: "tool_proxy".to_string(),
+                capability: tool_proxy_decl,
+                from: ProvideRef {
+                    component: ComponentId(2),
+                    name: "tool_proxy".to_string(),
+                },
+            }],
         };
-        scenario.normalize_child_order_by_moniker();
+        scenario.normalize_order();
 
         let url = Url::parse("file:///root.json5").unwrap();
         let provenance = Provenance {
@@ -472,12 +471,6 @@ mod tests {
                     observed_url: None,
                 },
             ],
-            root_exports: vec![RootExportProvenance {
-                name: Arc::from("tool_proxy"),
-                endpoint_component_moniker: Moniker::from(Arc::from("/green")),
-                endpoint_provide: Arc::from("tool_proxy"),
-                kind: CapabilityKind::Mcp,
-            }],
         };
 
         let (scenario, _prov) = DcePass.run(scenario, provenance, &store).unwrap();
@@ -547,6 +540,13 @@ mod tests {
         "##
         .parse()
         .unwrap();
+
+        let out_decl = consumer
+            .provides()
+            .get("out")
+            .expect("consumer provides out")
+            .decl
+            .clone();
 
         let input: Manifest = r##"
         {
@@ -639,8 +639,16 @@ mod tests {
             root: ComponentId(0),
             components,
             bindings,
+            exports: vec![ScenarioExport {
+                name: "out".to_string(),
+                capability: out_decl,
+                from: ProvideRef {
+                    component: ComponentId(1),
+                    name: "out".to_string(),
+                },
+            }],
         };
-        scenario.normalize_child_order_by_moniker();
+        scenario.normalize_order();
 
         let url = Url::parse("file:///root.json5").unwrap();
         let provenance = Provenance {
@@ -674,12 +682,6 @@ mod tests {
                     observed_url: None,
                 },
             ],
-            root_exports: vec![RootExportProvenance {
-                name: Arc::from("out"),
-                endpoint_component_moniker: Moniker::from(Arc::from("/consumer")),
-                endpoint_provide: Arc::from("out"),
-                kind: CapabilityKind::Mcp,
-            }],
         };
 
         let (scenario, _prov) = DcePass.run(scenario, provenance, &store).unwrap();
@@ -743,6 +745,13 @@ mod tests {
         .parse()
         .unwrap();
 
+        let out_decl = app
+            .provides()
+            .get("out")
+            .expect("app provides out")
+            .decl
+            .clone();
+
         let admin: Manifest = r##"
         {
           manifest_version: "0.1.0",
@@ -801,8 +810,16 @@ mod tests {
             root: ComponentId(0),
             components,
             bindings,
+            exports: vec![ScenarioExport {
+                name: "out".to_string(),
+                capability: out_decl,
+                from: ProvideRef {
+                    component: ComponentId(1),
+                    name: "out".to_string(),
+                },
+            }],
         };
-        scenario.normalize_child_order_by_moniker();
+        scenario.normalize_order();
 
         let url = Url::parse("file:///root.json5").unwrap();
         let provenance = Provenance {
@@ -829,12 +846,6 @@ mod tests {
                     observed_url: None,
                 },
             ],
-            root_exports: vec![RootExportProvenance {
-                name: Arc::from("out"),
-                endpoint_component_moniker: Moniker::from(Arc::from("/app")),
-                endpoint_provide: Arc::from("out"),
-                kind: CapabilityKind::Mcp,
-            }],
         };
 
         let (scenario, _prov) = DcePass.run(scenario, provenance, &store).unwrap();
