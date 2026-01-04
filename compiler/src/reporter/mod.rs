@@ -4,8 +4,10 @@ use thiserror::Error;
 use crate::CompileOutput;
 
 pub mod dot;
+pub mod scenario_ir;
 
 pub use dot::DotReporter;
+pub use scenario_ir::ScenarioIrReporter;
 
 #[derive(Debug, Error, Diagnostic)]
 #[non_exhaustive]

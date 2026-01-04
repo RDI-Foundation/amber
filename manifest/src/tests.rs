@@ -19,6 +19,29 @@ fn create_empty_manifest() {
 }
 
 #[test]
+fn component_config_null_normalizes_to_none() {
+    let manifest: Manifest = r#"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            child: { manifest: "file:///child.json5", config: null },
+          },
+        }
+        "#
+    .parse()
+    .unwrap();
+
+    let child = manifest
+        .components()
+        .get("child")
+        .expect("child component should exist");
+    let ComponentDecl::Object(obj) = child else {
+        panic!("expected child component to be an object decl");
+    };
+    assert!(obj.config.is_none());
+}
+
+#[test]
 fn interpolation_parsing_splits_parts() {
     let parsed: InterpolatedString = "a ${config.b} c".parse().unwrap();
     assert_eq!(

@@ -1,5 +1,7 @@
 use std::{fs, path::Path, process::Command};
 
+use serde_json::Value;
+
 #[test]
 fn compile_writes_primary_output_and_dot_artifact() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -43,10 +45,30 @@ fn compile_writes_primary_output_and_dot_artifact() {
     );
     let primary_contents =
         fs::read_to_string(&primary_output).expect("failed to read primary output file");
+    let primary_json: Value =
+        serde_json::from_str(&primary_contents).expect("primary output did not contain valid JSON");
+    assert_eq!(primary_json["schema"], "amber.scenario.ir");
+    assert_eq!(primary_json["version"], 1);
+    assert_eq!(primary_json["root"], 0);
+
+    let components = primary_json["components"]
+        .as_array()
+        .expect("components should be a JSON array");
     assert!(
-        primary_contents.contains("amber output placeholder"),
-        "unexpected primary output contents"
+        components.iter().any(|c| c["moniker"] == "/"),
+        "scenario IR missing root component"
     );
+    assert!(
+        components.iter().any(|c| c["moniker"] == "/parent/child"),
+        "scenario IR missing child component"
+    );
+
+    let exports = primary_json["exports"]
+        .as_array()
+        .expect("exports should be a JSON array");
+    assert_eq!(exports.len(), 1, "expected one scenario export");
+    assert_eq!(exports[0]["name"], "cap");
+    assert_eq!(exports[0]["capability"]["kind"], "http");
 
     let dot_output = outputs_dir.path().join("scenario.dot");
     assert!(

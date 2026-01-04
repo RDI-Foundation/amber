@@ -5,8 +5,8 @@ use std::{
 };
 
 use amber_compiler::{
-    CompileOptions, Compiler,
-    reporter::{DotReporter, Reporter as _},
+    CompileOptions, CompileOutput, Compiler,
+    reporter::{DotReporter, Reporter as _, ScenarioIrReporter},
 };
 use amber_manifest::ManifestRef;
 use amber_resolver::Resolver;
@@ -129,7 +129,7 @@ async fn compile(args: CompileArgs) -> Result<()> {
     }
 
     let outputs = resolve_output_paths(&args, &manifest)?;
-    write_primary_output(&outputs.primary, &manifest)?;
+    write_primary_output(&outputs.primary, &output)?;
 
     if let Some(dot_dest) = outputs.dot {
         let dot = DotReporter.emit(&output).into_diagnostic()?;
@@ -378,18 +378,9 @@ fn default_output_stem(manifest: &ManifestRef) -> String {
         .to_string()
 }
 
-fn write_primary_output(path: &Path, manifest: &ManifestRef) -> Result<()> {
-    let url = manifest
-        .url
-        .as_url()
-        .expect("CLI resolves manifest refs into absolute URLs");
-
-    let contents = format!(
-        "amber output placeholder\nmanifest: {url}\n\nNOTE: the primary output format is not \
-         implemented yet.\n"
-    );
-
-    write_artifact(path, contents.as_bytes())
+fn write_primary_output(path: &Path, output: &CompileOutput) -> Result<()> {
+    let ir = ScenarioIrReporter.emit(output).into_diagnostic()?;
+    write_artifact(path, ir.as_bytes())
         .wrap_err_with(|| format!("failed to write primary output `{}`", path.display()))
 }
 

@@ -256,7 +256,7 @@ components: {
 
 Notes:
 
-* `config` is accepted as any JSON value by this crate (commonly an object).
+* `config` accepts any non-null JSON value; `null` is treated as omitted.
 * This crate does not validate `config` against `config_schema` (link-time concern).
 
 ---

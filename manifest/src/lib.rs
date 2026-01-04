@@ -20,7 +20,9 @@ use miette::Diagnostic;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
-use serde_with::{DeserializeFromStr, MapPreventDuplicates, SerializeDisplay, serde_as};
+use serde_with::{
+    DefaultOnNull, DeserializeFromStr, MapPreventDuplicates, SerializeDisplay, serde_as,
+};
 use sha2::Digest as _;
 pub use spans::{
     BindingSpans, BindingTargetKey, CapabilityDeclSpans, ComponentDeclSpans, EnvironmentSpans,
@@ -926,12 +928,14 @@ impl ManifestRef {
     }
 }
 
+#[serde_as]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ComponentRef {
     pub manifest: ManifestRef,
     #[serde(default)]
+    #[serde_as(deserialize_as = "DefaultOnNull")]
     pub config: Option<Value>,
     /// Optional resolution environment name (defined in the *parent* manifest's `environments`).
     #[serde(default)]
