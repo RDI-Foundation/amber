@@ -7,7 +7,7 @@ use std::{
 use amber_compiler::{
     CompileOptions, CompileOutput, Compiler, ResolverRegistry,
     bundle::{BundleBuilder, BundleLoader},
-    reporter::{DotReporter, Reporter as _, ScenarioIrReporter},
+    reporter::{Reporter as _, dot::DotReporter, scenario_ir::ScenarioIrReporter},
 };
 use amber_manifest::ManifestRef;
 use amber_resolver::Resolver;
@@ -158,7 +158,9 @@ async fn compile(args: CompileArgs) -> Result<()> {
     write_primary_output(&outputs.primary, &output)?;
 
     if let Some(dot_dest) = outputs.dot {
-        let dot = DotReporter.emit(&output).into_diagnostic()?;
+        let dot = DotReporter
+            .emit(&output)
+            .map_err(|err| miette::miette!("{err}"))?;
         match dot_dest {
             DotOutput::Stdout => print!("{dot}"),
             DotOutput::File(path) => write_artifact(&path, dot.as_bytes())?,
@@ -525,7 +527,9 @@ fn default_output_stem(manifest: &ManifestRef) -> String {
 }
 
 fn write_primary_output(path: &Path, output: &CompileOutput) -> Result<()> {
-    let ir = ScenarioIrReporter.emit(output).into_diagnostic()?;
+    let ir = ScenarioIrReporter
+        .emit(output)
+        .map_err(|err| miette::miette!("{err}"))?;
     write_artifact(path, ir.as_bytes())
         .wrap_err_with(|| format!("failed to write primary output `{}`", path.display()))
 }

@@ -10,7 +10,7 @@ use super::FlattenPass;
 use crate::{
     CompileOutput, ComponentProvenance, DigestStore, Provenance,
     passes::ScenarioPass,
-    reporter::{DotReporter, Reporter as _},
+    reporter::{Reporter as _, dot::DotReporter},
 };
 
 fn component(id: usize, moniker: &str) -> Component {

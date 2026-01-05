@@ -1,21 +1,25 @@
-use miette::Diagnostic;
-use thiserror::Error;
-
 use crate::CompileOutput;
 
+pub mod docker_compose;
 pub mod dot;
 pub mod scenario_ir;
 
-pub use dot::DotReporter;
-pub use scenario_ir::ScenarioIrReporter;
+pub use docker_compose::DockerComposeReporter;
 
-#[derive(Debug, Error, Diagnostic)]
-#[non_exhaustive]
+#[derive(Debug)]
 pub enum ReporterError {
-    #[error("reporter error: {0}")]
-    #[diagnostic(code(reporter::error))]
     Other(String),
 }
+
+impl std::fmt::Display for ReporterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReporterError::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ReporterError {}
 
 pub trait Reporter {
     type Artifact;

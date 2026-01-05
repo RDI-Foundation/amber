@@ -28,7 +28,7 @@ use crate::{
         BUNDLE_INDEX_NAME, BUNDLE_SCHEMA, BUNDLE_VERSION, BundleBuilder, BundleIndex, BundleLoader,
         BundleRequest,
     },
-    reporter::{Reporter as _, ScenarioIrReporter},
+    reporter::{Reporter as _, scenario_ir::ScenarioIrReporter},
 };
 
 fn error_contains(err: &crate::Error, needle: &str) -> bool {
