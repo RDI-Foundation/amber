@@ -36,6 +36,7 @@ struct Cli {
 enum Command {
     Compile(CompileArgs),
     Check(CheckArgs),
+    Docs(DocsArgs),
 }
 
 #[derive(Args)]
@@ -84,6 +85,17 @@ struct CheckArgs {
     manifest: String,
 }
 
+#[derive(Args)]
+struct DocsArgs {
+    #[command(subcommand)]
+    command: DocsCommand,
+}
+
+#[derive(Subcommand)]
+enum DocsCommand {
+    Manifest,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     miette::set_panic_hook();
@@ -93,6 +105,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Compile(args) => compile(args).await,
         Command::Check(args) => check(args).await,
+        Command::Docs(args) => docs(args),
     }
 }
 
@@ -178,6 +191,19 @@ async fn check(args: CheckArgs) -> Result<()> {
         Err(miette::miette!("check failed"))
     } else {
         Ok(())
+    }
+}
+
+fn docs(args: DocsArgs) -> Result<()> {
+    match args.command {
+        DocsCommand::Manifest => {
+            const MANIFEST_DOCS: &str = include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../manifest/README.md"
+            ));
+            print!("{MANIFEST_DOCS}");
+            Ok(())
+        }
     }
 }
 
