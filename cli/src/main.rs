@@ -7,7 +7,10 @@ use std::{
 use amber_compiler::{
     CompileOptions, CompileOutput, Compiler, ResolverRegistry,
     bundle::{BundleBuilder, BundleLoader},
-    reporter::{Reporter as _, dot::DotReporter, scenario_ir::ScenarioIrReporter},
+    reporter::{
+        Reporter as _, docker_compose::DockerComposeReporter, dot::DotReporter,
+        scenario_ir::ScenarioIrReporter,
+    },
 };
 use amber_manifest::ManifestRef;
 use amber_resolver::Resolver;
@@ -64,6 +67,19 @@ struct CompileArgs {
         allow_hyphen_values = true
     )]
     dot: Option<Option<PathBuf>>,
+
+    /// Write Docker Compose output to this path, or `-` for stdout.
+    ///
+    /// If omitted, defaults to next to the primary output.
+    #[arg(
+        long = "docker-compose",
+        visible_alias = "compose",
+        value_name = "FILE",
+        num_args = 0..=1,
+        require_equals = true,
+        allow_hyphen_values = true
+    )]
+    docker_compose: Option<Option<PathBuf>>,
 
     /// Write a manifest bundle to this directory.
     #[arg(long = "bundle", value_name = "DIR")]
@@ -162,8 +178,18 @@ async fn compile(args: CompileArgs) -> Result<()> {
             .emit(&output)
             .map_err(|err| miette::miette!("{err}"))?;
         match dot_dest {
-            DotOutput::Stdout => print!("{dot}"),
-            DotOutput::File(path) => write_artifact(&path, dot.as_bytes())?,
+            ArtifactOutput::Stdout => print!("{dot}"),
+            ArtifactOutput::File(path) => write_artifact(&path, dot.as_bytes())?,
+        }
+    }
+
+    if let Some(compose_dest) = outputs.docker_compose {
+        let compose = DockerComposeReporter
+            .emit(&output)
+            .map_err(|err| miette::miette!("{err}"))?;
+        match compose_dest {
+            ArtifactOutput::Stdout => print!("{compose}"),
+            ArtifactOutput::File(path) => write_artifact(&path, compose.as_bytes())?,
         }
     }
 
@@ -427,14 +453,15 @@ fn local_input_path(input: &str) -> Result<Option<PathBuf>> {
     Ok(Some(abs))
 }
 
-enum DotOutput {
+enum ArtifactOutput {
     Stdout,
     File(PathBuf),
 }
 
 struct OutputPaths {
     primary: PathBuf,
-    dot: Option<DotOutput>,
+    dot: Option<ArtifactOutput>,
+    docker_compose: Option<ArtifactOutput>,
 }
 
 fn resolve_output_paths(args: &CompileArgs, manifest: &ManifestRef) -> Result<OutputPaths> {
@@ -446,14 +473,13 @@ fn resolve_output_paths(args: &CompileArgs, manifest: &ManifestRef) -> Result<Ou
         }
     };
 
-    let dot = match args.dot.as_ref() {
-        None => None,
-        Some(None) => Some(DotOutput::File(primary.with_extension("dot"))),
-        Some(Some(path)) if path.as_path() == Path::new("-") => Some(DotOutput::Stdout),
-        Some(Some(path)) => Some(DotOutput::File(path.clone())),
-    };
+    let dot = resolve_optional_output(&args.dot, primary.with_extension("dot"));
+    let docker_compose = resolve_optional_output(
+        &args.docker_compose,
+        primary.with_extension("docker-compose.yaml"),
+    );
 
-    if let Some(DotOutput::File(dot_path)) = dot.as_ref()
+    if let Some(ArtifactOutput::File(dot_path)) = dot.as_ref()
         && dot_path == &primary
     {
         return Err(miette::miette!(
@@ -462,7 +488,42 @@ fn resolve_output_paths(args: &CompileArgs, manifest: &ManifestRef) -> Result<Ou
         ));
     }
 
-    Ok(OutputPaths { primary, dot })
+    if let Some(ArtifactOutput::File(compose_path)) = docker_compose.as_ref()
+        && compose_path == &primary
+    {
+        return Err(miette::miette!(
+            "docker compose output path `{}` must not match the primary output path",
+            compose_path.display()
+        ));
+    }
+
+    if let (Some(ArtifactOutput::File(dot_path)), Some(ArtifactOutput::File(compose_path))) =
+        (dot.as_ref(), docker_compose.as_ref())
+        && dot_path == compose_path
+    {
+        return Err(miette::miette!(
+            "dot output path `{}` must not match docker compose output path",
+            dot_path.display()
+        ));
+    }
+
+    Ok(OutputPaths {
+        primary,
+        dot,
+        docker_compose,
+    })
+}
+
+fn resolve_optional_output(
+    request: &Option<Option<PathBuf>>,
+    default_path: PathBuf,
+) -> Option<ArtifactOutput> {
+    match request.as_ref() {
+        None => None,
+        Some(None) => Some(ArtifactOutput::File(default_path)),
+        Some(Some(path)) if path.as_path() == Path::new("-") => Some(ArtifactOutput::Stdout),
+        Some(Some(path)) => Some(ArtifactOutput::File(path.clone())),
+    }
 }
 
 fn resolve_bundle_root(args: &CompileArgs) -> Result<Option<PathBuf>> {

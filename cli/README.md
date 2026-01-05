@@ -5,7 +5,7 @@ Command-line front-end for the compiler. It resolves a root manifest, runs compi
 ## Responsibilities
 - Wire `amber-compiler` and `amber-resolver` for compile/check flows.
 - Render diagnostics via `miette`, including treating selected warnings as errors.
-- Write the primary compile output (scenario IR JSON) plus optional side artifacts (e.g. Graphviz DOT via `--dot`).
+- Write the primary compile output (scenario IR JSON) plus optional side artifacts (e.g. Graphviz DOT via `--dot`, Docker Compose via `--docker-compose`/`--compose`).
 - Detect bundle inputs and emit bundle directories via `--bundle`.
 - Surface the manifest README via `amber docs manifest`.
 

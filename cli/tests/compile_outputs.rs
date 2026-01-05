@@ -24,6 +24,7 @@ fn compile_writes_primary_output_and_dot_artifact() {
         .arg("--out-dir")
         .arg(outputs_dir.path())
         .arg("--dot")
+        .arg("--docker-compose")
         .arg(&manifest)
         .output()
         .unwrap_or_else(|err| panic!("failed to run amber compile: {err}"));
@@ -119,5 +120,22 @@ fn compile_writes_primary_output_and_dot_artifact() {
     assert!(
         dot_contents.contains("digraph scenario"),
         "dot output did not contain a scenario graph"
+    );
+
+    let compose_output = outputs_dir.path().join("scenario.docker-compose.yaml");
+    assert!(
+        compose_output.is_file(),
+        "expected docker compose output file at {}",
+        compose_output.display()
+    );
+    let compose_contents =
+        fs::read_to_string(&compose_output).expect("failed to read docker compose output file");
+    assert!(
+        compose_contents.contains("services:"),
+        "docker compose output missing services section"
+    );
+    assert!(
+        compose_contents.contains("context: ./docker/amber-sidecar"),
+        "docker compose output missing sidecar build context"
     );
 }
