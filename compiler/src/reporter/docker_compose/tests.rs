@@ -1,10 +1,11 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use amber_manifest::{ManifestDigest, SlotDecl};
+use amber_manifest::{ManifestDigest, ManifestRef, SlotDecl};
 use amber_scenario::{BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, SlotRef};
 use serde_json::json;
+use url::Url;
 
-use super::{SIDECAR_IMAGE, render_docker_compose};
+use super::{super::Reporter as _, DockerComposeReporter, SIDECAR_IMAGE};
 
 fn digest(byte: u8) -> ManifestDigest {
     ManifestDigest::new([byte; 32])
@@ -12,6 +13,35 @@ fn digest(byte: u8) -> ManifestDigest {
 
 fn moniker(path: &str) -> Moniker {
     Moniker::from(Arc::from(path))
+}
+
+fn compile_output(scenario: Scenario) -> crate::CompileOutput {
+    let url = Url::parse("file:///scenario.json5").expect("test URL should parse");
+    let provenance = crate::Provenance {
+        components: scenario
+            .components
+            .iter()
+            .map(|component| {
+                let component = component
+                    .as_ref()
+                    .expect("test scenario component should exist");
+                crate::ComponentProvenance {
+                    authored_moniker: component.moniker.clone(),
+                    declared_ref: ManifestRef::from_url(url.clone()),
+                    resolved_url: url.clone(),
+                    digest: component.digest,
+                    observed_url: None,
+                }
+            })
+            .collect(),
+    };
+
+    crate::CompileOutput {
+        scenario,
+        store: crate::DigestStore::new(),
+        provenance,
+        diagnostics: Vec::new(),
+    }
 }
 
 #[test]
@@ -94,7 +124,10 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         exports: vec![],
     };
 
-    let yaml = render_docker_compose(&scenario).expect("compose render ok");
+    let output = compile_output(scenario);
+    let yaml = DockerComposeReporter
+        .emit(&output)
+        .expect("compose render ok");
 
     // Service names should be injective and include sidecars.
     assert!(yaml.contains("c1-server-net:"), "{yaml}");
@@ -226,9 +259,11 @@ fn errors_on_shared_port_with_different_paths() {
         exports: vec![],
     };
 
-    let err = render_docker_compose(&scenario).unwrap_err();
+    let output = compile_output(scenario);
+    let err = DockerComposeReporter.emit(&output).unwrap_err();
     assert!(
-        err.contains("Cannot enforce separate capabilities"),
+        err.to_string()
+            .contains("docker-compose output cannot enforce separate capabilities"),
         "unexpected error: {err}"
     );
 }
@@ -366,7 +401,10 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         exports: vec![],
     };
 
-    let yaml = render_docker_compose(&scenario).expect("compose render ok");
+    let output = compile_output(scenario);
+    let yaml = DockerComposeReporter
+        .emit(&output)
+        .expect("compose render ok");
     fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
 
     let compose = |args: &[&str]| {

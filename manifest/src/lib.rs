@@ -25,8 +25,9 @@ use serde_with::{
 };
 use sha2::Digest as _;
 pub use spans::{
-    BindingSpans, BindingTargetKey, CapabilityDeclSpans, ComponentDeclSpans, EnvironmentSpans,
-    ExportSpans, ManifestSpans, ProgramSpans, ProvideDeclSpans, span_for_json_pointer,
+    BindingSpans, BindingTargetKey, CapabilityDeclSpans, ComponentDeclSpans, EndpointSpans,
+    EnvironmentSpans, ExportSpans, ManifestSpans, ProgramSpans, ProvideDeclSpans,
+    span_for_json_pointer,
 };
 use thiserror::Error;
 use url::{ParseError, Url};

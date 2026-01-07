@@ -8,3 +8,5 @@
 * Run `cargo fmt`, `cargo clippy`, and `cargo test` after any non-trivial change.
 * There may be other agents working on this repo concurrently
 * Always keep READMEs up-to-date with information that is helpful to expert developers who are not familiar with Amber. When making updates to the READMEs, don't just find and replace isolated snippets–ensure that each line, paragraph, section, etc. is useful in the context of the whole document.
+* Make error messages and spans as helpful to devs as possible. Rust error messaging is a great example of usability
+    - Create UI tests whenever adding a new error type or variant. From the perspective of a dev using the software, ensure that the error is helpful.

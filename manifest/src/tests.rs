@@ -1505,16 +1505,16 @@ fn manifest_spans_capture_program_endpoint_names() {
     let http_span = program
         .endpoints
         .iter()
-        .find(|(name, _)| name.as_ref() == "http")
-        .map(|(_, span)| *span)
+        .find(|endpoint| endpoint.name.as_ref() == "http")
+        .map(|endpoint| endpoint.name_span)
         .expect("http endpoint span");
     assert_eq!(span_text(source, http_span), "\"http\"");
 
     let admin_span = program
         .endpoints
         .iter()
-        .find(|(name, _)| name.as_ref() == "admin")
-        .map(|(_, span)| *span)
+        .find(|endpoint| endpoint.name.as_ref() == "admin")
+        .map(|endpoint| endpoint.name_span)
         .expect("admin endpoint span");
     assert_eq!(span_text(source, admin_span), "\"admin\"");
 }

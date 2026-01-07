@@ -174,9 +174,7 @@ async fn compile(args: CompileArgs) -> Result<()> {
     write_primary_output(&outputs.primary, &output)?;
 
     if let Some(dot_dest) = outputs.dot {
-        let dot = DotReporter
-            .emit(&output)
-            .map_err(|err| miette::miette!("{err}"))?;
+        let dot = DotReporter.emit(&output).map_err(miette::Report::new)?;
         match dot_dest {
             ArtifactOutput::Stdout => print!("{dot}"),
             ArtifactOutput::File(path) => write_artifact(&path, dot.as_bytes())?,
@@ -186,7 +184,7 @@ async fn compile(args: CompileArgs) -> Result<()> {
     if let Some(compose_dest) = outputs.docker_compose {
         let compose = DockerComposeReporter
             .emit(&output)
-            .map_err(|err| miette::miette!("{err}"))?;
+            .map_err(miette::Report::new)?;
         match compose_dest {
             ArtifactOutput::Stdout => print!("{compose}"),
             ArtifactOutput::File(path) => write_artifact(&path, compose.as_bytes())?,
@@ -590,7 +588,7 @@ fn default_output_stem(manifest: &ManifestRef) -> String {
 fn write_primary_output(path: &Path, output: &CompileOutput) -> Result<()> {
     let ir = ScenarioIrReporter
         .emit(output)
-        .map_err(|err| miette::miette!("{err}"))?;
+        .map_err(miette::Report::new)?;
     write_artifact(path, ir.as_bytes())
         .wrap_err_with(|| format!("failed to write primary output `{}`", path.display()))
 }

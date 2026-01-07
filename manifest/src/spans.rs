@@ -23,7 +23,16 @@ pub struct ManifestSpans {
 #[derive(Clone, Debug)]
 pub struct ProgramSpans {
     pub whole: SourceSpan,
-    pub endpoints: Vec<(Arc<str>, SourceSpan)>,
+    pub endpoints: Vec<EndpointSpans>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EndpointSpans {
+    pub name: Arc<str>,
+    pub whole: SourceSpan,
+    pub name_span: SourceSpan,
+    pub port_span: Option<SourceSpan>,
+    pub path_span: Option<SourceSpan>,
 }
 
 #[derive(Clone, Debug)]
@@ -473,10 +482,16 @@ fn extract_program_spans(program_value: &Value, program: SpanCursor<'_>) -> Prog
         let Some(endpoint_span) = endpoints_span.index_cursor(idx) else {
             continue;
         };
-        let Some(span) = endpoint_span.child_span("name") else {
+        let Some(name_span) = endpoint_span.child_span("name") else {
             continue;
         };
-        endpoints.push((name.into(), span));
+        endpoints.push(EndpointSpans {
+            name: name.into(),
+            whole: endpoint_span.span,
+            name_span,
+            port_span: endpoint_span.child_span("port"),
+            path_span: endpoint_span.child_span("path"),
+        });
     }
 
     ProgramSpans { whole, endpoints }

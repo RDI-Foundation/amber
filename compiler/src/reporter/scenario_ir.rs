@@ -18,7 +18,7 @@ impl Reporter for ScenarioIrReporter {
 pub fn render_scenario_ir(s: &Scenario) -> Result<String, ReporterError> {
     let ir = ScenarioIr::from(s);
     let mut out = serde_json::to_string_pretty(&ir)
-        .map_err(|e| ReporterError::Other(format!("failed to render scenario IR: {e}")))?;
+        .map_err(|e| ReporterError::new(format!("failed to render scenario IR: {e}")))?;
     out.push('\n');
     Ok(out)
 }

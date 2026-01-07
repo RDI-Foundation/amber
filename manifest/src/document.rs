@@ -336,7 +336,7 @@ fn labels_for_duplicate_endpoint_name(spans: &ManifestSpans, name: &str) -> Vec<
     let matches: Vec<_> = program
         .endpoints
         .iter()
-        .filter_map(|(n, s)| (n.as_ref() == name).then_some(*s))
+        .filter_map(|endpoint| (endpoint.name.as_ref() == name).then_some(endpoint.name_span))
         .collect();
 
     match matches.as_slice() {

@@ -5,6 +5,7 @@ use std::{
 };
 
 use amber_scenario::{ComponentId, Scenario};
+use miette::LabeledSpan;
 use serde_json::Value;
 
 use super::{Reporter, ReporterError};
@@ -26,7 +27,7 @@ impl Reporter for DockerComposeReporter {
     type Artifact = String;
 
     fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError> {
-        render_docker_compose(&output.scenario).map_err(ReporterError::Other)
+        render_docker_compose(output)
     }
 }
 
@@ -38,6 +39,7 @@ struct ServiceNames {
 
 #[derive(Clone, Debug)]
 struct Endpoint {
+    name: String,
     port: u16,
     path: String,
 }
@@ -64,7 +66,140 @@ struct ExportMapping {
     target_port: u16,
 }
 
-fn render_docker_compose(s: &Scenario) -> Result<String, String> {
+#[derive(Debug)]
+struct PortPathConflict {
+    component: ComponentId,
+    port: u16,
+    first_provide: String,
+    first_endpoint: String,
+    first_path: String,
+    provide: String,
+    endpoint: String,
+    path: String,
+}
+
+#[derive(Debug)]
+enum DockerComposeError {
+    Other(String),
+    PortPathConflict(Box<PortPathConflict>),
+}
+
+impl From<String> for DockerComposeError {
+    fn from(value: String) -> Self {
+        Self::Other(value)
+    }
+}
+
+impl DockerComposeError {
+    fn into_reporter_error(self, output: &CompileOutput) -> ReporterError {
+        match self {
+            DockerComposeError::Other(message) => ReporterError::new(message),
+            DockerComposeError::PortPathConflict(conflict) => {
+                let PortPathConflict {
+                    component,
+                    port,
+                    first_provide,
+                    first_endpoint,
+                    first_path,
+                    provide,
+                    endpoint,
+                    path,
+                } = *conflict;
+                let component_moniker = output.scenario.component(component).moniker.as_str();
+                let message = format!(
+                    "docker-compose output cannot enforce separate capabilities for provides \
+                     `{first_provide}` and `{provide}` in component `{component_moniker}`: both \
+                     route to port {port} but have different HTTP paths ({first_path} vs {path})"
+                );
+                let help = "Split the endpoints onto different ports, or route both paths through \
+                            an L7 proxy and expose a single provide per port.";
+
+                let prov = output.provenance.for_component(component);
+                let Some((src, spans)) = output.store.diagnostic_source(&prov.resolved_url) else {
+                    return ReporterError::new(message).with_help(help);
+                };
+
+                let mut labels = Vec::new();
+                let mut has_primary = false;
+
+                let provide_span = |name: &str| {
+                    spans
+                        .provides
+                        .get(name)
+                        .map(|s| s.capability.name)
+                        .or_else(|| spans.provides.get(name).map(|s| s.capability.whole))
+                };
+
+                let endpoint_span = |name: &str| {
+                    spans
+                        .program
+                        .as_ref()?
+                        .endpoints
+                        .iter()
+                        .find(|endpoint| endpoint.name.as_ref() == name)
+                };
+
+                if let Some(endpoint) = endpoint_span(&first_endpoint) {
+                    let span = endpoint
+                        .path_span
+                        .or(endpoint.port_span)
+                        .unwrap_or(endpoint.whole);
+
+                    labels.push(LabeledSpan::new_primary_with_span(
+                        Some(format!("path used by provide `{first_provide}`")),
+                        span,
+                    ));
+                    has_primary = true;
+                }
+                if let Some(endpoint) = endpoint_span(&endpoint) {
+                    let span = endpoint
+                        .path_span
+                        .or(endpoint.port_span)
+                        .unwrap_or(endpoint.whole);
+
+                    let label = Some(format!("path used by provide `{provide}`"));
+                    if has_primary {
+                        labels.push(LabeledSpan::new_with_span(label, span));
+                    } else {
+                        labels.push(LabeledSpan::new_primary_with_span(label, span));
+                        has_primary = true;
+                    }
+                }
+
+                if !has_primary {
+                    if let Some(span) = provide_span(&first_provide) {
+                        labels.push(LabeledSpan::new_primary_with_span(
+                            Some(format!("provide `{first_provide}`")),
+                            span,
+                        ));
+                        has_primary = true;
+                    }
+                    if let Some(span) = provide_span(&provide) {
+                        let label = Some(format!("provide `{provide}`"));
+                        if has_primary {
+                            labels.push(LabeledSpan::new_with_span(label, span));
+                        } else {
+                            labels.push(LabeledSpan::new_primary_with_span(label, span));
+                        }
+                    }
+                }
+
+                ReporterError::new(message)
+                    .with_help(help)
+                    .with_source_code(src)
+                    .with_labels(labels)
+            }
+        }
+    }
+}
+
+type DcResult<T> = Result<T, DockerComposeError>;
+
+fn render_docker_compose(output: &CompileOutput) -> Result<String, ReporterError> {
+    render_docker_compose_inner(&output.scenario).map_err(|err| err.into_reporter_error(output))
+}
+
+fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
     // Backend prerequisite: strong dependency graph must be acyclic.
     // (Ignoring weak edges is the semantics you described.)
     if let Err(cycle) = amber_scenario::graph::topo_order(s) {
@@ -77,7 +212,8 @@ fn render_docker_compose(s: &Scenario) -> Result<String, String> {
         return Err(format!(
             "docker-compose reporter requires an acyclic dependency graph (ignoring weak \
              bindings). Found a cycle: {cycle_str}"
-        ));
+        )
+        .into());
     }
 
     // Collect program components (these become runnable services).
@@ -110,14 +246,16 @@ fn render_docker_compose(s: &Scenario) -> Result<String, String> {
                 "binding source {}.{} is not runnable (component has no program)",
                 component_label(s, b.from.component),
                 b.from.name
-            ));
+            )
+            .into());
         }
         if s.component(b.to.component).program.is_none() {
             return Err(format!(
                 "binding target {}.{} is not runnable (component has no program)",
                 component_label(s, b.to.component),
                 b.to.name
-            ));
+            )
+            .into());
         }
     }
     for ex in &s.exports {
@@ -128,7 +266,8 @@ fn render_docker_compose(s: &Scenario) -> Result<String, String> {
                 ex.name,
                 component_label(s, ex.from.component),
                 ex.from.name
-            ));
+            )
+            .into());
         }
     }
 
@@ -161,8 +300,9 @@ fn render_docker_compose(s: &Scenario) -> Result<String, String> {
     // Inbound allowlist: (provider_component, port) -> set of consumer sidecar IPs
     let mut inbound_allow: HashMap<(ComponentId, u16), BTreeSet<Ipv4Addr>> = HashMap::new();
 
-    // Track (component,port) -> (first_provide_name, first_path) to detect path conflicts on shared ports.
-    let mut port_path_owner: HashMap<(ComponentId, u16), (String, String)> = HashMap::new();
+    // Track (component,port) -> (first_provide_name, first_endpoint_name, first_path) to detect
+    // path conflicts on shared ports.
+    let mut port_path_owner: HashMap<(ComponentId, u16), (String, String, String)> = HashMap::new();
 
     for b in &s.bindings {
         let provider = b.from.component;
@@ -176,6 +316,7 @@ fn render_docker_compose(s: &Scenario) -> Result<String, String> {
             provider,
             endpoint.port,
             &b.from.name,
+            &endpoint.name,
             &endpoint.path,
         )?;
 
@@ -252,7 +393,8 @@ fn render_docker_compose(s: &Scenario) -> Result<String, String> {
                     "slot {}.{} has no resolved binding (linker should have rejected this)",
                     component_label(s, *id),
                     slot_name
-                ));
+                )
+                .into());
             }
         }
     }
@@ -272,6 +414,7 @@ fn render_docker_compose(s: &Scenario) -> Result<String, String> {
                 provider,
                 endpoint.port,
                 &ex.from.name,
+                &endpoint.name,
                 &endpoint.path,
             )?;
 
@@ -389,7 +532,8 @@ fn render_docker_compose(s: &Scenario) -> Result<String, String> {
                     return Err(format!(
                         "internal error: missing service name for dependency {}",
                         component_label(s, *dep)
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -558,6 +702,7 @@ fn resolve_provide_endpoint(
         })?;
 
     Ok(Endpoint {
+        name: endpoint.name.clone(),
         port: endpoint.port,
         path: endpoint.path.clone(),
     })
@@ -576,25 +721,36 @@ fn normalize_path(p: &str) -> String {
 }
 
 fn enforce_single_path_per_port(
-    owner: &mut HashMap<(ComponentId, u16), (String, String)>,
+    owner: &mut HashMap<(ComponentId, u16), (String, String, String)>,
     component: ComponentId,
     port: u16,
     provide_name: &str,
+    endpoint_name: &str,
     path: &str,
-) -> Result<(), String> {
+) -> Result<(), DockerComposeError> {
     let path = normalize_path(path);
 
     match owner.get(&(component, port)) {
         None => {
-            owner.insert((component, port), (provide_name.to_string(), path));
+            owner.insert(
+                (component, port),
+                (provide_name.to_string(), endpoint_name.to_string(), path),
+            );
             Ok(())
         }
-        Some((first_provide, first_path)) if *first_path == path => Ok(()),
-        Some((first_provide, first_path)) => Err(format!(
-            "Cannot enforce separate capabilities for provides {first_provide} and \
-             {provide_name}: they share port {port} but have different paths ({first_path} vs \
-             {path}). Split ports or use an L7 backend."
-        )),
+        Some((_first_provide, _first_endpoint, first_path)) if *first_path == path => Ok(()),
+        Some((first_provide, first_endpoint, first_path)) => Err(
+            DockerComposeError::PortPathConflict(Box::new(PortPathConflict {
+                component,
+                port,
+                first_provide: first_provide.clone(),
+                first_endpoint: first_endpoint.clone(),
+                first_path: first_path.clone(),
+                provide: provide_name.to_string(),
+                endpoint: endpoint_name.to_string(),
+                path,
+            })),
+        ),
     }
 }
 
