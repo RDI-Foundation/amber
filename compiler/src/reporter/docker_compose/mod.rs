@@ -6,6 +6,7 @@ use std::{
 
 use amber_scenario::{ComponentId, Scenario};
 use miette::LabeledSpan;
+use serde::Serialize;
 use serde_json::Value;
 
 use super::{Reporter, ReporterError};
@@ -19,6 +20,7 @@ const SIDECAR_IMAGE: &str = "ghcr.io/rdi-foundation/amber-sidecar:main";
 
 const LOCAL_PROXY_PORT_BASE: u16 = 20000;
 const EXPORT_PORT_BASE: u16 = 18000;
+const EXPORT_HOST: &str = "127.0.0.1";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DockerComposeReporter;
@@ -59,11 +61,15 @@ struct SlotValue {
     path: String,
 }
 
-#[derive(Clone, Debug)]
-struct ExportMapping {
-    export_name: String,
+#[derive(Clone, Debug, Serialize)]
+struct ExportMetadata {
+    published_host: String,
     published_port: u16,
     target_port: u16,
+    component: String,
+    provide: String,
+    endpoint: String,
+    path: String,
 }
 
 #[derive(Debug)]
@@ -402,7 +408,9 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
     // Scenario exports => publish to host loopback with stable host ports.
     // Also, allow inbound on that target port from host loopback / docker gateway.
     let mut exported_ports: HashMap<ComponentId, BTreeSet<u16>> = HashMap::new();
-    let mut exports_by_provider: HashMap<ComponentId, Vec<ExportMapping>> = HashMap::new();
+    let mut exports_by_provider: HashMap<ComponentId, BTreeMap<String, ExportMetadata>> =
+        HashMap::new();
+    let mut exports_by_name: BTreeMap<String, ExportMetadata> = BTreeMap::new();
     {
         let mut next_host_port = EXPORT_PORT_BASE;
         for ex in &s.exports {
@@ -428,19 +436,21 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
                 .or_default()
                 .insert(endpoint.port);
 
+            let metadata = ExportMetadata {
+                published_host: EXPORT_HOST.to_string(),
+                published_port: published,
+                target_port: endpoint.port,
+                component: component_label(s, provider),
+                provide: ex.from.name.clone(),
+                endpoint: endpoint.name.clone(),
+                path: normalize_path(&endpoint.path),
+            };
+
             exports_by_provider
                 .entry(provider)
                 .or_default()
-                .push(ExportMapping {
-                    export_name: ex.name.clone(),
-                    published_port: published,
-                    target_port: endpoint.port,
-                });
-        }
-
-        // stable ordering
-        for v in exports_by_provider.values_mut() {
-            v.sort_by(|a, b| a.export_name.cmp(&b.export_name));
+                .insert(ex.name.clone(), metadata.clone());
+            exports_by_name.insert(ex.name.clone(), metadata);
         }
     }
 
@@ -477,11 +487,27 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
         // Host port publishes for scenario exports (loopback-only for MVP)
         if let Some(mappings) = exports_by_provider.get(id) {
             push_line(&mut out, 4, "ports:");
-            for m in mappings {
+            for m in mappings.values() {
                 // Published on host loopback only.
-                let spec = format!("127.0.0.1:{}:{}", m.published_port, m.target_port);
+                let spec = format!(
+                    "{}:{}:{}",
+                    m.published_host, m.published_port, m.target_port
+                );
                 push_line(&mut out, 6, &format!("- {}", yaml_str(&spec)));
             }
+
+            let labels_json = serde_json::to_string(mappings).map_err(|err| {
+                format!(
+                    "failed to serialize export labels for {}: {err}",
+                    c.moniker.as_str()
+                )
+            })?;
+            push_line(&mut out, 4, "labels:");
+            push_line(
+                &mut out,
+                6,
+                &format!("amber.exports: {}", yaml_str(&labels_json)),
+            );
         }
 
         // Sidecar command script
@@ -598,6 +624,41 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
     push_line(&mut out, 4, "ipam:");
     push_line(&mut out, 6, "config:");
     push_line(&mut out, 8, &format!("- subnet: {MESH_SUBNET}"));
+
+    if !exports_by_name.is_empty() {
+        writeln!(&mut out, "x-amber:").unwrap();
+        push_line(&mut out, 2, "exports:");
+        for (export_name, meta) in &exports_by_name {
+            push_line(&mut out, 4, &format!("{}:", yaml_str(export_name)));
+            push_line(
+                &mut out,
+                6,
+                &format!("published_host: {}", yaml_str(&meta.published_host)),
+            );
+            push_line(
+                &mut out,
+                6,
+                &format!("published_port: {}", meta.published_port),
+            );
+            push_line(&mut out, 6, &format!("target_port: {}", meta.target_port));
+            push_line(
+                &mut out,
+                6,
+                &format!("component: {}", yaml_str(&meta.component)),
+            );
+            push_line(
+                &mut out,
+                6,
+                &format!("provide: {}", yaml_str(&meta.provide)),
+            );
+            push_line(
+                &mut out,
+                6,
+                &format!("endpoint: {}", yaml_str(&meta.endpoint)),
+            );
+            push_line(&mut out, 6, &format!("path: {}", yaml_str(&meta.path)));
+        }
+    }
 
     Ok(out)
 }
@@ -949,7 +1010,7 @@ fn build_sidecar_script(
         for port in ports {
             writeln!(
                 &mut script,
-                "iptables -w -A INPUT -p tcp -s 127.0.0.1 --dport {port} -j ACCEPT"
+                "iptables -w -A INPUT -p tcp -s {EXPORT_HOST} --dport {port} -j ACCEPT"
             )
             .unwrap();
             writeln!(

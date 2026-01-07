@@ -1,7 +1,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use amber_manifest::{ManifestDigest, ManifestRef, SlotDecl};
-use amber_scenario::{BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, SlotRef};
+use amber_manifest::{ManifestDigest, ManifestRef, ProvideDecl, SlotDecl};
+use amber_scenario::{
+    BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, ScenarioExport, SlotRef,
+};
 use serde_json::json;
 use url::Url;
 
@@ -68,7 +70,7 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
     .unwrap();
 
     let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
-    let provide_http =
+    let provide_http: ProvideDecl =
         serde_json::from_value(json!({ "kind": "http", "endpoint": "api" })).unwrap();
 
     let root = Component {
@@ -159,6 +161,82 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
 
     // Slot URL should be rendered with local proxy port base (20000) + path.
     assert!(yaml.contains(r#"URL: "http://127.0.0.1:20000/""#), "{yaml}");
+}
+
+#[test]
+fn compose_emits_export_metadata_and_labels() {
+    let server_program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "args": [],
+        "env": {},
+        "network": {
+            "endpoints": [
+                { "name": "api", "port": 8080, "protocol": "http", "path": "/" }
+            ]
+        }
+    }))
+    .unwrap();
+
+    let provide_http: ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "api" })).unwrap();
+    let provide_decl = provide_http.decl.clone();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        children: vec![ComponentId(1)],
+    };
+
+    let server = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/server"),
+        digest: digest(1),
+        config: None,
+        program: Some(server_program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(server)],
+        bindings: vec![],
+        exports: vec![ScenarioExport {
+            name: "public".to_string(),
+            capability: provide_decl,
+            from: ProvideRef {
+                component: ComponentId(1),
+                name: "api".to_string(),
+            },
+        }],
+    };
+
+    let output = compile_output(scenario);
+    let yaml = DockerComposeReporter
+        .emit(&output)
+        .expect("compose render ok");
+
+    assert!(yaml.contains("x-amber:"), "{yaml}");
+    assert!(yaml.contains(r#"exports:"#), "{yaml}");
+    assert!(yaml.contains(r#""public":"#), "{yaml}");
+    assert!(yaml.contains(r#"published_host: "127.0.0.1""#), "{yaml}");
+    assert!(yaml.contains("published_port: 18000"), "{yaml}");
+    assert!(yaml.contains("target_port: 8080"), "{yaml}");
+    assert!(yaml.contains(r#"component: "/server""#), "{yaml}");
+    assert!(yaml.contains(r#"provide: "api""#), "{yaml}");
+    assert!(yaml.contains(r#"endpoint: "api""#), "{yaml}");
+    assert!(yaml.contains(r#"path: "/""#), "{yaml}");
+    assert!(yaml.contains("127.0.0.1:18000:8080"), "{yaml}");
+    assert!(yaml.contains(r#"amber.exports: "{\"public\""#), "{yaml}");
+    assert!(yaml.contains(r#"\"published_port\":18000"#), "{yaml}");
 }
 
 #[test]

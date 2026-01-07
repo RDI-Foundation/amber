@@ -195,12 +195,13 @@ docker compose -f target/amber-out/scenario.docker-compose.yaml up
 Finding the host ports for Scenario exports:
 
 * Exports are published on **host loopback** (`127.0.0.1`) starting at port **18000**.
-* The exact `host_port -> container_port` mapping is in the YAML under each `*-net` sidecar service’s `ports:` section.
+* The compose file includes `x-amber.exports`, a mapping of `export_name -> published_host/published_port/target_port` plus component/provide/endpoint/path.
+* Each `*-net` sidecar service also carries an `amber.exports` label with the same JSON mapping for runtime discovery.
 
-A quick way to locate them:
+You can still locate the raw publishes under each `*-net` sidecar service’s `ports:` section:
 
 ```bash
-grep -n "127.0.0.1:18" -n target/amber-out/scenario.docker-compose.yaml
+rg -n "127.0.0.1:18" target/amber-out/scenario.docker-compose.yaml
 ```
 
 ---
