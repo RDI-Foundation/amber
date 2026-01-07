@@ -42,4 +42,23 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=refs/heads/${{ github.ref_name }}
           cache-to: type=gha,mode=max,scope=refs/heads/${{ github.ref_name }}
-
+      - name: Configure sidecar tags
+        id: sidecar_meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository_owner }}/amber-sidecar
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
+      - name: Build and push sidecar
+        uses: docker/build-push-action@v5
+        with:
+          context: docker/amber-sidecar
+          file: docker/amber-sidecar/Dockerfile
+          push: true
+          tags: ${{ steps.sidecar_meta.outputs.tags }}
+          labels: ${{ steps.sidecar_meta.outputs.labels }}
+          cache-from: type=gha,scope=refs/heads/${{ github.ref_name }}-sidecar
+          cache-to: type=gha,mode=max,scope=refs/heads/${{ github.ref_name }}-sidecar

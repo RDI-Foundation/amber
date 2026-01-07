@@ -4,7 +4,7 @@ use amber_manifest::{ManifestDigest, SlotDecl};
 use amber_scenario::{BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, SlotRef};
 use serde_json::json;
 
-use super::render_docker_compose;
+use super::{SIDECAR_IMAGE, render_docker_compose};
 
 fn digest(byte: u8) -> ManifestDigest {
     ManifestDigest::new([byte; 32])
@@ -105,6 +105,12 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
     // Program uses sidecar netns.
     assert!(
         yaml.contains(r#"network_mode: "service:c2-client-net""#),
+        "{yaml}"
+    );
+
+    // Sidecar image should be pulled from GHCR.
+    assert!(
+        yaml.contains(&format!(r#"image: "{SIDECAR_IMAGE}""#)),
         "{yaml}"
     );
 
@@ -269,20 +275,10 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
     // - allowed client has a binding and uses ${slots.api.url}
     // - denied client has no binding and tries to call server directly by sidecar IP:8080 (should fail)
     //
-    // NOTE: This test writes a temp compose project including a sidecar Dockerfile.
+    // NOTE: This test pulls the published sidecar image from GHCR.
     let dir = tempdir().unwrap();
     let project = dir.path();
     let _compose_guard = ComposeGuard::new(project);
-
-    // Sidecar build context expected by reporter.
-    fs::create_dir_all(project.join("docker/amber-sidecar")).unwrap();
-    fs::write(
-        project.join("docker/amber-sidecar/Dockerfile"),
-        r#"FROM alpine:3.20
-RUN apk add --no-cache iptables ip6tables socat
-"#,
-    )
-    .unwrap();
 
     // Scenario definition
     let server_program = serde_json::from_value(json!({
@@ -380,7 +376,7 @@ RUN apk add --no-cache iptables ip6tables socat
     };
 
     // Up
-    let status = compose(&["up", "-d", "--build"]).status().unwrap();
+    let status = compose(&["up", "-d"]).status().unwrap();
     assert!(status.success(), "docker compose up failed");
 
     // Allowed should succeed via local slot URL.

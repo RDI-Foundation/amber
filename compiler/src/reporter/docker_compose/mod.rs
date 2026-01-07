@@ -14,7 +14,7 @@ const MESH_NETWORK_NAME: &str = "amber_mesh";
 const MESH_SUBNET: &str = "10.88.0.0/16";
 const MESH_GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 1);
 
-const SIDECAR_BUILD_CONTEXT: &str = "./docker/amber-sidecar";
+const SIDECAR_IMAGE: &str = "ghcr.io/rdi-foundation/amber-sidecar:main";
 
 const LOCAL_PROXY_PORT_BASE: u16 = 20000;
 const EXPORT_PORT_BASE: u16 = 18000;
@@ -317,8 +317,7 @@ fn render_docker_compose(s: &Scenario) -> Result<String, String> {
         // ---- sidecar ----
         push_line(&mut out, 2, &format!("{}:", svc.sidecar));
 
-        push_line(&mut out, 4, "build:");
-        push_line(&mut out, 6, &format!("context: {}", SIDECAR_BUILD_CONTEXT));
+        push_line(&mut out, 4, &format!("image: {}", yaml_str(SIDECAR_IMAGE)));
 
         push_line(&mut out, 4, "cap_add:");
         push_line(&mut out, 6, "- NET_ADMIN");

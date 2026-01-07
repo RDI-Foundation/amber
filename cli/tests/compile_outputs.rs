@@ -135,7 +135,7 @@ fn compile_writes_primary_output_and_dot_artifact() {
         "docker compose output missing services section"
     );
     assert!(
-        compose_contents.contains("context: ./docker/amber-sidecar"),
-        "docker compose output missing sidecar build context"
+        compose_contents.contains(r#"image: "ghcr.io/rdi-foundation/amber-sidecar:main""#),
+        "docker compose output missing sidecar image"
     );
 }

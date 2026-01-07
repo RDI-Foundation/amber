@@ -94,6 +94,8 @@ The Docker Compose reporter emits **two services per runnable component**:
 * a **sidecar** (sets firewall rules + runs local TCP proxies)
 * the **program container** (your actual image), sharing the sidecar network namespace
 
+Sidecars run the published image `ghcr.io/rdi-foundation/amber-sidecar:main`.
+
 ```mermaid
 flowchart LR
   Host["Host / developer<br/>(127.0.0.1)"] -->|"Scenario exports<br/>published on loopback<br/>(ports 18000+)"| SidecarP
@@ -187,7 +189,7 @@ dot -Tsvg target/amber-out/scenario.dot -o target/amber-out/scenario.svg
 ### Run the compiled system with Docker Compose
 
 ```bash
-docker compose -f target/amber-out/scenario.docker-compose.yaml up --build
+docker compose -f target/amber-out/scenario.docker-compose.yaml up
 ```
 
 Finding the host ports for Scenario exports:
@@ -291,7 +293,7 @@ This is a Rust workspace:
   Scenario graph types + graph utilities + Scenario IR conversions
 
 * `docker/amber-sidecar/`
-  Dockerfile for the sidecar used by the Docker Compose reporter
+  Dockerfile for the published sidecar image used by the Docker Compose reporter
 
 * `examples/`
 
