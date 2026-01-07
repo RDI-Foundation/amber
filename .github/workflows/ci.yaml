@@ -37,6 +37,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: mozilla-actions/sccache-action@v0.0.9
       - run: cargo test --workspace --all-features
+      - run: cargo test -p amber-compiler --all-features docker_smoke_ocap_blocks_unbound_callers -- --ignored
 
   docker-build:
     name: Build Docker Image
