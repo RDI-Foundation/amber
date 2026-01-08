@@ -15,7 +15,7 @@
     },
     network: {
       endpoints: [
-        { name: "endpoint", port: 1234, path: "/" },
+        { name: "endpoint", port: 1234 },
       ],
     },
   },

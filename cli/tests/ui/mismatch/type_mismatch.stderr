@@ -2,10 +2,10 @@ linker::type_mismatch
 
   x type mismatch for slot `/green_router/wrapper.litellm`: expected llm, got http
     ,-[<CARGO_MANIFEST_DIR>/tests/ui/mismatch/litellm.json5:20:5]
- 19 |   bindings: [
- 20 |     { to: "#wrapper.litellm", from: "self.admin_api" },
-    :     ^^^^^^^^^^^^^^^^^^^^^^^^^|^^^^^^^^^^^^^^^^^^^^^^^^
-    :                              `-- binding provides `http` to slot expecting `llm`
+ 19 |     { to: "#proxy.backend", from: "self.http" },
+ 20 |     { to: "#wrapper.litellm", from: "#proxy.admin_api" },
+    :     ^^^^^^^^^^^^^^^^^^^^^^^^^^|^^^^^^^^^^^^^^^^^^^^^^^^^
+    :                               `-- binding provides `http` to slot expecting `llm`
  21 |   ],
     `----
   help: Bind a provide of type `llm` to `/green_router/wrapper.litellm`, or change the slot/provide `kind`/`profile` so they match.
@@ -21,22 +21,22 @@ Advice:
     `----
 
 Advice: 
-  > provide `admin_api` declared on /green_router
-    ,-[<CARGO_MANIFEST_DIR>/tests/ui/mismatch/litellm.json5:17:24]
- 16 |     llm: { kind: "llm", endpoint: "router" },
- 17 |     admin_api: { kind: "http", endpoint: "admin-api" },
+  > provide `admin_api` declared on /green_router/proxy
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/mismatch/litellm-proxy.json5:25:24]
+ 24 |     llm: { kind: "llm", endpoint: "router" },
+ 25 |     admin_api: { kind: "http", endpoint: "admin-api" },
     :                        ^^^|^^
     :                           `-- provide type declared here
- 18 |   },
+ 26 |   },
     `----
 linker::type_mismatch
 
   x type mismatch for slot `/purple_router/wrapper.litellm`: expected llm, got http
     ,-[<CARGO_MANIFEST_DIR>/tests/ui/mismatch/litellm.json5:20:5]
- 19 |   bindings: [
- 20 |     { to: "#wrapper.litellm", from: "self.admin_api" },
-    :     ^^^^^^^^^^^^^^^^^^^^^^^^^|^^^^^^^^^^^^^^^^^^^^^^^^
-    :                              `-- binding provides `http` to slot expecting `llm`
+ 19 |     { to: "#proxy.backend", from: "self.http" },
+ 20 |     { to: "#wrapper.litellm", from: "#proxy.admin_api" },
+    :     ^^^^^^^^^^^^^^^^^^^^^^^^^^|^^^^^^^^^^^^^^^^^^^^^^^^^
+    :                               `-- binding provides `http` to slot expecting `llm`
  21 |   ],
     `----
   help: Bind a provide of type `llm` to `/purple_router/wrapper.litellm`, or change the slot/provide `kind`/`profile` so they match.
@@ -52,13 +52,13 @@ Advice:
     `----
 
 Advice: 
-  > provide `admin_api` declared on /purple_router
-    ,-[<CARGO_MANIFEST_DIR>/tests/ui/mismatch/litellm.json5:17:24]
- 16 |     llm: { kind: "llm", endpoint: "router" },
- 17 |     admin_api: { kind: "http", endpoint: "admin-api" },
+  > provide `admin_api` declared on /purple_router/proxy
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/mismatch/litellm-proxy.json5:25:24]
+ 24 |     llm: { kind: "llm", endpoint: "router" },
+ 25 |     admin_api: { kind: "http", endpoint: "admin-api" },
     :                        ^^^|^^
     :                           `-- provide type declared here
- 18 |   },
+ 26 |   },
     `----
 linker::unbound_slot
 
@@ -74,7 +74,7 @@ linker::unbound_slot
 Advice: 
   > component `wrapper` declared on component /green_router
     ,-[<CARGO_MANIFEST_DIR>/tests/ui/mismatch/litellm.json5:13:5]
- 12 |   components: {
+ 12 |     proxy: "./litellm-proxy.json5",
  13 |     wrapper: "./litellm-wrapper.json5",
     :     ^^^|^^^
     :        `-- component declared here
@@ -94,7 +94,7 @@ linker::unbound_slot
 Advice: 
   > component `wrapper` declared on component /purple_router
     ,-[<CARGO_MANIFEST_DIR>/tests/ui/mismatch/litellm.json5:13:5]
- 12 |   components: {
+ 12 |     proxy: "./litellm-proxy.json5",
  13 |     wrapper: "./litellm-wrapper.json5",
     :     ^^^|^^^
     :        `-- component declared here

@@ -43,7 +43,6 @@ struct ServiceNames {
 struct Endpoint {
     name: String,
     port: u16,
-    path: String,
 }
 
 #[derive(Clone, Debug)]
@@ -58,7 +57,6 @@ struct SlotValue {
     url: String,
     host: String,
     port: u16,
-    path: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -69,25 +67,22 @@ struct ExportMetadata {
     component: String,
     provide: String,
     endpoint: String,
-    path: String,
 }
 
 #[derive(Debug)]
-struct PortPathConflict {
+struct PortConflict {
     component: ComponentId,
     port: u16,
     first_provide: String,
     first_endpoint: String,
-    first_path: String,
     provide: String,
     endpoint: String,
-    path: String,
 }
 
 #[derive(Debug)]
 enum DockerComposeError {
     Other(String),
-    PortPathConflict(Box<PortPathConflict>),
+    PortConflict(Box<PortConflict>),
 }
 
 impl From<String> for DockerComposeError {
@@ -100,25 +95,23 @@ impl DockerComposeError {
     fn into_reporter_error(self, output: &CompileOutput) -> ReporterError {
         match self {
             DockerComposeError::Other(message) => ReporterError::new(message),
-            DockerComposeError::PortPathConflict(conflict) => {
-                let PortPathConflict {
+            DockerComposeError::PortConflict(conflict) => {
+                let PortConflict {
                     component,
                     port,
                     first_provide,
                     first_endpoint,
-                    first_path,
                     provide,
                     endpoint,
-                    path,
                 } = *conflict;
                 let component_moniker = output.scenario.component(component).moniker.as_str();
                 let message = format!(
                     "docker-compose output cannot enforce separate capabilities for provides \
                      `{first_provide}` and `{provide}` in component `{component_moniker}`: both \
-                     route to port {port} but have different HTTP paths ({first_path} vs {path})"
+                     route to port {port} via endpoints `{first_endpoint}` and `{endpoint}`"
                 );
-                let help = "Split the endpoints onto different ports, or route both paths through \
-                            an L7 proxy and expose a single provide per port.";
+                let help = "Expose each capability on its own port, or add an explicit L7 proxy \
+                            component that maps each capability to a separate port.";
 
                 let prov = output.provenance.for_component(component);
                 let Some((src, spans)) = output.store.diagnostic_source(&prov.resolved_url) else {
@@ -146,24 +139,18 @@ impl DockerComposeError {
                 };
 
                 if let Some(endpoint) = endpoint_span(&first_endpoint) {
-                    let span = endpoint
-                        .path_span
-                        .or(endpoint.port_span)
-                        .unwrap_or(endpoint.whole);
+                    let span = endpoint.port_span.unwrap_or(endpoint.whole);
 
                     labels.push(LabeledSpan::new_primary_with_span(
-                        Some(format!("path used by provide `{first_provide}`")),
+                        Some(format!("port used by provide `{first_provide}`")),
                         span,
                     ));
                     has_primary = true;
                 }
                 if let Some(endpoint) = endpoint_span(&endpoint) {
-                    let span = endpoint
-                        .path_span
-                        .or(endpoint.port_span)
-                        .unwrap_or(endpoint.whole);
+                    let span = endpoint.port_span.unwrap_or(endpoint.whole);
 
-                    let label = Some(format!("path used by provide `{provide}`"));
+                    let label = Some(format!("port used by provide `{provide}`"));
                     if has_primary {
                         labels.push(LabeledSpan::new_with_span(label, span));
                     } else {
@@ -306,9 +293,9 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
     // Inbound allowlist: (provider_component, port) -> set of consumer sidecar IPs
     let mut inbound_allow: HashMap<(ComponentId, u16), BTreeSet<Ipv4Addr>> = HashMap::new();
 
-    // Track (component,port) -> (first_provide_name, first_endpoint_name, first_path) to detect
-    // path conflicts on shared ports.
-    let mut port_path_owner: HashMap<(ComponentId, u16), (String, String, String)> = HashMap::new();
+    // Track (component,port) -> (first_provide_name, first_endpoint_name) to detect
+    // distinct endpoints sharing a port.
+    let mut port_owner: HashMap<(ComponentId, u16), (String, String)> = HashMap::new();
 
     for b in &s.bindings {
         let provider = b.from.component;
@@ -316,14 +303,13 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
 
         let endpoint = resolve_provide_endpoint(s, provider, &b.from.name)?;
 
-        // Port/path conflict check (L4 backend cannot separate paths on same port).
-        enforce_single_path_per_port(
-            &mut port_path_owner,
+        // Port conflict check (L4 backend cannot separate endpoints on the same port).
+        enforce_single_endpoint_per_port(
+            &mut port_owner,
             provider,
             endpoint.port,
             &b.from.name,
             &endpoint.name,
-            &endpoint.path,
         )?;
 
         let consumer_ip = *ips.get(&consumer).ok_or_else(|| {
@@ -369,8 +355,7 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
                 remote_port: endpoint.port,
             });
 
-        let path = normalize_path(&endpoint.path);
-        let url = format!("http://127.0.0.1:{local_port}{path}");
+        let url = format!("http://127.0.0.1:{local_port}");
 
         slot_values_by_component
             .entry(consumer)
@@ -381,7 +366,6 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
                     url,
                     host: "127.0.0.1".to_string(),
                     port: local_port,
-                    path,
                 },
             );
     }
@@ -417,13 +401,12 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
             let provider = ex.from.component;
             let endpoint = resolve_provide_endpoint(s, provider, &ex.from.name)?;
 
-            enforce_single_path_per_port(
-                &mut port_path_owner,
+            enforce_single_endpoint_per_port(
+                &mut port_owner,
                 provider,
                 endpoint.port,
                 &ex.from.name,
                 &endpoint.name,
-                &endpoint.path,
             )?;
 
             let published = next_host_port;
@@ -443,7 +426,6 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
                 component: component_label(s, provider),
                 provide: ex.from.name.clone(),
                 endpoint: endpoint.name.clone(),
-                path: normalize_path(&endpoint.path),
             };
 
             exports_by_provider
@@ -656,7 +638,6 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
                 6,
                 &format!("endpoint: {}", yaml_str(&meta.endpoint)),
             );
-            push_line(&mut out, 6, &format!("path: {}", yaml_str(&meta.path)));
         }
     }
 
@@ -765,53 +746,35 @@ fn resolve_provide_endpoint(
     Ok(Endpoint {
         name: endpoint.name.clone(),
         port: endpoint.port,
-        path: endpoint.path.clone(),
     })
 }
 
-fn normalize_path(p: &str) -> String {
-    let p = p.trim();
-    if p.is_empty() {
-        return "/".to_string();
-    }
-    if p.starts_with('/') {
-        p.to_string()
-    } else {
-        format!("/{p}")
-    }
-}
-
-fn enforce_single_path_per_port(
-    owner: &mut HashMap<(ComponentId, u16), (String, String, String)>,
+fn enforce_single_endpoint_per_port(
+    owner: &mut HashMap<(ComponentId, u16), (String, String)>,
     component: ComponentId,
     port: u16,
     provide_name: &str,
     endpoint_name: &str,
-    path: &str,
 ) -> Result<(), DockerComposeError> {
-    let path = normalize_path(path);
-
     match owner.get(&(component, port)) {
         None => {
             owner.insert(
                 (component, port),
-                (provide_name.to_string(), endpoint_name.to_string(), path),
+                (provide_name.to_string(), endpoint_name.to_string()),
             );
             Ok(())
         }
-        Some((_first_provide, _first_endpoint, first_path)) if *first_path == path => Ok(()),
-        Some((first_provide, first_endpoint, first_path)) => Err(
-            DockerComposeError::PortPathConflict(Box::new(PortPathConflict {
+        Some((_first_provide, first_endpoint)) if *first_endpoint == endpoint_name => Ok(()),
+        Some((first_provide, first_endpoint)) => {
+            Err(DockerComposeError::PortConflict(Box::new(PortConflict {
                 component,
                 port,
                 first_provide: first_provide.clone(),
                 first_endpoint: first_endpoint.clone(),
-                first_path: first_path.clone(),
                 provide: provide_name.to_string(),
                 endpoint: endpoint_name.to_string(),
-                path,
-            })),
-        ),
+            })))
+        }
     }
 }
 
@@ -948,7 +911,7 @@ fn resolve_slots_path(slots: &BTreeMap<String, SlotValue>, path: &str) -> Result
     if it.next().is_some() {
         return Err(format!(
             "unsupported slots interpolation 'slots.{path}': only slots.<slot>.<field> is \
-             supported (url/host/port/path)"
+             supported (url/host/port)"
         ));
     }
 
@@ -960,9 +923,8 @@ fn resolve_slots_path(slots: &BTreeMap<String, SlotValue>, path: &str) -> Result
         "url" => Ok(slot.url.clone()),
         "host" => Ok(slot.host.clone()),
         "port" => Ok(slot.port.to_string()),
-        "path" => Ok(slot.path.clone()),
         other => Err(format!(
-            "unsupported slots field slots.{slot_name}.{other} (supported: url/host/port/path)"
+            "unsupported slots field slots.{slot_name}.{other} (supported: url/host/port)"
         )),
     }
 }

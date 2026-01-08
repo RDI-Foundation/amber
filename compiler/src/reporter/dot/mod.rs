@@ -128,7 +128,7 @@ fn endpoint_label_for_provide(component: &Component, provide_name: &str) -> Stri
         .find(|e| e.name == endpoint_name)
         .expect("scenario invariant: endpoint exists");
 
-    format!("{}:{}{}", endpoint.protocol, endpoint.port, endpoint.path)
+    format!("{}:{}", endpoint.protocol, endpoint.port)
 }
 
 fn render_root(s: &Scenario, render_root_node: bool, indent: usize, out: &mut String) {

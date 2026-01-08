@@ -188,7 +188,6 @@ program: {
         name: "http",          // required; unique within endpoints
         port: 8080,            // required
         protocol: "http",      // optional; default "http" (http/https/tcp/udp)
-        path: "/",             // optional; default "/"
       },
     ],
   },
@@ -429,7 +428,7 @@ component that consumes it, or introduce an adapter component that turns the inp
   program: {
     image: "ghcr.io/acme/hello:v1",
     args: "--port 8080",
-    network: { endpoints: [{ name: "http", port: 8080, path: "/" }] },
+    network: { endpoints: [{ name: "http", port: 8080 }] },
   },
   provides: {
     api: { kind: "http", endpoint: "http" },
@@ -478,7 +477,7 @@ This component:
     image: "docker.io/litellm/litellm:latest",
     network: {
       endpoints: [
-        { name: "admin", port: 4000, path: "/api" },
+        { name: "admin", port: 4000 },
       ],
     },
   },

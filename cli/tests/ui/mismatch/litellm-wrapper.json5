@@ -5,7 +5,7 @@
     args: ["--litellm-url", "${slots.litellm.url}"],
     network: {
       endpoints: [
-        { name: "admin-api", port: 80, path: "/api" },
+        { name: "admin-api", port: 80 },
       ],
     },
   },

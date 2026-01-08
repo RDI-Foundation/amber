@@ -4,20 +4,20 @@
     image: "docker.io/litellm/litellm:latest",
     network: {
       endpoints: [
-        { name: "router", port: 80, path: "/v1" },
-        { name: "admin-api", port: 80, path: "/api" },
+        { name: "http", port: 80 },
       ],
     },
   },
   components: {
+    proxy: "./litellm-proxy.json5",
     wrapper: "./litellm-wrapper.json5",
   },
   provides: {
-    llm: { kind: "llm", endpoint: "router" },
-    admin_api: { kind: "http", endpoint: "admin-api" },
+    http: { kind: "http", endpoint: "http" },
   },
   bindings: [
-    { to: "#wrapper.litellm", from: "self.admin_api" },
+    { to: "#proxy.backend", from: "self.http" },
+    { to: "#wrapper.litellm", from: "#proxy.admin_api" },
   ],
-  exports: { llm: "llm", admin_api: "#wrapper.admin_api" },
+  exports: { llm: "#proxy.llm", admin_api: "#wrapper.admin_api" },
 }

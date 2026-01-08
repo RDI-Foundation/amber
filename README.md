@@ -109,7 +109,7 @@ flowchart LR
 
     subgraph Consumer["Consumer component (cY)"]
       SidecarC["cY-net (sidecar)<br/>- socat local proxies<br/>127.0.0.1:20000 -> cX:PORT"]
-      ProgC["cY (program)<br/>uses \${slots.*}<br/>(e.g. http://127.0.0.1:20000/path)"]
+      ProgC["cY (program)<br/>uses \${slots.*}<br/>(e.g. http://127.0.0.1:20000)"]
       ProgC --- SidecarC
     end
 
@@ -195,7 +195,7 @@ docker compose -f target/amber-out/scenario.docker-compose.yaml up
 Finding the host ports for Scenario exports:
 
 * Exports are published on **host loopback** (`127.0.0.1`) starting at port **18000**.
-* The compose file includes `x-amber.exports`, a mapping of `export_name -> published_host/published_port/target_port` plus component/provide/endpoint/path.
+* The compose file includes `x-amber.exports`, a mapping of `export_name -> published_host/published_port/target_port` plus component/provide/endpoint.
 * Each `*-net` sidecar service also carries an `amber.exports` label with the same JSON mapping for runtime discovery.
 
 You can still locate the raw publishes under each `*-net` sidecar service’s `ports:` section:
@@ -261,12 +261,11 @@ Programs can interpolate:
 
 For Docker Compose output, slot fields include:
 
-* `url` (currently emitted as `http://127.0.0.1:<local_port><path>`)
+* `url` (currently emitted as `http://127.0.0.1:<local_port>`)
 * `host` (usually `127.0.0.1`)
 * `port` (local proxy port)
-* `path`
 
-If you need a non-HTTP scheme, prefer composing your own value using `host/port/path`.
+If you need a non-HTTP scheme, prefer composing your own value using `host` and `port`.
 
 ---
 
@@ -354,4 +353,4 @@ UI tests live in `cli/tests/ui/`:
 ## Known limitations (current behavior)
 
 * Docker Compose slot wiring is implemented as **TCP forwarding** (via `socat`) plus an iptables allowlist in each sidecar.
-* If two provides share the same port but need different paths, Compose emission will fail (an L4 backend can’t separate paths).
+* If two provides route to different endpoints on the same port, Compose emission will fail (an L4 backend can’t separate them).

@@ -180,7 +180,7 @@ fn dot_renders_root_exports_as_endpoints() {
 	              program: {
 	                image: "b",
 	                network: {
-	                  endpoints: [{ name: "ep", port: 8080, path: "/api" }],
+	                  endpoints: [{ name: "ep", port: 8080 }],
 	                },
 	              },
 	              provides: { out: { kind: "http", endpoint: "ep" } },
@@ -292,7 +292,7 @@ fn dot_renders_root_exports_as_endpoints() {
     c1 [label="/a"];
     c2 [label="/b"];
   }
-  e0 [label="http:8080/api", shape=box];
+  e0 [label="http:8080", shape=box];
   c2 -> c1 [label="out"];
   c2 -> e0 [label="http"];
 }
@@ -365,6 +365,6 @@ fn dot_renders_root_exports_from_root_component() {
 
     let dot = render_dot_with_exports(&output);
     assert!(dot.contains("c0 [label=\"program\"]"));
-    assert!(dot.contains("e0 [label=\"http:80/\", shape=box]"));
+    assert!(dot.contains("e0 [label=\"http:80\", shape=box]"));
     assert!(dot.contains("c0 -> e0 [label=\"http\"]"));
 }

@@ -1,0 +1,15 @@
+Error:   × docker-compose output cannot enforce separate capabilities for provides
+  │ `admin` and `api` in component `/`: both route to port 8080 via endpoints
+  │ `admin` and `api`
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/docker_compose_port_conflict.json5:8:32]
+ 6 │       endpoints: [
+ 7 │         { name: "api", port: 8080 },
+   ·                              ──┬─
+   ·                                ╰── port used by provide `api`
+ 8 │         { name: "admin", port: 8080 },
+   ·                                ──┬─
+   ·                                  ╰── port used by provide `admin`
+ 9 │       ],
+   ╰────
+  help: Expose each capability on its own port, or add an explicit L7 proxy
+        component that maps each capability to a separate port.

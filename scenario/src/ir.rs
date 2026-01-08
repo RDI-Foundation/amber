@@ -341,8 +341,7 @@ mod tests {
                                 {
                                     "name": "api",
                                     "port": 80,
-                                    "protocol": "http",
-                                    "path": "/"
+                                    "protocol": "http"
                                 }
                             ]
                         }
@@ -431,8 +430,7 @@ mod tests {
                                 {
                                     "name": "api",
                                     "port": 80,
-                                    "protocol": "http",
-                                    "path": "/"
+                                    "protocol": "http"
                                 }
                             ]
                         }

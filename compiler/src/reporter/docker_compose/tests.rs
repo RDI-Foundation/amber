@@ -54,7 +54,7 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         "env": {},
         "network": {
             "endpoints": [
-                { "name": "api", "port": 8080, "protocol": "http", "path": "/" }
+                { "name": "api", "port": 8080, "protocol": "http" }
             ]
         }
     }))
@@ -159,8 +159,8 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         "{yaml}"
     );
 
-    // Slot URL should be rendered with local proxy port base (20000) + path.
-    assert!(yaml.contains(r#"URL: "http://127.0.0.1:20000/""#), "{yaml}");
+    // Slot URL should be rendered with local proxy port base (20000).
+    assert!(yaml.contains(r#"URL: "http://127.0.0.1:20000""#), "{yaml}");
 }
 
 #[test]
@@ -171,7 +171,7 @@ fn compose_emits_export_metadata_and_labels() {
         "env": {},
         "network": {
             "endpoints": [
-                { "name": "api", "port": 8080, "protocol": "http", "path": "/" }
+                { "name": "api", "port": 8080, "protocol": "http" }
             ]
         }
     }))
@@ -233,20 +233,19 @@ fn compose_emits_export_metadata_and_labels() {
     assert!(yaml.contains(r#"component: "/server""#), "{yaml}");
     assert!(yaml.contains(r#"provide: "api""#), "{yaml}");
     assert!(yaml.contains(r#"endpoint: "api""#), "{yaml}");
-    assert!(yaml.contains(r#"path: "/""#), "{yaml}");
     assert!(yaml.contains("127.0.0.1:18000:8080"), "{yaml}");
     assert!(yaml.contains(r#"amber.exports: "{\"public\""#), "{yaml}");
     assert!(yaml.contains(r#"\"published_port\":18000"#), "{yaml}");
 }
 
 #[test]
-fn errors_on_shared_port_with_different_paths() {
+fn errors_on_shared_port_with_different_endpoints() {
     let server_program = serde_json::from_value(json!({
         "image": "alpine:3.20",
         "network": {
             "endpoints": [
-                { "name": "a", "port": 80, "protocol": "http", "path": "/v1" },
-                { "name": "b", "port": 80, "protocol": "http", "path": "/admin" }
+                { "name": "a", "port": 80, "protocol": "http" },
+                { "name": "b", "port": 80, "protocol": "http" }
             ]
         }
     }))
@@ -344,6 +343,10 @@ fn errors_on_shared_port_with_different_paths() {
             .contains("docker-compose output cannot enforce separate capabilities"),
         "unexpected error: {err}"
     );
+    assert!(
+        err.to_string().contains("route to port 80"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -397,7 +400,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
     let server_program = serde_json::from_value(json!({
         "image": "busybox:1.36.1",
         "args": ["sh", "-lc", "mkdir -p /www && echo hello > /www/index.html && httpd -f -p 8080 -h /www"],
-        "network": { "endpoints": [ { "name": "api", "port": 8080, "protocol": "http", "path": "/" } ] }
+        "network": { "endpoints": [ { "name": "api", "port": 8080, "protocol": "http" } ] }
     }))
     .unwrap();
 

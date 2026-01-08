@@ -5,7 +5,7 @@
     args: "--llm-api ${slots.llm.url} --port 443",
     network: {
       endpoints: [
-        { name: "endpoint", port: 443, path: "/" },
+        { name: "endpoint", port: 443 },
       ],
     },
   },

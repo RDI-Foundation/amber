@@ -984,7 +984,6 @@ fn endpoint_validation_passes_for_defined_reference() {
         name: "endpoint".to_string(),
         port: 80,
         protocol: NetworkProtocol::Http,
-        path: "/".to_string(),
     }));
 
     let api = m.provides.get("api").expect("api provide");

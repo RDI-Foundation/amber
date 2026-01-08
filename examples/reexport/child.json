@@ -3,7 +3,7 @@
   "program": {
     "image": "example/child",
     "network": {
-      "endpoints": [{ "name": "endpoint", "port": 8080, "path": "/" }]
+      "endpoints": [{ "name": "endpoint", "port": 8080 }]
     }
   },
   "provides": {

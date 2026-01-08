@@ -651,8 +651,6 @@ pub struct Endpoint {
     pub port: u16,
     #[serde(default = "default_protocol")]
     pub protocol: NetworkProtocol,
-    #[serde(default = "default_path")]
-    pub path: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -679,10 +677,6 @@ impl fmt::Display for NetworkProtocol {
 
 fn default_protocol() -> NetworkProtocol {
     NetworkProtocol::Http
-}
-
-fn default_path() -> String {
-    "/".to_string()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

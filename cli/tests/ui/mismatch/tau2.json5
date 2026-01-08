@@ -4,7 +4,7 @@
     image: "ghcr.io/sierra-research/tau2:v2",
     network: {
       endpoints: [
-        { name: "endpoint", port: 8080, path: "/env" },
+        { name: "endpoint", port: 8080 },
       ],
     },
   },

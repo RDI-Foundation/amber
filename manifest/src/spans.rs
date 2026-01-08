@@ -32,7 +32,6 @@ pub struct EndpointSpans {
     pub whole: SourceSpan,
     pub name_span: SourceSpan,
     pub port_span: Option<SourceSpan>,
-    pub path_span: Option<SourceSpan>,
 }
 
 #[derive(Clone, Debug)]
@@ -490,7 +489,6 @@ fn extract_program_spans(program_value: &Value, program: SpanCursor<'_>) -> Prog
             whole: endpoint_span.span,
             name_span,
             port_span: endpoint_span.child_span("port"),
-            path_span: endpoint_span.child_span("path"),
         });
     }
 
