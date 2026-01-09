@@ -48,38 +48,22 @@ struct CompileArgs {
     #[arg(short = 'D', long = "deny", value_name = "LINT")]
     deny: Vec<String>,
 
-    /// Directory for default output files (defaults to the current directory).
-    #[arg(long = "out-dir", value_name = "DIR", conflicts_with = "output")]
-    out_dir: Option<PathBuf>,
-
     /// Write the primary output to this path.
     #[arg(short = 'o', long = "output", value_name = "FILE")]
     output: Option<PathBuf>,
 
     /// Write Graphviz DOT output to this path, or `-` for stdout.
-    ///
-    /// If omitted, defaults to next to the primary output.
-    #[arg(
-        long = "dot",
-        value_name = "FILE",
-        num_args = 0..=1,
-        require_equals = true,
-        allow_hyphen_values = true
-    )]
-    dot: Option<Option<PathBuf>>,
+    #[arg(long = "dot", value_name = "FILE", allow_hyphen_values = true)]
+    dot: Option<PathBuf>,
 
     /// Write Docker Compose output to this path, or `-` for stdout.
-    ///
-    /// If omitted, defaults to next to the primary output.
     #[arg(
         long = "docker-compose",
         visible_alias = "compose",
         value_name = "FILE",
-        num_args = 0..=1,
-        require_equals = true,
         allow_hyphen_values = true
     )]
-    docker_compose: Option<Option<PathBuf>>,
+    docker_compose: Option<PathBuf>,
 
     /// Write a manifest bundle to this directory.
     #[arg(long = "bundle", value_name = "DIR")]
@@ -149,6 +133,9 @@ fn init_tracing(verbose: u8) -> Result<()> {
 }
 
 async fn compile(args: CompileArgs) -> Result<()> {
+    ensure_outputs_requested(&args)?;
+    let outputs = resolve_output_paths(&args)?;
+
     let resolved = resolve_input(&args.manifest).await?;
     let compiler =
         Compiler::new(resolved.resolver, Default::default()).with_registry(resolved.registry);
@@ -170,8 +157,9 @@ async fn compile(args: CompileArgs) -> Result<()> {
         return Err(miette::miette!("compilation failed"));
     }
 
-    let outputs = resolve_output_paths(&args, &resolved.manifest)?;
-    write_primary_output(&outputs.primary, &output)?;
+    if let Some(primary) = outputs.primary.as_ref() {
+        write_primary_output(primary, &output)?;
+    }
 
     if let Some(dot_dest) = outputs.dot {
         let dot = DotReporter.emit(&output).map_err(miette::Report::new)?;
@@ -457,28 +445,35 @@ enum ArtifactOutput {
 }
 
 struct OutputPaths {
-    primary: PathBuf,
+    primary: Option<PathBuf>,
     dot: Option<ArtifactOutput>,
     docker_compose: Option<ArtifactOutput>,
 }
 
-fn resolve_output_paths(args: &CompileArgs, manifest: &ManifestRef) -> Result<OutputPaths> {
-    let primary = match args.output.as_ref() {
-        Some(path) => path.clone(),
-        None => {
-            let dir = args.out_dir.clone().unwrap_or_else(|| PathBuf::from("."));
-            dir.join(default_output_stem(manifest))
-        }
-    };
+fn ensure_outputs_requested(args: &CompileArgs) -> Result<()> {
+    if args.output.is_some()
+        || args.dot.is_some()
+        || args.docker_compose.is_some()
+        || args.bundle.is_some()
+    {
+        return Ok(());
+    }
 
-    let dot = resolve_optional_output(&args.dot, primary.with_extension("dot"));
-    let docker_compose = resolve_optional_output(
-        &args.docker_compose,
-        primary.with_extension("docker-compose.yaml"),
-    );
+    Err(miette::miette!(
+        help = "Request at least one output with `--output`, `--dot`, `--docker-compose`, or \
+                `--bundle`.",
+        "no outputs requested for `amber compile`"
+    ))
+}
 
-    if let Some(ArtifactOutput::File(dot_path)) = dot.as_ref()
-        && dot_path == &primary
+fn resolve_output_paths(args: &CompileArgs) -> Result<OutputPaths> {
+    let primary = args.output.clone();
+    let dot = resolve_optional_output(&args.dot);
+    let docker_compose = resolve_optional_output(&args.docker_compose);
+
+    if let (Some(primary_path), Some(ArtifactOutput::File(dot_path))) =
+        (primary.as_ref(), dot.as_ref())
+        && dot_path == primary_path
     {
         return Err(miette::miette!(
             "dot output path `{}` must not match the primary output path",
@@ -486,8 +481,9 @@ fn resolve_output_paths(args: &CompileArgs, manifest: &ManifestRef) -> Result<Ou
         ));
     }
 
-    if let Some(ArtifactOutput::File(compose_path)) = docker_compose.as_ref()
-        && compose_path == &primary
+    if let (Some(primary_path), Some(ArtifactOutput::File(compose_path))) =
+        (primary.as_ref(), docker_compose.as_ref())
+        && compose_path == primary_path
     {
         return Err(miette::miette!(
             "docker compose output path `{}` must not match the primary output path",
@@ -512,29 +508,18 @@ fn resolve_output_paths(args: &CompileArgs, manifest: &ManifestRef) -> Result<Ou
     })
 }
 
-fn resolve_optional_output(
-    request: &Option<Option<PathBuf>>,
-    default_path: PathBuf,
-) -> Option<ArtifactOutput> {
-    match request.as_ref() {
-        None => None,
-        Some(None) => Some(ArtifactOutput::File(default_path)),
-        Some(Some(path)) if path.as_path() == Path::new("-") => Some(ArtifactOutput::Stdout),
-        Some(Some(path)) => Some(ArtifactOutput::File(path.clone())),
-    }
+fn resolve_optional_output(request: &Option<PathBuf>) -> Option<ArtifactOutput> {
+    request.as_ref().map(|path| {
+        if path.as_path() == Path::new("-") {
+            ArtifactOutput::Stdout
+        } else {
+            ArtifactOutput::File(path.clone())
+        }
+    })
 }
 
 fn resolve_bundle_root(args: &CompileArgs) -> Result<Option<PathBuf>> {
-    let Some(path) = args.bundle.as_ref() else {
-        return Ok(None);
-    };
-
-    if path.is_absolute() {
-        return Ok(Some(path.clone()));
-    }
-
-    let base = args.out_dir.clone().unwrap_or_else(|| PathBuf::from("."));
-    Ok(Some(base.join(path)))
+    Ok(args.bundle.clone())
 }
 
 fn prepare_bundle_dir(path: &Path) -> Result<()> {
@@ -557,32 +542,6 @@ fn prepare_bundle_dir(path: &Path) -> Result<()> {
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to create bundle directory `{}`", path.display()))?;
     Ok(())
-}
-
-fn default_output_stem(manifest: &ManifestRef) -> String {
-    let url = manifest
-        .url
-        .as_url()
-        .expect("CLI resolves manifest refs into absolute URLs");
-
-    let file_name = if url.scheme() == "file" {
-        url.to_file_path().ok().and_then(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_string)
-        })
-    } else {
-        url.path_segments()
-            .and_then(|mut segments| segments.next_back())
-            .map(str::to_string)
-    };
-
-    file_name
-        .as_deref()
-        .and_then(|name| Path::new(name).file_stem().and_then(|s| s.to_str()))
-        .filter(|s| !s.is_empty())
-        .unwrap_or("amber")
-        .to_string()
 }
 
 fn write_primary_output(path: &Path, output: &CompileOutput) -> Result<()> {

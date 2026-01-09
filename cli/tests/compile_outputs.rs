@@ -19,12 +19,18 @@ fn compile_writes_primary_output_and_dot_artifact() {
         .tempdir_in(&outputs_root)
         .expect("failed to create outputs directory");
 
+    let primary_output = outputs_dir.path().join("scenario");
+    let dot_output = outputs_dir.path().join("scenario.dot");
+    let compose_output = outputs_dir.path().join("scenario.docker-compose.yaml");
+
     let output = Command::new(env!("CARGO_BIN_EXE_amber"))
         .arg("compile")
-        .arg("--out-dir")
-        .arg(outputs_dir.path())
+        .arg("--output")
+        .arg(&primary_output)
         .arg("--dot")
+        .arg(&dot_output)
         .arg("--docker-compose")
+        .arg(&compose_output)
         .arg(&manifest)
         .output()
         .unwrap_or_else(|err| panic!("failed to run amber compile: {err}"));
@@ -38,7 +44,6 @@ fn compile_writes_primary_output_and_dot_artifact() {
         );
     }
 
-    let primary_output = outputs_dir.path().join("scenario");
     assert!(
         primary_output.is_file(),
         "expected primary output file at {}",
@@ -110,7 +115,6 @@ fn compile_writes_primary_output_and_dot_artifact() {
     assert_eq!(exports[0]["name"], "cap");
     assert_eq!(exports[0]["capability"]["kind"], "http");
 
-    let dot_output = outputs_dir.path().join("scenario.dot");
     assert!(
         dot_output.is_file(),
         "expected dot output file at {}",
@@ -122,7 +126,6 @@ fn compile_writes_primary_output_and_dot_artifact() {
         "dot output did not contain a scenario graph"
     );
 
-    let compose_output = outputs_dir.path().join("scenario.docker-compose.yaml");
     assert!(
         compose_output.is_file(),
         "expected docker compose output file at {}",

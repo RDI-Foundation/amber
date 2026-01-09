@@ -5,7 +5,6 @@ use std::{
 };
 
 use similar::TextDiff;
-use tempfile::TempDir;
 
 #[test]
 fn ui_tests() -> Result<(), Box<dyn std::error::Error>> {
@@ -62,7 +61,6 @@ fn run_case(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
         "compile" => {
             cmd.arg("compile");
-            let _output_dir = add_compile_output_dir(&mut cmd)?;
             cmd.args(args).arg(path);
         }
         other => {
@@ -170,19 +168,4 @@ fn read_command(case: &Path) -> Result<String, Box<dyn std::error::Error>> {
         .find(|line| !line.is_empty() && !line.starts_with('#'))
         .ok_or_else(|| format!("empty ui test command file {}", cmd_path.display()))?;
     Ok(cmd.to_string())
-}
-
-fn add_compile_output_dir(cmd: &mut Command) -> Result<TempDir, Box<dyn std::error::Error>> {
-    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("cli crate should live under the workspace root");
-    let outputs_root = workspace_root.join("target").join("cli-ui-test-outputs");
-    fs::create_dir_all(&outputs_root)?;
-
-    let outputs_dir = tempfile::Builder::new()
-        .prefix("outputs-")
-        .tempdir_in(outputs_root)?;
-
-    cmd.arg("--out-dir").arg(outputs_dir.path());
-    Ok(outputs_dir)
 }

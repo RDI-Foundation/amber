@@ -164,17 +164,19 @@ cargo run -p amber-cli -- check -D warnings examples/tau2/scenario.json5
 
 ### Compile an example and emit artifacts (Scenario IR + DOT + Docker Compose)
 
+`amber compile` requires at least one output flag (`--output`, `--dot`, `--docker-compose`, or `--bundle`).
+
 ```bash
 rm -rf target/amber-out
 cargo run -p amber-cli -- \
   compile \
-  --out-dir target/amber-out \
-  --dot \
-  --docker-compose \
+  --output target/amber-out/scenario \
+  --dot target/amber-out/scenario.dot \
+  --docker-compose target/amber-out/scenario.docker-compose.yaml \
   examples/tau2/scenario.json5
 ```
 
-Expected outputs (for `scenario.json5`, the stem is `scenario`):
+Expected outputs (for the paths above):
 
 * `target/amber-out/scenario` — **primary output** (Scenario IR JSON)
 * `target/amber-out/scenario.dot` — graph diagram (Graphviz DOT)
