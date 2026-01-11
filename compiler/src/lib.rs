@@ -13,6 +13,8 @@ mod linker;
 mod manifest_table;
 mod provenance;
 mod runtime_config;
+mod slot_query;
+mod slot_validation;
 mod store;
 
 pub mod bundle;
@@ -111,8 +113,14 @@ impl Compiler {
         tree: ResolvedTree,
         opts: OptimizeOptions,
     ) -> Result<CompileOutput, Error> {
+        let mut diagnostics =
+            slot_validation::collect_slot_interpolation_diagnostics_from_tree(&tree, &self.store);
         let (scenario, provenance) = linker::link(tree, &self.store)?;
-        let diagnostics = collect_manifest_diagnostics(&scenario, &provenance, &self.store);
+        diagnostics.extend(collect_manifest_diagnostics(
+            &scenario,
+            &provenance,
+            &self.store,
+        ));
 
         let (scenario, provenance) = {
             let mut pm = passes::PassManager::new();
@@ -133,7 +141,9 @@ impl Compiler {
 
     #[allow(clippy::result_large_err)]
     pub fn check_from_tree(&self, tree: ResolvedTree) -> Result<CheckOutput, Error> {
-        let mut diagnostics = collect_manifest_diagnostics_from_tree(&tree, &self.store);
+        let mut diagnostics =
+            slot_validation::collect_slot_interpolation_diagnostics_from_tree(&tree, &self.store);
+        diagnostics.extend(collect_manifest_diagnostics_from_tree(&tree, &self.store));
         let mut has_errors = false;
 
         match linker::link(tree, &self.store) {

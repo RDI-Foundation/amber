@@ -212,7 +212,11 @@ Examples:
 
 Notes:
 
-* This crate **parses** interpolation syntax but does **not** validate that the referenced paths exist.
+* Slots expose a virtual object. Today the only defined field is `url`; use
+  `${slots.<slot>.url}` for the URL string or `${slots.<slot>}` to interpolate the object as JSON.
+* This crate **parses** interpolation syntax but does **not** validate that the referenced paths
+  exist. The compiler validates `${config.*}` against `config_schema` and `${slots.*}` against
+  declared slots and supported fields.
 
 ---
 

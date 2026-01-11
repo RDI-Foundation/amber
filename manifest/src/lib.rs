@@ -443,11 +443,14 @@ impl InterpolatedString {
             if *source != InterpolationSource::Slots {
                 continue;
             }
+            if query.is_empty() {
+                return true;
+            }
             let slot = query
                 .split_once('.')
                 .map_or(query.as_str(), |(first, _)| first);
             if slot.is_empty() {
-                return true;
+                return false;
             }
             visit(slot);
         }
@@ -473,10 +476,9 @@ impl FromStr for InterpolatedPart {
             return Err(Error::InvalidInterpolation(inner.to_string()));
         }
 
-        let mut segments = inner.split('.');
-        let prefix = segments
-            .next()
-            .ok_or_else(|| Error::InvalidInterpolation(inner.to_string()))?;
+        let (prefix, query) = inner
+            .split_once('.')
+            .map_or((inner, ""), |(prefix, query)| (prefix, query));
 
         let source = match prefix {
             "config" => InterpolationSource::Config,
@@ -484,12 +486,10 @@ impl FromStr for InterpolatedPart {
             _ => return Err(Error::InvalidInterpolation(inner.to_string())),
         };
 
-        let query = segments
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(".");
-
-        Ok(InterpolatedPart::Interpolation { source, query })
+        Ok(InterpolatedPart::Interpolation {
+            source,
+            query: query.to_string(),
+        })
     }
 }
 

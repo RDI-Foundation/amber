@@ -1,0 +1,12 @@
+compiler::invalid_slots_interpolation
+
+  x invalid slots interpolation in / (program.entrypoint[2]): unsupported slots field "blabla" (only "url" is supported)
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_interpolation_invalid_field.json5:8:7]
+ 7 |       "--agent",
+ 8 |       "${slots.agent.blabla}",
+   :       ^^^^^^^^^^^|^^^^^^^^^^^
+   :                  `-- slot interpolation here
+ 9 |     ],
+   `----
+  help: Supported slot fields: url.
+Error:   × check failed

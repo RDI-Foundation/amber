@@ -12,7 +12,10 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::{Reporter, ReporterError};
-use crate::{CompileOutput, runtime_config as rc};
+use crate::{
+    CompileOutput, runtime_config as rc,
+    slot_query::{SlotObject, resolve_slot_query},
+};
 
 const MESH_NETWORK_NAME: &str = "amber_mesh";
 const DEFAULT_MESH_SUBNET: &str = "10.88.0.0/16";
@@ -63,13 +66,6 @@ struct SlotProxy {
     local_port: u16,
     remote_ip: Ipv4Addr,
     remote_port: u16,
-}
-
-#[derive(Clone, Debug)]
-struct SlotValue {
-    url: String,
-    host: String,
-    port: u16,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -308,7 +304,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     let slot_ports_by_component = allocate_local_proxy_ports(s, &program_components)?;
 
     // Build per-component slot-values and per-component slot-proxy processes.
-    let mut slot_values_by_component: HashMap<ComponentId, BTreeMap<String, SlotValue>> =
+    let mut slot_values_by_component: HashMap<ComponentId, BTreeMap<String, SlotObject>> =
         HashMap::new();
     for id in &program_components {
         slot_values_by_component.insert(*id, BTreeMap::new());
@@ -385,14 +381,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         slot_values_by_component
             .entry(consumer)
             .or_default()
-            .insert(
-                b.to.name.clone(),
-                SlotValue {
-                    url,
-                    host: "127.0.0.1".to_string(),
-                    port: local_port,
-                },
-            );
+            .insert(b.to.name.clone(), SlotObject { url });
     }
 
     // Ensure all declared slots on runnable components got bound (this should already be true after linking).
@@ -541,37 +530,6 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     let mut program_mode: HashMap<ComponentId, ProgramMode> = HashMap::new();
     let mut any_helper = false;
 
-    // Helper: resolve a `${slots.*}` query (without the `slots.` prefix) to its concrete value.
-    fn resolve_slots_query(
-        slots: &BTreeMap<String, SlotValue>,
-        query: &str,
-    ) -> Result<String, String> {
-        let mut it = query.split('.');
-        let slot_name = it
-            .next()
-            .ok_or_else(|| "invalid slots interpolation: missing slot name".to_string())?;
-        let field = it.next().ok_or_else(|| {
-            format!("invalid slots.{slot_name} interpolation: expected a field like url")
-        })?;
-        if it.next().is_some() {
-            return Err(format!(
-                "unsupported slots interpolation 'slots.{query}': only slots.<slot>.<field> is \
-                 supported (url/host/port)"
-            ));
-        }
-        let slot = slots
-            .get(slot_name)
-            .ok_or_else(|| format!("slots.{slot_name} not found"))?;
-        match field {
-            "url" => Ok(slot.url.clone()),
-            "host" => Ok(slot.host.clone()),
-            "port" => Ok(slot.port.to_string()),
-            other => Err(format!(
-                "unsupported slots field slots.{slot_name}.{other} (supported: url/host/port)"
-            )),
-        }
-    }
-
     // Attempt to resolve a config interpolation to a static string; otherwise keep it as runtime.
     #[derive(Debug)]
     enum ConfigResolution {
@@ -674,7 +632,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                     InterpolatedPart::Literal(lit) => ts.push(rc::TemplatePart::lit(lit)),
                     InterpolatedPart::Interpolation { source, query } => match source {
                         InterpolationSource::Slots => {
-                            let v = resolve_slots_query(slots, query)?;
+                            let v = resolve_slot_query(slots, query)?;
                             ts.push(rc::TemplatePart::lit(v));
                         }
                         InterpolationSource::Config => {
@@ -723,7 +681,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                     InterpolatedPart::Literal(lit) => ts.push(rc::TemplatePart::lit(lit)),
                     InterpolatedPart::Interpolation { source, query } => match source {
                         InterpolationSource::Slots => {
-                            let vv = resolve_slots_query(slots, query)?;
+                            let vv = resolve_slot_query(slots, query)?;
                             ts.push(rc::TemplatePart::lit(vv));
                         }
                         InterpolationSource::Config => {
