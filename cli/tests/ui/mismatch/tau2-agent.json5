@@ -2,7 +2,7 @@
   manifest_version: "0.1.0",
   program: {
     image: "ghcr.io/agentbeats/tau2-agent:v1.0.0",
-    args: "--llm-api ${slots.llm.url} --port 443",
+    entrypoint: "tau2-agent --llm-api ${slots.llm.url} --port 443",
     network: {
       endpoints: [
         { name: "endpoint", port: 443 },

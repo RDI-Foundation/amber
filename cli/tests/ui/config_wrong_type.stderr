@@ -1,6 +1,6 @@
 linker::invalid_config
 
-  x invalid config for /green: "one" is not of type "integer"
+  x invalid config for /green: invalid config: "one" is not of type "integer"
     ,-[<CARGO_MANIFEST_DIR>/tests/ui/config_wrong_type.json5:13:21]
  12 |         domain: "airline",
  13 |         num_trials: "one",
@@ -11,20 +11,19 @@ linker::invalid_config
 
 Advice: 
   > config schema for /green
-    ,-[<CARGO_MANIFEST_DIR>/tests/ui/tau2-evaluator.json5:22:18]
- 21 |       },
- 22 | ,->   config_schema: {
- 23 | |       type: "object",
- 24 | |       properties: {
- 25 | |         domain: { type: "string", enum: ["airline", "other"] },
- 26 | |         num_trials: { type: "integer", minimum: 1 },
- 27 | |         num_tasks: { type: "integer", minimum: 1, maximum: 4 },
- 28 | |       },
- 29 | |       required: ["domain", "num_trials", "num_tasks"],
- 30 | |       additionalProperties: false,
- 31 | |->   },
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/tau2-evaluator.json5:23:18]
+ 22 |       },
+ 23 | ,->   config_schema: {
+ 24 | |       type: "object",
+ 25 | |       properties: {
+ 26 | |         domain: { type: "string", enum: ["airline", "other"] },
+ 27 | |         num_trials: { type: "integer", minimum: 1 },
+ 28 | |         num_tasks: { type: "integer", minimum: 1, maximum: 4 },
+ 29 | |       },
+ 30 | |       required: ["domain", "num_trials", "num_tasks"],
+ 31 | |       additionalProperties: false,
+ 32 | |->   },
     : `---- config schema declared here
- 32 |       slots: {
+ 33 |       slots: {
     `----
 Error:   × check failed
-

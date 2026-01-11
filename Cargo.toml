@@ -2,11 +2,13 @@
 members = [
   "cli",
   "compiler",
+  "compose-helper",
   "json5",
   "manifest",
   "node",
   "resolver",
   "scenario",
+  "template",
 ]
 resolver = "2"
 
@@ -16,6 +18,7 @@ amber-json5 = { path = "json5" }
 amber-manifest = { path = "manifest" }
 amber-resolver = { path = "resolver" }
 amber-scenario = { path = "scenario" }
+amber-template = { path = "template" }
 base64 = "0.22.1"
 futures = "0.3.31"
 jsonschema = { version = "0.38.1", default-features = false }

@@ -69,7 +69,7 @@ This crate also provides `manifest::lint::lint_manifest` for non-fatal checks:
 * Every declared **slot** should be either:
 
   * **bound into `self`** (some binding has `to: "self"` and `slot: "<name>"`), or
-  * **referenced by the program** (via `${slots.<name>...}` in `program.args` or `program.env`)
+  * **referenced by the program** (via `${slots.<name>...}` in `program.entrypoint` or `program.env`)
 * Every declared **provide** should be either:
 
   * **exported** (some export target points at `self.<name>` or `<name>`), or

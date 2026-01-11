@@ -181,6 +181,7 @@ fn binding_sugar_forms_parse() {
           manifest_version: "0.1.0",
           program: {
             image: "x",
+            entrypoint: ["x"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           components: {
@@ -317,6 +318,7 @@ fn binding_round_trip_through_canonical_json_parses() {
           manifest_version: "0.1.0",
           program: {
             image: "x",
+            entrypoint: ["x"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           components: {
@@ -414,6 +416,7 @@ fn manifest_deserialize_error_includes_path() {
           manifest_version: "0.1.0",
           program: {
             image: "x",
+            entrypoint: ["x"],
             network: { endpoints: [ { name: "endpoint", port: "80" } ] }
           }
         }
@@ -855,6 +858,7 @@ fn manifest_digest_is_stable_across_json5_formatting() {
           manifest_version: "0.1.0",
           program: {
             image: "x",
+            entrypoint: ["x"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           provides: { api: { kind: "http", endpoint: "endpoint" } },
@@ -874,6 +878,7 @@ fn manifest_digest_is_stable_across_json5_formatting() {
           },
           program: {
             image: "x",
+            entrypoint: ["x"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           manifest_version: "0.1.0",
@@ -894,6 +899,7 @@ fn endpoint_validation_fails_for_unknown_reference() {
           manifest_version: "0.1.0",
           program: {
             image: "x",
+            entrypoint: ["x"],
             network: { endpoints: [ { name: "endpoint", port: 80 } ] }
           },
           provides: {
@@ -915,6 +921,7 @@ fn endpoint_validation_fails_for_missing_provide_endpoint() {
           manifest_version: "0.1.0",
           program: {
             image: "x",
+            entrypoint: ["x"],
             network: { endpoints: [ { name: "endpoint", port: 80 } ] }
           },
           provides: {
@@ -939,6 +946,7 @@ fn duplicate_endpoint_names_error() {
           manifest_version: "0.1.0",
           program: {
             image: "x",
+            entrypoint: ["x"],
             network: {
               endpoints: [
                 { name: "endpoint", port: 80 },
@@ -964,6 +972,7 @@ fn endpoint_validation_passes_for_defined_reference() {
           manifest_version: "0.1.0",
           program: {
             image: "x",
+            entrypoint: ["x"],
             network: { endpoints: [ { name: "endpoint", port: 80 } ] }
           },
           provides: {
@@ -1015,6 +1024,7 @@ fn duplicate_keys_in_program_env_errors() {
           manifest_version: "0.1.0",
           program: {
             image: "x",
+            entrypoint: ["x"],
             env: { FOO: "a", FOO: "b" }
           }
         }
@@ -1066,6 +1076,7 @@ fn provide_names_cannot_contain_dots() {
           },
           program: {
             image: "x",
+            entrypoint: ["x"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
         }
@@ -1178,6 +1189,7 @@ fn export_targets_serialize_with_self_prefix() {
           manifest_version: "0.1.0",
           program: {
             image: "x",
+            entrypoint: ["x"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           provides: { api: { kind: "http", endpoint: "endpoint" } },
@@ -1204,6 +1216,7 @@ fn slots_and_provides_cannot_share_names() {
           manifest_version: "0.1.0",
           program: {
             image: "x",
+            entrypoint: ["x"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           slots: { api: { kind: "http" } },
@@ -1379,6 +1392,7 @@ fn slot_used_in_program_env_is_not_linted() {
           slots: { llm: { kind: "llm" } },
           program: {
             image: "x",
+            entrypoint: ["x"],
             env: { LLM_URL: "${slots.llm.url}" },
           },
         }
@@ -1399,6 +1413,7 @@ fn unused_provide_is_linted() {
           manifest_version: "0.1.0",
           program: {
             image: "x",
+            entrypoint: ["x"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           provides: { api: { kind: "http", endpoint: "endpoint" } },
@@ -1418,7 +1433,7 @@ fn unused_program_is_linted() {
     let input = r#"
         {
           manifest_version: "0.1.0",
-          program: { image: "x" },
+          program: { image: "x", entrypoint: ["x"] },
         }
         "#;
     let raw = parse_raw(input);
@@ -1438,6 +1453,7 @@ fn program_used_by_binding_is_not_linted() {
           manifest_version: "0.1.0",
           program: {
             image: "x",
+            entrypoint: ["x"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           components: {
@@ -1466,6 +1482,7 @@ fn program_used_by_export_is_not_linted() {
           manifest_version: "0.1.0",
           program: {
             image: "x",
+            entrypoint: ["x"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           provides: { api: { kind: "http", endpoint: "endpoint" } },
@@ -1525,6 +1542,7 @@ fn manifest_doc_error_unknown_export_target_points_to_target() {
           manifest_version: "0.1.0",
           program: {
             image: "x",
+            entrypoint: ["x"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           provides: {
@@ -1551,6 +1569,7 @@ fn manifest_doc_error_duplicate_binding_target_marks_second_binding() {
           manifest_version: "0.1.0",
           program: {
             image: "x",
+            entrypoint: ["x"],
             network: { endpoints: [{ name: "a", port: 80 }, { name: "b", port: 81 }] },
           },
           slots: {
@@ -1586,6 +1605,7 @@ fn exported_provide_is_not_linted() {
           manifest_version: "0.1.0",
           program: {
             image: "x",
+            entrypoint: ["x"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           provides: {

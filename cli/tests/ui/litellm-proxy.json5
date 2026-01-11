@@ -2,7 +2,7 @@
   manifest_version: "0.1.0",
   program: {
     image: "nginx:1.27-alpine",
-    args: [
+    entrypoint: [
       "sh",
       "-lc",
       "cat > /etc/nginx/conf.d/default.conf <<EOF\nserver {\n  listen 8081;\n  location / {\n    proxy_pass $BACKEND_URL/v1$request_uri;\n  }\n}\nserver {\n  listen 8082;\n  location / {\n    proxy_pass $BACKEND_URL/api$request_uri;\n  }\n}\nEOF\nnginx -g 'daemon off;'",

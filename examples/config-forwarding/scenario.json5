@@ -1,0 +1,24 @@
+{
+  manifest_version: "0.1.0",
+
+  config_schema: {
+    type: "object",
+    properties: {
+      api_key: { type: "string" },
+    },
+    required: ["api_key"],
+    additionalProperties: false,
+  },
+
+  components: {
+    api_client: {
+      manifest: "./api-client.json5",
+      config: {
+        api_key: "${config.api_key}",
+        system_prompt: "You are an agent.",
+      },
+    },
+  },
+
+  exports: { api: "#api_client.api" },
+}

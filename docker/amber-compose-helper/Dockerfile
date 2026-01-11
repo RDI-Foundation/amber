@@ -6,11 +6,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     g++ \
+    musl-tools \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 COPY rust-toolchain.toml .
 RUN rustup show
+RUN rustup target add x86_64-unknown-linux-musl
 
 FROM base-builder AS builder
 
@@ -41,30 +43,11 @@ COPY scenario ./scenario
 COPY template ./template
 COPY node ./node
 
-ARG BUILD_MODE=release
-RUN if [ "$BUILD_MODE" = "release" ]; then \
-      cargo build --locked --release -p amber-node; \
-    else \
-      cargo build -p amber-node; \
-    fi
+RUN cargo build -p amber-compose-helper --release --locked --target x86_64-unknown-linux-musl
 
-FROM debian:13-slim AS runtime
+FROM debian:13-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    tini \
-    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/amber-compose-helper /amber-helper
+RUN chmod 0755 /amber-helper
 
-ARG USERNAME=amber
-ARG USER_UID=1001
-ARG USER_GID=${USER_UID}
-RUN groupadd --gid ${USER_GID} ${USERNAME} && \
-    useradd --uid ${USER_UID} --gid ${USER_GID} --shell /bin/false --create-home ${USERNAME}
-
-WORKDIR /home/${USERNAME}/app
-
-ARG BUILD_MODE=release
-COPY --from=builder --chown=${USERNAME}:${USERNAME} /app/target/${BUILD_MODE}/amber-node /usr/local/bin/node
-
-USER ${USERNAME}
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/node"]
+ENTRYPOINT ["/amber-helper"]

@@ -2,7 +2,8 @@
   manifest_version: "0.1.0",
   program: {
     image: "ghcr.io/agentbeats/tau2-evaluator:v1.0.0",
-    args: [
+    entrypoint: [
+      "tau2-evaluator",
       "--domain", "${config.domain}",
       "--llm", "${slots.llm.url}",
       "--agent", "${slots.agent.url}",

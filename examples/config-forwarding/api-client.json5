@@ -1,0 +1,30 @@
+{
+  manifest_version: "0.1.0",
+
+  config_schema: {
+    type: "object",
+    properties: {
+      api_key: { type: "string" },
+      system_prompt: { type: "string" },
+    },
+    required: ["api_key", "system_prompt"],
+    additionalProperties: false,
+  },
+
+  program: {
+    image: "busybox:1.36",
+    args: [
+      "sh",
+      "-c",
+      "echo \"api-client starting; api_key=${config.api_key}\"; exec httpd -f -p 8080",
+    ],
+    network: {
+      endpoints: [{ name: "http", port: 8080 }],
+    },
+  },
+
+  provides: {
+    api: { kind: "http", endpoint: "http" },
+  },
+  exports: { api: "api" },
+}

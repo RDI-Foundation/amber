@@ -83,6 +83,7 @@ fn dce_prunes_unused_transitive_subtree() {
           manifest_version: "0.1.0",
           program: {
             image: "wrapper",
+            entrypoint: ["wrapper"],
             network: { endpoints: [{ name: "admin_api", port: 80 }] },
           },
           slots: { litellm: { kind: "http" } },
@@ -98,6 +99,7 @@ fn dce_prunes_unused_transitive_subtree() {
           manifest_version: "0.1.0",
           program: {
             image: "router",
+            entrypoint: ["router"],
             network: {
               endpoints: [
                 { name: "llm", port: 80 },
@@ -327,6 +329,7 @@ fn dce_keeps_dependencies_for_program_slots() {
           manifest_version: "0.1.0",
           program: {
             image: "input",
+            entrypoint: ["input"],
             network: { endpoints: [{ name: "input", port: 80 }] },
           },
           provides: { input: { kind: "mcp", endpoint: "input" } },
@@ -341,6 +344,7 @@ fn dce_keeps_dependencies_for_program_slots() {
           manifest_version: "0.1.0",
           program: {
             image: "llm",
+            entrypoint: ["llm"],
             network: { endpoints: [{ name: "llm", port: 80 }] },
           },
           provides: { llm: { kind: "llm", endpoint: "llm" } },
@@ -509,6 +513,7 @@ fn dce_keeps_program_slots_from_env() {
           manifest_version: "0.1.0",
           program: {
             image: "app",
+            entrypoint: ["app"],
             env: { ADMIN_URL: "${slots.admin.url}" },
             network: { endpoints: [{ name: "out", port: 80 }] },
           },
@@ -532,6 +537,7 @@ fn dce_keeps_program_slots_from_env() {
           manifest_version: "0.1.0",
           program: {
             image: "admin",
+            entrypoint: ["admin"],
             network: { endpoints: [{ name: "admin", port: 80 }] },
           },
           provides: { admin: { kind: "mcp", endpoint: "admin" } },

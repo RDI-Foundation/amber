@@ -12,6 +12,7 @@ mod frontend;
 mod linker;
 mod manifest_table;
 mod provenance;
+mod runtime_config;
 mod store;
 
 pub mod bundle;

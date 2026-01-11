@@ -50,7 +50,7 @@ flowchart TB
 
   subgraph ChildB["Child B (consumer)"]
     Bslot["slots:<br/>llm (kind=llm)<br/>admin_api (kind=mcp)"]
-    Bprog["program:<br/>args/env can interpolate<br/>\${slots.*} + \${config.*}"]
+    Bprog["program:<br/>entrypoint/env can interpolate<br/>\${slots.*} + \${config.*}"]
   end
 
   ChildA -->|"bind: ChildA.llm → ChildB.llm"| ChildB
@@ -297,8 +297,12 @@ This is a Rust workspace:
 * `docker/amber-sidecar/`
   Dockerfile for the published sidecar image used by the Docker Compose reporter
 
+* `docker/amber-compose-helper/`
+  Dockerfile for the helper image used to render runtime config in Docker Compose output
+
 * `examples/`
 
+  * `config-forwarding/`: root config forwarding into a child component
   * `tau2/`: end-to-end agent/evaluator/router/env composition
   * `reexport/`: minimal example demonstrating export forwarding through components
 

@@ -207,6 +207,7 @@ async fn compile_twice_unpinned_fails_when_sources_removed() {
           manifest_version: "0.1.0",
           program: {
             image: "a",
+            entrypoint: ["a"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           provides: { api: { kind: "http", endpoint: "endpoint" } },
@@ -222,6 +223,7 @@ async fn compile_twice_unpinned_fails_when_sources_removed() {
           manifest_version: "0.1.0",
           program: {
             image: "b",
+            entrypoint: ["b"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           provides: { llm: { kind: "llm", endpoint: "endpoint" } },
@@ -293,6 +295,7 @@ async fn compile_twice_with_digest_pins_succeeds_when_sources_removed() {
           manifest_version: "0.1.0",
           program: {
             image: "a",
+            entrypoint: ["a"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           provides: { api: { kind: "http", endpoint: "endpoint" } },
@@ -304,6 +307,7 @@ async fn compile_twice_with_digest_pins_succeeds_when_sources_removed() {
           manifest_version: "0.1.0",
           program: {
             image: "b",
+            entrypoint: ["b"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           provides: { llm: { kind: "llm", endpoint: "endpoint" } },
@@ -567,6 +571,7 @@ async fn binding_rejects_missing_child_slot() {
           manifest_version: "0.1.0",
           program: {
             image: "child",
+            entrypoint: ["child"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           provides: { api: { kind: "http", endpoint: "endpoint" } },
@@ -585,6 +590,7 @@ async fn binding_rejects_missing_child_slot() {
               }},
               program: {{
                 image: "root",
+                entrypoint: ["root"],
                 network: {{ endpoints: [{{ name: "endpoint", port: 80 }}] }},
               }},
               provides: {{ api: {{ kind: "http", endpoint: "endpoint" }} }},
@@ -711,6 +717,7 @@ async fn duplicate_slot_bindings_across_manifests_error() {
           manifest_version: "0.1.0",
           program: {
             image: "child",
+            entrypoint: ["child"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           slots: { api: { kind: "http" } },
@@ -732,6 +739,7 @@ async fn duplicate_slot_bindings_across_manifests_error() {
               }},
               program: {{
                 image: "root",
+                entrypoint: ["root"],
                 network: {{ endpoints: [{{ name: "endpoint", port: 80 }}] }},
               }},
               provides: {{ api: {{ kind: "http", endpoint: "endpoint" }} }},
@@ -774,6 +782,7 @@ async fn type_mismatch_reports_expected_and_got() {
           manifest_version: "0.1.0",
           program: {
             image: "child",
+            entrypoint: ["child"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           provides: { http: { kind: "http", endpoint: "endpoint" } },
@@ -832,6 +841,7 @@ async fn delegated_export_chain_resolves_binding_source() {
           manifest_version: "0.1.0",
           program: {
             image: "grand",
+            entrypoint: ["grand"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           provides: { api: { kind: "http", endpoint: "endpoint" } },
@@ -1061,6 +1071,7 @@ async fn compile_emits_manifest_lints() {
           manifest_version: "0.1.0",
           program: {
             image: "root",
+            entrypoint: ["root"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
           provides: { api: { kind: "http", endpoint: "endpoint" } },
@@ -1167,7 +1178,7 @@ async fn bundle_compile_avoids_http_requests() {
     let child_manifest = r#"
         {
           manifest_version: "0.1.0",
-          program: { image: "child" },
+          program: { image: "child", entrypoint: ["child"] },
         }
         "#
     .to_string();
@@ -1220,7 +1231,7 @@ async fn bundle_compile_supports_relative_refs_with_digest_pins() {
     let child_contents = r#"
         {
           manifest_version: "0.1.0",
-          program: { image: "child" },
+          program: { image: "child", entrypoint: ["child"] },
         }
         "#;
     write_file(&child_path, child_contents);

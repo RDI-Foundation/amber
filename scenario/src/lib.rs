@@ -193,7 +193,7 @@ pub struct Component {
     /// Optional instance config (authored at the use-site).
     pub config: Option<Value>,
 
-    /// Program definition (image/args/env/network) extracted from the manifest.
+    /// Program definition (image/entrypoint/env/network) extracted from the manifest.
     pub program: Option<Program>,
 
     /// Declared input slots (capability requirements).

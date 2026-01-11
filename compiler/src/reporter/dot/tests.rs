@@ -120,7 +120,7 @@ fn dot_renders_root_program_node() {
     let root_manifest: Manifest = r#"
         {
           manifest_version: "0.1.0",
-          program: { image: "root" },
+          program: { image: "root", entrypoint: ["root"] },
         }
     "#
     .parse()
@@ -179,6 +179,7 @@ fn dot_renders_root_exports_as_endpoints() {
 	              manifest_version: "0.1.0",
 	              program: {
 	                image: "b",
+	                entrypoint: ["b"],
 	                network: {
 	                  endpoints: [{ name: "ep", port: 8080 }],
 	                },
@@ -308,6 +309,7 @@ fn dot_renders_root_exports_from_root_component() {
               manifest_version: "0.1.0",
               program: {
                 image: "root",
+                entrypoint: ["root"],
                 network: { endpoints: [{ name: "out", port: 80 }] },
               },
               provides: { out: { kind: "http", endpoint: "out" } },

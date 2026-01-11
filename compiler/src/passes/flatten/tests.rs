@@ -68,6 +68,7 @@ fn flatten_removes_pure_routing_nodes_and_preserves_debug_data() {
           manifest_version: "0.1.0",
           program: {
             image: "child",
+            entrypoint: ["child"],
             network: { endpoints: [{ name: "cap", port: 80 }] },
           },
           provides: { cap: { kind: "http", endpoint: "cap" } },
@@ -241,6 +242,7 @@ fn flatten_allows_same_name_siblings() {
           manifest_version: "0.1.0",
           program: {
             image: "child_a",
+            entrypoint: ["child_a"],
             network: { endpoints: [{ name: "cap", port: 80 }] },
           },
           provides: { cap: { kind: "http", endpoint: "cap" } },
@@ -255,6 +257,7 @@ fn flatten_allows_same_name_siblings() {
           manifest_version: "0.1.0",
           program: {
             image: "child_b",
+            entrypoint: ["child_b"],
             network: { endpoints: [{ name: "cap", port: 80 }] },
           },
           provides: { cap: { kind: "http", endpoint: "cap" } },

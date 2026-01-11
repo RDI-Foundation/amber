@@ -22,26 +22,26 @@ Advice:
 
 Advice: 
   > slots declared on component /green
-    ,-[<CARGO_MANIFEST_DIR>/tests/ui/tau2-evaluator.json5:32:10]
- 31 |       },
- 32 | ,->   slots: {
- 33 | |       env: { kind: "mcp", profile: "openenv" },
- 34 | |       llm: { kind: "llm" },
- 35 | |       agent: { kind: "a2a" },
- 36 | |       admin_api: { kind: "mcp" },
- 37 | |->   },
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/tau2-evaluator.json5:33:10]
+ 32 |       },
+ 33 | ,->   slots: {
+ 34 | |       env: { kind: "mcp", profile: "openenv" },
+ 35 | |       llm: { kind: "llm" },
+ 36 | |       agent: { kind: "a2a" },
+ 37 | |       admin_api: { kind: "mcp" },
+ 38 | |->   },
     : `---- slots declared here
- 38 |       provides: {
+ 39 |       provides: {
     `----
 linker::unbound_slot
 
   x slot `llm` on component /green is not bound (non-optional slots must be filled)
-    ,-[<CARGO_MANIFEST_DIR>/tests/ui/tau2-evaluator.json5:34:5]
- 33 |     env: { kind: "mcp", profile: "openenv" },
- 34 |     llm: { kind: "llm" },
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/tau2-evaluator.json5:35:5]
+ 34 |     env: { kind: "mcp", profile: "openenv" },
+ 35 |     llm: { kind: "llm" },
     :     ^|^
     :      `-- slot declared here
- 35 |     agent: { kind: "a2a" },
+ 36 |     agent: { kind: "a2a" },
     `----
 
 Advice: 
@@ -54,4 +54,3 @@ Advice:
  10 |       manifest: "./tau2-evaluator.json5",
     `----
 Error:   × check failed
-

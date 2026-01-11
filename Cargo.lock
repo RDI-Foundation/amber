@@ -73,6 +73,7 @@ dependencies = [
  "amber-manifest",
  "amber-resolver",
  "amber-scenario",
+ "amber-template",
  "base64",
  "dashmap",
  "futures",
@@ -84,6 +85,18 @@ dependencies = [
  "thiserror 2.0.17",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "amber-compose-helper"
+version = "0.1.0"
+dependencies = [
+ "amber-template",
+ "base64",
+ "jsonschema",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
@@ -144,6 +157,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.17",
+]
+
+[[package]]
+name = "amber-template"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

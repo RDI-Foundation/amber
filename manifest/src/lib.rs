@@ -79,6 +79,13 @@ pub enum Error {
     #[diagnostic(code(manifest::unclosed_quote))]
     UnclosedQuote,
 
+    #[error(
+        "program.entrypoint must be non-empty (implicit image entrypoints are unsupported; set \
+         `program.entrypoint`/`program.args` to an explicit command)"
+    )]
+    #[diagnostic(code(manifest::empty_entrypoint))]
+    EmptyEntrypoint,
+
     #[error("export `{export}` references unknown capability `{target}`")]
     #[diagnostic(code(manifest::unknown_export_target))]
     UnknownExportTarget { export: String, target: String },
@@ -609,7 +616,7 @@ impl<'de> Deserialize<'de> for ProgramArgs {
 #[non_exhaustive]
 pub struct Program {
     pub image: String,
-    #[serde(default)]
+    #[serde(default, alias = "entrypoint")]
     pub args: ProgramArgs,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
@@ -1567,6 +1574,12 @@ impl RawManifest {
         let bindings_out = build_bindings(bindings, &ctx)?;
         let exports_out = build_exports(exports, &ctx)?;
         validate_endpoints(program.as_ref(), &provides)?;
+
+        if let Some(program) = program.as_ref()
+            && program.args.0.is_empty()
+        {
+            return Err(Error::EmptyEntrypoint);
+        }
 
         Ok(Manifest {
             manifest_version,

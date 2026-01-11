@@ -2,6 +2,7 @@
   manifest_version: "0.1.0",
   program: {
     image: "ghcr.io/sierra-research/tau2:v2",
+    entrypoint: ["tau2"],
     network: {
       endpoints: [
         { name: "endpoint", port: 8080 },

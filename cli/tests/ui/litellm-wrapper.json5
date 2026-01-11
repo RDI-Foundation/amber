@@ -2,7 +2,7 @@
   manifest_version: "0.1.0",
   program: {
     image: "ghcr.io/amber-protocol/litellm-wrapper:latest",
-    args: ["--litellm-url", "${slots.litellm.url}"],
+    entrypoint: ["litellm-wrapper", "--litellm-url", "${slots.litellm.url}"],
     network: {
       endpoints: [
         { name: "admin-api", port: 80 },

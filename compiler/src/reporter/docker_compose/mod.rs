@@ -4,23 +4,36 @@ use std::{
     net::Ipv4Addr,
 };
 
+use amber_manifest::{InterpolatedPart, InterpolationSource, Manifest};
 use amber_scenario::{ComponentId, Scenario};
+use base64::Engine as _;
 use miette::LabeledSpan;
 use serde::Serialize;
 use serde_json::Value;
 
 use super::{Reporter, ReporterError};
-use crate::CompileOutput;
+use crate::{CompileOutput, runtime_config as rc};
 
 const MESH_NETWORK_NAME: &str = "amber_mesh";
-const MESH_SUBNET: &str = "10.88.0.0/16";
-const MESH_GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 1);
+const DEFAULT_MESH_SUBNET: &str = "10.88.0.0/16";
 
 const SIDECAR_IMAGE: &str = "ghcr.io/rdi-foundation/amber-sidecar:main";
+const HELPER_IMAGE: &str = "ghcr.io/rdi-foundation/amber-compose-helper:v1";
+const HELPER_VOLUME_NAME: &str = "amber-helper-bin";
+const HELPER_INIT_SERVICE: &str = "amber-init";
+const HELPER_BIN_DIR: &str = "/amber/bin";
+const HELPER_BIN_PATH: &str = "/amber/bin/amber-helper";
 
 const LOCAL_PROXY_PORT_BASE: u16 = 20000;
 const EXPORT_PORT_BASE: u16 = 18000;
 const EXPORT_HOST: &str = "127.0.0.1";
+
+#[derive(Clone, Debug)]
+struct MeshNetwork {
+    cidr: String,
+    base: Ipv4Addr,
+    gateway: Ipv4Addr,
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DockerComposeReporter;
@@ -189,10 +202,22 @@ impl DockerComposeError {
 type DcResult<T> = Result<T, DockerComposeError>;
 
 fn render_docker_compose(output: &CompileOutput) -> Result<String, ReporterError> {
-    render_docker_compose_inner(&output.scenario).map_err(|err| err.into_reporter_error(output))
+    render_docker_compose_inner(output).map_err(|err| err.into_reporter_error(output))
 }
 
-fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
+fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
+    let s = &output.scenario;
+    let mesh = mesh_network()?;
+
+    let manifests = crate::manifest_table::build_manifest_table(&s.components, &output.store)
+        .map_err(|e| {
+            format!(
+                "internal error: missing manifest content for {} (digest {})",
+                component_label(s, e.component),
+                e.digest
+            )
+        })?;
+
     // Backend prerequisite: strong dependency graph must be acyclic.
     // (Ignoring weak edges is the semantics you described.)
     if let Err(cycle) = amber_scenario::graph::topo_order(s) {
@@ -229,7 +254,7 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
                 sidecar,
             },
         );
-        ips.insert(*id, sidecar_ipv4(*id)?);
+        ips.insert(*id, sidecar_ipv4(&mesh, *id)?);
     }
 
     // Validate: every binding endpoint is between program components.
@@ -439,9 +464,438 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
     // Compose YAML
     let mut out = String::new();
 
+    // ---- runtime config / helper decision ----
+    // Compose root-only config templates for all components so we can decide which services need the helper.
+    let root_id = s.root;
+    let root_schema = manifests[root_id.0]
+        .as_ref()
+        .and_then(|m| m.config_schema())
+        .map(|s| &s.0);
+
+    let root_template = if root_schema.is_some() {
+        rc::RootConfigTemplate::Root
+    } else {
+        rc::RootConfigTemplate::Node(rc::ConfigNode::empty_object())
+    };
+
+    let mut composed_templates: HashMap<ComponentId, rc::RootConfigTemplate> = HashMap::new();
+
+    fn compose_templates_dfs(
+        s: &Scenario,
+        id: ComponentId,
+        manifests: &[Option<std::sync::Arc<Manifest>>],
+        parent_schema: Option<&Value>,
+        parent_template: &rc::RootConfigTemplate,
+        out: &mut HashMap<ComponentId, rc::RootConfigTemplate>,
+    ) -> Result<(), String> {
+        let c = s.component(id);
+        let m = manifests[id.0].as_ref().expect("manifest should exist");
+        let schema = m.config_schema().map(|s| &s.0);
+
+        let this_template = if id == s.root {
+            if schema.is_some() {
+                rc::RootConfigTemplate::Root
+            } else {
+                rc::RootConfigTemplate::Node(rc::ConfigNode::empty_object())
+            }
+        } else if schema.is_none() {
+            rc::RootConfigTemplate::Node(rc::ConfigNode::empty_object())
+        } else {
+            let initial = rc::parse_instance_config_template(c.config.as_ref(), parent_schema)?;
+            let composed = rc::compose_config_template(initial, parent_template)?.simplify();
+            rc::RootConfigTemplate::Node(composed)
+        };
+
+        out.insert(id, this_template.clone());
+
+        for &child in &c.children {
+            compose_templates_dfs(s, child, manifests, schema, &this_template, out)?;
+        }
+        Ok(())
+    }
+
+    compose_templates_dfs(
+        s,
+        s.root,
+        &manifests,
+        root_schema,
+        &root_template,
+        &mut composed_templates,
+    )
+    .map_err(|e| format!("failed to compose component config templates: {e}"))?;
+
+    // Build per-program service mode (direct vs helper) + payloads.
+    #[derive(Clone, Debug)]
+    enum ProgramMode {
+        Direct {
+            entrypoint: Vec<String>,
+            env: BTreeMap<String, String>,
+        },
+        Helper {
+            template_spec_b64: String,
+            component_cfg_template_b64: String,
+            component_schema_b64: String,
+        },
+    }
+
+    let mut program_mode: HashMap<ComponentId, ProgramMode> = HashMap::new();
+    let mut any_helper = false;
+
+    // Helper: resolve a `${slots.*}` query (without the `slots.` prefix) to its concrete value.
+    fn resolve_slots_query(
+        slots: &BTreeMap<String, SlotValue>,
+        query: &str,
+    ) -> Result<String, String> {
+        let mut it = query.split('.');
+        let slot_name = it
+            .next()
+            .ok_or_else(|| "invalid slots interpolation: missing slot name".to_string())?;
+        let field = it.next().ok_or_else(|| {
+            format!("invalid slots.{slot_name} interpolation: expected a field like url")
+        })?;
+        if it.next().is_some() {
+            return Err(format!(
+                "unsupported slots interpolation 'slots.{query}': only slots.<slot>.<field> is \
+                 supported (url/host/port)"
+            ));
+        }
+        let slot = slots
+            .get(slot_name)
+            .ok_or_else(|| format!("slots.{slot_name} not found"))?;
+        match field {
+            "url" => Ok(slot.url.clone()),
+            "host" => Ok(slot.host.clone()),
+            "port" => Ok(slot.port.to_string()),
+            other => Err(format!(
+                "unsupported slots field slots.{slot_name}.{other} (supported: url/host/port)"
+            )),
+        }
+    }
+
+    // Attempt to resolve a config interpolation to a static string; otherwise keep it as runtime.
+    #[derive(Debug)]
+    enum ConfigResolution {
+        Static(String),
+        Runtime,
+    }
+
+    fn resolve_config_query_for_program(
+        template: Option<&rc::ConfigNode>,
+        query: &str,
+    ) -> Result<ConfigResolution, String> {
+        let Some(template) = template else {
+            return Ok(ConfigResolution::Runtime);
+        };
+
+        // Empty query means "the whole config".
+        if query.is_empty() {
+            return if !template.contains_runtime() {
+                let v = template.evaluate_static()?;
+                Ok(ConfigResolution::Static(rc::stringify_for_interpolation(
+                    &v,
+                )?))
+            } else {
+                Ok(ConfigResolution::Runtime)
+            };
+        }
+
+        // Traverse until we either:
+        // - reach the node (resolved)
+        // - hit a runtime insert (ConfigRef) before path ends (runtime)
+        // - find a missing key (error)
+        let mut cur = template;
+        for seg in query.split('.') {
+            if seg.is_empty() {
+                return Err(format!("invalid config path {query:?}: empty segment"));
+            }
+            match cur {
+                rc::ConfigNode::Object(map) => {
+                    let Some(next) = map.get(seg) else {
+                        return Err(format!("config.{query} not found (missing key {seg:?})"));
+                    };
+                    cur = next;
+                }
+                rc::ConfigNode::ConfigRef(_) => return Ok(ConfigResolution::Runtime),
+                _ => {
+                    return Err(format!(
+                        "config.{query} not found (encountered non-object before segment {seg:?})"
+                    ));
+                }
+            }
+        }
+
+        if !cur.contains_runtime() {
+            let v = cur.evaluate_static()?;
+            Ok(ConfigResolution::Static(rc::stringify_for_interpolation(
+                &v,
+            )?))
+        } else {
+            Ok(ConfigResolution::Runtime)
+        }
+    }
+
+    fn render_template_string_static(ts: &rc::TemplateString) -> Result<String, String> {
+        if rc::template_string_is_runtime(ts) {
+            return Err(
+                "internal error: attempted to render a runtime template string statically"
+                    .to_string(),
+            );
+        }
+        let mut out = String::new();
+        for part in ts {
+            match part {
+                rc::TemplatePart::Lit { lit } => out.push_str(lit),
+                rc::TemplatePart::Config { .. } => unreachable!(),
+            }
+        }
+        Ok(out)
+    }
+
+    for id in &program_components {
+        let c = s.component(*id);
+        let program = c.program.as_ref().unwrap();
+
+        let slots = slot_values_by_component.get(id).unwrap();
+
+        // Root-only composed config template (if available). Root component uses runtime root config.
+        let template_opt: Option<&rc::ConfigNode> = match composed_templates.get(id) {
+            Some(rc::RootConfigTemplate::Node(node)) => Some(node),
+            _ => None,
+        };
+
+        // Build template spec with slots resolved and config either resolved (static) or preserved.
+        let mut entrypoint_ts: Vec<rc::TemplateString> = Vec::new();
+        let mut needs_helper = false;
+
+        for (idx, arg) in program.args.0.iter().enumerate() {
+            let mut ts: rc::TemplateString = Vec::new();
+            for part in &arg.parts {
+                match part {
+                    InterpolatedPart::Literal(lit) => ts.push(rc::TemplatePart::lit(lit)),
+                    InterpolatedPart::Interpolation { source, query } => match source {
+                        InterpolationSource::Slots => {
+                            let v = resolve_slots_query(slots, query)?;
+                            ts.push(rc::TemplatePart::lit(v));
+                        }
+                        InterpolationSource::Config => {
+                            match resolve_config_query_for_program(template_opt, query)? {
+                                ConfigResolution::Static(v) => ts.push(rc::TemplatePart::lit(v)),
+                                ConfigResolution::Runtime => {
+                                    ts.push(rc::TemplatePart::config(query.clone()));
+                                    needs_helper = true;
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(format!(
+                                "unsupported interpolation source {other} in {} \
+                                 program.entrypoint[{idx}]",
+                                component_label(s, *id)
+                            )
+                            .into());
+                        }
+                    },
+                    _ => {
+                        return Err(format!(
+                            "unsupported interpolation part in {} program.entrypoint[{idx}]",
+                            component_label(s, *id)
+                        )
+                        .into());
+                    }
+                }
+            }
+            if ts.is_empty() {
+                return Err(format!(
+                    "internal error: produced empty template for {} program.entrypoint[{idx}]",
+                    component_label(s, *id)
+                )
+                .into());
+            }
+            entrypoint_ts.push(ts);
+        }
+
+        // program.env
+        let mut env_ts: BTreeMap<String, rc::TemplateString> = BTreeMap::new();
+        for (k, v) in &program.env {
+            let mut ts: rc::TemplateString = Vec::new();
+            for part in &v.parts {
+                match part {
+                    InterpolatedPart::Literal(lit) => ts.push(rc::TemplatePart::lit(lit)),
+                    InterpolatedPart::Interpolation { source, query } => match source {
+                        InterpolationSource::Slots => {
+                            let vv = resolve_slots_query(slots, query)?;
+                            ts.push(rc::TemplatePart::lit(vv));
+                        }
+                        InterpolationSource::Config => {
+                            match resolve_config_query_for_program(template_opt, query)? {
+                                ConfigResolution::Static(vv) => ts.push(rc::TemplatePart::lit(vv)),
+                                ConfigResolution::Runtime => {
+                                    ts.push(rc::TemplatePart::config(query.clone()));
+                                    needs_helper = true;
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(format!(
+                                "unsupported interpolation source {other} in {} program.env.{k}",
+                                component_label(s, *id)
+                            )
+                            .into());
+                        }
+                    },
+                    _ => {
+                        return Err(format!(
+                            "unsupported interpolation part in {} program.env.{k}",
+                            component_label(s, *id)
+                        )
+                        .into());
+                    }
+                }
+            }
+            env_ts.insert(k.clone(), ts);
+        }
+
+        if needs_helper {
+            any_helper = true;
+
+            let m = manifests[id.0].as_ref().expect("manifest should exist");
+            let schema = m
+                .config_schema()
+                .ok_or_else(|| {
+                    format!(
+                        "internal error: helper-needed service {} has no config_schema",
+                        component_label(s, *id)
+                    )
+                })?
+                .0
+                .clone();
+
+            let cfg_template_value = composed_templates
+                .get(id)
+                .expect("template exists")
+                .to_json_ir();
+
+            let spec = rc::TemplateSpec {
+                program: rc::ProgramTemplateSpec {
+                    entrypoint: entrypoint_ts,
+                    env: env_ts,
+                },
+            };
+
+            let b64 = base64::engine::general_purpose::STANDARD;
+
+            let spec_json = serde_json::to_vec(&spec).map_err(|e| {
+                format!(
+                    "failed to serialize template spec for {}: {e}",
+                    component_label(s, *id)
+                )
+            })?;
+            let spec_b64 = b64.encode(spec_json);
+
+            let template_json = serde_json::to_vec(&cfg_template_value).map_err(|e| {
+                format!(
+                    "failed to serialize component config template for {}: {e}",
+                    component_label(s, *id)
+                )
+            })?;
+            let template_b64 = b64.encode(template_json);
+
+            let schema_json = serde_json::to_vec(&rc::canonical_json(&schema)).map_err(|e| {
+                format!(
+                    "failed to serialize component config schema for {}: {e}",
+                    component_label(s, *id)
+                )
+            })?;
+            let schema_b64 = b64.encode(schema_json);
+
+            program_mode.insert(
+                *id,
+                ProgramMode::Helper {
+                    template_spec_b64: spec_b64,
+                    component_cfg_template_b64: template_b64,
+                    component_schema_b64: schema_b64,
+                },
+            );
+        } else {
+            // Fully resolved: render to concrete entrypoint/env.
+            let mut rendered_entrypoint: Vec<String> = Vec::new();
+            for ts in entrypoint_ts {
+                rendered_entrypoint.push(render_template_string_static(&ts)?);
+            }
+
+            let mut rendered_env: BTreeMap<String, String> = BTreeMap::new();
+            for (k, ts) in env_ts {
+                rendered_env.insert(k, render_template_string_static(&ts)?);
+            }
+
+            program_mode.insert(
+                *id,
+                ProgramMode::Direct {
+                    entrypoint: rendered_entrypoint,
+                    env: rendered_env,
+                },
+            );
+        }
+    }
+
+    // Root schema payloads + AMBER_CONFIG_* env list are only needed if at least one service uses the helper.
+    let mut root_schema_b64: Option<String> = None;
+    let mut root_env_entries: Vec<String> = Vec::new();
+
+    if any_helper {
+        let root_schema = root_schema.ok_or_else(|| {
+            "root component must declare config_schema when runtime config interpolation is \
+             required"
+                .to_string()
+        })?;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let root_schema_json = serde_json::to_vec(&rc::canonical_json(root_schema))
+            .map_err(|e| format!("failed to serialize root config schema: {e}"))?;
+        root_schema_b64 = Some(b64.encode(root_schema_json));
+
+        let leafs = rc::collect_leaf_paths(root_schema)
+            .map_err(|e| format!("failed to enumerate root config schema leaf paths: {e}"))?;
+
+        for leaf in leafs {
+            let var = rc::env_var_for_path(&leaf.path)
+                .map_err(|e| format!("failed to map config path {} to env var: {e}", leaf.path))?;
+            if leaf.required {
+                // Compose-enforced required variable with helpful message.
+                root_env_entries.push(format!("{var}=${{{var}?missing config.{}}}", leaf.path));
+            } else {
+                // Pass-through: can be set or omitted.
+                root_env_entries.push(var);
+            }
+        }
+    }
+
+    // ---- YAML headers ----
+    if any_helper {
+        writeln!(&mut out, "volumes:").unwrap();
+        push_line(&mut out, 2, &format!("{HELPER_VOLUME_NAME}: {{}}"));
+    }
+
     writeln!(&mut out, "services:").unwrap();
 
-    let empty_config = Value::Object(Default::default());
+    if any_helper {
+        push_line(&mut out, 2, &format!("{HELPER_INIT_SERVICE}:"));
+        push_line(&mut out, 4, &format!("image: {}", yaml_str(HELPER_IMAGE)));
+        push_line(&mut out, 4, "entrypoint:");
+        push_line(&mut out, 6, &format!("- {}", yaml_str("/amber-helper")));
+        push_line(&mut out, 6, &format!("- {}", yaml_str("install")));
+        push_line(
+            &mut out,
+            6,
+            &format!("- {}", yaml_str(&format!("{HELPER_BIN_DIR}/amber-helper"))),
+        );
+        push_line(&mut out, 4, "volumes:");
+        push_line(
+            &mut out,
+            6,
+            &format!("- {}:{}", HELPER_VOLUME_NAME, HELPER_BIN_DIR),
+        );
+        push_line(&mut out, 4, &format!("restart: {}", yaml_str("no")));
+    }
 
     // Emit services in stable (component id) order, sidecar then program.
     for id in &program_components {
@@ -500,6 +954,7 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
                 .filter_map(|((prov, port), srcs)| (*prov == *id).then_some((*port, srcs)))
                 .collect(),
             exported_ports.get(id),
+            mesh.gateway,
             slot_proxies_by_component.get(id),
         );
 
@@ -529,13 +984,20 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
             ),
         );
 
-        // depends_on: own sidecar + strong deps provider programs
-        let mut depends = Vec::<String>::new();
-        depends.push(svc.sidecar.clone());
+        // depends_on: own sidecar + strong deps provider programs (+ amber-init for helper-backed services)
+        let mode = program_mode.get(id).expect("program mode computed");
+        let mut deps: Vec<(String, &'static str)> = Vec::new();
+        if any_helper && matches!(mode, ProgramMode::Helper { .. }) {
+            deps.push((
+                HELPER_INIT_SERVICE.to_string(),
+                "service_completed_successfully",
+            ));
+        }
+        deps.push((svc.sidecar.clone(), "service_started"));
         if let Some(ds) = strong_deps.get(id) {
             for dep in ds {
                 if let Some(dep_names) = names.get(dep) {
-                    depends.push(dep_names.program.clone());
+                    deps.push((dep_names.program.clone(), "service_started"));
                 } else {
                     return Err(format!(
                         "internal error: missing service name for dependency {}",
@@ -545,56 +1007,94 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
                 }
             }
         }
-        if !depends.is_empty() {
+        if !deps.is_empty() {
             push_line(&mut out, 4, "depends_on:");
-            for d in depends {
-                push_line(&mut out, 6, &format!("- {}", d));
+            if any_helper {
+                for (name, cond) in deps {
+                    push_line(&mut out, 6, &format!("{name}:"));
+                    push_line(&mut out, 8, &format!("condition: {cond}"));
+                }
+            } else {
+                for (name, _) in deps {
+                    push_line(&mut out, 6, &format!("- {}", name));
+                }
             }
         }
 
-        // Render args/env with interpolation.
-        let config = c.config.as_ref().unwrap_or(&empty_config);
-        let slots = slot_values_by_component.get(id).unwrap();
+        match mode {
+            ProgramMode::Direct { entrypoint, env } => {
+                // Use entrypoint so image entrypoints are ignored.
+                push_line(&mut out, 4, "entrypoint:");
+                for a in entrypoint {
+                    push_line(&mut out, 6, &format!("- {}", yaml_str(a)));
+                }
 
-        let mut rendered_args: Vec<String> = Vec::new();
-        for arg in &program.args.0 {
-            let raw = arg.to_string();
-            let rendered = interpolate_template(&raw, config, slots).map_err(|e| {
-                format!(
-                    "interpolation error in {} args {:?}: {e}",
-                    component_label(s, *id),
-                    raw
-                )
-            })?;
-            rendered_args.push(rendered);
-        }
-
-        if !rendered_args.is_empty() {
-            push_line(&mut out, 4, "command:");
-            for a in rendered_args {
-                push_line(&mut out, 6, &format!("- {}", yaml_str(&a)));
+                if !env.is_empty() {
+                    push_line(&mut out, 4, "environment:");
+                    for (k, v) in env {
+                        push_line(&mut out, 6, &format!("{k}: {}", yaml_str(v)));
+                    }
+                }
             }
-        }
+            ProgramMode::Helper {
+                template_spec_b64,
+                component_cfg_template_b64,
+                component_schema_b64,
+            } => {
+                // Mount helper binary and run it as PID1; it execs the program entrypoint.
+                push_line(&mut out, 4, "volumes:");
+                push_line(
+                    &mut out,
+                    6,
+                    &format!("- {}:{}:ro", HELPER_VOLUME_NAME, HELPER_BIN_DIR),
+                );
+                push_line(&mut out, 4, "entrypoint:");
+                push_line(&mut out, 6, &format!("- {}", yaml_str(HELPER_BIN_PATH)));
+                push_line(&mut out, 6, &format!("- {}", yaml_str("run")));
 
-        // Environment: emit in stable key order
-        if !program.env.is_empty() {
-            let mut env_sorted: BTreeMap<String, String> = BTreeMap::new();
-            for (k, v) in &program.env {
-                let raw = v.to_string();
-                let rendered = interpolate_template(&raw, config, slots).map_err(|e| {
-                    format!(
-                        "interpolation error in {} env {}={:?}: {e}",
-                        component_label(s, *id),
-                        k,
-                        raw
-                    )
-                })?;
-                env_sorted.insert(k.clone(), rendered);
-            }
+                push_line(&mut out, 4, "environment:");
+                // Emit as list so pass-through entries can remain unset.
+                for entry in &root_env_entries {
+                    push_line(&mut out, 6, &format!("- {}", yaml_str(entry)));
+                }
 
-            push_line(&mut out, 4, "environment:");
-            for (k, v) in env_sorted {
-                push_line(&mut out, 6, &format!("{k}: {}", yaml_str(&v)));
+                let root_schema_b64 = root_schema_b64.as_ref().expect("helper enabled");
+                push_line(
+                    &mut out,
+                    6,
+                    &format!(
+                        "- {}",
+                        yaml_str(&format!("AMBER_ROOT_CONFIG_SCHEMA_B64={root_schema_b64}"))
+                    ),
+                );
+                push_line(
+                    &mut out,
+                    6,
+                    &format!(
+                        "- {}",
+                        yaml_str(&format!(
+                            "AMBER_COMPONENT_CONFIG_SCHEMA_B64={component_schema_b64}"
+                        ))
+                    ),
+                );
+                push_line(
+                    &mut out,
+                    6,
+                    &format!(
+                        "- {}",
+                        yaml_str(&format!(
+                            "AMBER_COMPONENT_CONFIG_TEMPLATE_B64={component_cfg_template_b64}"
+                        ))
+                    ),
+                );
+                push_line(
+                    &mut out,
+                    6,
+                    &format!(
+                        "- {}",
+                        yaml_str(&format!("AMBER_TEMPLATE_SPEC_B64={template_spec_b64}"))
+                    ),
+                );
             }
         }
     }
@@ -605,7 +1105,7 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
     push_line(&mut out, 4, "driver: bridge");
     push_line(&mut out, 4, "ipam:");
     push_line(&mut out, 6, "config:");
-    push_line(&mut out, 8, &format!("- subnet: {MESH_SUBNET}"));
+    push_line(&mut out, 8, &format!("- subnet: {}", mesh.cidr));
 
     if !exports_by_name.is_empty() {
         writeln!(&mut out, "x-amber:").unwrap();
@@ -650,6 +1150,41 @@ fn component_label(s: &Scenario, id: ComponentId) -> String {
     s.component(id).moniker.as_str().to_string()
 }
 
+fn mesh_network() -> DcResult<MeshNetwork> {
+    let cidr =
+        std::env::var("AMBER_MESH_SUBNET").unwrap_or_else(|_| DEFAULT_MESH_SUBNET.to_string());
+    parse_mesh_subnet(cidr.trim()).map_err(DockerComposeError::Other)
+}
+
+fn parse_mesh_subnet(cidr: &str) -> Result<MeshNetwork, String> {
+    let (addr, prefix) = cidr.split_once('/').ok_or_else(|| {
+        format!("invalid AMBER_MESH_SUBNET {cidr:?}: expected CIDR like {DEFAULT_MESH_SUBNET}")
+    })?;
+    let base: Ipv4Addr = addr.parse().map_err(|_| {
+        format!("invalid AMBER_MESH_SUBNET {cidr:?}: expected IPv4 CIDR like {DEFAULT_MESH_SUBNET}")
+    })?;
+    let prefix: u8 = prefix.parse().map_err(|_| {
+        format!("invalid AMBER_MESH_SUBNET {cidr:?}: expected IPv4 CIDR like {DEFAULT_MESH_SUBNET}")
+    })?;
+    if prefix != 16 {
+        return Err(format!(
+            "invalid AMBER_MESH_SUBNET {cidr:?}: only /16 subnets are supported"
+        ));
+    }
+    let octets = base.octets();
+    if octets[2] != 0 || octets[3] != 0 {
+        return Err(format!(
+            "invalid AMBER_MESH_SUBNET {cidr:?}: address must end with .0.0 for /16"
+        ));
+    }
+    let gateway = Ipv4Addr::new(octets[0], octets[1], 0, 1);
+    Ok(MeshNetwork {
+        cidr: cidr.to_string(),
+        base,
+        gateway,
+    })
+}
+
 fn service_base_name(id: ComponentId, local_name: &str) -> String {
     // Ensure injective via numeric prefix; keep human-readable suffix.
     let slug = sanitize_service_suffix(local_name);
@@ -672,22 +1207,23 @@ fn sanitize_service_suffix(s: &str) -> String {
     out
 }
 
-fn sidecar_ipv4(id: ComponentId) -> Result<Ipv4Addr, String> {
-    // Stable mapping within 10.88.0.0/16.
+fn sidecar_ipv4(mesh: &MeshNetwork, id: ComponentId) -> Result<Ipv4Addr, String> {
+    // Stable mapping within the mesh /16.
     let offset: u32 = (id.0 as u32)
         .checked_add(10)
         .ok_or_else(|| "component id overflow while assigning sidecar IP".to_string())?;
 
     if offset >= 65535 {
         return Err(format!(
-            "too many components for subnet {MESH_SUBNET}; component id {} overflows",
-            id.0
+            "too many components for subnet {}; component id {} overflows",
+            mesh.cidr, id.0
         ));
     }
 
     let third = (offset / 256) as u8;
     let fourth = (offset % 256) as u8;
-    Ok(Ipv4Addr::new(10, 88, third, fourth))
+    let [first, second, ..] = mesh.base.octets();
+    Ok(Ipv4Addr::new(first, second, third, fourth))
 }
 
 fn resolve_provide_endpoint(
@@ -824,115 +1360,14 @@ fn allocate_local_proxy_ports(
     Ok(out)
 }
 
-fn interpolate_template(
-    template: &str,
-    config: &Value,
-    slots: &BTreeMap<String, SlotValue>,
-) -> Result<String, String> {
-    let mut out = String::new();
-    let mut rest = template;
-
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        let tail = &rest[start + 2..];
-        let end = tail.find('}').ok_or_else(|| {
-            format!(
-                "unterminated interpolation starting at: {:?}",
-                &rest[start..]
-            )
-        })?;
-        let expr = tail[..end].trim();
-        let value = resolve_interpolation_expr(expr, config, slots)?;
-        out.push_str(&value);
-        rest = &tail[end + 1..];
-    }
-
-    out.push_str(rest);
-    Ok(out)
-}
-
-fn resolve_interpolation_expr(
-    expr: &str,
-    config: &Value,
-    slots: &BTreeMap<String, SlotValue>,
-) -> Result<String, String> {
-    if let Some(path) = expr.strip_prefix("config.") {
-        return resolve_config_path(config, path);
-    }
-    if let Some(path) = expr.strip_prefix("slots.") {
-        return resolve_slots_path(slots, path);
-    }
-    Err(format!(
-        "unsupported interpolation source in ${{{expr}}}; expected config.<path> or slots.<path>"
-    ))
-}
-
-fn resolve_config_path(config: &Value, path: &str) -> Result<String, String> {
-    let mut cur = config;
-    for seg in path.split('.') {
-        if seg.is_empty() {
-            return Err(format!(
-                "invalid config path 'config.{path}': empty segment"
-            ));
-        }
-        match cur {
-            Value::Object(m) => {
-                cur = m
-                    .get(seg)
-                    .ok_or_else(|| format!("config.{path} not found (missing key {seg:?})"))?;
-            }
-            _ => {
-                return Err(format!(
-                    "config.{path} not found (encountered non-object before segment {seg:?})"
-                ));
-            }
-        }
-    }
-
-    match cur {
-        Value::Null => Err(format!("config.{path} is null; cannot interpolate")),
-        Value::String(s) => Ok(s.clone()),
-        Value::Bool(b) => Ok(b.to_string()),
-        Value::Number(n) => Ok(n.to_string()),
-        Value::Array(_) | Value::Object(_) => serde_json::to_string(cur)
-            .map_err(|e| format!("failed to serialize config.{path} as JSON: {e}")),
-    }
-}
-
-fn resolve_slots_path(slots: &BTreeMap<String, SlotValue>, path: &str) -> Result<String, String> {
-    let mut it = path.split('.');
-    let slot_name = it
-        .next()
-        .ok_or_else(|| "invalid slots path: missing slot name".to_string())?;
-    let field = it.next().ok_or_else(|| {
-        format!("invalid slots.{slot_name} interpolation: expected a field like url")
-    })?;
-
-    if it.next().is_some() {
-        return Err(format!(
-            "unsupported slots interpolation 'slots.{path}': only slots.<slot>.<field> is \
-             supported (url/host/port)"
-        ));
-    }
-
-    let slot = slots
-        .get(slot_name)
-        .ok_or_else(|| format!("slots.{slot_name} not found"))?;
-
-    match field {
-        "url" => Ok(slot.url.clone()),
-        "host" => Ok(slot.host.clone()),
-        "port" => Ok(slot.port.to_string()),
-        other => Err(format!(
-            "unsupported slots field slots.{slot_name}.{other} (supported: url/host/port)"
-        )),
-    }
-}
+// NOTE: template interpolation is now handled structurally via `amber_manifest::InterpolatedString`
+// parts and the runtime helper payload IR. The old string re-parser has been removed.
 
 fn build_sidecar_script(
     _component: ComponentId,
     inbound: Vec<(u16, &BTreeSet<Ipv4Addr>)>,
     exported_ports: Option<&BTreeSet<u16>>,
+    mesh_gateway: Ipv4Addr,
     proxies: Option<&Vec<SlotProxy>>,
 ) -> String {
     let mut script = String::new();
@@ -977,7 +1412,7 @@ fn build_sidecar_script(
             .unwrap();
             writeln!(
                 &mut script,
-                "iptables -w -A INPUT -p tcp -s {MESH_GATEWAY} --dport {port} -j ACCEPT"
+                "iptables -w -A INPUT -p tcp -s {mesh_gateway} --dport {port} -j ACCEPT"
             )
             .unwrap();
         }

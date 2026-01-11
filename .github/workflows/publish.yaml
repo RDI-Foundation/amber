@@ -62,3 +62,23 @@ jobs:
           labels: ${{ steps.sidecar_meta.outputs.labels }}
           cache-from: type=gha,scope=refs/heads/${{ github.ref_name }}-sidecar
           cache-to: type=gha,mode=max,scope=refs/heads/${{ github.ref_name }}-sidecar
+      - name: Configure helper tags
+        id: helper_meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository_owner }}/amber-helper
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
+      - name: Build and push helper
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/amber-compose-helper/Dockerfile
+          push: true
+          tags: ${{ steps.helper_meta.outputs.tags }}
+          labels: ${{ steps.helper_meta.outputs.labels }}
+          cache-from: type=gha,scope=refs/heads/${{ github.ref_name }}-helper
+          cache-to: type=gha,mode=max,scope=refs/heads/${{ github.ref_name }}-helper

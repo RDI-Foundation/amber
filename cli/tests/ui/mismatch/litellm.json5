@@ -2,11 +2,20 @@
   manifest_version: "0.1.0",
   program: {
     image: "docker.io/litellm/litellm:latest",
+    entrypoint: ["litellm"],
     network: {
       endpoints: [
         { name: "http", port: 80 },
       ],
     },
+  },
+  config_schema: {
+    type: "object",
+    properties: {
+      model: { type: "string" },
+    },
+    required: ["model"],
+    additionalProperties: false,
   },
   components: {
     proxy: "./litellm-proxy.json5",
