@@ -47,7 +47,7 @@ fn collect_root_manifests(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
-fn examples_check() {
+fn examples_check_deny_warnings() {
     let examples_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("examples");
@@ -62,6 +62,8 @@ fn examples_check() {
     for manifest in manifests {
         let output = Command::new(amber)
             .arg("check")
+            .arg("-D")
+            .arg("warnings")
             .arg(&manifest)
             .output()
             .unwrap_or_else(|err| panic!("failed to run amber on {}: {err}", manifest.display()));

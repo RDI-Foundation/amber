@@ -16,7 +16,7 @@
     args: [
       "sh",
       "-c",
-      "echo \"api-client starting; api_key=${config.api_key}\"; exec httpd -f -p 8080",
+      "echo \"api-client starting; config=${config}\"; exec httpd -f -p 8080",
     ],
     network: {
       endpoints: [{ name: "http", port: 8080 }],
