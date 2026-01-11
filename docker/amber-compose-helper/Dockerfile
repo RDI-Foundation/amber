@@ -12,7 +12,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY rust-toolchain.toml .
 RUN rustup show
-RUN rustup target add x86_64-unknown-linux-musl
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+        amd64) target="x86_64-unknown-linux-musl" ;; \
+        arm64) target="aarch64-unknown-linux-musl" ;; \
+        *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    echo "${target}" > /tmp/rust-target && \
+    rustup target add "${target}"
 
 FROM base-builder AS builder
 
@@ -43,11 +50,12 @@ COPY scenario ./scenario
 COPY template ./template
 COPY node ./node
 
-RUN cargo build -p amber-compose-helper --release --locked --target x86_64-unknown-linux-musl
+RUN target=$(cat /tmp/rust-target) && \
+    cargo build -p amber-compose-helper --release --locked --target "${target}" && \
+    install -D -m 0755 /app/target/"${target}"/release/amber-compose-helper /out/amber-helper
 
 FROM debian:13-slim
 
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/amber-compose-helper /amber-helper
-RUN chmod 0755 /amber-helper
+COPY --from=builder /out/amber-helper /amber-helper
 
 ENTRYPOINT ["/amber-helper"]

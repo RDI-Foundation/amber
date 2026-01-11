@@ -329,11 +329,8 @@ fn ensure_image_platform(tag: &str, platform: &str) {
 
 fn build_docker_image(tag: &str, dockerfile: &Path, context: &Path) -> String {
     let status = std::process::Command::new("docker")
-        .env("DOCKER_DEFAULT_PLATFORM", "linux/amd64")
         .arg("buildx")
         .arg("build")
-        .arg("--platform")
-        .arg("linux/amd64")
         .arg("--load")
         .arg("-t")
         .arg(tag)
@@ -702,14 +699,12 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
 
     struct ComposeGuard {
         project: std::path::PathBuf,
-        platform: String,
     }
 
     impl ComposeGuard {
-        fn new(project: &std::path::Path, platform: &str) -> Self {
+        fn new(project: &std::path::Path) -> Self {
             Self {
                 project: project.to_path_buf(),
-                platform: platform.to_string(),
             }
         }
     }
@@ -718,7 +713,6 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         fn drop(&mut self) {
             let _ = Command::new("docker")
                 .current_dir(&self.project)
-                .env("DOCKER_DEFAULT_PLATFORM", &self.platform)
                 .arg("compose")
                 .args([
                     "down",
@@ -744,7 +738,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
     let platform = build_sidecar_image();
     ensure_image_platform("busybox:1.36.1", &platform);
     ensure_image_platform("alpine:3.20", &platform);
-    let _compose_guard = ComposeGuard::new(project, &platform);
+    let _compose_guard = ComposeGuard::new(project);
     let mesh_subnet = choose_mesh_subnet();
     let _mesh_guard = EnvVarGuard::set("AMBER_MESH_SUBNET", &mesh_subnet);
     let server_ip = sidecar_ipv4(mesh_base_from_env(), 1);
@@ -843,10 +837,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
 
     let compose = |args: &[&str]| {
         let mut cmd = Command::new("docker");
-        cmd.current_dir(project)
-            .env("DOCKER_DEFAULT_PLATFORM", &platform)
-            .arg("compose")
-            .args(args);
+        cmd.current_dir(project).arg("compose").args(args);
         cmd
     };
 
@@ -1077,15 +1068,13 @@ fn docker_smoke_config_forwarding_runtime_validation() {
 
     struct ComposeGuard {
         project: std::path::PathBuf,
-        platform: String,
         envs: Vec<(String, String)>,
     }
 
     impl ComposeGuard {
-        fn new(project: &std::path::Path, platform: &str, envs: &[(&str, &str)]) -> Self {
+        fn new(project: &std::path::Path, envs: &[(&str, &str)]) -> Self {
             Self {
                 project: project.to_path_buf(),
-                platform: platform.to_string(),
                 envs: envs
                     .iter()
                     .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1097,18 +1086,15 @@ fn docker_smoke_config_forwarding_runtime_validation() {
     impl Drop for ComposeGuard {
         fn drop(&mut self) {
             let mut cmd = Command::new("docker");
-            cmd.current_dir(&self.project)
-                .env("DOCKER_DEFAULT_PLATFORM", &self.platform)
-                .arg("compose")
-                .args([
-                    "down",
-                    "-v",
-                    "--remove-orphans",
-                    "--rmi",
-                    "local",
-                    "--timeout",
-                    "1",
-                ]);
+            cmd.current_dir(&self.project).arg("compose").args([
+                "down",
+                "-v",
+                "--remove-orphans",
+                "--rmi",
+                "local",
+                "--timeout",
+                "1",
+            ]);
             for (k, v) in &self.envs {
                 cmd.env(k, v);
             }
@@ -1120,14 +1106,11 @@ fn docker_smoke_config_forwarding_runtime_validation() {
         ("AMBER_CONFIG_API_KEY", "ABC"),
         ("AMBER_CONFIG_SYSTEM_PROMPT", "OVERRIDE"),
     ];
-    let _compose_guard = ComposeGuard::new(project, &platform, &valid_env);
+    let _compose_guard = ComposeGuard::new(project, &valid_env);
 
     let compose = |envs: &[(&str, &str)], args: &[&str]| {
         let mut cmd = Command::new("docker");
-        cmd.current_dir(project)
-            .env("DOCKER_DEFAULT_PLATFORM", &platform)
-            .arg("compose")
-            .args(args);
+        cmd.current_dir(project).arg("compose").args(args);
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -1218,7 +1201,6 @@ fn docker_smoke_config_forwarding_runtime_validation() {
     let mut exit = None;
     for _ in 0..10 {
         let inspect = Command::new("docker")
-            .env("DOCKER_DEFAULT_PLATFORM", &platform)
             .arg("inspect")
             .arg("-f")
             .arg("{{.State.Status}} {{.State.ExitCode}}")
