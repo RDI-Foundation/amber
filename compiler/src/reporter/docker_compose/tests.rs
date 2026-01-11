@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeMap,
-    net::Ipv4Addr,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -90,182 +89,6 @@ fn error_contains(err: &crate::Error, needle: &str) -> bool {
         crate::Error::Linker(err) => err.to_string().contains(needle),
         other => other.to_string().contains(needle),
     }
-}
-
-const DEFAULT_MESH_SUBNET: &str = "10.88.0.0/16";
-
-#[derive(Debug)]
-struct EnvVarGuard {
-    key: &'static str,
-    prev: Option<String>,
-}
-
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let prev = std::env::var(key).ok();
-        // SAFETY: These ignored e2e tests are expected to run in isolation; we set and restore
-        // the process env var only around compose generation.
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, prev }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        if let Some(prev) = &self.prev {
-            // SAFETY: See EnvVarGuard::set.
-            unsafe {
-                std::env::set_var(self.key, prev);
-            }
-        } else {
-            // SAFETY: See EnvVarGuard::set.
-            unsafe {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-}
-
-fn parse_ipv4_cidr(cidr: &str) -> Option<(u32, u8)> {
-    let (addr, prefix) = cidr.split_once('/')?;
-    let ip: Ipv4Addr = addr.parse().ok()?;
-    let prefix: u8 = prefix.parse().ok()?;
-    if prefix > 32 {
-        return None;
-    }
-    Some((u32::from(ip), prefix))
-}
-
-fn cidr_range(cidr: (u32, u8)) -> (u32, u32) {
-    let (addr, prefix) = cidr;
-    let mask = if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix)
-    };
-    let network = addr & mask;
-    let broadcast = network | !mask;
-    (network, broadcast)
-}
-
-fn cidr_overlaps(a: (u32, u8), b: (u32, u8)) -> bool {
-    let (a_start, a_end) = cidr_range(a);
-    let (b_start, b_end) = cidr_range(b);
-    a_start <= b_end && b_start <= a_end
-}
-
-fn docker_used_subnets() -> Vec<(u32, u8)> {
-    let output = std::process::Command::new("docker")
-        .args(["network", "ls", "-q"])
-        .output();
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    let ids = String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    if ids.is_empty() {
-        return Vec::new();
-    }
-
-    let output = std::process::Command::new("docker")
-        .arg("network")
-        .arg("inspect")
-        .args(&ids)
-        .output();
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) else {
-        return Vec::new();
-    };
-
-    let mut subnets = Vec::new();
-    let Some(networks) = value.as_array() else {
-        return subnets;
-    };
-    for network in networks {
-        let Some(configs) = network
-            .get("IPAM")
-            .and_then(|ipam| ipam.get("Config"))
-            .and_then(|cfg| cfg.as_array())
-        else {
-            continue;
-        };
-        for cfg in configs {
-            let Some(subnet) = cfg.get("Subnet").and_then(|s| s.as_str()) else {
-                continue;
-            };
-            if let Some(parsed) = parse_ipv4_cidr(subnet) {
-                subnets.push(parsed);
-            }
-        }
-    }
-
-    subnets
-}
-
-fn choose_mesh_subnet() -> String {
-    let candidates = [
-        "10.200.0.0/16",
-        "10.201.0.0/16",
-        "10.202.0.0/16",
-        "10.203.0.0/16",
-        "10.204.0.0/16",
-        "10.205.0.0/16",
-        "10.206.0.0/16",
-        "10.207.0.0/16",
-        "10.208.0.0/16",
-        "10.209.0.0/16",
-        "10.210.0.0/16",
-        "10.211.0.0/16",
-        "10.212.0.0/16",
-        "10.213.0.0/16",
-        "10.214.0.0/16",
-        "10.215.0.0/16",
-        "172.30.0.0/16",
-        "172.31.0.0/16",
-    ];
-
-    let used = docker_used_subnets();
-    for candidate in candidates {
-        let Some(parsed) = parse_ipv4_cidr(candidate) else {
-            continue;
-        };
-        let overlaps = used.iter().any(|used| cidr_overlaps(*used, parsed));
-        if !overlaps {
-            return candidate.to_string();
-        }
-    }
-
-    DEFAULT_MESH_SUBNET.to_string()
-}
-
-fn mesh_base_from_env() -> Ipv4Addr {
-    let cidr =
-        std::env::var("AMBER_MESH_SUBNET").unwrap_or_else(|_| DEFAULT_MESH_SUBNET.to_string());
-    let base = cidr
-        .split_once('/')
-        .map(|(addr, _)| addr)
-        .unwrap_or(cidr.as_str());
-    base.parse().unwrap_or_else(|_| Ipv4Addr::new(10, 88, 0, 0))
-}
-
-fn sidecar_ipv4(base: Ipv4Addr, id: u32) -> Ipv4Addr {
-    let offset = id + 10;
-    let third = (offset / 256) as u8;
-    let fourth = (offset % 256) as u8;
-    let [first, second, ..] = base.octets();
-    Ipv4Addr::new(first, second, third, fourth)
 }
 
 fn workspace_root() -> PathBuf {
@@ -477,26 +300,19 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         "{yaml}"
     );
 
-    // Static IP assignment should be stable: c1 => base.0.11, c2 => base.0.12
-    let base = mesh_base_from_env();
-    let server_ip = sidecar_ipv4(base, 1);
-    let client_ip = sidecar_ipv4(base, 2);
+    // Compose should not pin static IPs or subnets.
+    assert!(!yaml.contains("ipv4_address:"), "{yaml}");
+    assert!(!yaml.contains("ipam:"), "{yaml}");
+
+    // Server sidecar should allow inbound from client on 8080 via DNS resolution.
+    assert!(yaml.contains(r#"resolve_ipv4 "c2-client-net""#), "{yaml}");
     assert!(
-        yaml.contains(&format!("ipv4_address: {server_ip}")),
-        "{yaml}"
-    );
-    assert!(
-        yaml.contains(&format!("ipv4_address: {client_ip}")),
+        yaml.contains(r#"add_rule "-s $$ip/32 -p tcp -m tcp --dport 8080 -j ACCEPT""#),
         "{yaml}"
     );
 
-    // Server sidecar should allow inbound from client on 8080.
-    assert!(
-        yaml.contains(&format!(
-            "iptables -w -A INPUT -p tcp -s {client_ip} --dport 8080 -j ACCEPT"
-        )),
-        "{yaml}"
-    );
+    // Sidecar proxies should target DNS names, not static IPs.
+    assert!(yaml.contains("TCP:c1-server-net:8080"), "{yaml}");
 
     // Slot URL should be rendered with local proxy port base (20000).
     assert!(yaml.contains(r#"URL: "http://127.0.0.1:20000""#), "{yaml}");
@@ -730,7 +546,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
     // Build a tiny scenario:
     // - server runs busybox httpd on 8080
     // - allowed client has a binding and uses ${slots.api.url}
-    // - denied client has no binding and tries to call server directly by sidecar IP:8080 (should fail)
+    // - denied client has no binding and tries to call server directly by sidecar DNS name:8080
     //
     // NOTE: This test builds the sidecar image locally and uses its platform.
     let dir = tempdir().unwrap();
@@ -739,9 +555,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
     ensure_image_platform("busybox:1.36.1", &platform);
     ensure_image_platform("alpine:3.20", &platform);
     let _compose_guard = ComposeGuard::new(project);
-    let mesh_subnet = choose_mesh_subnet();
-    let _mesh_guard = EnvVarGuard::set("AMBER_MESH_SUBNET", &mesh_subnet);
-    let server_ip = sidecar_ipv4(mesh_base_from_env(), 1);
+    let server_host = "c1-server-net";
 
     // Scenario definition
     let server_program = serde_json::from_value(json!({
@@ -852,7 +666,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         "c2-allowed",
         "sh",
         "-lc",
-        r#"i=0; while [ $i -lt 20 ]; do if wget -qO- --timeout=2 --tries=1 "$URL" | grep -q hello; then exit 0; fi; i=$((i+1)); sleep 1; done; exit 1"#,
+        r#"i=0; while [ $i -lt 10 ]; do if wget -qO- --timeout=1 --tries=1 "$URL" 2>/dev/null | grep -q hello; then exit 0; fi; i=$((i+1)); sleep 1; done; exit 1"#,
     ])
     .output()
     .unwrap();
@@ -903,14 +717,14 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         panic!("allowed client could not reach server via binding\n{debug}");
     }
 
-    // Denied should fail when calling server sidecar IP directly.
+    // Denied should fail when calling server sidecar DNS name directly.
     let denied = compose(&[
         "exec",
         "-T",
         "c3-denied",
         "sh",
         "-lc",
-        &format!(r#"wget -qO- --timeout=2 --tries=1 "http://{server_ip}:8080/""#),
+        &format!(r#"wget -qO- --timeout=2 --tries=1 "http://{server_host}:8080/" 2>/dev/null"#),
     ])
     .status()
     .unwrap();
@@ -937,8 +751,6 @@ fn docker_smoke_config_forwarding_runtime_validation() {
         (HELPER_IMAGE, helper_platform),
     ]);
     ensure_image_platform("busybox:1.36.1", &platform);
-    let mesh_subnet = choose_mesh_subnet();
-    let _mesh_guard = EnvVarGuard::set("AMBER_MESH_SUBNET", &mesh_subnet);
 
     let child_path = project.join("client.json5");
     fs::write(

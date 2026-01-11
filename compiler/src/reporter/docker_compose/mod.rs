@@ -1,7 +1,7 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Write as _,
-    net::Ipv4Addr,
 };
 
 use amber_manifest::{InterpolatedPart, InterpolationSource, Manifest};
@@ -18,7 +18,6 @@ use crate::{
 };
 
 const MESH_NETWORK_NAME: &str = "amber_mesh";
-const DEFAULT_MESH_SUBNET: &str = "10.88.0.0/16";
 
 const SIDECAR_IMAGE: &str = "ghcr.io/rdi-foundation/amber-sidecar:main";
 const HELPER_IMAGE: &str = "ghcr.io/rdi-foundation/amber-compose-helper:v1";
@@ -30,13 +29,6 @@ const HELPER_BIN_PATH: &str = "/amber/bin/amber-helper";
 const LOCAL_PROXY_PORT_BASE: u16 = 20000;
 const EXPORT_PORT_BASE: u16 = 18000;
 const EXPORT_HOST: &str = "127.0.0.1";
-
-#[derive(Clone, Debug)]
-struct MeshNetwork {
-    cidr: String,
-    base: Ipv4Addr,
-    gateway: Ipv4Addr,
-}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DockerComposeReporter;
@@ -64,7 +56,7 @@ struct Endpoint {
 #[derive(Clone, Debug)]
 struct SlotProxy {
     local_port: u16,
-    remote_ip: Ipv4Addr,
+    remote_host: String,
     remote_port: u16,
 }
 
@@ -203,7 +195,6 @@ fn render_docker_compose(output: &CompileOutput) -> Result<String, ReporterError
 
 fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     let s = &output.scenario;
-    let mesh = mesh_network()?;
 
     let manifests = crate::manifest_table::build_manifest_table(&s.components, &output.store)
         .map_err(|e| {
@@ -236,9 +227,8 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         .filter_map(|(id, c)| c.program.as_ref().map(|_| id))
         .collect();
 
-    // Precompute service names + sidecar IPs (injective & stable).
+    // Precompute service names (injective & stable).
     let mut names: HashMap<ComponentId, ServiceNames> = HashMap::new();
-    let mut ips: HashMap<ComponentId, Ipv4Addr> = HashMap::new();
     for id in &program_components {
         let c = s.component(*id);
         let base = service_base_name(*id, c.moniker.local_name().unwrap_or("component"));
@@ -250,7 +240,6 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 sidecar,
             },
         );
-        ips.insert(*id, sidecar_ipv4(&mesh, *id)?);
     }
 
     // Validate: every binding endpoint is between program components.
@@ -311,8 +300,8 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     }
     let mut slot_proxies_by_component: HashMap<ComponentId, Vec<SlotProxy>> = HashMap::new();
 
-    // Inbound allowlist: (provider_component, port) -> set of consumer sidecar IPs
-    let mut inbound_allow: HashMap<(ComponentId, u16), BTreeSet<Ipv4Addr>> = HashMap::new();
+    // Inbound allowlist: (provider_component, port) -> set of consumer sidecar hosts
+    let mut inbound_allow: HashMap<(ComponentId, u16), BTreeSet<String>> = HashMap::new();
 
     // Track (component,port) -> (first_provide_name, first_endpoint_name) to detect
     // distinct endpoints sharing a port.
@@ -333,16 +322,20 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
             &endpoint.name,
         )?;
 
-        let consumer_ip = *ips.get(&consumer).ok_or_else(|| {
-            format!(
-                "internal error: missing sidecar IP for consumer {}",
-                component_label(s, consumer)
-            )
-        })?;
+        let consumer_host = names
+            .get(&consumer)
+            .ok_or_else(|| {
+                format!(
+                    "internal error: missing sidecar name for consumer {}",
+                    component_label(s, consumer)
+                )
+            })?
+            .sidecar
+            .clone();
         inbound_allow
             .entry((provider, endpoint.port))
             .or_default()
-            .insert(consumer_ip);
+            .insert(consumer_host);
 
         // Create local loopback proxy in consumer namespace.
         let local_port = *slot_ports_by_component
@@ -356,15 +349,19 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 )
             })?;
 
-        let remote_ip = if provider == consumer {
-            Ipv4Addr::new(127, 0, 0, 1)
+        let remote_host = if provider == consumer {
+            "127.0.0.1".to_string()
         } else {
-            *ips.get(&provider).ok_or_else(|| {
-                format!(
-                    "internal error: missing sidecar IP for provider {}",
-                    component_label(s, provider)
-                )
-            })?
+            names
+                .get(&provider)
+                .ok_or_else(|| {
+                    format!(
+                        "internal error: missing sidecar name for provider {}",
+                        component_label(s, provider)
+                    )
+                })?
+                .sidecar
+                .clone()
         };
 
         slot_proxies_by_component
@@ -372,7 +369,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
             .or_default()
             .push(SlotProxy {
                 local_port,
-                remote_ip,
+                remote_host,
                 remote_port: endpoint.port,
             });
 
@@ -859,7 +856,6 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     for id in &program_components {
         let c = s.component(*id);
         let svc = names.get(id).unwrap();
-        let ip = ips.get(id).unwrap();
 
         // ---- sidecar ----
         push_line(&mut out, 2, &format!("{}:", svc.sidecar));
@@ -873,10 +869,9 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         push_line(&mut out, 4, "security_opt:");
         push_line(&mut out, 6, "- no-new-privileges:true");
 
-        // Networks with static IPv4
+        // Attach sidecar to mesh network (Compose assigns IPs + DNS names).
         push_line(&mut out, 4, "networks:");
-        push_line(&mut out, 6, &format!("{MESH_NETWORK_NAME}:"));
-        push_line(&mut out, 8, &format!("ipv4_address: {ip}"));
+        push_line(&mut out, 6, &format!("{MESH_NETWORK_NAME}: {{}}"));
 
         // Host port publishes for scenario exports (loopback-only for MVP)
         if let Some(mappings) = exports_by_provider.get(id) {
@@ -912,7 +907,6 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 .filter_map(|((prov, port), srcs)| (*prov == *id).then_some((*port, srcs)))
                 .collect(),
             exported_ports.get(id),
-            mesh.gateway,
             slot_proxies_by_component.get(id),
         );
 
@@ -921,7 +915,8 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         push_line(&mut out, 6, "- -lc");
         push_line(&mut out, 6, "- |-");
         for line in script.lines() {
-            push_line(&mut out, 8, line);
+            let escaped = escape_compose_interpolation(line);
+            push_line(&mut out, 8, escaped.as_ref());
         }
 
         // ---- program ----
@@ -1061,9 +1056,6 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     writeln!(&mut out, "networks:").unwrap();
     push_line(&mut out, 2, &format!("{MESH_NETWORK_NAME}:"));
     push_line(&mut out, 4, "driver: bridge");
-    push_line(&mut out, 4, "ipam:");
-    push_line(&mut out, 6, "config:");
-    push_line(&mut out, 8, &format!("- subnet: {}", mesh.cidr));
 
     if !exports_by_name.is_empty() {
         writeln!(&mut out, "x-amber:").unwrap();
@@ -1108,41 +1100,6 @@ fn component_label(s: &Scenario, id: ComponentId) -> String {
     s.component(id).moniker.as_str().to_string()
 }
 
-fn mesh_network() -> DcResult<MeshNetwork> {
-    let cidr =
-        std::env::var("AMBER_MESH_SUBNET").unwrap_or_else(|_| DEFAULT_MESH_SUBNET.to_string());
-    parse_mesh_subnet(cidr.trim()).map_err(DockerComposeError::Other)
-}
-
-fn parse_mesh_subnet(cidr: &str) -> Result<MeshNetwork, String> {
-    let (addr, prefix) = cidr.split_once('/').ok_or_else(|| {
-        format!("invalid AMBER_MESH_SUBNET {cidr:?}: expected CIDR like {DEFAULT_MESH_SUBNET}")
-    })?;
-    let base: Ipv4Addr = addr.parse().map_err(|_| {
-        format!("invalid AMBER_MESH_SUBNET {cidr:?}: expected IPv4 CIDR like {DEFAULT_MESH_SUBNET}")
-    })?;
-    let prefix: u8 = prefix.parse().map_err(|_| {
-        format!("invalid AMBER_MESH_SUBNET {cidr:?}: expected IPv4 CIDR like {DEFAULT_MESH_SUBNET}")
-    })?;
-    if prefix != 16 {
-        return Err(format!(
-            "invalid AMBER_MESH_SUBNET {cidr:?}: only /16 subnets are supported"
-        ));
-    }
-    let octets = base.octets();
-    if octets[2] != 0 || octets[3] != 0 {
-        return Err(format!(
-            "invalid AMBER_MESH_SUBNET {cidr:?}: address must end with .0.0 for /16"
-        ));
-    }
-    let gateway = Ipv4Addr::new(octets[0], octets[1], 0, 1);
-    Ok(MeshNetwork {
-        cidr: cidr.to_string(),
-        base,
-        gateway,
-    })
-}
-
 fn service_base_name(id: ComponentId, local_name: &str) -> String {
     // Ensure injective via numeric prefix; keep human-readable suffix.
     let slug = sanitize_service_suffix(local_name);
@@ -1153,35 +1110,18 @@ fn sanitize_service_suffix(s: &str) -> String {
     let mut out = String::new();
     for ch in s.chars() {
         let ch = ch.to_ascii_lowercase();
-        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+        if ch.is_ascii_alphanumeric() {
             out.push(ch);
         } else {
-            out.push('_');
+            out.push('-');
         }
     }
+    let out = out.trim_matches('-');
     if out.is_empty() {
-        out.push_str("component");
+        "component".to_string()
+    } else {
+        out.to_string()
     }
-    out
-}
-
-fn sidecar_ipv4(mesh: &MeshNetwork, id: ComponentId) -> Result<Ipv4Addr, String> {
-    // Stable mapping within the mesh /16.
-    let offset: u32 = (id.0 as u32)
-        .checked_add(10)
-        .ok_or_else(|| "component id overflow while assigning sidecar IP".to_string())?;
-
-    if offset >= 65535 {
-        return Err(format!(
-            "too many components for subnet {}; component id {} overflows",
-            mesh.cidr, id.0
-        ));
-    }
-
-    let third = (offset / 256) as u8;
-    let fourth = (offset % 256) as u8;
-    let [first, second, ..] = mesh.base.octets();
-    Ok(Ipv4Addr::new(first, second, third, fourth))
 }
 
 fn resolve_provide_endpoint(
@@ -1323,9 +1263,8 @@ fn allocate_local_proxy_ports(
 
 fn build_sidecar_script(
     _component: ComponentId,
-    inbound: Vec<(u16, &BTreeSet<Ipv4Addr>)>,
+    inbound: Vec<(u16, &BTreeSet<String>)>,
     exported_ports: Option<&BTreeSet<u16>>,
-    mesh_gateway: Ipv4Addr,
     proxies: Option<&Vec<SlotProxy>>,
 ) -> String {
     let mut script = String::new();
@@ -1345,18 +1284,47 @@ fn build_sidecar_script(
         "iptables -w -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
     )
     .unwrap();
+    writeln!(&mut script, "iptables -w -N AMBER-ALLOW").unwrap();
+    writeln!(&mut script, "iptables -w -A INPUT -j AMBER-ALLOW").unwrap();
 
-    // Allow inbound from bound consumers.
+    writeln!(&mut script, "resolve_ipv4() {{").unwrap();
+    writeln!(
+        &mut script,
+        "  getent hosts \"$1\" | awk '$1 ~ /^[0-9]+(\\.[0-9]+){{3}}$/ {{print $1}}' || true"
+    )
+    .unwrap();
+    writeln!(&mut script, "}}").unwrap();
+    writeln!(&mut script, "add_rule() {{").unwrap();
+    writeln!(&mut script, "  if [ -n \"$1\" ]; then").unwrap();
+    writeln!(
+        &mut script,
+        "    printf '%s\\n' \"$1\" >> \"$desired_rules\""
+    )
+    .unwrap();
+    writeln!(&mut script, "  fi").unwrap();
+    writeln!(&mut script, "}}").unwrap();
+    writeln!(&mut script, "refresh_allowlist() {{").unwrap();
+    writeln!(&mut script, "  set +e").unwrap();
+    writeln!(&mut script, "  desired_rules=\"/tmp/amber-allowlist\"").unwrap();
+    writeln!(&mut script, "  : > \"$desired_rules\"").unwrap();
+    writeln!(
+        &mut script,
+        "  gateway=\"$(ip -4 route show default | awk 'NR==1 {{print $3}}')\""
+    )
+    .unwrap();
+
+    // Allow inbound from bound consumers (resolved via DNS).
     let mut inbound_sorted = inbound;
     inbound_sorted.sort_by_key(|(port, _)| *port);
-
     for (port, srcs) in inbound_sorted {
         for src in srcs {
+            writeln!(&mut script, "  for ip in $(resolve_ipv4 \"{src}\"); do").unwrap();
             writeln!(
                 &mut script,
-                "iptables -w -A INPUT -p tcp -s {src} --dport {port} -j ACCEPT"
+                "    add_rule \"-s $ip/32 -p tcp -m tcp --dport {port} -j ACCEPT\""
             )
             .unwrap();
+            writeln!(&mut script, "  done").unwrap();
         }
     }
 
@@ -1365,16 +1333,39 @@ fn build_sidecar_script(
         for port in ports {
             writeln!(
                 &mut script,
-                "iptables -w -A INPUT -p tcp -s {EXPORT_HOST} --dport {port} -j ACCEPT"
+                "  add_rule \"-s {EXPORT_HOST}/32 -p tcp -m tcp --dport {port} -j ACCEPT\""
             )
             .unwrap();
+            writeln!(&mut script, "  if [ -n \"$gateway\" ]; then").unwrap();
             writeln!(
                 &mut script,
-                "iptables -w -A INPUT -p tcp -s {mesh_gateway} --dport {port} -j ACCEPT"
+                "    add_rule \"-s $gateway/32 -p tcp -m tcp --dport {port} -j ACCEPT\""
             )
             .unwrap();
+            writeln!(&mut script, "  fi").unwrap();
         }
     }
+    writeln!(&mut script, "  if [ -s \"$desired_rules\" ]; then").unwrap();
+    writeln!(&mut script, "    iptables -w -F AMBER-ALLOW").unwrap();
+    writeln!(&mut script, "    while read -r rule; do").unwrap();
+    writeln!(&mut script, "      [ -z \"$rule\" ] && continue").unwrap();
+    writeln!(&mut script, "      iptables -w -A AMBER-ALLOW $rule").unwrap();
+    writeln!(&mut script, "    done < \"$desired_rules\"").unwrap();
+    writeln!(&mut script, "  fi").unwrap();
+    writeln!(&mut script, "  set -e").unwrap();
+    writeln!(&mut script, "  return 0").unwrap();
+    writeln!(&mut script, "}}").unwrap();
+    writeln!(&mut script, "fast_refresh=1").unwrap();
+    writeln!(&mut script, "slow_refresh=5").unwrap();
+    writeln!(&mut script, "warmup_rounds=10").unwrap();
+    writeln!(&mut script, "refresh_allowlist || true").unwrap();
+    writeln!(
+        &mut script,
+        "while true; do refresh_allowlist || true; if [ \"$warmup_rounds\" -gt 0 ]; then \
+         warmup_rounds=$((warmup_rounds-1)); sleep \"$fast_refresh\"; else sleep \
+         \"$slow_refresh\"; fi; done &"
+    )
+    .unwrap();
 
     // Start local TCP proxies for slots.
     if let Some(ps) = proxies {
@@ -1387,7 +1378,7 @@ fn build_sidecar_script(
             writeln!(
                 &mut script,
                 "socat TCP-LISTEN:{},fork,reuseaddr,bind=127.0.0.1 TCP:{}:{} &",
-                p.local_port, p.remote_ip, p.remote_port
+                p.local_port, p.remote_host, p.remote_port
             )
             .unwrap();
         }
@@ -1423,6 +1414,14 @@ fn yaml_str(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+fn escape_compose_interpolation<'a>(line: &'a str) -> Cow<'a, str> {
+    if line.contains('$') {
+        Cow::Owned(line.replace('$', "$$"))
+    } else {
+        Cow::Borrowed(line)
+    }
 }
 
 #[cfg(test)]

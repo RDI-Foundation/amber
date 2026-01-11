@@ -100,15 +100,15 @@ Sidecars run the published image `ghcr.io/rdi-foundation/amber-sidecar:main`.
 flowchart LR
   Host["Host / developer<br/>(127.0.0.1)"] -->|"Scenario exports<br/>published on loopback<br/>(ports 18000+)"| SidecarP
 
-  subgraph Mesh["Docker network: amber_mesh (10.88.0.0/16)"]
+  subgraph Mesh["Docker Compose network (dynamic subnet + DNS)"]
     subgraph Provider["Provider component (cX)"]
-      SidecarP["cX-net (sidecar)<br/>- static IP<br/>- iptables allowlist<br/>- publishes exports"]
+      SidecarP["cX-net (sidecar)<br/>- DNS name<br/>- iptables allowlist (DNS-resolved)<br/>- publishes exports"]
       ProgP["cX (program)<br/>network_mode: service:cX-net<br/>(listens on provide ports)"]
       ProgP --- SidecarP
     end
 
     subgraph Consumer["Consumer component (cY)"]
-      SidecarC["cY-net (sidecar)<br/>- socat local proxies<br/>127.0.0.1:20000 -> cX:PORT"]
+      SidecarC["cY-net (sidecar)<br/>- socat local proxies<br/>127.0.0.1:20000 -> cX-net:PORT"]
       ProgC["cY (program)<br/>uses \${slots.*}<br/>(e.g. http://127.0.0.1:20000)"]
       ProgC --- SidecarC
     end
