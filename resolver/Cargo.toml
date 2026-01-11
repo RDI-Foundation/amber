@@ -7,7 +7,7 @@ edition = "2024"
 amber-manifest = { workspace = true }
 futures = { workspace = true }
 miette = { workspace = true, features = ["derive"] }
-reqwest = { version = "0.13.1", default-features = false, features = ["rustls", "stream"] }
+reqwest = { version = "0.13.1", features = ["stream"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 url = { workspace = true }

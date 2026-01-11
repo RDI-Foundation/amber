@@ -1,3 +1,4 @@
+mod config_schema_profile;
 mod document;
 pub mod lint;
 mod spans;
@@ -956,6 +957,8 @@ impl<'de> Deserialize<'de> for ConfigSchema {
         let value = Value::deserialize(deserializer)?;
         jsonschema::validator_for(&value)
             .map_err(|e| serde::de::Error::custom(Error::InvalidConfigSchema(e.to_string())))?;
+        config_schema_profile::validate(&value)
+            .map_err(|e| serde::de::Error::custom(Error::InvalidConfigSchema(e)))?;
         Ok(ConfigSchema(value))
     }
 }

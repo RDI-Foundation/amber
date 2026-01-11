@@ -1423,20 +1423,95 @@ fn config_used_in_component_config_is_not_linted() {
 }
 
 #[test]
-fn config_lint_incomplete_is_reported() {
+fn config_schema_profile_rejects_pattern_properties() {
     let input = r#"
         {
           manifest_version: "0.1.0",
           config_schema: {
             type: "object",
             patternProperties: {
-              "^x": { type: "string" },
+              ".*": { type: "string" },
             },
           },
         }
         "#;
-    let raw = parse_raw(input);
-    let manifest = raw.validate().unwrap();
+    let err = input.parse::<Manifest>().unwrap_err();
+    match err {
+        Error::Json5Path(diag) => {
+            assert!(
+                diag.to_string()
+                    .contains("does not match Amber config_schema profile")
+            );
+        }
+        other => panic!("expected Json5Path error, got: {other}"),
+    }
+}
+
+#[test]
+fn config_schema_profile_rejects_non_2020_12_draft() {
+    let input = r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            $schema: "http://json-schema.org/draft-07/schema#",
+            type: "object",
+            properties: { x: { type: "string" } },
+          },
+        }
+        "#;
+    let err = input.parse::<Manifest>().unwrap_err();
+    match err {
+        Error::Json5Path(diag) => {
+            assert!(
+                diag.to_string()
+                    .contains("does not match Amber config_schema profile")
+            );
+        }
+        other => panic!("expected Json5Path error, got: {other}"),
+    }
+}
+
+#[test]
+fn config_schema_profile_rejects_non_pointer_ref() {
+    let input = r##"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            $defs: {
+              x: { $anchor: "x", type: "string" },
+            },
+            properties: {
+              prop: { $ref: "#x" },
+            },
+          },
+        }
+        "##;
+    let err = input.parse::<Manifest>().unwrap_err();
+    match err {
+        Error::Json5Path(diag) => {
+            assert!(
+                diag.to_string()
+                    .contains("does not match Amber config_schema profile")
+            );
+        }
+        other => panic!("expected Json5Path error, got: {other}"),
+    }
+}
+
+#[test]
+fn config_lint_incomplete_is_reported() {
+    let mut manifest = Manifest::empty();
+    manifest.config_schema = Some(ConfigSchema(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "loop": { "$ref": "#/properties/loop" },
+        },
+    })));
+
+    let input = r#"
+        { manifest_version: "0.1.0" }
+        "#;
     let lints = lint_for(input, &manifest);
     assert!(
         lints

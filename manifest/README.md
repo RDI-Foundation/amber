@@ -76,7 +76,7 @@ This crate also provides `manifest::lint::lint_manifest` for non-fatal checks:
   * **used as a binding source from `self`** (some binding has `from: "self"` and `capability: "<name>"`)
 * If a **`program`** is declared, it should be referenced by a **`self` binding or export** (otherwise the program is likely unused).
 * Resolver names in each environment should be unique.
-* `config_schema` properties should be referenced by `${config.*}` in `program` or in child `components.<name>.config` templates (unused properties are linted). Schemas using unsupported features may emit a “lint incomplete” warning.
+* `config_schema` properties should be referenced by `${config.*}` in `program` or in child `components.<name>.config` templates (unused properties are linted). If the schema contains `$ref` cycles or unresolvable refs, the unused-property lint is incomplete and a warning is emitted; unsupported schema features are rejected at parse time.
 
 ### Link-time / resolution-time validation (NOT done by this crate)
 
@@ -272,7 +272,15 @@ Notes:
 
 Rules enforced by this crate:
 
-* The schema must be a valid JSON Schema (syntactically valid for the `jsonschema` library).
+* The schema must be valid JSON Schema (as accepted by the `jsonschema` library).
+* The schema must conform to Amber's `config_schema` profile (a deterministic subset that Amber tooling supports):
+  * If `$schema` is present, it must be Draft 2020-12 (`https://json-schema.org/draft/2020-12/schema`, with optional `#` and optional `http://`).
+  * Root schema must be object-shaped (`type: "object"` or `type: ["object", ...]`).
+  * Schema objects with `properties` or `required` must also include `"object"` in `type`.
+  * Property names (and `required` entries) must match `^(?!.*__)[a-z][a-z0-9_]*$`.
+  * `$ref` is allowed, but must be local-only JSON pointers (`#` or `#/...`).
+  * `additionalProperties` must be a boolean when present (schema-form `additionalProperties` is not supported).
+  * Unsupported keywords include: `anyOf`, `oneOf`, `not`, `if`/`then`/`else`, `patternProperties`, `propertyNames`, `dependentSchemas`, `dependentRequired`, `unevaluatedProperties`, `unevaluatedItems`, `$dynamicRef`, `$recursiveRef`.
 
 Example:
 

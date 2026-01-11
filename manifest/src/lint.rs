@@ -267,9 +267,6 @@ fn walk_schema<'a>(
             out.leaves
                 .entry(path.to_string())
                 .or_insert_with(|| cursor.pointer.clone());
-        } else {
-            out.unsupported
-                .insert("schema is not an object".to_string());
         }
         return;
     };
@@ -304,8 +301,6 @@ fn walk_schema<'a>(
         }
         return;
     }
-
-    record_unsupported_features(schema, out);
 
     let mut did_traverse = false;
 
@@ -351,84 +346,10 @@ fn walk_schema<'a>(
         }
     }
 
-    for key in ["anyOf", "oneOf"] {
-        let Some(subschemas) = schema.get(key).and_then(|v| v.as_array()) else {
-            continue;
-        };
-        for (idx, subschema) in subschemas.iter().enumerate() {
-            let pointer = push_pointer(&push_pointer(&cursor.pointer, key), &idx.to_string());
-            did_traverse = true;
-            walk_schema(
-                SchemaCursor {
-                    schema: subschema,
-                    pointer,
-                },
-                root,
-                path,
-                visited,
-                out,
-            );
-        }
-    }
-
-    for key in ["if", "then", "else"] {
-        let Some(subschema) = schema.get(key) else {
-            continue;
-        };
-        let pointer = push_pointer(&cursor.pointer, key);
-        did_traverse = true;
-        walk_schema(
-            SchemaCursor {
-                schema: subschema,
-                pointer,
-            },
-            root,
-            path,
-            visited,
-            out,
-        );
-    }
-
     if !did_traverse && !path.is_empty() {
         out.leaves
             .entry(path.to_string())
             .or_insert_with(|| cursor.pointer.clone());
-    }
-}
-
-fn record_unsupported_features(
-    schema: &serde_json::Map<String, Value>,
-    out: &mut SchemaLintResult,
-) {
-    if schema.contains_key("anyOf") {
-        out.unsupported.insert("anyOf".to_string());
-    }
-    if schema.contains_key("oneOf") {
-        out.unsupported.insert("oneOf".to_string());
-    }
-    if schema.contains_key("not") {
-        out.unsupported.insert("not".to_string());
-    }
-    if schema.contains_key("if") || schema.contains_key("then") || schema.contains_key("else") {
-        out.unsupported.insert("if/then/else".to_string());
-    }
-    if schema.contains_key("patternProperties") {
-        out.unsupported.insert("patternProperties".to_string());
-    }
-    if schema.contains_key("propertyNames") {
-        out.unsupported.insert("propertyNames".to_string());
-    }
-    if schema.contains_key("dependentSchemas") {
-        out.unsupported.insert("dependentSchemas".to_string());
-    }
-    if schema.contains_key("unevaluatedProperties") {
-        out.unsupported.insert("unevaluatedProperties".to_string());
-    }
-    if let Some(additional) = schema.get("additionalProperties")
-        && !additional.is_boolean()
-    {
-        out.unsupported
-            .insert("additionalProperties (schema)".to_string());
     }
 }
 

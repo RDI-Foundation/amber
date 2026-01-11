@@ -946,13 +946,13 @@ fn docker_smoke_config_forwarding_runtime_validation() {
             ],
         )
         .output();
-        if let Ok(output) = output {
-            if output.status.success() {
-                let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !text.is_empty() {
-                    rendered = Some(text);
-                    break;
-                }
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !text.is_empty() {
+                rendered = Some(text);
+                break;
             }
         }
         thread::sleep(Duration::from_secs(1));
@@ -1020,12 +1020,12 @@ fn docker_smoke_config_forwarding_runtime_validation() {
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&inspect.stdout).trim().to_string();
-        if let Some((status, code)) = text.split_once(' ') {
-            if status == "exited" {
-                let code = code.parse::<i32>().unwrap_or(0);
-                exit = Some((status.to_string(), code));
-                break;
-            }
+        if let Some((status, code)) = text.split_once(' ')
+            && status == "exited"
+        {
+            let code = code.parse::<i32>().unwrap_or(0);
+            exit = Some((status.to_string(), code));
+            break;
         }
         thread::sleep(Duration::from_secs(1));
     }
