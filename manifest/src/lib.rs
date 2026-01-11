@@ -126,7 +126,7 @@ pub enum Error {
     #[diagnostic(code(manifest::missing_provide_endpoint))]
     MissingProvideEndpoint { name: String },
 
-    #[error("invalid config schema: {0}")]
+    #[error("invalid config definition: {0}")]
     #[diagnostic(code(manifest::invalid_config_schema))]
     InvalidConfigSchema(String),
 

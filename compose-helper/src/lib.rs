@@ -198,23 +198,32 @@ fn schema_type_includes(schema: &Value, ty: &str) -> bool {
     }
 }
 
-fn schema_is_object(schema: &Value) -> bool {
-    schema_type_includes(schema, "object") || schema_properties(schema).is_some()
-}
-
 fn collect_leaf_paths(schema: &Value) -> Result<BTreeSet<String>> {
-    if !schema_is_object(schema) {
+    let mut out = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let has_children = walk_leaf_paths(schema, schema, "", &mut visited, &mut out)?;
+    if !has_children {
         return Err(HelperError::Schema(
             "root config_schema must be an object schema (type: \"object\" or properties: {...})"
                 .to_string(),
         ));
     }
+    Ok(out)
+}
 
-    fn walk(schema: &Value, prefix: &str, out: &mut BTreeSet<String>) -> Result<()> {
-        let Some(props) = schema_properties(schema) else {
-            return Ok(());
-        };
+fn walk_leaf_paths(
+    schema: &Value,
+    root: &Value,
+    prefix: &str,
+    visited: &mut BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) -> Result<bool> {
+    let schema = resolve_schema_ref(schema, root, visited)?;
+    ensure_schema_supported(schema)?;
 
+    let mut did_traverse = false;
+
+    if let Some(props) = schema_properties(schema) {
         let mut keys = props.keys().collect::<Vec<_>>();
         keys.sort();
 
@@ -226,18 +235,101 @@ fn collect_leaf_paths(schema: &Value) -> Result<BTreeSet<String>> {
                 format!("{prefix}.{k}")
             };
 
-            if schema_is_object(child) && schema_properties(child).is_some() {
-                walk(child, &path, out)?;
-            } else {
-                out.insert(path);
-            }
+            did_traverse = true;
+            let _ = walk_leaf_paths(child, root, &path, visited, out)?;
         }
-        Ok(())
     }
 
-    let mut out = BTreeSet::new();
-    walk(schema, "", &mut out)?;
-    Ok(out)
+    if let Some(all_of) = schema.get("allOf").and_then(|v| v.as_array()) {
+        for subschema in all_of {
+            did_traverse = true;
+            let _ = walk_leaf_paths(subschema, root, prefix, visited, out)?;
+        }
+    }
+
+    if !did_traverse && !prefix.is_empty() {
+        out.insert(prefix.to_string());
+    }
+
+    Ok(did_traverse)
+}
+
+fn ensure_schema_supported(schema: &Value) -> Result<()> {
+    let Value::Object(map) = schema else {
+        return Ok(());
+    };
+    let unsupported = [
+        ("anyOf", "anyOf"),
+        ("oneOf", "oneOf"),
+        ("not", "not"),
+        ("patternProperties", "patternProperties"),
+        ("propertyNames", "propertyNames"),
+        ("dependentSchemas", "dependentSchemas"),
+        ("unevaluatedProperties", "unevaluatedProperties"),
+    ];
+    for (key, name) in unsupported {
+        if map.contains_key(key) {
+            return Err(HelperError::Schema(format!(
+                "unsupported config_schema feature {name}"
+            )));
+        }
+    }
+    if map.contains_key("if") || map.contains_key("then") || map.contains_key("else") {
+        return Err(HelperError::Schema(
+            "unsupported config_schema feature if/then/else".to_string(),
+        ));
+    }
+    if let Some(additional) = map.get("additionalProperties")
+        && !additional.is_boolean()
+    {
+        return Err(HelperError::Schema(
+            "unsupported config_schema feature additionalProperties (schema)".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_schema_ref<'a>(
+    schema: &'a Value,
+    root: &'a Value,
+    visited: &mut BTreeSet<String>,
+) -> Result<&'a Value> {
+    let Value::Object(map) = schema else {
+        return Ok(schema);
+    };
+    let Some(reference) = map.get("$ref").and_then(|v| v.as_str()) else {
+        return Ok(schema);
+    };
+    let (target, pointer) = resolve_local_ref(root, reference)?;
+    if !visited.insert(pointer.clone()) {
+        return Err(HelperError::Schema(
+            "config_schema contains a cyclic $ref".to_string(),
+        ));
+    }
+    let resolved = resolve_schema_ref(target, root, visited);
+    visited.remove(&pointer);
+    resolved
+}
+
+fn resolve_local_ref<'a>(root: &'a Value, reference: &str) -> Result<(&'a Value, String)> {
+    if reference == "#" {
+        return Ok((root, String::new()));
+    }
+    let Some(pointer) = reference.strip_prefix("#/") else {
+        if reference.starts_with('#') {
+            return Err(HelperError::Schema(format!(
+                "unsupported $ref pointer {reference:?}"
+            )));
+        }
+        return Err(HelperError::Schema(format!(
+            "unsupported non-local $ref {reference:?}"
+        )));
+    };
+    let pointer = format!("/{pointer}");
+    let target = root
+        .pointer(&pointer)
+        .ok_or_else(|| HelperError::Schema(format!("unresolvable $ref pointer {reference:?}")))?;
+    Ok((target, pointer))
 }
 
 fn env_var_to_path(var: &str) -> Result<String> {
@@ -300,34 +392,54 @@ fn schema_lookup<'a>(schema: &'a Value, path: &str) -> Result<&'a Value> {
     if path.is_empty() {
         return Ok(schema);
     }
-    let mut cur = schema;
-    let mut it = path.split('.').peekable();
-    while let Some(seg) = it.next() {
-        let props = schema_properties(cur).ok_or_else(|| {
-            HelperError::Schema(format!(
-                "schema has no properties at segment {seg:?} for path {path:?}"
-            ))
-        })?;
-        let next = props.get(seg).ok_or_else(|| {
-            HelperError::Schema(format!(
-                "schema path {path:?} not found (unknown key {seg:?})"
-            ))
-        })?;
-        if it.peek().is_some() {
-            if schema_type_includes(next, "array") {
-                return Err(HelperError::Schema(format!(
-                    "cannot descend into array schema at segment {seg:?} for path {path:?}"
-                )));
-            }
-            if !(schema_is_object(next) && schema_properties(next).is_some()) {
-                return Err(HelperError::Schema(format!(
-                    "cannot descend into non-object schema at segment {seg:?} for path {path:?}"
-                )));
+    let segments = path.split('.').collect::<Vec<_>>();
+    if segments.iter().any(|seg| seg.is_empty()) {
+        return Err(HelperError::Schema(format!(
+            "invalid config path {path:?}: empty segment"
+        )));
+    }
+    let mut visited = BTreeSet::new();
+    lookup_path(schema, schema, &segments, &mut visited, path)
+}
+
+fn lookup_path<'a>(
+    schema: &'a Value,
+    root: &'a Value,
+    segments: &[&str],
+    visited: &mut BTreeSet<String>,
+    full_path: &str,
+) -> Result<&'a Value> {
+    let schema = resolve_schema_ref(schema, root, visited)?;
+    ensure_schema_supported(schema)?;
+
+    let seg = segments[0];
+    let rest = &segments[1..];
+
+    if let Some(props) = schema_properties(schema)
+        && let Some(child) = props.get(seg)
+    {
+        if rest.is_empty() {
+            return Ok(child);
+        }
+        if schema_type_includes(child, "array") {
+            return Err(HelperError::Schema(format!(
+                "cannot descend into array schema at segment {seg:?} for path {full_path:?}"
+            )));
+        }
+        return lookup_path(child, root, rest, visited, full_path);
+    }
+
+    if let Some(all_of) = schema.get("allOf").and_then(|v| v.as_array()) {
+        for subschema in all_of {
+            if let Ok(found) = lookup_path(subschema, root, segments, visited, full_path) {
+                return Ok(found);
             }
         }
-        cur = next;
     }
-    Ok(cur)
+
+    Err(HelperError::Schema(format!(
+        "schema path {full_path:?} not found (unknown key {seg:?})"
+    )))
 }
 
 fn parse_env_value(raw: &str, leaf_schema: &Value) -> Result<Value> {

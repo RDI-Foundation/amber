@@ -1,0 +1,13 @@
+manifest::unused_config
+
+  x config property `region` is never used (in component /)
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/lint_unused_config.json5:6:15]
+ 5 |     properties: {
+ 6 |       region: { type: "string" },
+   :               ^^^^^^^^^|^^^^^^^^
+   :                        `-- unused config property `region`
+ 7 |     },
+   `----
+  help: warning treated as error because it was denied via `-D warnings`
+        Remove the config property `region` if it is not needed, or reference it via config interpolation.
+Error:   × check failed

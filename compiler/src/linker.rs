@@ -261,10 +261,10 @@ fn config_schema_site(
     let (src, spans) = source_for_component(provenance, store, id)?;
     let span = spans.config_schema.unwrap_or((0usize, 0usize).into());
     Some(RelatedSpan {
-        message: format!("config schema for {component_path}"),
+        message: format!("config definition for {component_path}"),
         src,
         span,
-        label: "config schema declared here".to_string(),
+        label: "config definition declared here".to_string(),
     })
 }
 
@@ -712,7 +712,7 @@ fn validate_config_tree(
             let site = ConfigErrorSite::new(components, provenance, store, id).config_site();
             errors.push(Error::InvalidConfig {
                 component_path,
-                message: format!("invalid config schema: {msg}"),
+                message: format!("invalid config definition: {msg}"),
                 src: site.src,
                 span: site.span,
                 label: site.label,
@@ -766,7 +766,7 @@ fn validate_config_tree(
                         component_path: component_path.clone(),
                         message: format!(
                             "program.entrypoint[{arg_idx}] references ${{config{}}}, but this \
-                             component does not declare config_schema",
+                             component does not declare `config_schema`",
                             if query.is_empty() {
                                 "".to_string()
                             } else {
@@ -775,27 +775,31 @@ fn validate_config_tree(
                         ),
                         src: site.src.clone(),
                         span: site.span,
-                        label: "config schema required".to_string(),
+                        label: "config definition required".to_string(),
                         related: Vec::new(),
                     });
                     continue;
                 };
-                if let Err(e) = rc::schema_lookup(schema, query.as_str()) {
-                    errors.push(Error::InvalidConfig {
-                        component_path: component_path.clone(),
-                        message: format!(
-                            "invalid ${{config{}}} reference in program.entrypoint[{arg_idx}]: {e}",
-                            if query.is_empty() {
-                                "".to_string()
-                            } else {
-                                format!(".{query}")
-                            }
-                        ),
-                        src: site.src.clone(),
-                        span: site.span,
-                        label: "invalid config reference".to_string(),
-                        related: Vec::new(),
-                    });
+                match rc::schema_lookup(schema, query.as_str()) {
+                    Ok(rc::SchemaLookup::Found) | Ok(rc::SchemaLookup::Unknown) => {}
+                    Err(e) => {
+                        errors.push(Error::InvalidConfig {
+                            component_path: component_path.clone(),
+                            message: format!(
+                                "invalid ${{config{}}} reference in \
+                                 program.entrypoint[{arg_idx}]: {e}",
+                                if query.is_empty() {
+                                    "".to_string()
+                                } else {
+                                    format!(".{query}")
+                                }
+                            ),
+                            src: site.src.clone(),
+                            span: site.span,
+                            label: "invalid config reference".to_string(),
+                            related: Vec::new(),
+                        });
+                    }
                 }
             }
         }
@@ -813,7 +817,7 @@ fn validate_config_tree(
                         component_path: component_path.clone(),
                         message: format!(
                             "program.env.{k} references ${{config{}}}, but this component does \
-                             not declare config_schema",
+                             not declare `config_schema`",
                             if query.is_empty() {
                                 "".to_string()
                             } else {
@@ -822,27 +826,30 @@ fn validate_config_tree(
                         ),
                         src: site.src.clone(),
                         span: site.span,
-                        label: "config schema required".to_string(),
+                        label: "config definition required".to_string(),
                         related: Vec::new(),
                     });
                     continue;
                 };
-                if let Err(e) = rc::schema_lookup(schema, query.as_str()) {
-                    errors.push(Error::InvalidConfig {
-                        component_path: component_path.clone(),
-                        message: format!(
-                            "invalid ${{config{}}} reference in program.env.{k}: {e}",
-                            if query.is_empty() {
-                                "".to_string()
-                            } else {
-                                format!(".{query}")
-                            }
-                        ),
-                        src: site.src.clone(),
-                        span: site.span,
-                        label: "invalid config reference".to_string(),
-                        related: Vec::new(),
-                    });
+                match rc::schema_lookup(schema, query.as_str()) {
+                    Ok(rc::SchemaLookup::Found) | Ok(rc::SchemaLookup::Unknown) => {}
+                    Err(e) => {
+                        errors.push(Error::InvalidConfig {
+                            component_path: component_path.clone(),
+                            message: format!(
+                                "invalid ${{config{}}} reference in program.env.{k}: {e}",
+                                if query.is_empty() {
+                                    "".to_string()
+                                } else {
+                                    format!(".{query}")
+                                }
+                            ),
+                            src: site.src.clone(),
+                            span: site.span,
+                            label: "invalid config reference".to_string(),
+                            related: Vec::new(),
+                        });
+                    }
                 }
             }
         }
@@ -1052,7 +1059,7 @@ fn validate_config_tree(
                 errors.push(Error::InvalidConfig {
                     component_path: component_path.clone(),
                     message: "config was provided for a component that does not declare \
-                              config_schema"
+                              `config_schema`"
                         .to_string(),
                     src: site.src.clone(),
                     span: site.span,

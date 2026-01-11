@@ -1364,6 +1364,88 @@ fn unused_slot_is_linted() {
 }
 
 #[test]
+fn unused_config_is_linted() {
+    let input = r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              domain: { type: "string" },
+              num_trials: { type: "integer" },
+            },
+          },
+          program: {
+            image: "x",
+            args: ["--domain", "${config.domain}"],
+          },
+        }
+        "#;
+    let raw = parse_raw(input);
+    let manifest = raw.validate().unwrap();
+    let lints = lint_for(input, &manifest);
+    assert!(lints.iter().any(|lint| matches!(
+        lint,
+        lint::ManifestLint::UnusedConfig { path, .. } if path == "num_trials"
+    )));
+    assert!(!lints.iter().any(|lint| matches!(
+        lint,
+        lint::ManifestLint::UnusedConfig { path, .. } if path == "domain"
+    )));
+}
+
+#[test]
+fn config_used_in_component_config_is_not_linted() {
+    let input = r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              token: { type: "string" },
+            },
+          },
+          components: {
+            child: {
+              manifest: "https://example.com/child",
+              config: { token: "${config.token}" },
+            },
+          },
+        }
+        "#;
+    let raw = parse_raw(input);
+    let manifest = raw.validate().unwrap();
+    let lints = lint_for(input, &manifest);
+    assert!(!lints.iter().any(|lint| matches!(
+        lint,
+        lint::ManifestLint::UnusedConfig { path, .. } if path == "token"
+    )));
+}
+
+#[test]
+fn config_lint_incomplete_is_reported() {
+    let input = r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            patternProperties: {
+              "^x": { type: "string" },
+            },
+          },
+        }
+        "#;
+    let raw = parse_raw(input);
+    let manifest = raw.validate().unwrap();
+    let lints = lint_for(input, &manifest);
+    assert!(
+        lints
+            .iter()
+            .any(|lint| matches!(lint, lint::ManifestLint::ConfigLintIncomplete { .. }))
+    );
+}
+
+#[test]
 fn slot_used_in_program_args_is_not_linted() {
     let input = r#"
         {

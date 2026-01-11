@@ -141,7 +141,7 @@ fn labels_for_manifest_error(err: &ManifestError, spans: &ManifestSpans) -> Vec<
         }
         ManifestError::InvalidConfigSchema(_) => vec![primary(
             span_or_default(spans.config_schema),
-            Some("invalid schema here".to_string()),
+            Some("invalid config definition here".to_string()),
         )],
         ManifestError::UnknownEnvironmentExtends { name, .. } => {
             labels_for_unknown_environment_extends(spans, name)

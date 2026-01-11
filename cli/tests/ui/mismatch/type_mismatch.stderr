@@ -1,12 +1,12 @@
 linker::type_mismatch
 
   x type mismatch for slot `/green_router/wrapper.litellm`: expected llm, got http
-    ,-[<CARGO_MANIFEST_DIR>/tests/ui/mismatch/litellm.json5:29:5]
- 28 |     { to: "#proxy.backend", from: "self.http" },
- 29 |     { to: "#wrapper.litellm", from: "#proxy.admin_api" },
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/mismatch/litellm.json5:32:5]
+ 31 |     { to: "#proxy.backend", from: "self.http" },
+ 32 |     { to: "#wrapper.litellm", from: "#proxy.admin_api" },
     :     ^^^^^^^^^^^^^^^^^^^^^^^^^^|^^^^^^^^^^^^^^^^^^^^^^^^^
     :                               `-- binding provides `http` to slot expecting `llm`
- 30 |   ],
+ 33 |   ],
     `----
   help: Bind a provide of type `llm` to `/green_router/wrapper.litellm`, or change the slot/provide `kind`/`profile` so they match.
 
@@ -32,12 +32,12 @@ Advice:
 linker::type_mismatch
 
   x type mismatch for slot `/purple_router/wrapper.litellm`: expected llm, got http
-    ,-[<CARGO_MANIFEST_DIR>/tests/ui/mismatch/litellm.json5:29:5]
- 28 |     { to: "#proxy.backend", from: "self.http" },
- 29 |     { to: "#wrapper.litellm", from: "#proxy.admin_api" },
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/mismatch/litellm.json5:32:5]
+ 31 |     { to: "#proxy.backend", from: "self.http" },
+ 32 |     { to: "#wrapper.litellm", from: "#proxy.admin_api" },
     :     ^^^^^^^^^^^^^^^^^^^^^^^^^^|^^^^^^^^^^^^^^^^^^^^^^^^^
     :                               `-- binding provides `http` to slot expecting `llm`
- 30 |   ],
+ 33 |   ],
     `----
   help: Bind a provide of type `llm` to `/purple_router/wrapper.litellm`, or change the slot/provide `kind`/`profile` so they match.
 
@@ -73,12 +73,12 @@ linker::unbound_slot
 
 Advice: 
   > component `wrapper` declared on component /green_router
-    ,-[<CARGO_MANIFEST_DIR>/tests/ui/mismatch/litellm.json5:22:5]
- 21 |     proxy: "./litellm-proxy.json5",
- 22 |     wrapper: "./litellm-wrapper.json5",
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/mismatch/litellm.json5:25:5]
+ 24 |     proxy: "./litellm-proxy.json5",
+ 25 |     wrapper: "./litellm-wrapper.json5",
     :     ^^^|^^^
     :        `-- component declared here
- 23 |   },
+ 26 |   },
     `----
 linker::unbound_slot
 
@@ -93,11 +93,11 @@ linker::unbound_slot
 
 Advice: 
   > component `wrapper` declared on component /purple_router
-    ,-[<CARGO_MANIFEST_DIR>/tests/ui/mismatch/litellm.json5:22:5]
- 21 |     proxy: "./litellm-proxy.json5",
- 22 |     wrapper: "./litellm-wrapper.json5",
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/mismatch/litellm.json5:25:5]
+ 24 |     proxy: "./litellm-proxy.json5",
+ 25 |     wrapper: "./litellm-wrapper.json5",
     :     ^^^|^^^
     :        `-- component declared here
- 23 |   },
+ 26 |   },
     `----
 Error:   × check failed

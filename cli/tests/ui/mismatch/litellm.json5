@@ -3,6 +3,9 @@
   program: {
     image: "docker.io/litellm/litellm:latest",
     entrypoint: ["litellm"],
+    env: {
+      MODEL: "${config.model}",
+    },
     network: {
       endpoints: [
         { name: "http", port: 80 },

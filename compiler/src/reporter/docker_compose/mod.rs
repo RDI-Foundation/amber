@@ -718,7 +718,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 .config_schema()
                 .ok_or_else(|| {
                     format!(
-                        "internal error: helper-needed service {} has no config_schema",
+                        "internal error: helper-needed service {} has no `config_schema`",
                         component_label(s, *id)
                     )
                 })?
@@ -757,7 +757,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
 
             let schema_json = serde_json::to_vec(&rc::canonical_json(&schema)).map_err(|e| {
                 format!(
-                    "failed to serialize component config schema for {}: {e}",
+                    "failed to serialize component config definition for {}: {e}",
                     component_label(s, *id)
                 )
             })?;
@@ -799,17 +799,17 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
 
     if any_helper {
         let root_schema = root_schema.ok_or_else(|| {
-            "root component must declare config_schema when runtime config interpolation is \
+            "root component must declare `config_schema` when runtime config interpolation is \
              required"
                 .to_string()
         })?;
         let b64 = base64::engine::general_purpose::STANDARD;
         let root_schema_json = serde_json::to_vec(&rc::canonical_json(root_schema))
-            .map_err(|e| format!("failed to serialize root config schema: {e}"))?;
+            .map_err(|e| format!("failed to serialize root config definition: {e}"))?;
         root_schema_b64 = Some(b64.encode(root_schema_json));
 
         let leafs = rc::collect_leaf_paths(root_schema)
-            .map_err(|e| format!("failed to enumerate root config schema leaf paths: {e}"))?;
+            .map_err(|e| format!("failed to enumerate root config definition leaf paths: {e}"))?;
 
         for leaf in leafs {
             let var = rc::env_var_for_path(&leaf.path)

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use amber_manifest::{InterpolatedPart, InterpolatedString, InterpolationSource};
 use amber_template::{ConfigTemplate, ConfigTemplatePayload};
@@ -243,7 +243,7 @@ impl RootConfigTemplate {
     }
 }
 
-/// Return `true` if `key` is a valid Amber config schema property name.
+/// Return `true` if `key` is a valid Amber config property name.
 ///
 /// Required to make `AMBER_CONFIG_*` mapping injective.
 pub fn is_valid_config_key(key: &str) -> bool {
@@ -280,16 +280,62 @@ fn schema_properties(schema: &Value) -> Option<&Map<String, Value>> {
     schema.get("properties")?.as_object()
 }
 
-fn schema_is_object_with_properties(schema: &Value) -> bool {
-    schema_type_includes(schema, "object") && schema_properties(schema).is_some()
+#[derive(Clone, Copy, Debug)]
+pub enum SchemaLookup {
+    Found,
+    Unknown,
 }
 
-/// Validate that a config schema is object-shaped and that all `properties` keys are valid.
+#[derive(Debug)]
+enum LookupStatus {
+    Found,
+    Missing(String),
+    Unknown,
+}
+
+fn schema_has_unsupported_features(schema: &Value) -> bool {
+    let Value::Object(map) = schema else {
+        return false;
+    };
+    if map.contains_key("anyOf")
+        || map.contains_key("oneOf")
+        || map.contains_key("not")
+        || map.contains_key("if")
+        || map.contains_key("then")
+        || map.contains_key("else")
+        || map.contains_key("patternProperties")
+        || map.contains_key("propertyNames")
+        || map.contains_key("dependentSchemas")
+        || map.contains_key("unevaluatedProperties")
+    {
+        return true;
+    }
+    !matches!(map.get("additionalProperties"), Some(Value::Bool(_)) | None)
+}
+
+fn resolve_local_ref<'a>(root: &'a Value, reference: &str) -> Result<(&'a Value, String), String> {
+    if reference == "#" {
+        return Ok((root, String::new()));
+    }
+    let Some(pointer) = reference.strip_prefix("#/") else {
+        if reference.starts_with('#') {
+            return Err("invalid $ref pointer".to_string());
+        }
+        return Err("non-local $ref".to_string());
+    };
+    let pointer = format!("/{pointer}");
+    let Some(target) = root.pointer(&pointer) else {
+        return Err("unresolvable $ref".to_string());
+    };
+    Ok((target, pointer))
+}
+
+/// Validate that a config definition is object-shaped and that all `properties` keys are valid.
 ///
 /// The manifest layer already ensures it is valid JSON Schema; this adds Amber-specific constraints.
 pub fn validate_config_schema(schema: &Value) -> Result<(), String> {
     if !schema_type_includes(schema, "object") {
-        return Err("config_schema must have type \"object\"".to_string());
+        return Err("config definition must have type \"object\"".to_string());
     }
 
     fn walk(schema: &Value, at: &str) -> Result<(), String> {
@@ -299,7 +345,7 @@ pub fn validate_config_schema(schema: &Value) -> Result<(), String> {
 
         if !schema_type_includes(schema, "object") {
             return Err(format!(
-                "schema at {at} has `properties` but is not type \"object\""
+                "config definition at {at} has `properties` but is not type \"object\""
             ));
         }
 
@@ -310,7 +356,7 @@ pub fn validate_config_schema(schema: &Value) -> Result<(), String> {
         for k in keys {
             if !is_valid_config_key(k.as_str()) {
                 return Err(format!(
-                    "invalid config schema property name {k:?} at {at} (must match \
+                    "invalid config property name {k:?} in config definition at {at} (must match \
                      ^[a-z][a-z0-9_]*$ and must not contain '.' or '__')"
                 ));
             }
@@ -332,52 +378,135 @@ pub fn validate_config_schema(schema: &Value) -> Result<(), String> {
 /// Look up a subschema by a dotted property path (e.g. `db.url`).
 ///
 /// Arrays are treated as leaves: you may not descend into them.
-pub fn schema_lookup<'a>(schema: &'a Value, path: &str) -> Result<&'a Value, String> {
+pub fn schema_lookup(schema: &Value, path: &str) -> Result<SchemaLookup, String> {
     if path.is_empty() {
-        return Ok(schema);
+        return Ok(SchemaLookup::Found);
     }
 
-    let mut cur = schema;
-    let mut it = path.split('.').peekable();
-
-    while let Some(seg) = it.next() {
+    let mut segments = Vec::new();
+    for seg in path.split('.') {
         if seg.is_empty() {
             return Err(format!("invalid config path {path:?}: empty segment"));
         }
         if !is_valid_config_key(seg) {
             return Err(format!("invalid config path segment {seg:?} in {path:?}"));
         }
-
-        let Some(props) = schema_properties(cur) else {
-            return Err(format!(
-                "config path {path:?} not found (schema has no properties at segment {seg:?})"
-            ));
-        };
-
-        let Some(next) = props.get(seg) else {
-            return Err(format!(
-                "config path {path:?} not found (unknown key {seg:?})"
-            ));
-        };
-
-        if it.peek().is_some() {
-            if schema_type_includes(next, "array") {
-                return Err(format!(
-                    "invalid config path {path:?}: cannot descend into array at segment {seg:?}"
-                ));
-            }
-            if !schema_is_object_with_properties(next) {
-                return Err(format!(
-                    "invalid config path {path:?}: cannot descend into non-object schema at \
-                     segment {seg:?}"
-                ));
-            }
-        }
-
-        cur = next;
+        segments.push(seg);
     }
 
-    Ok(cur)
+    let mut visited = BTreeSet::new();
+    match lookup_path(schema, schema, &segments, &mut visited, path) {
+        LookupStatus::Found => Ok(SchemaLookup::Found),
+        LookupStatus::Unknown => Ok(SchemaLookup::Unknown),
+        LookupStatus::Missing(msg) => Err(msg),
+    }
+}
+
+fn lookup_path(
+    schema: &Value,
+    root: &Value,
+    segments: &[&str],
+    visited: &mut BTreeSet<String>,
+    full_path: &str,
+) -> LookupStatus {
+    if segments.is_empty() {
+        return LookupStatus::Found;
+    }
+
+    if let Some(reference) = schema.get("$ref").and_then(|v| v.as_str()) {
+        let Ok((resolved, pointer)) = resolve_local_ref(root, reference) else {
+            return LookupStatus::Unknown;
+        };
+        if !visited.insert(pointer.clone()) {
+            return LookupStatus::Unknown;
+        }
+        let out = lookup_path(resolved, root, segments, visited, full_path);
+        visited.remove(&pointer);
+        return out;
+    }
+
+    let mut unknown = schema_has_unsupported_features(schema);
+    let seg = segments[0];
+    let rest = &segments[1..];
+
+    let mut outcomes = Vec::new();
+
+    if let Some(props) = schema_properties(schema) {
+        if let Some(child) = props.get(seg) {
+            if !rest.is_empty() && schema_type_includes(child, "array") {
+                outcomes.push(LookupStatus::Missing(format!(
+                    "invalid config path {full_path:?}: cannot descend into array at segment \
+                     {seg:?}"
+                )));
+            } else {
+                outcomes.push(lookup_path(child, root, rest, visited, full_path));
+            }
+        } else {
+            outcomes.push(LookupStatus::Missing(format!(
+                "config path {full_path:?} not found (unknown key {seg:?})"
+            )));
+        }
+    } else {
+        outcomes.push(LookupStatus::Missing(format!(
+            "config path {full_path:?} not found (schema has no properties at segment {seg:?})"
+        )));
+    }
+
+    if let Some(all_of) = schema.get("allOf").and_then(|v| v.as_array()) {
+        for subschema in all_of {
+            outcomes.push(lookup_path(subschema, root, segments, visited, full_path));
+        }
+    }
+
+    if let Some(any_of) = schema.get("anyOf").and_then(|v| v.as_array()) {
+        unknown = true;
+        for subschema in any_of {
+            outcomes.push(lookup_path(subschema, root, segments, visited, full_path));
+        }
+    }
+
+    if let Some(one_of) = schema.get("oneOf").and_then(|v| v.as_array()) {
+        unknown = true;
+        for subschema in one_of {
+            outcomes.push(lookup_path(subschema, root, segments, visited, full_path));
+        }
+    }
+
+    if let Some(subschema) = schema.get("if") {
+        unknown = true;
+        outcomes.push(lookup_path(subschema, root, segments, visited, full_path));
+    }
+    if let Some(subschema) = schema.get("then") {
+        unknown = true;
+        outcomes.push(lookup_path(subschema, root, segments, visited, full_path));
+    }
+    if let Some(subschema) = schema.get("else") {
+        unknown = true;
+        outcomes.push(lookup_path(subschema, root, segments, visited, full_path));
+    }
+
+    if outcomes
+        .iter()
+        .any(|outcome| matches!(outcome, LookupStatus::Found))
+    {
+        return LookupStatus::Found;
+    }
+
+    if unknown
+        || outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, LookupStatus::Unknown))
+    {
+        return LookupStatus::Unknown;
+    }
+
+    for outcome in outcomes {
+        if let LookupStatus::Missing(msg) = outcome {
+            return LookupStatus::Missing(msg);
+        }
+    }
+
+    LookupStatus::Missing(format!("config path {full_path:?} not found"))
 }
 
 fn schema_required_set(schema: &Value) -> BTreeMap<String, ()> {
@@ -393,7 +522,7 @@ fn schema_required_set(schema: &Value) -> BTreeMap<String, ()> {
     out
 }
 
-/// A leaf property path in an object-shaped config schema.
+/// A leaf property path in an object-shaped config definition.
 #[derive(Clone, Debug)]
 pub struct SchemaLeaf {
     pub path: String,
@@ -406,18 +535,47 @@ pub struct SchemaLeaf {
 /// leaves.
 pub fn collect_leaf_paths(schema: &Value) -> Result<Vec<SchemaLeaf>, String> {
     validate_config_schema(schema)?;
+    let mut out: BTreeMap<String, bool> = BTreeMap::new();
+    let mut visited = BTreeSet::new();
+    let _ = walk_leaf_paths(schema, schema, "", true, &mut visited, &mut out)?;
+    Ok(out
+        .into_iter()
+        .map(|(path, required)| SchemaLeaf { path, required })
+        .collect())
+}
 
-    let mut out = Vec::new();
+fn walk_leaf_paths(
+    schema: &Value,
+    root: &Value,
+    prefix: &str,
+    required_so_far: bool,
+    visited: &mut BTreeSet<String>,
+    out: &mut BTreeMap<String, bool>,
+) -> Result<bool, String> {
+    let Value::Object(map) = schema else {
+        if !prefix.is_empty() {
+            out.entry(prefix.to_string())
+                .and_modify(|req| *req |= required_so_far)
+                .or_insert(required_so_far);
+        }
+        return Ok(false);
+    };
 
-    fn walk(
-        schema: &Value,
-        prefix: &str,
-        required_so_far: bool,
-        out: &mut Vec<SchemaLeaf>,
-    ) -> Result<(), String> {
-        let Some(props) = schema_properties(schema) else {
-            return Ok(());
-        };
+    if let Some(reference) = map.get("$ref").and_then(|v| v.as_str()) {
+        let (resolved, pointer) = resolve_local_ref(root, reference)?;
+        if !visited.insert(pointer.clone()) {
+            return Err("config definition contains a cyclic $ref".to_string());
+        }
+        let out = walk_leaf_paths(resolved, root, prefix, required_so_far, visited, out);
+        visited.remove(&pointer);
+        return out;
+    }
+
+    ensure_leaf_schema_supported(map)?;
+
+    let mut did_traverse = false;
+
+    if let Some(props) = schema_properties(schema) {
         let req = schema_required_set(schema);
 
         // Deterministic ordering.
@@ -435,21 +593,60 @@ pub fn collect_leaf_paths(schema: &Value) -> Result<Vec<SchemaLeaf>, String> {
                 format!("{prefix}.{k}")
             };
 
-            if schema_is_object_with_properties(child_schema) {
-                walk(child_schema, &path, req_path, out)?;
-            } else {
-                out.push(SchemaLeaf {
-                    path,
-                    required: req_path,
-                });
-            }
+            did_traverse = true;
+            let _ = walk_leaf_paths(child_schema, root, &path, req_path, visited, out)?;
         }
-
-        Ok(())
     }
 
-    walk(schema, "", true, &mut out)?;
-    Ok(out)
+    if let Some(all_of) = schema.get("allOf").and_then(|v| v.as_array()) {
+        for subschema in all_of {
+            did_traverse = true;
+            let _ = walk_leaf_paths(subschema, root, prefix, required_so_far, visited, out)?;
+        }
+    }
+
+    if !did_traverse && !prefix.is_empty() {
+        out.entry(prefix.to_string())
+            .and_modify(|req| *req |= required_so_far)
+            .or_insert(required_so_far);
+    }
+
+    Ok(did_traverse)
+}
+
+fn ensure_leaf_schema_supported(schema: &serde_json::Map<String, Value>) -> Result<(), String> {
+    let unsupported = [
+        ("anyOf", "anyOf"),
+        ("oneOf", "oneOf"),
+        ("not", "not"),
+        ("patternProperties", "patternProperties"),
+        ("propertyNames", "propertyNames"),
+        ("dependentSchemas", "dependentSchemas"),
+        ("unevaluatedProperties", "unevaluatedProperties"),
+    ];
+    for (key, name) in unsupported {
+        if schema.contains_key(key) {
+            return Err(format!(
+                "config definition uses unsupported feature {name} for leaf enumeration"
+            ));
+        }
+    }
+    if schema.contains_key("if") || schema.contains_key("then") || schema.contains_key("else") {
+        return Err(
+            "config definition uses unsupported feature if/then/else for leaf enumeration"
+                .to_string(),
+        );
+    }
+    if let Some(additional) = schema.get("additionalProperties")
+        && !additional.is_boolean()
+    {
+        return Err(
+            "config definition uses unsupported feature additionalProperties (schema) for leaf \
+             enumeration"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Map a config leaf path (like `db.url`) to its corresponding env var name
@@ -537,7 +734,7 @@ fn parse_string_template(s: &str, parent_schema: Option<&Value>) -> Result<Confi
                     let schema = parent_schema.ok_or_else(|| {
                         format!(
                             "config interpolation ${{config{}}} is not allowed because the parent \
-                             component has no config_schema",
+                             component has no `config_schema`",
                             if query.is_empty() {
                                 "".to_string()
                             } else {
@@ -547,8 +744,12 @@ fn parse_string_template(s: &str, parent_schema: Option<&Value>) -> Result<Confi
                     })?;
 
                     // Validate the referenced path exists in the parent schema.
-                    let _ = schema_lookup(schema, query.as_str())
-                        .map_err(|e| format!("invalid parent config reference {query:?}: {e}"))?;
+                    match schema_lookup(schema, query.as_str()) {
+                        Ok(SchemaLookup::Found) | Ok(SchemaLookup::Unknown) => {}
+                        Err(e) => {
+                            return Err(format!("invalid parent config reference {query:?}: {e}"));
+                        }
+                    }
 
                     parts.push(TemplatePart::config(query));
                 }

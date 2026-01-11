@@ -76,6 +76,7 @@ This crate also provides `manifest::lint::lint_manifest` for non-fatal checks:
   * **used as a binding source from `self`** (some binding has `from: "self"` and `capability: "<name>"`)
 * If a **`program`** is declared, it should be referenced by a **`self` binding or export** (otherwise the program is likely unused).
 * Resolver names in each environment should be unique.
+* `config_schema` properties should be referenced by `${config.*}` in `program` or in child `components.<name>.config` templates (unused properties are linted). Schemas using unsupported features may emit a “lint incomplete” warning.
 
 ### Link-time / resolution-time validation (NOT done by this crate)
 
