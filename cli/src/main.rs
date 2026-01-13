@@ -8,7 +8,10 @@ use amber_compiler::{
     CompileOptions, CompileOutput, Compiler, ResolverRegistry,
     bundle::{BundleBuilder, BundleLoader},
     reporter::{
-        Reporter as _, docker_compose::DockerComposeReporter, dot::DotReporter,
+        Reporter as _,
+        docker_compose::DockerComposeReporter,
+        dot::DotReporter,
+        kubernetes::{KubernetesReporter, KubernetesReporterConfig},
         scenario_ir::ScenarioIrReporter,
     },
 };
@@ -68,6 +71,14 @@ struct CompileArgs {
     /// Write a manifest bundle to this directory.
     #[arg(long = "bundle", value_name = "DIR")]
     bundle: Option<PathBuf>,
+
+    /// Write Kubernetes manifests to this directory.
+    #[arg(long = "kubernetes", visible_alias = "k8s", value_name = "DIR")]
+    kubernetes: Option<PathBuf>,
+
+    /// Allow deployment without NetworkPolicy enforcement check.
+    #[arg(long = "allow-no-networkpolicy", requires = "kubernetes")]
+    allow_no_networkpolicy: bool,
 
     /// Root manifest or bundle to compile (URL or local path).
     #[arg(value_name = "MANIFEST")]
@@ -177,6 +188,16 @@ async fn compile(args: CompileArgs) -> Result<()> {
             ArtifactOutput::Stdout => print!("{compose}"),
             ArtifactOutput::File(path) => write_artifact(&path, compose.as_bytes())?,
         }
+    }
+
+    if let Some(k8s_dir) = &args.kubernetes {
+        let reporter = KubernetesReporter {
+            config: KubernetesReporterConfig {
+                allow_no_networkpolicy: args.allow_no_networkpolicy,
+            },
+        };
+        let artifact = reporter.emit(&output).map_err(miette::Report::new)?;
+        write_kubernetes_output(k8s_dir, &artifact)?;
     }
 
     if let Some(bundle_root) = resolve_bundle_root(&args)? {
@@ -455,13 +476,14 @@ fn ensure_outputs_requested(args: &CompileArgs) -> Result<()> {
         || args.dot.is_some()
         || args.docker_compose.is_some()
         || args.bundle.is_some()
+        || args.kubernetes.is_some()
     {
         return Ok(());
     }
 
     Err(miette::miette!(
-        help = "Request at least one output with `--output`, `--dot`, `--docker-compose`, or \
-                `--bundle`.",
+        help = "Request at least one output with `--output`, `--dot`, `--docker-compose`, \
+                `--kubernetes`, or `--bundle`.",
         "no outputs requested for `amber compile`"
     ))
 }
@@ -564,4 +586,52 @@ fn write_artifact(path: &Path, contents: &[u8]) -> Result<()> {
     std::fs::write(path, contents)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to write `{}`", path.display()))
+}
+
+fn write_kubernetes_output(
+    root: &Path,
+    artifact: &amber_compiler::reporter::kubernetes::KubernetesArtifact,
+) -> Result<()> {
+    // Clean and recreate the output directory.
+    if root.exists() {
+        if root.is_dir() {
+            std::fs::remove_dir_all(root)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to remove kubernetes output directory `{}`",
+                        root.display()
+                    )
+                })?;
+        } else {
+            return Err(miette::miette!(
+                "kubernetes output path `{}` is not a directory",
+                root.display()
+            ));
+        }
+    }
+
+    std::fs::create_dir_all(root)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to create kubernetes output directory `{}`",
+                root.display()
+            )
+        })?;
+
+    // Write each file.
+    for (rel_path, content) in &artifact.files {
+        let full_path = root.join(rel_path);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to create directory `{}`", parent.display()))?;
+        }
+        std::fs::write(&full_path, content)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to write `{}`", full_path.display()))?;
+    }
+
+    Ok(())
 }

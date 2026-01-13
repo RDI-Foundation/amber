@@ -24,7 +24,7 @@ use crate::{
 const MESH_NETWORK_NAME: &str = "amber_mesh";
 
 const SIDECAR_IMAGE: &str = "ghcr.io/rdi-foundation/amber-sidecar:main";
-const HELPER_IMAGE: &str = "ghcr.io/rdi-foundation/amber-compose-helper:v1";
+const HELPER_IMAGE: &str = "ghcr.io/rdi-foundation/amber-helper:v1";
 const HELPER_VOLUME_NAME: &str = "amber-helper-bin";
 const HELPER_INIT_SERVICE: &str = "amber-init";
 const HELPER_BIN_DIR: &str = "/amber/bin";

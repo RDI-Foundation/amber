@@ -28,7 +28,7 @@ fn encode_spec_b64(spec: &TemplateSpec) -> String {
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("compose-helper crate should live under the workspace root")
+        .expect("helper crate should live under the workspace root")
         .to_path_buf()
 }
 
@@ -42,7 +42,7 @@ fn docker_target_arch() -> &'static str {
 
 fn build_helper_image(tag: &str) {
     let root = workspace_root();
-    let dockerfile = root.join("docker/amber-compose-helper/Dockerfile");
+    let dockerfile = root.join("docker/amber-helper/Dockerfile");
     let status = Command::new("docker")
         .arg("build")
         .arg("--build-arg")
@@ -73,7 +73,7 @@ fn run_helper_container(image: &str, out_dir: &Path, envs: &[(String, String)]) 
 #[test]
 #[ignore = "requires docker; run manually or in CI"]
 fn helper_image_executes_run_plan_in_scratch() {
-    let tag = "amber-compose-helper:e2e";
+    let tag = "amber-helper:e2e";
     build_helper_image(tag);
 
     let out_dir = tempdir().expect("temp dir should create");

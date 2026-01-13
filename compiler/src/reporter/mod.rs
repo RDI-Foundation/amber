@@ -6,6 +6,7 @@ use crate::CompileOutput;
 
 pub mod docker_compose;
 pub mod dot;
+pub mod kubernetes;
 pub mod scenario_ir;
 
 pub use docker_compose::DockerComposeReporter;
