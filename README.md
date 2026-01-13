@@ -369,6 +369,14 @@ UI tests live in `cli/tests/ui/`:
 * each `*.json5` case has an expected `*.stderr` (and optionally `*.stdout`)
 * tests run `amber check` and compare normalized output
 
+Docker-backed tests are ignored by default (they require Docker):
+
+```bash
+cargo test -p amber-compiler --all-features docker_smoke_ocap_blocks_unbound_callers -- --ignored --test-threads=1
+cargo test -p amber-compiler --all-features docker_smoke_config_forwarding_runtime_validation -- --ignored --test-threads=1
+cargo test -p amber-compose-helper --all-features helper_image_executes_run_plan_in_scratch -- --ignored --test-threads=1
+```
+
 ---
 
 ## Known limitations (current behavior)
