@@ -18,12 +18,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: amber-node
+          - image: amber-cli
             context: .
             file: Dockerfile
             runner: ubuntu-latest
             arch: amd64
-          - image: amber-node
+          - image: amber-cli
             context: .
             file: Dockerfile
             runner: ubuntu-24.04-arm
@@ -101,19 +101,19 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Configure node tags
-        id: node_meta
+      - name: Configure cli tags
+        id: cli_meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_REGISTRY }}/amber-node
+          images: ${{ env.IMAGE_REGISTRY }}/amber-cli
           tags: |
             type=ref,event=branch
             type=ref,event=tag
             type=sha
-      - name: Publish amber-node manifests
+      - name: Publish amber-cli manifests
         run: |
           set -euo pipefail
-          tags="${{ steps.node_meta.outputs.tags }}"
+          tags="${{ steps.cli_meta.outputs.tags }}"
           while read -r tag; do
             [ -z "$tag" ] && continue
             docker buildx imagetools create -t "$tag" "${tag}-amd64" "${tag}-arm64"
@@ -152,3 +152,46 @@ jobs:
             [ -z "$tag" ] && continue
             docker buildx imagetools create -t "$tag" "${tag}-amd64" "${tag}-arm64"
           done <<< "$tags"
+
+  cli-artifacts:
+    name: Build amber-cli artifacts (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: macos-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly-2025-10-30
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+      - name: Build amber-cli
+        run: cargo build -p amber-cli --release --target ${{ matrix.target }}
+      - name: Package artifact
+        run: |
+          set -euo pipefail
+          tar -czf "amber-cli-${{ matrix.platform }}.tar.gz" -C "target/${{ matrix.target }}/release" amber
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: amber-cli-${{ matrix.platform }}
+          path: amber-cli-${{ matrix.platform }}.tar.gz
+          if-no-files-found: error

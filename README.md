@@ -129,6 +129,21 @@ flowchart LR
 * **Docker + Docker Compose:** needed to run the emitted `docker-compose.yaml`
 * **Graphviz (optional):** to render `.dot` files into SVG/PNG
 
+### Download prebuilt amber-cli (optional)
+
+If you don't want to build from source, download the latest nightly artifacts (linux/amd64, linux/arm64, macos/arm64) from:
+
+https://github.com/RDI-Foundation/amber/actions/workflows/publish.yaml?query=branch%3Amain
+
+Open the most recent `amber-publish` run and download the `amber-cli-<platform>.tar.gz` artifact. Each archive contains the `amber` binary.
+
+Example:
+
+```bash
+tar -xzf amber-cli-linux-amd64.tar.gz
+./amber --help
+```
+
 ### Build
 
 ```bash
