@@ -54,7 +54,7 @@ RUN target=$(cat /tmp/rust-target) && \
     cargo build -p amber-compose-helper --release --locked --target "${target}" && \
     install -D -m 0755 /app/target/"${target}"/release/amber-compose-helper /out/amber-helper
 
-FROM debian:13-slim
+FROM gcr.io/distroless/static-debian13
 
 COPY --from=builder /out/amber-helper /amber-helper
 

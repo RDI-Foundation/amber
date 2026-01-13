@@ -6,11 +6,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     g++ \
+    musl-tools \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 COPY rust-toolchain.toml .
 RUN rustup show
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+        amd64) target="x86_64-unknown-linux-musl" ;; \
+        arm64) target="aarch64-unknown-linux-musl" ;; \
+        *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    echo "${target}" > /tmp/rust-target && \
+    rustup target add "${target}"
 
 FROM base-builder AS builder
 
@@ -42,29 +51,22 @@ COPY template ./template
 COPY node ./node
 
 ARG BUILD_MODE=release
-RUN if [ "$BUILD_MODE" = "release" ]; then \
-      cargo build --locked --release -p amber-cli; \
+RUN target=$(cat /tmp/rust-target) && \
+    if [ "$BUILD_MODE" = "release" ]; then \
+      cargo build --locked --release -p amber-cli --target "${target}"; \
+      build_dir=release; \
     else \
-      cargo build -p amber-cli; \
-    fi
+      cargo build -p amber-cli --target "${target}"; \
+      build_dir=debug; \
+    fi && \
+    install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber /out/amber && \
+    install -d -m 0755 /out/workdir
 
-FROM debian:13-slim AS runtime
+FROM gcr.io/distroless/static-debian13 AS runtime
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    tini \
-    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder --chown=65532:65532 /out/workdir /app
+COPY --from=builder --chown=65532:65532 /out/amber /amber
 
-ARG USERNAME=amber
-ARG USER_UID=1001
-ARG USER_GID=${USER_UID}
-RUN groupadd --gid ${USER_GID} ${USERNAME} && \
-    useradd --uid ${USER_UID} --gid ${USER_GID} --shell /bin/false --create-home ${USERNAME}
-
-WORKDIR /home/${USERNAME}/app
-
-ARG BUILD_MODE=release
-COPY --from=builder --chown=${USERNAME}:${USERNAME} /app/target/${BUILD_MODE}/amber /usr/local/bin/amber
-
-USER ${USERNAME}
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/amber"]
+USER 65532:65532
+WORKDIR /app
+ENTRYPOINT ["/amber"]
