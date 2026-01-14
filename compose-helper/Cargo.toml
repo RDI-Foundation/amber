@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+amber-config = { workspace = true }
 base64 = { workspace = true }
 jsonschema = { workspace = true }
 amber-template = { workspace = true }

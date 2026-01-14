@@ -7,12 +7,13 @@ use amber_scenario::Scenario;
 use miette::{Diagnostic, Report};
 use thiserror::Error;
 
+mod config_template;
+mod config_templates;
 mod environment;
 mod frontend;
 mod linker;
 mod manifest_table;
 mod provenance;
-mod runtime_config;
 mod slot_query;
 mod slot_validation;
 mod store;

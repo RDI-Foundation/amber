@@ -6,6 +6,7 @@ use std::{
     sync::Arc,
 };
 
+use amber_config as rc;
 use amber_manifest::{
     BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, ChildName, ExportName,
     ExportTarget, InterpolatedPart, InterpolationSource, Manifest, ManifestDigest,
@@ -20,7 +21,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use super::frontend::{ResolvedNode, ResolvedTree};
-use crate::{ComponentProvenance, DigestStore, Provenance, runtime_config as rc};
+use crate::{ComponentProvenance, DigestStore, Provenance, config_templates};
 
 #[allow(unused_assignments)]
 #[derive(Debug, Error, Diagnostic)]
@@ -707,12 +708,12 @@ fn validate_config_tree(
         let Some(schema_decl) = m.config_schema() else {
             continue;
         };
-        if let Err(msg) = rc::validate_config_schema(&schema_decl.0) {
+        if let Err(err) = rc::validate_config_schema(&schema_decl.0) {
             let component_path = component_path_for(components, id);
             let site = ConfigErrorSite::new(components, provenance, store, id).config_site();
             errors.push(Error::InvalidConfig {
                 component_path,
-                message: format!("invalid config definition: {msg}"),
+                message: format!("invalid config definition: {err}"),
                 src: site.src,
                 span: site.span,
                 label: site.label,
@@ -721,19 +722,7 @@ fn validate_config_tree(
         }
     }
 
-    // 2) Validate config use-sites and program `${config.*}` references while composing
-    //    component config templates into root-only templates (for static validation only).
-
-    let root_manifest = manifests[root.0]
-        .as_ref()
-        .expect("root manifest should exist");
-    let root_schema = root_manifest.config_schema().map(|s| &s.0);
-
-    let root_template = if root_schema.is_some() {
-        rc::RootConfigTemplate::Root
-    } else {
-        rc::RootConfigTemplate::Node(rc::ConfigNode::empty_object())
-    };
+    // 2) Validate config use-sites and program `${config.*}` references.
 
     fn validate_program_config_refs(
         id: ComponentId,
@@ -1023,38 +1012,36 @@ fn validate_config_tree(
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn visit(
-        id: ComponentId,
-        root: ComponentId,
-        components: &[Option<Component>],
-        manifests: &[Option<Arc<Manifest>>],
-        provenance: &Provenance,
-        store: &DigestStore,
-        parent_schema: Option<&Value>,
-        parent_template: &rc::RootConfigTemplate,
-        schema_cache: &mut HashMap<ManifestDigest, Arc<Validator>>,
-        errors: &mut Vec<Error>,
-    ) -> rc::RootConfigTemplate {
-        let c = component(components, id);
+    for id in (0..components.len()).map(ComponentId) {
         let m = manifests[id.0].as_ref().expect("manifest should exist");
-
         let schema = m.config_schema().map(|s| &s.0);
         validate_program_config_refs(id, components, manifests, provenance, store, schema, errors);
+    }
+
+    let composed = config_templates::compose_root_config_templates(root, components, manifests);
+
+    for err in &composed.errors {
+        let component_path = component_path_for(components, err.component);
+        let site = ConfigErrorSite::new(components, provenance, store, err.component).config_site();
+        errors.push(Error::InvalidConfig {
+            component_path,
+            message: err.message.clone(),
+            src: site.src,
+            span: site.span,
+            label: site.label,
+            related: Vec::new(),
+        });
+    }
+
+    for id in (0..components.len()).map(ComponentId) {
+        let c = component(components, id);
+        let m = manifests[id.0].as_ref().expect("manifest should exist");
+        let schema = m.config_schema().map(|s| &s.0);
 
         let component_path = component_path_for(components, id);
         let site = ConfigErrorSite::new(components, provenance, store, id).config_site();
 
-        let this_template: rc::RootConfigTemplate = if id == root {
-            // Root config is a runtime input when schema exists. If the root has no schema, it has
-            // no config at all (so any `${config.*}` usage should have already errored above).
-            if schema.is_some() {
-                rc::RootConfigTemplate::Root
-            } else {
-                rc::RootConfigTemplate::Node(rc::ConfigNode::empty_object())
-            }
-        } else if schema.is_none() {
-            // Components without config_schema have no config at all.
+        let Some(schema) = schema else {
             if c.config.is_some() {
                 errors.push(Error::InvalidConfig {
                     component_path: component_path.clone(),
@@ -1067,95 +1054,44 @@ fn validate_config_tree(
                     related: Vec::new(),
                 });
             }
-            rc::RootConfigTemplate::Node(rc::ConfigNode::empty_object())
-        } else {
-            // Parse use-site config as a template (relative to parent config), then compose to root-only.
-            let initial = match rc::parse_instance_config_template(c.config.as_ref(), parent_schema)
-            {
-                Ok(t) => t,
-                Err(msg) => {
-                    errors.push(Error::InvalidConfig {
-                        component_path: component_path.clone(),
-                        message: msg,
-                        src: site.src.clone(),
-                        span: site.span,
-                        label: site.label.clone(),
-                        related: Vec::new(),
-                    });
-                    rc::ConfigNode::empty_object()
-                }
-            };
+            continue;
+        };
 
-            let composed = match rc::compose_config_template(initial, parent_template) {
-                Ok(t) => t.simplify(),
-                Err(msg) => {
-                    errors.push(Error::InvalidConfig {
-                        component_path: component_path.clone(),
-                        message: msg,
-                        src: site.src.clone(),
-                        span: site.span,
-                        label: site.label.clone(),
-                        related: Vec::new(),
-                    });
-                    rc::ConfigNode::empty_object()
-                }
-            };
+        let template = composed.templates.get(&id).expect("template should exist");
+        let rc::RootConfigTemplate::Node(composed) = template else {
+            // Root config is a runtime input when schema exists.
+            continue;
+        };
 
-            if !composed.is_object() {
-                errors.push(Error::InvalidConfig {
-                    component_path: component_path.clone(),
-                    message: "component config must be an object (non-object config templates are \
-                              unsupported)"
-                        .to_string(),
-                    src: site.src.clone(),
-                    span: site.span,
-                    label: site.label.clone(),
-                    related: Vec::new(),
-                });
-                return rc::RootConfigTemplate::Node(rc::ConfigNode::empty_object());
-            }
+        if !composed.is_object() {
+            errors.push(Error::InvalidConfig {
+                component_path: component_path.clone(),
+                message: "component config must be an object (non-object config templates are \
+                          unsupported)"
+                    .to_string(),
+                src: site.src.clone(),
+                span: site.span,
+                label: site.label.clone(),
+                related: Vec::new(),
+            });
+            continue;
+        }
 
-            if let Some(schema) = schema {
-                if let Err(msg) = ensure_required_keys_present(schema, &composed, "") {
-                    errors.push(Error::InvalidConfig {
-                        component_path: component_path.clone(),
-                        message: msg,
-                        src: site.src.clone(),
-                        span: site.span,
-                        label: site.label.clone(),
-                        related: Vec::new(),
-                    });
-                }
+        if let Err(msg) = ensure_required_keys_present(schema, composed, "") {
+            errors.push(Error::InvalidConfig {
+                component_path: component_path.clone(),
+                message: msg,
+                src: site.src.clone(),
+                span: site.span,
+                label: site.label.clone(),
+                related: Vec::new(),
+            });
+        }
 
-                // Validate static values at compile time.
-                if !composed.contains_runtime() {
-                    match composed.evaluate_static() {
-                        Ok(v) => {
-                            if let Err(e) = validate_jsonschema(
-                                id,
-                                components,
-                                manifests,
-                                provenance,
-                                store,
-                                schema_cache,
-                                schema,
-                                &v,
-                                "invalid config",
-                            ) {
-                                errors.push(e);
-                            }
-                        }
-                        Err(msg) => errors.push(Error::InvalidConfig {
-                            component_path: component_path.clone(),
-                            message: msg,
-                            src: site.src.clone(),
-                            span: site.span,
-                            label: site.label.clone(),
-                            related: Vec::new(),
-                        }),
-                    }
-                } else if let Some(partial) = composed.static_subset() {
-                    let projected = project_schema_for_partial(schema, &partial);
+        // Validate static values at compile time.
+        if !composed.contains_runtime() {
+            match composed.evaluate_static() {
+                Ok(v) => {
                     if let Err(e) = validate_jsonschema(
                         id,
                         components,
@@ -1163,49 +1099,39 @@ fn validate_config_tree(
                         provenance,
                         store,
                         schema_cache,
-                        &projected,
-                        &partial,
-                        "invalid static config values",
+                        schema,
+                        &v,
+                        "invalid config",
                     ) {
                         errors.push(e);
                     }
                 }
+                Err(err) => errors.push(Error::InvalidConfig {
+                    component_path: component_path.clone(),
+                    message: err.to_string(),
+                    src: site.src.clone(),
+                    span: site.span,
+                    label: site.label.clone(),
+                    related: Vec::new(),
+                }),
             }
-
-            rc::RootConfigTemplate::Node(composed)
-        };
-
-        // Recurse to children.
-        for &child in &c.children {
-            let _ = visit(
-                child,
-                root,
+        } else if let Some(partial) = composed.static_subset() {
+            let projected = project_schema_for_partial(schema, &partial);
+            if let Err(e) = validate_jsonschema(
+                id,
                 components,
                 manifests,
                 provenance,
                 store,
-                schema,
-                &this_template,
                 schema_cache,
-                errors,
-            );
+                &projected,
+                &partial,
+                "invalid static config values",
+            ) {
+                errors.push(e);
+            }
         }
-
-        this_template
     }
-
-    let _ = visit(
-        root,
-        root,
-        components,
-        manifests,
-        provenance,
-        store,
-        root_schema,
-        &root_template,
-        schema_cache,
-        errors,
-    );
 }
 
 fn validate_exports(

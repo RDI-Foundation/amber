@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "cli",
+  "config",
   "compiler",
   "compose-helper",
   "json5",
@@ -14,6 +15,7 @@ resolver = "2"
 
 [workspace.dependencies]
 amber-compiler = { path = "compiler" }
+amber-config = { path = "config" }
 amber-json5 = { path = "json5" }
 amber-manifest = { path = "manifest" }
 amber-resolver = { path = "resolver" }

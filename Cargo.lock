@@ -70,6 +70,7 @@ dependencies = [
 name = "amber-compiler"
 version = "0.1.0"
 dependencies = [
+ "amber-config",
  "amber-manifest",
  "amber-resolver",
  "amber-scenario",
@@ -91,6 +92,7 @@ dependencies = [
 name = "amber-compose-helper"
 version = "0.1.0"
 dependencies = [
+ "amber-config",
  "amber-template",
  "base64",
  "jsonschema",
@@ -98,6 +100,15 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.17",
+]
+
+[[package]]
+name = "amber-config"
+version = "0.1.0"
+dependencies = [
+ "amber-template",
+ "jsonschema",
+ "serde_json",
 ]
 
 [[package]]

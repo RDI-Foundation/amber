@@ -4,16 +4,17 @@ use std::{
     fmt::Write as _,
 };
 
-use amber_manifest::{InterpolatedPart, InterpolationSource, Manifest};
+use amber_config as rc;
+use amber_manifest::{InterpolatedPart, InterpolationSource};
 use amber_scenario::{ComponentId, Scenario};
+use amber_template::{ProgramTemplateSpec, TemplatePart, TemplateSpec, TemplateString};
 use base64::Engine as _;
 use miette::LabeledSpan;
 use serde::Serialize;
-use serde_json::Value;
 
 use super::{Reporter, ReporterError};
 use crate::{
-    CompileOutput, runtime_config as rc,
+    CompileOutput, config_templates,
     slot_query::{SlotObject, resolve_slot_query},
 };
 
@@ -458,57 +459,17 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         .and_then(|m| m.config_schema())
         .map(|s| &s.0);
 
-    let root_template = if root_schema.is_some() {
-        rc::RootConfigTemplate::Root
-    } else {
-        rc::RootConfigTemplate::Node(rc::ConfigNode::empty_object())
-    };
-
-    let mut composed_templates: HashMap<ComponentId, rc::RootConfigTemplate> = HashMap::new();
-
-    fn compose_templates_dfs(
-        s: &Scenario,
-        id: ComponentId,
-        manifests: &[Option<std::sync::Arc<Manifest>>],
-        parent_schema: Option<&Value>,
-        parent_template: &rc::RootConfigTemplate,
-        out: &mut HashMap<ComponentId, rc::RootConfigTemplate>,
-    ) -> Result<(), String> {
-        let c = s.component(id);
-        let m = manifests[id.0].as_ref().expect("manifest should exist");
-        let schema = m.config_schema().map(|s| &s.0);
-
-        let this_template = if id == s.root {
-            if schema.is_some() {
-                rc::RootConfigTemplate::Root
-            } else {
-                rc::RootConfigTemplate::Node(rc::ConfigNode::empty_object())
-            }
-        } else if schema.is_none() {
-            rc::RootConfigTemplate::Node(rc::ConfigNode::empty_object())
-        } else {
-            let initial = rc::parse_instance_config_template(c.config.as_ref(), parent_schema)?;
-            let composed = rc::compose_config_template(initial, parent_template)?.simplify();
-            rc::RootConfigTemplate::Node(composed)
-        };
-
-        out.insert(id, this_template.clone());
-
-        for &child in &c.children {
-            compose_templates_dfs(s, child, manifests, schema, &this_template, out)?;
-        }
-        Ok(())
+    let composed =
+        config_templates::compose_root_config_templates(s.root, &s.components, &manifests);
+    if let Some(err) = composed.errors.first() {
+        return Err(format!(
+            "failed to compose component config templates: {}",
+            err.message
+        )
+        .into());
     }
 
-    compose_templates_dfs(
-        s,
-        s.root,
-        &manifests,
-        root_schema,
-        &root_template,
-        &mut composed_templates,
-    )
-    .map_err(|e| format!("failed to compose component config templates: {e}"))?;
+    let composed_templates = composed.templates;
 
     // Build per-program service mode (direct vs helper) + payloads.
     #[derive(Clone, Debug)]
@@ -545,10 +506,10 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         // Empty query means "the whole config".
         if query.is_empty() {
             return if !template.contains_runtime() {
-                let v = template.evaluate_static()?;
-                Ok(ConfigResolution::Static(rc::stringify_for_interpolation(
-                    &v,
-                )?))
+                let v = template.evaluate_static().map_err(|e| e.to_string())?;
+                Ok(ConfigResolution::Static(
+                    rc::stringify_for_interpolation(&v).map_err(|e| e.to_string())?,
+                ))
             } else {
                 Ok(ConfigResolution::Runtime)
             };
@@ -580,16 +541,16 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         }
 
         if !cur.contains_runtime() {
-            let v = cur.evaluate_static()?;
-            Ok(ConfigResolution::Static(rc::stringify_for_interpolation(
-                &v,
-            )?))
+            let v = cur.evaluate_static().map_err(|e| e.to_string())?;
+            Ok(ConfigResolution::Static(
+                rc::stringify_for_interpolation(&v).map_err(|e| e.to_string())?,
+            ))
         } else {
             Ok(ConfigResolution::Runtime)
         }
     }
 
-    fn render_template_string_static(ts: &rc::TemplateString) -> Result<String, String> {
+    fn render_template_string_static(ts: &TemplateString) -> Result<String, String> {
         if rc::template_string_is_runtime(ts) {
             return Err(
                 "internal error: attempted to render a runtime template string statically"
@@ -599,8 +560,8 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         let mut out = String::new();
         for part in ts {
             match part {
-                rc::TemplatePart::Lit { lit } => out.push_str(lit),
-                rc::TemplatePart::Config { .. } => unreachable!(),
+                TemplatePart::Lit { lit } => out.push_str(lit),
+                TemplatePart::Config { .. } => unreachable!(),
             }
         }
         Ok(out)
@@ -619,24 +580,24 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         };
 
         // Build template spec with slots resolved and config either resolved (static) or preserved.
-        let mut entrypoint_ts: Vec<rc::TemplateString> = Vec::new();
+        let mut entrypoint_ts: Vec<TemplateString> = Vec::new();
         let mut needs_helper = false;
 
         for (idx, arg) in program.args.0.iter().enumerate() {
-            let mut ts: rc::TemplateString = Vec::new();
+            let mut ts: TemplateString = Vec::new();
             for part in &arg.parts {
                 match part {
-                    InterpolatedPart::Literal(lit) => ts.push(rc::TemplatePart::lit(lit)),
+                    InterpolatedPart::Literal(lit) => ts.push(TemplatePart::lit(lit)),
                     InterpolatedPart::Interpolation { source, query } => match source {
                         InterpolationSource::Slots => {
                             let v = resolve_slot_query(slots, query)?;
-                            ts.push(rc::TemplatePart::lit(v));
+                            ts.push(TemplatePart::lit(v));
                         }
                         InterpolationSource::Config => {
                             match resolve_config_query_for_program(template_opt, query)? {
-                                ConfigResolution::Static(v) => ts.push(rc::TemplatePart::lit(v)),
+                                ConfigResolution::Static(v) => ts.push(TemplatePart::lit(v)),
                                 ConfigResolution::Runtime => {
-                                    ts.push(rc::TemplatePart::config(query.clone()));
+                                    ts.push(TemplatePart::config(query.clone()));
                                     needs_helper = true;
                                 }
                             }
@@ -670,22 +631,22 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         }
 
         // program.env
-        let mut env_ts: BTreeMap<String, rc::TemplateString> = BTreeMap::new();
+        let mut env_ts: BTreeMap<String, TemplateString> = BTreeMap::new();
         for (k, v) in &program.env {
-            let mut ts: rc::TemplateString = Vec::new();
+            let mut ts: TemplateString = Vec::new();
             for part in &v.parts {
                 match part {
-                    InterpolatedPart::Literal(lit) => ts.push(rc::TemplatePart::lit(lit)),
+                    InterpolatedPart::Literal(lit) => ts.push(TemplatePart::lit(lit)),
                     InterpolatedPart::Interpolation { source, query } => match source {
                         InterpolationSource::Slots => {
                             let vv = resolve_slot_query(slots, query)?;
-                            ts.push(rc::TemplatePart::lit(vv));
+                            ts.push(TemplatePart::lit(vv));
                         }
                         InterpolationSource::Config => {
                             match resolve_config_query_for_program(template_opt, query)? {
-                                ConfigResolution::Static(vv) => ts.push(rc::TemplatePart::lit(vv)),
+                                ConfigResolution::Static(vv) => ts.push(TemplatePart::lit(vv)),
                                 ConfigResolution::Runtime => {
-                                    ts.push(rc::TemplatePart::config(query.clone()));
+                                    ts.push(TemplatePart::config(query.clone()));
                                     needs_helper = true;
                                 }
                             }
@@ -730,8 +691,8 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 .expect("template exists")
                 .to_json_ir();
 
-            let spec = rc::TemplateSpec {
-                program: rc::ProgramTemplateSpec {
+            let spec = TemplateSpec {
+                program: ProgramTemplateSpec {
                     entrypoint: entrypoint_ts,
                     env: env_ts,
                 },
