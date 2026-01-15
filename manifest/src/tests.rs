@@ -1448,6 +1448,31 @@ fn config_schema_profile_rejects_pattern_properties() {
 }
 
 #[test]
+fn config_schema_profile_accepts_secret_annotation() {
+    let input = r#"
+        {
+          manifest_version: "0.1.0",
+	          config_schema: {
+	            type: "object",
+	            properties: {
+	              token: { type: "string", secret: true },
+	              group: {
+	                type: "object",
+	                secret: true,
+	                properties: {
+	                  url: { type: "string" },
+	                },
+	              },
+	            },
+	          },
+	        }
+	        "#;
+    let _ = input
+        .parse::<Manifest>()
+        .expect("schema with secret annotations should parse");
+}
+
+#[test]
 fn config_schema_profile_rejects_non_2020_12_draft() {
     let input = r#"
         {

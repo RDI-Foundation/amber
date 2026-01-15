@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 base64 = { workspace = true }
+amber-config = { workspace = true }
 amber-json5 = { workspace = true }
 jsonschema = { workspace = true }
 miette = { workspace = true, features = ["derive"] }

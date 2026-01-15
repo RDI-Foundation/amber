@@ -129,6 +129,7 @@ dependencies = [
 name = "amber-manifest"
 version = "0.1.0"
 dependencies = [
+ "amber-config",
  "amber-json5",
  "base64",
  "jsonschema",

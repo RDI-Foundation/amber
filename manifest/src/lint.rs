@@ -1,10 +1,8 @@
 #![allow(unused_assignments)]
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeSet, sync::Arc};
 
+use amber_config as rc;
 use miette::{Diagnostic, NamedSource, SourceSpan};
 use serde_json::Value;
 use thiserror::Error;
@@ -228,157 +226,6 @@ fn collect_config_uses_from_value(value: &Value, uses: &mut ConfigUses) {
     }
 }
 
-#[derive(Default)]
-struct SchemaLintResult {
-    leaves: BTreeMap<String, String>,
-    unsupported: BTreeSet<String>,
-}
-
-struct SchemaCursor<'a> {
-    schema: &'a Value,
-    pointer: String,
-}
-
-fn collect_schema_leaves(schema: &Value) -> SchemaLintResult {
-    let mut result = SchemaLintResult::default();
-    let mut visited = BTreeSet::new();
-    walk_schema(
-        SchemaCursor {
-            schema,
-            pointer: String::new(),
-        },
-        schema,
-        "",
-        &mut visited,
-        &mut result,
-    );
-    result
-}
-
-fn walk_schema<'a>(
-    cursor: SchemaCursor<'a>,
-    root: &'a Value,
-    path: &str,
-    visited: &mut BTreeSet<String>,
-    out: &mut SchemaLintResult,
-) {
-    let Value::Object(schema) = cursor.schema else {
-        if !path.is_empty() {
-            out.leaves
-                .entry(path.to_string())
-                .or_insert_with(|| cursor.pointer.clone());
-        }
-        return;
-    };
-
-    if let Some(reference) = schema.get("$ref").and_then(|v| v.as_str()) {
-        match resolve_local_ref(root, reference) {
-            Ok((resolved, pointer)) => {
-                if !visited.insert(pointer.clone()) {
-                    out.unsupported.insert("$ref (cycle)".to_string());
-                    return;
-                }
-                walk_schema(
-                    SchemaCursor {
-                        schema: resolved,
-                        pointer: pointer.clone(),
-                    },
-                    root,
-                    path,
-                    visited,
-                    out,
-                );
-                visited.remove(&pointer);
-            }
-            Err(reason) => {
-                out.unsupported.insert(reason);
-                if !path.is_empty() {
-                    out.leaves
-                        .entry(path.to_string())
-                        .or_insert_with(|| cursor.pointer.clone());
-                }
-            }
-        }
-        return;
-    }
-
-    let mut did_traverse = false;
-
-    if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
-        let mut keys: Vec<_> = props.keys().collect();
-        keys.sort();
-        for key in keys {
-            let child = props.get(key).expect("key exists");
-            let pointer = push_pointer(&push_pointer(&cursor.pointer, "properties"), key.as_str());
-            let child_path = if path.is_empty() {
-                key.clone()
-            } else {
-                format!("{path}.{key}")
-            };
-            did_traverse = true;
-            walk_schema(
-                SchemaCursor {
-                    schema: child,
-                    pointer,
-                },
-                root,
-                &child_path,
-                visited,
-                out,
-            );
-        }
-    }
-
-    if let Some(all_of) = schema.get("allOf").and_then(|v| v.as_array()) {
-        for (idx, subschema) in all_of.iter().enumerate() {
-            let pointer = push_pointer(&push_pointer(&cursor.pointer, "allOf"), &idx.to_string());
-            did_traverse = true;
-            walk_schema(
-                SchemaCursor {
-                    schema: subschema,
-                    pointer,
-                },
-                root,
-                path,
-                visited,
-                out,
-            );
-        }
-    }
-
-    if !did_traverse && !path.is_empty() {
-        out.leaves
-            .entry(path.to_string())
-            .or_insert_with(|| cursor.pointer.clone());
-    }
-}
-
-fn resolve_local_ref<'a>(root: &'a Value, reference: &str) -> Result<(&'a Value, String), String> {
-    if reference == "#" {
-        return Ok((root, String::new()));
-    }
-    let Some(pointer) = reference.strip_prefix("#/") else {
-        if reference.starts_with('#') {
-            return Err("$ref (invalid pointer)".to_string());
-        }
-        return Err("$ref (non-local)".to_string());
-    };
-    let pointer = format!("/{pointer}");
-    let target = root
-        .pointer(&pointer)
-        .ok_or_else(|| "$ref (unresolvable)".to_string())?;
-    Ok((target, pointer))
-}
-
-fn push_pointer(base: &str, segment: &str) -> String {
-    let escaped = segment.replace('~', "~0").replace('/', "~1");
-    if base.is_empty() {
-        format!("/{escaped}")
-    } else {
-        format!("{base}/{escaped}")
-    }
-}
-
 pub fn lint_manifest(
     manifest: &Manifest,
     component: &str,
@@ -496,7 +343,7 @@ pub fn lint_manifest(
 
     if let Some(schema) = manifest.config_schema() {
         let config_uses = collect_config_uses(manifest);
-        let schema_lints = collect_schema_leaves(&schema.0);
+        let schema_lints = rc::collect_schema_leaves(&schema.0);
 
         if !schema_lints.unsupported.is_empty() {
             let mut reasons: Vec<_> = schema_lints.unsupported.into_iter().collect();
@@ -513,17 +360,18 @@ pub fn lint_manifest(
 
         let source = src.inner().as_ref();
         let schema_span = spans.config_schema.unwrap_or((0usize, 0usize).into());
-        for (path, pointer) in schema_lints.leaves {
-            if config_uses.is_used(&path) {
+        for leaf in schema_lints.leaves {
+            if config_uses.is_used(&leaf.path) {
                 continue;
             }
-            let span = if pointer.is_empty() {
+            let span = if leaf.pointer.is_empty() {
                 schema_span
             } else {
-                crate::span_for_json_pointer(source, schema_span, &pointer).unwrap_or(schema_span)
+                crate::span_for_json_pointer(source, schema_span, &leaf.pointer)
+                    .unwrap_or(schema_span)
             };
             lints.push(ManifestLint::UnusedConfig {
-                path,
+                path: leaf.path,
                 component: component.clone(),
                 src: src.clone(),
                 span,

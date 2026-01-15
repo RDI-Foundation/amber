@@ -280,6 +280,7 @@ Rules enforced by this crate:
   * Property names (and `required` entries) must match `^(?!.*__)[a-z][a-z0-9_]*$`.
   * `$ref` is allowed, but must be local-only JSON pointers (`#` or `#/...`).
   * `additionalProperties` must be a boolean when present (schema-form `additionalProperties` is not supported).
+  * `secret` is allowed as a boolean annotation; if set on a schema node, that value (and its descendants) are treated as secret.
   * Unsupported keywords include: `anyOf`, `oneOf`, `not`, `if`/`then`/`else`, `patternProperties`, `propertyNames`, `dependentSchemas`, `dependentRequired`, `unevaluatedProperties`, `unevaluatedItems`, `$dynamicRef`, `$recursiveRef`.
 
 Example:
@@ -293,6 +294,17 @@ config_schema: {
   },
   required: ["domain", "num_trials"],
   additionalProperties: false,
+}
+```
+
+To mark a value as secret, add `secret: true` to its schema entry:
+
+```json5
+config_schema: {
+  type: "object",
+  properties: {
+    api_key: { type: "string", secret: true },
+  },
 }
 ```
 

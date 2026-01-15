@@ -268,6 +268,7 @@ This is important when you have “peer-ish” connections that shouldn’t forc
 
 Manifests can declare `config_schema` (JSON Schema, constrained to Amber's supported profile; see `manifest/README.md`). When a parent instantiates that component
 with `components.<name>.config`, the compiler validates the config against the schema at link time.
+Schema nodes can be annotated with `secret: true` to mark secret values; children inherit the secret marker.
 
 ### Interpolation
 

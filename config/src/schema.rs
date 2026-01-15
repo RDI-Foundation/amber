@@ -101,6 +101,13 @@ pub fn validate_config_schema(schema: &Value) -> Result<()> {
     }
 
     fn walk(schema: &Value, at: &str) -> Result<()> {
+        if let Some(value) = schema.get("secret")
+            && !value.is_boolean()
+        {
+            return Err(ConfigError::schema(format!(
+                "config definition at {at} has `secret` but value is not boolean"
+            )));
+        }
         let Some(props) = schema_properties(schema) else {
             return Ok(());
         };
@@ -395,58 +402,242 @@ fn schema_required_set(schema: &Value) -> BTreeMap<String, ()> {
     out
 }
 
+fn schema_secret_flag(schema: &Value) -> bool {
+    schema
+        .get("secret")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn push_pointer(base: &str, segment: &str) -> String {
+    let escaped = segment.replace('~', "~0").replace('/', "~1");
+    if base.is_empty() {
+        format!("/{escaped}")
+    } else {
+        format!("{base}/{escaped}")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SchemaLeaf {
     pub path: String,
     pub required: bool,
+    pub secret: bool,
+    pub pointer: String,
+}
+
+#[derive(Default)]
+pub struct SchemaWalkResult {
+    pub leaves: Vec<SchemaLeaf>,
+    pub unsupported: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct LeafMeta {
+    required: bool,
+    secret: bool,
+    pointer: String,
+}
+
+fn insert_leaf(
+    out: &mut BTreeMap<String, LeafMeta>,
+    path: &str,
+    required: bool,
+    secret: bool,
+    pointer: &str,
+) {
+    match out.get_mut(path) {
+        Some(meta) => {
+            meta.required |= required;
+            meta.secret |= secret;
+            if meta.pointer.is_empty() {
+                meta.pointer = pointer.to_string();
+            }
+        }
+        None => {
+            out.insert(
+                path.to_string(),
+                LeafMeta {
+                    required,
+                    secret,
+                    pointer: pointer.to_string(),
+                },
+            );
+        }
+    }
+}
+
+fn finalize_leaves(out: BTreeMap<String, LeafMeta>) -> Vec<SchemaLeaf> {
+    out.into_iter()
+        .map(|(path, meta)| SchemaLeaf {
+            path,
+            required: meta.required,
+            secret: meta.secret,
+            pointer: meta.pointer,
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+struct SchemaCursor<'a> {
+    schema: &'a Value,
+    pointer: String,
+}
+
+struct SchemaWalkContext<'a, 'b> {
+    root: &'a Value,
+    visited: &'b mut BTreeSet<String>,
+    out: &'b mut BTreeMap<String, LeafMeta>,
+}
+
+enum WalkMode<'a> {
+    Strict,
+    Lint {
+        unsupported: &'a mut BTreeSet<String>,
+    },
+}
+
+impl WalkMode<'_> {
+    fn record_unsupported(&mut self, message: String) -> Result<()> {
+        match self {
+            WalkMode::Strict => Err(ConfigError::schema(message)),
+            WalkMode::Lint { unsupported } => {
+                unsupported.insert(message);
+                Ok(())
+            }
+        }
+    }
+
+    fn is_strict(&self) -> bool {
+        matches!(self, WalkMode::Strict)
+    }
+}
+
+pub fn collect_schema_leaves(schema: &Value) -> SchemaWalkResult {
+    let mut out = SchemaWalkResult::default();
+    let mut visited = BTreeSet::new();
+    let mut leafs: BTreeMap<String, LeafMeta> = BTreeMap::new();
+    let mut mode = WalkMode::Lint {
+        unsupported: &mut out.unsupported,
+    };
+    {
+        let mut ctx = SchemaWalkContext {
+            root: schema,
+            visited: &mut visited,
+            out: &mut leafs,
+        };
+        let _ = walk_leaf_paths(
+            SchemaCursor {
+                schema,
+                pointer: String::new(),
+            },
+            &mut ctx,
+            "",
+            true,
+            false,
+            &mut mode,
+        );
+    }
+    out.leaves = finalize_leaves(leafs);
+    out
 }
 
 pub fn collect_leaf_paths(schema: &Value) -> Result<Vec<SchemaLeaf>> {
     validate_config_schema(schema)?;
-    let mut out: BTreeMap<String, bool> = BTreeMap::new();
+    let mut out: BTreeMap<String, LeafMeta> = BTreeMap::new();
     let mut visited = BTreeSet::new();
-    let _ = walk_leaf_paths(schema, schema, "", true, &mut visited, &mut out)?;
-    Ok(out
-        .into_iter()
-        .map(|(path, required)| SchemaLeaf { path, required })
-        .collect())
+    let mut mode = WalkMode::Strict;
+    {
+        let mut ctx = SchemaWalkContext {
+            root: schema,
+            visited: &mut visited,
+            out: &mut out,
+        };
+        let _ = walk_leaf_paths(
+            SchemaCursor {
+                schema,
+                pointer: String::new(),
+            },
+            &mut ctx,
+            "",
+            true,
+            false,
+            &mut mode,
+        )?;
+    }
+    Ok(finalize_leaves(out))
 }
 
-fn walk_leaf_paths(
-    schema: &Value,
-    root: &Value,
+fn walk_leaf_paths<'a>(
+    cursor: SchemaCursor<'a>,
+    ctx: &mut SchemaWalkContext<'a, '_>,
     prefix: &str,
     required_so_far: bool,
-    visited: &mut BTreeSet<String>,
-    out: &mut BTreeMap<String, bool>,
+    secret_so_far: bool,
+    mode: &mut WalkMode<'_>,
 ) -> Result<bool> {
-    let Value::Object(map) = schema else {
+    let secret_here = secret_so_far || schema_secret_flag(cursor.schema);
+
+    let Value::Object(map) = cursor.schema else {
         if !prefix.is_empty() {
-            out.entry(prefix.to_string())
-                .and_modify(|req| *req |= required_so_far)
-                .or_insert(required_so_far);
+            insert_leaf(
+                ctx.out,
+                prefix,
+                required_so_far,
+                secret_here,
+                &cursor.pointer,
+            );
         }
         return Ok(false);
     };
 
     if let Some(reference) = map.get("$ref").and_then(|v| v.as_str()) {
-        let (resolved, pointer) = resolve_local_ref(root, reference)?;
-        if !visited.insert(pointer.clone()) {
-            return Err(ConfigError::schema(
-                "config definition contains a cyclic $ref".to_string(),
-            ));
+        match resolve_local_ref(ctx.root, reference) {
+            Ok((resolved, pointer)) => {
+                if !ctx.visited.insert(pointer.clone()) {
+                    mode.record_unsupported(
+                        "config definition contains a cyclic $ref".to_string(),
+                    )?;
+                    return Ok(false);
+                }
+                let out = walk_leaf_paths(
+                    SchemaCursor {
+                        schema: resolved,
+                        pointer: pointer.clone(),
+                    },
+                    ctx,
+                    prefix,
+                    required_so_far,
+                    secret_here,
+                    mode,
+                );
+                ctx.visited.remove(&pointer);
+                return out;
+            }
+            Err(err) => {
+                mode.record_unsupported(err.to_string())?;
+                if !prefix.is_empty() {
+                    insert_leaf(
+                        ctx.out,
+                        prefix,
+                        required_so_far,
+                        secret_here,
+                        &cursor.pointer,
+                    );
+                }
+                return Ok(false);
+            }
         }
-        let out = walk_leaf_paths(resolved, root, prefix, required_so_far, visited, out);
-        visited.remove(&pointer);
-        return out;
     }
 
-    ensure_leaf_schema_supported(map)?;
+    if mode.is_strict() {
+        ensure_leaf_schema_supported(map)?;
+    }
 
     let mut did_traverse = false;
 
-    if let Some(props) = schema_properties(schema) {
-        let req = schema_required_set(schema);
+    if let Some(props) = schema_properties(cursor.schema) {
+        let req = schema_required_set(cursor.schema);
 
         let mut keys: Vec<&String> = props.keys().collect();
         keys.sort();
@@ -462,22 +653,49 @@ fn walk_leaf_paths(
                 format!("{prefix}.{k}")
             };
 
+            let pointer = push_pointer(&push_pointer(&cursor.pointer, "properties"), k.as_str());
+
             did_traverse = true;
-            let _ = walk_leaf_paths(child_schema, root, &path, req_path, visited, out)?;
+            let _ = walk_leaf_paths(
+                SchemaCursor {
+                    schema: child_schema,
+                    pointer,
+                },
+                ctx,
+                &path,
+                req_path,
+                secret_here,
+                mode,
+            )?;
         }
     }
 
-    if let Some(all_of) = schema.get("allOf").and_then(|v| v.as_array()) {
-        for subschema in all_of {
+    if let Some(all_of) = cursor.schema.get("allOf").and_then(|v| v.as_array()) {
+        for (idx, subschema) in all_of.iter().enumerate() {
+            let pointer = push_pointer(&push_pointer(&cursor.pointer, "allOf"), &idx.to_string());
             did_traverse = true;
-            let _ = walk_leaf_paths(subschema, root, prefix, required_so_far, visited, out)?;
+            let _ = walk_leaf_paths(
+                SchemaCursor {
+                    schema: subschema,
+                    pointer,
+                },
+                ctx,
+                prefix,
+                required_so_far,
+                secret_here,
+                mode,
+            )?;
         }
     }
 
     if !did_traverse && !prefix.is_empty() {
-        out.entry(prefix.to_string())
-            .and_modify(|req| *req |= required_so_far)
-            .or_insert(required_so_far);
+        insert_leaf(
+            ctx.out,
+            prefix,
+            required_so_far,
+            secret_here,
+            &cursor.pointer,
+        );
     }
 
     Ok(did_traverse)

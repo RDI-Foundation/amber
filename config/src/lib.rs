@@ -10,8 +10,9 @@ pub use env::{
 pub use error::{ConfigError, Result};
 pub use node::{ConfigNode, RootConfigTemplate, compose_config_template};
 pub use schema::{
-    SchemaLeaf, SchemaLookup, canonical_json, collect_leaf_paths, is_valid_config_key,
-    schema_lookup, schema_lookup_ref, validate_config_schema,
+    SchemaLeaf, SchemaLookup, SchemaWalkResult, canonical_json, collect_leaf_paths,
+    collect_schema_leaves, is_valid_config_key, schema_lookup, schema_lookup_ref,
+    validate_config_schema,
 };
 pub use template::{
     eval_config_template, get_by_path, render_template_string, stringify_for_interpolation,
@@ -126,12 +127,111 @@ mod tests {
 
         let leaves = collect_leaf_paths(&schema).expect("collect leaf paths");
         let mut required_by_path = std::collections::BTreeMap::new();
+        let mut secret_by_path = std::collections::BTreeMap::new();
         for leaf in leaves {
-            required_by_path.insert(leaf.path, leaf.required);
+            required_by_path.insert(leaf.path.clone(), leaf.required);
+            secret_by_path.insert(leaf.path, leaf.secret);
         }
 
         assert_eq!(required_by_path.len(), 2);
         assert_eq!(required_by_path.get("db.url"), Some(&true));
         assert_eq!(required_by_path.get("db.pool"), Some(&false));
+        assert_eq!(secret_by_path.get("db.url"), Some(&false));
+        assert_eq!(secret_by_path.get("db.pool"), Some(&false));
+    }
+
+    #[test]
+    fn collect_leaf_paths_tracks_secrets() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "api": {
+                    "type": "object",
+                    "secret": true,
+                    "properties": {
+                        "token": { "type": "string" },
+                        "endpoint": { "type": "string" }
+                    }
+                },
+                "public": { "type": "string" },
+                "token": { "type": "string", "secret": true }
+            }
+        });
+
+        let leaves = collect_leaf_paths(&schema).expect("collect leaf paths");
+        let mut secret_by_path = std::collections::BTreeMap::new();
+        for leaf in leaves {
+            secret_by_path.insert(leaf.path, leaf.secret);
+        }
+
+        assert_eq!(secret_by_path.get("api.token"), Some(&true));
+        assert_eq!(secret_by_path.get("api.endpoint"), Some(&true));
+        assert_eq!(secret_by_path.get("public"), Some(&false));
+        assert_eq!(secret_by_path.get("token"), Some(&true));
+    }
+
+    #[test]
+    fn collect_leaf_paths_tracks_secrets_through_ref() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "api": { "$ref": "#/$defs/api" },
+                "api_secret": { "$ref": "#/$defs/api_secret" },
+                "auth": { "$ref": "#/$defs/api", "secret": true },
+            },
+            "$defs": {
+                "api": {
+                    "type": "object",
+                    "properties": {
+                        "token": { "type": "string" },
+                        "endpoint": { "type": "string" },
+                    }
+                },
+                "api_secret": {
+                    "type": "object",
+                    "secret": true,
+                    "properties": {
+                        "token": { "type": "string" },
+                        "endpoint": { "type": "string" },
+                    }
+                },
+            }
+        });
+
+        let leaves = collect_leaf_paths(&schema).expect("collect leaf paths");
+        let mut secret_by_path = std::collections::BTreeMap::new();
+        for leaf in leaves {
+            secret_by_path.insert(leaf.path, leaf.secret);
+        }
+
+        assert_eq!(secret_by_path.get("api.token"), Some(&false));
+        assert_eq!(secret_by_path.get("api.endpoint"), Some(&false));
+        assert_eq!(secret_by_path.get("api_secret.token"), Some(&true));
+        assert_eq!(secret_by_path.get("api_secret.endpoint"), Some(&true));
+        assert_eq!(secret_by_path.get("auth.token"), Some(&true));
+        assert_eq!(secret_by_path.get("auth.endpoint"), Some(&true));
+    }
+
+    #[test]
+    fn collect_leaf_paths_tracks_secrets_through_allof() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "token": {
+                    "allOf": [
+                        { "type": "string" },
+                        { "secret": true },
+                    ]
+                },
+            }
+        });
+
+        let leaves = collect_leaf_paths(&schema).expect("collect leaf paths");
+        let mut secret_by_path = std::collections::BTreeMap::new();
+        for leaf in leaves {
+            secret_by_path.insert(leaf.path, leaf.secret);
+        }
+
+        assert_eq!(secret_by_path.get("token"), Some(&true));
     }
 }

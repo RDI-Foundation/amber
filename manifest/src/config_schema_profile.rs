@@ -54,6 +54,7 @@ fn profile_meta_schema() -> Value {
                         "items": key_name.clone(),
                     },
                     "additionalProperties": { "type": "boolean" },
+                    "secret": { "type": "boolean" },
 
                     "anyOf": false,
                     "oneOf": false,
