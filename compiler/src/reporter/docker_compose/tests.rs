@@ -264,6 +264,7 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         root: ComponentId(0),
         components: vec![Some(root), Some(server), Some(client)],
         bindings: vec![BindingEdge {
+            name: None,
             from: ProvideRef {
                 component: ComponentId(1),
                 name: "api".to_string(),
@@ -468,6 +469,7 @@ fn errors_on_shared_port_with_different_endpoints() {
         components: vec![Some(root), Some(server), Some(client)],
         bindings: vec![
             BindingEdge {
+                name: None,
                 from: ProvideRef {
                     component: ComponentId(1),
                     name: "v1".to_string(),
@@ -479,6 +481,7 @@ fn errors_on_shared_port_with_different_endpoints() {
                 weak: false,
             },
             BindingEdge {
+                name: None,
                 from: ProvideRef {
                     component: ComponentId(1),
                     name: "admin".to_string(),
@@ -630,6 +633,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         root: ComponentId(0),
         components: vec![Some(root), Some(server), Some(allowed), Some(denied)],
         bindings: vec![BindingEdge {
+            name: None,
             from: ProvideRef {
                 component: ComponentId(1),
                 name: "api".to_string(),

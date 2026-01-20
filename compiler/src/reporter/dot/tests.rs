@@ -62,6 +62,7 @@ fn dot_renders_clusters_and_edges() {
 
     let bindings = vec![
         BindingEdge {
+            name: Some("route".to_string()),
             from: ProvideRef {
                 component: ComponentId(1),
                 name: "cap".to_string(),
@@ -73,6 +74,7 @@ fn dot_renders_clusters_and_edges() {
             weak: false,
         },
         BindingEdge {
+            name: None,
             from: ProvideRef {
                 component: ComponentId(2),
                 name: "weak_cap".to_string(),
@@ -107,7 +109,7 @@ fn dot_renders_clusters_and_edges() {
     }
     c2 [label="/beta"];
   }
-  c1 -> c2 [label="cap"];
+  c1 -> c2 [label="cap (route)"];
   c2 -> c1 [label="weak_cap", style=dashed, constraint=false];
 }
 "#;
@@ -231,6 +233,7 @@ fn dot_renders_root_exports_as_endpoints() {
         root: ComponentId(0),
         components,
         bindings: vec![BindingEdge {
+            name: None,
             from: ProvideRef {
                 component: ComponentId(2),
                 name: "out".to_string(),

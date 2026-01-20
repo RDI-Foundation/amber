@@ -183,6 +183,7 @@ mod tests {
         let components = vec![Some(component(0, "/a")), Some(component(1, "/b"))];
         let bindings = vec![
             BindingEdge {
+                name: None,
                 from: ProvideRef {
                     component: ComponentId(0),
                     name: "api".to_string(),
@@ -194,6 +195,7 @@ mod tests {
                 weak: false,
             },
             BindingEdge {
+                name: None,
                 from: ProvideRef {
                     component: ComponentId(1),
                     name: "api".to_string(),
@@ -225,6 +227,7 @@ mod tests {
         ];
         let bindings = vec![
             BindingEdge {
+                name: None,
                 from: ProvideRef {
                     component: ComponentId(0),
                     name: "p".to_string(),
@@ -236,6 +239,7 @@ mod tests {
                 weak: false,
             },
             BindingEdge {
+                name: None,
                 from: ProvideRef {
                     component: ComponentId(1),
                     name: "p".to_string(),
@@ -247,6 +251,7 @@ mod tests {
                 weak: false,
             },
             BindingEdge {
+                name: None,
                 from: ProvideRef {
                     component: ComponentId(2),
                     name: "p".to_string(),

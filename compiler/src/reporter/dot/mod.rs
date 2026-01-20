@@ -87,6 +87,11 @@ fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
             b.from.component.0, b.to.component.0
         );
         write_escaped_label(&mut out, &b.from.name);
+        if let Some(name) = b.name.as_ref() {
+            let _ = write!(out, " (");
+            write_escaped_label(&mut out, name);
+            let _ = write!(out, ")");
+        }
         if b.weak {
             let _ = writeln!(out, "\", style=dashed, constraint=false];");
         } else {

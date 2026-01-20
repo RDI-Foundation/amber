@@ -167,6 +167,9 @@ impl ComponentIr {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BindingIr {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub from: ProvideRefIr,
     pub to: SlotRefIr,
     pub weak: bool,
@@ -175,6 +178,7 @@ pub struct BindingIr {
 impl From<&BindingEdge> for BindingIr {
     fn from(binding: &BindingEdge) -> Self {
         Self {
+            name: binding.name.clone(),
             from: ProvideRefIr::from(&binding.from),
             to: SlotRefIr::from(&binding.to),
             weak: binding.weak,
@@ -185,6 +189,7 @@ impl From<&BindingEdge> for BindingIr {
 impl BindingIr {
     fn into_binding(self) -> BindingEdge {
         BindingEdge {
+            name: self.name,
             from: self.from.into_provide_ref(),
             to: self.to.into_slot_ref(),
             weak: self.weak,
@@ -371,6 +376,7 @@ mod tests {
             root: ComponentId(0),
             components,
             bindings: vec![BindingEdge {
+                name: Some("bind_api".to_string()),
                 from: ProvideRef {
                     component: ComponentId(1),
                     name: "api".to_string(),
@@ -452,6 +458,7 @@ mod tests {
             ],
             "bindings": [
                 {
+                    "name": "bind_api",
                     "from": {
                         "component": 1,
                         "provide": "api"
@@ -508,5 +515,45 @@ mod tests {
         assert!(root.program.is_none());
         assert!(root.slots.is_empty());
         assert!(root.provides.is_empty());
+    }
+
+    #[test]
+    fn scenario_ir_binding_name_round_trip() {
+        let payload = json!({
+            "schema": SCENARIO_IR_SCHEMA,
+            "version": SCENARIO_IR_VERSION,
+            "root": 0,
+            "components": [
+                {
+                    "id": 0,
+                    "moniker": "/",
+                    "parent": null,
+                    "children": [1],
+                    "digest": ManifestDigest::new([0u8; 32]).to_string(),
+                    "config": null
+                },
+                {
+                    "id": 1,
+                    "moniker": "/child",
+                    "parent": 0,
+                    "children": [],
+                    "digest": ManifestDigest::new([1u8; 32]).to_string(),
+                    "config": null
+                }
+            ],
+            "bindings": [
+                {
+                    "name": "route",
+                    "from": { "component": 1, "provide": "api" },
+                    "to": { "component": 0, "slot": "needs" },
+                    "weak": false
+                }
+            ],
+            "exports": []
+        });
+
+        let ir: ScenarioIr = serde_json::from_value(payload).expect("deserialize scenario IR");
+        let scenario: Scenario = ir.try_into().expect("convert scenario IR");
+        assert_eq!(scenario.bindings[0].name.as_deref(), Some("route"));
     }
 }

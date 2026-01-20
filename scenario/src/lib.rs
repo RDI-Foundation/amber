@@ -220,6 +220,8 @@ pub struct SlotRef {
 
 #[derive(Clone, Debug)]
 pub struct BindingEdge {
+    /// Optional binding name as authored in the manifest.
+    pub name: Option<String>,
     pub from: ProvideRef,
     pub to: SlotRef,
     /// If true, this edge does not participate in dependency ordering or cycle detection.

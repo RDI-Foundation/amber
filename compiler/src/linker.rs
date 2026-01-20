@@ -1455,6 +1455,7 @@ fn resolve_bindings(
             }
 
             edges.push(BindingEdge {
+                name: binding.name.as_ref().map(|name| name.to_string()),
                 from: source.provide_ref,
                 to: target.slot_ref,
                 weak: binding.weak,

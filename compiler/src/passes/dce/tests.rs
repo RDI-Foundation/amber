@@ -164,6 +164,7 @@ fn dce_prunes_unused_transitive_subtree() {
     let bindings = vec![
         // Root wiring: green.llm <- router.llm
         BindingEdge {
+            name: None,
             from: ProvideRef {
                 component: ComponentId(1),
                 name: "llm".to_string(),
@@ -176,6 +177,7 @@ fn dce_prunes_unused_transitive_subtree() {
         },
         // Root wiring: green.admin_api <- router.admin_api (resolved to wrapper.admin_api)
         BindingEdge {
+            name: None,
             from: ProvideRef {
                 component: ComponentId(3),
                 name: "admin_api".to_string(),
@@ -188,6 +190,7 @@ fn dce_prunes_unused_transitive_subtree() {
         },
         // Router internal wiring: wrapper.litellm <- router.admin_api
         BindingEdge {
+            name: None,
             from: ProvideRef {
                 component: ComponentId(1),
                 name: "admin_api".to_string(),
@@ -391,6 +394,7 @@ fn dce_keeps_dependencies_for_program_slots() {
 
     let bindings = vec![
         BindingEdge {
+            name: None,
             from: ProvideRef {
                 component: ComponentId(2),
                 name: "input".to_string(),
@@ -402,6 +406,7 @@ fn dce_keeps_dependencies_for_program_slots() {
             weak: false,
         },
         BindingEdge {
+            name: None,
             from: ProvideRef {
                 component: ComponentId(3),
                 name: "llm".to_string(),
@@ -577,6 +582,7 @@ fn dce_keeps_program_slots_from_env() {
         .extend([ComponentId(1), ComponentId(2)]);
 
     let bindings = vec![BindingEdge {
+        name: None,
         from: ProvideRef {
             component: ComponentId(2),
             name: "admin".to_string(),

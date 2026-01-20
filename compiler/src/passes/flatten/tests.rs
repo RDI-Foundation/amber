@@ -123,6 +123,7 @@ fn flatten_removes_pure_routing_nodes_and_preserves_debug_data() {
         root: ComponentId(0),
         components,
         bindings: vec![BindingEdge {
+            name: None,
             from: ProvideRef {
                 component: ComponentId(2),
                 name: "cap".to_string(),
