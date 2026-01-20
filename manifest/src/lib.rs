@@ -489,6 +489,7 @@ impl FromStr for InterpolatedPart {
         let source = match prefix {
             "config" => InterpolationSource::Config,
             "slots" => InterpolationSource::Slots,
+            "bindings" => InterpolationSource::Bindings,
             _ => return Err(Error::InvalidInterpolation(inner.to_string())),
         };
 
@@ -505,6 +506,7 @@ impl FromStr for InterpolatedPart {
 pub enum InterpolationSource {
     Config,
     Slots,
+    Bindings,
 }
 
 impl fmt::Display for InterpolationSource {
@@ -512,6 +514,7 @@ impl fmt::Display for InterpolationSource {
         let s = match self {
             InterpolationSource::Config => "config",
             InterpolationSource::Slots => "slots",
+            InterpolationSource::Bindings => "bindings",
         };
         f.write_str(s)
     }

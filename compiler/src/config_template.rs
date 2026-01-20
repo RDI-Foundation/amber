@@ -76,6 +76,12 @@ fn parse_string_template(
                             .to_string(),
                     ));
                 }
+                InterpolationSource::Bindings => {
+                    return Err(ConfigError::interp(
+                        "binding interpolation is not allowed in component config templates"
+                            .to_string(),
+                    ));
+                }
                 other => {
                     return Err(ConfigError::interp(format!(
                         "unsupported interpolation source {other} in component config template"

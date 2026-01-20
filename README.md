@@ -50,7 +50,7 @@ flowchart TB
 
   subgraph ChildB["Child B (consumer)"]
     Bslot["slots:<br/>llm (kind=llm)<br/>admin_api (kind=mcp)"]
-    Bprog["program:<br/>entrypoint/env can interpolate<br/>\${slots.*} + \${config.*}"]
+    Bprog["program:<br/>entrypoint/env can interpolate<br/>\${slots.*} + \${config.*} + \${bindings.*}"]
   end
 
   ChildA -->|"bind: ChildA.llm → ChildB.llm"| ChildB
@@ -109,7 +109,7 @@ flowchart LR
 
     subgraph Consumer["Consumer component (cY)"]
       SidecarC["cY-net (sidecar)<br/>- socat local proxies<br/>127.0.0.1:20000 -> cX-net:PORT"]
-      ProgC["cY (program)<br/>uses \${slots.*}<br/>(e.g. http://127.0.0.1:20000)"]
+      ProgC["cY (program)<br/>uses \${slots.*} or \${bindings.*}<br/>(e.g. http://127.0.0.1:20000)"]
       ProgC --- SidecarC
     end
 
@@ -276,6 +276,7 @@ Programs can interpolate:
 
 * `${config.<path>}` from the component’s config
 * `${slots.<slot>.<field>}` from the resolved slot value
+* `${bindings.<name>.url}` from a named binding that targets this component (URL used by `to`)
 
 For Docker Compose output, slot fields include:
 
@@ -284,6 +285,9 @@ For Docker Compose output, slot fields include:
 * `port` (local proxy port)
 
 If you need a non-HTTP scheme, prefer composing your own value using `host` and `port`.
+
+Bindings interpolation is for introspection only. Seeing a binding URL does not grant access; only
+the binding `to` component can reach the binding `from`, even if another component has the URL.
 
 ---
 

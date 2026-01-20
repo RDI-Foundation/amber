@@ -205,6 +205,7 @@ Supported sources:
 
 * `${config.<path>}` reads from the component’s config value.
 * `${slots.<path>}` reads from resolved slot values.
+* `${bindings.<name>.url}` reads the URL for a named binding that targets this component.
 
 `<path>` is dot-separated for nested objects.
 
@@ -217,9 +218,14 @@ Notes:
 
 * Slots expose a virtual object. Today the only defined field is `url`; use
   `${slots.<slot>.url}` for the URL string or `${slots.<slot>}` to interpolate the object as JSON.
+* Bindings expose a virtual object with a single `url` field; bindings must be named to be
+  referenced via `${bindings.<name>.url}`.
 * This crate **parses** interpolation syntax but does **not** validate that the referenced paths
   exist. The compiler validates `${config.*}` against `config_schema` and `${slots.*}` against
-  declared slots and supported fields.
+  declared slots and supported fields. `${bindings.*}` is validated against named bindings that
+  target the component.
+* `${bindings.*}` is for introspection only: seeing the URL does not grant access. Only the binding
+  `to` component can reach the binding `from`, even if another component has the URL.
 
 ---
 
@@ -407,7 +413,7 @@ Bindings forms:
 
 ```json5
 {
-  name: "route_llm", // optional; must be unique within the manifest
+  name: "route_llm", // optional; must be unique within the manifest; used by `${bindings.<name>.url}`
   to: "#evaluator",
   slot: "llm",
   from: "#router",

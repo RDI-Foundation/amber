@@ -1,0 +1,12 @@
+compiler::invalid_bindings_interpolation
+
+  x invalid bindings interpolation in / (program.entrypoint[2]): unknown binding name `route`
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/binding_interpolation_unknown_binding.json5:8:7]
+ 7 |       "--backend",
+ 8 |       "${bindings.route.url}",
+   :       ^^^^^^^^^^^|^^^^^^^^^^^
+   :                  `-- binding interpolation here
+ 9 |     ],
+   `----
+  help: Named bindings targeting component /: backend
+Error:   × check failed

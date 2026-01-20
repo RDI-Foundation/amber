@@ -7,6 +7,8 @@ use amber_scenario::Scenario;
 use miette::{Diagnostic, Report};
 use thiserror::Error;
 
+mod binding_query;
+mod binding_validation;
 mod config_template;
 mod config_templates;
 mod environment;
@@ -116,6 +118,12 @@ impl Compiler {
     ) -> Result<CompileOutput, Error> {
         let mut diagnostics =
             slot_validation::collect_slot_interpolation_diagnostics_from_tree(&tree, &self.store);
+        diagnostics.extend(
+            binding_validation::collect_binding_interpolation_diagnostics_from_tree(
+                &tree,
+                &self.store,
+            ),
+        );
         let (scenario, provenance) = linker::link(tree, &self.store)?;
         diagnostics.extend(collect_manifest_diagnostics(
             &scenario,
@@ -144,6 +152,12 @@ impl Compiler {
     pub fn check_from_tree(&self, tree: ResolvedTree) -> Result<CheckOutput, Error> {
         let mut diagnostics =
             slot_validation::collect_slot_interpolation_diagnostics_from_tree(&tree, &self.store);
+        diagnostics.extend(
+            binding_validation::collect_binding_interpolation_diagnostics_from_tree(
+                &tree,
+                &self.store,
+            ),
+        );
         diagnostics.extend(collect_manifest_diagnostics_from_tree(&tree, &self.store));
         let mut has_errors = false;
 

@@ -85,6 +85,18 @@ fn interpolation_multiple_and_adjacent() {
 }
 
 #[test]
+fn interpolation_parsing_supports_bindings() {
+    let parsed: InterpolatedString = "${bindings.route.url}".parse().unwrap();
+    assert_eq!(
+        parsed.parts,
+        vec![InterpolatedPart::Interpolation {
+            source: InterpolationSource::Bindings,
+            query: "route.url".to_string()
+        }]
+    );
+}
+
+#[test]
 fn interpolation_unknown_source_errors() {
     assert!("${foo.bar}".parse::<InterpolatedString>().is_err());
 }

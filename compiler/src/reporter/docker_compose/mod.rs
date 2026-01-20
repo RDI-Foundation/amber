@@ -14,7 +14,9 @@ use serde::Serialize;
 
 use super::{Reporter, ReporterError};
 use crate::{
-    CompileOutput, config_templates,
+    CompileOutput,
+    binding_query::{BindingObject, resolve_binding_query},
+    config_templates,
     slot_query::{SlotObject, resolve_slot_query},
 };
 
@@ -293,11 +295,14 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     // Allocate stable local proxy ports per (component, slot), avoiding colliding with program listens.
     let slot_ports_by_component = allocate_local_proxy_ports(s, &program_components)?;
 
-    // Build per-component slot-values and per-component slot-proxy processes.
+    // Build per-component slot-values, binding-values, and per-component slot-proxy processes.
     let mut slot_values_by_component: HashMap<ComponentId, BTreeMap<String, SlotObject>> =
+        HashMap::new();
+    let mut binding_values_by_component: HashMap<ComponentId, BTreeMap<String, BindingObject>> =
         HashMap::new();
     for id in &program_components {
         slot_values_by_component.insert(*id, BTreeMap::new());
+        binding_values_by_component.insert(*id, BTreeMap::new());
     }
     let mut slot_proxies_by_component: HashMap<ComponentId, Vec<SlotProxy>> = HashMap::new();
 
@@ -379,7 +384,14 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         slot_values_by_component
             .entry(consumer)
             .or_default()
-            .insert(b.to.name.clone(), SlotObject { url });
+            .insert(b.to.name.clone(), SlotObject { url: url.clone() });
+
+        if let Some(name) = b.name.as_ref() {
+            binding_values_by_component
+                .entry(consumer)
+                .or_default()
+                .insert(name.clone(), BindingObject { url });
+        }
     }
 
     // Ensure all declared slots on runnable components got bound (this should already be true after linking).
@@ -572,6 +584,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         let program = c.program.as_ref().unwrap();
 
         let slots = slot_values_by_component.get(id).unwrap();
+        let bindings = binding_values_by_component.get(id).unwrap();
 
         // Root-only composed config template (if available). Root component uses runtime root config.
         let template_opt: Option<&rc::ConfigNode> = match composed_templates.get(id) {
@@ -591,6 +604,10 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                     InterpolatedPart::Interpolation { source, query } => match source {
                         InterpolationSource::Slots => {
                             let v = resolve_slot_query(slots, query)?;
+                            ts.push(TemplatePart::lit(v));
+                        }
+                        InterpolationSource::Bindings => {
+                            let v = resolve_binding_query(bindings, query)?;
                             ts.push(TemplatePart::lit(v));
                         }
                         InterpolationSource::Config => {
@@ -640,6 +657,10 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                     InterpolatedPart::Interpolation { source, query } => match source {
                         InterpolationSource::Slots => {
                             let vv = resolve_slot_query(slots, query)?;
+                            ts.push(TemplatePart::lit(vv));
+                        }
+                        InterpolationSource::Bindings => {
+                            let vv = resolve_binding_query(bindings, query)?;
                             ts.push(TemplatePart::lit(vv));
                         }
                         InterpolationSource::Config => {
