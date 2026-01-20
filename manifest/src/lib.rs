@@ -103,6 +103,10 @@ pub enum Error {
     #[diagnostic(code(manifest::duplicate_binding_target))]
     DuplicateBindingTarget { to: String, slot: String },
 
+    #[error("binding name `{name}` is used more than once")]
+    #[diagnostic(code(manifest::duplicate_binding_name))]
+    DuplicateBindingName { name: String },
+
     #[error("binding references unknown child `#{child}`")]
     #[diagnostic(code(manifest::unknown_binding_child))]
     UnknownBindingChild { child: String },
@@ -221,6 +225,7 @@ name_type!(ChildName, "child");
 name_type!(SlotName, "slot");
 name_type!(ProvideName, "provide");
 name_type!(ExportName, "export");
+name_type!(BindingName, "binding");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay)]
 #[non_exhaustive]
@@ -967,6 +972,9 @@ impl<'de> Deserialize<'de> for ConfigSchema {
 #[non_exhaustive]
 /// A binding wires a target slot to a source provide.
 pub struct RawBinding {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub to: LocalComponentRef,
     pub slot: String,
     pub from: LocalComponentRef,
@@ -985,6 +993,8 @@ impl<'de> Deserialize<'de> for RawBinding {
         #[serde(deny_unknown_fields)]
         struct BindingInput {
             #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
             to: Option<String>,
             #[serde(default)]
             slot: Option<String>,
@@ -997,6 +1007,7 @@ impl<'de> Deserialize<'de> for RawBinding {
         }
 
         let BindingInput {
+            name,
             to,
             slot,
             from,
@@ -1016,6 +1027,7 @@ impl<'de> Deserialize<'de> for RawBinding {
                 ensure_binding_name_no_dot(&capability, capability.as_str())
                     .map_err(serde::de::Error::custom)?;
                 Ok(RawBinding {
+                    name,
                     to: parse_binding_component_ref(&to).map_err(serde::de::Error::custom)?,
                     slot,
                     from: parse_binding_component_ref(&from).map_err(serde::de::Error::custom)?,
@@ -1028,6 +1040,7 @@ impl<'de> Deserialize<'de> for RawBinding {
                 let (from, capability) =
                     split_binding_side(&from).map_err(serde::de::Error::custom)?;
                 Ok(RawBinding {
+                    name,
                     to,
                     slot,
                     from,
@@ -1185,6 +1198,7 @@ pub enum BindingSource {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct Binding {
+    pub name: Option<BindingName>,
     pub from: BindingSource,
     pub weak: bool,
 }
@@ -1412,15 +1426,30 @@ fn build_bindings(
     ctx: &ValidateCtx<'_>,
 ) -> Result<BTreeMap<BindingTarget, Binding>, Error> {
     let mut bindings_out = BTreeMap::new();
+    let mut binding_names = BTreeSet::new();
 
     for binding in bindings {
         let RawBinding {
+            name,
             to,
             slot,
             from,
             capability,
             weak,
         } = binding;
+
+        let name = match name {
+            Some(name) => {
+                let name = BindingName::try_from(name)?;
+                if !binding_names.insert(name.clone()) {
+                    return Err(Error::DuplicateBindingName {
+                        name: name.to_string(),
+                    });
+                }
+                Some(name)
+            }
+            None => None,
+        };
 
         let target = resolve_binding_target(ctx, to, slot)?;
         let source = resolve_binding_source(ctx, from, capability)?;
@@ -1437,7 +1466,14 @@ fn build_bindings(
             return Err(Error::DuplicateBindingTarget { to, slot });
         }
 
-        bindings_out.insert(target, Binding { from: source, weak });
+        bindings_out.insert(
+            target,
+            Binding {
+                name,
+                from: source,
+                weak,
+            },
+        );
     }
 
     Ok(bindings_out)
@@ -1729,6 +1765,7 @@ impl From<&Manifest> for RawManifest {
                 };
 
                 RawBinding {
+                    name: binding.name.as_ref().map(ToString::to_string),
                     to,
                     slot,
                     from,

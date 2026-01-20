@@ -209,6 +209,7 @@ fn binding_sugar_forms_parse() {
                 slot: SlotName::try_from("s").unwrap(),
             },
             Binding {
+                name: None,
                 from: BindingSource::ChildExport {
                     child: ChildName::try_from("b").unwrap(),
                     export: ExportName::try_from("c").unwrap(),
@@ -222,6 +223,7 @@ fn binding_sugar_forms_parse() {
                 slot: SlotName::try_from("t").unwrap(),
             },
             Binding {
+                name: None,
                 from: BindingSource::SelfProvide(ProvideName::try_from("d").unwrap()),
                 weak: false,
             },
@@ -229,6 +231,34 @@ fn binding_sugar_forms_parse() {
     ]);
 
     assert_eq!(m.bindings, expected);
+}
+
+#[test]
+fn binding_name_is_parsed() {
+    let m: Manifest = r##"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            a: "https://example.com/a",
+            b: "https://example.com/b",
+          },
+          bindings: [
+            { name: "link", to: "#a.s", from: "#b.c" },
+          ],
+        }
+        "##
+    .parse()
+    .unwrap();
+
+    let target = BindingTarget::ChildSlot {
+        child: ChildName::try_from("a").unwrap(),
+        slot: SlotName::try_from("s").unwrap(),
+    };
+    let binding = m.bindings.get(&target).expect("binding");
+    assert_eq!(
+        binding.name.as_ref().map(|name| name.as_str()),
+        Some("link")
+    );
 }
 
 #[test]
@@ -296,6 +326,32 @@ fn binding_dot_names_are_rejected_in_explicit_form() {
 }
 
 #[test]
+fn binding_name_cannot_contain_dots() {
+    let err = r##"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            a: "https://example.com/a",
+            b: "https://example.com/b",
+          },
+          bindings: [
+            { name: "bad.name", to: "#a.s", from: "#b.c" },
+          ],
+        }
+        "##
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    match err {
+        Error::InvalidName { kind, name } => {
+            assert_eq!(kind, "binding");
+            assert_eq!(name, "bad.name");
+        }
+        other => panic!("expected InvalidName error, got: {other}"),
+    }
+}
+
+#[test]
 fn binding_child_names_cannot_contain_dots() {
     let err = r#"
         {
@@ -328,7 +384,7 @@ fn binding_round_trip_through_canonical_json_parses() {
             c: { kind: "http", endpoint: "endpoint" },
           },
           bindings: [
-            { to: "#a.s", from: "self.c" },
+            { name: "link", to: "#a.s", from: "self.c" },
           ],
         }
         "##
@@ -1263,6 +1319,31 @@ fn binding_target_cannot_be_multiplexed() {
 }
 
 #[test]
+fn binding_name_must_be_unique() {
+    let raw = parse_raw(
+        r##"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            a: "https://example.com/a",
+            b: "https://example.com/b",
+          },
+          bindings: [
+            { name: "dup", to: "#a.s", from: "#b.c" },
+            { name: "dup", to: "#a.t", from: "#b.d" },
+          ],
+        }
+        "##,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::DuplicateBindingName { name } => assert_eq!(name, "dup"),
+        other => panic!("expected DuplicateBindingName error, got: {other}"),
+    }
+}
+
+#[test]
 fn duplicate_binding_target_error_shows_both_sites() {
     use miette::Diagnostic;
 
@@ -1321,6 +1402,7 @@ fn binding_source_can_be_multiplexed() {
                 slot: SlotName::try_from("s1").unwrap(),
             },
             Binding {
+                name: None,
                 from: BindingSource::ChildExport {
                     child: ChildName::try_from("b").unwrap(),
                     export: ExportName::try_from("c").unwrap(),
@@ -1334,6 +1416,7 @@ fn binding_source_can_be_multiplexed() {
                 slot: SlotName::try_from("s2").unwrap(),
             },
             Binding {
+                name: None,
                 from: BindingSource::ChildExport {
                     child: ChildName::try_from("b").unwrap(),
                     export: ExportName::try_from("c").unwrap(),
@@ -1778,6 +1861,38 @@ fn manifest_doc_error_duplicate_binding_target_marks_second_binding() {
         .expect("second binding label");
     let second_text = labeled_span_text(source.as_ref(), second);
     assert!(second_text.contains("self.b"));
+}
+
+#[test]
+fn manifest_doc_error_duplicate_binding_name_marks_second_binding() {
+    let source = r##"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            a: "https://example.com/a",
+            b: "https://example.com/b",
+          },
+          bindings: [
+            { name: "dup", to: "#a.s", from: "#b.c" },
+            { name: "dup", to: "#a.t", from: "#b.d" },
+          ],
+        }
+        "##;
+    let source: Arc<str> = Arc::from(source);
+    let err = ParsedManifest::parse_named("<test>", Arc::clone(&source)).unwrap_err();
+    assert!(matches!(err.kind, Error::DuplicateBindingName { .. }));
+
+    let labels: Vec<_> = err.labels().expect("labels").collect();
+    let second = labels
+        .iter()
+        .find(|label| label.label() == Some("second binding name here"))
+        .expect("second binding name label");
+    let starts: Vec<_> = source
+        .match_indices("\"dup\"")
+        .map(|(idx, _)| idx)
+        .collect();
+    assert_eq!(starts.len(), 2);
+    assert_eq!(second.offset(), starts[1]);
 }
 
 #[test]

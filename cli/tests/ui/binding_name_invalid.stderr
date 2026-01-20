@@ -1,0 +1,11 @@
+Error: manifest::invalid_name
+
+  × check failed
+  ╰─▶ invalid binding name `bad.name`: dots are reserved
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/binding_name_invalid.json5:8:13]
+ 7 │   bindings: [
+ 8 │     { name: "bad.name", to: "#a.s", from: "#b.c" },
+   ·             ─────┬────
+   ·                  ╰── invalid name
+ 9 │   ],
+   ╰────

@@ -125,6 +125,9 @@ fn labels_for_manifest_error(err: &ManifestError, spans: &ManifestSpans) -> Vec<
         ManifestError::DuplicateBindingTarget { to, slot } => {
             labels_for_duplicate_binding_target(spans, to, slot)
         }
+        ManifestError::DuplicateBindingName { name } => {
+            labels_for_duplicate_binding_name(spans, name)
+        }
         ManifestError::UnknownBindingSlot { slot } => labels_for_unknown_binding_slot(spans, slot),
         ManifestError::UnknownBindingProvide { capability } => {
             labels_for_unknown_binding_provide(spans, capability)
@@ -181,14 +184,21 @@ fn labels_for_invalid_name(
     kind: &'static str,
     name: &str,
 ) -> Vec<LabeledSpan> {
-    let span = match kind {
-        "environment" => spans.environments.get(name).map(|s| s.name),
-        "child" => spans.components.get(name).map(|s| s.name),
-        "slot" => spans.slots.get(name).map(|s| s.name),
-        "provide" => spans.provides.get(name).map(|s| s.capability.name),
-        "export" => spans.exports.get(name).map(|s| s.name),
-        _ => None,
-    };
+    let span =
+        match kind {
+            "environment" => spans.environments.get(name).map(|s| s.name),
+            "child" => spans.components.get(name).map(|s| s.name),
+            "slot" => spans.slots.get(name).map(|s| s.name),
+            "provide" => spans.provides.get(name).map(|s| s.capability.name),
+            "export" => spans.exports.get(name).map(|s| s.name),
+            "binding" => spans.bindings_by_index.iter().find_map(|binding| {
+                match binding.name_value.as_deref() {
+                    Some(value) if value == name => binding.name.or(Some(binding.whole)),
+                    _ => None,
+                }
+            }),
+            _ => None,
+        };
     vec![primary(
         span_or_default(span),
         Some("invalid name".to_string()),
@@ -246,6 +256,40 @@ fn labels_for_duplicate_binding_target(
             labels.push(primary(*second, Some("second binding here".to_string())));
             labels.push(LabeledSpan::new_with_span(
                 Some("first binding here".to_string()),
+                *first,
+            ));
+            for span in rest {
+                labels.push(LabeledSpan::new_with_span(None, *span));
+            }
+            labels
+        }
+    }
+}
+
+fn labels_for_duplicate_binding_name(spans: &ManifestSpans, name: &str) -> Vec<LabeledSpan> {
+    let matches: Vec<_> = spans
+        .bindings_by_index
+        .iter()
+        .filter_map(|binding| match binding.name_value.as_deref() {
+            Some(value) if value == name => binding.name.or(Some(binding.whole)),
+            _ => None,
+        })
+        .collect();
+
+    match matches.as_slice() {
+        [] => vec![primary(
+            default_span(),
+            Some("duplicate binding name".to_string()),
+        )],
+        [only] => vec![primary(*only, Some("duplicate binding name".to_string()))],
+        [first, second, rest @ ..] => {
+            let mut labels = Vec::new();
+            labels.push(primary(
+                *second,
+                Some("second binding name here".to_string()),
+            ));
+            labels.push(LabeledSpan::new_with_span(
+                Some("first binding name here".to_string()),
                 *first,
             ));
             for span in rest {

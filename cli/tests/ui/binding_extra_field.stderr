@@ -2,12 +2,11 @@ Error: manifest::deserialize_error
 
   × check failed
   ╰─▶ json5 deserialize error at bindings[0].weakk: unknown field `weakk`,
-      expected one of `to`, `slot`, `from`, `capability`, `weak`
+      expected one of `name`, `to`, `slot`, `from`, `capability`, `weak`
     ╭─[<CARGO_MANIFEST_DIR>/tests/ui/binding_extra_field.json5:24:52]
  23 │   bindings: [
  24 │     { to: "#green.llm", from: "#green_router.llm", weakk: true },
     ·                                                    ──┬──
-    ·                                                      ╰── unknown field `weakk`, expected one of `to`, `slot`, `from`, `capability`, `weak`
+    ·                                                      ╰── unknown field `weakk`, expected one of `name`, `to`, `slot`, `from`, `capability`, `weak`
  25 │     { to: "#green.env", from: "#tau2.env" },
     ╰────
-

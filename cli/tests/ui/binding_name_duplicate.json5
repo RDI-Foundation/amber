@@ -1,0 +1,11 @@
+{
+  manifest_version: "0.1.0",
+  components: {
+    a: "https://example.com/a",
+    b: "https://example.com/b",
+  },
+  bindings: [
+    { name: "dup", to: "#a.s", from: "#b.c" },
+    { name: "dup", to: "#a.t", from: "#b.d" },
+  ],
+}

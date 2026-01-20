@@ -47,6 +47,7 @@ This crate **parses JSON5**, deserializes into Rust types, and validates:
 * No dots (`.`) in:
 
   * child instance names (`components` keys)
+  * binding names (`bindings[].name`)
   * capability names (`slots`/`provides` keys, binding slot/capability names, and export target names)
   * export names (keys in `exports`)
   * child refs (`#<name>`) in bindings and export targets
@@ -54,6 +55,7 @@ This crate **parses JSON5**, deserializes into Rust types, and validates:
 * `exports` targets that point at `self` must refer to something declared in `provides`.
 * `exports` targets that point at `#child` must refer to a declared child.
 * Each binding target `(<to>.<slot>)` may appear **only once**.
+* Binding names (when present) must be unique within a manifest.
 * Binding references must be locally well-formed:
 
   * `to: "self"` requires `slot` exist in `slots`
@@ -405,6 +407,7 @@ Bindings forms:
 
 ```json5
 {
+  name: "route_llm", // optional; must be unique within the manifest
   to: "#evaluator",
   slot: "llm",
   from: "#router",
@@ -422,6 +425,7 @@ Bindings forms:
 Rules enforced by this crate:
 
 * Target uniqueness: you cannot bind the same `(<to>.<slot>)` more than once.
+* Binding names (if present) must be unique within the manifest and follow child name rules (no `.`).
 * `to: "self"` requires `slot` exist in `slots`.
 * `from: "self"` requires `capability` exist in `provides`.
 * Any `#child` referenced in `to` or `from` must exist in `components`.

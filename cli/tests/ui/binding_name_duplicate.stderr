@@ -1,0 +1,14 @@
+Error: manifest::duplicate_binding_name
+
+  × check failed
+  ╰─▶ binding name `dup` is used more than once
+    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/binding_name_duplicate.json5:9:13]
+  7 │   bindings: [
+  8 │     { name: "dup", to: "#a.s", from: "#b.c" },
+    ·             ──┬──
+    ·               ╰── first binding name here
+  9 │     { name: "dup", to: "#a.t", from: "#b.d" },
+    ·             ──┬──
+    ·               ╰── second binding name here
+ 10 │   ],
+    ╰────
