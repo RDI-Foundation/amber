@@ -2,10 +2,11 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Write as _,
+    sync::Arc,
 };
 
 use amber_config as rc;
-use amber_manifest::{InterpolatedPart, InterpolationSource};
+use amber_manifest::{BindingTarget, InterpolatedPart, InterpolationSource, Manifest};
 use amber_scenario::{ComponentId, Scenario};
 use amber_template::{ProgramTemplateSpec, TemplatePart, TemplateSpec, TemplateString};
 use base64::Engine as _;
@@ -413,6 +414,8 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         }
     }
 
+    let binding_urls_by_scope = binding_urls_by_scope(s, &manifests, &slot_values_by_component)?;
+
     // Scenario exports => publish to host loopback with stable host ports.
     // Also, allow inbound on that target port from host loopback / docker gateway.
     let mut exported_ports: HashMap<ComponentId, BTreeSet<u16>> = HashMap::new();
@@ -481,7 +484,8 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         .into());
     }
 
-    let composed_templates = composed.templates;
+    let resolved_templates =
+        resolve_binding_templates(composed.templates, &binding_urls_by_scope, s)?;
 
     // Build per-program service mode (direct vs helper) + payloads.
     #[derive(Clone, Debug)]
@@ -574,6 +578,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
             match part {
                 TemplatePart::Lit { lit } => out.push_str(lit),
                 TemplatePart::Config { .. } => unreachable!(),
+                TemplatePart::Binding { .. } => unreachable!(),
             }
         }
         Ok(out)
@@ -587,7 +592,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         let bindings = binding_values_by_component.get(id).unwrap();
 
         // Root-only composed config template (if available). Root component uses runtime root config.
-        let template_opt: Option<&rc::ConfigNode> = match composed_templates.get(id) {
+        let template_opt: Option<&rc::ConfigNode> = match resolved_templates.get(id) {
             Some(rc::RootConfigTemplate::Node(node)) => Some(node),
             _ => None,
         };
@@ -707,7 +712,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 .0
                 .clone();
 
-            let cfg_template_value = composed_templates
+            let cfg_template_value = resolved_templates
                 .get(id)
                 .expect("template exists")
                 .to_json_ir();
@@ -1077,6 +1082,156 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
 }
 
 // ---- helpers ----
+
+fn binding_urls_by_scope(
+    s: &Scenario,
+    manifests: &[Option<Arc<Manifest>>],
+    slot_values_by_component: &HashMap<ComponentId, BTreeMap<String, SlotObject>>,
+) -> Result<HashMap<u64, BTreeMap<String, BindingObject>>, String> {
+    let mut out: HashMap<u64, BTreeMap<String, BindingObject>> = HashMap::new();
+
+    for (idx, manifest) in manifests.iter().enumerate() {
+        let Some(manifest) = manifest else {
+            continue;
+        };
+        let realm = ComponentId(idx);
+        let mut by_name = BTreeMap::new();
+
+        for (target, binding) in manifest.bindings() {
+            let Some(name) = binding.name.as_ref() else {
+                continue;
+            };
+
+            let (target_component, slot_name) = match target {
+                BindingTarget::SelfSlot(slot) => (realm, slot.as_str()),
+                BindingTarget::ChildSlot { child, slot } => {
+                    let child_id = child_component_id_for_name(s, realm, child.as_str())?;
+                    (child_id, slot.as_str())
+                }
+                _ => {
+                    return Err(format!(
+                        "unsupported binding target {:?} in {}",
+                        target,
+                        component_label(s, realm)
+                    ));
+                }
+            };
+
+            let slot_values = slot_values_by_component
+                .get(&target_component)
+                .ok_or_else(|| {
+                    format!(
+                        "internal error: missing slot values for {}",
+                        component_label(s, target_component)
+                    )
+                })?;
+            let slot = slot_values.get(slot_name).ok_or_else(|| {
+                format!(
+                    "internal error: missing slot url for {}.{}",
+                    component_label(s, target_component),
+                    slot_name
+                )
+            })?;
+
+            by_name.insert(
+                name.to_string(),
+                BindingObject {
+                    url: slot.url.clone(),
+                },
+            );
+        }
+
+        out.insert(realm.0 as u64, by_name);
+    }
+
+    Ok(out)
+}
+
+fn resolve_binding_templates(
+    templates: HashMap<ComponentId, rc::RootConfigTemplate>,
+    bindings_by_scope: &HashMap<u64, BTreeMap<String, BindingObject>>,
+    s: &Scenario,
+) -> Result<HashMap<ComponentId, rc::RootConfigTemplate>, String> {
+    let mut out = HashMap::with_capacity(templates.len());
+    for (id, template) in templates {
+        let resolved = match template {
+            rc::RootConfigTemplate::Root => rc::RootConfigTemplate::Root,
+            rc::RootConfigTemplate::Node(node) => {
+                let resolved =
+                    resolve_binding_parts_in_config(&node, bindings_by_scope).map_err(|err| {
+                        format!(
+                            "failed to resolve binding interpolation in config for {}: {err}",
+                            component_label(s, id)
+                        )
+                    })?;
+                rc::RootConfigTemplate::Node(resolved)
+            }
+        };
+        out.insert(id, resolved);
+    }
+    Ok(out)
+}
+
+fn resolve_binding_parts_in_config(
+    node: &rc::ConfigNode,
+    bindings_by_scope: &HashMap<u64, BTreeMap<String, BindingObject>>,
+) -> Result<rc::ConfigNode, String> {
+    match node {
+        rc::ConfigNode::StringTemplate(parts) => {
+            let mut out = Vec::with_capacity(parts.len());
+            for part in parts {
+                match part {
+                    TemplatePart::Lit { lit } => out.push(TemplatePart::lit(lit)),
+                    TemplatePart::Config { config } => out.push(TemplatePart::config(config)),
+                    TemplatePart::Binding { binding, scope } => {
+                        let bindings = bindings_by_scope
+                            .get(scope)
+                            .ok_or_else(|| format!("bindings scope {scope} is missing"))?;
+                        let url = resolve_binding_query(bindings, binding)?;
+                        out.push(TemplatePart::lit(url));
+                    }
+                }
+            }
+            Ok(rc::ConfigNode::StringTemplate(out).simplify())
+        }
+        rc::ConfigNode::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(resolve_binding_parts_in_config(item, bindings_by_scope)?);
+            }
+            Ok(rc::ConfigNode::Array(out))
+        }
+        rc::ConfigNode::Object(map) => {
+            let mut out = BTreeMap::new();
+            for (k, v) in map {
+                out.insert(
+                    k.clone(),
+                    resolve_binding_parts_in_config(v, bindings_by_scope)?,
+                );
+            }
+            Ok(rc::ConfigNode::Object(out))
+        }
+        other => Ok(other.clone()),
+    }
+}
+
+fn child_component_id_for_name(
+    s: &Scenario,
+    parent: ComponentId,
+    child_name: &str,
+) -> Result<ComponentId, String> {
+    let parent_component = s.component(parent);
+    for child_id in &parent_component.children {
+        let child = s.component(*child_id);
+        if child.moniker.local_name() == Some(child_name) {
+            return Ok(*child_id);
+        }
+    }
+    Err(format!(
+        "internal error: missing child {child_name:?} for {}",
+        component_label(s, parent)
+    ))
+}
 
 fn component_label(s: &Scenario, id: ComponentId) -> String {
     s.component(id).moniker.as_str().to_string()

@@ -8,7 +8,7 @@ use amber_manifest::{Manifest, ManifestDigest, ManifestRef, ProvideDecl, SlotDec
 use amber_scenario::{
     BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, ScenarioExport, SlotRef,
 };
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use url::Url;
 
 use super::{super::Reporter as _, DockerComposeReporter, HELPER_IMAGE, SIDECAR_IMAGE};
@@ -21,7 +21,10 @@ fn moniker(path: &str) -> Moniker {
     Moniker::from(Arc::from(path))
 }
 
-fn compile_output(scenario: Scenario) -> crate::CompileOutput {
+fn compile_output_with_manifest_overrides(
+    scenario: Scenario,
+    overrides: BTreeMap<ComponentId, Map<String, Value>>,
+) -> crate::CompileOutput {
     let url = Url::parse("file:///scenario.json5").expect("test URL should parse");
     let store = crate::DigestStore::new();
 
@@ -48,6 +51,11 @@ fn compile_output(scenario: Scenario) -> crate::CompileOutput {
                 "provides".to_string(),
                 serde_json::to_value(&component.provides).unwrap(),
             );
+        }
+        if let Some(extra) = overrides.get(&component.id) {
+            for (key, value) in extra {
+                manifest.insert(key.clone(), value.clone());
+            }
         }
 
         let manifest: Manifest = serde_json::from_value(Value::Object(manifest)).unwrap();
@@ -79,6 +87,10 @@ fn compile_output(scenario: Scenario) -> crate::CompileOutput {
         provenance,
         diagnostics: Vec::new(),
     }
+}
+
+fn compile_output(scenario: Scenario) -> crate::CompileOutput {
+    compile_output_with_manifest_overrides(scenario, BTreeMap::new())
 }
 
 fn error_contains(err: &crate::Error, needle: &str) -> bool {
@@ -317,6 +329,364 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
 
     // Slot URL should be rendered with local proxy port base (20000).
     assert!(yaml.contains(r#"URL: "http://127.0.0.1:20000""#), "{yaml}");
+}
+
+#[test]
+fn compose_resolves_binding_urls_in_child_config() {
+    let server_program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["server"],
+        "env": {},
+        "network": {
+            "endpoints": [
+                { "name": "api", "port": 8080, "protocol": "http" }
+            ]
+        }
+    }))
+    .unwrap();
+
+    let client_program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["client"],
+        "env": {
+            "BIND_URL": "${slots.api.url}"
+        }
+    }))
+    .unwrap();
+
+    let observer_program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["observer"],
+        "env": {
+            "UPSTREAM_URL": "${config.upstream_url}"
+        }
+    }))
+    .unwrap();
+
+    let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
+    let provide_http: ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "api" })).unwrap();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        children: vec![ComponentId(3), ComponentId(2), ComponentId(1)],
+    };
+
+    let server = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/server"),
+        digest: digest(1),
+        config: None,
+        program: Some(server_program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        children: Vec::new(),
+    };
+
+    let client = Component {
+        id: ComponentId(2),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/client"),
+        digest: digest(2),
+        config: None,
+        program: Some(client_program),
+        slots: BTreeMap::from([("api".to_string(), slot_http)]),
+        provides: BTreeMap::new(),
+        children: Vec::new(),
+    };
+
+    let observer = Component {
+        id: ComponentId(3),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/observer"),
+        digest: digest(3),
+        config: Some(json!({
+            "upstream_url": "${bindings.bind.url}"
+        })),
+        program: Some(observer_program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(server), Some(client), Some(observer)],
+        bindings: vec![BindingEdge {
+            name: Some("bind".to_string()),
+            from: ProvideRef {
+                component: ComponentId(1),
+                name: "api".to_string(),
+            },
+            to: SlotRef {
+                component: ComponentId(2),
+                name: "api".to_string(),
+            },
+            weak: false,
+        }],
+        exports: vec![],
+    };
+
+    let mut overrides = BTreeMap::new();
+    let mut root_overrides = Map::new();
+    root_overrides.insert(
+        "components".to_string(),
+        json!({
+            "server": "file:///server.json5",
+            "client": "file:///client.json5",
+            "observer": "file:///observer.json5",
+        }),
+    );
+    root_overrides.insert(
+        "bindings".to_string(),
+        json!([
+            { "name": "bind", "to": "#client.api", "from": "#server.api" }
+        ]),
+    );
+    overrides.insert(ComponentId(0), root_overrides);
+
+    let mut observer_overrides = Map::new();
+    observer_overrides.insert(
+        "config_schema".to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "upstream_url": { "type": "string" }
+            },
+            "required": ["upstream_url"],
+            "additionalProperties": false
+        }),
+    );
+    overrides.insert(ComponentId(3), observer_overrides);
+
+    let output = compile_output_with_manifest_overrides(scenario, overrides);
+    let yaml = DockerComposeReporter
+        .emit(&output)
+        .expect("compose render ok");
+
+    assert!(
+        yaml.contains(r#"BIND_URL: "http://127.0.0.1:20000""#),
+        "{yaml}"
+    );
+    assert!(
+        yaml.contains(r#"UPSTREAM_URL: "http://127.0.0.1:20000""#),
+        "{yaml}"
+    );
+    assert!(
+        !yaml.contains("AMBER_COMPONENT_CONFIG_TEMPLATE_B64"),
+        "{yaml}"
+    );
+}
+
+#[test]
+fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
+    let server_program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["server"],
+        "env": {},
+        "network": {
+            "endpoints": [
+                { "name": "api", "port": 8080, "protocol": "http" }
+            ]
+        }
+    }))
+    .unwrap();
+
+    let client_program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["client"],
+        "env": {}
+    }))
+    .unwrap();
+
+    let child_program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["child"],
+        "env": {
+            "UPSTREAM_URL": "${config.upstream_url}"
+        }
+    }))
+    .unwrap();
+
+    let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
+    let provide_http: ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "api" })).unwrap();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        children: vec![ComponentId(3), ComponentId(2), ComponentId(1)],
+    };
+
+    let server = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/server"),
+        digest: digest(1),
+        config: None,
+        program: Some(server_program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        children: Vec::new(),
+    };
+
+    let client = Component {
+        id: ComponentId(2),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/client"),
+        digest: digest(2),
+        config: None,
+        program: Some(client_program),
+        slots: BTreeMap::from([("api".to_string(), slot_http)]),
+        provides: BTreeMap::new(),
+        children: Vec::new(),
+    };
+
+    let grandparent = Component {
+        id: ComponentId(3),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/grandparent"),
+        digest: digest(3),
+        config: Some(json!({
+            "upstream_url": "${bindings.bind.url}"
+        })),
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        children: vec![ComponentId(4)],
+    };
+
+    let parent = Component {
+        id: ComponentId(4),
+        parent: Some(ComponentId(3)),
+        moniker: moniker("/grandparent/parent"),
+        digest: digest(4),
+        config: Some(json!({
+            "upstream_url": "${config.upstream_url}"
+        })),
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        children: vec![ComponentId(5)],
+    };
+
+    let child = Component {
+        id: ComponentId(5),
+        parent: Some(ComponentId(4)),
+        moniker: moniker("/grandparent/parent/child"),
+        digest: digest(5),
+        config: Some(json!({
+            "upstream_url": "${config.upstream_url}"
+        })),
+        program: Some(child_program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![
+            Some(root),
+            Some(server),
+            Some(client),
+            Some(grandparent),
+            Some(parent),
+            Some(child),
+        ],
+        bindings: vec![BindingEdge {
+            name: Some("bind".to_string()),
+            from: ProvideRef {
+                component: ComponentId(1),
+                name: "api".to_string(),
+            },
+            to: SlotRef {
+                component: ComponentId(2),
+                name: "api".to_string(),
+            },
+            weak: false,
+        }],
+        exports: vec![],
+    };
+
+    let upstream_schema = json!({
+        "type": "object",
+        "properties": {
+            "upstream_url": { "type": "string" }
+        },
+        "required": ["upstream_url"],
+        "additionalProperties": false
+    });
+
+    let mut overrides = BTreeMap::new();
+    let mut root_overrides = Map::new();
+    root_overrides.insert(
+        "components".to_string(),
+        json!({
+            "server": "file:///server.json5",
+            "client": "file:///client.json5",
+            "grandparent": "file:///grandparent.json5",
+        }),
+    );
+    root_overrides.insert(
+        "bindings".to_string(),
+        json!([
+            { "name": "bind", "to": "#client.api", "from": "#server.api" }
+        ]),
+    );
+    overrides.insert(ComponentId(0), root_overrides);
+
+    let mut grandparent_overrides = Map::new();
+    grandparent_overrides.insert(
+        "components".to_string(),
+        json!({
+            "parent": "file:///parent.json5"
+        }),
+    );
+    grandparent_overrides.insert("config_schema".to_string(), upstream_schema.clone());
+    overrides.insert(ComponentId(3), grandparent_overrides);
+
+    let mut parent_overrides = Map::new();
+    parent_overrides.insert(
+        "components".to_string(),
+        json!({
+            "child": "file:///child.json5"
+        }),
+    );
+    parent_overrides.insert("config_schema".to_string(), upstream_schema.clone());
+    overrides.insert(ComponentId(4), parent_overrides);
+
+    let mut child_overrides = Map::new();
+    child_overrides.insert("config_schema".to_string(), upstream_schema);
+    overrides.insert(ComponentId(5), child_overrides);
+
+    let output = compile_output_with_manifest_overrides(scenario, overrides);
+    let yaml = DockerComposeReporter
+        .emit(&output)
+        .expect("compose render ok");
+
+    assert!(
+        yaml.contains(r#"UPSTREAM_URL: "http://127.0.0.1:20000""#),
+        "{yaml}"
+    );
+    assert!(
+        !yaml.contains("AMBER_COMPONENT_CONFIG_TEMPLATE_B64"),
+        "{yaml}"
+    );
 }
 
 #[test]

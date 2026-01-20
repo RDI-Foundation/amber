@@ -4,7 +4,7 @@ use serde_json::Value;
 use crate::{ConfigError, Result};
 
 pub fn template_string_is_runtime(ts: &TemplateString) -> bool {
-    ts.iter().any(|p| p.is_config())
+    ts.iter().any(|p| p.is_config() || p.is_binding())
 }
 
 pub fn stringify_for_interpolation(v: &Value) -> Result<String> {
@@ -96,6 +96,11 @@ pub fn render_template_string(parts: &TemplateString, config: &Value) -> Result<
                     )));
                 }
                 out.push_str(&stringify_for_interpolation(v)?);
+            }
+            TemplatePart::Binding { binding, .. } => {
+                return Err(ConfigError::interp(format!(
+                    "binding interpolation bindings.{binding} cannot be rendered at runtime"
+                )));
             }
         }
     }

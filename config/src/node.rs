@@ -30,7 +30,7 @@ impl ConfigNode {
     pub fn contains_runtime(&self) -> bool {
         match self {
             Self::ConfigRef(_) => true,
-            Self::StringTemplate(parts) => parts.iter().any(|p| p.is_config()),
+            Self::StringTemplate(parts) => template_string_is_runtime(parts),
             Self::Array(items) => items.iter().any(|n| n.contains_runtime()),
             Self::Object(map) => map.values().any(|n| n.contains_runtime()),
             _ => false,
@@ -91,7 +91,7 @@ impl ConfigNode {
                 let mut s = String::new();
                 for part in parts {
                     let TemplatePart::Lit { lit } = part else {
-                        unreachable!("no config parts in static template");
+                        unreachable!("no config or binding parts in static template");
                     };
                     s.push_str(lit);
                 }
@@ -110,7 +110,7 @@ impl ConfigNode {
                     let mut s = String::new();
                     for part in parts {
                         let TemplatePart::Lit { lit } = part else {
-                            unreachable!("no config parts in static template");
+                            unreachable!("no config or binding parts in static template");
                         };
                         s.push_str(lit);
                     }
@@ -194,7 +194,7 @@ impl ConfigNode {
                     let mut s = String::new();
                     for part in parts {
                         let TemplatePart::Lit { lit } = part else {
-                            unreachable!("no config parts in static template");
+                            unreachable!("no config or binding parts in static template");
                         };
                         s.push_str(&lit);
                     }
@@ -268,6 +268,9 @@ pub fn compose_config_template(
                             let resolved = resolve_against_parent(parent, &parent_path)?;
                             let inlined = inline_as_template_parts(&resolved)?;
                             out.extend(inlined);
+                        }
+                        TemplatePart::Binding { binding, scope } => {
+                            out.push(TemplatePart::binding(scope, binding));
                         }
                     }
                 }

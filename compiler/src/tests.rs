@@ -705,6 +705,83 @@ async fn config_validation_error_points_to_invalid_value() {
 }
 
 #[tokio::test]
+async fn binding_interpolation_error_points_to_config_value() {
+    use miette::Diagnostic;
+
+    let dir = tmp_dir("scenario-binding-config-span");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              url: { type: "string" },
+            },
+            required: ["url"],
+            additionalProperties: false,
+          },
+        }
+        "#,
+    );
+
+    let root_source = format!(
+        r##"
+        {{
+          manifest_version: "0.1.0",
+          components: {{
+            child: {{
+              manifest: "{child}",
+              config: {{ url: "${{bindings.missing.url}}" }},
+            }},
+          }},
+        }}
+        "##,
+        child = file_url(&child_path),
+    );
+    write_file(&root_path, &root_source);
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+    let output = compiler
+        .check(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
+            },
+        )
+        .await
+        .unwrap();
+
+    let report = output
+        .diagnostics
+        .iter()
+        .find(|report| {
+            let diag: &dyn Diagnostic = &***report;
+            diag.code()
+                .is_some_and(|c| c.to_string() == "compiler::invalid_bindings_interpolation")
+        })
+        .expect("expected invalid_bindings_interpolation diagnostic");
+    let diag: &dyn Diagnostic = &**report;
+    let labels: Vec<_> = diag
+        .labels()
+        .expect("binding interpolation diagnostic should include a label")
+        .collect();
+    assert_eq!(labels.len(), 1);
+
+    let label = &labels[0];
+    let needle = "\"${bindings.missing.url}\"";
+    let offset = root_source.find(needle).unwrap();
+    assert_eq!(label.offset(), offset);
+    assert_eq!(label.len(), needle.len());
+}
+
+#[tokio::test]
 async fn duplicate_slot_bindings_across_manifests_error() {
     let dir = tmp_dir("scenario-duplicate-slot-binding");
     let root_path = dir.path().join("root.json5");

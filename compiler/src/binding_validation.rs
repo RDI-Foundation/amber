@@ -3,10 +3,11 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use amber_manifest::{
-    BindingTarget, InterpolatedPart, InterpolatedString, InterpolationSource, Manifest,
-    ManifestSpans, span_for_json_pointer,
+    BindingTarget, ComponentDecl, InterpolatedPart, InterpolatedString, InterpolationSource,
+    Manifest, ManifestSpans, span_for_json_pointer,
 };
 use miette::{Diagnostic, NamedSource, Report, SourceSpan};
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
@@ -66,6 +67,18 @@ fn collect_bindings_for_target(
     out
 }
 
+fn collect_bindings_in_manifest(manifest: &Manifest) -> BindingLookup {
+    let mut out = BindingLookup::default();
+    for binding in manifest.bindings().values() {
+        if let Some(name) = binding.name.as_ref() {
+            out.named.insert(name.to_string());
+        } else {
+            out.has_unnamed = true;
+        }
+    }
+    out
+}
+
 pub(crate) fn collect_binding_interpolation_diagnostics_from_tree(
     tree: &ResolvedTree,
     store: &DigestStore,
@@ -108,6 +121,15 @@ fn collect_binding_interpolation_diagnostics(
         manifest.as_ref(),
         component_path,
         bindings,
+        Arc::clone(&source),
+        spans,
+        &src_name,
+    ));
+    let config_bindings = collect_bindings_in_manifest(manifest.as_ref());
+    diagnostics.extend(validate_manifest_config_binding_interpolations(
+        manifest.as_ref(),
+        component_path,
+        config_bindings,
         source,
         spans,
         &src_name,
@@ -166,6 +188,171 @@ fn validate_manifest_binding_interpolations(
     }
 
     diagnostics
+}
+
+struct ConfigBindingValidationContext<'a> {
+    component_path: &'a str,
+    bindings: &'a BindingLookup,
+    source: &'a Arc<str>,
+    src_name: &'a str,
+}
+
+fn validate_manifest_config_binding_interpolations(
+    manifest: &Manifest,
+    component_path: &str,
+    bindings: BindingLookup,
+    source: Arc<str>,
+    spans: &ManifestSpans,
+    src_name: &str,
+) -> Vec<Report> {
+    let mut diagnostics = Vec::new();
+    let ctx = ConfigBindingValidationContext {
+        component_path,
+        bindings: &bindings,
+        source: &source,
+        src_name,
+    };
+    let root_span = (0usize, source.len()).into();
+
+    for (child_name, decl) in manifest.components() {
+        let ComponentDecl::Object(obj) = decl else {
+            continue;
+        };
+        let Some(config) = obj.config.as_ref() else {
+            continue;
+        };
+
+        let mut pointer = "/components/".to_string();
+        push_json_pointer_segment(&mut pointer, child_name.as_str());
+        pointer.push_str("/config");
+
+        let location = format!("components.{child_name}.config");
+        let config_span = spans
+            .components
+            .get(child_name.as_str())
+            .and_then(|spans| spans.config);
+
+        validate_config_value(
+            config,
+            &ctx,
+            root_span,
+            &pointer,
+            &location,
+            config_span,
+            &mut diagnostics,
+        );
+    }
+
+    diagnostics
+}
+
+fn validate_config_value(
+    value: &Value,
+    ctx: &ConfigBindingValidationContext<'_>,
+    root_span: SourceSpan,
+    pointer: &str,
+    location: &str,
+    config_span: Option<SourceSpan>,
+    diagnostics: &mut Vec<Report>,
+) {
+    match value {
+        Value::String(s) => {
+            let Ok(parsed) = s.parse::<InterpolatedString>() else {
+                return;
+            };
+            let span = span_for_json_pointer(ctx.source.as_ref(), root_span, pointer)
+                .or(config_span)
+                .unwrap_or_else(|| (0usize, 0usize).into());
+            validate_interpolated_config_string(&parsed, ctx, location, span, diagnostics);
+        }
+        Value::Array(values) => {
+            for (idx, value) in values.iter().enumerate() {
+                let mut next_pointer = pointer.to_string();
+                next_pointer.push('/');
+                next_pointer.push_str(&idx.to_string());
+                let next_location = format!("{location}[{idx}]");
+                validate_config_value(
+                    value,
+                    ctx,
+                    root_span,
+                    &next_pointer,
+                    &next_location,
+                    config_span,
+                    diagnostics,
+                );
+            }
+        }
+        Value::Object(map) => {
+            for (key, value) in map {
+                let mut next_pointer = pointer.to_string();
+                next_pointer.push('/');
+                push_json_pointer_segment(&mut next_pointer, key);
+                let next_location = format!("{location}.{key}");
+                validate_config_value(
+                    value,
+                    ctx,
+                    root_span,
+                    &next_pointer,
+                    &next_location,
+                    config_span,
+                    diagnostics,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn validate_interpolated_config_string(
+    value: &InterpolatedString,
+    ctx: &ConfigBindingValidationContext<'_>,
+    location: &str,
+    span: SourceSpan,
+    diagnostics: &mut Vec<Report>,
+) {
+    for part in &value.parts {
+        let InterpolatedPart::Interpolation {
+            source: kind,
+            query,
+        } = part
+        else {
+            continue;
+        };
+        if *kind != InterpolationSource::Bindings {
+            continue;
+        }
+
+        match parse_binding_query(query) {
+            Ok(parsed) => {
+                if !ctx.bindings.named.contains(parsed.name) {
+                    let help = unknown_binding_help_for_config(ctx.component_path, ctx.bindings);
+                    diagnostics.push(Report::new(InvalidBindingsInterpolation {
+                        component_path: ctx.component_path.to_string(),
+                        location: location.to_string(),
+                        message: format!("unknown binding name `{}`", parsed.name),
+                        help,
+                        src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source))
+                            .with_language("json5"),
+                        span,
+                        label: "binding interpolation here".to_string(),
+                    }));
+                }
+            }
+            Err(err) => {
+                let help = binding_query_help(&err);
+                diagnostics.push(Report::new(InvalidBindingsInterpolation {
+                    component_path: ctx.component_path.to_string(),
+                    location: location.to_string(),
+                    message: err.to_string(),
+                    help,
+                    src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source))
+                        .with_language("json5"),
+                    span,
+                    label: "binding interpolation here".to_string(),
+                }));
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -313,6 +500,29 @@ fn unknown_binding_help(component_path: &str, bindings: &BindingLookup) -> Strin
         .collect::<Vec<_>>()
         .join(", ");
     format!("Named bindings targeting component {component_path}: {names}")
+}
+
+fn unknown_binding_help_for_config(component_path: &str, bindings: &BindingLookup) -> String {
+    if bindings.named.is_empty() {
+        if bindings.has_unnamed {
+            return format!(
+                "Bindings declared in component {component_path} are unnamed. Add `name` to the \
+                 binding you want to reference."
+            );
+        }
+        return format!(
+            "Component {component_path} declares no bindings. Add a named binding or fix the \
+             reference."
+        );
+    }
+    let names = bindings
+        .named
+        .iter()
+        .take(20)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Named bindings declared in component {component_path}: {names}")
 }
 
 fn push_json_pointer_segment(out: &mut String, segment: &str) {

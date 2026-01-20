@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 pub enum TemplatePart {
     Lit { lit: String },
     Config { config: String },
+    Binding { binding: String, scope: u64 },
 }
 
 impl TemplatePart {
@@ -21,15 +22,27 @@ impl TemplatePart {
         }
     }
 
+    pub fn binding(scope: u64, value: impl Into<String>) -> Self {
+        Self::Binding {
+            binding: value.into(),
+            scope,
+        }
+    }
+
     pub fn as_lit(&self) -> Option<&str> {
         match self {
             Self::Lit { lit } => Some(lit.as_str()),
             Self::Config { .. } => None,
+            Self::Binding { .. } => None,
         }
     }
 
     pub fn is_config(&self) -> bool {
         matches!(self, Self::Config { .. })
+    }
+
+    pub fn is_binding(&self) -> bool {
+        matches!(self, Self::Binding { .. })
     }
 }
 

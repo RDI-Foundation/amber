@@ -46,6 +46,7 @@ pub fn compose_root_config_templates(
         manifests: &[Option<Arc<Manifest>>],
         parent_schema: Option<&Value>,
         parent_template: &rc::RootConfigTemplate,
+        binding_scope: ComponentId,
         templates: &mut HashMap<ComponentId, rc::RootConfigTemplate>,
         errors: &mut Vec<TemplateError>,
     ) {
@@ -65,6 +66,7 @@ pub fn compose_root_config_templates(
             let initial = match config_template::parse_instance_config_template(
                 c.config.as_ref(),
                 parent_schema,
+                binding_scope.0 as u64,
             ) {
                 Ok(t) => t,
                 Err(err) => {
@@ -110,6 +112,7 @@ pub fn compose_root_config_templates(
                 manifests,
                 schema,
                 &this_template,
+                id,
                 templates,
                 errors,
             );
@@ -123,6 +126,7 @@ pub fn compose_root_config_templates(
         manifests,
         root_schema,
         &root_template,
+        root,
         &mut templates,
         &mut errors,
     );
