@@ -3,7 +3,9 @@ use std::{
     sync::Arc,
 };
 
-use amber_manifest::{CapabilityDecl, ManifestDigest, Program, ProvideDecl, SlotDecl};
+use amber_manifest::{
+    CapabilityDecl, FrameworkCapabilityName, ManifestDigest, Program, ProvideDecl, SlotDecl,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -166,7 +168,9 @@ impl Scenario {
         }
 
         for binding in &self.bindings {
-            let _ = self.component(binding.from.component);
+            if let BindingFrom::Component(provide) = &binding.from {
+                let _ = self.component(provide.component);
+            }
             let _ = self.component(binding.to.component);
         }
 
@@ -213,6 +217,12 @@ pub struct ProvideRef {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum BindingFrom {
+    Component(ProvideRef),
+    Framework(FrameworkCapabilityName),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SlotRef {
     pub component: ComponentId,
     pub name: String,
@@ -222,7 +232,7 @@ pub struct SlotRef {
 pub struct BindingEdge {
     /// Optional binding name as authored in the manifest.
     pub name: Option<String>,
-    pub from: ProvideRef,
+    pub from: BindingFrom,
     pub to: SlotRef,
     /// If true, this edge does not participate in dependency ordering or cycle detection.
     pub weak: bool,

@@ -1,5 +1,8 @@
+#![allow(unused_assignments)]
+
 mod config_schema_profile;
 mod document;
+pub mod framework;
 pub mod lint;
 mod spans;
 #[cfg(test)]
@@ -7,8 +10,10 @@ mod tests;
 
 use std::{
     borrow::Borrow,
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
+    hash::{Hash, Hasher},
     io::{self, Write},
     str::FromStr,
     sync::{Arc, OnceLock},
@@ -17,6 +22,9 @@ use std::{
 use amber_json5::DiagnosticError;
 use base64::Engine;
 pub use document::{ManifestDocError, ParsedManifest};
+pub use framework::{
+    FrameworkBindingShape, FrameworkCapabilitySpec, framework_capabilities, framework_capability,
+};
 use miette::Diagnostic;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -33,6 +41,7 @@ pub use spans::{
 use thiserror::Error;
 use url::{ParseError, Url};
 
+#[allow(unused_assignments)]
 #[derive(Debug, Error, Diagnostic)]
 #[non_exhaustive]
 pub enum Error {
@@ -67,6 +76,13 @@ pub enum Error {
     #[error("invalid binding `{input}`: {message}")]
     #[diagnostic(code(manifest::invalid_binding))]
     InvalidBinding { input: String, message: String },
+
+    #[error("binding mixes dot form with `slot`/`capability`")]
+    #[diagnostic(
+        code(manifest::mixed_binding_form),
+        help("Use either dot form or explicit `slot`/`capability` fields.")
+    )]
+    MixedBindingForm { to: String, from: String },
 
     #[error("invalid export target `{input}`: {message}")]
     #[diagnostic(code(manifest::invalid_export_target))]
@@ -118,6 +134,10 @@ pub enum Error {
     #[error("binding source `self.{capability}` references unknown provide")]
     #[diagnostic(code(manifest::unknown_binding_provide))]
     UnknownBindingProvide { capability: String },
+
+    #[error("unknown framework capability `{capability}`")]
+    #[diagnostic(code(manifest::unknown_framework_capability), help("{help}"))]
+    UnknownFrameworkCapability { capability: String, help: String },
 
     #[error("duplicate endpoint name `{name}`")]
     #[diagnostic(code(manifest::duplicate_endpoint_name))]
@@ -226,6 +246,7 @@ name_type!(SlotName, "slot");
 name_type!(ProvideName, "provide");
 name_type!(ExportName, "export");
 name_type!(BindingName, "binding");
+name_type!(FrameworkCapabilityName, "framework capability");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay)]
 #[non_exhaustive]
@@ -782,6 +803,32 @@ impl FromStr for LocalComponentRef {
     }
 }
 
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, DeserializeFromStr, SerializeDisplay,
+)]
+#[non_exhaustive]
+pub enum BindingSourceRef {
+    Component(LocalComponentRef),
+    Framework,
+}
+
+impl fmt::Display for BindingSourceRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Component(component) => component.fmt(f),
+            Self::Framework => f.write_str("framework"),
+        }
+    }
+}
+
+impl FromStr for BindingSourceRef {
+    type Err = Error;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        parse_binding_source_ref(input)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay)]
 #[non_exhaustive]
 pub struct RawExportTarget {
@@ -820,6 +867,12 @@ impl FromStr for RawExportTarget {
             return Err(Error::InvalidExportTarget {
                 input: input.to_string(),
                 message: "export target cannot be empty".to_string(),
+            });
+        }
+        if input == "framework" || input.starts_with("framework.") {
+            return Err(Error::InvalidExportTarget {
+                input: input.to_string(),
+                message: "framework is only valid as a binding source".to_string(),
             });
         }
 
@@ -971,7 +1024,7 @@ impl<'de> Deserialize<'de> for ConfigSchema {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[non_exhaustive]
 /// A binding wires a target slot to a source provide.
 pub struct RawBinding {
@@ -980,11 +1033,68 @@ pub struct RawBinding {
     pub name: Option<String>,
     pub to: LocalComponentRef,
     pub slot: String,
-    pub from: LocalComponentRef,
+    pub from: BindingSourceRef,
     pub capability: String,
     /// If true, this binding does not participate in dependency ordering or cycle detection.
     #[serde(default)]
     pub weak: bool,
+    #[serde(skip)]
+    mixed_form: bool,
+    #[serde(skip)]
+    raw_to: Option<String>,
+    #[serde(skip)]
+    raw_from: Option<String>,
+}
+
+impl PartialEq for RawBinding {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.to == other.to
+            && self.slot == other.slot
+            && self.from == other.from
+            && self.capability == other.capability
+            && self.weak == other.weak
+    }
+}
+
+impl Eq for RawBinding {}
+
+impl PartialOrd for RawBinding {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RawBinding {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (
+            &self.name,
+            &self.to,
+            &self.slot,
+            &self.from,
+            &self.capability,
+            &self.weak,
+        )
+            .cmp(&(
+                &other.name,
+                &other.to,
+                &other.slot,
+                &other.from,
+                &other.capability,
+                &other.weak,
+            ))
+    }
+}
+
+impl Hash for RawBinding {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.to.hash(state);
+        self.slot.hash(state);
+        self.from.hash(state);
+        self.capability.hash(state);
+        self.weak.hash(state);
+    }
 }
 
 impl<'de> Deserialize<'de> for RawBinding {
@@ -1025,23 +1135,39 @@ impl<'de> Deserialize<'de> for RawBinding {
 
         match (slot, capability) {
             (Some(slot), Some(capability)) => {
+                if to.contains('.') || from.contains('.') {
+                    return Ok(RawBinding {
+                        name,
+                        to: LocalComponentRef::Self_,
+                        slot,
+                        from: BindingSourceRef::Component(LocalComponentRef::Self_),
+                        capability,
+                        weak,
+                        mixed_form: true,
+                        raw_to: Some(to),
+                        raw_from: Some(from),
+                    });
+                }
                 ensure_binding_name_no_dot(&slot, slot.as_str())
                     .map_err(serde::de::Error::custom)?;
                 ensure_binding_name_no_dot(&capability, capability.as_str())
                     .map_err(serde::de::Error::custom)?;
                 Ok(RawBinding {
                     name,
-                    to: parse_binding_component_ref(&to).map_err(serde::de::Error::custom)?,
+                    to: parse_binding_target_ref(&to).map_err(serde::de::Error::custom)?,
                     slot,
-                    from: parse_binding_component_ref(&from).map_err(serde::de::Error::custom)?,
+                    from: parse_binding_source_ref(&from).map_err(serde::de::Error::custom)?,
                     capability,
                     weak,
+                    mixed_form: false,
+                    raw_to: None,
+                    raw_from: None,
                 })
             }
             (None, None) => {
-                let (to, slot) = split_binding_side(&to).map_err(serde::de::Error::custom)?;
+                let (to, slot) = split_binding_target(&to).map_err(serde::de::Error::custom)?;
                 let (from, capability) =
-                    split_binding_side(&from).map_err(serde::de::Error::custom)?;
+                    split_binding_source(&from).map_err(serde::de::Error::custom)?;
                 Ok(RawBinding {
                     name,
                     to,
@@ -1049,6 +1175,9 @@ impl<'de> Deserialize<'de> for RawBinding {
                     from,
                     capability,
                     weak,
+                    mixed_form: false,
+                    raw_to: None,
+                    raw_from: None,
                 })
             }
             (Some(_), None) => Err(serde::de::Error::custom(
@@ -1097,13 +1226,6 @@ fn parse_component_ref(input: &str) -> Result<LocalComponentRef, ComponentRefPar
     }
 }
 
-fn parse_binding_component_ref(input: &str) -> Result<LocalComponentRef, Error> {
-    parse_component_ref(input).map_err(|err| Error::InvalidBinding {
-        input: err.input,
-        message: err.message,
-    })
-}
-
 fn binding_target_key_for_component_ref(
     component: &LocalComponentRef,
     slot: &str,
@@ -1122,12 +1244,12 @@ pub(crate) fn binding_target_key_for_binding(
     slot: Option<&str>,
 ) -> Option<BindingTargetKey> {
     if let Some(slot) = slot
-        && let Ok(component) = parse_component_ref(to)
+        && let Ok(component) = parse_binding_target_ref(to)
     {
         return Some(binding_target_key_for_component_ref(&component, slot));
     }
 
-    let (component, slot) = split_binding_side(to).ok()?;
+    let (component, slot) = split_binding_target(to).ok()?;
     Some(binding_target_key_for_component_ref(&component, &slot))
 }
 
@@ -1151,7 +1273,35 @@ fn ensure_binding_name_no_dot(name: &str, input: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn split_binding_side(input: &str) -> Result<(LocalComponentRef, String), Error> {
+fn is_framework_ref(input: &str) -> bool {
+    input == "framework"
+}
+
+fn parse_binding_target_ref(input: &str) -> Result<LocalComponentRef, Error> {
+    if is_framework_ref(input) {
+        return Err(Error::InvalidBinding {
+            input: input.to_string(),
+            message: "framework cannot be a binding target".to_string(),
+        });
+    }
+    parse_component_ref(input).map_err(|err| Error::InvalidBinding {
+        input: err.input,
+        message: err.message,
+    })
+}
+
+fn parse_binding_source_ref(input: &str) -> Result<BindingSourceRef, Error> {
+    if is_framework_ref(input) {
+        return Ok(BindingSourceRef::Framework);
+    }
+    let component = parse_component_ref(input).map_err(|err| Error::InvalidBinding {
+        input: err.input,
+        message: err.message,
+    })?;
+    Ok(BindingSourceRef::Component(component))
+}
+
+fn split_binding_target(input: &str) -> Result<(LocalComponentRef, String), Error> {
     let Some((left, right)) = input.split_once('.') else {
         return Err(Error::InvalidBinding {
             input: input.to_string(),
@@ -1166,9 +1316,29 @@ fn split_binding_side(input: &str) -> Result<(LocalComponentRef, String), Error>
         });
     }
 
-    let component = parse_binding_component_ref(left)?;
+    let component = parse_binding_target_ref(left)?;
     ensure_binding_name_no_dot(right, input)?;
     Ok((component, right.to_string()))
+}
+
+fn split_binding_source(input: &str) -> Result<(BindingSourceRef, String), Error> {
+    let Some((left, right)) = input.split_once('.') else {
+        return Err(Error::InvalidBinding {
+            input: input.to_string(),
+            message: "expected `<source-ref>.<name>`".to_string(),
+        });
+    };
+
+    if left.is_empty() || right.is_empty() {
+        return Err(Error::InvalidBinding {
+            input: input.to_string(),
+            message: "expected `<source-ref>.<name>`".to_string(),
+        });
+    }
+
+    let source = parse_binding_source_ref(left)?;
+    ensure_binding_name_no_dot(right, input)?;
+    Ok((source, right.to_string()))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1196,6 +1366,7 @@ pub enum BindingSource {
         child: ChildName,
         export: ExportName,
     },
+    Framework(FrameworkCapabilityName),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1397,20 +1568,34 @@ fn resolve_binding_target(
     }
 }
 
+fn framework_capability_help() -> String {
+    let caps = framework_capabilities();
+    if caps.is_empty() {
+        return "framework exposes no capabilities yet".to_string();
+    }
+    let names = caps
+        .iter()
+        .take(20)
+        .map(|cap| cap.name.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Known framework capabilities: {names}")
+}
+
 fn resolve_binding_source(
     ctx: &ValidateCtx<'_>,
-    from: LocalComponentRef,
+    from: BindingSourceRef,
     capability: String,
 ) -> Result<BindingSource, Error> {
     match from {
-        LocalComponentRef::Self_ => {
+        BindingSourceRef::Component(LocalComponentRef::Self_) => {
             let (provide_name, _) = ctx
                 .provides
                 .get_key_value(capability.as_str())
                 .ok_or_else(|| Error::UnknownBindingProvide { capability })?;
             Ok(BindingSource::SelfProvide(provide_name.clone()))
         }
-        LocalComponentRef::Child(child) => {
+        BindingSourceRef::Component(LocalComponentRef::Child(child)) => {
             let (child_name, _) = ctx
                 .components
                 .get_key_value(child.as_str())
@@ -1420,6 +1605,15 @@ fn resolve_binding_source(
                 child: child_name.clone(),
                 export,
             })
+        }
+        BindingSourceRef::Framework => {
+            let Some(spec) = framework_capability(capability.as_str()) else {
+                return Err(Error::UnknownFrameworkCapability {
+                    capability,
+                    help: framework_capability_help(),
+                });
+            };
+            Ok(BindingSource::Framework(spec.name.clone()))
         }
     }
 }
@@ -1439,7 +1633,17 @@ fn build_bindings(
             from,
             capability,
             weak,
+            mixed_form,
+            raw_to,
+            raw_from,
         } = binding;
+
+        if mixed_form {
+            return Err(Error::MixedBindingForm {
+                to: raw_to.unwrap_or_else(|| to.to_string()),
+                from: raw_from.unwrap_or_else(|| from.to_string()),
+            });
+        }
 
         let name = match name {
             Some(name) => {
@@ -1758,13 +1962,17 @@ impl From<&Manifest> for RawManifest {
                 };
 
                 let (from, capability) = match &binding.from {
-                    BindingSource::SelfProvide(name) => {
-                        (LocalComponentRef::Self_, name.to_string())
-                    }
+                    BindingSource::SelfProvide(name) => (
+                        BindingSourceRef::Component(LocalComponentRef::Self_),
+                        name.to_string(),
+                    ),
                     BindingSource::ChildExport { child, export } => (
-                        LocalComponentRef::Child(child.to_string()),
+                        BindingSourceRef::Component(LocalComponentRef::Child(child.to_string())),
                         export.to_string(),
                     ),
+                    BindingSource::Framework(name) => {
+                        (BindingSourceRef::Framework, name.to_string())
+                    }
                 };
 
                 RawBinding {
@@ -1774,6 +1982,9 @@ impl From<&Manifest> for RawManifest {
                     from,
                     capability,
                     weak: binding.weak,
+                    mixed_form: false,
+                    raw_to: None,
+                    raw_from: None,
                 }
             })
             .collect();

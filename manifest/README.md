@@ -60,7 +60,9 @@ This crate **parses JSON5**, deserializes into Rust types, and validates:
 
   * `to: "self"` requires `slot` exist in `slots`
   * `from: "self"` requires `capability` exist in `provides`
+  * `from: "framework"` requires a known framework capability name
   * `#child` used in a binding must exist in `components`
+* `framework` is only valid as a binding source; it cannot appear in `to` or `exports`.
 * Endpoint names in `program.network.endpoints[]` must be unique.
 * Each `provides` entry must declare an `endpoint`, and it must refer to a declared endpoint name.
 
@@ -220,6 +222,8 @@ Notes:
   `${slots.<slot>.url}` for the URL string or `${slots.<slot>}` to interpolate the object as JSON.
 * Bindings expose a virtual object with a single `url` field; bindings must be named to be
   referenced via `${bindings.<name>.url}`.
+* Framework bindings may be **non-URL-shaped**; `${bindings.<name>.url}` is invalid for those
+  bindings and is rejected by the compiler.
 * This crate **parses** interpolation syntax but does **not** validate that the referenced paths
   exist. The compiler validates `${config.*}` against `config_schema` and `${slots.*}` against
   declared slots and supported fields. `${bindings.*}` is validated against named bindings that
@@ -395,14 +399,22 @@ Rules enforced:
 
 ## `bindings`
 
-A binding wires a **target slot** to a **source provide**:
+A binding wires a **target slot** to a **source provide** or **framework capability**:
 
 `(<to>.<slot>) <- (<from>.<capability>)`
 
-Component refs:
+Component refs (for `to` and component-sourced `from`):
 
 * `"self"` for the current manifest
 * `"#<child>"` for a key in `components`
+
+Framework refs (binding sources only):
+
+* `"framework"` for runtime/framework-provided capabilities
+* `"framework.<capability>"` in dot-sugar form
+
+`framework` is **not** a component ref: it is only valid on the `from` side. `#framework` remains a
+normal child ref.
 
 To satisfy a child slot, create a binding with `to: "#<child>.<slot>"` and a provide source
 (`from: "self.<provide>"` or `from: "#<other>.<export>"`).
@@ -434,8 +446,13 @@ Rules enforced by this crate:
 * Binding names (if present) must be unique within the manifest and follow child name rules (no `.`).
 * `to: "self"` requires `slot` exist in `slots`.
 * `from: "self"` requires `capability` exist in `provides`.
+* `from: "framework"` requires a known framework capability name (see below).
+* `framework` is only valid as a binding source; it cannot appear in `to` or `exports`.
 * Any `#child` referenced in `to` or `from` must exist in `components`.
 * Slot/capability names must not contain `.`.
+
+Framework capabilities are a fixed compiler-known list. **Today the list is empty**, so any
+`from: "framework"` binding fails validation; this will change as capabilities are added.
 
 `weak`:
 

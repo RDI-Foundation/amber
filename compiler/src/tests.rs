@@ -15,7 +15,7 @@ use std::{
 
 use amber_manifest::{Manifest, ManifestRef};
 use amber_resolver::{Backend, RemoteResolver, Resolution, Resolver};
-use amber_scenario::graph;
+use amber_scenario::{BindingFrom, graph};
 use base64::Engine as _;
 use miette::Severity;
 use tempfile::TempDir;
@@ -975,10 +975,15 @@ async fn delegated_export_chain_resolves_binding_source() {
         .unwrap();
 
     let binding = compilation.scenario.bindings.first().expect("binding");
-    let from_path =
-        graph::component_path_for(&compilation.scenario.components, binding.from.component);
+    let from = match &binding.from {
+        BindingFrom::Component(from) => from,
+        BindingFrom::Framework(name) => {
+            panic!("unexpected framework binding framework.{name}")
+        }
+    };
+    let from_path = graph::component_path_for(&compilation.scenario.components, from.component);
     assert_eq!(from_path, "/child/grand");
-    assert_eq!(binding.from.name, "api");
+    assert_eq!(from.name, "api");
 }
 
 struct CountingBackend {

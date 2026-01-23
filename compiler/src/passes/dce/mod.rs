@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use amber_scenario::{ComponentId, Scenario};
+use amber_scenario::{BindingFrom, ComponentId, Scenario};
 
 use super::{PassError, ScenarioPass};
 use crate::{DigestStore, Provenance};
@@ -41,7 +41,9 @@ impl ScenarioPass for DcePass {
         let mut incoming = vec![Vec::new(); n];
         for (idx, b) in scenario.bindings.iter().enumerate() {
             let _ = scenario.component(b.to.component);
-            let _ = scenario.component(b.from.component);
+            if let BindingFrom::Component(from) = &b.from {
+                let _ = scenario.component(from.component);
+            }
             incoming[b.to.component.0].push(idx);
         }
 
@@ -94,13 +96,14 @@ impl ScenarioPass for DcePass {
                             continue;
                         }
                         live_bindings[edge_idx] = true;
-
-                        let provide = CapKey {
-                            component: edge.from.component.0,
-                            name: Arc::from(edge.from.name.as_str()),
-                        };
-                        if live_provides.insert(provide.clone()) {
-                            work.push_back(WorkItem::Provide(provide));
+                        if let BindingFrom::Component(from) = &edge.from {
+                            let provide = CapKey {
+                                component: from.component.0,
+                                name: Arc::from(from.name.as_str()),
+                            };
+                            if live_provides.insert(provide.clone()) {
+                                work.push_back(WorkItem::Provide(provide));
+                            }
                         }
                     }
                 }

@@ -1,0 +1,12 @@
+Error: manifest::mixed_binding_form
+
+  × check failed
+  ╰─▶ binding mixes dot form with `slot`/`capability`
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/binding_mixed_dot_form_from.json5:4:36]
+ 3 │   bindings: [
+ 4 │     { to: "self", slot: "s", from: "self.p", capability: "p" },
+   ·                                    ────┬───
+   ·                                        ╰── dot form here
+ 5 │   ],
+   ╰────
+  help: Use either dot form or explicit `slot`/`capability` fields.

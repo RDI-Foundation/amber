@@ -1,10 +1,14 @@
 #![allow(unused_assignments)]
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use amber_manifest::{
-    BindingTarget, ComponentDecl, InterpolatedPart, InterpolatedString, InterpolationSource,
-    Manifest, ManifestSpans, span_for_json_pointer,
+    BindingSource, BindingTarget, ComponentDecl, FrameworkBindingShape, InterpolatedPart,
+    InterpolatedString, InterpolationSource, Manifest, ManifestSpans, framework_capability,
+    span_for_json_pointer,
 };
 use miette::{Diagnostic, NamedSource, Report, SourceSpan};
 use serde_json::Value;
@@ -34,6 +38,7 @@ struct InvalidBindingsInterpolation {
 #[derive(Default)]
 struct BindingLookup {
     named: BTreeSet<String>,
+    named_url_unsupported: BTreeMap<String, String>,
     has_unnamed: bool,
 }
 
@@ -60,6 +65,10 @@ fn collect_bindings_for_target(
         }
         if let Some(name) = binding.name.as_ref() {
             out.named.insert(name.to_string());
+            if let Some(capability) = binding_url_unsupported(binding) {
+                out.named_url_unsupported
+                    .insert(name.to_string(), capability);
+            }
         } else {
             out.has_unnamed = true;
         }
@@ -72,11 +81,27 @@ fn collect_bindings_in_manifest(manifest: &Manifest) -> BindingLookup {
     for binding in manifest.bindings().values() {
         if let Some(name) = binding.name.as_ref() {
             out.named.insert(name.to_string());
+            if let Some(capability) = binding_url_unsupported(binding) {
+                out.named_url_unsupported
+                    .insert(name.to_string(), capability);
+            }
         } else {
             out.has_unnamed = true;
         }
     }
     out
+}
+
+fn binding_url_unsupported(binding: &amber_manifest::Binding) -> Option<String> {
+    let BindingSource::Framework(name) = &binding.from else {
+        return None;
+    };
+    let spec = framework_capability(name.as_str())
+        .expect("manifest invariant: framework capability exists");
+    match spec.binding_shape {
+        FrameworkBindingShape::Url => None,
+        FrameworkBindingShape::Opaque => Some(name.to_string()),
+    }
 }
 
 pub(crate) fn collect_binding_interpolation_diagnostics_from_tree(
@@ -336,6 +361,23 @@ fn validate_interpolated_config_string(
                         span,
                         label: "binding interpolation here".to_string(),
                     }));
+                } else if let Some(capability) = ctx.bindings.named_url_unsupported.get(parsed.name)
+                {
+                    let help = non_url_binding_help(parsed.name, capability);
+                    diagnostics.push(Report::new(InvalidBindingsInterpolation {
+                        component_path: ctx.component_path.to_string(),
+                        location: location.to_string(),
+                        message: format!(
+                            "binding `{}` does not expose a url (framework capability \
+                             `framework.{capability}` is not URL-shaped)",
+                            parsed.name
+                        ),
+                        help,
+                        src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source))
+                            .with_language("json5"),
+                        span,
+                        label: "binding interpolation here".to_string(),
+                    }));
                 }
             }
             Err(err) => {
@@ -446,6 +488,23 @@ fn validate_interpolated_string(
                         span,
                         label: "binding interpolation here".to_string(),
                     }));
+                } else if let Some(capability) = ctx.bindings.named_url_unsupported.get(parsed.name)
+                {
+                    let help = non_url_binding_help(parsed.name, capability);
+                    diagnostics.push(Report::new(InvalidBindingsInterpolation {
+                        component_path: ctx.component_path.to_string(),
+                        location: location.label(),
+                        message: format!(
+                            "binding `{}` does not expose a url (framework capability \
+                             `framework.{capability}` is not URL-shaped)",
+                            parsed.name
+                        ),
+                        help,
+                        src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source))
+                            .with_language("json5"),
+                        span,
+                        label: "binding interpolation here".to_string(),
+                    }));
                 }
             }
             Err(err) => {
@@ -525,6 +584,13 @@ fn unknown_binding_help_for_config(component_path: &str, bindings: &BindingLooku
     format!("Named bindings declared in component {component_path}: {names}")
 }
 
+fn non_url_binding_help(binding: &str, capability: &str) -> String {
+    format!(
+        "Binding `{binding}` targets framework.{capability}, which does not expose a URL. Remove \
+         the interpolation or use a URL-shaped binding."
+    )
+}
+
 fn push_json_pointer_segment(out: &mut String, segment: &str) {
     for ch in segment.chars() {
         match ch {
@@ -532,5 +598,46 @@ fn push_json_pointer_segment(out: &mut String, segment: &str) {
             '/' => out.push_str("~1"),
             other => out.push(other),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::*;
+
+    #[test]
+    fn bindings_interpolation_rejects_non_url_framework_binding() {
+        let bindings = BindingLookup {
+            named: BTreeSet::from(["bind".to_string()]),
+            named_url_unsupported: BTreeMap::from([(
+                "bind".to_string(),
+                "dynamic_children".to_string(),
+            )]),
+            has_unnamed: false,
+        };
+        let source: Arc<str> = Arc::from("${bindings.bind.url}");
+        let ctx = BindingValidationContext {
+            component_path: "/",
+            bindings: &bindings,
+            source: &source,
+            src_name: "<test>",
+        };
+
+        let value: InterpolatedString = "${bindings.bind.url}".parse().unwrap();
+        let mut diagnostics = Vec::new();
+        validate_interpolated_string(
+            &value,
+            &ctx,
+            ProgramLocation::Entrypoint(0),
+            (0usize, 0usize).into(),
+            &mut diagnostics,
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        let message = diagnostics[0].to_string();
+        assert!(message.contains("does not expose a url"), "{message}");
+        assert!(message.contains("framework.dynamic_children"), "{message}");
     }
 }

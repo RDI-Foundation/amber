@@ -2,7 +2,8 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use amber_manifest::{Manifest, ManifestRef};
 use amber_scenario::{
-    BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, ScenarioExport, SlotRef,
+    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
+    ScenarioExport, SlotRef,
 };
 use url::Url;
 
@@ -124,10 +125,10 @@ fn flatten_removes_pure_routing_nodes_and_preserves_debug_data() {
         components,
         bindings: vec![BindingEdge {
             name: None,
-            from: ProvideRef {
+            from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(2),
                 name: "cap".to_string(),
-            },
+            }),
             to: SlotRef {
                 component: ComponentId(2),
                 name: "cap".to_string(),

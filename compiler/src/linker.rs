@@ -10,10 +10,11 @@ use amber_config as rc;
 use amber_manifest::{
     BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, ChildName, ExportName,
     ExportTarget, InterpolatedPart, InterpolationSource, Manifest, ManifestDigest,
+    framework_capability,
 };
 use amber_scenario::{
-    BindingEdge, Component, ComponentId, ProvideRef, Scenario, ScenarioExport, SlotRef,
-    graph::component_path_for,
+    BindingEdge, BindingFrom, Component, ComponentId, ProvideRef, Scenario, ScenarioExport,
+    SlotRef, graph::component_path_for,
 };
 use jsonschema::Validator;
 use miette::{Diagnostic, NamedSource, SourceSpan};
@@ -1208,8 +1209,8 @@ struct ResolvedBindingTarget {
 }
 
 struct ResolvedBindingSource {
-    provide_ref: ProvideRef,
-    provide_decl: CapabilityDecl,
+    from: BindingFrom,
+    decl: CapabilityDecl,
 }
 
 fn push_error<T>(errors: &mut Vec<Error>, res: Result<T, Error>) -> Option<T> {
@@ -1285,11 +1286,11 @@ fn resolve_binding_source(
                 .get(provide_name)
                 .expect("manifest invariant: self provide exists");
             Ok(ResolvedBindingSource {
-                provide_ref: ProvideRef {
+                from: BindingFrom::Component(ProvideRef {
                     component: from_id,
                     name: provide_name.to_string(),
-                },
-                provide_decl: provide_decl.decl.clone(),
+                }),
+                decl: provide_decl.decl.clone(),
             })
         }
         BindingSource::ChildExport { child, export } => {
@@ -1320,11 +1321,19 @@ fn resolve_binding_source(
                     other => other,
                 })?;
             Ok(ResolvedBindingSource {
-                provide_ref: ProvideRef {
+                from: BindingFrom::Component(ProvideRef {
                     component: resolved.component,
                     name: resolved.name,
-                },
-                provide_decl: resolved.decl,
+                }),
+                decl: resolved.decl,
+            })
+        }
+        BindingSource::Framework(name) => {
+            let spec = framework_capability(name.as_str())
+                .expect("manifest invariant: framework capability exists");
+            Ok(ResolvedBindingSource {
+                from: BindingFrom::Framework(spec.name.clone()),
+                decl: spec.decl.clone(),
             })
         }
         _ => Err(Error::UnsupportedManifestFeature {
@@ -1347,12 +1356,12 @@ fn type_mismatch_error(
         slot_ref,
         slot_decl,
     } = target;
-    let ResolvedBindingSource {
-        provide_ref,
-        provide_decl,
-    } = source;
-    let (src, span) = binding_site(provenance, store, realm, target_key)
-        .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+    let ResolvedBindingSource { from, decl } = source;
+    let (src, span) = match &from {
+        BindingFrom::Framework(_) => binding_source_site(provenance, store, realm, target_key),
+        BindingFrom::Component(_) => binding_site(provenance, store, realm, target_key),
+    }
+    .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
 
     let mut related = Vec::new();
 
@@ -1374,8 +1383,9 @@ fn type_mismatch_error(
         });
     }
 
-    if let Some((provide_src, provide_spans)) =
-        source_for_component(provenance, store, provide_ref.component)
+    if let BindingFrom::Component(provide_ref) = &from
+        && let Some((provide_src, provide_spans)) =
+            source_for_component(provenance, store, provide_ref.component)
     {
         let provide_name = provide_ref.name.as_str();
         if let Some(p) = provide_spans.provides.get(provide_name) {
@@ -1396,7 +1406,7 @@ fn type_mismatch_error(
         to_component_path: component_path_for(components, to_id),
         slot: slot_ref.name,
         expected: slot_decl,
-        got: provide_decl,
+        got: decl,
         src,
         span,
         related,
@@ -1441,7 +1451,7 @@ fn resolve_bindings(
                 None => continue,
             };
 
-            if target.slot_decl != source.provide_decl {
+            if target.slot_decl != source.decl {
                 errors.push(type_mismatch_error(
                     components,
                     provenance,
@@ -1456,7 +1466,7 @@ fn resolve_bindings(
 
             edges.push(BindingEdge {
                 name: binding.name.as_ref().map(|name| name.to_string()),
-                from: source.provide_ref,
+                from: source.from,
                 to: target.slot_ref,
                 weak: binding.weak,
             });
@@ -1571,23 +1581,15 @@ fn validate_unique_slot_bindings(
     store: &DigestStore,
     errors: &mut Vec<Error>,
 ) {
-    let mut seen: HashMap<(ComponentId, String), (ProvideRef, usize)> = HashMap::new();
+    let mut seen: HashMap<(ComponentId, String), (BindingFrom, usize)> = HashMap::new();
 
     for (idx, b) in bindings.iter().enumerate() {
         let key = (b.to.component, b.to.name.clone());
         if let Some((prev_from, prev_idx)) = seen.insert(key, (b.from.clone(), idx)) {
             let to_component_path = component_path_for(components, b.to.component);
 
-            let first_from = format!(
-                "{}.{}",
-                component_path_for(components, prev_from.component),
-                prev_from.name
-            );
-            let second_from = format!(
-                "{}.{}",
-                component_path_for(components, b.from.component),
-                b.from.name
-            );
+            let first_from = binding_from_label(components, &prev_from);
+            let second_from = binding_from_label(components, &b.from);
 
             let second_origin = origins.get(idx);
             let first_origin = origins.get(prev_idx);
@@ -1623,5 +1625,16 @@ fn validate_unique_slot_bindings(
                 related,
             });
         }
+    }
+}
+
+fn binding_from_label(components: &[Option<Component>], from: &BindingFrom) -> String {
+    match from {
+        BindingFrom::Component(provide) => format!(
+            "{}.{}",
+            component_path_for(components, provide.component),
+            provide.name
+        ),
+        BindingFrom::Framework(name) => format!("framework.{name}"),
     }
 }

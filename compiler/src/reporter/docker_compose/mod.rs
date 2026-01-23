@@ -7,7 +7,7 @@ use std::{
 
 use amber_config as rc;
 use amber_manifest::{BindingTarget, InterpolatedPart, InterpolationSource, Manifest};
-use amber_scenario::{ComponentId, Scenario};
+use amber_scenario::{BindingFrom, ComponentId, ProvideRef, Scenario};
 use amber_template::{ProgramTemplateSpec, TemplatePart, TemplateSpec, TemplateString};
 use base64::Engine as _;
 use miette::LabeledSpan;
@@ -200,6 +200,18 @@ fn render_docker_compose(output: &CompileOutput) -> Result<String, ReporterError
 fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     let s = &output.scenario;
 
+    for b in &s.bindings {
+        if let BindingFrom::Framework(name) = &b.from {
+            return Err(format!(
+                "docker-compose reporter does not support framework binding `framework.{name}` \
+                 (bound to {}.{})",
+                component_label(s, b.to.component),
+                b.to.name
+            )
+            .into());
+        }
+    }
+
     let manifests = crate::manifest_table::build_manifest_table(&s.components, &output.store)
         .map_err(|e| {
             format!(
@@ -248,11 +260,12 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
 
     // Validate: every binding endpoint is between program components.
     for b in &s.bindings {
-        if s.component(b.from.component).program.is_none() {
+        let from = binding_from_component(&b.from);
+        if s.component(from.component).program.is_none() {
             return Err(format!(
                 "binding source {}.{} is not runnable (component has no program)",
-                component_label(s, b.from.component),
-                b.from.name
+                component_label(s, from.component),
+                from.name
             )
             .into());
         }
@@ -284,13 +297,14 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         if b.weak {
             continue;
         }
-        if b.from.component == b.to.component {
+        let from = binding_from_component(&b.from);
+        if from.component == b.to.component {
             continue;
         }
         strong_deps
             .entry(b.to.component)
             .or_default()
-            .insert(b.from.component);
+            .insert(from.component);
     }
 
     // Allocate stable local proxy ports per (component, slot), avoiding colliding with program listens.
@@ -315,17 +329,18 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     let mut port_owner: HashMap<(ComponentId, u16), (String, String)> = HashMap::new();
 
     for b in &s.bindings {
-        let provider = b.from.component;
+        let from = binding_from_component(&b.from);
+        let provider = from.component;
         let consumer = b.to.component;
 
-        let endpoint = resolve_provide_endpoint(s, provider, &b.from.name)?;
+        let endpoint = resolve_provide_endpoint(s, provider, &from.name)?;
 
         // Port conflict check (L4 backend cannot separate endpoints on the same port).
         enforce_single_endpoint_per_port(
             &mut port_owner,
             provider,
             endpoint.port,
-            &b.from.name,
+            &from.name,
             &endpoint.name,
         )?;
 
@@ -1235,6 +1250,15 @@ fn child_component_id_for_name(
 
 fn component_label(s: &Scenario, id: ComponentId) -> String {
     s.component(id).moniker.as_str().to_string()
+}
+
+fn binding_from_component(from: &BindingFrom) -> &ProvideRef {
+    match from {
+        BindingFrom::Component(provide) => provide,
+        BindingFrom::Framework(name) => {
+            unreachable!("framework binding framework.{name} should be rejected earlier")
+        }
+    }
 }
 
 fn service_base_name(id: ComponentId, local_name: &str) -> String {

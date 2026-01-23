@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
-use amber_manifest::{Manifest, ManifestDigest, ManifestRef};
+use amber_manifest::{FrameworkCapabilityName, Manifest, ManifestDigest, ManifestRef};
 use amber_scenario::{
-    BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, ScenarioExport, SlotRef,
+    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
+    ScenarioExport, SlotRef,
 };
 use url::Url;
 
@@ -63,10 +64,10 @@ fn dot_renders_clusters_and_edges() {
     let bindings = vec![
         BindingEdge {
             name: Some("route".to_string()),
-            from: ProvideRef {
+            from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(1),
                 name: "cap".to_string(),
-            },
+            }),
             to: SlotRef {
                 component: ComponentId(2),
                 name: "needs".to_string(),
@@ -75,10 +76,10 @@ fn dot_renders_clusters_and_edges() {
         },
         BindingEdge {
             name: None,
-            from: ProvideRef {
+            from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(2),
                 name: "weak_cap".to_string(),
-            },
+            }),
             to: SlotRef {
                 component: ComponentId(1),
                 name: "opt".to_string(),
@@ -150,6 +151,36 @@ fn dot_renders_root_program_node() {
 }
 "#;
     assert_eq!(dot, expected);
+}
+
+#[test]
+fn dot_renders_framework_bindings() {
+    let components = vec![Some(component(0, "/")), Some(component(1, "/consumer"))];
+    let bindings = vec![BindingEdge {
+        name: None,
+        from: BindingFrom::Framework(
+            FrameworkCapabilityName::try_from("dynamic_children").unwrap(),
+        ),
+        to: SlotRef {
+            component: ComponentId(1),
+            name: "control".to_string(),
+        },
+        weak: false,
+    }];
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components,
+        bindings,
+        exports: Vec::new(),
+    };
+
+    let dot = render_dot(&scenario);
+    assert!(dot.contains("framework [label=\"framework\""), "{dot}");
+    assert!(
+        dot.contains("framework -> c1 [label=\"framework.dynamic_children\""),
+        "{dot}"
+    );
 }
 
 #[test]
@@ -234,10 +265,10 @@ fn dot_renders_root_exports_as_endpoints() {
         components,
         bindings: vec![BindingEdge {
             name: None,
-            from: ProvideRef {
+            from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(2),
                 name: "out".to_string(),
-            },
+            }),
             to: SlotRef {
                 component: ComponentId(1),
                 name: "in".to_string(),

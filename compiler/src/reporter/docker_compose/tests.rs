@@ -4,9 +4,12 @@ use std::{
     sync::Arc,
 };
 
-use amber_manifest::{Manifest, ManifestDigest, ManifestRef, ProvideDecl, SlotDecl};
+use amber_manifest::{
+    FrameworkCapabilityName, Manifest, ManifestDigest, ManifestRef, ProvideDecl, SlotDecl,
+};
 use amber_scenario::{
-    BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, ScenarioExport, SlotRef,
+    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
+    ScenarioExport, SlotRef,
 };
 use serde_json::{Map, Value, json};
 use url::Url;
@@ -277,10 +280,10 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         components: vec![Some(root), Some(server), Some(client)],
         bindings: vec![BindingEdge {
             name: None,
-            from: ProvideRef {
+            from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(1),
                 name: "api".to_string(),
-            },
+            }),
             to: SlotRef {
                 component: ComponentId(2),
                 name: "api".to_string(),
@@ -422,10 +425,10 @@ fn compose_resolves_binding_urls_in_child_config() {
         components: vec![Some(root), Some(server), Some(client), Some(observer)],
         bindings: vec![BindingEdge {
             name: Some("bind".to_string()),
-            from: ProvideRef {
+            from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(1),
                 name: "api".to_string(),
-            },
+            }),
             to: SlotRef {
                 component: ComponentId(2),
                 name: "api".to_string(),
@@ -610,10 +613,10 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         ],
         bindings: vec![BindingEdge {
             name: Some("bind".to_string()),
-            from: ProvideRef {
+            from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(1),
                 name: "api".to_string(),
-            },
+            }),
             to: SlotRef {
                 component: ComponentId(2),
                 name: "api".to_string(),
@@ -840,10 +843,10 @@ fn errors_on_shared_port_with_different_endpoints() {
         bindings: vec![
             BindingEdge {
                 name: None,
-                from: ProvideRef {
+                from: BindingFrom::Component(ProvideRef {
                     component: ComponentId(1),
                     name: "v1".to_string(),
-                },
+                }),
                 to: SlotRef {
                     component: ComponentId(2),
                     name: "v1".to_string(),
@@ -852,10 +855,10 @@ fn errors_on_shared_port_with_different_endpoints() {
             },
             BindingEdge {
                 name: None,
-                from: ProvideRef {
+                from: BindingFrom::Component(ProvideRef {
                     component: ComponentId(1),
                     name: "admin".to_string(),
-                },
+                }),
                 to: SlotRef {
                     component: ComponentId(2),
                     name: "admin".to_string(),
@@ -876,6 +879,50 @@ fn errors_on_shared_port_with_different_endpoints() {
     assert!(
         err.to_string().contains("route to port 80"),
         "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn docker_compose_rejects_framework_bindings() {
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root)],
+        bindings: vec![BindingEdge {
+            name: None,
+            from: BindingFrom::Framework(
+                FrameworkCapabilityName::try_from("dynamic_children").unwrap(),
+            ),
+            to: SlotRef {
+                component: ComponentId(0),
+                name: "control".to_string(),
+            },
+            weak: false,
+        }],
+        exports: Vec::new(),
+    };
+
+    let output = compile_output(scenario);
+    let err = DockerComposeReporter.emit(&output).unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("framework.dynamic_children"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("docker-compose reporter does not support framework binding"),
+        "unexpected error: {message}"
     );
 }
 
@@ -1004,10 +1051,10 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         components: vec![Some(root), Some(server), Some(allowed), Some(denied)],
         bindings: vec![BindingEdge {
             name: None,
-            from: ProvideRef {
+            from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(1),
                 name: "api".to_string(),
-            },
+            }),
             to: SlotRef {
                 component: ComponentId(2),
                 name: "api".to_string(),

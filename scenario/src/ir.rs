@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
 
-use amber_manifest::{CapabilityDecl, ManifestDigest, Program, ProvideDecl, SlotDecl};
+use amber_manifest::{
+    CapabilityDecl, FrameworkCapabilityName, ManifestDigest, Program, ProvideDecl, SlotDecl,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, ScenarioExport, SlotRef,
+    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
+    ScenarioExport, SlotRef,
 };
 
 pub const SCENARIO_IR_SCHEMA: &str = "amber.scenario.ir";
@@ -72,6 +75,12 @@ impl TryFrom<ScenarioIr> for Scenario {
             if components[id].is_some() {
                 return Err(ScenarioIrError::DuplicateComponentId { id });
             }
+            for name in component.slots.keys() {
+                ensure_name_no_dot(name)?;
+            }
+            for name in component.provides.keys() {
+                ensure_name_no_dot(name)?;
+            }
             components[id] = Some(component.into_component());
         }
 
@@ -91,14 +100,30 @@ impl TryFrom<ScenarioIr> for Scenario {
         }
 
         for binding in &ir.bindings {
-            ensure_component(&components, binding.from.component, || {
-                format!("binding source for {}", binding.to.slot)
-            })?;
+            if let Some(name) = binding.name.as_deref() {
+                ensure_name_no_dot(name)?;
+            }
+            ensure_name_no_dot(&binding.to.slot)?;
+            match &binding.from {
+                BindingFromIr::Component { provide, .. } => {
+                    ensure_name_no_dot(provide)?;
+                }
+                BindingFromIr::Framework { capability } => {
+                    ensure_name_no_dot(capability)?;
+                }
+            }
+            if let BindingFromIr::Component { component, .. } = &binding.from {
+                ensure_component(&components, *component, || {
+                    format!("binding source for {}", binding.to.slot)
+                })?;
+            }
             ensure_component(&components, binding.to.component, || {
                 format!("binding target for {}", binding.to.slot)
             })?;
         }
         for export in &ir.exports {
+            ensure_name_no_dot(&export.name)?;
+            ensure_name_no_dot(&export.from.provide)?;
             ensure_component(&components, export.from.component, || {
                 format!("export source for {}", export.name)
             })?;
@@ -111,7 +136,7 @@ impl TryFrom<ScenarioIr> for Scenario {
                 .bindings
                 .into_iter()
                 .map(BindingIr::into_binding)
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()?,
             exports: ir.exports.into_iter().map(ExportIr::into_export).collect(),
         };
         scenario.normalize_order();
@@ -166,11 +191,18 @@ impl ComponentIr {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum BindingFromIr {
+    Component { component: usize, provide: String },
+    Framework { capability: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BindingIr {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    pub from: ProvideRefIr,
+    pub from: BindingFromIr,
     pub to: SlotRefIr,
     pub weak: bool,
 }
@@ -179,7 +211,7 @@ impl From<&BindingEdge> for BindingIr {
     fn from(binding: &BindingEdge) -> Self {
         Self {
             name: binding.name.clone(),
-            from: ProvideRefIr::from(&binding.from),
+            from: BindingFromIr::from(&binding.from),
             to: SlotRefIr::from(&binding.to),
             weak: binding.weak,
         }
@@ -187,12 +219,48 @@ impl From<&BindingEdge> for BindingIr {
 }
 
 impl BindingIr {
-    fn into_binding(self) -> BindingEdge {
-        BindingEdge {
+    fn into_binding(self) -> Result<BindingEdge, ScenarioIrError> {
+        Ok(BindingEdge {
             name: self.name,
-            from: self.from.into_provide_ref(),
+            from: self.from.into_binding_from()?,
             to: self.to.into_slot_ref(),
             weak: self.weak,
+        })
+    }
+}
+
+impl From<&BindingFrom> for BindingFromIr {
+    fn from(from: &BindingFrom) -> Self {
+        match from {
+            BindingFrom::Component(provide) => Self::Component {
+                component: provide.component.0,
+                provide: provide.name.clone(),
+            },
+            BindingFrom::Framework(name) => Self::Framework {
+                capability: name.to_string(),
+            },
+        }
+    }
+}
+
+impl BindingFromIr {
+    fn into_binding_from(self) -> Result<BindingFrom, ScenarioIrError> {
+        match self {
+            BindingFromIr::Component { component, provide } => {
+                Ok(BindingFrom::Component(ProvideRef {
+                    component: ComponentId(component),
+                    name: provide,
+                }))
+            }
+            BindingFromIr::Framework { capability } => {
+                let name =
+                    FrameworkCapabilityName::try_from(capability.as_str()).map_err(|_| {
+                        ScenarioIrError::InvalidName {
+                            name: capability.clone(),
+                        }
+                    })?;
+                Ok(BindingFrom::Framework(name))
+            }
         }
     }
 }
@@ -285,6 +353,8 @@ pub enum ScenarioIrError {
     DuplicateComponentId { id: usize },
     #[error("scenario IR missing component {id} referenced by {context}")]
     MissingComponent { id: usize, context: String },
+    #[error("scenario IR has invalid name {name:?}: dots are reserved")]
+    InvalidName { name: String },
 }
 
 fn ensure_component(
@@ -306,16 +376,26 @@ fn ensure_component(
     }
 }
 
+fn ensure_name_no_dot(name: &str) -> Result<(), ScenarioIrError> {
+    if name.contains('.') {
+        return Err(ScenarioIrError::InvalidName {
+            name: name.to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use amber_manifest::ManifestDigest;
+    use amber_manifest::{FrameworkCapabilityName, ManifestDigest};
     use serde_json::json;
 
     use super::{SCENARIO_IR_SCHEMA, SCENARIO_IR_VERSION, ScenarioIr};
     use crate::{
-        BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, ScenarioExport, SlotRef,
+        BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
+        ScenarioExport, SlotRef,
     };
 
     #[test]
@@ -377,10 +457,10 @@ mod tests {
             components,
             bindings: vec![BindingEdge {
                 name: Some("bind_api".to_string()),
-                from: ProvideRef {
+                from: BindingFrom::Component(ProvideRef {
                     component: ComponentId(1),
                     name: "api".to_string(),
-                },
+                }),
                 to: SlotRef {
                     component: ComponentId(0),
                     name: "needs".to_string(),
@@ -460,6 +540,7 @@ mod tests {
                 {
                     "name": "bind_api",
                     "from": {
+                        "kind": "component",
                         "component": 1,
                         "provide": "api"
                     },
@@ -518,6 +599,125 @@ mod tests {
     }
 
     #[test]
+    fn scenario_ir_roundtrips_framework_binding() {
+        let components = vec![Some(Component {
+            id: ComponentId(0),
+            parent: None,
+            moniker: Moniker::from("/".to_string()),
+            digest: ManifestDigest::new([0u8; 32]),
+            config: None,
+            program: None,
+            slots: BTreeMap::new(),
+            provides: BTreeMap::new(),
+            children: Vec::new(),
+        })];
+
+        let mut scenario = Scenario {
+            root: ComponentId(0),
+            components,
+            bindings: vec![BindingEdge {
+                name: None,
+                from: BindingFrom::Framework(
+                    FrameworkCapabilityName::try_from("dynamic_children").unwrap(),
+                ),
+                to: SlotRef {
+                    component: ComponentId(0),
+                    name: "control".to_string(),
+                },
+                weak: false,
+            }],
+            exports: Vec::new(),
+        };
+        scenario.normalize_order();
+
+        let ir = ScenarioIr::from(&scenario);
+        let value = serde_json::to_value(&ir).expect("serialize scenario IR");
+
+        assert_eq!(
+            value["bindings"][0]["from"]["kind"],
+            serde_json::Value::String("framework".to_string())
+        );
+        assert_eq!(
+            value["bindings"][0]["from"]["capability"],
+            serde_json::Value::String("dynamic_children".to_string())
+        );
+
+        let roundtripped: Scenario = ir.try_into().expect("deserialize scenario IR");
+        let binding = &roundtripped.bindings[0];
+        match &binding.from {
+            BindingFrom::Framework(name) => assert_eq!(name.as_str(), "dynamic_children"),
+            BindingFrom::Component(_) => panic!("expected framework binding"),
+        }
+    }
+
+    #[test]
+    fn scenario_ir_rejects_framework_capability_with_dot() {
+        let payload = json!({
+            "schema": SCENARIO_IR_SCHEMA,
+            "version": SCENARIO_IR_VERSION,
+            "root": 0,
+            "components": [
+                {
+                    "id": 0,
+                    "moniker": "/",
+                    "parent": null,
+                    "children": [],
+                    "digest": ManifestDigest::new([0u8; 32]).to_string(),
+                    "config": null
+                }
+            ],
+            "bindings": [
+                {
+                    "from": { "kind": "framework", "capability": "bad.name" },
+                    "to": { "component": 0, "slot": "control" },
+                    "weak": false
+                }
+            ],
+            "exports": []
+        });
+
+        let ir: ScenarioIr = serde_json::from_value(payload).expect("deserialize scenario IR");
+        let err = Scenario::try_from(ir).expect_err("invalid name");
+        let message = err.to_string();
+        assert!(message.contains("invalid name"), "{message}");
+        assert!(message.contains("dots are reserved"), "{message}");
+    }
+
+    #[test]
+    fn scenario_ir_rejects_binding_name_with_dot() {
+        let payload = json!({
+            "schema": SCENARIO_IR_SCHEMA,
+            "version": SCENARIO_IR_VERSION,
+            "root": 0,
+            "components": [
+                {
+                    "id": 0,
+                    "moniker": "/",
+                    "parent": null,
+                    "children": [],
+                    "digest": ManifestDigest::new([0u8; 32]).to_string(),
+                    "config": null
+                }
+            ],
+            "bindings": [
+                {
+                    "name": "bad.name",
+                    "from": { "kind": "component", "component": 0, "provide": "api" },
+                    "to": { "component": 0, "slot": "needs" },
+                    "weak": false
+                }
+            ],
+            "exports": []
+        });
+
+        let ir: ScenarioIr = serde_json::from_value(payload).expect("deserialize scenario IR");
+        let err = Scenario::try_from(ir).expect_err("invalid name");
+        let message = err.to_string();
+        assert!(message.contains("invalid name"), "{message}");
+        assert!(message.contains("dots are reserved"), "{message}");
+    }
+
+    #[test]
     fn scenario_ir_binding_name_round_trip() {
         let payload = json!({
             "schema": SCENARIO_IR_SCHEMA,
@@ -544,7 +744,7 @@ mod tests {
             "bindings": [
                 {
                     "name": "route",
-                    "from": { "component": 1, "provide": "api" },
+                    "from": { "kind": "component", "component": 1, "provide": "api" },
                     "to": { "component": 0, "slot": "needs" },
                     "weak": false
                 }

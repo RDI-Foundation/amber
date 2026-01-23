@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, VecDeque};
 
-use super::{Component, ComponentId, Scenario};
+use super::{BindingFrom, Component, ComponentId, Scenario};
 
 #[derive(Clone, Debug, thiserror::Error)]
 #[error("scenario contains a dependency cycle: {cycle:?}")]
@@ -30,7 +30,10 @@ pub fn topo_order(s: &Scenario) -> Result<Vec<ComponentId>, CycleError> {
         if b.weak {
             continue;
         }
-        let u = b.from.component.0;
+        let BindingFrom::Component(from) = &b.from else {
+            continue;
+        };
+        let u = from.component.0;
         let v = b.to.component.0;
         if u == v {
             continue;
@@ -93,8 +96,11 @@ pub fn component_path_for(components: &[Option<Component>], id: ComponentId) -> 
 pub fn providers_of(s: &Scenario, id: ComponentId) -> BTreeSet<ComponentId> {
     let mut set = BTreeSet::new();
     for b in &s.bindings {
-        if b.to.component == id && b.from.component != id {
-            set.insert(b.from.component);
+        let BindingFrom::Component(from) = &b.from else {
+            continue;
+        };
+        if b.to.component == id && from.component != id {
+            set.insert(from.component);
         }
     }
     set
@@ -159,10 +165,10 @@ fn find_cycle(out: &[Vec<usize>], indeg: &[usize], live: &[bool]) -> Vec<Compone
 mod tests {
     use std::{collections::BTreeMap, sync::Arc};
 
-    use amber_manifest::ManifestDigest;
+    use amber_manifest::{FrameworkCapabilityName, ManifestDigest};
 
     use super::*;
-    use crate::{BindingEdge, Moniker, ProvideRef, SlotRef};
+    use crate::{BindingEdge, BindingFrom, Moniker, ProvideRef, SlotRef};
 
     fn component(id: usize, moniker: &str) -> Component {
         Component {
@@ -184,10 +190,10 @@ mod tests {
         let bindings = vec![
             BindingEdge {
                 name: None,
-                from: ProvideRef {
+                from: BindingFrom::Component(ProvideRef {
                     component: ComponentId(0),
                     name: "api".to_string(),
-                },
+                }),
                 to: SlotRef {
                     component: ComponentId(1),
                     name: "needs".to_string(),
@@ -196,10 +202,10 @@ mod tests {
             },
             BindingEdge {
                 name: None,
-                from: ProvideRef {
+                from: BindingFrom::Component(ProvideRef {
                     component: ComponentId(1),
                     name: "api".to_string(),
-                },
+                }),
                 to: SlotRef {
                     component: ComponentId(0),
                     name: "needs".to_string(),
@@ -228,10 +234,10 @@ mod tests {
         let bindings = vec![
             BindingEdge {
                 name: None,
-                from: ProvideRef {
+                from: BindingFrom::Component(ProvideRef {
                     component: ComponentId(0),
                     name: "p".to_string(),
-                },
+                }),
                 to: SlotRef {
                     component: ComponentId(1),
                     name: "s".to_string(),
@@ -240,10 +246,10 @@ mod tests {
             },
             BindingEdge {
                 name: None,
-                from: ProvideRef {
+                from: BindingFrom::Component(ProvideRef {
                     component: ComponentId(1),
                     name: "p".to_string(),
-                },
+                }),
                 to: SlotRef {
                     component: ComponentId(2),
                     name: "s".to_string(),
@@ -252,10 +258,10 @@ mod tests {
             },
             BindingEdge {
                 name: None,
-                from: ProvideRef {
+                from: BindingFrom::Component(ProvideRef {
                     component: ComponentId(2),
                     name: "p".to_string(),
-                },
+                }),
                 to: SlotRef {
                     component: ComponentId(0),
                     name: "s".to_string(),
@@ -280,9 +286,38 @@ mod tests {
                 scenario
                     .bindings
                     .iter()
-                    .any(|b| !b.weak && b.from.component == from && b.to.component == to),
+                    .any(|b| {
+                        !b.weak
+                            && matches!(&b.from, BindingFrom::Component(edge_from) if edge_from.component == from)
+                            && b.to.component == to
+                    }),
                 "missing edge {from:?} -> {to:?}"
             );
         }
+    }
+
+    #[test]
+    fn topo_order_ignores_framework_bindings() {
+        let components = vec![Some(component(0, "/a")), Some(component(1, "/b"))];
+        let bindings = vec![BindingEdge {
+            name: None,
+            from: BindingFrom::Framework(
+                FrameworkCapabilityName::try_from("dynamic_children").unwrap(),
+            ),
+            to: SlotRef {
+                component: ComponentId(1),
+                name: "needs".to_string(),
+            },
+            weak: false,
+        }];
+        let scenario = Scenario {
+            root: ComponentId(0),
+            components,
+            bindings,
+            exports: Vec::new(),
+        };
+
+        let order = topo_order(&scenario).unwrap();
+        assert_eq!(order, vec![ComponentId(0), ComponentId(1)]);
     }
 }

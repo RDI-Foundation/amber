@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 
 use amber_manifest::CapabilityKind;
-use amber_scenario::{Component, ComponentId, Scenario};
+use amber_scenario::{BindingFrom, Component, ComponentId, Scenario};
 
 use super::{Reporter, ReporterError};
 use crate::CompileOutput;
@@ -52,8 +52,17 @@ fn render_dot_with_exports(output: &CompileOutput) -> String {
 fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
     let root = s.root;
     let root_has_program = s.component(root).program.is_some();
-    let root_needs_node = !root_has_program && exports.iter().any(|e| e.from == root);
+    let root_has_binding = s.bindings.iter().any(|b| {
+        matches!(&b.from, BindingFrom::Component(from) if from.component == root)
+            || b.to.component == root
+    });
+    let root_needs_node =
+        !root_has_program && (exports.iter().any(|e| e.from == root) || root_has_binding);
     let root_has_node = root_has_program || root_needs_node;
+    let has_framework = s
+        .bindings
+        .iter()
+        .any(|b| matches!(b.from, BindingFrom::Framework(_)));
 
     let mut out = String::new();
     let _ = writeln!(out, "digraph scenario {{");
@@ -74,19 +83,35 @@ fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
         write_escaped_label(&mut out, &export.endpoint_label);
         let _ = writeln!(out, "\", shape=box];");
     }
+    if has_framework {
+        write_indent(&mut out, 1);
+        let _ = writeln!(out, "framework [label=\"framework\", shape=box];");
+    }
 
     for b in &s.bindings {
-        if !root_has_node && (b.from.component == root || b.to.component == root) {
+        let from_component = match &b.from {
+            BindingFrom::Component(from) => Some(from.component),
+            BindingFrom::Framework(_) => None,
+        };
+        if !root_has_node && (from_component == Some(root) || b.to.component == root) {
             continue;
         }
 
         write_indent(&mut out, 1);
-        let _ = write!(
-            out,
-            "c{} -> c{} [label=\"",
-            b.from.component.0, b.to.component.0
-        );
-        write_escaped_label(&mut out, &b.from.name);
+        match &b.from {
+            BindingFrom::Component(from) => {
+                let _ = write!(
+                    out,
+                    "c{} -> c{} [label=\"",
+                    from.component.0, b.to.component.0
+                );
+                write_escaped_label(&mut out, &from.name);
+            }
+            BindingFrom::Framework(name) => {
+                let _ = write!(out, "framework -> c{} [label=\"", b.to.component.0);
+                write_escaped_label(&mut out, &format!("framework.{name}"));
+            }
+        }
         if let Some(name) = b.name.as_ref() {
             let _ = write!(out, " (");
             write_escaped_label(&mut out, name);

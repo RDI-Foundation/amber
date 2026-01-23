@@ -1,4 +1,4 @@
-use amber_scenario::{BindingEdge, Component, ComponentId, Scenario};
+use amber_scenario::{BindingEdge, BindingFrom, Component, ComponentId, Scenario};
 use miette::Diagnostic;
 use thiserror::Error;
 
@@ -68,7 +68,12 @@ fn prune_and_rebuild_scenario(
         if !keep_binding(idx, &binding) {
             continue;
         }
-        if removed[binding.from.component.0] || removed[binding.to.component.0] {
+        if removed[binding.to.component.0] {
+            continue;
+        }
+        if let BindingFrom::Component(from) = &binding.from
+            && removed[from.component.0]
+        {
             continue;
         }
         new_bindings.push(binding);

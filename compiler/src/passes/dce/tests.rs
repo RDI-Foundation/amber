@@ -1,9 +1,11 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use amber_manifest::{Manifest, ManifestRef};
+use amber_manifest::{FrameworkCapabilityName, Manifest, ManifestRef};
 use amber_scenario::{
-    BindingEdge, Component, ComponentId, Moniker, ProvideRef, Scenario, ScenarioExport, SlotRef,
+    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
+    ScenarioExport, SlotRef,
 };
+use serde_json::json;
 use url::Url;
 
 use super::DcePass;
@@ -165,10 +167,10 @@ fn dce_prunes_unused_transitive_subtree() {
         // Root wiring: green.llm <- router.llm
         BindingEdge {
             name: None,
-            from: ProvideRef {
+            from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(1),
                 name: "llm".to_string(),
-            },
+            }),
             to: SlotRef {
                 component: ComponentId(2),
                 name: "llm".to_string(),
@@ -178,10 +180,10 @@ fn dce_prunes_unused_transitive_subtree() {
         // Root wiring: green.admin_api <- router.admin_api (resolved to wrapper.admin_api)
         BindingEdge {
             name: None,
-            from: ProvideRef {
+            from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(3),
                 name: "admin_api".to_string(),
-            },
+            }),
             to: SlotRef {
                 component: ComponentId(2),
                 name: "admin_api".to_string(),
@@ -191,10 +193,10 @@ fn dce_prunes_unused_transitive_subtree() {
         // Router internal wiring: wrapper.litellm <- router.admin_api
         BindingEdge {
             name: None,
-            from: ProvideRef {
+            from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(1),
                 name: "admin_api".to_string(),
-            },
+            }),
             to: SlotRef {
                 component: ComponentId(3),
                 name: "litellm".to_string(),
@@ -265,7 +267,13 @@ fn dce_prunes_unused_transitive_subtree() {
 
     assert_eq!(scenario.bindings.len(), 1);
     let edge = &scenario.bindings[0];
-    assert_eq!(edge.from.name, "llm");
+    let edge_from = match &edge.from {
+        BindingFrom::Component(from) => from,
+        BindingFrom::Framework(name) => {
+            panic!("unexpected framework binding framework.{name}")
+        }
+    };
+    assert_eq!(edge_from.name, "llm");
     assert_eq!(edge.to.name, "llm");
     assert_eq!(
         scenario.components[edge.to.component.0]
@@ -276,7 +284,7 @@ fn dce_prunes_unused_transitive_subtree() {
         Some("green")
     );
     assert_eq!(
-        scenario.components[edge.from.component.0]
+        scenario.components[edge_from.component.0]
             .as_ref()
             .unwrap()
             .moniker
@@ -395,10 +403,10 @@ fn dce_keeps_dependencies_for_program_slots() {
     let bindings = vec![
         BindingEdge {
             name: None,
-            from: ProvideRef {
+            from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(2),
                 name: "input".to_string(),
-            },
+            }),
             to: SlotRef {
                 component: ComponentId(1),
                 name: "input".to_string(),
@@ -407,10 +415,10 @@ fn dce_keeps_dependencies_for_program_slots() {
         },
         BindingEdge {
             name: None,
-            from: ProvideRef {
+            from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(3),
                 name: "llm".to_string(),
-            },
+            }),
             to: SlotRef {
                 component: ComponentId(1),
                 name: "llm".to_string(),
@@ -484,18 +492,14 @@ fn dce_keeps_dependencies_for_program_slots() {
             .flatten()
             .any(|c| c.moniker.local_name() == Some("llm"))
     );
-    assert!(
-        scenario
-            .bindings
-            .iter()
-            .any(|edge| edge.from.name == "input" && edge.to.name == "input")
-    );
-    assert!(
-        scenario
-            .bindings
-            .iter()
-            .any(|edge| edge.from.name == "llm" && edge.to.name == "llm")
-    );
+    assert!(scenario.bindings.iter().any(|edge| {
+        matches!(&edge.from, BindingFrom::Component(from) if from.name == "input")
+            && edge.to.name == "input"
+    }));
+    assert!(scenario.bindings.iter().any(|edge| {
+        matches!(&edge.from, BindingFrom::Component(from) if from.name == "llm")
+            && edge.to.name == "llm"
+    }));
 }
 
 #[test]
@@ -583,10 +587,10 @@ fn dce_keeps_program_slots_from_env() {
 
     let bindings = vec![BindingEdge {
         name: None,
-        from: ProvideRef {
+        from: BindingFrom::Component(ProvideRef {
             component: ComponentId(2),
             name: "admin".to_string(),
-        },
+        }),
         to: SlotRef {
             component: ComponentId(1),
             name: "admin".to_string(),
@@ -645,10 +649,88 @@ fn dce_keeps_program_slots_from_env() {
             .flatten()
             .any(|c| c.moniker.local_name() == Some("admin"))
     );
-    assert!(
-        scenario
-            .bindings
+    assert!(scenario.bindings.iter().any(|edge| {
+        matches!(&edge.from, BindingFrom::Component(from) if from.name == "admin")
+            && edge.to.name == "admin"
+    }));
+}
+
+#[test]
+fn dce_keeps_framework_bound_slots() {
+    let control_slot = serde_json::from_value(json!({ "kind": "mcp" })).unwrap();
+    let consumer_program = serde_json::from_value(json!({
+        "image": "consumer",
+        "args": ["${slots.control.url}"]
+    }))
+    .unwrap();
+
+    let mut components = vec![Some(component(0, "/")), Some(component(1, "/consumer"))];
+    components[1].as_mut().unwrap().parent = Some(ComponentId(0));
+    components[0]
+        .as_mut()
+        .unwrap()
+        .children
+        .push(ComponentId(1));
+    components[1].as_mut().unwrap().program = Some(consumer_program);
+    components[1]
+        .as_mut()
+        .unwrap()
+        .slots
+        .insert("control".to_string(), control_slot);
+
+    let bindings = vec![BindingEdge {
+        name: None,
+        from: BindingFrom::Framework(
+            FrameworkCapabilityName::try_from("dynamic_children").unwrap(),
+        ),
+        to: SlotRef {
+            component: ComponentId(1),
+            name: "control".to_string(),
+        },
+        weak: false,
+    }];
+
+    let export_capability =
+        serde_json::from_value(json!({ "kind": "http" })).expect("capability decl");
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components,
+        bindings,
+        exports: vec![ScenarioExport {
+            name: "out".to_string(),
+            capability: export_capability,
+            from: ProvideRef {
+                component: ComponentId(1),
+                name: "out".to_string(),
+            },
+        }],
+    };
+
+    let store = DigestStore::new();
+    let url = Url::parse("file:///root.json5").unwrap();
+    let provenance = Provenance {
+        components: scenario
+            .components
             .iter()
-            .any(|edge| edge.from.name == "admin" && edge.to.name == "admin")
-    );
+            .map(|component| {
+                let component = component.as_ref().expect("test component should exist");
+                ComponentProvenance {
+                    authored_moniker: component.moniker.clone(),
+                    declared_ref: ManifestRef::from_url(url.clone()),
+                    resolved_url: url.clone(),
+                    digest: component.digest,
+                    observed_url: None,
+                }
+            })
+            .collect(),
+    };
+
+    let (scenario, _prov) = DcePass.run(scenario, provenance, &store).unwrap();
+    assert_eq!(scenario.components.iter().flatten().count(), 2);
+    assert_eq!(scenario.bindings.len(), 1);
+    match &scenario.bindings[0].from {
+        BindingFrom::Framework(name) => assert_eq!(name.as_str(), "dynamic_children"),
+        BindingFrom::Component(_) => panic!("expected framework binding"),
+    }
 }

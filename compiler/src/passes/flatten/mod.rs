@@ -1,5 +1,5 @@
 use amber_manifest::Manifest;
-use amber_scenario::{Component, ComponentId, Scenario};
+use amber_scenario::{BindingFrom, Component, ComponentId, Scenario};
 
 use super::{PassError, ScenarioPass};
 use crate::{DigestStore, Provenance};
@@ -33,7 +33,9 @@ impl ScenarioPass for FlattenPass {
         let n = scenario.components.len();
         let mut referenced_by_binding = vec![false; n];
         for b in &scenario.bindings {
-            referenced_by_binding[b.from.component.0] = true;
+            if let BindingFrom::Component(from) = &b.from {
+                referenced_by_binding[from.component.0] = true;
+            }
             referenced_by_binding[b.to.component.0] = true;
         }
 

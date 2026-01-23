@@ -1,0 +1,6 @@
+{
+  manifest_version: "0.1.0",
+  bindings: [
+    { to: "self.s", slot: "s", from: "self", capability: "p" },
+  ],
+}

@@ -290,6 +290,44 @@ fn binding_component_refs_require_hash_for_children() {
 }
 
 #[test]
+fn binding_target_framework_is_rejected() {
+    let err = r#"
+        {
+          manifest_version: "0.1.0",
+          bindings: [
+            { to: "framework", slot: "control", from: "self", capability: "api" },
+          ],
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("framework cannot be a binding target")
+    );
+}
+
+#[test]
+fn export_target_framework_is_rejected() {
+    let err = r#"
+        {
+          manifest_version: "0.1.0",
+          exports: {
+            api: "framework.log",
+          }
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("framework is only valid as a binding source")
+    );
+}
+
+#[test]
 fn binding_missing_capability_errors() {
     let err = r#"
         {
@@ -364,19 +402,25 @@ fn binding_name_cannot_contain_dots() {
 }
 
 #[test]
-fn binding_child_names_cannot_contain_dots() {
-    let err = r#"
+fn binding_mixed_form_is_rejected() {
+    let err = r##"
         {
           manifest_version: "0.1.0",
           bindings: [
-            { to: "\#a.b", slot: "s", from: "self", capability: "c" },
+            { to: "#a.b", slot: "s", from: "self", capability: "c" },
           ],
         }
-        "#
+        "##
     .parse::<Manifest>()
     .unwrap_err();
 
-    assert!(err.to_string().contains("child name cannot contain `.`"));
+    match err {
+        Error::MixedBindingForm { to, from } => {
+            assert_eq!(to, "#a.b");
+            assert_eq!(from, "self");
+        }
+        other => panic!("expected MixedBindingForm error, got: {other}"),
+    }
 }
 
 #[test]
@@ -451,6 +495,58 @@ fn binding_from_self_requires_provide() {
     match err {
         Error::UnknownBindingProvide { capability } => assert_eq!(capability, "api"),
         other => panic!("expected UnknownBindingProvide error, got: {other}"),
+    }
+}
+
+#[test]
+fn binding_from_framework_requires_known_capability_explicit_form() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: {
+            control: { kind: "mcp" },
+          },
+          bindings: [
+            { to: "self", slot: "control", from: "framework", capability: "dynamic_children" },
+          ],
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::UnknownFrameworkCapability { capability, help } => {
+            assert_eq!(capability, "dynamic_children");
+            assert!(help.contains("framework exposes no capabilities yet"));
+        }
+        other => panic!("expected UnknownFrameworkCapability error, got: {other}"),
+    }
+}
+
+#[test]
+fn binding_from_framework_requires_known_capability_dot_form() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: {
+            control: { kind: "mcp" },
+          },
+          bindings: [
+            { to: "self.control", from: "framework.dynamic_children" },
+          ],
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::UnknownFrameworkCapability { capability, help } => {
+            assert_eq!(capability, "dynamic_children");
+            assert!(help.contains("framework exposes no capabilities yet"));
+        }
+        other => panic!("expected UnknownFrameworkCapability error, got: {other}"),
     }
 }
 

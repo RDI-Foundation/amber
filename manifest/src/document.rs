@@ -112,6 +112,9 @@ fn labels_for_manifest_error(err: &ManifestError, spans: &ManifestSpans) -> Vec<
             Some("unsupported `manifest_version`".to_string()),
         )],
         ManifestError::InvalidName { kind, name } => labels_for_invalid_name(spans, kind, name),
+        ManifestError::MixedBindingForm { to, from } => {
+            labels_for_mixed_binding_form(spans, to, from)
+        }
         ManifestError::UnknownExportTarget { export, .. }
         | ManifestError::UnknownExportChild { export, .. } => {
             vec![primary(
@@ -134,6 +137,9 @@ fn labels_for_manifest_error(err: &ManifestError, spans: &ManifestSpans) -> Vec<
         }
         ManifestError::UnknownBindingChild { child } => {
             labels_for_unknown_binding_child(spans, child)
+        }
+        ManifestError::UnknownFrameworkCapability { capability, .. } => {
+            labels_for_unknown_framework_capability(spans, capability)
         }
         ManifestError::DuplicateEndpointName { name } => {
             labels_for_duplicate_endpoint_name(spans, name)
@@ -203,6 +209,50 @@ fn labels_for_invalid_name(
         span_or_default(span),
         Some("invalid name".to_string()),
     )]
+}
+
+fn labels_for_mixed_binding_form(spans: &ManifestSpans, to: &str, from: &str) -> Vec<LabeledSpan> {
+    let dot_to = to.contains('.');
+    let dot_from = from.contains('.');
+    let binding = spans.bindings_by_index.iter().find(|binding| {
+        binding.to_value.as_deref() == Some(to) && binding.from_value.as_deref() == Some(from)
+    });
+
+    let binding = binding.or_else(|| {
+        spans.bindings_by_index.iter().find(|binding| {
+            binding.slot_value.is_some()
+                && binding.capability_value.is_some()
+                && (binding
+                    .to_value
+                    .as_deref()
+                    .is_some_and(|value| value.contains('.'))
+                    || binding
+                        .from_value
+                        .as_deref()
+                        .is_some_and(|value| value.contains('.')))
+        })
+    });
+
+    let Some(binding) = binding else {
+        return Vec::new();
+    };
+
+    let mut labels = Vec::new();
+    if dot_to && let Some(span) = binding.to {
+        labels.push(primary(span, Some("dot form here".to_string())));
+    }
+    if dot_from && let Some(span) = binding.from {
+        labels.push(primary(span, Some("dot form here".to_string())));
+    }
+
+    if labels.is_empty() {
+        labels.push(primary(
+            span_or_default(Some(binding.whole)),
+            Some("mixed binding form".to_string()),
+        ));
+    }
+
+    labels
 }
 
 fn labels_for_ambiguous_capability_name(spans: &ManifestSpans, name: &str) -> Vec<LabeledSpan> {
@@ -341,6 +391,32 @@ fn labels_for_unknown_binding_provide(spans: &ManifestSpans, capability: &str) -
     vec![primary(
         span,
         Some("unknown provide referenced here".to_string()),
+    )]
+}
+
+fn labels_for_unknown_framework_capability(
+    spans: &ManifestSpans,
+    capability: &str,
+) -> Vec<LabeledSpan> {
+    let span = binding_span_or_default(spans, |binding| {
+        if binding.capability_value.as_deref() == Some(capability)
+            && binding.from_value.as_deref() == Some("framework")
+        {
+            return binding.capability.or(binding.from).or(Some(binding.whole));
+        }
+        if binding
+            .from_value
+            .as_deref()
+            .and_then(|from| from.strip_prefix("framework."))
+            .is_some_and(|name| name == capability)
+        {
+            return binding.from.or(Some(binding.whole));
+        }
+        None
+    });
+    vec![primary(
+        span,
+        Some("unknown framework capability referenced here".to_string()),
     )]
 }
 
