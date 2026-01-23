@@ -9,7 +9,7 @@ use std::{
 use amber_config as rc;
 use amber_manifest::{BindingTarget, InterpolatedPart, InterpolationSource, Manifest};
 use amber_scenario::{ComponentId, Scenario};
-use amber_template::{ProgramTemplateSpec, TemplatePart, TemplateSpec};
+use amber_template::{ProgramTemplateSpec, TemplatePart, TemplateSpec, TemplateString};
 use base64::Engine as _;
 pub use resources::*;
 use serde::Serialize;
@@ -23,26 +23,24 @@ use crate::{
     slot_query::{SlotObject, resolve_slot_query},
 };
 
-/// Helper image for runtime config interpolation.
+// Helper injection system: When a component requires runtime config interpolation,
+// an init container installs the amber-helper binary into a shared volume, then the
+// main container uses the helper as its entrypoint to resolve config templates and
+// exec the actual program.
 const HELPER_IMAGE: &str = "ghcr.io/rdi-foundation/amber-helper:v1";
-/// Volume name for sharing helper binary between init container and main container.
 const HELPER_VOLUME_NAME: &str = "amber-helper";
-/// Path where helper binary is installed in the shared volume.
 const HELPER_BIN_DIR: &str = "/amber/bin";
-/// Full path to helper binary.
 const HELPER_BIN_PATH: &str = "/amber/bin/amber-helper";
 
-/// Root config Secret/ConfigMap names.
+// Root config Secret/ConfigMap names.
 const ROOT_CONFIG_SECRET_NAME: &str = "amber-root-config-secret";
 const ROOT_CONFIG_CONFIGMAP_NAME: &str = "amber-root-config";
-
-type TemplateString = Vec<TemplatePart>;
 
 /// Kubernetes reporter configuration.
 #[derive(Clone, Debug, Default)]
 pub struct KubernetesReporterConfig {
-    /// Allow deployment without NetworkPolicy enforcement check.
-    pub allow_no_networkpolicy: bool,
+    /// Disable generation of NetworkPolicy enforcement check resources.
+    pub disable_networkpolicy_check: bool,
 }
 
 /// Reporter that outputs Kubernetes manifests as a directory structure.
@@ -51,7 +49,7 @@ pub struct KubernetesReporter {
     pub config: KubernetesReporterConfig,
 }
 
-/// Output artifact containing all generated K8s YAML files.
+/// Output artifact containing all generated Kubernetes YAML files.
 #[derive(Clone, Debug)]
 pub struct KubernetesArtifact {
     /// Map of relative path -> YAML content.
@@ -70,17 +68,10 @@ impl Reporter for KubernetesReporter {
 
 #[derive(Clone, Debug)]
 struct ComponentNames {
-    /// Service/deployment name (DNS-1123 compliant)
+    /// Service/deployment name (RFC 1123 subdomain).
     service: String,
-    /// NetworkPolicy name
+    /// NetworkPolicy name.
     netpol: String,
-}
-
-#[derive(Clone, Debug)]
-struct Endpoint {
-    #[allow(dead_code)]
-    name: String,
-    port: u16,
 }
 
 /// Metadata about a scenario export for the amber-metadata ConfigMap.
@@ -128,12 +119,12 @@ enum ProgramMode {
     },
 }
 
-type K8sResult<T> = Result<T, ReporterError>;
+type KubernetesResult<T> = Result<T, ReporterError>;
 
 fn render_kubernetes(
     output: &CompileOutput,
     config: &KubernetesReporterConfig,
-) -> K8sResult<KubernetesArtifact> {
+) -> KubernetesResult<KubernetesArtifact> {
     let s = &output.scenario;
 
     let manifests = crate::manifest_table::build_manifest_table(&s.components, &output.store)
@@ -212,11 +203,13 @@ fn render_kubernetes(
     }
 
     // Build slot values and binding values for each component (resolved URLs to services).
-    let mut slot_values: HashMap<ComponentId, BTreeMap<String, SlotObject>> = HashMap::new();
-    let mut binding_values: HashMap<ComponentId, BTreeMap<String, BindingObject>> = HashMap::new();
+    let mut slot_values_by_component: HashMap<ComponentId, BTreeMap<String, SlotObject>> =
+        HashMap::new();
+    let mut binding_values_by_component: HashMap<ComponentId, BTreeMap<String, BindingObject>> =
+        HashMap::new();
     for id in &program_components {
-        slot_values.insert(*id, BTreeMap::new());
-        binding_values.insert(*id, BTreeMap::new());
+        slot_values_by_component.insert(*id, BTreeMap::new());
+        binding_values_by_component.insert(*id, BTreeMap::new());
     }
 
     // Track inbound allowlist: provider -> set of (consumer_component, port)
@@ -226,7 +219,7 @@ fn render_kubernetes(
         let provider = b.from.component;
         let consumer = b.to.component;
 
-        let endpoint = resolve_provide_endpoint(s, provider, &b.from.name)?;
+        let endpoint_port = resolve_provide_endpoint(s, provider, &b.from.name)?;
         let provider_names = names.get(&provider).ok_or_else(|| {
             ReporterError::new(format!(
                 "internal error: missing names for provider {}",
@@ -234,24 +227,24 @@ fn render_kubernetes(
             ))
         })?;
 
-        // Slot resolves to K8s service DNS.
         let url = if provider == consumer {
             // Self-reference: use localhost
-            format!("http://127.0.0.1:{}", endpoint.port)
+            format!("http://127.0.0.1:{}", endpoint_port)
         } else {
+            // Slot resolves to Kubernetes service DNS.
             format!(
                 "http://{}.{}.svc.cluster.local:{}",
-                provider_names.service, namespace, endpoint.port
+                provider_names.service, namespace, endpoint_port
             )
         };
 
-        slot_values
+        slot_values_by_component
             .entry(consumer)
             .or_default()
             .insert(b.to.name.clone(), SlotObject { url: url.clone() });
 
         if let Some(name) = b.name.as_ref() {
-            binding_values
+            binding_values_by_component
                 .entry(consumer)
                 .or_default()
                 .insert(name.clone(), BindingObject { url });
@@ -262,7 +255,7 @@ fn render_kubernetes(
             inbound_allow
                 .entry(provider)
                 .or_default()
-                .push((consumer, endpoint.port));
+                .push((consumer, endpoint_port));
         }
     }
 
@@ -293,7 +286,7 @@ fn render_kubernetes(
     })?;
 
     let binding_urls_by_scope =
-        binding_urls_by_scope(s, &manifests, &slot_values).map_err(ReporterError::new)?;
+        binding_urls_by_scope(s, &manifests, &slot_values_by_component).map_err(ReporterError::new)?;
 
     let resolved_templates =
         resolve_binding_templates(composed_templates, &binding_urls_by_scope, s)
@@ -347,7 +340,7 @@ fn render_kubernetes(
     for id in &program_components {
         let c = s.component(*id);
         let program = c.program.as_ref().unwrap();
-        let slots = slot_values.get(id).unwrap();
+        let slots = slot_values_by_component.get(id).unwrap();
 
         let component_template = resolved_templates.get(id).ok_or_else(|| {
             ReporterError::new(format!(
@@ -367,7 +360,7 @@ fn render_kubernetes(
             .and_then(|m| m.config_schema())
             .map(|s| &s.0);
 
-        let bindings = binding_values.get(id).unwrap();
+        let bindings = binding_values_by_component.get(id).unwrap();
 
         let mode = build_program_mode(
             s,
@@ -391,16 +384,8 @@ fn render_kubernetes(
     let mut kustomization = Kustomization::new();
     kustomization.namespace = Some(namespace.clone());
 
-    // If any component needs helper, generate kustomization.yaml and root config template.
+    // If any component needs helper, generate root config Secret/ConfigMap and .env templates.
     if any_helper {
-        let root_schema = root_schema.ok_or_else(|| {
-            ReporterError::new(
-                "root component must declare `config_schema` when runtime config interpolation is \
-                 required"
-                    .to_string(),
-            )
-        })?;
-
         // Separate root leaves into secret and non-secret.
         let secret_leaves: Vec<_> = root_leaves.iter().filter(|l| l.secret).collect();
         let config_leaves: Vec<_> = root_leaves.iter().filter(|l| !l.secret).collect();
@@ -452,20 +437,18 @@ fn render_kubernetes(
         }
 
         // Don't insert kustomization yet - we'll do it at the end after collecting all resource paths
-
-        // Encode root schema for helper.
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let root_schema_json =
-            serde_json::to_vec(&rc::canonical_json(root_schema)).map_err(|e| {
-                ReporterError::new(format!("failed to serialize root config definition: {e}"))
-            })?;
-        let _root_schema_b64 = b64.encode(root_schema_json);
     }
 
     // Note: Per-component ConfigMaps/Secrets are not generated because:
-    // - Direct mode: config values are baked into entrypoint/env at compile time
-    // - Helper mode: config comes from root config Secret/ConfigMap at runtime
-    // The only ConfigMaps needed are amber-metadata and the Kustomize-generated root config.
+    // - Direct mode: all config must be fully static (no runtime interpolation).
+    //   Static values are rendered to strings and inlined directly into the
+    //   Deployment YAML as literal env vars. This includes secret config values,
+    //   which will be visible in the generated YAML.
+    // - Helper mode: config with runtime interpolation uses the helper binary.
+    //   The helper reads config values from the root config Secret/ConfigMap at
+    //   runtime and resolves templates, so secret values are not inlined.
+    // The only ConfigMaps generated are amber-metadata and the Kustomize-generated
+    // root config (when helper mode is used).
 
     // Encode root schema for helper (needed for all helper components).
     let root_schema_b64 = if any_helper {
@@ -625,7 +608,7 @@ fn render_kubernetes(
         }
 
         // Add init container to wait for NetworkPolicy enforcement check.
-        if !config.allow_no_networkpolicy {
+        if !config.disable_networkpolicy_check {
             init_containers.push(Container {
                 name: "wait-for-netpol-check".to_string(),
                 image: "busybox:1.36".to_string(),
@@ -787,7 +770,7 @@ fn render_kubernetes(
     }
 
     // NetworkPolicy enforcement check (unless disabled).
-    if !config.allow_no_networkpolicy {
+    if !config.disable_networkpolicy_check {
         let enforcement_resources =
             generate_netpol_enforcement_check(&namespace, &scenario_labels(&[]));
         for (filename, resource_yaml) in enforcement_resources {
@@ -803,7 +786,7 @@ fn render_kubernetes(
     for ex in &s.exports {
         let provider = ex.from.component;
         let provider_names = names.get(&provider).unwrap();
-        let endpoint = resolve_provide_endpoint(s, provider, &ex.from.name)?;
+        let endpoint_port = resolve_provide_endpoint(s, provider, &ex.from.name)?;
 
         export_metadata.insert(
             ex.name.clone(),
@@ -811,7 +794,7 @@ fn render_kubernetes(
                 component: s.component(provider).moniker.as_str().to_string(),
                 provide: ex.from.name.clone(),
                 service: provider_names.service.clone(),
-                port: endpoint.port,
+                port: endpoint_port,
                 kind: format!("{}", ex.capability.kind),
             },
         );
@@ -1098,7 +1081,7 @@ fn truncate_dns_name(s: &str, max_len: usize) -> String {
 }
 
 fn sanitize_label_value(s: &str) -> String {
-    // K8s label values: max 63 chars, alphanumeric, -, _, .
+    // Kubernetes label values: max 63 chars, alphanumeric, -, _, .
     let mut out = String::new();
     for ch in s.chars() {
         if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
@@ -1118,7 +1101,7 @@ fn resolve_provide_endpoint(
     s: &Scenario,
     component_id: ComponentId,
     provide_name: &str,
-) -> Result<Endpoint, ReporterError> {
+) -> Result<u16, ReporterError> {
     let component = s.component(component_id);
 
     let provide = component.provides.get(provide_name).ok_or_else(|| {
@@ -1166,10 +1149,7 @@ fn resolve_provide_endpoint(
             ))
         })?;
 
-    Ok(Endpoint {
-        name: endpoint.name.clone(),
-        port: endpoint.port,
-    })
+    Ok(endpoint.port)
 }
 
 fn compose_templates_dfs(
@@ -1307,7 +1287,7 @@ fn build_program_mode(
     template_opt: Option<&rc::ConfigNode>,
     component_schema: Option<&Value>,
     component_template: &rc::RootConfigTemplate,
-) -> K8sResult<ProgramMode> {
+) -> KubernetesResult<ProgramMode> {
     let mut entrypoint_ts: Vec<TemplateString> = Vec::new();
     let mut needs_helper = false;
 
@@ -1514,7 +1494,7 @@ fn build_program_mode(
 fn generate_netpol_enforcement_check(
     namespace: &str,
     labels: &BTreeMap<String, String>,
-) -> Vec<(&'static str, K8sResult<String>)> {
+) -> Vec<(&'static str, KubernetesResult<String>)> {
     let mut check_labels = labels.clone();
     check_labels.insert("amber.io/type".to_string(), "netpol-check".to_string());
 
@@ -1709,7 +1689,7 @@ if [ -n "$RESPONSE" ]; then
     echo "To fix this, either:"
     echo "  1. Install a CNI that supports NetworkPolicy:"
     echo "     - Calico, Cilium, Weave Net, etc."
-    echo "  2. Re-generate with --allow-no-networkpolicy"
+    echo "  2. Re-generate with --disable-networkpolicy-check"
     echo ""
     exit 1
 fi

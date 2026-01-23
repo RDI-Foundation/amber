@@ -76,9 +76,9 @@ struct CompileArgs {
     #[arg(long = "kubernetes", visible_alias = "k8s", value_name = "DIR")]
     kubernetes: Option<PathBuf>,
 
-    /// Allow deployment without NetworkPolicy enforcement check.
-    #[arg(long = "allow-no-networkpolicy", requires = "kubernetes")]
-    allow_no_networkpolicy: bool,
+    /// Disable generation of NetworkPolicy enforcement check resources.
+    #[arg(long = "disable-networkpolicy-check", requires = "kubernetes")]
+    disable_networkpolicy_check: bool,
 
     /// Root manifest or bundle to compile (URL or local path).
     #[arg(value_name = "MANIFEST")]
@@ -190,14 +190,14 @@ async fn compile(args: CompileArgs) -> Result<()> {
         }
     }
 
-    if let Some(k8s_dir) = &args.kubernetes {
+    if let Some(kubernetes_dest) = outputs.kubernetes {
         let reporter = KubernetesReporter {
             config: KubernetesReporterConfig {
-                allow_no_networkpolicy: args.allow_no_networkpolicy,
+                disable_networkpolicy_check: args.disable_networkpolicy_check,
             },
         };
         let artifact = reporter.emit(&output).map_err(miette::Report::new)?;
-        write_kubernetes_output(k8s_dir, &artifact)?;
+        write_kubernetes_output(&kubernetes_dest, &artifact)?;
     }
 
     if let Some(bundle_root) = resolve_bundle_root(&args)? {
@@ -469,6 +469,7 @@ struct OutputPaths {
     primary: Option<PathBuf>,
     dot: Option<ArtifactOutput>,
     docker_compose: Option<ArtifactOutput>,
+    kubernetes: Option<PathBuf>,
 }
 
 fn ensure_outputs_requested(args: &CompileArgs) -> Result<()> {
@@ -492,6 +493,7 @@ fn resolve_output_paths(args: &CompileArgs) -> Result<OutputPaths> {
     let primary = args.output.clone();
     let dot = resolve_optional_output(&args.dot);
     let docker_compose = resolve_optional_output(&args.docker_compose);
+    let kubernetes = args.kubernetes.clone();
 
     if let (Some(primary_path), Some(ArtifactOutput::File(dot_path))) =
         (primary.as_ref(), dot.as_ref())
@@ -527,6 +529,7 @@ fn resolve_output_paths(args: &CompileArgs) -> Result<OutputPaths> {
         primary,
         dot,
         docker_compose,
+        kubernetes,
     })
 }
 
