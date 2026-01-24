@@ -519,8 +519,28 @@ fn render_kubernetes(
                 // Helper mode: use helper binary as entrypoint, mount shared volume.
                 let mut container_env: Vec<EnvVar> = Vec::new();
 
-                // Add root config env vars from kustomize-generated Secret/ConfigMap.
+                // Collect config paths referenced by this component's template.
+                let component_template = resolved_templates.get(id).ok_or_else(|| {
+                    ReporterError::new(format!(
+                        "no config template for component {}",
+                        component_label(s, *id)
+                    ))
+                })?;
+                let referenced_paths = collect_config_refs(component_template);
+
+                // Add only the root config env vars that are actually referenced by this component.
+                // If referenced_paths is None, it means the component template is Root and needs all config.
                 for leaf in &root_leaves {
+                    // Check if this leaf path is referenced by the component template.
+                    let should_include = match &referenced_paths {
+                        Some(paths) => paths.contains(&leaf.path),
+                        None => true, // Root template needs all config
+                    };
+
+                    if !should_include {
+                        continue;
+                    }
+
                     let env_var = rc::env_var_for_path(&leaf.path).map_err(|e| {
                         ReporterError::new(format!("failed to map config path: {e}"))
                     })?;
@@ -1194,6 +1214,52 @@ fn compose_templates_dfs(
 }
 
 // ---- Runtime config / helper mode support ----
+
+/// Collect all config paths referenced in a RootConfigTemplate.
+/// Returns None if the template is Root (indicating all config should be provided).
+/// Returns Some(paths) with the specific paths referenced in the template.
+fn collect_config_refs(template: &rc::RootConfigTemplate) -> Option<std::collections::BTreeSet<String>> {
+    use std::collections::BTreeSet;
+
+    fn collect_from_node(node: &rc::ConfigNode, acc: &mut BTreeSet<String>) {
+        match node {
+            rc::ConfigNode::ConfigRef(path) => {
+                acc.insert(path.clone());
+            }
+            rc::ConfigNode::StringTemplate(parts) => {
+                for part in parts {
+                    if let amber_template::TemplatePart::Config { config } = part {
+                        acc.insert(config.clone());
+                    }
+                }
+            }
+            rc::ConfigNode::Array(items) => {
+                for item in items {
+                    collect_from_node(item, acc);
+                }
+            }
+            rc::ConfigNode::Object(map) => {
+                for value in map.values() {
+                    collect_from_node(value, acc);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    match template {
+        rc::RootConfigTemplate::Root => {
+            // Root template means the component IS the root and receives the entire root config.
+            // Return None to indicate all config paths should be provided.
+            None
+        }
+        rc::RootConfigTemplate::Node(node) => {
+            let mut paths = BTreeSet::new();
+            collect_from_node(node, &mut paths);
+            Some(paths)
+        }
+    }
+}
 
 /// Attempt to resolve a config interpolation to a static string; otherwise keep it as runtime.
 enum ConfigResolution {
