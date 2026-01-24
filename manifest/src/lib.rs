@@ -21,6 +21,7 @@ use std::{
 
 use amber_json5::DiagnosticError;
 use base64::Engine;
+use bon::bon;
 pub use document::{ManifestDocError, ParsedManifest};
 pub use framework::{
     FrameworkBindingShape, FrameworkCapabilitySpec, framework_capabilities, framework_capability,
@@ -641,25 +642,43 @@ impl<'de> Deserialize<'de> for ProgramArgs {
 }
 
 #[serde_as]
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, bon::Builder,
+)]
+#[builder(on(String, into))]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Program {
     pub image: String,
     #[serde(default, alias = "entrypoint")]
+    #[builder(default)]
     pub args: ProgramArgs,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
+    #[builder(default)]
     pub env: BTreeMap<String, InterpolatedString>,
     #[serde(default)]
     pub network: Option<Network>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    bon::Builder,
+)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Network {
     #[serde(default, deserialize_with = "deserialize_endpoints")]
+    #[builder(default)]
     pub endpoints: BTreeSet<Endpoint>,
 }
 
@@ -679,7 +698,10 @@ where
     Ok(endpoints.into_iter().collect())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, bon::Builder,
+)]
+#[builder(on(String, into))]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Endpoint {
@@ -687,6 +709,7 @@ pub struct Endpoint {
     // TODO: this should be an enum tagged by `NetworkProtocol` and carrying appropriate data for the protocol
     pub port: u16,
     #[serde(default = "default_protocol")]
+    #[builder(default = default_protocol())]
     pub protocol: NetworkProtocol,
 }
 
@@ -738,7 +761,10 @@ impl fmt::Display for CapabilityKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, bon::Builder,
+)]
+#[builder(on(String, into))]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct CapabilityDecl {
@@ -757,7 +783,9 @@ impl fmt::Display for CapabilityDecl {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, bon::Builder,
+)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct SlotDecl {
@@ -829,7 +857,8 @@ impl FromStr for BindingSourceRef {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay, bon::Builder)]
+#[builder(on(String, into))]
 #[non_exhaustive]
 pub struct RawExportTarget {
     pub component: LocalComponentRef,
@@ -906,7 +935,10 @@ impl FromStr for RawExportTarget {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, bon::Builder,
+)]
+#[builder(on(String, into))]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ProvideDecl {
@@ -919,7 +951,8 @@ pub struct ProvideDecl {
 /// A named resolution environment, used to resolve child manifests.
 ///
 /// The compiler interprets the resolver names here via an external registry (provided by the host).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct EnvironmentDecl {
@@ -928,6 +961,7 @@ pub struct EnvironmentDecl {
     pub extends: Option<String>,
     /// Names of resolvers to add (interpreted by the host/compiler).
     #[serde(default)]
+    #[builder(default)]
     pub resolvers: Vec<String>,
 }
 
@@ -993,7 +1027,8 @@ impl ManifestRef {
 }
 
 #[serde_as]
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ComponentRef {
@@ -1010,17 +1045,34 @@ pub struct ComponentRef {
 #[serde(transparent)]
 pub struct ConfigSchema(pub Value);
 
+impl ConfigSchema {
+    fn validate_value(value: &Value) -> Result<(), Error> {
+        jsonschema::validator_for(value).map_err(|e| Error::InvalidConfigSchema(e.to_string()))?;
+        config_schema_profile::validate(value).map_err(Error::InvalidConfigSchema)?;
+        Ok(())
+    }
+
+    pub fn new(value: Value) -> Result<Self, Error> {
+        Self::validate_value(&value)?;
+        Ok(Self(value))
+    }
+}
+
+impl TryFrom<Value> for ConfigSchema {
+    type Error = Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
 impl<'de> Deserialize<'de> for ConfigSchema {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        jsonschema::validator_for(&value)
-            .map_err(|e| serde::de::Error::custom(Error::InvalidConfigSchema(e.to_string())))?;
-        config_schema_profile::validate(&value)
-            .map_err(|e| serde::de::Error::custom(Error::InvalidConfigSchema(e)))?;
-        Ok(ConfigSchema(value))
+        ConfigSchema::new(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1189,6 +1241,34 @@ impl<'de> Deserialize<'de> for RawBinding {
                  form `to: \"<component-ref>.<slot>\", from: \"<component-ref>.<provide>\"`)",
             )),
         }
+    }
+}
+
+#[bon]
+impl RawBinding {
+    #[builder(on(String, into))]
+    pub fn new(
+        name: Option<String>,
+        to: String,
+        slot: String,
+        from: String,
+        capability: String,
+        #[builder(default)] weak: bool,
+    ) -> Result<Self, Error> {
+        ensure_binding_name_no_dot(&slot, slot.as_str())?;
+        ensure_binding_name_no_dot(&capability, capability.as_str())?;
+
+        Ok(Self {
+            name,
+            to: parse_binding_target_ref(&to)?,
+            slot,
+            from: parse_binding_source_ref(&from)?,
+            capability,
+            weak,
+            mixed_form: false,
+            raw_to: None,
+            raw_from: None,
+        })
     }
 }
 
@@ -1423,6 +1503,25 @@ struct ValidateCtx<'a> {
     components: &'a BTreeMap<ChildName, ComponentDecl>,
     slots: &'a BTreeMap<SlotName, SlotDecl>,
     provides: &'a BTreeMap<ProvideName, ProvideDecl>,
+}
+
+fn validate_manifest_ref(reference: &ManifestRef) -> Result<(), Error> {
+    // Re-parse the string form to enforce the same invariants serde enforces for manifests loaded
+    // from JSON/JSON5, even when the user mutates the public fields programmatically.
+    let _ = reference.url.as_str().parse::<ManifestUrl>()?;
+    Ok(())
+}
+
+fn validate_component_manifest_refs(
+    components: &BTreeMap<String, ComponentDecl>,
+) -> Result<(), Error> {
+    for decl in components.values() {
+        match decl {
+            ComponentDecl::Reference(reference) => validate_manifest_ref(reference)?,
+            ComponentDecl::Object(obj) => validate_manifest_ref(&obj.manifest)?,
+        }
+    }
+    Ok(())
 }
 
 fn validate_environment_names(
@@ -1800,6 +1899,10 @@ impl RawManifest {
             exports,
         } = self;
 
+        if let Some(schema) = config_schema.as_ref() {
+            ConfigSchema::validate_value(&schema.0)?;
+        }
+        validate_component_manifest_refs(&components)?;
         validate_environment_names(&environments)?;
 
         let components = convert_components(components)?;
@@ -1912,6 +2015,37 @@ impl Manifest {
 
     pub fn digest(&self) -> ManifestDigest {
         self.digest
+    }
+}
+
+#[bon]
+impl Manifest {
+    #[builder]
+    pub fn new(
+        #[builder(default = Version::new(0, 1, 0))] manifest_version: Version,
+        program: Option<Program>,
+        #[builder(default)] components: BTreeMap<String, ComponentDecl>,
+        #[builder(default)] environments: BTreeMap<String, EnvironmentDecl>,
+        config_schema: Option<Value>,
+        #[builder(default)] slots: BTreeMap<String, SlotDecl>,
+        #[builder(default)] provides: BTreeMap<String, ProvideDecl>,
+        #[builder(default)] bindings: BTreeSet<RawBinding>,
+        #[builder(default)] exports: BTreeMap<String, RawExportTarget>,
+    ) -> Result<Self, Error> {
+        let config_schema = config_schema.map(ConfigSchema::try_from).transpose()?;
+
+        RawManifest {
+            manifest_version,
+            program,
+            components,
+            environments,
+            config_schema,
+            slots,
+            provides,
+            bindings,
+            exports,
+        }
+        .validate()
     }
 }
 
