@@ -12,7 +12,6 @@ pub struct CycleError {
 /// if A provides something bound into B's slot, A must come before B.
 ///
 /// Notes:
-/// - Self-bindings are ignored.
 /// - Weak edges are ignored for ordering and cycle detection (they can point "backwards" without creating a dependency cycle).
 /// - This is intentionally separate from Scenario (graph ops live here).
 pub fn topo_order(s: &Scenario) -> Result<Vec<ComponentId>, CycleError> {
@@ -35,9 +34,6 @@ pub fn topo_order(s: &Scenario) -> Result<Vec<ComponentId>, CycleError> {
         };
         let u = from.component.0;
         let v = b.to.component.0;
-        if u == v {
-            continue;
-        }
         out[u].push(v);
     }
 
@@ -99,7 +95,7 @@ pub fn providers_of(s: &Scenario, id: ComponentId) -> BTreeSet<ComponentId> {
         let BindingFrom::Component(from) = &b.from else {
             continue;
         };
-        if b.to.component == id && from.component != id {
+        if b.to.component == id {
             set.insert(from.component);
         }
     }

@@ -2,24 +2,20 @@
   manifest_version: "0.1.0",
   program: {
     image: "ghcr.io/acme/app:v1",
-    entrypoint: [
-      "app",
-      "--backend",
-      "${bindings.route.url}",
-    ],
+    entrypoint: ["app"],
     network: {
       endpoints: [
         { name: "http", port: 8080 },
       ],
     },
   },
-  components: {
-    provider: "./simple-provider.json5",
-  },
   slots: {
     backend: { kind: "http" },
   },
+  provides: {
+    api: { kind: "http", endpoint: "http" },
+  },
   bindings: [
-    { name: "backend", to: "self.backend", from: "#provider.api" },
+    { to: "self.backend", from: "self.api" },
   ],
 }

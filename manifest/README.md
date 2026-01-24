@@ -448,6 +448,7 @@ Rules enforced by this crate:
 * `from: "self"` requires `capability` exist in `provides`.
 * `from: "framework"` requires a known framework capability name (see below).
 * `framework` is only valid as a binding source; it cannot appear in `to` or `exports`.
+* `to` and `from` must refer to different components (self-bindings are invalid).
 * Any `#child` referenced in `to` or `from` must exist in `components`.
 * Slot/capability names must not contain `.`.
 

@@ -786,24 +786,40 @@ async fn duplicate_slot_bindings_across_manifests_error() {
     let dir = tmp_dir("scenario-duplicate-slot-binding");
     let root_path = dir.path().join("root.json5");
     let child_path = dir.path().join("child.json5");
+    let provider_path = dir.path().join("provider.json5");
 
     write_file(
-        &child_path,
+        &provider_path,
         r#"
         {
           manifest_version: "0.1.0",
           program: {
-            image: "child",
-            entrypoint: ["child"],
+            image: "provider",
+            entrypoint: ["provider"],
             network: { endpoints: [{ name: "endpoint", port: 80 }] },
           },
-          slots: { api: { kind: "http" } },
           provides: { http: { kind: "http", endpoint: "endpoint" } },
-          bindings: [
-            { to: "self.api", from: "self.http" },
-          ],
+          exports: { http: "http" },
         }
         "#,
+    );
+    write_file(
+        &child_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              components: {{
+                provider: "{provider}",
+              }},
+              slots: {{ api: {{ kind: "http" }} }},
+              bindings: [
+                {{ to: "self.api", from: "#provider.http" }},
+              ],
+            }}
+            "##,
+            provider = file_url(&provider_path),
+        ),
     );
     write_file(
         &root_path,

@@ -1,0 +1,18 @@
+{
+  manifest_version: "0.1.0",
+  program: {
+    image: "ghcr.io/acme/provider:v1",
+    entrypoint: ["provider"],
+    network: {
+      endpoints: [
+        { name: "http", port: 8080 },
+        { name: "agent", port: 8081 },
+      ],
+    },
+  },
+  provides: {
+    api: { kind: "http", endpoint: "http" },
+    agent: { kind: "a2a", endpoint: "agent" },
+  },
+  exports: { api: "api", agent: "agent" },
+}

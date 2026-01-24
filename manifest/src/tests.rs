@@ -1937,27 +1937,19 @@ fn manifest_doc_error_unknown_export_target_points_to_target() {
 
 #[test]
 fn manifest_doc_error_duplicate_binding_target_marks_second_binding() {
-    let source = r#"
+    let source = r##"
         {
           manifest_version: "0.1.0",
-          program: {
-            image: "x",
-            entrypoint: ["x"],
-            network: { endpoints: [{ name: "a", port: 80 }, { name: "b", port: 81 }] },
-          },
-          slots: {
-            api: { kind: "http" },
-          },
-          provides: {
-            a: { kind: "http", endpoint: "a" },
-            b: { kind: "http", endpoint: "b" },
+          components: {
+            a: "https://example.com/a",
+            b: "https://example.com/b",
           },
           bindings: [
-            { to: "self.api", from: "self.a" },
-            { to: "self.api", from: "self.b" },
+            { to: "#a.api", from: "#b.a" },
+            { to: "#a.api", from: "#b.b" },
           ],
         }
-        "#;
+        "##;
     let source: Arc<str> = Arc::from(source);
     let err = ParsedManifest::parse_named("<test>", Arc::clone(&source)).unwrap_err();
     assert!(matches!(err.kind, Error::DuplicateBindingTarget { .. }));
@@ -1968,7 +1960,36 @@ fn manifest_doc_error_duplicate_binding_target_marks_second_binding() {
         .find(|label| label.label() == Some("second binding here"))
         .expect("second binding label");
     let second_text = labeled_span_text(source.as_ref(), second);
-    assert!(second_text.contains("self.b"));
+    assert!(second_text.contains("#b.b"));
+}
+
+#[test]
+fn manifest_doc_error_self_binding_marks_self_binding() {
+    let source = r##"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            child: "https://example.com/child",
+            provider: "https://example.com/provider",
+          },
+          bindings: [
+            { to: "#child.api", from: "#provider.api" },
+            { to: "#child", slot: "api", from: "#child", capability: "api" },
+          ],
+        }
+        "##;
+    let source: Arc<str> = Arc::from(source);
+    let err = ParsedManifest::parse_named("<test>", Arc::clone(&source)).unwrap_err();
+    assert!(matches!(err.kind, Error::SelfBinding { .. }));
+
+    let labels: Vec<_> = err.labels().expect("labels").collect();
+    let binding = labels
+        .iter()
+        .find(|label| label.label() == Some("self-binding here"))
+        .expect("self-binding label");
+    let binding_text = labeled_span_text(source.as_ref(), binding);
+    assert!(binding_text.contains("capability: \"api\""));
+    assert!(!binding_text.contains("#provider.api"));
 }
 
 #[test]

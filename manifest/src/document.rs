@@ -131,6 +131,13 @@ fn labels_for_manifest_error(err: &ManifestError, spans: &ManifestSpans) -> Vec<
         ManifestError::DuplicateBindingName { name } => {
             labels_for_duplicate_binding_name(spans, name)
         }
+        ManifestError::SelfBinding {
+            to,
+            slot,
+            from,
+            capability,
+            name,
+        } => labels_for_self_binding(spans, to, slot, from, capability, name.as_deref()),
         ManifestError::UnknownBindingSlot { slot } => labels_for_unknown_binding_slot(spans, slot),
         ManifestError::UnknownBindingProvide { capability } => {
             labels_for_unknown_binding_provide(spans, capability)
@@ -348,6 +355,69 @@ fn labels_for_duplicate_binding_name(spans: &ManifestSpans, name: &str) -> Vec<L
             labels
         }
     }
+}
+
+fn labels_for_self_binding(
+    spans: &ManifestSpans,
+    to: &str,
+    slot: &str,
+    from: &str,
+    capability: &str,
+    name: Option<&str>,
+) -> Vec<LabeledSpan> {
+    let Some(key) = crate::binding_target_key_for_binding(to, Some(slot)) else {
+        return vec![primary(
+            default_span(),
+            Some("self-binding here".to_string()),
+        )];
+    };
+
+    let binding = spans.bindings_by_index.iter().find(|b| {
+        if !binding_name_matches(b, name) {
+            return false;
+        }
+        let target_match = binding_target_key_for_span(b)
+            .as_ref()
+            .is_some_and(|k| k == &key);
+        if !target_match {
+            return false;
+        }
+        binding_source_parts_for_span(b).is_some_and(|(span_from, span_capability)| {
+            span_from == from && span_capability == capability
+        })
+    });
+
+    let Some(binding) = binding else {
+        return vec![primary(
+            default_span(),
+            Some("self-binding here".to_string()),
+        )];
+    };
+
+    vec![primary(
+        span_or_default(Some(binding.whole)),
+        Some("self-binding here".to_string()),
+    )]
+}
+
+fn binding_name_matches(binding: &crate::BindingSpans, name: Option<&str>) -> bool {
+    match name {
+        Some(expected) => binding.name_value.as_deref() == Some(expected),
+        None => binding.name_value.is_none(),
+    }
+}
+
+fn binding_source_parts_for_span(span: &crate::BindingSpans) -> Option<(String, String)> {
+    if let (Some(from), Some(capability)) =
+        (span.from_value.as_deref(), span.capability_value.as_deref())
+    {
+        let source = crate::parse_binding_source_ref(from).ok()?;
+        return Some((source.to_string(), capability.to_string()));
+    }
+
+    let from = span.from_value.as_deref()?;
+    let (source, capability) = crate::split_binding_source(from).ok()?;
+    Some((source.to_string(), capability))
 }
 
 fn binding_span_or_default(

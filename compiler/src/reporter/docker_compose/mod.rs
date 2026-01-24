@@ -298,9 +298,6 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
             continue;
         }
         let from = binding_from_component(&b.from);
-        if from.component == b.to.component {
-            continue;
-        }
         strong_deps
             .entry(b.to.component)
             .or_default()
@@ -371,20 +368,16 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 )
             })?;
 
-        let remote_host = if provider == consumer {
-            "127.0.0.1".to_string()
-        } else {
-            names
-                .get(&provider)
-                .ok_or_else(|| {
-                    format!(
-                        "internal error: missing sidecar name for provider {}",
-                        component_label(s, provider)
-                    )
-                })?
-                .sidecar
-                .clone()
-        };
+        let remote_host = names
+            .get(&provider)
+            .ok_or_else(|| {
+                format!(
+                    "internal error: missing sidecar name for provider {}",
+                    component_label(s, provider)
+                )
+            })?
+            .sidecar
+            .clone();
 
         slot_proxies_by_component
             .entry(consumer)

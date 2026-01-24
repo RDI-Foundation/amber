@@ -13,13 +13,13 @@
       ],
     },
   },
+  components: {
+    provider: "./simple-provider.json5",
+  },
   slots: {
     agent: { kind: "a2a" },
   },
-  provides: {
-    agent_provider: { kind: "a2a", endpoint: "agent" },
-  },
   bindings: [
-    { to: "self.agent", from: "self.agent_provider" },
+    { to: "self.agent", from: "#provider.agent" },
   ],
 }

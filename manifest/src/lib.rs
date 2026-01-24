@@ -123,6 +123,19 @@ pub enum Error {
     #[diagnostic(code(manifest::duplicate_binding_name))]
     DuplicateBindingName { name: String },
 
+    #[error("binding connects `{to}` to itself")]
+    #[diagnostic(
+        code(manifest::self_binding),
+        help("bindings must connect different components")
+    )]
+    SelfBinding {
+        to: String,
+        slot: String,
+        from: String,
+        capability: String,
+        name: Option<String>,
+    },
+
     #[error("binding references unknown child `#{child}`")]
     #[diagnostic(code(manifest::unknown_binding_child))]
     UnknownBindingChild { child: String },
@@ -1618,6 +1631,43 @@ fn resolve_binding_source(
     }
 }
 
+fn binding_target_parts(target: &BindingTarget) -> (String, String) {
+    let to = match target {
+        BindingTarget::SelfSlot(_) => "self".to_string(),
+        BindingTarget::ChildSlot { child, .. } => format!("#{child}"),
+    };
+    let slot = match target {
+        BindingTarget::SelfSlot(name) => name.to_string(),
+        BindingTarget::ChildSlot { slot, .. } => slot.to_string(),
+    };
+    (to, slot)
+}
+
+fn binding_source_parts(source: &BindingSource) -> (String, String) {
+    match source {
+        BindingSource::SelfProvide(name) => ("self".to_string(), name.to_string()),
+        BindingSource::ChildExport { child, export } => (format!("#{child}"), export.to_string()),
+        BindingSource::Framework(name) => ("framework".to_string(), name.to_string()),
+    }
+}
+
+fn is_self_binding(target: &BindingTarget, source: &BindingSource) -> bool {
+    match (target, source) {
+        (BindingTarget::SelfSlot(_), BindingSource::SelfProvide(_)) => true,
+        (
+            BindingTarget::ChildSlot {
+                child: target_child,
+                ..
+            },
+            BindingSource::ChildExport {
+                child: source_child,
+                ..
+            },
+        ) => target_child == source_child,
+        _ => false,
+    }
+}
+
 fn build_bindings(
     bindings: BTreeSet<RawBinding>,
     ctx: &ValidateCtx<'_>,
@@ -1660,16 +1710,21 @@ fn build_bindings(
 
         let target = resolve_binding_target(ctx, to, slot)?;
         let source = resolve_binding_source(ctx, from, capability)?;
+        let (to, slot) = binding_target_parts(&target);
+
+        if is_self_binding(&target, &source) {
+            let (from, capability) = binding_source_parts(&source);
+            let name_value = name.as_ref().map(|name| name.to_string());
+            return Err(Error::SelfBinding {
+                to,
+                slot,
+                from,
+                capability,
+                name: name_value,
+            });
+        }
 
         if bindings_out.contains_key(&target) {
-            let to = match &target {
-                BindingTarget::SelfSlot(_) => "self".to_string(),
-                BindingTarget::ChildSlot { child, .. } => format!("#{child}"),
-            };
-            let slot = match &target {
-                BindingTarget::SelfSlot(name) => name.to_string(),
-                BindingTarget::ChildSlot { slot, .. } => slot.to_string(),
-            };
             return Err(Error::DuplicateBindingTarget { to, slot });
         }
 

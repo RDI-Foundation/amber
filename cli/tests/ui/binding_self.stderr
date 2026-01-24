@@ -1,0 +1,12 @@
+Error: manifest::self_binding
+
+  × check failed
+  ╰─▶ binding connects `self` to itself
+    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/binding_self.json5:19:5]
+ 18 │   bindings: [
+ 19 │     { to: "self.backend", from: "self.api" },
+    ·     ────────────────────┬───────────────────
+    ·                         ╰── self-binding here
+ 20 │   ],
+    ╰────
+  help: bindings must connect different components
