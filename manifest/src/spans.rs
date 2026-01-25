@@ -526,3 +526,71 @@ fn push_json_pointer_segment(out: &mut String, segment: &str) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn span_text(source: &str, span: SourceSpan) -> &str {
+        let start = span.offset();
+        let end = start + span.len();
+        source.get(start..end).expect("span within source")
+    }
+
+    #[test]
+    fn span_for_json_pointer_finds_nested_values() {
+        let source = r#"{ foo: { bar: 42, list: ["a", "b"] } }"#;
+        let root: SourceSpan = (0usize, source.len()).into();
+
+        let bar = span_for_json_pointer(source, root, "/foo/bar").unwrap();
+        assert_eq!(span_text(source, bar).trim(), "42");
+
+        let list_1 = span_for_json_pointer(source, root, "/foo/list/1").unwrap();
+        assert_eq!(span_text(source, list_1).trim(), "\"b\"");
+    }
+
+    #[test]
+    fn span_for_json_pointer_unescapes_segments() {
+        let source = r#"{ "~": { "/": 1 } }"#;
+        let root: SourceSpan = (0usize, source.len()).into();
+
+        let span = span_for_json_pointer(source, root, "/~0/~1").unwrap();
+        assert_eq!(span_text(source, span).trim(), "1");
+    }
+
+    #[test]
+    fn manifest_spans_capture_program_endpoint_names() {
+        let source = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "example",
+            network: {
+              endpoints: [
+                { name: "http", port: 80 },
+                { name: "admin", port: 8080 },
+              ],
+            },
+          },
+        }
+        "#;
+        let spans = ManifestSpans::parse(source);
+        let program = spans.program.expect("program spans");
+
+        let http_span = program
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.name.as_ref() == "http")
+            .map(|endpoint| endpoint.name_span)
+            .expect("http endpoint span");
+        assert_eq!(span_text(source, http_span), "\"http\"");
+
+        let admin_span = program
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.name.as_ref() == "admin")
+            .map(|endpoint| endpoint.name_span)
+            .expect("admin endpoint span");
+        assert_eq!(span_text(source, admin_span), "\"admin\"");
+    }
+}

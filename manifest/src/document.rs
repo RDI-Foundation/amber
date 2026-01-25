@@ -543,3 +543,319 @@ fn binding_target_key_for_span(span: &crate::BindingSpans) -> Option<crate::Bind
     let to = span.to_value.as_deref()?;
     crate::binding_target_key_for_binding(to, span.slot_value.as_deref())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use miette::Diagnostic as _;
+
+    use super::*;
+
+    fn labeled_span_text<'a>(source: &'a str, label: &miette::LabeledSpan) -> &'a str {
+        let start = label.offset();
+        let end = start + label.len();
+        source.get(start..end).expect("label span within source")
+    }
+
+    #[test]
+    fn binding_unknown_field_points_to_key() {
+        let source = r##"
+        {
+          manifest_version: "0.1.0",
+          bindings: [
+            { to: "#green.llm", form: "#green_router.llm" },
+          ],
+        }
+        "##;
+
+        let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+        let labels: Vec<_> = err.labels().unwrap().collect();
+        assert_eq!(labels.len(), 1);
+
+        let label = &labels[0];
+        let offset = source.find("form").unwrap();
+        assert_eq!(label.offset(), offset);
+        assert_eq!(label.len(), "form".len());
+    }
+
+    #[test]
+    fn binding_dot_form_error_points_to_offending_field() {
+        let source = r##"
+        {
+          manifest_version: "0.1.0",
+          bindings: [
+            { to: "#a.s", from: "#b" },
+          ],
+        }
+        "##;
+
+        let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+        let labels: Vec<_> = err.labels().unwrap().collect();
+        assert_eq!(labels.len(), 1);
+
+        let label = &labels[0];
+        let offset = source.find("\"#b\"").unwrap();
+        assert_eq!(label.offset(), offset);
+        assert_eq!(label.len(), "\"#b\"".len());
+    }
+
+    #[test]
+    fn binding_missing_capability_points_to_slot_value() {
+        let source = r#"
+        {
+          manifest_version: "0.1.0",
+          bindings: [
+            { to: "self", slot: "s", from: "self" },
+          ],
+        }
+        "#;
+
+        let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+        let labels: Vec<_> = err.labels().unwrap().collect();
+        assert_eq!(labels.len(), 1);
+
+        let label = &labels[0];
+        let offset = source.find("\"s\"").unwrap();
+        assert_eq!(label.offset(), offset);
+        assert_eq!(label.len(), "\"s\"".len());
+    }
+
+    #[test]
+    fn binding_missing_slot_points_to_capability_value() {
+        let source = r#"
+        {
+          manifest_version: "0.1.0",
+          bindings: [
+            { to: "self", from: "self", capability: "c" },
+          ],
+        }
+        "#;
+
+        let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+        let labels: Vec<_> = err.labels().unwrap().collect();
+        assert_eq!(labels.len(), 1);
+
+        let label = &labels[0];
+        let offset = source.find("\"c\"").unwrap();
+        assert_eq!(label.offset(), offset);
+        assert_eq!(label.len(), "\"c\"".len());
+    }
+
+    #[test]
+    fn program_unknown_field_points_to_key() {
+        let source = r##"
+        {
+          manifest_version: "0.1.0",
+          program: { imag: "x" }
+        }
+        "##;
+
+        let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+        let labels: Vec<_> = err.labels().unwrap().collect();
+        assert_eq!(labels.len(), 1);
+
+        let label = &labels[0];
+        let offset = source.find("imag").unwrap();
+        assert_eq!(label.offset(), offset);
+        assert_eq!(label.len(), "imag".len());
+    }
+
+    #[test]
+    fn json5_missing_close_bracket_points_to_array_open() {
+        let source = r#"
+        {
+          manifest_version: "0.1.0",
+          bindings: [
+            { to: "self.a", from: "self.b" }
+        "#;
+
+        let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+        let labels: Vec<_> = err.labels().unwrap().collect();
+        assert_eq!(labels.len(), 1);
+
+        let label = &labels[0];
+        let offset = source.find('[').unwrap();
+        assert_eq!(label.offset(), offset);
+    }
+
+    #[test]
+    fn json5_missing_close_brace_ignores_comment_and_string() {
+        let source = r#"
+        {
+          // { brace in comment should be ignored
+          manifest_version: "0.1.0",
+          program: { image: "{not", args: [] }
+        "#;
+
+        let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+        let labels: Vec<_> = err.labels().unwrap().collect();
+        assert_eq!(labels.len(), 1);
+
+        let label = &labels[0];
+        let offset = source.find('{').unwrap();
+        assert_eq!(label.offset(), offset);
+    }
+
+    #[test]
+    fn components_bool_type_error_points_to_value() {
+        let source = r#"
+        {
+          manifest_version: "0.1.0",
+          components: true,
+        }
+        "#;
+
+        let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+        assert!(err.to_string().contains("expected object, found boolean"));
+
+        let labels: Vec<_> = err.labels().unwrap().collect();
+        assert_eq!(labels.len(), 1);
+
+        let label = &labels[0];
+        let offset = source.find("true").unwrap();
+        assert_eq!(label.offset(), offset);
+        assert_eq!(label.len(), "true".len());
+    }
+
+    #[test]
+    fn missing_manifest_version_has_fix_suggestion() {
+        let source = r#"{ }"#;
+
+        let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+        let help = err.help().unwrap().to_string();
+        assert!(help.contains("manifest_version"));
+        assert!(help.contains("\"0.1.0\""));
+    }
+
+    #[test]
+    fn manifest_doc_error_unknown_export_target_points_to_target() {
+        let source = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          provides: {
+            api: { kind: "http", endpoint: "endpoint" },
+          },
+          exports: { public: "missing" },
+        }
+        "#;
+        let source: Arc<str> = Arc::from(source);
+        let err = ParsedManifest::parse_named("<test>", Arc::clone(&source)).unwrap_err();
+        assert!(matches!(err.kind, crate::Error::UnknownExportTarget { .. }));
+
+        let labels: Vec<_> = err.labels().expect("labels").collect();
+        let has_target = labels
+            .iter()
+            .any(|label| labeled_span_text(source.as_ref(), label).trim() == "\"missing\"");
+        assert!(has_target);
+    }
+
+    #[test]
+    fn duplicate_binding_target_error_shows_both_sites() {
+        let source = r##"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            a: "https://example.com/a",
+            b: "https://example.com/b",
+            c: "https://example.com/c",
+          },
+          bindings: [
+            { to: "#a.s", from: "#b.c" },
+            { to: "#a.s", from: "#c.d" },
+          ],
+        }
+        "##;
+
+        let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
+        let labels: Vec<_> = err.labels().unwrap().collect();
+        assert!(labels.len() >= 2);
+
+        let starts: Vec<_> = source
+            .match_indices("{ to: \"#a.s\"")
+            .map(|(idx, _)| idx)
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert!(labels.iter().any(|l| l.offset() == starts[0]));
+        assert!(labels.iter().any(|l| l.offset() == starts[1]));
+    }
+
+    #[test]
+    fn manifest_doc_error_duplicate_binding_target_marks_second_binding() {
+        let source = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            network: { endpoints: [{ name: "a", port: 80 }, { name: "b", port: 81 }] },
+          },
+          slots: {
+            api: { kind: "http" },
+          },
+          provides: {
+            a: { kind: "http", endpoint: "a" },
+            b: { kind: "http", endpoint: "b" },
+          },
+          bindings: [
+            { to: "self.api", from: "self.a" },
+            { to: "self.api", from: "self.b" },
+          ],
+        }
+        "#;
+        let source: Arc<str> = Arc::from(source);
+        let err = ParsedManifest::parse_named("<test>", Arc::clone(&source)).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            crate::Error::DuplicateBindingTarget { .. }
+        ));
+
+        let labels: Vec<_> = err.labels().expect("labels").collect();
+        let second = labels
+            .iter()
+            .find(|label| label.label() == Some("second binding here"))
+            .expect("second binding label");
+        let second_text = labeled_span_text(source.as_ref(), second);
+        assert!(second_text.contains("self.b"));
+    }
+
+    #[test]
+    fn manifest_doc_error_duplicate_binding_name_marks_second_binding() {
+        let source = r##"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            a: "https://example.com/a",
+            b: "https://example.com/b",
+          },
+          bindings: [
+            { name: "dup", to: "#a.s", from: "#b.c" },
+            { name: "dup", to: "#a.t", from: "#b.d" },
+          ],
+        }
+        "##;
+        let source: Arc<str> = Arc::from(source);
+        let err = ParsedManifest::parse_named("<test>", Arc::clone(&source)).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            crate::Error::DuplicateBindingName { .. }
+        ));
+
+        let labels: Vec<_> = err.labels().expect("labels").collect();
+        let second = labels
+            .iter()
+            .find(|label| label.label() == Some("second binding name here"))
+            .expect("second binding name label");
+        let starts: Vec<_> = source
+            .match_indices("\"dup\"")
+            .map(|(idx, _)| idx)
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(second.offset(), starts[1]);
+    }
+}

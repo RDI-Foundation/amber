@@ -381,3 +381,297 @@ pub fn lint_manifest(
 
     lints
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::{Manifest, ManifestSpans, RawManifest};
+
+    fn lint_for(input: &str, manifest: &Manifest) -> Vec<crate::lint::ManifestLint> {
+        let source: Arc<str> = input.into();
+        let spans = ManifestSpans::parse(&source);
+        let src = miette::NamedSource::new("<test>", Arc::clone(&source)).with_language("json5");
+        crate::lint::lint_manifest(manifest, "/", src, &spans)
+    }
+
+    fn parse_raw(input: &str) -> RawManifest {
+        amber_json5::parse(input).unwrap()
+    }
+
+    #[test]
+    fn environment_duplicate_resolvers_are_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.1.0",
+          environments: {
+            a: { resolvers: ["x", "x"] },
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::DuplicateEnvironmentResolver { environment, resolver, .. }
+                if environment == "a" && resolver == "x"
+        )));
+    }
+
+    #[test]
+    fn unused_slot_is_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { llm: { kind: "llm" } },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedSlot { name, .. } if name == "llm"
+        )));
+    }
+
+    #[test]
+    fn unused_config_is_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              domain: { type: "string" },
+              num_trials: { type: "integer" },
+            },
+          },
+          program: {
+            image: "x",
+            args: ["--domain", "${config.domain}"],
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedConfig { path, .. } if path == "num_trials"
+        )));
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedConfig { path, .. } if path == "domain"
+        )));
+    }
+
+    #[test]
+    fn config_used_in_component_config_is_not_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              token: { type: "string" },
+            },
+          },
+          components: {
+            child: {
+              manifest: "https://example.com/child",
+              config: { token: "${config.token}" },
+            },
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedConfig { path, .. } if path == "token"
+        )));
+    }
+
+    #[test]
+    fn config_lint_incomplete_is_reported() {
+        let manifest = Manifest::builder()
+            .config_schema(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "loop": { "$ref": "#/properties/loop" },
+                },
+            }))
+            .build()
+            .unwrap();
+
+        let input = r#"{ manifest_version: "0.1.0" }"#;
+        let lints = lint_for(input, &manifest);
+        assert!(
+            lints
+                .iter()
+                .any(|lint| matches!(lint, crate::lint::ManifestLint::ConfigLintIncomplete { .. }))
+        );
+    }
+
+    #[test]
+    fn slot_used_in_program_args_is_not_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { llm: { kind: "llm" } },
+          program: {
+            image: "x",
+            args: ["--llm", "${slots.llm.url}"],
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedSlot { name, .. } if name == "llm"
+        )));
+    }
+
+    #[test]
+    fn slot_used_in_program_env_is_not_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { llm: { kind: "llm" } },
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            env: { LLM_URL: "${slots.llm.url}" },
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedSlot { name, .. } if name == "llm"
+        )));
+    }
+
+    #[test]
+    fn unused_provide_is_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          provides: { api: { kind: "http", endpoint: "endpoint" } },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedProvide { name, .. } if name == "api"
+        )));
+    }
+
+    #[test]
+    fn unused_program_is_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.1.0",
+          program: { image: "x", entrypoint: ["x"] },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(
+            lints
+                .iter()
+                .any(|lint| matches!(lint, crate::lint::ManifestLint::UnusedProgram { .. }))
+        );
+    }
+
+    #[test]
+    fn program_used_by_binding_is_not_linted() {
+        let input = r##"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          components: {
+            worker: "https://example.com/worker",
+          },
+          provides: { api: { kind: "http", endpoint: "endpoint" } },
+          bindings: [
+            { to: "#worker.api", from: "self.api" },
+          ],
+        }
+        "##;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(
+            !lints
+                .iter()
+                .any(|lint| matches!(lint, crate::lint::ManifestLint::UnusedProgram { .. }))
+        );
+    }
+
+    #[test]
+    fn program_used_by_export_is_not_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          provides: { api: { kind: "http", endpoint: "endpoint" } },
+          exports: { api: "api" },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(
+            !lints
+                .iter()
+                .any(|lint| matches!(lint, crate::lint::ManifestLint::UnusedProgram { .. }))
+        );
+    }
+
+    #[test]
+    fn exported_provide_is_not_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          provides: {
+            api: { kind: "http", endpoint: "endpoint" },
+          },
+          exports: { public: "api" },
+        }
+        "#;
+        let raw = parse_raw(input);
+
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(lints.is_empty());
+    }
+}
