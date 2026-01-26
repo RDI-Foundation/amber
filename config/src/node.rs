@@ -213,6 +213,13 @@ pub enum RootConfigTemplate {
 }
 
 impl RootConfigTemplate {
+    pub fn node(&self) -> Option<&ConfigNode> {
+        match self {
+            RootConfigTemplate::Root => None,
+            RootConfigTemplate::Node(node) => Some(node),
+        }
+    }
+
     pub fn to_template_payload(&self) -> ConfigTemplatePayload {
         match self {
             RootConfigTemplate::Root => ConfigTemplatePayload::Root,

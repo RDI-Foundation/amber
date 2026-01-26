@@ -607,10 +607,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         let bindings = binding_values_by_component.get(id).unwrap();
 
         // Root-only composed config template (if available). Root component uses runtime root config.
-        let template_opt: Option<&rc::ConfigNode> = match resolved_templates.get(id) {
-            Some(rc::RootConfigTemplate::Node(node)) => Some(node),
-            _ => None,
-        };
+        let template_opt = resolved_templates.get(id).and_then(|t| t.node());
 
         // Build template spec with slots resolved and config either resolved (static) or preserved.
         let mut entrypoint_ts: Vec<TemplateString> = Vec::new();

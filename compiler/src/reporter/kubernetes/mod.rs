@@ -350,10 +350,7 @@ fn render_kubernetes(
         })?;
 
         // Get the config node for template resolution.
-        let template_opt: Option<&rc::ConfigNode> = match component_template {
-            rc::RootConfigTemplate::Node(node) => Some(node),
-            rc::RootConfigTemplate::Root => None,
-        };
+        let template_opt = component_template.node();
 
         let component_schema = manifests[id.0]
             .as_ref()
@@ -387,8 +384,8 @@ fn render_kubernetes(
     // If any component needs helper, generate root config Secret/ConfigMap and .env templates.
     if any_helper {
         // Separate root leaves into secret and non-secret.
-        let secret_leaves: Vec<_> = root_leaves.iter().filter(|l| l.secret).collect();
-        let config_leaves: Vec<_> = root_leaves.iter().filter(|l| !l.secret).collect();
+        let (secret_leaves, config_leaves): (Vec<_>, Vec<_>) =
+            root_leaves.iter().partition(|l| l.secret);
 
         // Add secretGenerator for secret config values.
         if !secret_leaves.is_empty() {

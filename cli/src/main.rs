@@ -549,18 +549,10 @@ fn resolve_bundle_root(args: &CompileArgs) -> Result<Option<PathBuf>> {
 
 fn prepare_bundle_dir(path: &Path) -> Result<()> {
     if path.exists() {
-        if path.is_dir() {
-            std::fs::remove_dir_all(path)
-                .into_diagnostic()
-                .wrap_err_with(|| {
-                    format!("failed to remove bundle directory `{}`", path.display())
-                })?;
-        } else {
-            return Err(miette::miette!(
-                "bundle output path `{}` is not a directory",
-                path.display()
-            ));
-        }
+        return Err(miette::miette!(
+            "bundle output directory `{}` already exists; please delete it first",
+            path.display()
+        ));
     }
 
     std::fs::create_dir_all(path)
