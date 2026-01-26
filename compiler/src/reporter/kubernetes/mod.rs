@@ -8,7 +8,7 @@ use std::{
 
 use amber_config as rc;
 use amber_manifest::{BindingTarget, InterpolatedPart, InterpolationSource, Manifest};
-use amber_scenario::{ComponentId, Scenario};
+use amber_scenario::{BindingFrom, ComponentId, ProvideRef, Scenario};
 use amber_template::{ProgramTemplateSpec, TemplatePart, TemplateSpec, TemplateString};
 use base64::Engine as _;
 pub use resources::*;
@@ -173,13 +173,26 @@ fn render_kubernetes(
         );
     }
 
+    // Validate: framework bindings are not supported.
+    for b in &s.bindings {
+        if let BindingFrom::Framework(name) = &b.from {
+            return Err(ReporterError::new(format!(
+                "kubernetes reporter does not support framework binding `framework.{name}` \
+                 (bound to {}.{})",
+                component_label(s, b.to.component),
+                b.to.name
+            )));
+        }
+    }
+
     // Validate: every binding endpoint is between program components.
     for b in &s.bindings {
-        if s.component(b.from.component).program.is_none() {
+        let from = binding_from_component(&b.from);
+        if s.component(from.component).program.is_none() {
             return Err(ReporterError::new(format!(
                 "binding source {}.{} is not runnable (component has no program)",
-                component_label(s, b.from.component),
-                b.from.name
+                component_label(s, from.component),
+                from.name
             )));
         }
         if s.component(b.to.component).program.is_none() {
@@ -216,10 +229,11 @@ fn render_kubernetes(
     let mut inbound_allow: HashMap<ComponentId, Vec<(ComponentId, u16)>> = HashMap::new();
 
     for b in &s.bindings {
-        let provider = b.from.component;
+        let from = binding_from_component(&b.from);
+        let provider = from.component;
         let consumer = b.to.component;
 
-        let endpoint_port = resolve_provide_endpoint(s, provider, &b.from.name)?;
+        let endpoint_port = resolve_provide_endpoint(s, provider, &from.name)?;
         let provider_names = names.get(&provider).ok_or_else(|| {
             ReporterError::new(format!(
                 "internal error: missing names for provider {}",
@@ -1848,6 +1862,15 @@ while true; do echo "ready" | nc -l -p 8080 >/dev/null; done
         ("client-deployment.yaml", to_yaml(&client_deployment)),
         ("client-service.yaml", to_yaml(&client_service)),
     ]
+}
+
+fn binding_from_component(from: &BindingFrom) -> &ProvideRef {
+    match from {
+        BindingFrom::Component(provide) => provide,
+        BindingFrom::Framework(name) => {
+            unreachable!("framework binding framework.{name} should be rejected earlier")
+        }
+    }
 }
 
 fn to_yaml<T: Serialize>(value: &T) -> Result<String, ReporterError> {
