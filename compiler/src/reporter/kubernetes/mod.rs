@@ -177,8 +177,8 @@ fn render_kubernetes(
     for b in &s.bindings {
         if let BindingFrom::Framework(name) = &b.from {
             return Err(ReporterError::new(format!(
-                "kubernetes reporter does not support framework binding `framework.{name}` \
-                 (bound to {}.{})",
+                "kubernetes reporter does not support framework binding `framework.{name}` (bound \
+                 to {}.{})",
                 component_label(s, b.to.component),
                 b.to.name
             )));
@@ -299,8 +299,8 @@ fn render_kubernetes(
         ReporterError::new(format!("failed to compose component config templates: {e}"))
     })?;
 
-    let binding_urls_by_scope =
-        binding_urls_by_scope(s, &manifests, &slot_values_by_component).map_err(ReporterError::new)?;
+    let binding_urls_by_scope = binding_urls_by_scope(s, &manifests, &slot_values_by_component)
+        .map_err(ReporterError::new)?;
 
     let resolved_templates =
         resolve_binding_templates(composed_templates, &binding_urls_by_scope, s)
@@ -1229,7 +1229,9 @@ fn compose_templates_dfs(
 /// Collect all config paths referenced in a RootConfigTemplate.
 /// Returns None if the template is Root (indicating all config should be provided).
 /// Returns Some(paths) with the specific paths referenced in the template.
-fn collect_config_refs(template: &rc::RootConfigTemplate) -> Option<std::collections::BTreeSet<String>> {
+fn collect_config_refs(
+    template: &rc::RootConfigTemplate,
+) -> Option<std::collections::BTreeSet<String>> {
     use std::collections::BTreeSet;
 
     fn collect_from_node(node: &rc::ConfigNode, acc: &mut BTreeSet<String>) {

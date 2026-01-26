@@ -92,8 +92,9 @@ fn test_schema_leaf_secret_field() {
 
 #[test]
 fn test_collect_config_refs() {
-    use amber_template::TemplatePart;
     use std::collections::BTreeMap;
+
+    use amber_template::TemplatePart;
 
     // Test with Root template - should return None (all config needed)
     let root_template = rc::RootConfigTemplate::Root;
@@ -131,7 +132,10 @@ fn test_collect_config_refs() {
 
     let mut outer_map = BTreeMap::new();
     outer_map.insert("database".to_string(), rc::ConfigNode::Object(inner_map));
-    outer_map.insert("static".to_string(), rc::ConfigNode::String("value".to_string()));
+    outer_map.insert(
+        "static".to_string(),
+        rc::ConfigNode::String("value".to_string()),
+    );
 
     let nested_template = rc::RootConfigTemplate::Node(rc::ConfigNode::Object(outer_map));
     let paths = collect_config_refs(&nested_template).expect("should have paths");
