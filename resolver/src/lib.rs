@@ -1,3 +1,5 @@
+#![feature(once_cell_try)]
+
 pub mod file;
 pub mod http;
 pub mod remote;

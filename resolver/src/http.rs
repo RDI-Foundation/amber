@@ -1,4 +1,8 @@
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    io,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use futures::StreamExt;
 use reqwest::header::CONTENT_TYPE;
@@ -8,31 +12,40 @@ use super::{Error, Resolution};
 
 #[derive(Clone, Debug)]
 pub struct HttpResolver {
-    client: reqwest::Client,
+    client: Arc<OnceLock<reqwest::Client>>,
     options: HttpResolverOptions,
 }
 
 impl HttpResolver {
     pub fn new() -> Self {
         Self::with_options(HttpResolverOptions::default())
-            .expect("default http resolver configuration failed")
+    }
+
+    pub fn with_options(options: HttpResolverOptions) -> Self {
+        Self {
+            client: Arc::new(OnceLock::new()),
+            options,
+        }
     }
 
     #[allow(clippy::result_large_err)]
-    pub fn with_options(options: HttpResolverOptions) -> Result<Self, Error> {
-        let mut builder = reqwest::Client::builder()
-            .connect_timeout(options.connect_timeout)
-            .timeout(options.request_timeout);
-        if let Some(read_timeout) = options.read_timeout {
-            builder = builder.read_timeout(read_timeout);
-        }
-        let client = builder.build()?;
-        Ok(Self { client, options })
+    fn client(&self) -> Result<&reqwest::Client, Error> {
+        self.client
+            .get_or_try_init(|| {
+                let mut builder = reqwest::Client::builder()
+                    .connect_timeout(self.options.connect_timeout)
+                    .timeout(self.options.request_timeout);
+                if let Some(read_timeout) = self.options.read_timeout {
+                    builder = builder.read_timeout(read_timeout);
+                }
+                builder.build()
+            })
+            .map_err(Error::from)
     }
 
     pub(super) async fn resolve_url(&self, url: &Url) -> Result<Resolution, Error> {
         let res = self
-            .client
+            .client()?
             .get(url.clone())
             .send()
             .await?
