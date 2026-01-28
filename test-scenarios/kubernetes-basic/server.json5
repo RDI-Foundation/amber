@@ -1,0 +1,48 @@
+{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      runtime_secret: { type: "string", secret: true },
+      runtime_config: { type: "string", },
+      static_secret: { type: "string", secret: true },
+      static_config: { type: "string", },
+    },
+    required: [
+      "runtime_secret",
+      "runtime_config",
+      "static_secret",
+      "static_config",
+    ],
+  },
+  program: {
+    image: "busybox:1.36",
+    args: [
+      "sh",
+      "-eu",
+      "-c",
+      "\
+        mkdir content\n\
+        cd content\n\
+        printf '%s\n' \"$RUNTIME_SECRET\" >runtime_secret.txt\n\
+        printf '%s\n' '${config.runtime_config}' >runtime_config.txt\n\
+        printf '%s\n' \"$STATIC_SECRET\" >static_secret.txt\n\
+        printf '%s\n' '${config.static_config}' >static_config.txt\n\
+        httpd -f -p 8080\n\
+      ",
+    ],
+    env: {
+      RUNTIME_SECRET: "${config.runtime_secret}",
+      STATIC_SECRET: "${config.static_secret}",
+    },
+    network: {
+      endpoints: [{ name: "http", port: 8080 }],
+    },
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" },
+  },
+  exports: {
+    http: "http",
+  },
+}

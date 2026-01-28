@@ -41,6 +41,82 @@ jobs:
       - run: cargo test -p amber-compiler --all-features docker_smoke_config_forwarding_runtime_validation -- --ignored --test-threads=1
       - run: cargo test -p amber-helper --all-features helper_image_executes_run_plan_in_scratch -- --ignored --test-threads=1
 
+  kubernetes-tests:
+    name: Kubernetes Reporter Tests
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Test Kubernetes reporter with KinD
+        run: |
+          # Compile the test scenario to Kubernetes manifests
+          cargo run -p amber-cli -- compile \
+            test-scenarios/kubernetes-basic/scenario.json5 \
+            --kubernetes target/amber-out/kubernetes
+
+          # Fill in the generated config template files
+          patch target/amber-out/kubernetes/root-config-secret.env <<'EOF'
+          --- a/root-config-secret.env
+          +++ b/root-config-secret.env
+          @@ -1,2 +1,2 @@
+           # Root config secrets - fill in values before deploying
+          -AMBER_CONFIG_SERVER_RUNTIME_SECRET=
+          +AMBER_CONFIG_SERVER_RUNTIME_SECRET=test-secret-value
+          EOF
+
+          patch target/amber-out/kubernetes/root-config.env <<'EOF'
+          --- a/root-config.env
+          +++ b/root-config.env
+          @@ -1,2 +1,2 @@
+           # Root config values - fill in values before deploying
+          -AMBER_CONFIG_SERVER_RUNTIME_CONFIG=
+          +AMBER_CONFIG_SERVER_RUNTIME_CONFIG=test-config-value
+          EOF
+
+          # Build the amber-helper image locally
+          docker build -t ghcr.io/rdi-foundation/amber-helper:v1 -f docker/amber-helper/Dockerfile .
+
+          # Create KinD cluster
+          kind create cluster --name amber-test --wait 120s
+
+          # Load the amber-helper image into KinD
+          kind load docker-image ghcr.io/rdi-foundation/amber-helper:v1 --name amber-test
+
+          # Apply the manifests using kustomize
+          kubectl apply -k target/amber-out/kubernetes
+
+          # Get the namespace that was created
+          NAMESPACE=$(kubectl get namespaces -l app.kubernetes.io/managed-by=amber -o jsonpath='{.items[0].metadata.name}')
+
+          # Wait for deployments to be ready (includes NetworkPolicy enforcement check in init containers)
+          kubectl wait --for=condition=available --timeout=120s \
+            deployment --all -n "${NAMESPACE}"
+
+          # Verify the deployed scenario by fetching files from the client component
+          kubectl port-forward -n "${NAMESPACE}" service/c1-client 8080:8080 &
+          PF_PID=$!
+          sleep 5
+
+          # Fetch the config files
+          RUNTIME_SECRET=$(curl -s http://localhost:8080/runtime_secret.txt)
+          RUNTIME_CONFIG=$(curl -s http://localhost:8080/runtime_config.txt)
+          STATIC_SECRET=$(curl -s http://localhost:8080/static_secret.txt)
+          STATIC_CONFIG=$(curl -s http://localhost:8080/static_config.txt)
+
+          kill $PF_PID
+          wait
+
+          # Verify values match expectations
+          test "$RUNTIME_SECRET" = "test-secret-value"
+          test "$RUNTIME_CONFIG" = "test-config-value"
+          test "$STATIC_SECRET" = "hardcode-this-secret"
+          test "$STATIC_CONFIG" = "hardcode-this-config"
+
   docker-build:
     name: Build Docker Images (${{ matrix.image }} ${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}

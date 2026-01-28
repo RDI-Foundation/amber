@@ -1,0 +1,32 @@
+{
+  manifest_version: "0.1.0",
+  program: {
+    image: "busybox:1.36",
+    args: [
+      "sh",
+      "-eu",
+      "-c",
+      "\
+        mkdir content\n\
+        cd content\n\
+        wget '${slots.server.url}/runtime_secret.txt'\n\
+        wget '${slots.server.url}/runtime_config.txt'\n\
+        wget '${slots.server.url}/static_secret.txt'\n\
+        wget '${slots.server.url}/static_config.txt'\n\
+        httpd -f -p 8080\n\
+      ",
+    ],
+    network: {
+      endpoints: [{ name: "http", port: 8080 }],
+    },
+  },
+  slots: {
+    server: { kind: "http" },
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" },
+  },
+  exports: {
+    http: "http",
+  },
+}
