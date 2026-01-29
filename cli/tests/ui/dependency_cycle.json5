@@ -1,0 +1,11 @@
+{
+  manifest_version: "0.1.0",
+  components: {
+    a: "./dependency_cycle_child_a.json5",
+    b: "./dependency_cycle_child_b.json5",
+  },
+  bindings: [
+    { to: "#a.peer", from: "#b.api" },
+    { to: "#b.peer", from: "#a.api" },
+  ],
+}

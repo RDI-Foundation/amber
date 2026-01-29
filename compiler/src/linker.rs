@@ -510,6 +510,21 @@ pub enum Error {
         component_path: String,
         feature: &'static str,
     },
+
+    #[error("dependency cycle detected: {cycle}")]
+    #[diagnostic(
+        code(linker::dependency_cycle),
+        help("Break the cycle by removing or weakening at least one binding in the cycle.")
+    )]
+    DependencyCycle {
+        cycle: String,
+        #[source_code]
+        src: Option<NamedSource<Arc<str>>>,
+        #[label(primary, "binding here participates in the cycle")]
+        span: Option<SourceSpan>,
+        #[related]
+        related: Vec<RelatedSpan>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -707,6 +722,10 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         exports,
     };
     scenario.normalize_order();
+
+    if let Some(err) = dependency_cycle_error(&scenario, &bindings, &provenance, store) {
+        return Err(err);
+    }
     scenario.assert_invariants();
 
     Ok((scenario, provenance))
@@ -1877,6 +1896,95 @@ fn format_cycle(parts: &[String]) -> String {
     let mut out = parts.to_vec();
     out.push(parts[0].clone());
     out.join(" -> ")
+}
+
+fn dependency_cycle_error(
+    scenario: &Scenario,
+    bindings: &[BindingSpec],
+    provenance: &Provenance,
+    store: &DigestStore,
+) -> Option<Error> {
+    let Err(cycle) = amber_scenario::graph::topo_order(scenario) else {
+        return None;
+    };
+
+    let mut ids = cycle.cycle;
+    if ids.len() > 1 && ids.first() == ids.last() {
+        ids.pop();
+    }
+
+    let mut labels = Vec::with_capacity(ids.len());
+    for id in &ids {
+        labels.push(component_path_for(&scenario.components, *id));
+    }
+    let cycle_str = format_cycle(&labels);
+
+    let mut origin_by_slot: HashMap<SlotRef, BindingOrigin> = HashMap::new();
+    for spec in bindings {
+        origin_by_slot
+            .entry(spec.target.clone())
+            .or_insert(spec.origin.clone());
+    }
+
+    let mut edge_by_pair: HashMap<(ComponentId, ComponentId), SlotRef> = HashMap::new();
+    for binding in &scenario.bindings {
+        let BindingFrom::Component(from) = &binding.from else {
+            continue;
+        };
+        if binding.weak {
+            continue;
+        }
+        if from.component == binding.to.component {
+            continue;
+        }
+        edge_by_pair
+            .entry((from.component, binding.to.component))
+            .or_insert_with(|| binding.to.clone());
+    }
+
+    let mut related = Vec::new();
+    let mut primary: Option<(NamedSource<Arc<str>>, SourceSpan)> = None;
+
+    for idx in 0..ids.len() {
+        let from = ids[idx];
+        let to = ids[(idx + 1) % ids.len()];
+        let Some(slot_ref) = edge_by_pair.get(&(from, to)) else {
+            continue;
+        };
+        let Some(origin) = origin_by_slot.get(slot_ref) else {
+            continue;
+        };
+        let Some((src, span)) = binding_site(provenance, store, origin.realm, &origin.target_key)
+        else {
+            continue;
+        };
+
+        let message = format!(
+            "binding into {}.{} participates in the cycle",
+            component_path_for(&scenario.components, slot_ref.component),
+            slot_ref.name
+        );
+
+        if primary.is_none() {
+            primary = Some((src, span));
+        } else {
+            related.push(RelatedSpan {
+                message,
+                src,
+                span,
+                label: "binding here participates in the cycle".to_string(),
+            });
+        }
+    }
+
+    let (src, span) = primary.map_or((None, None), |(src, span)| (Some(src), Some(span)));
+
+    Some(Error::DependencyCycle {
+        cycle: cycle_str,
+        src,
+        span,
+        related,
+    })
 }
 
 fn resolve_binding_edges(
