@@ -1,0 +1,11 @@
+{
+  manifest_version: "0.1.0",
+  components: {
+    a: "./slot_cycle_child_a.json5",
+    b: "./slot_cycle_child_b.json5",
+  },
+  bindings: [
+    { to: "#a.api", from: "#b.api" },
+    { to: "#b.api", from: "#a.api" },
+  ],
+}

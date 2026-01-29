@@ -782,78 +782,14 @@ async fn binding_interpolation_error_points_to_config_value() {
 }
 
 #[tokio::test]
-async fn duplicate_slot_bindings_across_manifests_error() {
-    let dir = tmp_dir("scenario-duplicate-slot-binding");
-    let root_path = dir.path().join("root.json5");
-    let child_path = dir.path().join("child.json5");
-
-    write_file(
-        &child_path,
-        r#"
-        {
-          manifest_version: "0.1.0",
-          program: {
-            image: "child",
-            entrypoint: ["child"],
-            network: { endpoints: [{ name: "endpoint", port: 80 }] },
-          },
-          slots: { api: { kind: "http" } },
-          provides: { http: { kind: "http", endpoint: "endpoint" } },
-          bindings: [
-            { to: "self.api", from: "self.http" },
-          ],
-        }
-        "#,
-    );
-    write_file(
-        &root_path,
-        &format!(
-            r##"
-            {{
-              manifest_version: "0.1.0",
-              components: {{
-                child: "{child}",
-              }},
-              program: {{
-                image: "root",
-                entrypoint: ["root"],
-                network: {{ endpoints: [{{ name: "endpoint", port: 80 }}] }},
-              }},
-              provides: {{ api: {{ kind: "http", endpoint: "endpoint" }} }},
-              bindings: [
-                {{ to: "#child.api", from: "self.api" }},
-              ],
-            }}
-            "##,
-            child = file_url(&child_path),
-        ),
-    );
-
-    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let root_ref = ManifestRef::from_url(file_url(&root_path));
-
-    let err = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
-        .await
-        .unwrap_err();
-
-    assert!(error_contains(&err, "bound more than once"));
-}
-
-#[tokio::test]
 async fn type_mismatch_reports_expected_and_got() {
     let dir = tmp_dir("scenario-type-mismatch-message");
     let root_path = dir.path().join("root.json5");
-    let child_path = dir.path().join("child.json5");
+    let provider_path = dir.path().join("provider.json5");
+    let consumer_path = dir.path().join("consumer.json5");
 
     write_file(
-        &child_path,
+        &provider_path,
         r#"
         {
           manifest_version: "0.1.0",
@@ -868,21 +804,31 @@ async fn type_mismatch_reports_expected_and_got() {
         "#,
     );
     write_file(
+        &consumer_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { llm: { kind: "llm" } },
+        }
+        "#,
+    );
+    write_file(
         &root_path,
         &format!(
             r##"
             {{
               manifest_version: "0.1.0",
               components: {{
-                child: "{child}",
+                provider: "{provider}",
+                consumer: "{consumer}",
               }},
-              slots: {{ llm: {{ kind: "llm" }} }},
               bindings: [
-                {{ to: "self.llm", from: "#child.http" }},
+                {{ to: "#consumer.llm", from: "#provider.http" }},
               ],
             }}
             "##,
-            child = file_url(&child_path),
+            provider = file_url(&provider_path),
+            consumer = file_url(&consumer_path),
         ),
     );
 
@@ -905,11 +851,222 @@ async fn type_mismatch_reports_expected_and_got() {
 }
 
 #[tokio::test]
+async fn slot_forwarding_and_export_chain_resolve_to_provider() {
+    let dir = tmp_dir("scenario-slot-forwarding");
+    let root_path = dir.path().join("root.json5");
+    let router_path = dir.path().join("router.json5");
+    let gateway_path = dir.path().join("gateway.json5");
+    let consumer_path = dir.path().join("consumer.json5");
+
+    write_file(
+        &gateway_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { api: { kind: "http" } },
+          exports: { public_api: "api" },
+        }
+        "#,
+    );
+    write_file(
+        &router_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              slots: {{ api: {{ kind: "http" }} }},
+              components: {{
+                gateway: "{gateway}",
+              }},
+              bindings: [
+                {{ to: "#gateway.api", from: "self.api" }},
+              ],
+              exports: {{ public_api: "#gateway.public_api" }},
+            }}
+            "##,
+            gateway = file_url(&gateway_path),
+        ),
+    );
+    write_file(
+        &consumer_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { api: { kind: "http" } },
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              program: {{
+                image: "root",
+                entrypoint: ["root"],
+                network: {{ endpoints: [{{ name: "api", port: 80 }}] }},
+              }},
+              provides: {{ api: {{ kind: "http", endpoint: "api" }} }},
+              components: {{
+                router: "{router}",
+                consumer: "{consumer}",
+              }},
+              bindings: [
+                {{ to: "#router.api", from: "self.api" }},
+                {{ to: "#consumer.api", from: "#router.public_api" }},
+              ],
+            }}
+            "##,
+            router = file_url(&router_path),
+            consumer = file_url(&consumer_path),
+        ),
+    );
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+    let output = compiler
+        .compile(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
+            },
+        )
+        .await
+        .unwrap();
+
+    let scenario = &output.scenario;
+    let root = scenario.root;
+    let consumer_id = scenario
+        .components_iter()
+        .find(|(_, c)| c.moniker.as_str() == "/consumer")
+        .map(|(id, _)| id)
+        .expect("consumer component");
+
+    let binding = scenario
+        .bindings
+        .iter()
+        .find(|b| b.to.component == consumer_id && b.to.name == "api")
+        .expect("binding to consumer.api");
+
+    assert!(
+        matches!(
+            &binding.from,
+            BindingFrom::Component(provide)
+                if provide.component == root && provide.name == "api"
+        ),
+        "expected consumer.api bound from root.api, got {:?}",
+        binding.from
+    );
+}
+
+#[tokio::test]
+async fn slot_cycle_reports_error() {
+    let dir = tmp_dir("scenario-slot-cycle");
+    let root_path = dir.path().join("root.json5");
+    let a_path = dir.path().join("a.json5");
+    let b_path = dir.path().join("b.json5");
+
+    write_file(
+        &a_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { api: { kind: "http" } },
+          exports: { api: "api" },
+        }
+        "#,
+    );
+    write_file(
+        &b_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { api: { kind: "http" } },
+          exports: { api: "api" },
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              components: {{
+                a: "{a}",
+                b: "{b}",
+              }},
+              bindings: [
+                {{ to: "#a.api", from: "#b.api" }},
+                {{ to: "#b.api", from: "#a.api" }},
+              ],
+            }}
+            "##,
+            a = file_url(&a_path),
+            b = file_url(&b_path),
+        ),
+    );
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+    let err = compiler
+        .compile(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error_contains(&err, "slot routing cycle detected"));
+}
+
+#[tokio::test]
+async fn exporting_unbound_optional_slot_errors() {
+    let dir = tmp_dir("scenario-export-unbound-slot");
+    let root_path = dir.path().join("root.json5");
+
+    write_file(
+        &root_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { api: { kind: "http", optional: true } },
+          exports: { api: "api" },
+        }
+        "#,
+    );
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+    let err = compiler
+        .compile(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error_contains(
+        &err,
+        "export `api` on root component resolves to unbound slot `api`"
+    ));
+}
+
+#[tokio::test]
 async fn delegated_export_chain_resolves_binding_source() {
     let dir = tmp_dir("scenario-delegated-export-chain");
     let root_path = dir.path().join("root.json5");
     let child_path = dir.path().join("child.json5");
     let grand_path = dir.path().join("grand.json5");
+    let consumer_path = dir.path().join("consumer.json5");
 
     write_file(
         &grand_path,
@@ -942,6 +1099,15 @@ async fn delegated_export_chain_resolves_binding_source() {
         ),
     );
     write_file(
+        &consumer_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { api: { kind: "http" } },
+        }
+        "#,
+    );
+    write_file(
         &root_path,
         &format!(
             r##"
@@ -949,14 +1115,15 @@ async fn delegated_export_chain_resolves_binding_source() {
               manifest_version: "0.1.0",
               components: {{
                 child: "{child}",
+                consumer: "{consumer}",
               }},
-              slots: {{ api: {{ kind: "http" }} }},
               bindings: [
-                {{ to: "self.api", from: "#child.api" }},
+                {{ to: "#consumer.api", from: "#child.api" }},
               ],
             }}
             "##,
             child = file_url(&child_path),
+            consumer = file_url(&consumer_path),
         ),
     );
 
@@ -974,7 +1141,19 @@ async fn delegated_export_chain_resolves_binding_source() {
         .await
         .unwrap();
 
-    let binding = compilation.scenario.bindings.first().expect("binding");
+    let consumer_id = compilation
+        .scenario
+        .components_iter()
+        .find(|(_, c)| c.moniker.as_str() == "/consumer")
+        .map(|(id, _)| id)
+        .expect("consumer component");
+
+    let binding = compilation
+        .scenario
+        .bindings
+        .iter()
+        .find(|b| b.to.component == consumer_id && b.to.name == "api")
+        .expect("binding");
     let from = match &binding.from {
         BindingFrom::Component(from) => from,
         BindingFrom::Framework(name) => {

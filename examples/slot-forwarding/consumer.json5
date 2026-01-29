@@ -1,0 +1,22 @@
+{
+  manifest_version: "0.1.0",
+  program: {
+    image: "example/consumer",
+    entrypoint: ["sleep", "infinity"],
+    env: {
+      API_URL: "${slots.api.url}",
+    },
+    network: {
+      endpoints: [{ name: "public", port: 9000 }],
+    },
+  },
+  slots: {
+    api: { kind: "http" },
+  },
+  provides: {
+    public: { kind: "http", endpoint: "public" },
+  },
+  exports: {
+    public: "public",
+  },
+}

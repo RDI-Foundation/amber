@@ -13,13 +13,13 @@
       ],
     },
   },
-  slots: {
-    backend: { kind: "http" },
+  components: {
+    backend: "./binding_interpolation_unknown_binding_child.json5",
   },
   provides: {
     api: { kind: "http", endpoint: "http" },
   },
   bindings: [
-    { name: "backend", to: "self.backend", from: "self.api" },
+    { name: "backend", to: "#backend.backend", from: "self.api" },
   ],
 }

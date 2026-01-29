@@ -8,7 +8,7 @@ linker::type_mismatch
     :                               `-- binding provides `http` to slot expecting `llm`
  33 |   ],
     `----
-  help: Bind a provide of type `llm` to `/green_router/wrapper.litellm`, or change the slot/provide `kind`/`profile` so they match.
+  help: Bind a capability of type `llm` to `/green_router/wrapper.litellm`, or change the slot/capability `kind`/`profile` so they match.
 
 Advice: 
   > slot `litellm` declared on /green_router/wrapper
@@ -39,7 +39,7 @@ linker::type_mismatch
     :                               `-- binding provides `http` to slot expecting `llm`
  33 |   ],
     `----
-  help: Bind a provide of type `llm` to `/purple_router/wrapper.litellm`, or change the slot/provide `kind`/`profile` so they match.
+  help: Bind a capability of type `llm` to `/purple_router/wrapper.litellm`, or change the slot/capability `kind`/`profile` so they match.
 
 Advice: 
   > slot `litellm` declared on /purple_router/wrapper

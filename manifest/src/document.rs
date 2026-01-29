@@ -131,9 +131,11 @@ fn labels_for_manifest_error(err: &ManifestError, spans: &ManifestSpans) -> Vec<
         ManifestError::DuplicateBindingName { name } => {
             labels_for_duplicate_binding_name(spans, name)
         }
-        ManifestError::UnknownBindingSlot { slot } => labels_for_unknown_binding_slot(spans, slot),
-        ManifestError::UnknownBindingProvide { capability } => {
-            labels_for_unknown_binding_provide(spans, capability)
+        ManifestError::BindingTargetSelfSlot { slot } => {
+            labels_for_binding_target_self(spans, slot)
+        }
+        ManifestError::UnknownBindingSource { capability } => {
+            labels_for_unknown_binding_source(spans, capability)
         }
         ManifestError::UnknownBindingChild { child } => {
             labels_for_unknown_binding_child(spans, child)
@@ -284,7 +286,7 @@ fn labels_for_duplicate_binding_target(
         )];
     };
 
-    let matches: Vec<_> = spans
+    let mut matches: Vec<_> = spans
         .bindings_by_index
         .iter()
         .filter(|b| {
@@ -294,6 +296,22 @@ fn labels_for_duplicate_binding_target(
         })
         .map(|b| b.whole)
         .collect();
+    if matches.len() < 2 {
+        let dot_target = format!("{to}.{slot}");
+        let raw_matches: Vec<_> = spans
+            .bindings_by_index
+            .iter()
+            .filter(|b| match (b.to_value.as_deref(), b.slot_value.as_deref()) {
+                (Some(to_value), Some(slot_value)) => to_value == to && slot_value == slot,
+                (Some(to_value), None) => to_value == dot_target,
+                _ => false,
+            })
+            .map(|b| b.whole)
+            .collect();
+        if raw_matches.len() > matches.len() {
+            matches = raw_matches;
+        }
+    }
 
     match matches.as_slice() {
         [] => vec![primary(
@@ -361,19 +379,7 @@ fn binding_span_or_default(
         .unwrap_or_else(default_span)
 }
 
-fn labels_for_unknown_binding_slot(spans: &ManifestSpans, slot: &str) -> Vec<LabeledSpan> {
-    let span = binding_span_or_default(spans, |binding| {
-        (binding.slot_value.as_deref() == Some(slot))
-            .then_some(binding.slot.or(binding.to).or(Some(binding.whole)))
-            .flatten()
-    });
-    vec![primary(
-        span,
-        Some("unknown slot referenced here".to_string()),
-    )]
-}
-
-fn labels_for_unknown_binding_provide(spans: &ManifestSpans, capability: &str) -> Vec<LabeledSpan> {
+fn labels_for_unknown_binding_source(spans: &ManifestSpans, capability: &str) -> Vec<LabeledSpan> {
     let span = binding_span_or_default(spans, |binding| {
         if binding.capability_value.as_deref() == Some(capability) {
             return binding.capability.or(binding.from).or(Some(binding.whole));
@@ -390,7 +396,30 @@ fn labels_for_unknown_binding_provide(spans: &ManifestSpans, capability: &str) -
     });
     vec![primary(
         span,
-        Some("unknown provide referenced here".to_string()),
+        Some("unknown slot/provide referenced here".to_string()),
+    )]
+}
+
+fn labels_for_binding_target_self(spans: &ManifestSpans, slot: &str) -> Vec<LabeledSpan> {
+    let span = binding_span_or_default(spans, |binding| {
+        if binding.slot_value.as_deref() == Some(slot)
+            && binding.to_value.as_deref() == Some("self")
+        {
+            return binding.slot.or(binding.to).or(Some(binding.whole));
+        }
+        if binding
+            .to_value
+            .as_deref()
+            .and_then(|to| to.strip_prefix("self."))
+            .is_some_and(|name| name == slot)
+        {
+            return binding.to.or(Some(binding.whole));
+        }
+        None
+    });
+    vec![primary(
+        span,
+        Some("binding targets `self` here".to_string()),
     )]
 }
 
@@ -602,14 +631,17 @@ mod tests {
 
     #[test]
     fn binding_missing_capability_points_to_slot_value() {
-        let source = r#"
+        let source = r##"
         {
           manifest_version: "0.1.0",
+          components: {
+            child: "https://example.com/child",
+          },
           bindings: [
-            { to: "self", slot: "s", from: "self" },
+            { to: "#child", slot: "s", from: "self" },
           ],
         }
-        "#;
+        "##;
 
         let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
         let labels: Vec<_> = err.labels().unwrap().collect();
@@ -623,14 +655,14 @@ mod tests {
 
     #[test]
     fn binding_missing_slot_points_to_capability_value() {
-        let source = r#"
+        let source = r##"
         {
           manifest_version: "0.1.0",
           bindings: [
             { to: "self", from: "self", capability: "c" },
           ],
         }
-        "#;
+        "##;
 
         let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
         let labels: Vec<_> = err.labels().unwrap().collect();
@@ -663,12 +695,12 @@ mod tests {
 
     #[test]
     fn json5_missing_close_bracket_points_to_array_open() {
-        let source = r#"
+        let source = r##"
         {
           manifest_version: "0.1.0",
           bindings: [
             { to: "self.a", from: "self.b" }
-        "#;
+        "##;
 
         let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
         let labels: Vec<_> = err.labels().unwrap().collect();
@@ -681,12 +713,12 @@ mod tests {
 
     #[test]
     fn json5_missing_close_brace_ignores_comment_and_string() {
-        let source = r#"
+        let source = r##"
         {
           // { brace in comment should be ignored
           manifest_version: "0.1.0",
           program: { image: "{not", args: [] }
-        "#;
+        "##;
 
         let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
         let labels: Vec<_> = err.labels().unwrap().collect();
@@ -699,12 +731,12 @@ mod tests {
 
     #[test]
     fn components_bool_type_error_points_to_value() {
-        let source = r#"
+        let source = r##"
         {
           manifest_version: "0.1.0",
           components: true,
         }
-        "#;
+        "##;
 
         let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
         assert!(err.to_string().contains("expected object, found boolean"));
@@ -730,7 +762,7 @@ mod tests {
 
     #[test]
     fn manifest_doc_error_unknown_export_target_points_to_target() {
-        let source = r#"
+        let source = r##"
         {
           manifest_version: "0.1.0",
           program: {
@@ -743,7 +775,7 @@ mod tests {
           },
           exports: { public: "missing" },
         }
-        "#;
+        "##;
         let source: Arc<str> = Arc::from(source);
         let err = ParsedManifest::parse_named("<test>", Arc::clone(&source)).unwrap_err();
         assert!(matches!(err.kind, crate::Error::UnknownExportTarget { .. }));
@@ -787,7 +819,7 @@ mod tests {
 
     #[test]
     fn manifest_doc_error_duplicate_binding_target_marks_second_binding() {
-        let source = r#"
+        let source = r##"
         {
           manifest_version: "0.1.0",
           program: {
@@ -795,19 +827,19 @@ mod tests {
             entrypoint: ["x"],
             network: { endpoints: [{ name: "a", port: 80 }, { name: "b", port: 81 }] },
           },
-          slots: {
-            api: { kind: "http" },
+          components: {
+            child: "https://example.com/child",
           },
           provides: {
             a: { kind: "http", endpoint: "a" },
             b: { kind: "http", endpoint: "b" },
           },
           bindings: [
-            { to: "self.api", from: "self.a" },
-            { to: "self.api", from: "self.b" },
+            { to: "#child.api", from: "self.a" },
+            { to: "#child.api", from: "self.b" },
           ],
         }
-        "#;
+        "##;
         let source: Arc<str> = Arc::from(source);
         let err = ParsedManifest::parse_named("<test>", Arc::clone(&source)).unwrap_err();
         assert!(matches!(

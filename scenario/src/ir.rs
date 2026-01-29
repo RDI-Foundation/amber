@@ -524,7 +524,8 @@ mod tests {
                     "slots": {
                         "input": {
                             "kind": "mcp",
-                            "profile": null
+                            "profile": null,
+                            "optional": false
                         }
                     },
                     "provides": {

@@ -346,7 +346,7 @@ fn binding_round_trip_through_canonical_json_parses() {
 }
 
 #[test]
-fn binding_to_self_requires_slot() {
+fn binding_to_self_is_disallowed() {
     let raw = parse_raw(
         r#"
         {
@@ -363,13 +363,13 @@ fn binding_to_self_requires_slot() {
     let err = raw.validate().unwrap_err();
 
     match err {
-        Error::UnknownBindingSlot { slot } => assert_eq!(slot, "needs"),
-        other => panic!("expected UnknownBindingSlot error, got: {other}"),
+        Error::BindingTargetSelfSlot { slot } => assert_eq!(slot, "needs"),
+        other => panic!("expected BindingTargetSelfSlot error, got: {other}"),
     }
 }
 
 #[test]
-fn binding_from_self_requires_provide() {
+fn binding_from_self_requires_slot_or_provide() {
     let raw = parse_raw(
         r#"
         {
@@ -386,9 +386,37 @@ fn binding_from_self_requires_provide() {
     let err = raw.validate().unwrap_err();
 
     match err {
-        Error::UnknownBindingProvide { capability } => assert_eq!(capability, "api"),
-        other => panic!("expected UnknownBindingProvide error, got: {other}"),
+        Error::UnknownBindingSource { capability } => assert_eq!(capability, "api"),
+        other => panic!("expected UnknownBindingSource error, got: {other}"),
     }
+}
+
+#[test]
+fn binding_from_self_slot_is_allowed() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: {
+            api: { kind: "http" },
+          },
+          components: {
+            child: "https://example.com/child",
+          },
+          bindings: [
+            { to: "\#child.api", from: "self.api" },
+          ],
+        }
+        "#,
+    );
+
+    let manifest = raw.validate().unwrap();
+    let target = BindingTarget::ChildSlot {
+        child: ChildName::try_from("child").unwrap(),
+        slot: SlotName::try_from("api").unwrap(),
+    };
+    let binding = manifest.bindings().get(&target).expect("binding");
+    assert!(matches!(binding.from, BindingSource::SelfSlot(_)));
 }
 
 #[test]
@@ -397,11 +425,11 @@ fn binding_from_framework_requires_known_capability_explicit_form() {
         r#"
         {
           manifest_version: "0.1.0",
-          slots: {
-            control: { kind: "mcp" },
+          components: {
+            child: "https://example.com/child",
           },
           bindings: [
-            { to: "self", slot: "control", from: "framework", capability: "dynamic_children" },
+            { to: "\#child", slot: "control", from: "framework", capability: "dynamic_children" },
           ],
         }
         "#,
@@ -423,11 +451,11 @@ fn binding_from_framework_requires_known_capability_dot_form() {
         r#"
         {
           manifest_version: "0.1.0",
-          slots: {
-            control: { kind: "mcp" },
+          components: {
+            child: "https://example.com/child",
           },
           bindings: [
-            { to: "self.control", from: "framework.dynamic_children" },
+            { to: "\#child.control", from: "framework.dynamic_children" },
           ],
         }
         "#,
@@ -989,7 +1017,7 @@ fn export_target_unknown_capability_errors() {
 }
 
 #[test]
-fn export_target_slot_errors() {
+fn export_target_slot_is_allowed() {
     let raw = parse_raw(
         r#"
         {
@@ -999,15 +1027,10 @@ fn export_target_slot_errors() {
         }
         "#,
     );
-    let err = raw.validate().unwrap_err();
-
-    match err {
-        Error::UnknownExportTarget { export, target } => {
-            assert_eq!(export, "llm");
-            assert_eq!(target, "llm");
-        }
-        other => panic!("expected UnknownExportTarget error, got: {other}"),
-    }
+    let manifest = raw.validate().unwrap();
+    let export_name = ExportName::try_from("llm").unwrap();
+    let target = manifest.exports().get(&export_name).expect("export target");
+    assert!(matches!(target, ExportTarget::SelfSlot(_)));
 }
 
 #[test]

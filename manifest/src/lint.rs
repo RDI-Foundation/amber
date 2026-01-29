@@ -8,8 +8,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    BindingSource, BindingTarget, ComponentDecl, ExportTarget, InterpolatedPart,
-    InterpolatedString, InterpolationSource, Manifest, ManifestSpans, SlotName,
+    BindingSource, ComponentDecl, ExportTarget, InterpolatedPart, InterpolatedString,
+    InterpolationSource, Manifest, ManifestSpans, SlotName,
 };
 
 #[allow(unused_assignments)]
@@ -20,7 +20,9 @@ pub enum ManifestLint {
     #[diagnostic(
         code(manifest::unused_program),
         severity(Warning),
-        help("Remove the `program` block if it is not needed, or ensure it is bound.")
+        help(
+            "Remove the `program` block if it is not needed, or export/bind one of its provides."
+        )
     )]
     UnusedProgram {
         component: String,
@@ -30,11 +32,14 @@ pub enum ManifestLint {
         span: SourceSpan,
     },
 
-    #[error("slot `{name}` is never bound (in component {component})")]
+    #[error("slot `{name}` is never used (in component {component})")]
     #[diagnostic(
         code(manifest::unused_slot),
         severity(Warning),
-        help("Remove the slot `{name}` if it is not needed, or bind it to a provider.")
+        help(
+            "Remove the slot `{name}` if it is not needed, or reference it in the program, \
+             forward it via a binding, or export it."
+        )
     )]
     UnusedSlot {
         name: String,
@@ -237,12 +242,12 @@ pub fn lint_manifest(
 
     let mut bound_slots = BTreeSet::new();
     let mut bound_provides = BTreeSet::new();
-    for (target, binding) in manifest.bindings() {
-        if let BindingTarget::SelfSlot(slot_name) = target {
-            bound_slots.insert(slot_name);
-        }
+    for binding in manifest.bindings().values() {
         if let BindingSource::SelfProvide(provide_name) = &binding.from {
             bound_provides.insert(provide_name);
+        }
+        if let BindingSource::SelfSlot(slot_name) = &binding.from {
+            bound_slots.insert(slot_name);
         }
     }
 
@@ -266,17 +271,17 @@ pub fn lint_manifest(
     }
 
     let mut exported_provides = BTreeSet::new();
+    let mut exported_slots = BTreeSet::new();
     for target in manifest.exports().values() {
         if let ExportTarget::SelfProvide(provide_name) = target {
             exported_provides.insert(provide_name);
         }
+        if let ExportTarget::SelfSlot(slot_name) = target {
+            exported_slots.insert(slot_name);
+        }
     }
 
-    if manifest.program().is_some()
-        && bound_slots.is_empty()
-        && bound_provides.is_empty()
-        && exported_provides.is_empty()
-    {
+    if manifest.program().is_some() && bound_provides.is_empty() && exported_provides.is_empty() {
         let span = spans
             .program
             .as_ref()
@@ -290,7 +295,10 @@ pub fn lint_manifest(
     }
 
     for slot_name in manifest.slots().keys() {
-        if !bound_slots.contains(slot_name) && !program_used_slots.contains(slot_name) {
+        if !bound_slots.contains(slot_name)
+            && !program_used_slots.contains(slot_name)
+            && !exported_slots.contains(slot_name)
+        {
             let span = spans
                 .slots
                 .get(slot_name.as_str())

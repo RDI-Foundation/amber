@@ -14,12 +14,12 @@
     },
   },
   slots: {
-    agent: { kind: "a2a" },
+    agent: { kind: "a2a", optional: true },
   },
   provides: {
     agent_provider: { kind: "a2a", endpoint: "agent" },
   },
-  bindings: [
-    { to: "self.agent", from: "self.agent_provider" },
-  ],
+  exports: {
+    agent: "agent_provider",
+  },
 }

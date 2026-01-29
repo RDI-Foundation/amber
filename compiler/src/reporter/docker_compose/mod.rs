@@ -413,7 +413,10 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     // Ensure all declared slots on runnable components got bound (this should already be true after linking).
     for id in &program_components {
         let c = s.component(*id);
-        for slot_name in c.slots.keys() {
+        for (slot_name, slot_decl) in c.slots.iter() {
+            if slot_decl.optional {
+                continue;
+            }
             let ok = slot_values_by_component
                 .get(id)
                 .and_then(|m| m.get(slot_name))

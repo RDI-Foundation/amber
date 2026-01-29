@@ -8,5 +8,5 @@ compiler::invalid_bindings_interpolation
    :                  `-- binding interpolation here
  9 |     ],
    `----
-  help: Named bindings targeting component /: backend
+  help: No bindings target component /. Add a named binding in the parent manifest or fix the reference.
 Error:   × check failed

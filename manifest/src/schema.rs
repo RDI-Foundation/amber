@@ -175,6 +175,9 @@ impl fmt::Display for CapabilityDecl {
 pub struct SlotDecl {
     #[serde(flatten)]
     pub decl: CapabilityDecl,
+    #[serde(default)]
+    #[builder(default)]
+    pub optional: bool,
 }
 
 #[derive(
@@ -439,7 +442,7 @@ impl<'de> Deserialize<'de> for ConfigSchema {
 
 #[derive(Clone, Debug, Serialize)]
 #[non_exhaustive]
-/// A binding wires a target slot to a source provide.
+/// A binding wires a target slot to a source capability.
 pub struct RawBinding {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -776,6 +779,7 @@ fn split_binding_source(input: &str) -> Result<(BindingSourceRef, String), Error
 #[non_exhaustive]
 pub enum ExportTarget {
     SelfProvide(ProvideName),
+    SelfSlot(SlotName),
     ChildExport {
         child: ChildName,
         export: ExportName,
@@ -793,6 +797,7 @@ pub enum BindingTarget {
 #[non_exhaustive]
 pub enum BindingSource {
     SelfProvide(ProvideName),
+    SelfSlot(SlotName),
     ChildExport {
         child: ChildName,
         export: ExportName,

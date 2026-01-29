@@ -1,0 +1,72 @@
+linker::slot_cycle
+
+  x slot routing cycle detected: /b.api -> /a.api -> /b.api
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_cycle.json5:8:5]
+ 7 |   bindings: [
+ 8 |     { to: "#a.api", from: "#b.api" },
+   :     ^^^^^^^^^^^^^^^^|^^^^^^^^^^^^^^^
+   :                     `-- binding here participates in the cycle
+ 9 |     { to: "#b.api", from: "#a.api" },
+   `----
+  help: Break the cycle by making at least one slot `optional: true` or by rewiring the route.
+
+Advice: 
+  > slot `api` declared on /b
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_cycle_child_b.json5:4:5]
+ 3 |   slots: {
+ 4 |     api: { kind: "http" },
+   :     ^|^
+   :      `-- slot declared here
+ 5 |   },
+   `----
+
+Advice: 
+  > slot `api` declared on /a
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_cycle_child_a.json5:4:5]
+ 3 |   slots: {
+ 4 |     api: { kind: "http" },
+   :     ^|^
+   :      `-- slot declared here
+ 5 |   },
+   `----
+linker::unbound_slot
+
+  x slot `api` on component /a is not bound (non-optional slots must be filled)
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_cycle_child_a.json5:4:5]
+ 3 |   slots: {
+ 4 |     api: { kind: "http" },
+   :     ^|^
+   :      `-- slot declared here
+ 5 |   },
+   `----
+
+Advice: 
+  > component `a` declared on root component
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_cycle.json5:4:5]
+ 3 |   components: {
+ 4 |     a: "./slot_cycle_child_a.json5",
+   :     |
+   :     `-- component declared here
+ 5 |     b: "./slot_cycle_child_b.json5",
+   `----
+linker::unbound_slot
+
+  x slot `api` on component /b is not bound (non-optional slots must be filled)
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_cycle_child_b.json5:4:5]
+ 3 |   slots: {
+ 4 |     api: { kind: "http" },
+   :     ^|^
+   :      `-- slot declared here
+ 5 |   },
+   `----
+
+Advice: 
+  > component `b` declared on root component
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_cycle.json5:5:5]
+ 4 |     a: "./slot_cycle_child_a.json5",
+ 5 |     b: "./slot_cycle_child_b.json5",
+   :     |
+   :     `-- component declared here
+ 6 |   },
+   `----
+Error:   × check failed

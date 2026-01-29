@@ -52,14 +52,14 @@ This crate **parses JSON5**, deserializes into Rust types, and validates:
   * export names (keys in `exports`)
   * child refs (`#<name>`) in bindings and export targets
 * A name cannot be declared in **both** `slots` and `provides`.
-* `exports` targets that point at `self` must refer to something declared in `provides`.
+* `exports` targets that point at `self` must refer to something declared in `slots` or `provides`.
 * `exports` targets that point at `#child` must refer to a declared child.
 * Each binding target `(<to>.<slot>)` may appear **only once**.
 * Binding names (when present) must be unique within a manifest.
 * Binding references must be locally well-formed:
 
-  * `to: "self"` requires `slot` exist in `slots`
-  * `from: "self"` requires `capability` exist in `provides`
+  * `to` must reference a child component (`#<child>`)
+  * `from: "self"` requires `capability` exist in `slots` or `provides`
   * `from: "framework"` requires a known framework capability name
   * `#child` used in a binding must exist in `components`
 * `framework` is only valid as a binding source; it cannot appear in `to` or `exports`.
@@ -72,13 +72,14 @@ This crate also provides `manifest::lint::lint_manifest` for non-fatal checks:
 
 * Every declared **slot** should be either:
 
-  * **bound into `self`** (some binding has `to: "self"` and `slot: "<name>"`), or
-  * **referenced by the program** (via `${slots.<name>...}` in `program.entrypoint` or `program.env`)
+  * **referenced by the program** (via `${slots.<name>...}` in `program.entrypoint` or `program.env`), or
+  * **exported** (some export target points at `self.<name>` or `<name>`), or
+  * **used as a binding source from `self`** (some binding has `from: "self"` and `capability: "<name>"`)
 * Every declared **provide** should be either:
 
   * **exported** (some export target points at `self.<name>` or `<name>`), or
   * **used as a binding source from `self`** (some binding has `from: "self"` and `capability: "<name>"`)
-* If a **`program`** is declared, it should be referenced by a **`self` binding or export** (otherwise the program is likely unused).
+* If a **`program`** is declared, it should be referenced by a **provide binding or export** (otherwise the program is likely unused).
 * Resolver names in each environment should be unique.
 * `config_schema` properties should be referenced by `${config.*}` in `program` or in child `components.<name>.config` templates (unused properties are linted). If the schema contains `$ref` cycles or unresolvable refs, the unused-property lint is incomplete and a warning is emitted; unsupported schema features are rejected at parse time.
 
@@ -350,7 +351,22 @@ slots: {
 
 Important rule (enforced at link time):
 
-* Slots are inputs to the component. Each slot must be satisfied by a binding into `self.<slot>`.
+* Slots are inputs to the component. Each slot must be satisfied by a binding in the **parent**
+  manifest into `#<child>.<slot>` (unless the slot is `optional`).
+
+`optional` (default `false`) allows a slot to be left unbound:
+
+```json5
+slots: {
+  api: { kind: "http", optional: true },
+}
+```
+
+Optional slots can be used to break slot-forwarding cycles; if a required slot is part of a cycle,
+linking fails.
+
+Note: scenario-level slot injection is not supported yet. Required slots on the root component will
+fail to link because there is no parent to satisfy them.
 
 ### `provides`
 
@@ -374,7 +390,8 @@ Notes:
 
 ### `exports`
 
-`exports` maps public names to provides in this manifest or to child exports.
+`exports` maps public names to capabilities in this manifest (provides or slots) or to child
+exports.
 
 ```json5
 exports: {
@@ -389,21 +406,22 @@ Rules enforced:
 * Export names (keys) must not contain `.`.
 * Targets must be one of:
 
-  * `<name>` (shorthand for `self.<provide>`)
-  * `self.<provide>`
+  * `<name>` (shorthand for `self.<provide-or-slot>`)
+  * `self.<provide-or-slot>`
   * `#<child>.<export>`
-* Targets pointing at `self` must refer to a declared provide.
+* Targets pointing at `self` must refer to a declared slot or provide.
 * Targets pointing at `#child` must refer to a declared child.
 
 ---
 
 ## `bindings`
 
-A binding wires a **target slot** to a **source provide** or **framework capability**:
+A binding wires a **target slot** to a **source capability** (provide, slot, child export, or
+framework):
 
 `(<to>.<slot>) <- (<from>.<capability>)`
 
-Component refs (for `to` and component-sourced `from`):
+Component refs (for component-sourced `from`):
 
 * `"self"` for the current manifest
 * `"#<child>"` for a key in `components`
@@ -416,8 +434,18 @@ Framework refs (binding sources only):
 `framework` is **not** a component ref: it is only valid on the `from` side. `#framework` remains a
 normal child ref.
 
-To satisfy a child slot, create a binding with `to: "#<child>.<slot>"` and a provide source
-(`from: "self.<provide>"` or `from: "#<other>.<export>"`).
+To satisfy a child slot, create a binding with `to: "#<child>.<slot>"` and a source capability
+(`from: "self.<provide>"`, `from: "self.<slot>"`, or `from: "#<other>.<export>"`).
+
+Forwarding a slot to a child:
+
+```json5
+slots: { api: { kind: "http" } },
+bindings: [
+  { to: "#gateway.api", from: "self.api" },
+],
+exports: { public_api: "api" },
+```
 
 Bindings forms:
 
@@ -444,8 +472,8 @@ Rules enforced by this crate:
 
 * Target uniqueness: you cannot bind the same `(<to>.<slot>)` more than once.
 * Binding names (if present) must be unique within the manifest and follow child name rules (no `.`).
-* `to: "self"` requires `slot` exist in `slots`.
-* `from: "self"` requires `capability` exist in `provides`.
+* `to` must reference a child (`#<child>`).
+* `from: "self"` requires `capability` exist in `slots` or `provides`.
 * `from: "framework"` requires a known framework capability name (see below).
 * `framework` is only valid as a binding source; it cannot appear in `to` or `exports`.
 * Any `#child` referenced in `to` or `from` must exist in `components`.
@@ -458,15 +486,6 @@ Framework capabilities are a fixed compiler-known list. **Today the list is empt
 
 * `weak: true` marks a binding as **non-ordering**: it does not participate in dependency ordering or cycle detection (i.e. weak bindings cannot create a dependency cycle), similar to `Arc` vs `Weak` in Rust.
 * This crate parses and preserves `weak`, but does not implement dependency ordering or cycle checks.
-
----
-
-## Limitation: no binding from local slots
-
-This version does **not** allow binding from a local slot (`from: "self.<slot>"`). A binding source in `self.*` must refer to a **provide**, not a slot.
-
-If you need to forward an input, restructure the component tree so the slot is declared on the
-component that consumes it, or introduce an adapter component that turns the input into a provide.
 
 ---
 

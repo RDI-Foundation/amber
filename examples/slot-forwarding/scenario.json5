@@ -1,0 +1,22 @@
+{
+  manifest_version: "0.1.0",
+  program: {
+    image: "example/root",
+    entrypoint: ["sleep", "infinity"],
+    network: {
+      endpoints: [{ name: "api", port: 8080 }],
+    },
+  },
+  provides: {
+    api: { kind: "http", endpoint: "api" },
+  },
+  components: {
+    router: "./router.json5",
+  },
+  bindings: [
+    { to: "#router.api", from: "self.api" },
+  ],
+  exports: {
+    api: "#router.api",
+  },
+}

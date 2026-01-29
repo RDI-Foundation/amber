@@ -211,13 +211,7 @@ fn resolve_binding_target(
     slot: String,
 ) -> Result<BindingTarget, Error> {
     match to {
-        LocalComponentRef::Self_ => {
-            let (slot_name, _) = ctx
-                .slots
-                .get_key_value(slot.as_str())
-                .ok_or_else(|| Error::UnknownBindingSlot { slot })?;
-            Ok(BindingTarget::SelfSlot(slot_name.clone()))
-        }
+        LocalComponentRef::Self_ => Err(Error::BindingTargetSelfSlot { slot }),
         LocalComponentRef::Child(child) => {
             let (child_name, _) = ctx
                 .components
@@ -253,11 +247,13 @@ fn resolve_binding_source(
 ) -> Result<BindingSource, Error> {
     match from {
         BindingSourceRef::Component(LocalComponentRef::Self_) => {
-            let (provide_name, _) = ctx
-                .provides
-                .get_key_value(capability.as_str())
-                .ok_or_else(|| Error::UnknownBindingProvide { capability })?;
-            Ok(BindingSource::SelfProvide(provide_name.clone()))
+            if let Some((slot_name, _)) = ctx.slots.get_key_value(capability.as_str()) {
+                return Ok(BindingSource::SelfSlot(slot_name.clone()));
+            }
+            if let Some((provide_name, _)) = ctx.provides.get_key_value(capability.as_str()) {
+                return Ok(BindingSource::SelfProvide(provide_name.clone()));
+            }
+            Err(Error::UnknownBindingSource { capability })
         }
         BindingSourceRef::Component(LocalComponentRef::Child(child)) => {
             let (child_name, _) = ctx
@@ -358,13 +354,15 @@ fn resolve_export_target(
     match target.component {
         LocalComponentRef::Self_ => {
             if let Some((provide_name, _)) = ctx.provides.get_key_value(target.name.as_str()) {
-                Ok(ExportTarget::SelfProvide(provide_name.clone()))
-            } else {
-                Err(Error::UnknownExportTarget {
-                    export: export_name.to_string(),
-                    target: target.name,
-                })
+                return Ok(ExportTarget::SelfProvide(provide_name.clone()));
             }
+            if let Some((slot_name, _)) = ctx.slots.get_key_value(target.name.as_str()) {
+                return Ok(ExportTarget::SelfSlot(slot_name.clone()));
+            }
+            Err(Error::UnknownExportTarget {
+                export: export_name.to_string(),
+                target: target.name,
+            })
         }
         LocalComponentRef::Child(child) => {
             let (child_name, _) =
@@ -665,6 +663,10 @@ impl From<&Manifest> for RawManifest {
                         BindingSourceRef::Component(LocalComponentRef::Self_),
                         name.to_string(),
                     ),
+                    BindingSource::SelfSlot(name) => (
+                        BindingSourceRef::Component(LocalComponentRef::Self_),
+                        name.to_string(),
+                    ),
                     BindingSource::ChildExport { child, export } => (
                         BindingSourceRef::Component(LocalComponentRef::Child(child.to_string())),
                         export.to_string(),
@@ -696,6 +698,10 @@ impl From<&Manifest> for RawManifest {
                     ExportTarget::SelfProvide(provide) => RawExportTarget {
                         component: LocalComponentRef::Self_,
                         name: provide.to_string(),
+                    },
+                    ExportTarget::SelfSlot(slot) => RawExportTarget {
+                        component: LocalComponentRef::Self_,
+                        name: slot.to_string(),
                     },
                     ExportTarget::ChildExport { child, export } => RawExportTarget {
                         component: LocalComponentRef::Child(child.to_string()),

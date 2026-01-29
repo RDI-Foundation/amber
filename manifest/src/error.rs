@@ -89,13 +89,19 @@ pub enum Error {
     #[diagnostic(code(manifest::unknown_binding_child))]
     UnknownBindingChild { child: String },
 
-    #[error("binding target `self.{slot}` references unknown slot")]
-    #[diagnostic(code(manifest::unknown_binding_slot))]
-    UnknownBindingSlot { slot: String },
+    #[error("binding target `self.{slot}` is invalid: slots are inputs supplied by the parent")]
+    #[diagnostic(
+        code(manifest::binding_target_self),
+        help(
+            "Bind child slots with `to: \"#<child>.<slot>\"`. Use `from: \"self.<slot>\"` to \
+             forward a slot, or reference it in the program via `${{slots.<slot>...}}`."
+        )
+    )]
+    BindingTargetSelfSlot { slot: String },
 
-    #[error("binding source `self.{capability}` references unknown provide")]
-    #[diagnostic(code(manifest::unknown_binding_provide))]
-    UnknownBindingProvide { capability: String },
+    #[error("binding source `self.{capability}` references unknown slot or provide")]
+    #[diagnostic(code(manifest::unknown_binding_source))]
+    UnknownBindingSource { capability: String },
 
     #[error("unknown framework capability `{capability}`")]
     #[diagnostic(code(manifest::unknown_framework_capability), help("{help}"))]

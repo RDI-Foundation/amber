@@ -1,0 +1,17 @@
+{
+  manifest_version: "0.1.0",
+  slots: {
+    api: { kind: "http" },
+  },
+  components: {
+    inlet: "./slot-exporter.json5",
+    consumer: "./consumer.json5",
+  },
+  bindings: [
+    { to: "#inlet.api", from: "self.api" },
+    { to: "#consumer.api", from: "#inlet.api" },
+  ],
+  exports: {
+    api: "#inlet.api",
+  },
+}
