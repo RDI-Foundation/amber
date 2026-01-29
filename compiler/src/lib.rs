@@ -15,6 +15,7 @@ mod environment;
 mod frontend;
 mod linker;
 mod manifest_table;
+mod mesh;
 mod provenance;
 mod slot_query;
 mod slot_validation;

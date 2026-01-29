@@ -2,23 +2,22 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Write as _,
-    sync::Arc,
 };
 
 use amber_config as rc;
-use amber_manifest::{BindingTarget, InterpolatedPart, InterpolationSource, Manifest};
-use amber_scenario::{BindingFrom, ComponentId, ProvideRef, Scenario};
-use amber_template::{ProgramTemplateSpec, TemplatePart, TemplateSpec, TemplateString};
-use base64::Engine as _;
+use amber_scenario::{ComponentId, Scenario};
 use miette::LabeledSpan;
 use serde::Serialize;
 
 use super::{Reporter, ReporterError};
 use crate::{
     CompileOutput,
-    binding_query::{BindingObject, resolve_binding_query},
-    config_templates,
-    slot_query::{SlotObject, resolve_slot_query},
+    binding_query::BindingObject,
+    mesh::{
+        MeshOptions, component_label,
+        config::{ProgramPlan, encode_helper_payload, encode_schema_b64},
+    },
+    slot_query::SlotObject,
 };
 
 const MESH_NETWORK_NAME: &str = "amber_mesh";
@@ -49,12 +48,6 @@ impl Reporter for DockerComposeReporter {
 struct ServiceNames {
     program: String,
     sidecar: String,
-}
-
-#[derive(Clone, Debug)]
-struct Endpoint {
-    name: String,
-    port: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -200,52 +193,20 @@ fn render_docker_compose(output: &CompileOutput) -> Result<String, ReporterError
 fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     let s = &output.scenario;
 
-    for b in &s.bindings {
-        if let BindingFrom::Framework(name) = &b.from {
-            return Err(format!(
-                "docker-compose reporter does not support framework binding `framework.{name}` \
-                 (bound to {}.{})",
-                component_label(s, b.to.component),
-                b.to.name
-            )
-            .into());
-        }
-    }
+    let mesh_plan = crate::mesh::build_mesh_plan(
+        s,
+        &output.store,
+        MeshOptions {
+            backend_label: "docker-compose reporter",
+        },
+    )
+    .map_err(|e| DockerComposeError::Other(e.to_string()))?;
 
-    let manifests = crate::manifest_table::build_manifest_table(&s.components, &output.store)
-        .map_err(|e| {
-            format!(
-                "internal error: missing manifest content for {} (digest {})",
-                component_label(s, e.component),
-                e.digest
-            )
-        })?;
-
-    // Backend prerequisite: strong dependency graph must be acyclic.
-    // (Ignoring weak edges is the semantics you described.)
-    if let Err(cycle) = amber_scenario::graph::topo_order(s) {
-        let cycle_str = cycle
-            .cycle
-            .iter()
-            .map(|id| format!("c{}", id.0))
-            .collect::<Vec<_>>()
-            .join(" -> ");
-        return Err(format!(
-            "docker-compose reporter requires an acyclic dependency graph (ignoring weak \
-             bindings). Found a cycle: {cycle_str}"
-        )
-        .into());
-    }
-
-    // Collect program components (these become runnable services).
-    let program_components: Vec<ComponentId> = s
-        .components_iter()
-        .filter_map(|(id, c)| c.program.as_ref().map(|_| id))
-        .collect();
+    let program_components = mesh_plan.program_components.as_slice();
 
     // Precompute service names (injective & stable).
     let mut names: HashMap<ComponentId, ServiceNames> = HashMap::new();
-    for id in &program_components {
+    for id in program_components {
         let c = s.component(*id);
         let base = service_base_name(*id, c.moniker.local_name().unwrap_or("component"));
         let sidecar = format!("{base}-net");
@@ -258,64 +219,15 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         );
     }
 
-    // Validate: every binding endpoint is between program components.
-    for b in &s.bindings {
-        let from = binding_from_component(&b.from);
-        if s.component(from.component).program.is_none() {
-            return Err(format!(
-                "binding source {}.{} is not runnable (component has no program)",
-                component_label(s, from.component),
-                from.name
-            )
-            .into());
-        }
-        if s.component(b.to.component).program.is_none() {
-            return Err(format!(
-                "binding target {}.{} is not runnable (component has no program)",
-                component_label(s, b.to.component),
-                b.to.name
-            )
-            .into());
-        }
-    }
-    for ex in &s.exports {
-        if s.component(ex.from.component).program.is_none() {
-            return Err(format!(
-                "scenario export '{}' points at {}.{} which is not runnable (component has no \
-                 program)",
-                ex.name,
-                component_label(s, ex.from.component),
-                ex.from.name
-            )
-            .into());
-        }
-    }
-
-    // Strong deps for compose ordering (weak edges do not order).
-    let mut strong_deps: HashMap<ComponentId, BTreeSet<ComponentId>> = HashMap::new();
-    for b in &s.bindings {
-        if b.weak {
-            continue;
-        }
-        let from = binding_from_component(&b.from);
-        if from.component == b.to.component {
-            continue;
-        }
-        strong_deps
-            .entry(b.to.component)
-            .or_default()
-            .insert(from.component);
-    }
-
     // Allocate stable local proxy ports per (component, slot), avoiding colliding with program listens.
-    let slot_ports_by_component = allocate_local_proxy_ports(s, &program_components)?;
+    let slot_ports_by_component = allocate_local_proxy_ports(s, program_components)?;
 
     // Build per-component slot-values, binding-values, and per-component slot-proxy processes.
     let mut slot_values_by_component: HashMap<ComponentId, BTreeMap<String, SlotObject>> =
         HashMap::new();
     let mut binding_values_by_component: HashMap<ComponentId, BTreeMap<String, BindingObject>> =
         HashMap::new();
-    for id in &program_components {
+    for id in program_components {
         slot_values_by_component.insert(*id, BTreeMap::new());
         binding_values_by_component.insert(*id, BTreeMap::new());
     }
@@ -328,19 +240,17 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     // distinct endpoints sharing a port.
     let mut port_owner: HashMap<(ComponentId, u16), (String, String)> = HashMap::new();
 
-    for b in &s.bindings {
-        let from = binding_from_component(&b.from);
-        let provider = from.component;
-        let consumer = b.to.component;
-
-        let endpoint = resolve_provide_endpoint(s, provider, &from.name)?;
+    for binding in &mesh_plan.bindings {
+        let provider = binding.provider;
+        let consumer = binding.consumer;
+        let endpoint = &binding.endpoint;
 
         // Port conflict check (L4 backend cannot separate endpoints on the same port).
         enforce_single_endpoint_per_port(
             &mut port_owner,
             provider,
             endpoint.port,
-            &from.name,
+            &binding.provide,
             &endpoint.name,
         )?;
 
@@ -362,12 +272,12 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         // Create local loopback proxy in consumer namespace.
         let local_port = *slot_ports_by_component
             .get(&consumer)
-            .and_then(|m| m.get(&b.to.name))
+            .and_then(|m| m.get(&binding.slot))
             .ok_or_else(|| {
                 format!(
                     "internal error: missing local port allocation for {}.{}",
                     component_label(s, consumer),
-                    b.to.name
+                    binding.slot
                 )
             })?;
 
@@ -400,39 +310,15 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         slot_values_by_component
             .entry(consumer)
             .or_default()
-            .insert(b.to.name.clone(), SlotObject { url: url.clone() });
+            .insert(binding.slot.clone(), SlotObject { url: url.clone() });
 
-        if let Some(name) = b.name.as_ref() {
+        if let Some(name) = binding.binding_name.as_ref() {
             binding_values_by_component
                 .entry(consumer)
                 .or_default()
                 .insert(name.clone(), BindingObject { url });
         }
     }
-
-    // Ensure all declared slots on runnable components got bound (this should already be true after linking).
-    for id in &program_components {
-        let c = s.component(*id);
-        for (slot_name, slot_decl) in c.slots.iter() {
-            if slot_decl.optional {
-                continue;
-            }
-            let ok = slot_values_by_component
-                .get(id)
-                .and_then(|m| m.get(slot_name))
-                .is_some();
-            if !ok {
-                return Err(format!(
-                    "slot {}.{} has no resolved binding (linker should have rejected this)",
-                    component_label(s, *id),
-                    slot_name
-                )
-                .into());
-            }
-        }
-    }
-
-    let binding_urls_by_scope = binding_urls_by_scope(s, &manifests, &slot_values_by_component)?;
 
     // Scenario exports => publish to host loopback with stable host ports.
     // Also, allow inbound on that target port from host loopback / docker gateway.
@@ -442,15 +328,15 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     let mut exports_by_name: BTreeMap<String, ExportMetadata> = BTreeMap::new();
     {
         let mut next_host_port = EXPORT_PORT_BASE;
-        for ex in &s.exports {
-            let provider = ex.from.component;
-            let endpoint = resolve_provide_endpoint(s, provider, &ex.from.name)?;
+        for ex in &mesh_plan.exports {
+            let provider = ex.provider;
+            let endpoint = &ex.endpoint;
 
             enforce_single_endpoint_per_port(
                 &mut port_owner,
                 provider,
                 endpoint.port,
-                &ex.from.name,
+                &ex.provide,
                 &endpoint.name,
             )?;
 
@@ -469,7 +355,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 published_port: published,
                 target_port: endpoint.port,
                 component: component_label(s, provider),
-                provide: ex.from.name.clone(),
+                provide: ex.provide.clone(),
                 endpoint: endpoint.name.clone(),
             };
 
@@ -485,346 +371,42 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     let mut out = String::new();
 
     // ---- runtime config / helper decision ----
-    // Compose root-only config templates for all components so we can decide which services need the helper.
-    let root_id = s.root;
-    let root_schema = manifests[root_id.0]
-        .as_ref()
-        .and_then(|m| m.config_schema())
-        .map(|s| &s.0);
-
-    let composed =
-        config_templates::compose_root_config_templates(s.root, &s.components, &manifests);
-    if let Some(err) = composed.errors.first() {
-        return Err(format!(
-            "failed to compose component config templates: {}",
-            err.message
-        )
-        .into());
-    }
-
-    let resolved_templates =
-        resolve_binding_templates(composed.templates, &binding_urls_by_scope, s)?;
-
-    // Build per-program service mode (direct vs helper) + payloads.
-    #[derive(Clone, Debug)]
-    enum ProgramMode {
-        Direct {
-            entrypoint: Vec<String>,
-            env: BTreeMap<String, String>,
-        },
-        Helper {
-            template_spec_b64: String,
-            component_cfg_template_b64: String,
-            component_schema_b64: String,
-        },
-    }
-
-    let mut program_mode: HashMap<ComponentId, ProgramMode> = HashMap::new();
-    let mut any_helper = false;
-
-    // Attempt to resolve a config interpolation to a static string; otherwise keep it as runtime.
-    #[derive(Debug)]
-    enum ConfigResolution {
-        Static(String),
-        Runtime,
-    }
-
-    fn resolve_config_query_for_program(
-        template: Option<&rc::ConfigNode>,
-        query: &str,
-    ) -> Result<ConfigResolution, String> {
-        let Some(template) = template else {
-            return Ok(ConfigResolution::Runtime);
-        };
-
-        // Empty query means "the whole config".
-        if query.is_empty() {
-            return if !template.contains_runtime() {
-                let v = template.evaluate_static().map_err(|e| e.to_string())?;
-                Ok(ConfigResolution::Static(
-                    rc::stringify_for_interpolation(&v).map_err(|e| e.to_string())?,
-                ))
-            } else {
-                Ok(ConfigResolution::Runtime)
-            };
-        }
-
-        // Traverse until we either:
-        // - reach the node (resolved)
-        // - hit a runtime insert (ConfigRef) before path ends (runtime)
-        // - find a missing key (error)
-        let mut cur = template;
-        for seg in query.split('.') {
-            if seg.is_empty() {
-                return Err(format!("invalid config path {query:?}: empty segment"));
-            }
-            match cur {
-                rc::ConfigNode::Object(map) => {
-                    let Some(next) = map.get(seg) else {
-                        return Err(format!("config.{query} not found (missing key {seg:?})"));
-                    };
-                    cur = next;
-                }
-                rc::ConfigNode::ConfigRef(_) => return Ok(ConfigResolution::Runtime),
-                _ => {
-                    return Err(format!(
-                        "config.{query} not found (encountered non-object before segment {seg:?})"
-                    ));
-                }
-            }
-        }
-
-        if !cur.contains_runtime() {
-            let v = cur.evaluate_static().map_err(|e| e.to_string())?;
-            Ok(ConfigResolution::Static(
-                rc::stringify_for_interpolation(&v).map_err(|e| e.to_string())?,
-            ))
-        } else {
-            Ok(ConfigResolution::Runtime)
-        }
-    }
-
-    fn render_template_string_static(ts: &TemplateString) -> Result<String, String> {
-        if rc::template_string_is_runtime(ts) {
-            return Err(
-                "internal error: attempted to render a runtime template string statically"
-                    .to_string(),
-            );
-        }
-        let mut out = String::new();
-        for part in ts {
-            match part {
-                TemplatePart::Lit { lit } => out.push_str(lit),
-                TemplatePart::Config { .. } => unreachable!(),
-                TemplatePart::Binding { .. } => unreachable!(),
-            }
-        }
-        Ok(out)
-    }
-
-    for id in &program_components {
-        let c = s.component(*id);
-        let program = c.program.as_ref().unwrap();
-
-        let slots = slot_values_by_component.get(id).unwrap();
-        let bindings = binding_values_by_component.get(id).unwrap();
-
-        // Root-only composed config template (if available). Root component uses runtime root config.
-        let template_opt = resolved_templates.get(id).and_then(|t| t.node());
-
-        // Build template spec with slots resolved and config either resolved (static) or preserved.
-        let mut entrypoint_ts: Vec<TemplateString> = Vec::new();
-        let mut needs_helper = false;
-
-        for (idx, arg) in program.args.0.iter().enumerate() {
-            let mut ts: TemplateString = Vec::new();
-            for part in &arg.parts {
-                match part {
-                    InterpolatedPart::Literal(lit) => ts.push(TemplatePart::lit(lit)),
-                    InterpolatedPart::Interpolation { source, query } => match source {
-                        InterpolationSource::Slots => {
-                            let v = resolve_slot_query(slots, query)?;
-                            ts.push(TemplatePart::lit(v));
-                        }
-                        InterpolationSource::Bindings => {
-                            let v = resolve_binding_query(bindings, query)?;
-                            ts.push(TemplatePart::lit(v));
-                        }
-                        InterpolationSource::Config => {
-                            match resolve_config_query_for_program(template_opt, query)? {
-                                ConfigResolution::Static(v) => ts.push(TemplatePart::lit(v)),
-                                ConfigResolution::Runtime => {
-                                    ts.push(TemplatePart::config(query.clone()));
-                                    needs_helper = true;
-                                }
-                            }
-                        }
-                        other => {
-                            return Err(format!(
-                                "unsupported interpolation source {other} in {} \
-                                 program.entrypoint[{idx}]",
-                                component_label(s, *id)
-                            )
-                            .into());
-                        }
-                    },
-                    _ => {
-                        return Err(format!(
-                            "unsupported interpolation part in {} program.entrypoint[{idx}]",
-                            component_label(s, *id)
-                        )
-                        .into());
-                    }
-                }
-            }
-            if ts.is_empty() {
-                return Err(format!(
-                    "internal error: produced empty template for {} program.entrypoint[{idx}]",
-                    component_label(s, *id)
-                )
-                .into());
-            }
-            entrypoint_ts.push(ts);
-        }
-
-        // program.env
-        let mut env_ts: BTreeMap<String, TemplateString> = BTreeMap::new();
-        for (k, v) in &program.env {
-            let mut ts: TemplateString = Vec::new();
-            for part in &v.parts {
-                match part {
-                    InterpolatedPart::Literal(lit) => ts.push(TemplatePart::lit(lit)),
-                    InterpolatedPart::Interpolation { source, query } => match source {
-                        InterpolationSource::Slots => {
-                            let vv = resolve_slot_query(slots, query)?;
-                            ts.push(TemplatePart::lit(vv));
-                        }
-                        InterpolationSource::Bindings => {
-                            let vv = resolve_binding_query(bindings, query)?;
-                            ts.push(TemplatePart::lit(vv));
-                        }
-                        InterpolationSource::Config => {
-                            match resolve_config_query_for_program(template_opt, query)? {
-                                ConfigResolution::Static(vv) => ts.push(TemplatePart::lit(vv)),
-                                ConfigResolution::Runtime => {
-                                    ts.push(TemplatePart::config(query.clone()));
-                                    needs_helper = true;
-                                }
-                            }
-                        }
-                        other => {
-                            return Err(format!(
-                                "unsupported interpolation source {other} in {} program.env.{k}",
-                                component_label(s, *id)
-                            )
-                            .into());
-                        }
-                    },
-                    _ => {
-                        return Err(format!(
-                            "unsupported interpolation part in {} program.env.{k}",
-                            component_label(s, *id)
-                        )
-                        .into());
-                    }
-                }
-            }
-            env_ts.insert(k.clone(), ts);
-        }
-
-        if needs_helper {
-            any_helper = true;
-
-            let m = manifests[id.0].as_ref().expect("manifest should exist");
-            let schema = m
-                .config_schema()
-                .ok_or_else(|| {
-                    format!(
-                        "internal error: helper-needed service {} has no `config_schema`",
-                        component_label(s, *id)
-                    )
-                })?
-                .0
-                .clone();
-
-            let cfg_template_value = resolved_templates
-                .get(id)
-                .expect("template exists")
-                .to_json_ir();
-
-            let spec = TemplateSpec {
-                program: ProgramTemplateSpec {
-                    entrypoint: entrypoint_ts,
-                    env: env_ts,
-                },
-            };
-
-            let b64 = base64::engine::general_purpose::STANDARD;
-
-            let spec_json = serde_json::to_vec(&spec).map_err(|e| {
-                format!(
-                    "failed to serialize template spec for {}: {e}",
-                    component_label(s, *id)
-                )
-            })?;
-            let spec_b64 = b64.encode(spec_json);
-
-            let template_json = serde_json::to_vec(&cfg_template_value).map_err(|e| {
-                format!(
-                    "failed to serialize component config template for {}: {e}",
-                    component_label(s, *id)
-                )
-            })?;
-            let template_b64 = b64.encode(template_json);
-
-            let schema_json = serde_json::to_vec(&rc::canonical_json(&schema)).map_err(|e| {
-                format!(
-                    "failed to serialize component config definition for {}: {e}",
-                    component_label(s, *id)
-                )
-            })?;
-            let schema_b64 = b64.encode(schema_json);
-
-            program_mode.insert(
-                *id,
-                ProgramMode::Helper {
-                    template_spec_b64: spec_b64,
-                    component_cfg_template_b64: template_b64,
-                    component_schema_b64: schema_b64,
-                },
-            );
-        } else {
-            // Fully resolved: render to concrete entrypoint/env.
-            let mut rendered_entrypoint: Vec<String> = Vec::new();
-            for ts in entrypoint_ts {
-                rendered_entrypoint.push(render_template_string_static(&ts)?);
-            }
-
-            let mut rendered_env: BTreeMap<String, String> = BTreeMap::new();
-            for (k, ts) in env_ts {
-                rendered_env.insert(k, render_template_string_static(&ts)?);
-            }
-
-            program_mode.insert(
-                *id,
-                ProgramMode::Direct {
-                    entrypoint: rendered_entrypoint,
-                    env: rendered_env,
-                },
-            );
-        }
-    }
+    let config_plan = crate::mesh::config::build_config_plan(
+        s,
+        &mesh_plan.manifests,
+        program_components,
+        &slot_values_by_component,
+        &binding_values_by_component,
+    )
+    .map_err(|e| DockerComposeError::Other(e.to_string()))?;
 
     // Root schema payloads + AMBER_CONFIG_* env list are only needed if at least one service uses the helper.
     let mut root_schema_b64: Option<String> = None;
     let mut root_env_entries: Vec<String> = Vec::new();
 
-    if any_helper {
-        let root_schema = root_schema.ok_or_else(|| {
-            "root component must declare `config_schema` when runtime config interpolation is \
-             required"
-                .to_string()
-        })?;
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let root_schema_json = serde_json::to_vec(&rc::canonical_json(root_schema))
-            .map_err(|e| format!("failed to serialize root config definition: {e}"))?;
-        root_schema_b64 = Some(b64.encode(root_schema_json));
+    if config_plan.uses_helper {
+        let root_schema = config_plan
+            .root_schema
+            .as_ref()
+            .expect("helper usage implies root schema");
+        root_schema_b64 = Some(
+            encode_schema_b64("root config definition", root_schema)
+                .map_err(|e| DockerComposeError::Other(e.to_string()))?,
+        );
 
-        let leafs = rc::collect_leaf_paths(root_schema)
-            .map_err(|e| format!("failed to enumerate root config definition leaf paths: {e}"))?;
-
-        for leaf in leafs {
+        for leaf in &config_plan.root_leaves {
             let var = rc::env_var_for_path(&leaf.path)
                 .map_err(|e| format!("failed to map config path {} to env var: {e}", leaf.path))?;
             if leaf.required {
-                // Compose-enforced required variable with helpful message.
                 root_env_entries.push(format!("{var}=${{{var}?missing config.{}}}", leaf.path));
             } else {
-                // Pass-through: can be set or omitted.
                 root_env_entries.push(var);
             }
         }
     }
+
+    let program_plans = &config_plan.program_plans;
+    let any_helper = config_plan.uses_helper;
 
     // ---- YAML headers ----
     if any_helper {
@@ -855,7 +437,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     }
 
     // Emit services in stable (component id) order, sidecar then program.
-    for id in &program_components {
+    for id in program_components {
         let c = s.component(*id);
         let svc = names.get(id).unwrap();
 
@@ -940,16 +522,16 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         );
 
         // depends_on: own sidecar + strong deps provider programs (+ amber-init for helper-backed services)
-        let mode = program_mode.get(id).expect("program mode computed");
+        let program_plan = program_plans.get(id).expect("program plan computed");
         let mut deps: Vec<(String, &'static str)> = Vec::new();
-        if any_helper && matches!(mode, ProgramMode::Helper { .. }) {
+        if any_helper && matches!(program_plan, ProgramPlan::Helper { .. }) {
             deps.push((
                 HELPER_INIT_SERVICE.to_string(),
                 "service_completed_successfully",
             ));
         }
         deps.push((svc.sidecar.clone(), "service_started"));
-        if let Some(ds) = strong_deps.get(id) {
+        if let Some(ds) = mesh_plan.strong_deps.get(id) {
             for dep in ds {
                 if let Some(dep_names) = names.get(dep) {
                     deps.push((dep_names.program.clone(), "service_started"));
@@ -976,8 +558,8 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
             }
         }
 
-        match mode {
-            ProgramMode::Direct { entrypoint, env } => {
+        match program_plan {
+            ProgramPlan::Direct { entrypoint, env } => {
                 // Use entrypoint so image entrypoints are ignored.
                 push_line(&mut out, 4, "entrypoint:");
                 for a in entrypoint {
@@ -991,11 +573,20 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                     }
                 }
             }
-            ProgramMode::Helper {
-                template_spec_b64,
-                component_cfg_template_b64,
-                component_schema_b64,
+            ProgramPlan::Helper {
+                template_spec,
+                component_template,
+                component_schema,
             } => {
+                let label = component_label(s, *id);
+                let payload = encode_helper_payload(
+                    &label,
+                    template_spec,
+                    component_template,
+                    component_schema,
+                )
+                .map_err(|e| DockerComposeError::Other(e.to_string()))?;
+
                 // Mount helper binary and run it as PID1; it execs the program entrypoint.
                 push_line(&mut out, 4, "volumes:");
                 push_line(
@@ -1028,7 +619,8 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                     &format!(
                         "- {}",
                         yaml_str(&format!(
-                            "AMBER_COMPONENT_CONFIG_SCHEMA_B64={component_schema_b64}"
+                            "AMBER_COMPONENT_CONFIG_SCHEMA_B64={}",
+                            payload.component_schema_b64
                         ))
                     ),
                 );
@@ -1038,7 +630,8 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                     &format!(
                         "- {}",
                         yaml_str(&format!(
-                            "AMBER_COMPONENT_CONFIG_TEMPLATE_B64={component_cfg_template_b64}"
+                            "AMBER_COMPONENT_CONFIG_TEMPLATE_B64={}",
+                            payload.component_cfg_template_b64
                         ))
                     ),
                 );
@@ -1047,7 +640,10 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                     6,
                     &format!(
                         "- {}",
-                        yaml_str(&format!("AMBER_TEMPLATE_SPEC_B64={template_spec_b64}"))
+                        yaml_str(&format!(
+                            "AMBER_TEMPLATE_SPEC_B64={}",
+                            payload.template_spec_b64
+                        ))
                     ),
                 );
             }
@@ -1098,169 +694,6 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
 
 // ---- helpers ----
 
-fn binding_urls_by_scope(
-    s: &Scenario,
-    manifests: &[Option<Arc<Manifest>>],
-    slot_values_by_component: &HashMap<ComponentId, BTreeMap<String, SlotObject>>,
-) -> Result<HashMap<u64, BTreeMap<String, BindingObject>>, String> {
-    let mut out: HashMap<u64, BTreeMap<String, BindingObject>> = HashMap::new();
-
-    for (idx, manifest) in manifests.iter().enumerate() {
-        let Some(manifest) = manifest else {
-            continue;
-        };
-        let realm = ComponentId(idx);
-        let mut by_name = BTreeMap::new();
-
-        for (target, binding) in manifest.bindings() {
-            let Some(name) = binding.name.as_ref() else {
-                continue;
-            };
-
-            let (target_component, slot_name) = match target {
-                BindingTarget::SelfSlot(slot) => (realm, slot.as_str()),
-                BindingTarget::ChildSlot { child, slot } => {
-                    let child_id = child_component_id_for_name(s, realm, child.as_str())?;
-                    (child_id, slot.as_str())
-                }
-                _ => {
-                    return Err(format!(
-                        "unsupported binding target {:?} in {}",
-                        target,
-                        component_label(s, realm)
-                    ));
-                }
-            };
-
-            let slot_values = slot_values_by_component
-                .get(&target_component)
-                .ok_or_else(|| {
-                    format!(
-                        "internal error: missing slot values for {}",
-                        component_label(s, target_component)
-                    )
-                })?;
-            let slot = slot_values.get(slot_name).ok_or_else(|| {
-                format!(
-                    "internal error: missing slot url for {}.{}",
-                    component_label(s, target_component),
-                    slot_name
-                )
-            })?;
-
-            by_name.insert(
-                name.to_string(),
-                BindingObject {
-                    url: slot.url.clone(),
-                },
-            );
-        }
-
-        out.insert(realm.0 as u64, by_name);
-    }
-
-    Ok(out)
-}
-
-fn resolve_binding_templates(
-    templates: HashMap<ComponentId, rc::RootConfigTemplate>,
-    bindings_by_scope: &HashMap<u64, BTreeMap<String, BindingObject>>,
-    s: &Scenario,
-) -> Result<HashMap<ComponentId, rc::RootConfigTemplate>, String> {
-    let mut out = HashMap::with_capacity(templates.len());
-    for (id, template) in templates {
-        let resolved = match template {
-            rc::RootConfigTemplate::Root => rc::RootConfigTemplate::Root,
-            rc::RootConfigTemplate::Node(node) => {
-                let resolved =
-                    resolve_binding_parts_in_config(&node, bindings_by_scope).map_err(|err| {
-                        format!(
-                            "failed to resolve binding interpolation in config for {}: {err}",
-                            component_label(s, id)
-                        )
-                    })?;
-                rc::RootConfigTemplate::Node(resolved)
-            }
-        };
-        out.insert(id, resolved);
-    }
-    Ok(out)
-}
-
-fn resolve_binding_parts_in_config(
-    node: &rc::ConfigNode,
-    bindings_by_scope: &HashMap<u64, BTreeMap<String, BindingObject>>,
-) -> Result<rc::ConfigNode, String> {
-    match node {
-        rc::ConfigNode::StringTemplate(parts) => {
-            let mut out = Vec::with_capacity(parts.len());
-            for part in parts {
-                match part {
-                    TemplatePart::Lit { lit } => out.push(TemplatePart::lit(lit)),
-                    TemplatePart::Config { config } => out.push(TemplatePart::config(config)),
-                    TemplatePart::Binding { binding, scope } => {
-                        let bindings = bindings_by_scope
-                            .get(scope)
-                            .ok_or_else(|| format!("bindings scope {scope} is missing"))?;
-                        let url = resolve_binding_query(bindings, binding)?;
-                        out.push(TemplatePart::lit(url));
-                    }
-                }
-            }
-            Ok(rc::ConfigNode::StringTemplate(out).simplify())
-        }
-        rc::ConfigNode::Array(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                out.push(resolve_binding_parts_in_config(item, bindings_by_scope)?);
-            }
-            Ok(rc::ConfigNode::Array(out))
-        }
-        rc::ConfigNode::Object(map) => {
-            let mut out = BTreeMap::new();
-            for (k, v) in map {
-                out.insert(
-                    k.clone(),
-                    resolve_binding_parts_in_config(v, bindings_by_scope)?,
-                );
-            }
-            Ok(rc::ConfigNode::Object(out))
-        }
-        other => Ok(other.clone()),
-    }
-}
-
-fn child_component_id_for_name(
-    s: &Scenario,
-    parent: ComponentId,
-    child_name: &str,
-) -> Result<ComponentId, String> {
-    let parent_component = s.component(parent);
-    for child_id in &parent_component.children {
-        let child = s.component(*child_id);
-        if child.moniker.local_name() == Some(child_name) {
-            return Ok(*child_id);
-        }
-    }
-    Err(format!(
-        "internal error: missing child {child_name:?} for {}",
-        component_label(s, parent)
-    ))
-}
-
-fn component_label(s: &Scenario, id: ComponentId) -> String {
-    s.component(id).moniker.as_str().to_string()
-}
-
-fn binding_from_component(from: &BindingFrom) -> &ProvideRef {
-    match from {
-        BindingFrom::Component(provide) => provide,
-        BindingFrom::Framework(name) => {
-            unreachable!("framework binding framework.{name} should be rejected earlier")
-        }
-    }
-}
-
 fn service_base_name(id: ComponentId, local_name: &str) -> String {
     // Ensure injective via numeric prefix; keep human-readable suffix.
     let slug = sanitize_service_suffix(local_name);
@@ -1283,65 +716,6 @@ fn sanitize_service_suffix(s: &str) -> String {
     } else {
         out.to_string()
     }
-}
-
-fn resolve_provide_endpoint(
-    s: &Scenario,
-    component_id: ComponentId,
-    provide_name: &str,
-) -> Result<Endpoint, String> {
-    let component = s.component(component_id);
-
-    let provide = component.provides.get(provide_name).ok_or_else(|| {
-        format!(
-            "provide {}.{} not found (linker invariant broken)",
-            component_label(s, component_id),
-            provide_name
-        )
-    })?;
-
-    let program = component.program.as_ref().ok_or_else(|| {
-        format!(
-            "provide {}.{} requires a program/network, but component has no program",
-            component_label(s, component_id),
-            provide_name
-        )
-    })?;
-
-    let network = program.network.as_ref().ok_or_else(|| {
-        format!(
-            "provide {}.{} requires program.network, but network is missing",
-            component_label(s, component_id),
-            provide_name
-        )
-    })?;
-
-    let endpoint_name = provide.endpoint.as_deref().ok_or_else(|| {
-        format!(
-            "provide {}.{} is missing an endpoint reference",
-            component_label(s, component_id),
-            provide_name
-        )
-    })?;
-
-    let endpoint = network
-        .endpoints
-        .iter()
-        .find(|e| e.name == endpoint_name)
-        .ok_or_else(|| {
-            format!(
-                "provide {}.{} references endpoint {:?}, but it was not found in \
-                 program.network.endpoints",
-                component_label(s, component_id),
-                provide_name,
-                endpoint_name
-            )
-        })?;
-
-    Ok(Endpoint {
-        name: endpoint.name.clone(),
-        port: endpoint.port,
-    })
 }
 
 fn enforce_single_endpoint_per_port(
