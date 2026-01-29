@@ -98,18 +98,42 @@ jobs:
             deployment --all -n "${NAMESPACE}"
 
           # Verify the deployed scenario by fetching files from the client component
-          kubectl port-forward -n "${NAMESPACE}" service/c1-client 8080:8080 &
+          CLIENT_POD=$(kubectl get pod -n "${NAMESPACE}" -l amber.io/component=c1-client -o jsonpath='{.items[0].metadata.name}')
+          kubectl wait --for=condition=ready --timeout=120s pod -n "${NAMESPACE}" "${CLIENT_POD}"
+
+          kubectl port-forward -n "${NAMESPACE}" "pod/${CLIENT_POD}" 8080:8080 > /tmp/c1-port-forward.log 2>&1 &
           PF_PID=$!
-          sleep 5
+          trap 'kill "${PF_PID}" 2>/dev/null || true; wait "${PF_PID}" 2>/dev/null || true' EXIT
+
+          fetch_with_retry() {
+            local url="$1"
+            local attempts=30
+            local delay=2
+            local output=""
+            for _ in $(seq 1 "${attempts}"); do
+              if output=$(curl -fsS "${url}"); then
+                echo "${output}"
+                return 0
+              fi
+              if ! kill -0 "${PF_PID}" 2>/dev/null; then
+                echo "Port-forward exited early. Logs:"
+                cat /tmp/c1-port-forward.log || true
+                kubectl logs -n "${NAMESPACE}" "${CLIENT_POD}" || true
+                return 1
+              fi
+              sleep "${delay}"
+            done
+            echo "Timed out waiting for ${url}"
+            cat /tmp/c1-port-forward.log || true
+            kubectl logs -n "${NAMESPACE}" "${CLIENT_POD}" || true
+            return 1
+          }
 
           # Fetch the config files
-          RUNTIME_SECRET=$(curl -s http://localhost:8080/runtime_secret.txt)
-          RUNTIME_CONFIG=$(curl -s http://localhost:8080/runtime_config.txt)
-          STATIC_SECRET=$(curl -s http://localhost:8080/static_secret.txt)
-          STATIC_CONFIG=$(curl -s http://localhost:8080/static_config.txt)
-
-          kill $PF_PID
-          wait
+          RUNTIME_SECRET=$(fetch_with_retry http://localhost:8080/runtime_secret.txt)
+          RUNTIME_CONFIG=$(fetch_with_retry http://localhost:8080/runtime_config.txt)
+          STATIC_SECRET=$(fetch_with_retry http://localhost:8080/static_secret.txt)
+          STATIC_CONFIG=$(fetch_with_retry http://localhost:8080/static_config.txt)
 
           # Verify values match expectations
           test "$RUNTIME_SECRET" = "test-secret-value"
