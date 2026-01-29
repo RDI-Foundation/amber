@@ -1,0 +1,30 @@
+{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      server_runtime_secret: { type: "string", secret: true },
+      server_runtime_config: { type: "string" },
+    },
+    required: ["server_runtime_secret", "server_runtime_config"],
+  },
+  components: {
+    server: {
+      manifest: "./server.json5",
+      config: {
+        runtime_secret: "${config.server_runtime_secret}",
+        runtime_config: "${config.server_runtime_config}",
+        static_secret: "hardcode-this-secret",
+        static_config: "hardcode-this-config",
+      },
+    },
+    client: "./client.json5",
+  },
+  bindings: [
+    { to: "#client.server", from: "#server.http" },
+  ],
+  exports: {
+    server_http: "#server.http",
+    client_http: "#client.http",
+  },
+}

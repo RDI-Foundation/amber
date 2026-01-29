@@ -40,12 +40,12 @@ jobs:
             arch: arm64
           - image: amber-helper
             context: .
-            file: docker/amber-compose-helper/Dockerfile
+            file: docker/amber-helper/Dockerfile
             runner: ubuntu-latest
             arch: amd64
           - image: amber-helper
             context: .
-            file: docker/amber-compose-helper/Dockerfile
+            file: docker/amber-helper/Dockerfile
             runner: ubuntu-24.04-arm
             arch: arm64
     steps:

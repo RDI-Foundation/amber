@@ -4,7 +4,7 @@ use std::{
     process::{Command, ExitCode},
 };
 
-use amber_compose_helper::{HelperError, RunPlan, build_run_plan};
+use amber_helper::{HelperError, RunPlan, build_run_plan};
 
 fn main() -> ExitCode {
     match run_main() {

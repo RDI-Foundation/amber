@@ -16,6 +16,7 @@ jsonschema = { workspace = true }
 miette = { workspace = true, features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "rt", "sync"] }
 url = { workspace = true, features = ["serde"] }

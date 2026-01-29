@@ -8,7 +8,10 @@ use amber_compiler::{
     CompileOptions, CompileOutput, Compiler, ResolverRegistry,
     bundle::{BundleBuilder, BundleLoader},
     reporter::{
-        Reporter as _, docker_compose::DockerComposeReporter, dot::DotReporter,
+        Reporter as _,
+        docker_compose::DockerComposeReporter,
+        dot::DotReporter,
+        kubernetes::{KubernetesReporter, KubernetesReporterConfig},
         scenario_ir::ScenarioIrReporter,
     },
 };
@@ -68,6 +71,14 @@ struct CompileArgs {
     /// Write a manifest bundle to this directory.
     #[arg(long = "bundle", value_name = "DIR")]
     bundle: Option<PathBuf>,
+
+    /// Write Kubernetes manifests to this directory.
+    #[arg(long = "kubernetes", visible_alias = "k8s", value_name = "DIR")]
+    kubernetes: Option<PathBuf>,
+
+    /// Disable generation of NetworkPolicy enforcement check resources.
+    #[arg(long = "disable-networkpolicy-check", requires = "kubernetes")]
+    disable_networkpolicy_check: bool,
 
     /// Root manifest or bundle to compile (URL or local path).
     #[arg(value_name = "MANIFEST")]
@@ -177,6 +188,16 @@ async fn compile(args: CompileArgs) -> Result<()> {
             ArtifactOutput::Stdout => print!("{compose}"),
             ArtifactOutput::File(path) => write_artifact(&path, compose.as_bytes())?,
         }
+    }
+
+    if let Some(kubernetes_dest) = outputs.kubernetes {
+        let reporter = KubernetesReporter {
+            config: KubernetesReporterConfig {
+                disable_networkpolicy_check: args.disable_networkpolicy_check,
+            },
+        };
+        let artifact = reporter.emit(&output).map_err(miette::Report::new)?;
+        write_kubernetes_output(&kubernetes_dest, &artifact)?;
     }
 
     if let Some(bundle_root) = resolve_bundle_root(&args)? {
@@ -448,6 +469,7 @@ struct OutputPaths {
     primary: Option<PathBuf>,
     dot: Option<ArtifactOutput>,
     docker_compose: Option<ArtifactOutput>,
+    kubernetes: Option<PathBuf>,
 }
 
 fn ensure_outputs_requested(args: &CompileArgs) -> Result<()> {
@@ -455,13 +477,14 @@ fn ensure_outputs_requested(args: &CompileArgs) -> Result<()> {
         || args.dot.is_some()
         || args.docker_compose.is_some()
         || args.bundle.is_some()
+        || args.kubernetes.is_some()
     {
         return Ok(());
     }
 
     Err(miette::miette!(
-        help = "Request at least one output with `--output`, `--dot`, `--docker-compose`, or \
-                `--bundle`.",
+        help = "Request at least one output with `--output`, `--dot`, `--docker-compose`, \
+                `--kubernetes`, or `--bundle`.",
         "no outputs requested for `amber compile`"
     ))
 }
@@ -470,6 +493,7 @@ fn resolve_output_paths(args: &CompileArgs) -> Result<OutputPaths> {
     let primary = args.output.clone();
     let dot = resolve_optional_output(&args.dot);
     let docker_compose = resolve_optional_output(&args.docker_compose);
+    let kubernetes = args.kubernetes.clone();
 
     if let (Some(primary_path), Some(ArtifactOutput::File(dot_path))) =
         (primary.as_ref(), dot.as_ref())
@@ -505,6 +529,7 @@ fn resolve_output_paths(args: &CompileArgs) -> Result<OutputPaths> {
         primary,
         dot,
         docker_compose,
+        kubernetes,
     })
 }
 
@@ -524,18 +549,10 @@ fn resolve_bundle_root(args: &CompileArgs) -> Result<Option<PathBuf>> {
 
 fn prepare_bundle_dir(path: &Path) -> Result<()> {
     if path.exists() {
-        if path.is_dir() {
-            std::fs::remove_dir_all(path)
-                .into_diagnostic()
-                .wrap_err_with(|| {
-                    format!("failed to remove bundle directory `{}`", path.display())
-                })?;
-        } else {
-            return Err(miette::miette!(
-                "bundle output path `{}` is not a directory",
-                path.display()
-            ));
-        }
+        return Err(miette::miette!(
+            "bundle output directory `{}` already exists; please delete it first",
+            path.display()
+        ));
     }
 
     std::fs::create_dir_all(path)
@@ -564,4 +581,52 @@ fn write_artifact(path: &Path, contents: &[u8]) -> Result<()> {
     std::fs::write(path, contents)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to write `{}`", path.display()))
+}
+
+fn write_kubernetes_output(
+    root: &Path,
+    artifact: &amber_compiler::reporter::kubernetes::KubernetesArtifact,
+) -> Result<()> {
+    // Clean and recreate the output directory.
+    if root.exists() {
+        if root.is_dir() {
+            std::fs::remove_dir_all(root)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to remove kubernetes output directory `{}`",
+                        root.display()
+                    )
+                })?;
+        } else {
+            return Err(miette::miette!(
+                "kubernetes output path `{}` is not a directory",
+                root.display()
+            ));
+        }
+    }
+
+    std::fs::create_dir_all(root)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to create kubernetes output directory `{}`",
+                root.display()
+            )
+        })?;
+
+    // Write each file.
+    for (rel_path, content) in &artifact.files {
+        let full_path = root.join(rel_path);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to create directory `{}`", parent.display()))?;
+        }
+        std::fs::write(&full_path, content)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to write `{}`", full_path.display()))?;
+    }
+
+    Ok(())
 }

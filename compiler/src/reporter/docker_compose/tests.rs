@@ -194,7 +194,7 @@ fn build_helper_image() -> String {
     let root = workspace_root();
     build_docker_image(
         HELPER_IMAGE,
-        &root.join("docker/amber-compose-helper/Dockerfile"),
+        &root.join("docker/amber-helper/Dockerfile"),
         &root,
     )
 }
