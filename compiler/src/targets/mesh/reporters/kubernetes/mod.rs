@@ -361,6 +361,7 @@ fn render_kubernetes(
                     env: container_env,
                     env_from: Vec::new(),
                     ports,
+                    readiness_probe: None,
                     volume_mounts: Vec::new(),
                 };
 
@@ -447,6 +448,7 @@ fn render_kubernetes(
                     env: container_env,
                     env_from: Vec::new(),
                     ports,
+                    readiness_probe: None,
                     volume_mounts: vec![VolumeMount {
                         name: HELPER_VOLUME_NAME.to_string(),
                         mount_path: HELPER_BIN_DIR.to_string(),
@@ -477,6 +479,7 @@ fn render_kubernetes(
                 env: Vec::new(),
                 env_from: Vec::new(),
                 ports: Vec::new(),
+                readiness_probe: None,
                 volume_mounts: vec![VolumeMount {
                     name: HELPER_VOLUME_NAME.to_string(),
                     mount_path: HELPER_BIN_DIR.to_string(),
@@ -503,6 +506,7 @@ fn render_kubernetes(
                 env: Vec::new(),
                 env_from: Vec::new(),
                 ports: Vec::new(),
+                readiness_probe: None,
                 volume_mounts: Vec::new(),
             });
         }
@@ -1138,6 +1142,21 @@ while true; do echo "ready" | nc -l -p 8080 >/dev/null; done
                             container_port: 8080,
                             protocol: "TCP",
                         }],
+                        readiness_probe: Some(Probe {
+                            exec: Some(ExecAction {
+                                command: vec![
+                                    "/bin/sh".to_string(),
+                                    "-c".to_string(),
+                                    "nc -z -w 2 127.0.0.1 8080".to_string(),
+                                ],
+                            }),
+                            http_get: None,
+                            tcp_socket: None,
+                            initial_delay_seconds: Some(1),
+                            period_seconds: Some(2),
+                            timeout_seconds: Some(1),
+                            failure_threshold: Some(30),
+                        }),
                         ..Default::default()
                     }],
                     volumes: Vec::new(),

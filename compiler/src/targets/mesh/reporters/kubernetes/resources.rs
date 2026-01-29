@@ -262,6 +262,8 @@ pub struct Container {
     pub env_from: Vec<EnvFromSource>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<ContainerPort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness_probe: Option<Probe>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub volume_mounts: Vec<VolumeMount>,
 }
