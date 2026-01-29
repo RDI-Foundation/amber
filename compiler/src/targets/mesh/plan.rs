@@ -9,8 +9,6 @@ use amber_scenario::{BindingFrom, ComponentId, ProvideRef, Scenario};
 
 use crate::{DigestStore, manifest_table};
 
-pub(crate) mod config;
-
 #[derive(Clone, Debug)]
 pub(crate) struct MeshOptions {
     pub(crate) backend_label: &'static str,

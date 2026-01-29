@@ -9,15 +9,15 @@ use amber_scenario::{ComponentId, Scenario};
 use miette::LabeledSpan;
 use serde::Serialize;
 
-use super::{Reporter, ReporterError};
 use crate::{
     CompileOutput,
     binding_query::BindingObject,
-    mesh::{
-        MeshOptions, component_label,
-        config::{ProgramPlan, encode_helper_payload, encode_schema_b64},
-    },
+    reporter::{Reporter, ReporterError},
     slot_query::SlotObject,
+    targets::mesh::{
+        config::{ProgramPlan, encode_helper_payload, encode_schema_b64},
+        plan::{MeshOptions, component_label},
+    },
 };
 
 const MESH_NETWORK_NAME: &str = "amber_mesh";
@@ -193,7 +193,7 @@ fn render_docker_compose(output: &CompileOutput) -> Result<String, ReporterError
 fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     let s = &output.scenario;
 
-    let mesh_plan = crate::mesh::build_mesh_plan(
+    let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
         s,
         &output.store,
         MeshOptions {
@@ -371,7 +371,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     let mut out = String::new();
 
     // ---- runtime config / helper decision ----
-    let config_plan = crate::mesh::config::build_config_plan(
+    let config_plan = crate::targets::mesh::config::build_config_plan(
         s,
         &mesh_plan.manifests,
         program_components,

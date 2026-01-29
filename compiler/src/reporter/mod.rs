@@ -4,12 +4,12 @@ use miette::{Diagnostic, LabeledSpan, NamedSource, Severity};
 
 use crate::CompileOutput;
 
-pub mod docker_compose;
 pub mod dot;
-pub mod kubernetes;
 pub mod scenario_ir;
 
 pub use docker_compose::DockerComposeReporter;
+
+pub use crate::targets::mesh::reporters::{docker_compose, kubernetes};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]

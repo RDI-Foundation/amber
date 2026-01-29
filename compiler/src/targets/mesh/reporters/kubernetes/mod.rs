@@ -10,15 +10,15 @@ use amber_scenario::{ComponentId, Scenario};
 pub use resources::*;
 use serde::Serialize;
 
-use super::{Reporter, ReporterError};
 use crate::{
     CompileOutput,
     binding_query::BindingObject,
-    mesh::{
-        MeshOptions, component_label,
-        config::{ProgramPlan, encode_helper_payload, encode_schema_b64},
-    },
+    reporter::{Reporter, ReporterError},
     slot_query::SlotObject,
+    targets::mesh::{
+        config::{ProgramPlan, encode_helper_payload, encode_schema_b64},
+        plan::{MeshOptions, component_label},
+    },
 };
 
 // Helper injection system: When a component requires runtime config interpolation,
@@ -106,7 +106,7 @@ fn render_kubernetes(
 ) -> KubernetesResult<KubernetesArtifact> {
     let s = &output.scenario;
 
-    let mesh_plan = crate::mesh::build_mesh_plan(
+    let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
         s,
         &output.store,
         MeshOptions {
@@ -191,7 +191,7 @@ fn render_kubernetes(
         }
     }
 
-    let config_plan = crate::mesh::config::build_config_plan(
+    let config_plan = crate::targets::mesh::config::build_config_plan(
         s,
         manifests,
         program_components,

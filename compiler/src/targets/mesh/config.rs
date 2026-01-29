@@ -10,7 +10,7 @@ use amber_template::{ProgramTemplateSpec, TemplatePart, TemplateSpec, TemplateSt
 use base64::Engine as _;
 use serde_json::Value;
 
-use super::{MeshError, component_label};
+use super::plan::{MeshError, component_label};
 use crate::{
     binding_query::{BindingObject, resolve_binding_query},
     config_templates,
