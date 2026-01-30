@@ -1143,15 +1143,9 @@ while true; do echo "ready" | nc -l -p 8080 >/dev/null; done
                             protocol: "TCP",
                         }],
                         readiness_probe: Some(Probe {
-                            exec: Some(ExecAction {
-                                command: vec![
-                                    "/bin/sh".to_string(),
-                                    "-c".to_string(),
-                                    "nc -z -w 2 127.0.0.1 8080".to_string(),
-                                ],
-                            }),
+                            exec: None,
                             http_get: None,
-                            tcp_socket: None,
+                            tcp_socket: Some(TcpSocketAction { port: 8080 }),
                             initial_delay_seconds: Some(1),
                             period_seconds: Some(2),
                             timeout_seconds: Some(1),

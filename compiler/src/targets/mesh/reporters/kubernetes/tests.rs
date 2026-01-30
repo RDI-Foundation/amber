@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use amber_manifest::ManifestRef;
@@ -155,6 +155,27 @@ impl PortForwardGuard {
     fn logs(&self) -> String {
         fs::read_to_string(&self.log_path).unwrap_or_default()
     }
+
+    fn wait_until_ready(&mut self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !self.is_running() {
+                let logs = self.logs();
+                panic!("port-forward exited before becoming ready\nport-forward logs:\n{logs}");
+            }
+
+            let logs = self.logs();
+            if logs.contains("Forwarding from") && logs.contains(":8080") {
+                return;
+            }
+
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for port-forward readiness\nport-forward logs:\n{logs}");
+            }
+
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
 }
 
 impl Drop for PortForwardGuard {
@@ -177,36 +198,34 @@ fn kubectl_logs(namespace: &str, pod: &str) -> String {
     }
 }
 
-fn fetch_with_retry(
-    url: &str,
-    port_forward: &mut PortForwardGuard,
-    namespace: &str,
-    pod: &str,
-) -> String {
-    let attempts = 30;
-    let delay = Duration::from_secs(2);
-    for _ in 0..attempts {
-        if let Ok(output) = Command::new("curl").arg("-fsS").arg(url).output() {
-            if output.status.success() {
-                return String::from_utf8_lossy(&output.stdout).trim().to_string();
-            }
-        }
+fn fetch(url: &str, port_forward: &mut PortForwardGuard, namespace: &str, pod: &str) -> String {
+    if !port_forward.is_running() {
+        let logs = port_forward.logs();
+        let pod_logs = kubectl_logs(namespace, pod);
+        panic!(
+            "port-forward exited before fetching {url}\nport-forward logs:\n{logs}\npod \
+             logs:\n{pod_logs}"
+        );
+    }
 
-        if !port_forward.is_running() {
-            let logs = port_forward.logs();
-            let pod_logs = kubectl_logs(namespace, pod);
-            panic!(
-                "port-forward exited early while fetching {url}\nport-forward logs:\n{logs}\npod \
-                 logs:\n{pod_logs}"
-            );
-        }
-
-        thread::sleep(delay);
+    let output = Command::new("curl")
+        .arg("-fsS")
+        .arg(url)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run curl for {url}: {err}"));
+    if output.status.success() {
+        return String::from_utf8_lossy(&output.stdout).trim().to_string();
     }
 
     let logs = port_forward.logs();
     let pod_logs = kubectl_logs(namespace, pod);
-    panic!("timed out waiting for {url}\nport-forward logs:\n{logs}\npod logs:\n{pod_logs}");
+    panic!(
+        "curl failed for {url} (status: {})\nstdout:\n{}\nstderr:\n{}\nport-forward \
+         logs:\n{logs}\npod logs:\n{pod_logs}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -315,26 +334,27 @@ fn kubernetes_smoke_config_roundtrip() {
 
     let port_forward_log = dir.path().join("port-forward.log");
     let mut port_forward = PortForwardGuard::new(&namespace, &client_pod, &port_forward_log);
+    port_forward.wait_until_ready(Duration::from_secs(30));
 
-    let runtime_secret = fetch_with_retry(
+    let runtime_secret = fetch(
         "http://localhost:8080/runtime_secret.txt",
         &mut port_forward,
         &namespace,
         &client_pod,
     );
-    let runtime_config = fetch_with_retry(
+    let runtime_config = fetch(
         "http://localhost:8080/runtime_config.txt",
         &mut port_forward,
         &namespace,
         &client_pod,
     );
-    let static_secret = fetch_with_retry(
+    let static_secret = fetch(
         "http://localhost:8080/static_secret.txt",
         &mut port_forward,
         &namespace,
         &client_pod,
     );
-    let static_config = fetch_with_retry(
+    let static_config = fetch(
         "http://localhost:8080/static_config.txt",
         &mut port_forward,
         &namespace,
