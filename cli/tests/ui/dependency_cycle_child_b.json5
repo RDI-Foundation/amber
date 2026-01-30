@@ -1,0 +1,20 @@
+{
+  manifest_version: "0.1.0",
+  program: {
+    image: "alpine:3.19",
+    args: ["sleep", "infinity"],
+    network: {
+      endpoints: [{ name: "api", port: 8081 }],
+    },
+  },
+  provides: {
+    api: { kind: "http", endpoint: "api" },
+  },
+  exports: {
+    api: "api",
+    peer: "peer",
+  },
+  slots: {
+    peer: { kind: "http" },
+  },
+}

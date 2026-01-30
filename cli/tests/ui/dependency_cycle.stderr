@@ -1,0 +1,22 @@
+linker::dependency_cycle
+
+  x dependency cycle detected: /a -> /b -> /a
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/dependency_cycle.json5:9:5]
+  8 |     { to: "#a.peer", from: "#b.api" },
+  9 |     { to: "#b.peer", from: "#a.api" },
+    :     ^^^^^^^^^^^^^^^^|^^^^^^^^^^^^^^^^
+    :                     `-- binding here participates in the cycle
+ 10 |   ],
+    `----
+  help: Break the cycle by removing or weakening at least one binding in the cycle.
+
+Advice: 
+  > binding into /a.peer participates in the cycle
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/dependency_cycle.json5:8:5]
+ 7 |   bindings: [
+ 8 |     { to: "#a.peer", from: "#b.api" },
+   :     ^^^^^^^^^^^^^^^^|^^^^^^^^^^^^^^^^
+   :                     `-- binding here participates in the cycle
+ 9 |     { to: "#b.peer", from: "#a.api" },
+   `----
+Error:   × check failed

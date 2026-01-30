@@ -14,7 +14,8 @@ use amber_scenario::{
 use serde_json::{Map, Value, json};
 use url::Url;
 
-use super::{super::Reporter as _, DockerComposeReporter, HELPER_IMAGE, SIDECAR_IMAGE};
+use super::{DockerComposeReporter, HELPER_IMAGE, SIDECAR_IMAGE};
+use crate::reporter::Reporter as _;
 
 fn digest(byte: u8) -> ManifestDigest {
     ManifestDigest::new([byte; 32])

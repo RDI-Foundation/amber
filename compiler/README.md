@@ -20,5 +20,6 @@ Compiles a root component manifest into a linked `Scenario` plus provenance and 
 - `frontend`: async resolver with caching, cycle detection, and environment handling.
 - `linker`: schema validation, binding resolution, and export verification.
 - `passes`: graph rewrites that must preserve scenario invariants.
-- `reporter`: transforms `CompileOutput` into artifacts (e.g., scenario IR JSON, DOT, Docker Compose YAML, Kubernetes YAML).
+- `targets`: target-family planners and reporters (e.g., mesh-family planning + Docker Compose/Kubernetes reporters).
+- `reporter`: transforms `CompileOutput` into artifacts (e.g., scenario IR JSON, DOT, Docker Compose YAML, Kubernetes YAML); re-exports target reporters.
 - `bundle`: bundle index parsing, manifest packing, and bundle-only resolver wiring.

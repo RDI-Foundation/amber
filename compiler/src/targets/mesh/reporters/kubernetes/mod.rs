@@ -3,24 +3,22 @@ mod resources;
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
-    sync::Arc,
 };
 
 use amber_config as rc;
-use amber_manifest::{BindingTarget, InterpolatedPart, InterpolationSource, Manifest};
-use amber_scenario::{BindingFrom, ComponentId, ProvideRef, Scenario};
-use amber_template::{ProgramTemplateSpec, TemplatePart, TemplateSpec, TemplateString};
-use base64::Engine as _;
+use amber_scenario::{ComponentId, Scenario};
 pub use resources::*;
 use serde::Serialize;
-use serde_json::Value;
 
-use super::{Reporter, ReporterError};
 use crate::{
     CompileOutput,
-    binding_query::{BindingObject, resolve_binding_query},
-    config_template,
-    slot_query::{SlotObject, resolve_slot_query},
+    binding_query::BindingObject,
+    reporter::{Reporter, ReporterError},
+    slot_query::SlotObject,
+    targets::mesh::{
+        config::{ProgramPlan, encode_helper_payload, encode_schema_b64},
+        plan::{MeshOptions, component_label},
+    },
 };
 
 // Helper injection system: When a component requires runtime config interpolation,
@@ -100,25 +98,6 @@ struct ScenarioMetadata {
     inputs: BTreeMap<String, InputMetadata>,
 }
 
-/// How a program component will be run.
-#[derive(Clone, Debug)]
-enum ProgramMode {
-    /// Direct execution - all config is statically resolved at compile time.
-    Direct {
-        entrypoint: Vec<String>,
-        env: BTreeMap<String, String>,
-    },
-    /// Helper-mediated execution - needs runtime config interpolation.
-    Helper {
-        /// Base64-encoded TemplateSpec (program entrypoint + env with config refs).
-        template_spec_b64: String,
-        /// Base64-encoded component config template (for resolving against root config).
-        component_cfg_template_b64: String,
-        /// Base64-encoded component config schema (for validation).
-        component_schema_b64: String,
-    },
-}
-
 type KubernetesResult<T> = Result<T, ReporterError>;
 
 fn render_kubernetes(
@@ -127,41 +106,24 @@ fn render_kubernetes(
 ) -> KubernetesResult<KubernetesArtifact> {
     let s = &output.scenario;
 
-    let manifests = crate::manifest_table::build_manifest_table(&s.components, &output.store)
-        .map_err(|e| {
-            ReporterError::new(format!(
-                "internal error: missing manifest content for {} (digest {})",
-                component_label(s, e.component),
-                e.digest
-            ))
-        })?;
+    let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
+        s,
+        &output.store,
+        MeshOptions {
+            backend_label: "kubernetes reporter",
+        },
+    )
+    .map_err(|e| ReporterError::new(e.to_string()))?;
 
-    // Backend prerequisite: strong dependency graph must be acyclic.
-    if let Err(cycle) = amber_scenario::graph::topo_order(s) {
-        let cycle_str = cycle
-            .cycle
-            .iter()
-            .map(|id| format!("c{}", id.0))
-            .collect::<Vec<_>>()
-            .join(" -> ");
-        return Err(ReporterError::new(format!(
-            "kubernetes reporter requires an acyclic dependency graph (ignoring weak bindings). \
-             Found a cycle: {cycle_str}"
-        )));
-    }
-
-    // Collect program components (these become deployments).
-    let program_components: Vec<ComponentId> = s
-        .components_iter()
-        .filter_map(|(id, c)| c.program.as_ref().map(|_| id))
-        .collect();
+    let program_components = mesh_plan.program_components.as_slice();
+    let manifests = &mesh_plan.manifests;
 
     // Generate namespace name.
     let namespace = generate_namespace_name(s);
 
     // Generate component names.
     let mut names: HashMap<ComponentId, ComponentNames> = HashMap::new();
-    for id in &program_components {
+    for id in program_components {
         let c = s.component(*id);
         let base = service_name(*id, c.moniker.local_name().unwrap_or("component"));
         names.insert(
@@ -173,54 +135,12 @@ fn render_kubernetes(
         );
     }
 
-    // Validate: framework bindings are not supported.
-    for b in &s.bindings {
-        if let BindingFrom::Framework(name) = &b.from {
-            return Err(ReporterError::new(format!(
-                "kubernetes reporter does not support framework binding `framework.{name}` (bound \
-                 to {}.{})",
-                component_label(s, b.to.component),
-                b.to.name
-            )));
-        }
-    }
-
-    // Validate: every binding endpoint is between program components.
-    for b in &s.bindings {
-        let from = binding_from_component(&b.from);
-        if s.component(from.component).program.is_none() {
-            return Err(ReporterError::new(format!(
-                "binding source {}.{} is not runnable (component has no program)",
-                component_label(s, from.component),
-                from.name
-            )));
-        }
-        if s.component(b.to.component).program.is_none() {
-            return Err(ReporterError::new(format!(
-                "binding target {}.{} is not runnable (component has no program)",
-                component_label(s, b.to.component),
-                b.to.name
-            )));
-        }
-    }
-    for ex in &s.exports {
-        if s.component(ex.from.component).program.is_none() {
-            return Err(ReporterError::new(format!(
-                "scenario export '{}' points at {}.{} which is not runnable (component has no \
-                 program)",
-                ex.name,
-                component_label(s, ex.from.component),
-                ex.from.name
-            )));
-        }
-    }
-
     // Build slot values and binding values for each component (resolved URLs to services).
     let mut slot_values_by_component: HashMap<ComponentId, BTreeMap<String, SlotObject>> =
         HashMap::new();
     let mut binding_values_by_component: HashMap<ComponentId, BTreeMap<String, BindingObject>> =
         HashMap::new();
-    for id in &program_components {
+    for id in program_components {
         slot_values_by_component.insert(*id, BTreeMap::new());
         binding_values_by_component.insert(*id, BTreeMap::new());
     }
@@ -228,12 +148,10 @@ fn render_kubernetes(
     // Track inbound allowlist: provider -> set of (consumer_component, port)
     let mut inbound_allow: HashMap<ComponentId, Vec<(ComponentId, u16)>> = HashMap::new();
 
-    for b in &s.bindings {
-        let from = binding_from_component(&b.from);
-        let provider = from.component;
-        let consumer = b.to.component;
-
-        let endpoint_port = resolve_provide_endpoint(s, provider, &from.name)?;
+    for binding in &mesh_plan.bindings {
+        let provider = binding.provider;
+        let consumer = binding.consumer;
+        let endpoint_port = binding.endpoint.port;
         let provider_names = names.get(&provider).ok_or_else(|| {
             ReporterError::new(format!(
                 "internal error: missing names for provider {}",
@@ -255,9 +173,9 @@ fn render_kubernetes(
         slot_values_by_component
             .entry(consumer)
             .or_default()
-            .insert(b.to.name.clone(), SlotObject { url: url.clone() });
+            .insert(binding.slot.clone(), SlotObject { url: url.clone() });
 
-        if let Some(name) = b.name.as_ref() {
+        if let Some(name) = binding.binding_name.as_ref() {
             binding_values_by_component
                 .entry(consumer)
                 .or_default()
@@ -273,38 +191,15 @@ fn render_kubernetes(
         }
     }
 
-    // Compose config templates for all components.
-    let root_id = s.root;
-    let root_schema = manifests[root_id.0]
-        .as_ref()
-        .and_then(|m| m.config_schema())
-        .map(|s| &s.0);
-
-    let root_template = if root_schema.is_some() {
-        rc::RootConfigTemplate::Root
-    } else {
-        rc::RootConfigTemplate::Node(rc::ConfigNode::empty_object())
-    };
-
-    let mut composed_templates: HashMap<ComponentId, rc::RootConfigTemplate> = HashMap::new();
-    compose_templates_dfs(
+    let config_plan = crate::targets::mesh::config::build_config_plan(
         s,
-        s.root,
-        &manifests,
-        root_schema,
-        &root_template,
-        &mut composed_templates,
+        manifests,
+        program_components,
+        &slot_values_by_component,
+        &binding_values_by_component,
     )
-    .map_err(|e| {
-        ReporterError::new(format!("failed to compose component config templates: {e}"))
-    })?;
-
-    let binding_urls_by_scope = binding_urls_by_scope(s, &manifests, &slot_values_by_component)
-        .map_err(ReporterError::new)?;
-
-    let resolved_templates =
-        resolve_binding_templates(composed_templates, &binding_urls_by_scope, s)
-            .map_err(ReporterError::new)?;
+    .map_err(|e| ReporterError::new(e.to_string()))?;
+    let root_schema = config_plan.root_schema.as_ref();
 
     // Standard labels for all resources.
     let scenario_labels = |extra: &[(&str, &str)]| -> BTreeMap<String, String> {
@@ -338,58 +233,9 @@ fn render_kubernetes(
     let ns = Namespace::new(&namespace, scenario_labels(&[]));
     files.insert(PathBuf::from("00-namespace.yaml"), to_yaml(&ns)?);
 
-    // Collect root config leaf paths for metadata.
-    let root_leaves = if let Some(schema) = root_schema {
-        rc::collect_leaf_paths(schema).map_err(|e| {
-            ReporterError::new(format!("failed to enumerate root config paths: {e}"))
-        })?
-    } else {
-        Vec::new()
-    };
-
-    // Build ProgramMode for each component (determines if helper is needed).
-    let mut program_modes: HashMap<ComponentId, ProgramMode> = HashMap::new();
-    let mut any_helper = false;
-
-    for id in &program_components {
-        let c = s.component(*id);
-        let program = c.program.as_ref().unwrap();
-        let slots = slot_values_by_component.get(id).unwrap();
-
-        let component_template = resolved_templates.get(id).ok_or_else(|| {
-            ReporterError::new(format!(
-                "no config template for component {}",
-                component_label(s, *id)
-            ))
-        })?;
-
-        // Get the config node for template resolution.
-        let template_opt = component_template.node();
-
-        let component_schema = manifests[id.0]
-            .as_ref()
-            .and_then(|m| m.config_schema())
-            .map(|s| &s.0);
-
-        let bindings = binding_values_by_component.get(id).unwrap();
-
-        let mode = build_program_mode(
-            s,
-            *id,
-            program,
-            slots,
-            bindings,
-            template_opt,
-            component_schema,
-            component_template,
-        )?;
-
-        if matches!(mode, ProgramMode::Helper { .. }) {
-            any_helper = true;
-        }
-
-        program_modes.insert(*id, mode);
-    }
+    let root_leaves = &config_plan.root_leaves;
+    let program_plans = &config_plan.program_plans;
+    let any_helper = config_plan.uses_helper;
 
     // Build kustomization (will be populated at the end if helper mode is used).
     let mut kustomization = Kustomization::new();
@@ -470,23 +316,21 @@ fn render_kubernetes(
                     .to_string(),
             )
         })?;
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let root_schema_json =
-            serde_json::to_vec(&rc::canonical_json(root_schema)).map_err(|e| {
-                ReporterError::new(format!("failed to serialize root config definition: {e}"))
-            })?;
-        Some(b64.encode(root_schema_json))
+        Some(
+            encode_schema_b64("root config definition", root_schema)
+                .map_err(|e| ReporterError::new(e.to_string()))?,
+        )
     } else {
         None
     };
 
     // Deployments
-    for id in &program_components {
+    for id in program_components {
         let c = s.component(*id);
         let cnames = names.get(id).unwrap();
         let labels = component_labels(*id, &cnames.service);
         let program = c.program.as_ref().unwrap();
-        let mode = program_modes.get(id).unwrap();
+        let program_plan = program_plans.get(id).unwrap();
 
         // Container ports.
         let mut ports: Vec<ContainerPort> = Vec::new();
@@ -501,8 +345,8 @@ fn render_kubernetes(
         }
 
         // Build container based on program mode.
-        let (container, volumes) = match mode {
-            ProgramMode::Direct { entrypoint, env } => {
+        let (container, volumes) = match program_plan {
+            ProgramPlan::Direct { entrypoint, env } => {
                 // Direct mode: use resolved entrypoint and env directly.
                 // Config values are already baked into the entrypoint/env strings,
                 // so we don't need AMBER_CONFIG_* env vars here.
@@ -517,31 +361,35 @@ fn render_kubernetes(
                     env: container_env,
                     env_from: Vec::new(),
                     ports,
+                    readiness_probe: None,
                     volume_mounts: Vec::new(),
                 };
 
                 (container, Vec::new())
             }
-            ProgramMode::Helper {
-                template_spec_b64,
-                component_cfg_template_b64,
-                component_schema_b64,
+            ProgramPlan::Helper {
+                template_spec,
+                component_template,
+                component_schema,
             } => {
+                let label = component_label(s, *id);
+                let payload = encode_helper_payload(
+                    &label,
+                    template_spec,
+                    component_template,
+                    component_schema,
+                )
+                .map_err(|e| ReporterError::new(e.to_string()))?;
+
                 // Helper mode: use helper binary as entrypoint, mount shared volume.
                 let mut container_env: Vec<EnvVar> = Vec::new();
 
                 // Collect config paths referenced by this component's template.
-                let component_template = resolved_templates.get(id).ok_or_else(|| {
-                    ReporterError::new(format!(
-                        "no config template for component {}",
-                        component_label(s, *id)
-                    ))
-                })?;
                 let referenced_paths = collect_config_refs(component_template);
 
                 // Add only the root config env vars that are actually referenced by this component.
                 // If referenced_paths is None, it means the component template is Root and needs all config.
-                for leaf in &root_leaves {
+                for leaf in root_leaves {
                     // Check if this leaf path is referenced by the component template.
                     let should_include = match &referenced_paths {
                         Some(paths) => paths.contains(&leaf.path),
@@ -581,15 +429,15 @@ fn render_kubernetes(
                 ));
                 container_env.push(EnvVar::literal(
                     "AMBER_COMPONENT_CONFIG_SCHEMA_B64",
-                    component_schema_b64,
+                    &payload.component_schema_b64,
                 ));
                 container_env.push(EnvVar::literal(
                     "AMBER_COMPONENT_CONFIG_TEMPLATE_B64",
-                    component_cfg_template_b64,
+                    &payload.component_cfg_template_b64,
                 ));
                 container_env.push(EnvVar::literal(
                     "AMBER_TEMPLATE_SPEC_B64",
-                    template_spec_b64,
+                    &payload.template_spec_b64,
                 ));
 
                 let container = Container {
@@ -600,6 +448,7 @@ fn render_kubernetes(
                     env: container_env,
                     env_from: Vec::new(),
                     ports,
+                    readiness_probe: None,
                     volume_mounts: vec![VolumeMount {
                         name: HELPER_VOLUME_NAME.to_string(),
                         mount_path: HELPER_BIN_DIR.to_string(),
@@ -617,7 +466,7 @@ fn render_kubernetes(
         let mut init_containers = Vec::new();
 
         // For helper mode, add init container to install the helper binary.
-        if matches!(mode, ProgramMode::Helper { .. }) {
+        if matches!(program_plan, ProgramPlan::Helper { .. }) {
             init_containers.push(Container {
                 name: "install-helper".to_string(),
                 image: HELPER_IMAGE.to_string(),
@@ -630,6 +479,7 @@ fn render_kubernetes(
                 env: Vec::new(),
                 env_from: Vec::new(),
                 ports: Vec::new(),
+                readiness_probe: None,
                 volume_mounts: vec![VolumeMount {
                     name: HELPER_VOLUME_NAME.to_string(),
                     mount_path: HELPER_BIN_DIR.to_string(),
@@ -656,6 +506,7 @@ fn render_kubernetes(
                 env: Vec::new(),
                 env_from: Vec::new(),
                 ports: Vec::new(),
+                readiness_probe: None,
                 volume_mounts: Vec::new(),
             });
         }
@@ -702,7 +553,7 @@ fn render_kubernetes(
     }
 
     // Services (only for components with provides)
-    for id in &program_components {
+    for id in program_components {
         let c = s.component(*id);
         if c.provides.is_empty() {
             continue;
@@ -743,7 +594,7 @@ fn render_kubernetes(
     }
 
     // NetworkPolicies
-    for id in &program_components {
+    for id in program_components {
         let cnames = names.get(id).unwrap();
         let labels = component_labels(*id, &cnames.service);
 
@@ -814,25 +665,24 @@ fn render_kubernetes(
 
     // Metadata ConfigMap
     let mut export_metadata: BTreeMap<String, ExportMetadata> = BTreeMap::new();
-    for ex in &s.exports {
-        let provider = ex.from.component;
+    for ex in &mesh_plan.exports {
+        let provider = ex.provider;
         let provider_names = names.get(&provider).unwrap();
-        let endpoint_port = resolve_provide_endpoint(s, provider, &ex.from.name)?;
 
         export_metadata.insert(
             ex.name.clone(),
             ExportMetadata {
                 component: s.component(provider).moniker.as_str().to_string(),
-                provide: ex.from.name.clone(),
+                provide: ex.provide.clone(),
                 service: provider_names.service.clone(),
-                port: endpoint_port,
+                port: ex.endpoint.port,
                 kind: format!("{}", ex.capability.kind),
             },
         );
     }
 
     let mut input_metadata: BTreeMap<String, InputMetadata> = BTreeMap::new();
-    for leaf in &root_leaves {
+    for leaf in root_leaves {
         input_metadata.insert(
             leaf.path.clone(),
             InputMetadata {
@@ -892,160 +742,6 @@ fn render_kubernetes(
 }
 
 // ---- Helper functions ----
-
-fn component_label(s: &Scenario, id: ComponentId) -> String {
-    s.component(id).moniker.as_str().to_string()
-}
-
-fn binding_urls_by_scope(
-    s: &Scenario,
-    manifests: &[Option<Arc<Manifest>>],
-    slot_values_by_component: &HashMap<ComponentId, BTreeMap<String, SlotObject>>,
-) -> Result<HashMap<u64, BTreeMap<String, BindingObject>>, String> {
-    let mut out: HashMap<u64, BTreeMap<String, BindingObject>> = HashMap::new();
-
-    for (idx, manifest) in manifests.iter().enumerate() {
-        let Some(manifest) = manifest else {
-            continue;
-        };
-        let realm = ComponentId(idx);
-        let mut by_name = BTreeMap::new();
-
-        for (target, binding) in manifest.bindings() {
-            let Some(name) = binding.name.as_ref() else {
-                continue;
-            };
-
-            let (target_component, slot_name) = match target {
-                BindingTarget::SelfSlot(slot) => (realm, slot.as_str()),
-                BindingTarget::ChildSlot { child, slot } => {
-                    let child_id = child_component_id_for_name(s, realm, child.as_str())?;
-                    (child_id, slot.as_str())
-                }
-                _ => {
-                    return Err(format!(
-                        "unsupported binding target {:?} in {}",
-                        target,
-                        component_label(s, realm)
-                    ));
-                }
-            };
-
-            let slot_values = slot_values_by_component
-                .get(&target_component)
-                .ok_or_else(|| {
-                    format!(
-                        "internal error: missing slot values for {}",
-                        component_label(s, target_component)
-                    )
-                })?;
-            let slot = slot_values.get(slot_name).ok_or_else(|| {
-                format!(
-                    "internal error: missing slot url for {}.{}",
-                    component_label(s, target_component),
-                    slot_name
-                )
-            })?;
-
-            by_name.insert(
-                name.to_string(),
-                BindingObject {
-                    url: slot.url.clone(),
-                },
-            );
-        }
-
-        out.insert(realm.0 as u64, by_name);
-    }
-
-    Ok(out)
-}
-
-fn resolve_binding_templates(
-    templates: HashMap<ComponentId, rc::RootConfigTemplate>,
-    bindings_by_scope: &HashMap<u64, BTreeMap<String, BindingObject>>,
-    s: &Scenario,
-) -> Result<HashMap<ComponentId, rc::RootConfigTemplate>, String> {
-    let mut out = HashMap::with_capacity(templates.len());
-    for (id, template) in templates {
-        let resolved = match template {
-            rc::RootConfigTemplate::Root => rc::RootConfigTemplate::Root,
-            rc::RootConfigTemplate::Node(node) => {
-                let resolved =
-                    resolve_binding_parts_in_config(&node, bindings_by_scope).map_err(|err| {
-                        format!(
-                            "failed to resolve binding interpolation in config for {}: {err}",
-                            component_label(s, id)
-                        )
-                    })?;
-                rc::RootConfigTemplate::Node(resolved)
-            }
-        };
-        out.insert(id, resolved);
-    }
-    Ok(out)
-}
-
-fn resolve_binding_parts_in_config(
-    node: &rc::ConfigNode,
-    bindings_by_scope: &HashMap<u64, BTreeMap<String, BindingObject>>,
-) -> Result<rc::ConfigNode, String> {
-    match node {
-        rc::ConfigNode::StringTemplate(parts) => {
-            let mut out = Vec::with_capacity(parts.len());
-            for part in parts {
-                match part {
-                    TemplatePart::Lit { lit } => out.push(TemplatePart::lit(lit)),
-                    TemplatePart::Config { config } => out.push(TemplatePart::config(config)),
-                    TemplatePart::Binding { binding, scope } => {
-                        let bindings = bindings_by_scope
-                            .get(scope)
-                            .ok_or_else(|| format!("bindings scope {scope} is missing"))?;
-                        let url = resolve_binding_query(bindings, binding)?;
-                        out.push(TemplatePart::lit(url));
-                    }
-                }
-            }
-            Ok(rc::ConfigNode::StringTemplate(out).simplify())
-        }
-        rc::ConfigNode::Array(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                out.push(resolve_binding_parts_in_config(item, bindings_by_scope)?);
-            }
-            Ok(rc::ConfigNode::Array(out))
-        }
-        rc::ConfigNode::Object(map) => {
-            let mut out = BTreeMap::new();
-            for (k, v) in map {
-                out.insert(
-                    k.clone(),
-                    resolve_binding_parts_in_config(v, bindings_by_scope)?,
-                );
-            }
-            Ok(rc::ConfigNode::Object(out))
-        }
-        other => Ok(other.clone()),
-    }
-}
-
-fn child_component_id_for_name(
-    s: &Scenario,
-    parent: ComponentId,
-    child_name: &str,
-) -> Result<ComponentId, String> {
-    let parent_component = s.component(parent);
-    for child_id in &parent_component.children {
-        let child = s.component(*child_id);
-        if child.moniker.local_name() == Some(child_name) {
-            return Ok(*child_id);
-        }
-    }
-    Err(format!(
-        "internal error: missing child {child_name:?} for {}",
-        component_label(s, parent)
-    ))
-}
 
 fn generate_namespace_name(s: &Scenario) -> String {
     let root = s.component(s.root);
@@ -1128,102 +824,6 @@ fn sanitize_port_name(s: &str) -> String {
     truncate_dns_name(&sanitized, 15)
 }
 
-fn resolve_provide_endpoint(
-    s: &Scenario,
-    component_id: ComponentId,
-    provide_name: &str,
-) -> Result<u16, ReporterError> {
-    let component = s.component(component_id);
-
-    let provide = component.provides.get(provide_name).ok_or_else(|| {
-        ReporterError::new(format!(
-            "provide {}.{} not found",
-            component_label(s, component_id),
-            provide_name
-        ))
-    })?;
-
-    let program = component.program.as_ref().ok_or_else(|| {
-        ReporterError::new(format!(
-            "provide {}.{} requires a program, but component has none",
-            component_label(s, component_id),
-            provide_name
-        ))
-    })?;
-
-    let network = program.network.as_ref().ok_or_else(|| {
-        ReporterError::new(format!(
-            "provide {}.{} requires program.network, but none exists",
-            component_label(s, component_id),
-            provide_name
-        ))
-    })?;
-
-    let endpoint_name = provide.endpoint.as_deref().ok_or_else(|| {
-        ReporterError::new(format!(
-            "provide {}.{} is missing an endpoint reference",
-            component_label(s, component_id),
-            provide_name
-        ))
-    })?;
-
-    let endpoint = network
-        .endpoints
-        .iter()
-        .find(|e| e.name == endpoint_name)
-        .ok_or_else(|| {
-            ReporterError::new(format!(
-                "provide {}.{} references unknown endpoint {:?}",
-                component_label(s, component_id),
-                provide_name,
-                endpoint_name
-            ))
-        })?;
-
-    Ok(endpoint.port)
-}
-
-fn compose_templates_dfs(
-    s: &Scenario,
-    id: ComponentId,
-    manifests: &[Option<Arc<Manifest>>],
-    parent_schema: Option<&Value>,
-    parent_template: &rc::RootConfigTemplate,
-    out: &mut HashMap<ComponentId, rc::RootConfigTemplate>,
-) -> Result<(), String> {
-    let c = s.component(id);
-    let m = manifests[id.0].as_ref().expect("manifest should exist");
-    let schema = m.config_schema().map(|s| &s.0);
-
-    let this_template = if id == s.root {
-        if schema.is_some() {
-            rc::RootConfigTemplate::Root
-        } else {
-            rc::RootConfigTemplate::Node(rc::ConfigNode::empty_object())
-        }
-    } else if schema.is_none() {
-        rc::RootConfigTemplate::Node(rc::ConfigNode::empty_object())
-    } else {
-        let initial = config_template::parse_instance_config_template(
-            c.config.as_ref(),
-            parent_schema,
-            id.0 as u64,
-        )
-        .map_err(|e| e.to_string())?;
-        let composed = rc::compose_config_template(initial, parent_template)
-            .map_err(|e| e.to_string())?
-            .simplify();
-        rc::RootConfigTemplate::Node(composed)
-    };
-
-    out.insert(id, this_template.clone());
-
-    for &child in &c.children {
-        compose_templates_dfs(s, child, manifests, schema, &this_template, out)?;
-    }
-    Ok(())
-}
-
 // ---- Runtime config / helper mode support ----
 
 /// Collect all config paths referenced in a RootConfigTemplate.
@@ -1271,290 +871,6 @@ fn collect_config_refs(
             collect_from_node(node, &mut paths);
             Some(paths)
         }
-    }
-}
-
-/// Attempt to resolve a config interpolation to a static string; otherwise keep it as runtime.
-enum ConfigResolution {
-    Static(String),
-    Runtime,
-}
-
-/// Try to resolve a config query against a composed template.
-/// Returns Static if the value is fully resolved, Runtime if it contains config refs.
-fn resolve_config_query_for_program(
-    template: Option<&rc::ConfigNode>,
-    query: &str,
-) -> Result<ConfigResolution, String> {
-    let Some(template) = template else {
-        return Ok(ConfigResolution::Runtime);
-    };
-
-    // Empty query means "the whole config".
-    if query.is_empty() {
-        return if !template.contains_runtime() {
-            let v = template.evaluate_static().map_err(|e| e.to_string())?;
-            Ok(ConfigResolution::Static(
-                rc::stringify_for_interpolation(&v).map_err(|e| e.to_string())?,
-            ))
-        } else {
-            Ok(ConfigResolution::Runtime)
-        };
-    }
-
-    // Traverse until we either:
-    // - reach the node (resolved)
-    // - hit a runtime insert (ConfigRef) before path ends (runtime)
-    // - find a missing key (error)
-    let mut cur = template;
-    for seg in query.split('.') {
-        if seg.is_empty() {
-            return Err(format!("invalid config path {query:?}: empty segment"));
-        }
-        match cur {
-            rc::ConfigNode::Object(map) => {
-                let Some(next) = map.get(seg) else {
-                    return Err(format!("config.{query} not found (missing key {seg:?})"));
-                };
-                cur = next;
-            }
-            rc::ConfigNode::ConfigRef(_) => return Ok(ConfigResolution::Runtime),
-            _ => {
-                return Err(format!(
-                    "config.{query} not found (encountered non-object before segment {seg:?})"
-                ));
-            }
-        }
-    }
-
-    if !cur.contains_runtime() {
-        let v = cur.evaluate_static().map_err(|e| e.to_string())?;
-        Ok(ConfigResolution::Static(
-            rc::stringify_for_interpolation(&v).map_err(|e| e.to_string())?,
-        ))
-    } else {
-        Ok(ConfigResolution::Runtime)
-    }
-}
-
-/// Render a template string that is known to be fully static.
-fn render_template_string_static(ts: &TemplateString) -> Result<String, String> {
-    if rc::template_string_is_runtime(ts) {
-        return Err(
-            "internal error: attempted to render a runtime template string statically".to_string(),
-        );
-    }
-    let mut out = String::new();
-    for part in ts {
-        match part {
-            TemplatePart::Lit { lit } => out.push_str(lit),
-            TemplatePart::Config { .. } => unreachable!(),
-            TemplatePart::Binding { .. } => unreachable!(),
-        }
-    }
-    Ok(out)
-}
-
-/// Build ProgramMode for a component by analyzing its entrypoint and env for runtime config refs.
-#[allow(clippy::too_many_arguments)]
-fn build_program_mode(
-    s: &Scenario,
-    id: ComponentId,
-    program: &amber_manifest::Program,
-    slots: &BTreeMap<String, SlotObject>,
-    bindings: &BTreeMap<String, BindingObject>,
-    template_opt: Option<&rc::ConfigNode>,
-    component_schema: Option<&Value>,
-    component_template: &rc::RootConfigTemplate,
-) -> KubernetesResult<ProgramMode> {
-    let mut entrypoint_ts: Vec<TemplateString> = Vec::new();
-    let mut needs_helper = false;
-
-    for (idx, arg) in program.args.0.iter().enumerate() {
-        let mut ts: TemplateString = Vec::new();
-        for part in &arg.parts {
-            match part {
-                InterpolatedPart::Literal(lit) => ts.push(TemplatePart::lit(lit)),
-                InterpolatedPart::Interpolation { source, query } => match source {
-                    InterpolationSource::Slots => {
-                        let v = resolve_slot_query(slots, query).map_err(|e| {
-                            ReporterError::new(format!(
-                                "failed to resolve slot query in {}: {e}",
-                                component_label(s, id)
-                            ))
-                        })?;
-                        ts.push(TemplatePart::lit(v));
-                    }
-                    InterpolationSource::Bindings => {
-                        let v = resolve_binding_query(bindings, query).map_err(|e| {
-                            ReporterError::new(format!(
-                                "failed to resolve binding query in {}: {e}",
-                                component_label(s, id)
-                            ))
-                        })?;
-                        ts.push(TemplatePart::lit(v));
-                    }
-                    InterpolationSource::Config => {
-                        match resolve_config_query_for_program(template_opt, query)
-                            .map_err(ReporterError::new)?
-                        {
-                            ConfigResolution::Static(v) => ts.push(TemplatePart::lit(v)),
-                            ConfigResolution::Runtime => {
-                                ts.push(TemplatePart::config(query.clone()));
-                                needs_helper = true;
-                            }
-                        }
-                    }
-                    other => {
-                        return Err(ReporterError::new(format!(
-                            "unsupported interpolation source {other} in {} \
-                             program.entrypoint[{idx}]",
-                            component_label(s, id)
-                        )));
-                    }
-                },
-                _ => {
-                    return Err(ReporterError::new(format!(
-                        "unsupported interpolation part in {} program.entrypoint[{idx}]",
-                        component_label(s, id)
-                    )));
-                }
-            }
-        }
-        if ts.is_empty() {
-            return Err(ReporterError::new(format!(
-                "internal error: produced empty template for {} program.entrypoint[{idx}]",
-                component_label(s, id)
-            )));
-        }
-        entrypoint_ts.push(ts);
-    }
-
-    // program.env
-    let mut env_ts: BTreeMap<String, TemplateString> = BTreeMap::new();
-    for (k, v) in &program.env {
-        let mut ts: TemplateString = Vec::new();
-        for part in &v.parts {
-            match part {
-                InterpolatedPart::Literal(lit) => ts.push(TemplatePart::lit(lit)),
-                InterpolatedPart::Interpolation { source, query } => match source {
-                    InterpolationSource::Slots => {
-                        let vv = resolve_slot_query(slots, query).map_err(|e| {
-                            ReporterError::new(format!(
-                                "failed to resolve slot query in {}: {e}",
-                                component_label(s, id)
-                            ))
-                        })?;
-                        ts.push(TemplatePart::lit(vv));
-                    }
-                    InterpolationSource::Bindings => {
-                        let vv = resolve_binding_query(bindings, query).map_err(|e| {
-                            ReporterError::new(format!(
-                                "failed to resolve binding query in {}: {e}",
-                                component_label(s, id)
-                            ))
-                        })?;
-                        ts.push(TemplatePart::lit(vv));
-                    }
-                    InterpolationSource::Config => {
-                        match resolve_config_query_for_program(template_opt, query)
-                            .map_err(ReporterError::new)?
-                        {
-                            ConfigResolution::Static(vv) => ts.push(TemplatePart::lit(vv)),
-                            ConfigResolution::Runtime => {
-                                ts.push(TemplatePart::config(query.clone()));
-                                needs_helper = true;
-                            }
-                        }
-                    }
-                    other => {
-                        return Err(ReporterError::new(format!(
-                            "unsupported interpolation source {other} in {} program.env.{k}",
-                            component_label(s, id)
-                        )));
-                    }
-                },
-                _ => {
-                    return Err(ReporterError::new(format!(
-                        "unsupported interpolation part in {} program.env.{k}",
-                        component_label(s, id)
-                    )));
-                }
-            }
-        }
-        env_ts.insert(k.clone(), ts);
-    }
-
-    if needs_helper {
-        // Build TemplateSpec for the helper.
-        let spec = TemplateSpec {
-            program: ProgramTemplateSpec {
-                entrypoint: entrypoint_ts,
-                env: env_ts,
-            },
-        };
-
-        let b64 = base64::engine::general_purpose::STANDARD;
-
-        let spec_json = serde_json::to_vec(&spec).map_err(|e| {
-            ReporterError::new(format!(
-                "failed to serialize template spec for {}: {e}",
-                component_label(s, id)
-            ))
-        })?;
-        let spec_b64 = b64.encode(spec_json);
-
-        // Convert component template to payload format.
-        let cfg_template_value = component_template.to_json_ir();
-
-        let template_json = serde_json::to_vec(&cfg_template_value).map_err(|e| {
-            ReporterError::new(format!(
-                "failed to serialize component config template for {}: {e}",
-                component_label(s, id)
-            ))
-        })?;
-        let template_b64 = b64.encode(template_json);
-
-        let schema = component_schema.ok_or_else(|| {
-            ReporterError::new(format!(
-                "component {} requires config_schema when using runtime config interpolation",
-                component_label(s, id)
-            ))
-        })?;
-
-        let schema_json = serde_json::to_vec(&rc::canonical_json(schema)).map_err(|e| {
-            ReporterError::new(format!(
-                "failed to serialize component config definition for {}: {e}",
-                component_label(s, id)
-            ))
-        })?;
-        let schema_b64 = b64.encode(schema_json);
-
-        Ok(ProgramMode::Helper {
-            template_spec_b64: spec_b64,
-            component_cfg_template_b64: template_b64,
-            component_schema_b64: schema_b64,
-        })
-    } else {
-        // Fully resolved: render to concrete entrypoint/env.
-        let mut rendered_entrypoint: Vec<String> = Vec::new();
-        for ts in entrypoint_ts {
-            rendered_entrypoint
-                .push(render_template_string_static(&ts).map_err(ReporterError::new)?);
-        }
-
-        let mut rendered_env: BTreeMap<String, String> = BTreeMap::new();
-        for (k, ts) in env_ts {
-            rendered_env.insert(
-                k,
-                render_template_string_static(&ts).map_err(ReporterError::new)?,
-            );
-        }
-
-        Ok(ProgramMode::Direct {
-            entrypoint: rendered_entrypoint,
-            env: rendered_env,
-        })
     }
 }
 
@@ -1826,6 +1142,15 @@ while true; do echo "ready" | nc -l -p 8080 >/dev/null; done
                             container_port: 8080,
                             protocol: "TCP",
                         }],
+                        readiness_probe: Some(Probe {
+                            exec: None,
+                            http_get: None,
+                            tcp_socket: Some(TcpSocketAction { port: 8080 }),
+                            initial_delay_seconds: Some(1),
+                            period_seconds: Some(2),
+                            timeout_seconds: Some(1),
+                            failure_threshold: Some(30),
+                        }),
                         ..Default::default()
                     }],
                     volumes: Vec::new(),
@@ -1864,15 +1189,6 @@ while true; do echo "ready" | nc -l -p 8080 >/dev/null; done
         ("client-deployment.yaml", to_yaml(&client_deployment)),
         ("client-service.yaml", to_yaml(&client_service)),
     ]
-}
-
-fn binding_from_component(from: &BindingFrom) -> &ProvideRef {
-    match from {
-        BindingFrom::Component(provide) => provide,
-        BindingFrom::Framework(name) => {
-            unreachable!("framework binding framework.{name} should be rejected earlier")
-        }
-    }
 }
 
 fn to_yaml<T: Serialize>(value: &T) -> Result<String, ReporterError> {

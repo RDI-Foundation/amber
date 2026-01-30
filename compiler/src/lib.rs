@@ -19,6 +19,7 @@ mod provenance;
 mod slot_query;
 mod slot_validation;
 mod store;
+mod targets;
 
 pub mod bundle;
 pub mod passes;
