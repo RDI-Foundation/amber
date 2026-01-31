@@ -11,6 +11,7 @@ use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
     ScenarioExport, SlotRef,
 };
+use base64::Engine as _;
 use serde_json::{Map, Value, json};
 use url::Url;
 
@@ -211,6 +212,24 @@ fn require_same_platform(images: &[(&str, String)]) -> String {
         );
     }
     first_platform.clone()
+}
+
+fn extract_compose_env_value(yaml: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    for line in yaml.lines() {
+        let line = line.trim();
+        let Some(entry) = line.strip_prefix("- ") else {
+            continue;
+        };
+        let mut entry = entry.trim();
+        if entry.starts_with('"') && entry.ends_with('"') && entry.len() >= 2 {
+            entry = &entry[1..entry.len() - 1];
+        }
+        if let Some(value) = entry.strip_prefix(&prefix) {
+            return Some(value.to_string());
+        }
+    }
+    None
 }
 
 #[test]
@@ -778,9 +797,92 @@ fn compose_emits_export_metadata_and_labels() {
     assert!(yaml.contains(r#"component: "/server""#), "{yaml}");
     assert!(yaml.contains(r#"provide: "api""#), "{yaml}");
     assert!(yaml.contains(r#"endpoint: "api""#), "{yaml}");
-    assert!(yaml.contains("127.0.0.1:18000:8080"), "{yaml}");
+    assert!(yaml.contains("127.0.0.1:18000:22000"), "{yaml}");
     assert!(yaml.contains(r#"amber.exports: "{\"public\""#), "{yaml}");
     assert!(yaml.contains(r#"\"published_port\":18000"#), "{yaml}");
+}
+
+#[test]
+fn compose_routes_external_slots_through_router() {
+    let client_program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["client"],
+        "env": {
+            "API_URL": "${slots.api.url}"
+        }
+    }))
+    .unwrap();
+
+    let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        program: None,
+        slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
+        provides: BTreeMap::new(),
+        children: vec![ComponentId(1)],
+    };
+
+    let client = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/client"),
+        digest: digest(1),
+        config: None,
+        program: Some(client_program),
+        slots: BTreeMap::from([("api".to_string(), slot_http)]),
+        provides: BTreeMap::new(),
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(client)],
+        bindings: vec![BindingEdge {
+            name: None,
+            from: BindingFrom::External(SlotRef {
+                component: ComponentId(0),
+                name: "api".to_string(),
+            }),
+            to: SlotRef {
+                component: ComponentId(1),
+                name: "api".to_string(),
+            },
+            weak: true,
+        }],
+        exports: Vec::new(),
+    };
+
+    let output = compile_output(scenario);
+    let yaml = DockerComposeReporter
+        .emit(&output)
+        .expect("compose render ok");
+
+    assert!(yaml.contains("amber-router-net"), "{yaml}");
+    assert!(yaml.contains("AMBER_EXTERNAL_SLOT_API_URL"), "{yaml}");
+    assert!(
+        yaml.contains(r#"API_URL: "http://127.0.0.1:20000""#),
+        "{yaml}"
+    );
+
+    let b64 =
+        extract_compose_env_value(&yaml, "AMBER_ROUTER_CONFIG_B64").expect("router config env var");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .expect("decode router config");
+    let config: serde_json::Value = serde_json::from_slice(&decoded).expect("parse router config");
+
+    assert_eq!(config["external_slots"][0]["name"], "api");
+    assert_eq!(config["external_slots"][0]["listen_port"], 21000);
+    assert_eq!(
+        config["external_slots"][0]["url_env"],
+        "AMBER_EXTERNAL_SLOT_API_URL"
+    );
+    assert!(config["exports"].as_array().unwrap().is_empty());
 }
 
 #[test]

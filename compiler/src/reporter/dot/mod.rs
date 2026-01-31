@@ -63,6 +63,10 @@ fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
         .bindings
         .iter()
         .any(|b| matches!(b.from, BindingFrom::Framework(_)));
+    let has_external = s
+        .bindings
+        .iter()
+        .any(|b| matches!(b.from, BindingFrom::External(_)));
 
     let mut out = String::new();
     let _ = writeln!(out, "digraph scenario {{");
@@ -87,11 +91,16 @@ fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
         write_indent(&mut out, 1);
         let _ = writeln!(out, "framework [label=\"framework\", shape=box];");
     }
+    if has_external {
+        write_indent(&mut out, 1);
+        let _ = writeln!(out, "external [label=\"external\", shape=box];");
+    }
 
     for b in &s.bindings {
         let from_component = match &b.from {
             BindingFrom::Component(from) => Some(from.component),
             BindingFrom::Framework(_) => None,
+            BindingFrom::External(_) => None,
         };
         if !root_has_node && (from_component == Some(root) || b.to.component == root) {
             continue;
@@ -110,6 +119,10 @@ fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
             BindingFrom::Framework(name) => {
                 let _ = write!(out, "framework -> c{} [label=\"", b.to.component.0);
                 write_escaped_label(&mut out, &format!("framework.{name}"));
+            }
+            BindingFrom::External(slot) => {
+                let _ = write!(out, "external -> c{} [label=\"", b.to.component.0);
+                write_escaped_label(&mut out, &format!("slots.{}", slot.name));
             }
         }
         if let Some(name) = b.name.as_ref() {

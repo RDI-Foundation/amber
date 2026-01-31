@@ -486,6 +486,16 @@ pub struct NetworkPolicyPeer {
     pub pod_selector: Option<LabelSelector>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace_selector: Option<LabelSelector>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip_block: Option<IpBlock>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IpBlock {
+    pub cidr: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub except: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

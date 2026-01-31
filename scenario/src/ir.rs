@@ -12,7 +12,7 @@ use crate::{
 };
 
 pub const SCENARIO_IR_SCHEMA: &str = "amber.scenario.ir";
-pub const SCENARIO_IR_VERSION: u32 = 1;
+pub const SCENARIO_IR_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScenarioIr {
@@ -111,6 +111,12 @@ impl TryFrom<ScenarioIr> for Scenario {
                 BindingFromIr::Framework { capability } => {
                     ensure_name_no_dot(capability)?;
                 }
+                BindingFromIr::External { slot } => {
+                    ensure_name_no_dot(&slot.slot)?;
+                    ensure_component(&components, slot.component, || {
+                        format!("external slot source for {}", binding.to.slot)
+                    })?;
+                }
             }
             if let BindingFromIr::Component { component, .. } = &binding.from {
                 ensure_component(&components, *component, || {
@@ -200,6 +206,7 @@ impl ComponentIr {
 pub enum BindingFromIr {
     Component { component: usize, provide: String },
     Framework { capability: String },
+    External { slot: SlotRefIr },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -244,6 +251,9 @@ impl From<&BindingFrom> for BindingFromIr {
             BindingFrom::Framework(name) => Self::Framework {
                 capability: name.to_string(),
             },
+            BindingFrom::External(slot) => Self::External {
+                slot: SlotRefIr::from(slot),
+            },
         }
     }
 }
@@ -266,6 +276,7 @@ impl BindingFromIr {
                     })?;
                 Ok(BindingFrom::Framework(name))
             }
+            BindingFromIr::External { slot } => Ok(BindingFrom::External(slot.into_slot_ref())),
         }
     }
 }
@@ -656,6 +667,9 @@ mod tests {
         match &binding.from {
             BindingFrom::Framework(name) => assert_eq!(name.as_str(), "dynamic_children"),
             BindingFrom::Component(_) => panic!("expected framework binding"),
+            BindingFrom::External(slot) => {
+                panic!("unexpected external binding slots.{}", slot.name)
+            }
         }
     }
 

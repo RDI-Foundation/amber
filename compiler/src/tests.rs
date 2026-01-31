@@ -1026,6 +1026,136 @@ async fn slot_cycle_reports_error() {
 }
 
 #[tokio::test]
+async fn external_root_slot_with_weak_binding_is_allowed() {
+    let dir = tmp_dir("external-root-slot-weak");
+    let root_path = dir.path().join("root.json5");
+    let client_path = dir.path().join("client.json5");
+
+    write_file(
+        &client_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "client",
+            entrypoint: ["client"],
+            env: { API_URL: "${slots.api.url}" }
+          },
+          slots: { api: { kind: "http" } }
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              slots: {{ api: {{ kind: "http" }} }},
+              components: {{ client: "{client}" }},
+              bindings: [
+                {{ to: "#client.api", from: "self.api", weak: true }}
+              ]
+            }}
+            "##,
+            client = file_url(&client_path),
+        ),
+    );
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+    let output = compiler
+        .compile(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
+            },
+        )
+        .await
+        .unwrap();
+
+    let scenario = &output.scenario;
+    let client_id = scenario
+        .components_iter()
+        .find(|(_, c)| c.moniker.as_str() == "/client")
+        .map(|(id, _)| id)
+        .expect("client component");
+    let binding = scenario
+        .bindings
+        .iter()
+        .find(|b| b.to.component == client_id && b.to.name == "api")
+        .expect("binding to client.api");
+
+    assert!(binding.weak, "binding should be weak");
+    assert!(
+        matches!(
+            &binding.from,
+            BindingFrom::External(slot)
+                if slot.component == scenario.root && slot.name == "api"
+        ),
+        "expected external binding from root.api, got {:?}",
+        binding.from
+    );
+}
+
+#[tokio::test]
+async fn external_root_slot_requires_weak_binding() {
+    let dir = tmp_dir("external-root-slot-strong");
+    let root_path = dir.path().join("root.json5");
+    let client_path = dir.path().join("client.json5");
+
+    write_file(
+        &client_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "client",
+            entrypoint: ["client"],
+            env: { API_URL: "${slots.api.url}" }
+          },
+          slots: { api: { kind: "http" } }
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              slots: {{ api: {{ kind: "http" }} }},
+              components: {{ client: "{client}" }},
+              bindings: [
+                {{ to: "#client.api", from: "self.api" }}
+              ]
+            }}
+            "##,
+            client = file_url(&client_path),
+        ),
+    );
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+    let err = compiler
+        .compile(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        error_contains(&err, "external slot"),
+        "expected external slot weak-binding error, got {err}"
+    );
+}
+
+#[tokio::test]
 async fn exporting_unbound_optional_slot_errors() {
     let dir = tmp_dir("scenario-export-unbound-slot");
     let root_path = dir.path().join("root.json5");
@@ -1054,10 +1184,10 @@ async fn exporting_unbound_optional_slot_errors() {
         .await
         .unwrap_err();
 
-    assert!(error_contains(
-        &err,
-        "export `api` on root component resolves to unbound slot `api`"
-    ));
+    assert!(
+        error_contains(&err, "external slot"),
+        "expected external-slot export error, got {err}"
+    );
 }
 
 #[tokio::test]
@@ -1158,6 +1288,9 @@ async fn delegated_export_chain_resolves_binding_source() {
         BindingFrom::Component(from) => from,
         BindingFrom::Framework(name) => {
             panic!("unexpected framework binding framework.{name}")
+        }
+        BindingFrom::External(slot) => {
+            panic!("unexpected external binding slots.{}", slot.name)
         }
     };
     let from_path = graph::component_path_for(&compilation.scenario.components, from.component);

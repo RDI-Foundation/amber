@@ -12,7 +12,7 @@ use tempfile::tempdir;
 use url::Url;
 
 use super::{HELPER_IMAGE, KubernetesReporter, KubernetesReporterConfig};
-use crate::{CompileOptions, Compiler, DigestStore, reporter::Reporter as _};
+use crate::{CompileOptions, Compiler, DigestStore, OptimizeOptions, reporter::Reporter as _};
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -225,6 +225,119 @@ fn fetch(url: &str, port_forward: &mut PortForwardGuard, namespace: &str, pod: &
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn kubernetes_emits_router_for_external_slots() {
+    let dir = tempdir().expect("temp dir");
+    let root_path = dir.path().join("root.json5");
+    let client_path = dir.path().join("client.json5");
+
+    fs::write(
+        &root_path,
+        r##"
+        {
+          manifest_version: "0.1.0",
+          slots: { api: { kind: "http" } },
+          components: { client: "./client.json5" },
+          bindings: [
+            { to: "#client.api", from: "self.api", weak: true }
+          ]
+        }
+        "##,
+    )
+    .expect("write root manifest");
+
+    fs::write(
+        &client_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "client",
+            entrypoint: ["client"],
+            env: { API_URL: "${slots.api.url}" }
+          },
+          slots: { api: { kind: "http" } }
+        }
+        "#,
+    )
+    .expect("write client manifest");
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let mut opts = CompileOptions::default();
+    opts.optimize = OptimizeOptions { dce: false };
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let output = rt
+        .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
+        .expect("compile scenario");
+
+    let reporter = KubernetesReporter {
+        config: KubernetesReporterConfig::default(),
+    };
+    let artifact = reporter.emit(&output).expect("render kubernetes output");
+
+    let router_deploy = artifact
+        .files
+        .get(&PathBuf::from("03-deployments/amber-router.yaml"))
+        .expect("router deployment");
+    assert!(
+        router_deploy.contains("AMBER_ROUTER_CONFIG_B64"),
+        "{router_deploy}"
+    );
+    assert!(
+        router_deploy.contains("amber-router-external"),
+        "{router_deploy}"
+    );
+
+    let router_service = artifact
+        .files
+        .get(&PathBuf::from("04-services/amber-router.yaml"))
+        .expect("router service");
+    assert!(router_service.contains("port: 21000"), "{router_service}");
+
+    let router_env = artifact
+        .files
+        .get(&PathBuf::from("router-external.env"))
+        .expect("router env template");
+    assert!(
+        router_env.contains("AMBER_EXTERNAL_SLOT_API_URL="),
+        "{router_env}"
+    );
+
+    let kustomization = artifact
+        .files
+        .get(&PathBuf::from("kustomization.yaml"))
+        .expect("kustomization");
+    let kust_doc: serde_yaml::Value =
+        serde_yaml::from_str(kustomization).expect("parse kustomization");
+    let resources = kust_doc["resources"]
+        .as_sequence()
+        .expect("kustomization resources list");
+    let contains_env = resources
+        .iter()
+        .any(|item| item.as_str() == Some("router-external.env"));
+    assert!(!contains_env, "{kustomization}");
+
+    let metadata_yaml = artifact
+        .files
+        .get(&PathBuf::from("01-configmaps/amber-metadata.yaml"))
+        .expect("metadata configmap");
+    let meta_doc: serde_yaml::Value =
+        serde_yaml::from_str(metadata_yaml).expect("parse metadata yaml");
+    let scenario_json = meta_doc["data"]["scenario.json"]
+        .as_str()
+        .expect("scenario.json in metadata");
+    let scenario_json: serde_json::Value =
+        serde_json::from_str(scenario_json).expect("parse scenario.json");
+    assert_eq!(
+        scenario_json["external_slots"]["api"]["required"],
+        serde_json::Value::Bool(true)
+    );
+    assert_eq!(
+        scenario_json["external_slots"]["api"]["kind"],
+        serde_json::Value::String("http".to_string())
     );
 }
 

@@ -1,0 +1,13 @@
+{
+  manifest_version: "0.1.0",
+  // Root slot left unbound + weak bindings => externalized.
+  slots: {
+    api: { kind: "http" },
+  },
+  components: {
+    client: "./client.json5",
+  },
+  bindings: [
+    { to: "#client.api", from: "self.api", weak: true },
+  ],
+}

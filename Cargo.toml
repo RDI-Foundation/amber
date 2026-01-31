@@ -6,6 +6,7 @@ members = [
   "helper",
   "json5",
   "manifest",
+  "router",
   "node",
   "resolver",
   "scenario",

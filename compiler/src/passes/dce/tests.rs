@@ -273,6 +273,9 @@ fn dce_prunes_unused_transitive_subtree() {
         BindingFrom::Framework(name) => {
             panic!("unexpected framework binding framework.{name}")
         }
+        BindingFrom::External(slot) => {
+            panic!("unexpected external binding slots.{}", slot.name)
+        }
     };
     assert_eq!(edge_from.name, "llm");
     assert_eq!(edge.to.name, "llm");
@@ -733,5 +736,8 @@ fn dce_keeps_framework_bound_slots() {
     match &scenario.bindings[0].from {
         BindingFrom::Framework(name) => assert_eq!(name.as_str(), "dynamic_children"),
         BindingFrom::Component(_) => panic!("expected framework binding"),
+        BindingFrom::External(slot) => {
+            panic!("unexpected external binding slots.{}", slot.name)
+        }
     }
 }

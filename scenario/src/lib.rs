@@ -168,8 +168,14 @@ impl Scenario {
         }
 
         for binding in &self.bindings {
-            if let BindingFrom::Component(provide) = &binding.from {
-                let _ = self.component(provide.component);
+            match &binding.from {
+                BindingFrom::Component(provide) => {
+                    let _ = self.component(provide.component);
+                }
+                BindingFrom::External(slot) => {
+                    let _ = self.component(slot.component);
+                }
+                BindingFrom::Framework(_) => {}
             }
             let _ = self.component(binding.to.component);
         }
@@ -223,6 +229,7 @@ pub struct ProvideRef {
 pub enum BindingFrom {
     Component(ProvideRef),
     Framework(FrameworkCapabilityName),
+    External(SlotRef),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
