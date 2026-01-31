@@ -14,6 +14,7 @@ pub struct CycleError {
 /// Notes:
 /// - Self-bindings are ignored.
 /// - Weak edges are ignored for ordering and cycle detection (they can point "backwards" without creating a dependency cycle).
+/// - Framework and external bindings are ignored (they do not introduce component dependencies).
 /// - This is intentionally separate from Scenario (graph ops live here).
 pub fn topo_order(s: &Scenario) -> Result<Vec<ComponentId>, CycleError> {
     let n = s.components.len();

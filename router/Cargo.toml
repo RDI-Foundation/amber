@@ -1,0 +1,18 @@
+[package]
+name = "amber-router"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.7.7"
+base64 = { workspace = true }
+http = "1.1.0"
+hyper-util = { version = "0.1.10", features = ["client-legacy", "tokio"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+url = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

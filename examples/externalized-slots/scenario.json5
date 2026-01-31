@@ -1,0 +1,26 @@
+{
+  manifest_version: "0.1.0",
+  slots: {
+    api: { kind: "http" },
+  },
+  program: {
+    image: "busybox:1.36",
+    args: [
+      "sh",
+      "-c",
+      "httpd -f -p 9000 & while true; do echo \"[root] calling $API_URL\"; wget -qO- \"$API_URL\" || true; sleep 2; done",
+    ],
+    env: {
+      API_URL: "${slots.api.url}",
+    },
+    network: {
+      endpoints: [{ name: "public", port: 9000 }],
+    },
+  },
+  provides: {
+    public: { kind: "http", endpoint: "public" },
+  },
+  exports: {
+    public: "public",
+  },
+}
