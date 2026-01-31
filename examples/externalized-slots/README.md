@@ -1,7 +1,10 @@
 # Externalized slots
 
-This example shows how a root slot becomes externalized when it is left unbound and every binding
-that uses it is marked `weak: true`.
+This example is a single manifest with a root program that imports an external HTTP slot and
+exports its own HTTP capability. The root program reads `${slots.api.url}`, so the unbound `api`
+slot is treated as an externalized root input.
+
+The program also serves HTTP on port 9000 and exports it as `public`.
 
 ## Docker Compose
 
