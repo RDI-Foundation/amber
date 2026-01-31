@@ -7,7 +7,6 @@ use std::{
 
 use amber_config as rc;
 use amber_scenario::{ComponentId, Scenario};
-use base64::Engine as _;
 pub use resources::*;
 use serde::Serialize;
 
@@ -19,6 +18,10 @@ use crate::{
     targets::mesh::{
         config::{ProgramPlan, encode_helper_payload, encode_schema_b64},
         plan::{MeshOptions, component_label},
+        router_config::{
+            RouterConfig, RouterExport, RouterExternalSlot, allocate_external_slot_ports,
+            build_router_external_slots, encode_router_config_b64,
+        },
     },
 };
 
@@ -100,27 +103,6 @@ struct InputMetadata {
 struct ExternalSlotMetadata {
     required: bool,
     kind: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct RouterConfig {
-    external_slots: Vec<RouterExternalSlot>,
-    exports: Vec<RouterExport>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct RouterExternalSlot {
-    name: String,
-    listen_port: u16,
-    url_env: String,
-    optional: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct RouterExport {
-    name: String,
-    listen_port: u16,
-    target_url: String,
 }
 
 /// Full scenario metadata stored in amber-metadata ConfigMap.
@@ -233,20 +215,9 @@ fn render_kubernetes(
         .as_ref()
         .expect("root manifest should exist");
 
-    let mut external_slot_ports: BTreeMap<String, u16> = BTreeMap::new();
-    if !mesh_plan.external_bindings.is_empty() {
-        let mut next_port = ROUTER_EXTERNAL_PORT_BASE;
-        let mut slot_names = BTreeSet::new();
-        for binding in &mesh_plan.external_bindings {
-            slot_names.insert(binding.external_slot.clone());
-        }
-        for slot in slot_names {
-            external_slot_ports.insert(slot, next_port);
-            next_port = next_port.checked_add(1).ok_or_else(|| {
-                ReporterError::new("ran out of router external ports".to_string())
-            })?;
-        }
-    }
+    let external_slot_ports =
+        allocate_external_slot_ports(&mesh_plan.external_bindings, ROUTER_EXTERNAL_PORT_BASE)
+            .map_err(ReporterError::new)?;
 
     for binding in &mesh_plan.external_bindings {
         let consumer = binding.consumer;
@@ -363,20 +334,11 @@ fn render_kubernetes(
     let mut router_service_ports: Vec<ServicePort> = Vec::new();
 
     if needs_router {
-        for (slot_name, listen_port) in &external_slot_ports {
-            let decl = root_manifest
-                .slots()
-                .get(slot_name.as_str())
-                .expect("external slot should exist on root");
-            let url_env = external_slot_env_var(slot_name);
-            router_env_passthrough.push(url_env.clone());
-            router_external_slots.push(RouterExternalSlot {
-                name: slot_name.clone(),
-                listen_port: *listen_port,
-                url_env,
-                optional: decl.optional,
-            });
-        }
+        router_external_slots = build_router_external_slots(root_manifest, &external_slot_ports);
+        router_env_passthrough = router_external_slots
+            .iter()
+            .map(|slot| slot.url_env.clone())
+            .collect();
 
         for ex in &mesh_plan.exports {
             let listen_port = *export_ports_by_name.get(&ex.name).ok_or_else(|| {
@@ -433,10 +395,9 @@ fn render_kubernetes(
             external_slots: router_external_slots.clone(),
             exports: router_exports.clone(),
         };
-        let json = serde_json::to_vec(&router_config).map_err(|err| {
+        let b64 = encode_router_config_b64(&router_config).map_err(|err| {
             ReporterError::new(format!("failed to serialize router config: {err}"))
         })?;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(json);
         router_config_b64 = Some(b64);
     }
 
@@ -1244,19 +1205,6 @@ fn sanitize_port_name(s: &str) -> String {
     // Port names: max 15 chars, lowercase alphanumeric and hyphens.
     let sanitized = sanitize_dns_name(s);
     truncate_dns_name(&sanitized, 15)
-}
-
-fn external_slot_env_var(slot: &str) -> String {
-    let mut out = String::from("AMBER_EXTERNAL_SLOT_");
-    for ch in slot.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_uppercase());
-        } else {
-            out.push('_');
-        }
-    }
-    out.push_str("_URL");
-    out
 }
 
 // ---- Runtime config / helper mode support ----

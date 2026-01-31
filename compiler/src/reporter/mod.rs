@@ -9,7 +9,7 @@ pub mod scenario_ir;
 
 pub use docker_compose::DockerComposeReporter;
 
-pub use crate::targets::mesh::reporters::{docker_compose, kubernetes};
+pub use crate::targets::mesh::{docker_compose, kubernetes};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
