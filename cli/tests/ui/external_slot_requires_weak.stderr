@@ -1,0 +1,22 @@
+linker::external_slot_requires_weak
+
+  x binding into component /client.api must be weak because it depends on external slot `api`
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/external_slot_requires_weak.json5:10:11]
+  9 |   bindings: [
+ 10 |     { to: "#client.api", from: "self.api" },
+    :           ^^^^^^|^^^^^^
+    :                 `-- binding must be weak here
+ 11 |   ],
+    `----
+  help: Make this binding weak or insert a weak binding upstream.
+
+Advice: 
+  > external slot `api` declared on /
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/external_slot_requires_weak.json5:4:5]
+ 3 |   slots: {
+ 4 |     api: { kind: "http" },
+   :     ^|^
+   :      `-- slot declared here
+ 5 |   },
+   `----
+Error:   × check failed
