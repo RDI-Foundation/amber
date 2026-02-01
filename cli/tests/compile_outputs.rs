@@ -54,7 +54,7 @@ fn compile_writes_primary_output_and_dot_artifact() {
     let primary_json: Value =
         serde_json::from_str(&primary_contents).expect("primary output did not contain valid JSON");
     assert_eq!(primary_json["schema"], "amber.scenario.ir");
-    assert_eq!(primary_json["version"], 2);
+    assert_eq!(primary_json["version"], 1);
     assert_eq!(primary_json["root"], 0);
 
     let components = primary_json["components"]
