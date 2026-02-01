@@ -11,7 +11,7 @@ use amber_resolver::Resolver;
 use tempfile::tempdir;
 use url::Url;
 
-use super::{HELPER_IMAGE, KubernetesReporter, KubernetesReporterConfig};
+use super::{HELPER_IMAGE, KubernetesReporter, KubernetesReporterConfig, ROUTER_IMAGE};
 use crate::{CompileOptions, Compiler, DigestStore, OptimizeOptions, reporter::Reporter as _};
 
 fn workspace_root() -> PathBuf {
@@ -19,6 +19,87 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("compiler crate should live under the workspace root")
         .to_path_buf()
+}
+
+fn docker_platform() -> String {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    format!("linux/{arch}")
+}
+
+fn image_platform_opt(tag: &str) -> Option<String> {
+    let output = Command::new("docker")
+        .arg("image")
+        .arg("inspect")
+        .arg("-f")
+        .arg("{{.Architecture}}")
+        .arg(tag)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let arch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if arch.is_empty() {
+        return None;
+    }
+    Some(format!("linux/{arch}"))
+}
+
+fn ensure_image_platform(tag: &str, platform: &str) {
+    let needs_pull = match image_platform_opt(tag) {
+        Some(existing) => existing != platform,
+        None => true,
+    };
+
+    if needs_pull {
+        let mut cmd = Command::new("docker");
+        cmd.arg("pull").arg("--platform").arg(platform).arg(tag);
+        checked_status(&mut cmd, &format!("docker pull {tag} ({platform})"));
+    }
+}
+
+fn build_router_image() {
+    let root = workspace_root();
+    let dockerfile = root.join("docker/amber-router/Dockerfile");
+    let mut cmd = Command::new("docker");
+    cmd.arg("build")
+        .arg("-t")
+        .arg(ROUTER_IMAGE)
+        .arg("-f")
+        .arg(&dockerfile)
+        .arg(&root);
+    checked_status(&mut cmd, "docker build amber-router image");
+}
+
+fn ensure_router_image(platform: &str) {
+    let needs_pull = match image_platform_opt(ROUTER_IMAGE) {
+        Some(existing) => existing != platform,
+        None => true,
+    };
+
+    if !needs_pull {
+        return;
+    }
+
+    let mut cmd = Command::new("docker");
+    cmd.arg("pull")
+        .arg("--platform")
+        .arg(platform)
+        .arg(ROUTER_IMAGE)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let status = cmd.status().unwrap_or_else(|err| {
+        panic!("failed to run docker pull for {ROUTER_IMAGE}: {err}");
+    });
+    if status.success() {
+        return;
+    }
+
+    build_router_image();
 }
 
 fn file_url(path: &Path) -> Url {
@@ -74,7 +155,13 @@ fn checked_output(cmd: &mut Command, context: &str) -> std::process::Output {
 }
 
 fn checked_status(cmd: &mut Command, context: &str) {
-    let _ = checked_output(cmd, context);
+    cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    let status = cmd.status().unwrap_or_else(|err| {
+        panic!("failed to run {context}: {err}");
+    });
+    if !status.success() {
+        panic!("{context} failed (status: {status})");
+    }
 }
 
 fn build_helper_image() {
@@ -375,6 +462,9 @@ fn kubernetes_smoke_config_roundtrip() {
     );
 
     build_helper_image();
+    let platform = docker_platform();
+    ensure_router_image(&platform);
+    ensure_image_platform("busybox:1.36", &platform);
 
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -383,13 +473,15 @@ fn kubernetes_smoke_config_roundtrip() {
     let cluster_name = format!("amber-test-{}-{nonce}", std::process::id());
     let _cluster_guard = KindClusterGuard::new(cluster_name.clone());
 
-    let mut cmd = Command::new("kind");
-    cmd.arg("load")
-        .arg("docker-image")
-        .arg(HELPER_IMAGE)
-        .arg("--name")
-        .arg(&cluster_name);
-    checked_status(&mut cmd, "kind load helper image");
+    for image in [HELPER_IMAGE, ROUTER_IMAGE, "busybox:1.36"] {
+        let mut cmd = Command::new("kind");
+        cmd.arg("load")
+            .arg("docker-image")
+            .arg(image)
+            .arg("--name")
+            .arg(&cluster_name);
+        checked_status(&mut cmd, &format!("kind load {image} image"));
+    }
 
     let mut cmd = Command::new("kubectl");
     cmd.arg("apply").arg("-k").arg(&output_dir);
