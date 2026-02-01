@@ -249,6 +249,7 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        metadata: None,
         children: vec![ComponentId(2), ComponentId(1)],
     };
 
@@ -261,6 +262,7 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        metadata: None,
         children: Vec::new(),
     };
 
@@ -273,6 +275,7 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        metadata: None,
         children: Vec::new(),
     };
 
@@ -380,6 +383,7 @@ fn compose_resolves_binding_urls_in_child_config() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        metadata: None,
         children: vec![ComponentId(3), ComponentId(2), ComponentId(1)],
     };
 
@@ -392,6 +396,7 @@ fn compose_resolves_binding_urls_in_child_config() {
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        metadata: None,
         children: Vec::new(),
     };
 
@@ -404,6 +409,7 @@ fn compose_resolves_binding_urls_in_child_config() {
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        metadata: None,
         children: Vec::new(),
     };
 
@@ -418,6 +424,7 @@ fn compose_resolves_binding_urls_in_child_config() {
         program: Some(observer_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        metadata: None,
         children: Vec::new(),
     };
 
@@ -533,6 +540,7 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        metadata: None,
         children: vec![ComponentId(3), ComponentId(2), ComponentId(1)],
     };
 
@@ -545,6 +553,7 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        metadata: None,
         children: Vec::new(),
     };
 
@@ -557,6 +566,7 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        metadata: None,
         children: Vec::new(),
     };
 
@@ -571,6 +581,7 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        metadata: None,
         children: vec![ComponentId(4)],
     };
 
@@ -585,6 +596,7 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        metadata: None,
         children: vec![ComponentId(5)],
     };
 
@@ -599,6 +611,7 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         program: Some(child_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        metadata: None,
         children: Vec::new(),
     };
 
@@ -720,6 +733,7 @@ fn compose_emits_export_metadata_and_labels() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        metadata: None,
         children: vec![ComponentId(1)],
     };
 
@@ -732,6 +746,7 @@ fn compose_emits_export_metadata_and_labels() {
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        metadata: None,
         children: Vec::new(),
     };
 
@@ -805,6 +820,7 @@ fn errors_on_shared_port_with_different_endpoints() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        metadata: None,
         children: vec![ComponentId(2), ComponentId(1)],
     };
 
@@ -820,6 +836,7 @@ fn errors_on_shared_port_with_different_endpoints() {
             ("v1".to_string(), provide_v1),
             ("admin".to_string(), provide_admin),
         ]),
+        metadata: None,
         children: Vec::new(),
     };
 
@@ -835,6 +852,7 @@ fn errors_on_shared_port_with_different_endpoints() {
             ("admin".to_string(), slot_http),
         ]),
         provides: BTreeMap::new(),
+        metadata: None,
         children: Vec::new(),
     };
 
@@ -894,6 +912,7 @@ fn docker_compose_rejects_framework_bindings() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        metadata: None,
         children: Vec::new(),
     };
 
@@ -1008,6 +1027,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        metadata: None,
         children: vec![ComponentId(2), ComponentId(3), ComponentId(1)],
     };
 
@@ -1020,6 +1040,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        metadata: None,
         children: Vec::new(),
     };
 
@@ -1032,6 +1053,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         program: Some(sleeper_program(json!({ "URL": "${slots.api.url}" }))),
         slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
         provides: BTreeMap::new(),
+        metadata: None,
         children: Vec::new(),
     };
 
@@ -1044,6 +1066,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         program: Some(sleeper_program(json!({}))),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        metadata: None,
         children: Vec::new(),
     };
 

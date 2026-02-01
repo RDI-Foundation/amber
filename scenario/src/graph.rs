@@ -180,6 +180,7 @@ mod tests {
             program: None,
             slots: BTreeMap::new(),
             provides: BTreeMap::new(),
+            metadata: None,
             children: Vec::new(),
         }
     }

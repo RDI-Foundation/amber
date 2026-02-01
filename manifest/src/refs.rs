@@ -48,7 +48,9 @@ impl ManifestDigest {
         }
 
         let mut hasher = sha2::Sha256::new();
-        serde_json::to_writer(HashWriter(&mut hasher), manifest)
+        let mut manifest = manifest.clone();
+        manifest.metadata = None;
+        serde_json::to_writer(HashWriter(&mut hasher), &manifest)
             .expect("hashing manifest JSON cannot fail");
         Self(hasher.finalize().into())
     }

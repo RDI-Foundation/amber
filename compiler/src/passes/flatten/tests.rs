@@ -24,6 +24,7 @@ fn component(id: usize, moniker: &str) -> Component {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        metadata: None,
         children: Vec::new(),
     }
 }
@@ -40,6 +41,7 @@ fn apply_manifest(component: &mut Component, manifest: &Manifest) {
         .iter()
         .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
         .collect();
+    component.metadata = manifest.metadata().cloned();
 }
 
 #[test]

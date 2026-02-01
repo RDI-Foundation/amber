@@ -21,6 +21,7 @@ fn component(id: usize, moniker: &str) -> Component {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        metadata: None,
         children: Vec::new(),
     }
 }
