@@ -1,7 +1,11 @@
 use std::{
     collections::BTreeMap,
+    fs,
     path::{Path, PathBuf},
+    process::Command,
     sync::Arc,
+    thread,
+    time::Duration,
 };
 
 use amber_manifest::{
@@ -918,6 +922,217 @@ fn compose_routes_external_slots_through_router() {
         "AMBER_EXTERNAL_SLOT_API_URL"
     );
     assert!(config["exports"].as_array().unwrap().is_empty());
+}
+
+#[test]
+#[ignore = "requires docker + docker compose; run manually"]
+fn docker_smoke_external_slot_routes_to_outside_service() {
+    use tempfile::tempdir;
+
+    struct ComposeGuard {
+        project: PathBuf,
+        envs: Vec<(String, String)>,
+    }
+
+    impl ComposeGuard {
+        fn new(project: &Path, envs: &[(&str, &str)]) -> Self {
+            Self {
+                project: project.to_path_buf(),
+                envs: envs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for ComposeGuard {
+        fn drop(&mut self) {
+            let mut cmd = Command::new("docker");
+            cmd.current_dir(&self.project).arg("compose").args([
+                "down",
+                "-v",
+                "--remove-orphans",
+                "--rmi",
+                "local",
+                "--timeout",
+                "1",
+            ]);
+            for (k, v) in &self.envs {
+                cmd.env(k, v);
+            }
+            let _ = cmd.status();
+        }
+    }
+
+    struct ExternalContainerGuard {
+        name: String,
+    }
+
+    impl ExternalContainerGuard {
+        fn new(name: &str, network: &str) -> Self {
+            let status = Command::new("docker")
+                .arg("run")
+                .arg("-d")
+                .arg("--rm")
+                .arg("--name")
+                .arg(name)
+                .arg("--network")
+                .arg(network)
+                .arg("busybox:1.36.1")
+                .arg("sh")
+                .arg("-lc")
+                .arg(
+                    "mkdir -p /www && echo external-ok > /www/index.html && httpd -f -p 8080 -h \
+                     /www",
+                )
+                .status()
+                .unwrap();
+            assert!(status.success(), "docker run external server failed");
+            Self {
+                name: name.to_string(),
+            }
+        }
+    }
+
+    impl Drop for ExternalContainerGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("docker")
+                .arg("rm")
+                .arg("-f")
+                .arg(&self.name)
+                .status();
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let project = dir.path();
+    let platform = build_sidecar_image();
+    ensure_image_platform("busybox:1.36.1", &platform);
+    ensure_image_platform("alpine:3.20", &platform);
+
+    let client_program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "args": ["sh", "-lc", "sleep infinity"],
+        "env": {
+            "API_URL": "${slots.api.url}"
+        }
+    }))
+    .unwrap();
+
+    let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        program: None,
+        slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
+        provides: BTreeMap::new(),
+        children: vec![ComponentId(1)],
+    };
+
+    let client = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/client"),
+        digest: digest(1),
+        config: None,
+        program: Some(client_program),
+        slots: BTreeMap::from([("api".to_string(), slot_http)]),
+        provides: BTreeMap::new(),
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(client)],
+        bindings: vec![BindingEdge {
+            name: None,
+            from: BindingFrom::External(SlotRef {
+                component: ComponentId(0),
+                name: "api".to_string(),
+            }),
+            to: SlotRef {
+                component: ComponentId(1),
+                name: "api".to_string(),
+            },
+            weak: true,
+        }],
+        exports: Vec::new(),
+    };
+
+    let output = compile_output(scenario);
+    let yaml = DockerComposeReporter
+        .emit(&output)
+        .expect("compose render ok");
+    fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
+
+    let project_name = format!("amber-ext-slot-{}", std::process::id());
+    let external_name = format!("{project_name}-external");
+    let external_url = format!("http://{external_name}:8080");
+    let envs = [
+        ("COMPOSE_PROJECT_NAME", project_name.as_str()),
+        ("AMBER_EXTERNAL_SLOT_API_URL", external_url.as_str()),
+    ];
+
+    let _compose_guard = ComposeGuard::new(project, &envs);
+
+    let compose = |args: &[&str]| {
+        let mut cmd = Command::new("docker");
+        cmd.current_dir(project).arg("compose").args(args);
+        for (k, v) in &envs {
+            cmd.env(k, v);
+        }
+        cmd
+    };
+
+    let status = compose(&["up", "-d"]).status().unwrap();
+    assert!(status.success(), "docker compose up failed");
+
+    let network = format!("{project_name}_amber_mesh");
+    let _external_guard = ExternalContainerGuard::new(&external_name, &network);
+
+    let mut ok = false;
+    for _ in 0..30 {
+        let output = compose(&[
+            "exec",
+            "-T",
+            "c1-client",
+            "sh",
+            "-lc",
+            r#"wget -qO- --timeout=2 --tries=1 "$API_URL" 2>/dev/null"#,
+        ])
+        .output()
+        .unwrap();
+        if output.status.success()
+            && String::from_utf8_lossy(&output.stdout).contains("external-ok")
+        {
+            ok = true;
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    if !ok {
+        let compose_logs = compose(&["logs", "--no-color"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_else(|err| format!("failed to capture compose logs: {err}"));
+        let external_logs = Command::new("docker")
+            .arg("logs")
+            .arg(&external_name)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_else(|err| format!("failed to capture external logs: {err}"));
+        panic!(
+            "client could not reach external slot via router\ncompose logs:\n{}\nexternal \
+             logs:\n{}",
+            compose_logs, external_logs
+        );
+    }
 }
 
 #[test]

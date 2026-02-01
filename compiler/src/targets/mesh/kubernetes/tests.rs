@@ -571,3 +571,247 @@ fn kubernetes_smoke_config_roundtrip() {
     assert_eq!(static_secret, "hardcode-this-secret");
     assert_eq!(static_config, "hardcode-this-config");
 }
+
+#[test]
+#[ignore = "requires docker + kind + kubectl; run manually"]
+fn kubernetes_smoke_external_slot_routes_to_outside_service() {
+    let dir = tempdir().expect("temp dir");
+    let root_path = dir.path().join("root.json5");
+    let client_path = dir.path().join("client.json5");
+
+    fs::write(
+        &root_path,
+        r##"
+        {
+          manifest_version: "0.1.0",
+          slots: { api: { kind: "http" } },
+          components: { client: "./client.json5" },
+          bindings: [
+            { to: "#client.api", from: "self.api", weak: true }
+          ]
+        }
+        "##,
+    )
+    .expect("write root manifest");
+
+    fs::write(
+        &client_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "busybox:1.36.1",
+            args: ["sh", "-lc", "sleep 3600"],
+            env: { API_URL: "${slots.api.url}" }
+          },
+          slots: { api: { kind: "http" } }
+        }
+        "#,
+    )
+    .expect("write client manifest");
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let mut opts = CompileOptions::default();
+    opts.optimize = OptimizeOptions { dce: false };
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let output = rt
+        .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
+        .expect("compile scenario");
+
+    let reporter = KubernetesReporter {
+        config: KubernetesReporterConfig::default(),
+    };
+    let artifact = reporter.emit(&output).expect("render kubernetes output");
+
+    let output_dir = dir.path().join("kubernetes");
+    write_kubernetes_output(&output_dir, &artifact);
+
+    let kustomization =
+        fs::read_to_string(output_dir.join("kustomization.yaml")).expect("read kustomization");
+    let kust_doc: serde_yaml::Value =
+        serde_yaml::from_str(&kustomization).expect("parse kustomization");
+    let namespace = kust_doc["namespace"]
+        .as_str()
+        .expect("kustomization namespace");
+
+    set_env_value(
+        &output_dir.join("router-external.env"),
+        "AMBER_EXTERNAL_SLOT_API_URL",
+        "http://external-echo:8080",
+    );
+
+    let platform = docker_platform();
+    ensure_router_image(&platform);
+    ensure_image_platform("busybox:1.36.1", &platform);
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_secs();
+    let cluster_name = format!("amber-test-{}-{nonce}", std::process::id());
+    let _cluster_guard = KindClusterGuard::new(cluster_name.clone());
+
+    for image in [ROUTER_IMAGE, "busybox:1.36.1"] {
+        let mut cmd = Command::new("kind");
+        cmd.arg("load")
+            .arg("docker-image")
+            .arg(image)
+            .arg("--name")
+            .arg(&cluster_name);
+        checked_status(&mut cmd, &format!("kind load {image} image"));
+    }
+
+    let mut cmd = Command::new("kubectl");
+    cmd.arg("apply").arg("-k").arg(&output_dir);
+    checked_status(&mut cmd, "kubectl apply amber");
+
+    let external_path = dir.path().join("external-echo.yaml");
+    fs::write(
+        &external_path,
+        format!(
+            r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: external-echo
+  namespace: {namespace}
+  labels:
+    app: external-echo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: external-echo
+  template:
+    metadata:
+      labels:
+        app: external-echo
+    spec:
+      containers:
+        - name: external-echo
+          image: busybox:1.36.1
+          command: ["sh", "-lc", "mkdir -p /www && echo external-ok > /www/index.html && httpd -f -p 8080 -h /www"]
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-echo
+  namespace: {namespace}
+spec:
+  selector:
+    app: external-echo
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+"#
+        ),
+    )
+    .expect("write external service manifest");
+
+    let mut cmd = Command::new("kubectl");
+    cmd.arg("apply").arg("-f").arg(&external_path);
+    checked_status(&mut cmd, "kubectl apply external service");
+
+    let mut cmd = Command::new("kubectl");
+    cmd.arg("wait")
+        .arg("--for=condition=available")
+        .arg("--timeout=120s")
+        .arg("deployment")
+        .arg("--all")
+        .arg("-n")
+        .arg(namespace);
+    checked_status(&mut cmd, "kubectl wait for deployments");
+
+    let client_pod = {
+        let mut cmd = Command::new("kubectl");
+        cmd.arg("get")
+            .arg("pod")
+            .arg("-n")
+            .arg(namespace)
+            .arg("-l")
+            .arg("amber.io/component=c1-client")
+            .arg("-o")
+            .arg("jsonpath={.items[0].metadata.name}");
+        let output = checked_output(&mut cmd, "kubectl get client pod");
+        let pod = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert!(!pod.is_empty(), "no client pod found");
+        pod
+    };
+
+    let mut cmd = Command::new("kubectl");
+    cmd.arg("wait")
+        .arg("--for=condition=ready")
+        .arg("--timeout=120s")
+        .arg("pod")
+        .arg("-n")
+        .arg(namespace)
+        .arg(&client_pod);
+    checked_status(&mut cmd, "kubectl wait for client pod");
+
+    let mut ok = false;
+    for _ in 0..30 {
+        let output = Command::new("kubectl")
+            .arg("exec")
+            .arg("-n")
+            .arg(namespace)
+            .arg(&client_pod)
+            .arg("-c")
+            .arg("main")
+            .arg("--")
+            .arg("sh")
+            .arg("-lc")
+            .arg(r#"wget -qO- --timeout=2 --tries=1 "$API_URL" | grep -q external-ok"#)
+            .output()
+            .unwrap();
+        if output.status.success() {
+            ok = true;
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    if !ok {
+        let client_logs = {
+            let mut cmd = Command::new("kubectl");
+            cmd.arg("logs")
+                .arg("-n")
+                .arg(namespace)
+                .arg(&client_pod)
+                .arg("-c")
+                .arg("main");
+            cmd.output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_else(|err| format!("failed to capture client logs: {err}"))
+        };
+        let router_logs = {
+            let mut cmd = Command::new("kubectl");
+            cmd.arg("logs")
+                .arg("-n")
+                .arg(namespace)
+                .arg("-l")
+                .arg("amber.io/component=amber-router");
+            cmd.output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_else(|err| format!("failed to capture router logs: {err}"))
+        };
+        let external_logs = {
+            let mut cmd = Command::new("kubectl");
+            cmd.arg("logs")
+                .arg("-n")
+                .arg(namespace)
+                .arg("-l")
+                .arg("app=external-echo");
+            cmd.output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_else(|err| format!("failed to capture external logs: {err}"))
+        };
+        panic!(
+            "client could not reach external slot via router\nclient logs:\n{}\nrouter \
+             logs:\n{}\nexternal logs:\n{}",
+            client_logs, router_logs, external_logs
+        );
+    }
+}
