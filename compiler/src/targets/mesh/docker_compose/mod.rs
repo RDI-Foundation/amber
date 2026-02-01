@@ -763,13 +763,15 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 // Use entrypoint so image entrypoints are ignored.
                 push_line(&mut out, 4, "entrypoint:");
                 for a in entrypoint {
-                    push_line(&mut out, 6, &format!("- {}", yaml_str(a)));
+                    let escaped = escape_compose_interpolation(a);
+                    push_line(&mut out, 6, &format!("- {}", yaml_str(escaped.as_ref())));
                 }
 
                 if !env.is_empty() {
                     push_line(&mut out, 4, "environment:");
                     for (k, v) in env {
-                        push_line(&mut out, 6, &format!("{k}: {}", yaml_str(v)));
+                        let escaped = escape_compose_interpolation(v);
+                        push_line(&mut out, 6, &format!("{k}: {}", yaml_str(escaped.as_ref())));
                     }
                 }
             }

@@ -358,6 +358,41 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
 }
 
 #[test]
+fn compose_escapes_entrypoint_dollars() {
+    let program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "args": ["sh", "-lc", "echo $API_URL"]
+    }))
+    .unwrap();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        program: Some(program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root)],
+        bindings: vec![],
+        exports: vec![],
+    };
+
+    let output = compile_output(scenario);
+    let yaml = DockerComposeReporter
+        .emit(&output)
+        .expect("compose render ok");
+
+    assert!(yaml.contains(r#"- "echo $$API_URL""#), "{yaml}");
+}
+
+#[test]
 fn compose_resolves_binding_urls_in_child_config() {
     let server_program = serde_json::from_value(json!({
         "image": "alpine:3.20",
