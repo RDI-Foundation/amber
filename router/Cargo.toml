@@ -7,7 +7,15 @@ edition = "2024"
 axum = "0.7.7"
 base64 = { workspace = true }
 http = "1.1.0"
+hyper-rustls = { version = "0.27.7", default-features = false, features = [
+  "aws-lc-rs",
+  "http1",
+  "http2",
+  "tls12",
+  "webpki-tokio",
+] }
 hyper-util = { version = "0.1.10", features = ["client-legacy", "tokio"] }
+rustls = { version = "0.23.36", default-features = false, features = ["aws_lc_rs"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

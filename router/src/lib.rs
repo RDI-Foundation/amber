@@ -3,6 +3,7 @@ use std::{env, net::SocketAddr, sync::Arc};
 use axum::{Router, body::Body, extract::State, routing::any};
 use base64::Engine as _;
 use http::{HeaderMap, HeaderValue, Request, Response, StatusCode, Uri, header};
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
@@ -56,7 +57,7 @@ struct RouteState {
     target: RouteTarget,
 }
 
-type HttpClient = Client<HttpConnector, Body>;
+type HttpClient = Client<HttpsConnector<HttpConnector>, Body>;
 
 #[derive(Clone, Debug)]
 enum RouteTarget {
@@ -116,6 +117,13 @@ pub async fn run(config: RouterConfig) -> Result<(), RouterError> {
     for export in &config.exports {
         let target = Url::parse(&export.target_url)
             .map_err(|err| RouterError::InvalidConfig(err.to_string()))?;
+        if !is_http_scheme(&target) {
+            return Err(RouterError::InvalidConfig(format!(
+                "export {} target url must be http/https (got {})",
+                export.name,
+                target.scheme()
+            )));
+        }
         let target = RouteTarget::Export { target };
         let addr = SocketAddr::from(([0, 0, 0, 0], export.listen_port));
         handles.push(spawn_listener(addr, client.clone(), target).await?);
@@ -158,9 +166,18 @@ async fn spawn_listener(
 }
 
 fn build_client() -> HttpClient {
-    let mut connector = HttpConnector::new();
-    connector.enforce_http(false);
-    Client::builder(TokioExecutor::new()).build(connector)
+    install_default_crypto_provider();
+    let https = HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    Client::builder(TokioExecutor::new()).build(https)
+}
+
+fn install_default_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 async fn proxy_handler(State(state): State<Arc<RouteState>>, req: Request<Body>) -> Response<Body> {
@@ -227,6 +244,15 @@ fn resolve_target_url(target: &RouteTarget, req: &Request<Body>) -> Result<Url, 
                     &format!("invalid external slot url for {name}: {err}"),
                 )
             })?;
+            if !is_http_scheme(&base) {
+                return Err(error_response(
+                    StatusCode::BAD_GATEWAY,
+                    &format!(
+                        "invalid external slot url for {name}: scheme must be http/https (got {})",
+                        base.scheme()
+                    ),
+                ));
+            }
             Ok(join_url(&base, req.uri()))
         }
         RouteTarget::Export { target } => {
@@ -267,6 +293,10 @@ fn join_paths(base: &str, req: &str) -> String {
     } else {
         format!("/{combined}")
     }
+}
+
+fn is_http_scheme(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
 }
 
 fn sanitize_request_headers(headers: &mut HeaderMap, host: &str) {
