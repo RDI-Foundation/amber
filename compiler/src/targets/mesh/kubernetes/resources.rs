@@ -535,6 +535,13 @@ impl NetworkPolicy {
     pub fn add_ingress_rule(&mut self, rule: NetworkPolicyIngressRule) {
         self.spec.ingress.push(rule);
     }
+
+    pub fn add_egress_rule(&mut self, rule: NetworkPolicyEgressRule) {
+        if !self.spec.policy_types.contains(&"Egress") {
+            self.spec.policy_types.push("Egress");
+        }
+        self.spec.egress.push(rule);
+    }
 }
 
 // ---- Job (for NetworkPolicy enforcement check) ----

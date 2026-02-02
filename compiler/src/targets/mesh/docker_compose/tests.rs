@@ -19,7 +19,7 @@ use base64::Engine as _;
 use serde_json::{Map, Value, json};
 use url::Url;
 
-use super::{DockerComposeReporter, HELPER_IMAGE, SIDECAR_IMAGE};
+use super::{DockerComposeReporter, HELPER_IMAGE, ROUTER_IMAGE, SIDECAR_IMAGE};
 use crate::reporter::Reporter as _;
 
 fn digest(byte: u8) -> ManifestDigest {
@@ -201,6 +201,15 @@ fn build_helper_image() -> String {
     build_docker_image(
         HELPER_IMAGE,
         &root.join("docker/amber-helper/Dockerfile"),
+        &root,
+    )
+}
+
+fn build_router_image() -> String {
+    let root = workspace_root();
+    build_docker_image(
+        ROUTER_IMAGE,
+        &root.join("docker/amber-router/Dockerfile"),
         &root,
     )
 }
@@ -1007,7 +1016,12 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
 
     let dir = tempdir().unwrap();
     let project = dir.path();
-    let platform = build_sidecar_image();
+    let sidecar_platform = build_sidecar_image();
+    let router_platform = build_router_image();
+    let platform = require_same_platform(&[
+        (SIDECAR_IMAGE, sidecar_platform),
+        (ROUTER_IMAGE, router_platform),
+    ]);
     ensure_image_platform("busybox:1.36.1", &platform);
     ensure_image_platform("alpine:3.20", &platform);
 
@@ -1094,6 +1108,21 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
 
     let network = format!("{project_name}_amber_mesh");
     let _external_guard = ExternalContainerGuard::new(&external_name, &network);
+
+    let bypass = compose(&[
+        "exec",
+        "-T",
+        "c1-client",
+        "sh",
+        "-lc",
+        &format!(r#"wget -qO- --timeout=2 --tries=1 "http://{external_name}:8080" 2>/dev/null"#),
+    ])
+    .status()
+    .unwrap();
+    assert!(
+        !bypass.success(),
+        "client bypassed router by reaching {external_name} directly"
+    );
 
     let mut ok = false;
     for _ in 0..30 {

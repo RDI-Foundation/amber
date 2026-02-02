@@ -67,39 +67,13 @@ fn build_router_image() {
     let dockerfile = root.join("docker/amber-router/Dockerfile");
     let mut cmd = Command::new("docker");
     cmd.arg("build")
+        .env("DOCKER_BUILDKIT", "1")
         .arg("-t")
         .arg(ROUTER_IMAGE)
         .arg("-f")
         .arg(&dockerfile)
         .arg(&root);
     checked_status(&mut cmd, "docker build amber-router image");
-}
-
-fn ensure_router_image(platform: &str) {
-    let needs_pull = match image_platform_opt(ROUTER_IMAGE) {
-        Some(existing) => existing != platform,
-        None => true,
-    };
-
-    if !needs_pull {
-        return;
-    }
-
-    let mut cmd = Command::new("docker");
-    cmd.arg("pull")
-        .arg("--platform")
-        .arg(platform)
-        .arg(ROUTER_IMAGE)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    let status = cmd.status().unwrap_or_else(|err| {
-        panic!("failed to run docker pull for {ROUTER_IMAGE}: {err}");
-    });
-    if status.success() {
-        return;
-    }
-
-    build_router_image();
 }
 
 fn file_url(path: &Path) -> Url {
@@ -461,9 +435,9 @@ fn kubernetes_smoke_config_roundtrip() {
         "test-config-value",
     );
 
-    build_helper_image();
     let platform = docker_platform();
-    ensure_router_image(&platform);
+    build_helper_image();
+    build_router_image();
     ensure_image_platform("busybox:1.36", &platform);
 
     let nonce = SystemTime::now()
@@ -641,7 +615,7 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
     );
 
     let platform = docker_platform();
-    ensure_router_image(&platform);
+    build_router_image();
     ensure_image_platform("busybox:1.36.1", &platform);
 
     let nonce = SystemTime::now()
@@ -750,6 +724,24 @@ spec:
         .arg(namespace)
         .arg(&client_pod);
     checked_status(&mut cmd, "kubectl wait for client pod");
+
+    let bypass = Command::new("kubectl")
+        .arg("exec")
+        .arg("-n")
+        .arg(namespace)
+        .arg(&client_pod)
+        .arg("-c")
+        .arg("main")
+        .arg("--")
+        .arg("sh")
+        .arg("-lc")
+        .arg(r#"wget -qO- --timeout=2 --tries=1 "http://external-echo:8080" 2>/dev/null"#)
+        .output()
+        .unwrap();
+    assert!(
+        !bypass.status.success(),
+        "client bypassed router by reaching external-echo directly"
+    );
 
     let mut ok = false;
     for _ in 0..30 {

@@ -614,6 +614,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 Some(&router_export_ports)
             },
             None,
+            false,
         );
 
         push_line(&mut out, 4, "command:");
@@ -692,6 +693,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 .collect(),
             None,
             slot_proxies_by_component.get(id),
+            true,
         );
 
         push_line(&mut out, 4, "command:");
@@ -1003,8 +1005,18 @@ fn build_sidecar_script(
     inbound: Vec<(u16, &BTreeSet<String>)>,
     exported_ports: Option<&BTreeSet<u16>>,
     proxies: Option<&Vec<SlotProxy>>,
+    restrict_egress: bool,
 ) -> String {
     let mut script = String::new();
+
+    let mut egress_targets: Vec<(String, u16)> = Vec::new();
+    if restrict_egress && let Some(ps) = proxies {
+        let mut seen: BTreeSet<(String, u16)> = BTreeSet::new();
+        for p in ps {
+            seen.insert((p.remote_host.clone(), p.remote_port));
+        }
+        egress_targets.extend(seen);
+    }
 
     // Minimal, explicit, deterministic.
     writeln!(&mut script, "set -eu").unwrap();
@@ -1014,13 +1026,45 @@ fn build_sidecar_script(
     writeln!(&mut script, "iptables -w -X").unwrap();
     writeln!(&mut script, "iptables -w -P INPUT DROP").unwrap();
     writeln!(&mut script, "iptables -w -P FORWARD DROP").unwrap();
-    writeln!(&mut script, "iptables -w -P OUTPUT ACCEPT").unwrap();
+    writeln!(
+        &mut script,
+        "iptables -w -P OUTPUT {}",
+        if restrict_egress { "DROP" } else { "ACCEPT" }
+    )
+    .unwrap();
     writeln!(&mut script, "iptables -w -A INPUT -i lo -j ACCEPT").unwrap();
     writeln!(
         &mut script,
         "iptables -w -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
     )
     .unwrap();
+    if restrict_egress {
+        writeln!(&mut script, "iptables -w -A OUTPUT -o lo -j ACCEPT").unwrap();
+        writeln!(
+            &mut script,
+            "iptables -w -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+        )
+        .unwrap();
+        writeln!(
+            &mut script,
+            "for ns in $(awk '/^nameserver/{{print $2}}' /etc/resolv.conf | awk '$1 ~ \
+             /^[0-9]+(\\.[0-9]+){{3}}$/ {{print $1}}'); do"
+        )
+        .unwrap();
+        writeln!(
+            &mut script,
+            "  iptables -w -A OUTPUT -p udp -m udp --dport 53 -d \"$ns\" -j ACCEPT"
+        )
+        .unwrap();
+        writeln!(
+            &mut script,
+            "  iptables -w -A OUTPUT -p tcp -m tcp --dport 53 -d \"$ns\" -j ACCEPT"
+        )
+        .unwrap();
+        writeln!(&mut script, "done").unwrap();
+        writeln!(&mut script, "iptables -w -N AMBER-ALLOW-OUT").unwrap();
+        writeln!(&mut script, "iptables -w -A OUTPUT -j AMBER-ALLOW-OUT").unwrap();
+    }
     writeln!(&mut script, "iptables -w -N AMBER-ALLOW").unwrap();
     writeln!(&mut script, "iptables -w -A INPUT -j AMBER-ALLOW").unwrap();
 
@@ -1040,10 +1084,21 @@ fn build_sidecar_script(
     .unwrap();
     writeln!(&mut script, "  fi").unwrap();
     writeln!(&mut script, "}}").unwrap();
+    if restrict_egress {
+        writeln!(&mut script, "add_out_rule() {{").unwrap();
+        writeln!(&mut script, "  if [ -n \"$1\" ]; then").unwrap();
+        writeln!(&mut script, "    printf '%s\\n' \"$1\" >> \"$desired_out\"").unwrap();
+        writeln!(&mut script, "  fi").unwrap();
+        writeln!(&mut script, "}}").unwrap();
+    }
     writeln!(&mut script, "refresh_allowlist() {{").unwrap();
     writeln!(&mut script, "  set +e").unwrap();
     writeln!(&mut script, "  desired_rules=\"/tmp/amber-allowlist\"").unwrap();
     writeln!(&mut script, "  : > \"$desired_rules\"").unwrap();
+    if restrict_egress {
+        writeln!(&mut script, "  desired_out=\"/tmp/amber-allowlist-out\"").unwrap();
+        writeln!(&mut script, "  : > \"$desired_out\"").unwrap();
+    }
     writeln!(
         &mut script,
         "  gateway=\"$(ip -4 route show default | awk 'NR==1 {{print $3}}')\""
@@ -1081,6 +1136,24 @@ fn build_sidecar_script(
             .unwrap();
             writeln!(&mut script, "  fi").unwrap();
         }
+    }
+    if restrict_egress {
+        for (host, port) in &egress_targets {
+            writeln!(&mut script, "  for ip in $(resolve_ipv4 \"{host}\"); do").unwrap();
+            writeln!(
+                &mut script,
+                "    add_out_rule \"-d $ip/32 -p tcp -m tcp --dport {port} -j ACCEPT\""
+            )
+            .unwrap();
+            writeln!(&mut script, "  done").unwrap();
+        }
+        writeln!(&mut script, "  if [ -s \"$desired_out\" ]; then").unwrap();
+        writeln!(&mut script, "    iptables -w -F AMBER-ALLOW-OUT").unwrap();
+        writeln!(&mut script, "    while read -r rule; do").unwrap();
+        writeln!(&mut script, "      [ -z \"$rule\" ] && continue").unwrap();
+        writeln!(&mut script, "      iptables -w -A AMBER-ALLOW-OUT $rule").unwrap();
+        writeln!(&mut script, "    done < \"$desired_out\"").unwrap();
+        writeln!(&mut script, "  fi").unwrap();
     }
     writeln!(&mut script, "  if [ -s \"$desired_rules\" ]; then").unwrap();
     writeln!(&mut script, "    iptables -w -F AMBER-ALLOW").unwrap();
