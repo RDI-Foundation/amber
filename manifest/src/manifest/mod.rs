@@ -52,6 +52,8 @@ pub struct RawManifest {
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
     pub exports: BTreeMap<String, RawExportTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
 }
 
 const SUPPORTED_MANIFEST_VERSION_REQ: &str = "^0.1.0";
@@ -460,6 +462,7 @@ impl RawManifest {
             provides,
             bindings,
             exports,
+            metadata,
         } = self;
 
         if let Some(schema) = config_schema.as_ref() {
@@ -503,6 +506,7 @@ impl RawManifest {
             provides,
             bindings: bindings_out,
             exports: exports_out,
+            metadata,
             digest,
         })
     }
@@ -520,6 +524,7 @@ pub struct Manifest {
     provides: BTreeMap<ProvideName, ProvideDecl>,
     bindings: BTreeMap<BindingTarget, Binding>,
     exports: BTreeMap<ExportName, ExportTarget>,
+    metadata: Option<Value>,
     digest: ManifestDigest,
 }
 
@@ -571,9 +576,14 @@ impl Manifest {
             provides: BTreeMap::new(),
             bindings: BTreeSet::new(),
             exports: BTreeMap::new(),
+            metadata: None,
         }
         .validate()
         .expect("empty manifest is valid")
+    }
+
+    pub fn metadata(&self) -> Option<&Value> {
+        self.metadata.as_ref()
     }
 
     pub fn digest(&self) -> ManifestDigest {
@@ -594,6 +604,7 @@ impl Manifest {
         #[builder(default)] provides: BTreeMap<String, ProvideDecl>,
         #[builder(default)] bindings: BTreeSet<RawBinding>,
         #[builder(default)] exports: BTreeMap<String, RawExportTarget>,
+        metadata: Option<Value>,
     ) -> Result<Self, Error> {
         let config_schema = config_schema.map(ConfigSchema::try_from).transpose()?;
 
@@ -607,6 +618,7 @@ impl Manifest {
             provides,
             bindings,
             exports,
+            metadata,
         }
         .validate()
     }
@@ -723,6 +735,7 @@ impl From<&Manifest> for RawManifest {
             provides,
             bindings,
             exports,
+            metadata: manifest.metadata.clone(),
         }
     }
 }

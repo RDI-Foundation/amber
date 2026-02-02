@@ -158,6 +158,9 @@ pub struct ComponentIr {
     pub slots: BTreeMap<String, SlotDecl>,
     #[serde(default)]
     pub provides: BTreeMap<String, ProvideDecl>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
 }
 
 impl ComponentIr {
@@ -172,6 +175,7 @@ impl ComponentIr {
             program: component.program.clone(),
             slots: component.slots.clone(),
             provides: component.provides.clone(),
+            metadata: component.metadata.clone(),
         }
     }
 
@@ -185,6 +189,7 @@ impl ComponentIr {
             program: self.program,
             slots: self.slots,
             provides: self.provides,
+            metadata: self.metadata,
             children: self.children.into_iter().map(ComponentId).collect(),
         }
     }
@@ -410,6 +415,7 @@ mod tests {
                 program: None,
                 slots: BTreeMap::new(),
                 provides: BTreeMap::new(),
+                metadata: None,
                 children: vec![ComponentId(1)],
             }),
             Some(Component {
@@ -448,6 +454,7 @@ mod tests {
                     }))
                     .expect("deserialize provide decl"),
                 )]),
+                metadata: None,
                 children: Vec::new(),
             }),
         ];
@@ -610,6 +617,7 @@ mod tests {
             program: None,
             slots: BTreeMap::new(),
             provides: BTreeMap::new(),
+            metadata: None,
             children: Vec::new(),
         })];
 

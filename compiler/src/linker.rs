@@ -577,6 +577,7 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
             .iter()
             .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
             .collect();
+        c.metadata = m.metadata().cloned();
     }
 
     let mut schema_cache: HashMap<ManifestDigest, Arc<Validator>> = HashMap::new();
@@ -760,6 +761,7 @@ fn flatten(
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        metadata: None,
         children: Vec::new(),
     }));
     link_index.push(LinkIndex::default());
