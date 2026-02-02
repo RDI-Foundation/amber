@@ -387,6 +387,7 @@ fn compose_escapes_entrypoint_dollars() {
         program: Some(program),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        metadata: None,
         children: Vec::new(),
     };
 
@@ -872,6 +873,7 @@ fn compose_routes_external_slots_through_router() {
         program: None,
         slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
         provides: BTreeMap::new(),
+        metadata: None,
         children: vec![ComponentId(1)],
     };
 
@@ -884,6 +886,7 @@ fn compose_routes_external_slots_through_router() {
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        metadata: None,
         children: Vec::new(),
     };
 
@@ -1045,6 +1048,7 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
         program: None,
         slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
         provides: BTreeMap::new(),
+        metadata: None,
         children: vec![ComponentId(1)],
     };
 
@@ -1057,6 +1061,7 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        metadata: None,
         children: Vec::new(),
     };
 
