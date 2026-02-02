@@ -1,10 +1,11 @@
 use std::{
+    collections::HashSet,
     ffi::OsStr,
     path::{Path, PathBuf},
     process::Command,
 };
 
-use amber_manifest::Manifest;
+use amber_manifest::{ComponentDecl, Manifest, ManifestUrl};
 
 fn collect_example_manifests(dir: &Path) -> Vec<PathBuf> {
     let mut stack = vec![dir.to_path_buf()];
@@ -31,19 +32,73 @@ fn collect_example_manifests(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn collect_root_manifests(dir: &Path) -> Vec<PathBuf> {
-    let mut manifests = Vec::new();
-    for path in collect_example_manifests(dir) {
-        let contents = std::fs::read_to_string(&path)
+    let manifests = collect_example_manifests(dir);
+    let manifest_set: HashSet<PathBuf> =
+        manifests.iter().map(|path| canonicalize_or(path)).collect();
+
+    let mut referenced = HashSet::new();
+
+    for path in &manifests {
+        let contents = std::fs::read_to_string(path)
             .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
         let manifest: Manifest = contents
             .parse()
             .unwrap_or_else(|err| panic!("failed to parse {}: {err}", path.display()));
-        if manifest.slots().is_empty() {
-            manifests.push(path);
+        let base_dir = path.parent().unwrap_or(dir);
+
+        for component in manifest.components().values() {
+            let Some(manifest_ref) = (match component {
+                ComponentDecl::Reference(reference) => Some(reference),
+                ComponentDecl::Object(obj) => Some(&obj.manifest),
+                _ => None,
+            }) else {
+                continue;
+            };
+
+            let Some(resolved) = resolve_manifest_ref(base_dir, manifest_ref) else {
+                continue;
+            };
+            let resolved = canonicalize_or(&resolved);
+            if manifest_set.contains(&resolved) {
+                referenced.insert(resolved);
+            }
         }
     }
-    manifests.sort();
-    manifests
+
+    let mut roots: Vec<PathBuf> = manifests
+        .into_iter()
+        .filter(|path| !referenced.contains(&canonicalize_or(path)))
+        .collect();
+    roots.sort();
+    roots
+}
+
+fn resolve_manifest_ref(
+    base_dir: &Path,
+    reference: &amber_manifest::ManifestRef,
+) -> Option<PathBuf> {
+    match &reference.url {
+        ManifestUrl::Absolute(url) => {
+            if url.scheme() == "file" {
+                url.to_file_path().ok()
+            } else {
+                None
+            }
+        }
+        ManifestUrl::Relative(rel) => {
+            let rel_path = Path::new(rel.as_ref());
+            if rel_path.is_absolute() {
+                Some(rel_path.to_path_buf())
+            } else {
+                Some(base_dir.join(rel_path))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn canonicalize_or(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[test]

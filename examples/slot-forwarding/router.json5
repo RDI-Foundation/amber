@@ -8,10 +8,10 @@
     consumer: "./consumer.json5",
   },
   bindings: [
-    { to: "#inlet.api", from: "self.api" },
-    { to: "#consumer.api", from: "#inlet.api" },
+    { to: "#inlet.api", from: "self.api", weak: true },
+    { to: "#consumer.api", from: "#inlet.api", weak: true },
   ],
   exports: {
-    api: "#inlet.api",
+    api: "#consumer.public",
   },
 }

@@ -54,23 +54,13 @@ COPY scenario ./scenario
 COPY template ./template
 COPY node ./node
 
-ARG BUILD_MODE=release
 RUN target=$(cat /tmp/rust-target) && \
-    if [ "$BUILD_MODE" = "release" ]; then \
-      cargo build --locked --release -p amber-cli --target "${target}"; \
-      build_dir=release; \
-    else \
-      cargo build -p amber-cli --target "${target}"; \
-      build_dir=debug; \
-    fi && \
-    install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber /out/amber && \
-    install -d -m 0755 /out/workdir
+    cargo build -p amber-router --release --locked --target "${target}" && \
+    install -D -m 0755 /app/target/"${target}"/release/amber-router /out/amber-router
 
 FROM gcr.io/distroless/static-debian13 AS runtime
 
-COPY --from=builder --chown=65532:65532 /out/workdir /app
-COPY --from=builder --chown=65532:65532 /out/amber /amber
+COPY --from=builder /out/amber-router /amber-router
 
 USER 65532:65532
-WORKDIR /app
-ENTRYPOINT ["/amber"]
+ENTRYPOINT ["/amber-router"]

@@ -1,7 +1,7 @@
 mod resources;
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
 };
 
@@ -18,6 +18,10 @@ use crate::{
     targets::mesh::{
         config::{ProgramPlan, encode_helper_payload, encode_schema_b64},
         plan::{MeshOptions, component_label},
+        router_config::{
+            RouterConfig, RouterExport, RouterExternalSlot, allocate_external_slot_ports,
+            build_router_external_slots, encode_router_config_b64,
+        },
     },
 };
 
@@ -29,6 +33,11 @@ const HELPER_IMAGE: &str = "ghcr.io/rdi-foundation/amber-helper:v1";
 const HELPER_VOLUME_NAME: &str = "amber-helper";
 const HELPER_BIN_DIR: &str = "/amber/bin";
 const HELPER_BIN_PATH: &str = "/amber/bin/amber-helper";
+const ROUTER_IMAGE: &str = "ghcr.io/rdi-foundation/amber-router:v1";
+const ROUTER_NAME: &str = "amber-router";
+const ROUTER_EXTERNAL_SECRET_NAME: &str = "amber-router-external";
+const ROUTER_EXTERNAL_PORT_BASE: u16 = 21000;
+const ROUTER_EXPORT_PORT_BASE: u16 = 22000;
 
 // Root config Secret/ConfigMap names.
 const ROOT_CONFIG_SECRET_NAME: &str = "amber-root-config-secret";
@@ -89,6 +98,13 @@ struct InputMetadata {
     secret: bool,
 }
 
+/// Metadata about an external slot input for the amber-metadata ConfigMap.
+#[derive(Clone, Debug, Serialize)]
+struct ExternalSlotMetadata {
+    required: bool,
+    kind: String,
+}
+
 /// Full scenario metadata stored in amber-metadata ConfigMap.
 #[derive(Clone, Debug, Serialize)]
 struct ScenarioMetadata {
@@ -96,6 +112,7 @@ struct ScenarioMetadata {
     digest: String,
     exports: BTreeMap<String, ExportMetadata>,
     inputs: BTreeMap<String, InputMetadata>,
+    external_slots: BTreeMap<String, ExternalSlotMetadata>,
 }
 
 type KubernetesResult<T> = Result<T, ReporterError>;
@@ -134,6 +151,7 @@ fn render_kubernetes(
             },
         );
     }
+    let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
 
     // Build slot values and binding values for each component (resolved URLs to services).
     let mut slot_values_by_component: HashMap<ComponentId, BTreeMap<String, SlotObject>> =
@@ -147,6 +165,11 @@ fn render_kubernetes(
 
     // Track inbound allowlist: provider -> set of (consumer_component, port)
     let mut inbound_allow: HashMap<ComponentId, Vec<(ComponentId, u16)>> = HashMap::new();
+    let mut router_inbound_allow: BTreeMap<u16, Vec<ComponentId>> = BTreeMap::new();
+    let mut router_export_allow: HashMap<ComponentId, BTreeSet<u16>> = HashMap::new();
+    let mut egress_allow: HashMap<ComponentId, BTreeMap<ComponentId, BTreeSet<u16>>> =
+        HashMap::new();
+    let mut egress_router_allow: HashMap<ComponentId, BTreeSet<u16>> = HashMap::new();
 
     for binding in &mesh_plan.bindings {
         let provider = binding.provider;
@@ -188,7 +211,59 @@ fn render_kubernetes(
                 .entry(provider)
                 .or_default()
                 .push((consumer, endpoint_port));
+            egress_allow
+                .entry(consumer)
+                .or_default()
+                .entry(provider)
+                .or_default()
+                .insert(endpoint_port);
         }
+    }
+
+    let root_manifest = manifests[s.root.0]
+        .as_ref()
+        .expect("root manifest should exist");
+
+    let external_slot_ports =
+        allocate_external_slot_ports(&mesh_plan.external_bindings, ROUTER_EXTERNAL_PORT_BASE)
+            .map_err(ReporterError::new)?;
+
+    for binding in &mesh_plan.external_bindings {
+        let consumer = binding.consumer;
+        let router_port = *external_slot_ports
+            .get(&binding.external_slot)
+            .ok_or_else(|| {
+                ReporterError::new(format!(
+                    "missing router port for external slot {}",
+                    binding.external_slot
+                ))
+            })?;
+
+        let url = format!(
+            "http://{}.{}.svc.cluster.local:{}",
+            ROUTER_NAME, namespace, router_port
+        );
+
+        slot_values_by_component
+            .entry(consumer)
+            .or_default()
+            .insert(binding.slot.clone(), SlotObject { url: url.clone() });
+
+        if let Some(name) = binding.binding_name.as_ref() {
+            binding_values_by_component
+                .entry(consumer)
+                .or_default()
+                .insert(name.clone(), BindingObject { url });
+        }
+
+        router_inbound_allow
+            .entry(router_port)
+            .or_default()
+            .push(consumer);
+        egress_router_allow
+            .entry(consumer)
+            .or_default()
+            .insert(router_port);
     }
 
     let config_plan = crate::targets::mesh::config::build_config_plan(
@@ -224,6 +299,15 @@ fn render_kubernetes(
         labels.insert("amber.io/component-id".to_string(), format!("c{}", id.0));
         labels
     };
+    let router_labels = scenario_labels(&[
+        ("amber.io/type", "router"),
+        ("amber.io/component", ROUTER_NAME),
+    ]);
+    let router_selector = {
+        let mut m = BTreeMap::new();
+        m.insert("amber.io/component".to_string(), ROUTER_NAME.to_string());
+        m
+    };
 
     // ---- Generate resources ----
 
@@ -236,6 +320,99 @@ fn render_kubernetes(
     let root_leaves = &config_plan.root_leaves;
     let program_plans = &config_plan.program_plans;
     let any_helper = config_plan.uses_helper;
+
+    let mut export_ports_by_name: BTreeMap<String, u16> = BTreeMap::new();
+    let mut router_export_ports: BTreeSet<u16> = BTreeSet::new();
+    if !mesh_plan.exports.is_empty() {
+        let mut next_port = ROUTER_EXPORT_PORT_BASE;
+        for ex in &mesh_plan.exports {
+            let listen_port = next_port;
+            next_port = next_port
+                .checked_add(1)
+                .ok_or_else(|| ReporterError::new("ran out of router export ports".to_string()))?;
+            export_ports_by_name.insert(ex.name.clone(), listen_port);
+            router_export_ports.insert(listen_port);
+            router_export_allow
+                .entry(ex.provider)
+                .or_default()
+                .insert(ex.endpoint.port);
+        }
+    }
+
+    let mut router_external_slots: Vec<RouterExternalSlot> = Vec::new();
+    let mut router_exports: Vec<RouterExport> = Vec::new();
+    let mut router_config_b64: Option<String> = None;
+    let mut router_env_passthrough: Vec<String> = Vec::new();
+    let mut router_container_ports: Vec<ContainerPort> = Vec::new();
+    let mut router_service_ports: Vec<ServicePort> = Vec::new();
+
+    if needs_router {
+        router_external_slots = build_router_external_slots(root_manifest, &external_slot_ports);
+        router_env_passthrough = router_external_slots
+            .iter()
+            .map(|slot| slot.url_env.clone())
+            .collect();
+
+        for ex in &mesh_plan.exports {
+            let listen_port = *export_ports_by_name.get(&ex.name).ok_or_else(|| {
+                ReporterError::new(format!("missing router port for export {}", ex.name))
+            })?;
+            let provider_names = names.get(&ex.provider).ok_or_else(|| {
+                ReporterError::new(format!(
+                    "missing names for export provider {}",
+                    component_label(s, ex.provider)
+                ))
+            })?;
+            let target_url = format!(
+                "http://{}.{}.svc.cluster.local:{}",
+                provider_names.service, namespace, ex.endpoint.port
+            );
+            router_exports.push(RouterExport {
+                name: ex.name.clone(),
+                listen_port,
+                target_url,
+            });
+        }
+
+        for (idx, slot) in router_external_slots.iter().enumerate() {
+            let name = format!("ext-{}", idx + 1);
+            router_container_ports.push(ContainerPort {
+                name: name.clone(),
+                container_port: slot.listen_port,
+                protocol: "TCP",
+            });
+            router_service_ports.push(ServicePort {
+                name,
+                port: slot.listen_port,
+                target_port: slot.listen_port,
+                protocol: "TCP",
+            });
+        }
+
+        for (idx, export) in router_exports.iter().enumerate() {
+            let name = format!("exp-{}", idx + 1);
+            router_container_ports.push(ContainerPort {
+                name: name.clone(),
+                container_port: export.listen_port,
+                protocol: "TCP",
+            });
+            router_service_ports.push(ServicePort {
+                name,
+                port: export.listen_port,
+                target_port: export.listen_port,
+                protocol: "TCP",
+            });
+        }
+
+        let router_config = RouterConfig {
+            external_slots: router_external_slots.clone(),
+            exports: router_exports.clone(),
+        };
+        let b64 = encode_router_config_b64(&router_config).map_err(|err| {
+            ReporterError::new(format!("failed to serialize router config: {err}"))
+        })?;
+        router_config_b64 = Some(b64);
+    }
 
     // Build kustomization (will be populated at the end if helper mode is used).
     let mut kustomization = Kustomization::new();
@@ -294,6 +471,25 @@ fn render_kubernetes(
         }
 
         // Don't insert kustomization yet - we'll do it at the end after collecting all resource paths
+    }
+
+    if needs_router && !router_external_slots.is_empty() {
+        kustomization.secret_generator.push(SecretGenerator {
+            name: ROUTER_EXTERNAL_SECRET_NAME.to_string(),
+            namespace: Some(namespace.clone()),
+            env_files: vec!["router-external.env".to_string()],
+            literals: Vec::new(),
+            options: Some(GeneratorOptions {
+                disable_name_suffix_hash: Some(true),
+            }),
+        });
+
+        let mut env_content = String::new();
+        env_content.push_str("# Router external slot URLs - fill in values before deploying\n");
+        for env_var in &router_env_passthrough {
+            env_content.push_str(&format!("{env_var}=\n"));
+        }
+        files.insert(PathBuf::from("router-external.env"), env_content);
     }
 
     // Note: Per-component ConfigMaps/Secrets are not generated because:
@@ -552,6 +748,88 @@ fn render_kubernetes(
         );
     }
 
+    if needs_router {
+        let mut env = Vec::new();
+        let router_config_b64 = router_config_b64
+            .as_ref()
+            .expect("router config should be computed");
+        env.push(EnvVar::literal(
+            "AMBER_ROUTER_CONFIG_B64",
+            router_config_b64,
+        ));
+
+        let mut env_from = Vec::new();
+        if !router_external_slots.is_empty() {
+            env_from.push(EnvFromSource {
+                config_map_ref: None,
+                secret_ref: Some(LocalObjectReference {
+                    name: ROUTER_EXTERNAL_SECRET_NAME.to_string(),
+                    optional: Some(true),
+                }),
+            });
+        }
+
+        let container = Container {
+            name: "router".to_string(),
+            image: ROUTER_IMAGE.to_string(),
+            command: Vec::new(),
+            args: Vec::new(),
+            env,
+            env_from,
+            ports: router_container_ports.clone(),
+            readiness_probe: None,
+            volume_mounts: Vec::new(),
+        };
+
+        let deployment = Deployment {
+            api_version: "apps/v1",
+            kind: "Deployment",
+            metadata: ObjectMeta {
+                name: ROUTER_NAME.to_string(),
+                namespace: Some(namespace.clone()),
+                labels: router_labels.clone(),
+                ..Default::default()
+            },
+            spec: DeploymentSpec {
+                replicas: 1,
+                selector: LabelSelector {
+                    match_labels: router_selector.clone(),
+                },
+                template: PodTemplateSpec {
+                    metadata: ObjectMeta {
+                        labels: router_labels.clone(),
+                        ..Default::default()
+                    },
+                    spec: PodSpec {
+                        init_containers: Vec::new(),
+                        containers: vec![container],
+                        volumes: Vec::new(),
+                        restart_policy: None,
+                    },
+                },
+            },
+        };
+
+        files.insert(
+            PathBuf::from("03-deployments/amber-router.yaml"),
+            to_yaml(&deployment)?,
+        );
+
+        if !router_service_ports.is_empty() {
+            let service = Service::new(
+                ROUTER_NAME,
+                &namespace,
+                router_labels.clone(),
+                router_selector.clone(),
+                router_service_ports.clone(),
+            );
+            files.insert(
+                PathBuf::from("04-services/amber-router.yaml"),
+                to_yaml(&service)?,
+            );
+        }
+    }
+
     // Services (only for components with provides)
     for id in program_components {
         let c = s.component(*id);
@@ -631,6 +909,7 @@ fn render_kubernetes(
                                 },
                             }),
                             namespace_selector: None,
+                            ip_block: None,
                         }
                     })
                     .collect();
@@ -645,8 +924,171 @@ fn render_kubernetes(
             }
         }
 
+        if needs_router
+            && let Some(ports) = router_export_allow.get(id)
+            && !ports.is_empty()
+        {
+            netpol.add_ingress_rule(NetworkPolicyIngressRule {
+                from: vec![NetworkPolicyPeer {
+                    pod_selector: Some(LabelSelector {
+                        match_labels: router_selector.clone(),
+                    }),
+                    namespace_selector: None,
+                    ip_block: None,
+                }],
+                ports: ports
+                    .iter()
+                    .map(|port| NetworkPolicyPort {
+                        protocol: "TCP",
+                        port: *port,
+                    })
+                    .collect(),
+            });
+        }
+
+        let egress_from_consumers = egress_allow.get(id);
+        let egress_to_router = egress_router_allow.get(id);
+        if egress_from_consumers.is_some() || egress_to_router.is_some() {
+            netpol.add_egress_rule(NetworkPolicyEgressRule {
+                to: vec![NetworkPolicyPeer {
+                    pod_selector: None,
+                    namespace_selector: None,
+                    ip_block: Some(IpBlock {
+                        cidr: "0.0.0.0/0".to_string(),
+                        except: Vec::new(),
+                    }),
+                }],
+                ports: vec![
+                    NetworkPolicyPort {
+                        protocol: "UDP",
+                        port: 53,
+                    },
+                    NetworkPolicyPort {
+                        protocol: "TCP",
+                        port: 53,
+                    },
+                ],
+            });
+
+            if let Some(by_provider) = egress_from_consumers {
+                for (provider, ports) in by_provider {
+                    let provider_names = names.get(provider).unwrap();
+                    let mut selector = BTreeMap::new();
+                    selector.insert(
+                        "amber.io/component".to_string(),
+                        provider_names.service.clone(),
+                    );
+                    netpol.add_egress_rule(NetworkPolicyEgressRule {
+                        to: vec![NetworkPolicyPeer {
+                            pod_selector: Some(LabelSelector {
+                                match_labels: selector,
+                            }),
+                            namespace_selector: None,
+                            ip_block: None,
+                        }],
+                        ports: ports
+                            .iter()
+                            .map(|port| NetworkPolicyPort {
+                                protocol: "TCP",
+                                port: *port,
+                            })
+                            .collect(),
+                    });
+                }
+            }
+
+            if let Some(ports) = egress_to_router {
+                netpol.add_egress_rule(NetworkPolicyEgressRule {
+                    to: vec![NetworkPolicyPeer {
+                        pod_selector: Some(LabelSelector {
+                            match_labels: router_selector.clone(),
+                        }),
+                        namespace_selector: None,
+                        ip_block: None,
+                    }],
+                    ports: ports
+                        .iter()
+                        .map(|port| NetworkPolicyPort {
+                            protocol: "TCP",
+                            port: *port,
+                        })
+                        .collect(),
+                });
+            }
+        }
+
         files.insert(
             PathBuf::from(format!("05-networkpolicies/{}.yaml", cnames.netpol)),
+            to_yaml(&netpol)?,
+        );
+    }
+
+    if needs_router {
+        let mut netpol = NetworkPolicy::new(
+            format!("{ROUTER_NAME}-netpol"),
+            &namespace,
+            router_labels.clone(),
+            router_selector.clone(),
+        );
+
+        for (port, consumers) in &router_inbound_allow {
+            let mut unique = BTreeSet::new();
+            let mut from = Vec::new();
+            for consumer in consumers {
+                if !unique.insert(*consumer) {
+                    continue;
+                }
+                let consumer_names = names
+                    .get(consumer)
+                    .expect("router consumer should be a runnable component");
+                from.push(NetworkPolicyPeer {
+                    pod_selector: Some(LabelSelector {
+                        match_labels: {
+                            let mut m = BTreeMap::new();
+                            m.insert(
+                                "amber.io/component".to_string(),
+                                consumer_names.service.clone(),
+                            );
+                            m
+                        },
+                    }),
+                    namespace_selector: None,
+                    ip_block: None,
+                });
+            }
+
+            netpol.add_ingress_rule(NetworkPolicyIngressRule {
+                from,
+                ports: vec![NetworkPolicyPort {
+                    protocol: "TCP",
+                    port: *port,
+                }],
+            });
+        }
+
+        if !router_export_ports.is_empty() {
+            let ports = router_export_ports
+                .iter()
+                .map(|port| NetworkPolicyPort {
+                    protocol: "TCP",
+                    port: *port,
+                })
+                .collect();
+            netpol.add_ingress_rule(NetworkPolicyIngressRule {
+                from: vec![NetworkPolicyPeer {
+                    pod_selector: None,
+                    namespace_selector: None,
+                    ip_block: Some(IpBlock {
+                        cidr: "0.0.0.0/0".to_string(),
+                        except: Vec::new(),
+                    }),
+                }],
+                ports,
+            });
+        }
+
+        files.insert(
+            PathBuf::from("05-networkpolicies/amber-router-netpol.yaml"),
             to_yaml(&netpol)?,
         );
     }
@@ -668,14 +1110,22 @@ fn render_kubernetes(
     for ex in &mesh_plan.exports {
         let provider = ex.provider;
         let provider_names = names.get(&provider).unwrap();
+        let (service, port) = if needs_router {
+            let port = *export_ports_by_name
+                .get(&ex.name)
+                .unwrap_or(&ex.endpoint.port);
+            (ROUTER_NAME.to_string(), port)
+        } else {
+            (provider_names.service.clone(), ex.endpoint.port)
+        };
 
         export_metadata.insert(
             ex.name.clone(),
             ExportMetadata {
                 component: s.component(provider).moniker.as_str().to_string(),
                 provide: ex.provide.clone(),
-                service: provider_names.service.clone(),
-                port: ex.endpoint.port,
+                service,
+                port,
                 kind: format!("{}", ex.capability.kind),
             },
         );
@@ -692,11 +1142,27 @@ fn render_kubernetes(
         );
     }
 
+    let mut external_slot_metadata: BTreeMap<String, ExternalSlotMetadata> = BTreeMap::new();
+    for slot_name in external_slot_ports.keys() {
+        let decl = root_manifest
+            .slots()
+            .get(slot_name.as_str())
+            .expect("external slot should exist on root");
+        external_slot_metadata.insert(
+            slot_name.clone(),
+            ExternalSlotMetadata {
+                required: !decl.optional,
+                kind: format!("{}", decl.decl.kind),
+            },
+        );
+    }
+
     let scenario_metadata = ScenarioMetadata {
         version: "1",
         digest: s.component(s.root).digest.to_string(),
         exports: export_metadata,
         inputs: input_metadata,
+        external_slots: external_slot_metadata,
     };
 
     let metadata_json = serde_json::to_string_pretty(&scenario_metadata)
@@ -724,6 +1190,7 @@ fn render_kubernetes(
     for path in files.keys() {
         if path == &PathBuf::from("root-config.env")
             || path == &PathBuf::from("root-config-secret.env")
+            || path == &PathBuf::from("router-external.env")
         {
             continue; // Skip .env template files
         }

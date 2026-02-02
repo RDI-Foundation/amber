@@ -39,6 +39,7 @@ jobs:
       - run: cargo test --workspace --all-features
       - run: cargo test -p amber-compiler --all-features docker_smoke_ocap_blocks_unbound_callers -- --ignored --test-threads=1
       - run: cargo test -p amber-compiler --all-features docker_smoke_config_forwarding_runtime_validation -- --ignored --test-threads=1
+      - run: cargo test -p amber-compiler --all-features docker_smoke_external_slot_routes_to_outside_service -- --ignored --test-threads=1
       - run: cargo test -p amber-helper --all-features helper_image_executes_run_plan_in_scratch -- --ignored --test-threads=1
 
   kubernetes-tests:
@@ -54,6 +55,8 @@ jobs:
       - uses: mozilla-actions/sccache-action@v0.0.9
       - name: Test Kubernetes reporter with KinD
         run: cargo test -p amber-compiler --all-features kubernetes_smoke_config_roundtrip -- --ignored --test-threads=1
+      - name: Test Kubernetes external slot routing with KinD
+        run: cargo test -p amber-compiler --all-features kubernetes_smoke_external_slot_routes_to_outside_service -- --ignored --test-threads=1
 
   docker-build:
     name: Build Docker Images (${{ matrix.image }} ${{ matrix.arch }})

@@ -9,8 +9,8 @@ use std::{
 use amber_config as rc;
 use amber_manifest::{
     BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, ChildName, ExportName,
-    ExportTarget, InterpolatedPart, InterpolationSource, Manifest, ManifestDigest,
-    framework_capability,
+    ExportTarget, InterpolatedPart, InterpolatedString, InterpolationSource, Manifest,
+    ManifestDigest, framework_capability,
 };
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, ProvideRef, Scenario, ScenarioExport,
@@ -472,6 +472,26 @@ pub enum Error {
         related: Vec<RelatedSpan>,
     },
 
+    #[error(
+        "binding into {component_path}.{slot} must be weak because it depends on external slot \
+         `{external}`"
+    )]
+    #[diagnostic(
+        code(linker::external_slot_requires_weak),
+        help("Make this binding weak or insert a weak binding upstream.")
+    )]
+    ExternalSlotRequiresWeakBinding {
+        component_path: String,
+        slot: String,
+        external: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label(primary, "binding must be weak here")]
+        span: SourceSpan,
+        #[related]
+        related: Vec<RelatedSpan>,
+    },
+
     #[error("slot routing cycle detected: {cycle}")]
     #[diagnostic(
         code(linker::slot_cycle),
@@ -613,12 +633,27 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         &mut errors,
     );
 
-    let mut resolver = SlotResolver::new(&components, &bindings, &provenance, store);
+    let root_manifest = manifests[root.0]
+        .as_ref()
+        .expect("root manifest should exist");
+    let root_program_slots = collect_program_slot_uses(root_manifest);
+
+    let mut resolver = SlotResolver::new(
+        &components,
+        &bindings,
+        &provenance,
+        store,
+        root,
+        root_program_slots.clone(),
+    );
     let binding_edges = resolve_binding_edges(&mut resolver, &bindings, &mut errors);
+    let external_root_slots = resolver.external_root_slots();
     validate_all_slots_bound(
         &components,
         &manifests,
         &binding_edges,
+        &external_root_slots,
+        root,
         &provenance,
         store,
         &mut errors,
@@ -631,9 +666,6 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         });
     }
 
-    let root_manifest = manifests[root.0]
-        .as_ref()
-        .expect("root manifest should exist");
     let mut exports = Vec::new();
     for export_name in root_manifest.exports().keys() {
         let resolved_export =
@@ -657,6 +689,26 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
                                 name: export_name.to_string(),
                                 message: format!(
                                     "target resolves to framework.{name}, which cannot be exported"
+                                ),
+                                help: "Export a component provide or child export instead."
+                                    .to_string(),
+                                src,
+                                span,
+                            });
+                            None
+                        }
+                        BindingFrom::External(slot) => {
+                            let (src, span) = export_site(&provenance, store, root, export_name);
+                            errors.push(Error::InvalidExport {
+                                component_path: describe_component_path(&component_path_for(
+                                    &components,
+                                    root,
+                                )),
+                                name: export_name.to_string(),
+                                message: format!(
+                                    "target resolves to external slot `{}`, which cannot be \
+                                     exported",
+                                    slot.name
                                 ),
                                 help: "Export a component provide or child export instead."
                                     .to_string(),
@@ -714,6 +766,31 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
             count: errors.len(),
             errors,
         });
+    }
+
+    let mut binding_edges = binding_edges;
+    if !root_program_slots.is_empty() {
+        let mut seen = HashSet::new();
+        for edge in &binding_edges {
+            if edge.to.component == root {
+                seen.insert(edge.to.name.clone());
+            }
+        }
+        for slot in root_program_slots {
+            if seen.contains(&slot) {
+                continue;
+            }
+            let slot_ref = SlotRef {
+                component: root,
+                name: slot.clone(),
+            };
+            binding_edges.push(BindingEdge {
+                name: None,
+                from: BindingFrom::External(slot_ref.clone()),
+                to: slot_ref,
+                weak: true,
+            });
+        }
     }
 
     let mut scenario = Scenario {
@@ -1714,6 +1791,8 @@ fn resolve_export(
 struct ResolvedBindingFrom {
     from: BindingFrom,
     weak: bool,
+    all_weak: bool,
+    nonweak: Option<NonWeakBinding>,
 }
 
 #[derive(Clone, Debug)]
@@ -1730,6 +1809,14 @@ struct SlotResolver<'a> {
     store: &'a DigestStore,
     states: HashMap<SlotRef, ResolveState>,
     stack: Vec<SlotRef>,
+    root: ComponentId,
+    external_root_slots: HashSet<String>,
+}
+
+#[derive(Clone, Debug)]
+struct NonWeakBinding {
+    origin: BindingOrigin,
+    target: SlotRef,
 }
 
 impl<'a> SlotResolver<'a> {
@@ -1738,6 +1825,8 @@ impl<'a> SlotResolver<'a> {
         bindings: &'a [BindingSpec],
         provenance: &'a Provenance,
         store: &'a DigestStore,
+        root: ComponentId,
+        root_program_slots: HashSet<String>,
     ) -> Self {
         let mut binding_by_target = HashMap::new();
         for (idx, binding) in bindings.iter().enumerate() {
@@ -1751,6 +1840,8 @@ impl<'a> SlotResolver<'a> {
             store,
             states: HashMap::new(),
             stack: Vec::new(),
+            root,
+            external_root_slots: root_program_slots,
         }
     }
 
@@ -1763,10 +1854,14 @@ impl<'a> SlotResolver<'a> {
             CapabilitySource::Provide(provide) => Some(ResolvedBindingFrom {
                 from: BindingFrom::Component(provide.clone()),
                 weak: false,
+                all_weak: true,
+                nonweak: None,
             }),
             CapabilitySource::Framework(name) => Some(ResolvedBindingFrom {
                 from: BindingFrom::Framework(name.clone()),
                 weak: false,
+                all_weak: true,
+                nonweak: None,
             }),
             CapabilitySource::Slot(slot) => self.resolve_slot(slot, errors),
         }
@@ -1788,13 +1883,37 @@ impl<'a> SlotResolver<'a> {
         self.stack.push(slot.clone());
 
         let resolved = match self.binding_by_target.get(slot) {
-            None => None,
+            None => {
+                if slot.component == self.root {
+                    self.external_root_slots.insert(slot.name.clone());
+                    Some(ResolvedBindingFrom {
+                        from: BindingFrom::External(slot.clone()),
+                        weak: false,
+                        all_weak: true,
+                        nonweak: None,
+                    })
+                } else {
+                    None
+                }
+            }
             Some(&idx) => {
                 let binding = &self.bindings[idx];
                 let upstream = self.resolve_source(&binding.source, errors);
-                upstream.map(|resolved| ResolvedBindingFrom {
-                    from: resolved.from,
-                    weak: resolved.weak || binding.weak,
+                upstream.map(|resolved| {
+                    let nonweak = if binding.weak {
+                        resolved.nonweak
+                    } else {
+                        Some(NonWeakBinding {
+                            origin: binding.origin.clone(),
+                            target: binding.target.clone(),
+                        })
+                    };
+                    ResolvedBindingFrom {
+                        from: resolved.from,
+                        weak: resolved.weak || binding.weak,
+                        all_weak: resolved.all_weak && binding.weak,
+                        nonweak,
+                    }
                 })
             }
         };
@@ -1876,6 +1995,10 @@ impl<'a> SlotResolver<'a> {
             .map(|decl| decl.optional)
             .unwrap_or(false)
     }
+
+    fn external_root_slots(&self) -> HashSet<String> {
+        self.external_root_slots.clone()
+    }
 }
 
 fn cycle_labels(components: &[Option<Component>], slots: &[SlotRef]) -> Vec<String> {
@@ -1898,6 +2021,46 @@ fn format_cycle(parts: &[String]) -> String {
     let mut out = parts.to_vec();
     out.push(parts[0].clone());
     out.join(" -> ")
+}
+
+fn collect_program_slot_uses(manifest: &Manifest) -> HashSet<String> {
+    let mut uses = HashSet::new();
+    let Some(program) = manifest.program() else {
+        return uses;
+    };
+
+    let mut used_all = false;
+    for arg in &program.args.0 {
+        used_all = add_program_slot_uses(manifest, &mut uses, arg);
+        if used_all {
+            return uses;
+        }
+    }
+
+    for value in program.env.values() {
+        used_all = add_program_slot_uses(manifest, &mut uses, value);
+        if used_all {
+            return uses;
+        }
+    }
+
+    uses
+}
+
+fn add_program_slot_uses(
+    manifest: &Manifest,
+    uses: &mut HashSet<String>,
+    value: &InterpolatedString,
+) -> bool {
+    let used_all = value.visit_slot_uses(|slot| {
+        if manifest.slots().contains_key(slot) {
+            uses.insert(slot.to_string());
+        }
+    });
+    if used_all {
+        uses.extend(manifest.slots().keys().map(|s| s.to_string()));
+    }
+    used_all
 }
 
 fn dependency_cycle_error(
@@ -1999,6 +2162,61 @@ fn resolve_binding_edges(
         let Some(resolved) = resolver.resolve_source(&binding.source, errors) else {
             continue;
         };
+
+        let all_weak = resolved.all_weak && binding.weak;
+        let nonweak = if binding.weak {
+            resolved
+                .nonweak
+                .as_ref()
+                .map(|entry| (&entry.origin, &entry.target))
+        } else {
+            Some((&binding.origin, &binding.target))
+        };
+
+        if let BindingFrom::External(slot_ref) = &resolved.from
+            && !all_weak
+        {
+            let (origin, target) = nonweak.unwrap_or((&binding.origin, &binding.target));
+
+            let (src, span) = binding_target_site(
+                resolver.provenance,
+                resolver.store,
+                origin.realm,
+                &origin.target_key,
+            )
+            .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+
+            let mut related = Vec::new();
+            if let Some((slot_src, slot_spans)) =
+                source_for_component(resolver.provenance, resolver.store, slot_ref.component)
+                && let Some(s) = slot_spans.slots.get(slot_ref.name.as_str())
+            {
+                related.push(RelatedSpan {
+                    message: format!(
+                        "external slot `{}` declared on {}",
+                        slot_ref.name,
+                        component_path_for(resolver.components, slot_ref.component)
+                    ),
+                    src: slot_src,
+                    span: s.name,
+                    label: "slot declared here".to_string(),
+                });
+            }
+
+            errors.push(Error::ExternalSlotRequiresWeakBinding {
+                component_path: describe_component_path(&component_path_for(
+                    resolver.components,
+                    target.component,
+                )),
+                slot: target.name.clone(),
+                external: slot_ref.name.clone(),
+                src,
+                span,
+                related,
+            });
+            continue;
+        }
+
         edges.push(BindingEdge {
             name: binding.name.clone(),
             from: resolved.from,
@@ -2009,10 +2227,13 @@ fn resolve_binding_edges(
     edges
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_all_slots_bound(
     components: &[Option<Component>],
     manifests: &[Option<Arc<Manifest>>],
     bindings: &[BindingEdge],
+    external_root_slots: &HashSet<String>,
+    root: ComponentId,
     provenance: &Provenance,
     store: &DigestStore,
     errors: &mut Vec<Error>,
@@ -2026,6 +2247,9 @@ fn validate_all_slots_bound(
         let m = manifests[id.0].as_ref().expect("manifest should exist");
         for (slot_name, slot_decl) in m.slots().iter() {
             if slot_decl.optional {
+                continue;
+            }
+            if id == root && external_root_slots.contains(slot_name.as_str()) {
                 continue;
             }
             if satisfied.contains(&(id, slot_name.as_str())) {

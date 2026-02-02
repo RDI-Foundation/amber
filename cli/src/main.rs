@@ -80,6 +80,10 @@ struct CompileArgs {
     #[arg(long = "disable-networkpolicy-check", requires = "kubernetes")]
     disable_networkpolicy_check: bool,
 
+    /// Disable compiler optimizations.
+    #[arg(long = "no-opt")]
+    no_opt: bool,
+
     /// Root manifest or bundle to compile (URL or local path).
     #[arg(value_name = "MANIFEST")]
     manifest: String,
@@ -150,7 +154,10 @@ async fn compile(args: CompileArgs) -> Result<()> {
     let resolved = resolve_input(&args.manifest).await?;
     let compiler =
         Compiler::new(resolved.resolver, Default::default()).with_registry(resolved.registry);
-    let opts = CompileOptions::default();
+    let mut opts = CompileOptions::default();
+    if args.no_opt {
+        opts.optimize.dce = false;
+    }
 
     let tree = compiler
         .resolve_tree(resolved.manifest.clone(), opts.resolve)

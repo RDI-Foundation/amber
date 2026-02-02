@@ -1,0 +1,12 @@
+{
+  manifest_version: "0.1.0",
+  slots: {
+    api: { kind: "http" },
+  },
+  components: {
+    client: "./external_slot_requires_weak_child.json5",
+  },
+  bindings: [
+    { to: "#client.api", from: "self.api" },
+  ],
+}

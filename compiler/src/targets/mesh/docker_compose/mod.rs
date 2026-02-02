@@ -17,6 +17,10 @@ use crate::{
     targets::mesh::{
         config::{ProgramPlan, encode_helper_payload, encode_schema_b64},
         plan::{MeshOptions, component_label},
+        router_config::{
+            RouterConfig, RouterExport, RouterExternalSlot, allocate_external_slot_ports,
+            build_router_external_slots, encode_router_config_b64,
+        },
     },
 };
 
@@ -24,12 +28,16 @@ const MESH_NETWORK_NAME: &str = "amber_mesh";
 
 const SIDECAR_IMAGE: &str = "ghcr.io/rdi-foundation/amber-sidecar:main";
 const HELPER_IMAGE: &str = "ghcr.io/rdi-foundation/amber-helper:v1";
+const ROUTER_IMAGE: &str = "ghcr.io/rdi-foundation/amber-router:v1";
+const ROUTER_SERVICE_NAME: &str = "amber-router";
 const HELPER_VOLUME_NAME: &str = "amber-helper-bin";
 const HELPER_INIT_SERVICE: &str = "amber-init";
 const HELPER_BIN_DIR: &str = "/amber/bin";
 const HELPER_BIN_PATH: &str = "/amber/bin/amber-helper";
 
 const LOCAL_PROXY_PORT_BASE: u16 = 20000;
+const ROUTER_EXTERNAL_PORT_BASE: u16 = 21000;
+const ROUTER_EXPORT_PORT_BASE: u16 = 22000;
 const EXPORT_PORT_BASE: u16 = 18000;
 const EXPORT_HOST: &str = "127.0.0.1";
 
@@ -218,6 +226,11 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
             },
         );
     }
+    let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
+    let router_names = ServiceNames {
+        program: ROUTER_SERVICE_NAME.to_string(),
+        sidecar: format!("{ROUTER_SERVICE_NAME}-net"),
+    };
 
     // Allocate stable local proxy ports per (component, slot), avoiding colliding with program listens.
     let slot_ports_by_component = allocate_local_proxy_ports(s, program_components)?;
@@ -235,6 +248,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
 
     // Inbound allowlist: (provider_component, port) -> set of consumer sidecar hosts
     let mut inbound_allow: HashMap<(ComponentId, u16), BTreeSet<String>> = HashMap::new();
+    let mut router_inbound_allow: BTreeMap<u16, BTreeSet<String>> = BTreeMap::new();
 
     // Track (component,port) -> (first_provide_name, first_endpoint_name) to detect
     // distinct endpoints sharing a port.
@@ -320,14 +334,82 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         }
     }
 
-    // Scenario exports => publish to host loopback with stable host ports.
-    // Also, allow inbound on that target port from host loopback / docker gateway.
-    let mut exported_ports: HashMap<ComponentId, BTreeSet<u16>> = HashMap::new();
-    let mut exports_by_provider: HashMap<ComponentId, BTreeMap<String, ExportMetadata>> =
-        HashMap::new();
+    let root_manifest = mesh_plan.manifests[s.root.0]
+        .as_ref()
+        .expect("root manifest should exist");
+
+    let external_slot_ports =
+        allocate_external_slot_ports(&mesh_plan.external_bindings, ROUTER_EXTERNAL_PORT_BASE)
+            .map_err(DockerComposeError::Other)?;
+
+    for binding in &mesh_plan.external_bindings {
+        let consumer = binding.consumer;
+        let local_port = *slot_ports_by_component
+            .get(&consumer)
+            .and_then(|m| m.get(&binding.slot))
+            .ok_or_else(|| {
+                format!(
+                    "internal error: missing local port allocation for {}.{}",
+                    component_label(s, consumer),
+                    binding.slot
+                )
+            })?;
+
+        let remote_port = *external_slot_ports
+            .get(&binding.external_slot)
+            .ok_or_else(|| {
+                format!(
+                    "internal error: missing router port for external slot {}",
+                    binding.external_slot
+                )
+            })?;
+
+        let consumer_host = names
+            .get(&consumer)
+            .ok_or_else(|| {
+                format!(
+                    "internal error: missing sidecar name for consumer {}",
+                    component_label(s, consumer)
+                )
+            })?
+            .sidecar
+            .clone();
+        router_inbound_allow
+            .entry(remote_port)
+            .or_default()
+            .insert(consumer_host);
+
+        slot_proxies_by_component
+            .entry(consumer)
+            .or_default()
+            .push(SlotProxy {
+                local_port,
+                remote_host: router_names.sidecar.clone(),
+                remote_port,
+            });
+
+        let url = format!("http://127.0.0.1:{local_port}");
+
+        slot_values_by_component
+            .entry(consumer)
+            .or_default()
+            .insert(binding.slot.clone(), SlotObject { url: url.clone() });
+
+        if let Some(name) = binding.binding_name.as_ref() {
+            binding_values_by_component
+                .entry(consumer)
+                .or_default()
+                .insert(name.clone(), BindingObject { url });
+        }
+    }
+
+    // Scenario exports => publish to host loopback with stable host ports (via router).
+    let mut router_export_ports: BTreeSet<u16> = BTreeSet::new();
+    let mut export_ports_by_name: BTreeMap<String, u16> = BTreeMap::new();
     let mut exports_by_name: BTreeMap<String, ExportMetadata> = BTreeMap::new();
     {
         let mut next_host_port = EXPORT_PORT_BASE;
+        let mut next_router_port = ROUTER_EXPORT_PORT_BASE;
         for ex in &mesh_plan.exports {
             let provider = ex.provider;
             let endpoint = &ex.endpoint;
@@ -340,15 +422,23 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 &endpoint.name,
             )?;
 
+            inbound_allow
+                .entry((provider, endpoint.port))
+                .or_default()
+                .insert(router_names.sidecar.clone());
+
             let published = next_host_port;
             next_host_port = next_host_port.checked_add(1).ok_or_else(|| {
                 "ran out of host ports while allocating scenario exports".to_string()
             })?;
 
-            exported_ports
-                .entry(provider)
-                .or_default()
-                .insert(endpoint.port);
+            let listen_port = next_router_port;
+            next_router_port = next_router_port.checked_add(1).ok_or_else(|| {
+                "ran out of router ports while allocating scenario exports".to_string()
+            })?;
+
+            router_export_ports.insert(listen_port);
+            export_ports_by_name.insert(ex.name.clone(), listen_port);
 
             let metadata = ExportMetadata {
                 published_host: EXPORT_HOST.to_string(),
@@ -359,12 +449,51 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 endpoint: endpoint.name.clone(),
             };
 
-            exports_by_provider
-                .entry(provider)
-                .or_default()
-                .insert(ex.name.clone(), metadata.clone());
             exports_by_name.insert(ex.name.clone(), metadata);
         }
+    }
+
+    let mut router_external_slots: Vec<RouterExternalSlot> = Vec::new();
+    let mut router_exports: Vec<RouterExport> = Vec::new();
+    let mut router_env_passthrough: Vec<String> = Vec::new();
+    let mut router_config_b64: Option<String> = None;
+
+    if needs_router {
+        router_external_slots = build_router_external_slots(root_manifest, &external_slot_ports);
+        router_env_passthrough = router_external_slots
+            .iter()
+            .map(|slot| slot.url_env.clone())
+            .collect();
+
+        for ex in &mesh_plan.exports {
+            let listen_port = *export_ports_by_name.get(&ex.name).ok_or_else(|| {
+                format!("internal error: missing router port for export {}", ex.name)
+            })?;
+            let provider_sidecar = names
+                .get(&ex.provider)
+                .ok_or_else(|| {
+                    format!(
+                        "internal error: missing sidecar name for export provider {}",
+                        component_label(s, ex.provider)
+                    )
+                })?
+                .sidecar
+                .clone();
+            let target_url = format!("http://{}:{}", provider_sidecar, ex.endpoint.port);
+            router_exports.push(RouterExport {
+                name: ex.name.clone(),
+                listen_port,
+                target_url,
+            });
+        }
+
+        let router_config = RouterConfig {
+            external_slots: router_external_slots.clone(),
+            exports: router_exports.clone(),
+        };
+        let b64 = encode_router_config_b64(&router_config)
+            .map_err(|err| format!("failed to serialize router config: {err}"))?;
+        router_config_b64 = Some(b64);
     }
 
     // Compose YAML
@@ -436,6 +565,104 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         push_line(&mut out, 4, &format!("restart: {}", yaml_str("no")));
     }
 
+    if needs_router {
+        // ---- router sidecar ----
+        push_line(&mut out, 2, &format!("{}:", router_names.sidecar));
+        push_line(&mut out, 4, &format!("image: {}", yaml_str(SIDECAR_IMAGE)));
+        push_line(&mut out, 4, "cap_add:");
+        push_line(&mut out, 6, "- NET_ADMIN");
+        push_line(&mut out, 4, "cap_drop:");
+        push_line(&mut out, 6, "- ALL");
+        push_line(&mut out, 4, "security_opt:");
+        push_line(&mut out, 6, "- no-new-privileges:true");
+        push_line(&mut out, 4, "networks:");
+        push_line(&mut out, 6, &format!("{MESH_NETWORK_NAME}: {{}}"));
+
+        if !exports_by_name.is_empty() {
+            push_line(&mut out, 4, "ports:");
+            for (export_name, meta) in &exports_by_name {
+                let router_port = export_ports_by_name
+                    .get(export_name)
+                    .expect("router export port missing");
+                let spec = format!(
+                    "{}:{}:{}",
+                    meta.published_host, meta.published_port, router_port
+                );
+                push_line(&mut out, 6, &format!("- {}", yaml_str(&spec)));
+            }
+
+            let labels_json = serde_json::to_string(&exports_by_name)
+                .map_err(|err| format!("failed to serialize router export labels: {err}"))?;
+            push_line(&mut out, 4, "labels:");
+            push_line(
+                &mut out,
+                6,
+                &format!("amber.exports: {}", yaml_str(&labels_json)),
+            );
+        }
+
+        let router_inbound: Vec<(u16, &BTreeSet<String>)> = router_inbound_allow
+            .iter()
+            .map(|(port, srcs)| (*port, srcs))
+            .collect();
+        let router_script = build_sidecar_script(
+            s.root,
+            router_inbound,
+            if router_export_ports.is_empty() {
+                None
+            } else {
+                Some(&router_export_ports)
+            },
+            None,
+            false,
+        );
+
+        push_line(&mut out, 4, "command:");
+        push_line(&mut out, 6, "- /bin/sh");
+        push_line(&mut out, 6, "- -lc");
+        push_line(&mut out, 6, "- |-");
+        for line in router_script.lines() {
+            let escaped = escape_compose_interpolation(line);
+            push_line(&mut out, 8, escaped.as_ref());
+        }
+
+        // ---- router program ----
+        push_line(&mut out, 2, &format!("{}:", router_names.program));
+        push_line(&mut out, 4, &format!("image: {}", yaml_str(ROUTER_IMAGE)));
+        push_line(
+            &mut out,
+            4,
+            &format!(
+                "network_mode: {}",
+                yaml_str(&format!("service:{}", router_names.sidecar))
+            ),
+        );
+        push_line(&mut out, 4, "environment:");
+        for entry in &router_env_passthrough {
+            push_line(&mut out, 6, &format!("- {}", yaml_str(entry)));
+        }
+        let router_config_b64 = router_config_b64
+            .as_ref()
+            .expect("router config should be computed");
+        push_line(
+            &mut out,
+            6,
+            &format!(
+                "- {}",
+                yaml_str(&format!("AMBER_ROUTER_CONFIG_B64={router_config_b64}"))
+            ),
+        );
+        push_line(&mut out, 4, "depends_on:");
+        push_line(
+            &mut out,
+            6,
+            &format!(
+                "{}: {{ condition: service_started }}",
+                yaml_str(&router_names.sidecar)
+            ),
+        );
+    }
+
     // Emit services in stable (component id) order, sidecar then program.
     for id in program_components {
         let c = s.component(*id);
@@ -457,32 +684,6 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         push_line(&mut out, 4, "networks:");
         push_line(&mut out, 6, &format!("{MESH_NETWORK_NAME}: {{}}"));
 
-        // Host port publishes for scenario exports (loopback-only for MVP)
-        if let Some(mappings) = exports_by_provider.get(id) {
-            push_line(&mut out, 4, "ports:");
-            for m in mappings.values() {
-                // Published on host loopback only.
-                let spec = format!(
-                    "{}:{}:{}",
-                    m.published_host, m.published_port, m.target_port
-                );
-                push_line(&mut out, 6, &format!("- {}", yaml_str(&spec)));
-            }
-
-            let labels_json = serde_json::to_string(mappings).map_err(|err| {
-                format!(
-                    "failed to serialize export labels for {}: {err}",
-                    c.moniker.as_str()
-                )
-            })?;
-            push_line(&mut out, 4, "labels:");
-            push_line(
-                &mut out,
-                6,
-                &format!("amber.exports: {}", yaml_str(&labels_json)),
-            );
-        }
-
         // Sidecar command script
         let script = build_sidecar_script(
             *id,
@@ -490,8 +691,9 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 .iter()
                 .filter_map(|((prov, port), srcs)| (*prov == *id).then_some((*port, srcs)))
                 .collect(),
-            exported_ports.get(id),
+            None,
             slot_proxies_by_component.get(id),
+            true,
         );
 
         push_line(&mut out, 4, "command:");
@@ -563,13 +765,15 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 // Use entrypoint so image entrypoints are ignored.
                 push_line(&mut out, 4, "entrypoint:");
                 for a in entrypoint {
-                    push_line(&mut out, 6, &format!("- {}", yaml_str(a)));
+                    let escaped = escape_compose_interpolation(a);
+                    push_line(&mut out, 6, &format!("- {}", yaml_str(escaped.as_ref())));
                 }
 
                 if !env.is_empty() {
                     push_line(&mut out, 4, "environment:");
                     for (k, v) in env {
-                        push_line(&mut out, 6, &format!("{k}: {}", yaml_str(v)));
+                        let escaped = escape_compose_interpolation(v);
+                        push_line(&mut out, 6, &format!("{k}: {}", yaml_str(escaped.as_ref())));
                     }
                 }
             }
@@ -801,8 +1005,18 @@ fn build_sidecar_script(
     inbound: Vec<(u16, &BTreeSet<String>)>,
     exported_ports: Option<&BTreeSet<u16>>,
     proxies: Option<&Vec<SlotProxy>>,
+    restrict_egress: bool,
 ) -> String {
     let mut script = String::new();
+
+    let mut egress_targets: Vec<(String, u16)> = Vec::new();
+    if restrict_egress && let Some(ps) = proxies {
+        let mut seen: BTreeSet<(String, u16)> = BTreeSet::new();
+        for p in ps {
+            seen.insert((p.remote_host.clone(), p.remote_port));
+        }
+        egress_targets.extend(seen);
+    }
 
     // Minimal, explicit, deterministic.
     writeln!(&mut script, "set -eu").unwrap();
@@ -812,13 +1026,45 @@ fn build_sidecar_script(
     writeln!(&mut script, "iptables -w -X").unwrap();
     writeln!(&mut script, "iptables -w -P INPUT DROP").unwrap();
     writeln!(&mut script, "iptables -w -P FORWARD DROP").unwrap();
-    writeln!(&mut script, "iptables -w -P OUTPUT ACCEPT").unwrap();
+    writeln!(
+        &mut script,
+        "iptables -w -P OUTPUT {}",
+        if restrict_egress { "DROP" } else { "ACCEPT" }
+    )
+    .unwrap();
     writeln!(&mut script, "iptables -w -A INPUT -i lo -j ACCEPT").unwrap();
     writeln!(
         &mut script,
         "iptables -w -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
     )
     .unwrap();
+    if restrict_egress {
+        writeln!(&mut script, "iptables -w -A OUTPUT -o lo -j ACCEPT").unwrap();
+        writeln!(
+            &mut script,
+            "iptables -w -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+        )
+        .unwrap();
+        writeln!(
+            &mut script,
+            "for ns in $(awk '/^nameserver/{{print $2}}' /etc/resolv.conf | awk '$1 ~ \
+             /^[0-9]+(\\.[0-9]+){{3}}$/ {{print $1}}'); do"
+        )
+        .unwrap();
+        writeln!(
+            &mut script,
+            "  iptables -w -A OUTPUT -p udp -m udp --dport 53 -d \"$ns\" -j ACCEPT"
+        )
+        .unwrap();
+        writeln!(
+            &mut script,
+            "  iptables -w -A OUTPUT -p tcp -m tcp --dport 53 -d \"$ns\" -j ACCEPT"
+        )
+        .unwrap();
+        writeln!(&mut script, "done").unwrap();
+        writeln!(&mut script, "iptables -w -N AMBER-ALLOW-OUT").unwrap();
+        writeln!(&mut script, "iptables -w -A OUTPUT -j AMBER-ALLOW-OUT").unwrap();
+    }
     writeln!(&mut script, "iptables -w -N AMBER-ALLOW").unwrap();
     writeln!(&mut script, "iptables -w -A INPUT -j AMBER-ALLOW").unwrap();
 
@@ -838,10 +1084,21 @@ fn build_sidecar_script(
     .unwrap();
     writeln!(&mut script, "  fi").unwrap();
     writeln!(&mut script, "}}").unwrap();
+    if restrict_egress {
+        writeln!(&mut script, "add_out_rule() {{").unwrap();
+        writeln!(&mut script, "  if [ -n \"$1\" ]; then").unwrap();
+        writeln!(&mut script, "    printf '%s\\n' \"$1\" >> \"$desired_out\"").unwrap();
+        writeln!(&mut script, "  fi").unwrap();
+        writeln!(&mut script, "}}").unwrap();
+    }
     writeln!(&mut script, "refresh_allowlist() {{").unwrap();
     writeln!(&mut script, "  set +e").unwrap();
     writeln!(&mut script, "  desired_rules=\"/tmp/amber-allowlist\"").unwrap();
     writeln!(&mut script, "  : > \"$desired_rules\"").unwrap();
+    if restrict_egress {
+        writeln!(&mut script, "  desired_out=\"/tmp/amber-allowlist-out\"").unwrap();
+        writeln!(&mut script, "  : > \"$desired_out\"").unwrap();
+    }
     writeln!(
         &mut script,
         "  gateway=\"$(ip -4 route show default | awk 'NR==1 {{print $3}}')\""
@@ -879,6 +1136,24 @@ fn build_sidecar_script(
             .unwrap();
             writeln!(&mut script, "  fi").unwrap();
         }
+    }
+    if restrict_egress {
+        for (host, port) in &egress_targets {
+            writeln!(&mut script, "  for ip in $(resolve_ipv4 \"{host}\"); do").unwrap();
+            writeln!(
+                &mut script,
+                "    add_out_rule \"-d $ip/32 -p tcp -m tcp --dport {port} -j ACCEPT\""
+            )
+            .unwrap();
+            writeln!(&mut script, "  done").unwrap();
+        }
+        writeln!(&mut script, "  if [ -s \"$desired_out\" ]; then").unwrap();
+        writeln!(&mut script, "    iptables -w -F AMBER-ALLOW-OUT").unwrap();
+        writeln!(&mut script, "    while read -r rule; do").unwrap();
+        writeln!(&mut script, "      [ -z \"$rule\" ] && continue").unwrap();
+        writeln!(&mut script, "      iptables -w -A AMBER-ALLOW-OUT $rule").unwrap();
+        writeln!(&mut script, "    done < \"$desired_out\"").unwrap();
+        writeln!(&mut script, "  fi").unwrap();
     }
     writeln!(&mut script, "  if [ -s \"$desired_rules\" ]; then").unwrap();
     writeln!(&mut script, "    iptables -w -F AMBER-ALLOW").unwrap();

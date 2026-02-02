@@ -1,6 +1,6 @@
-linker::export_unbound_slot
+linker::invalid_export
 
-  x export `api` on root component resolves to unbound slot `api`
+  x invalid export `api` on root component: target resolves to external slot `api`, which cannot be exported
    ,-[<CARGO_MANIFEST_DIR>/tests/ui/export_unbound_slot.json5:7:10]
  6 |   exports: {
  7 |     api: "api",
@@ -8,15 +8,5 @@ linker::export_unbound_slot
    :            `-- export declared here
  8 |   },
    `----
-  help: Bind the slot or export a provide/child export instead.
-
-Advice: 
-  > slot `api` declared on /
-   ,-[<CARGO_MANIFEST_DIR>/tests/ui/export_unbound_slot.json5:4:5]
- 3 |   slots: {
- 4 |     api: { kind: "http", optional: true },
-   :     ^|^
-   :      `-- slot declared here
- 5 |   },
-   `----
+  help: Export a component provide or child export instead.
 Error:   × check failed

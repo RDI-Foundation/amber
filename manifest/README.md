@@ -486,6 +486,7 @@ Framework capabilities are a fixed compiler-known list. **Today the list is empt
 `weak`:
 
 * `weak: true` marks a binding as **non-ordering**: it does not participate in dependency ordering or cycle detection (i.e. weak bindings cannot create a dependency cycle), similar to `Arc` vs `Weak` in Rust.
+* In the compiler, `weak` also means the consumer tolerates the provider being unavailable; unbound root slots whose entire binding chain is weak are treated as external inputs and routed through the per-scenario router.
 * This crate parses and preserves `weak`, but does not implement dependency ordering or cycle checks.
 
 ---

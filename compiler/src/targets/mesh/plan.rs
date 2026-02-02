@@ -5,7 +5,7 @@ use std::{
 };
 
 use amber_manifest::{CapabilityDecl, Manifest};
-use amber_scenario::{BindingFrom, ComponentId, ProvideRef, Scenario};
+use amber_scenario::{BindingFrom, ComponentId, Scenario};
 
 use crate::{DigestStore, manifest_table};
 
@@ -19,6 +19,7 @@ pub(crate) struct MeshPlan {
     pub(crate) manifests: Vec<Option<Arc<Manifest>>>,
     pub(crate) program_components: Vec<ComponentId>,
     pub(crate) bindings: Vec<ResolvedBinding>,
+    pub(crate) external_bindings: Vec<ResolvedExternalBinding>,
     pub(crate) exports: Vec<ResolvedExport>,
     pub(crate) strong_deps: HashMap<ComponentId, BTreeSet<ComponentId>>,
 }
@@ -40,6 +41,14 @@ pub(crate) struct ResolvedExport {
     pub(crate) provide: String,
     pub(crate) endpoint: EndpointInfo,
     pub(crate) capability: CapabilityDecl,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedExternalBinding {
+    pub(crate) consumer: ComponentId,
+    pub(crate) slot: String,
+    pub(crate) external_slot: String,
+    pub(crate) binding_name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -106,8 +115,9 @@ pub(crate) fn build_mesh_plan(
         .collect();
 
     for binding in &scenario.bindings {
-        let from = binding_from_component(&binding.from)?;
-        if scenario.component(from.component).program.is_none() {
+        if let BindingFrom::Component(from) = &binding.from
+            && scenario.component(from.component).program.is_none()
+        {
             return Err(MeshError::new(format!(
                 "binding source {}.{} is not runnable (component has no program)",
                 component_label(scenario, from.component),
@@ -151,18 +161,31 @@ pub(crate) fn build_mesh_plan(
             .insert(from.component);
     }
 
-    let mut bindings = Vec::with_capacity(scenario.bindings.len());
+    let mut bindings = Vec::new();
+    let mut external_bindings = Vec::new();
     for binding in &scenario.bindings {
-        let from = binding_from_component(&binding.from)?;
-        let endpoint = resolve_provide_endpoint(scenario, from.component, &from.name)?;
-        bindings.push(ResolvedBinding {
-            provider: from.component,
-            consumer: binding.to.component,
-            provide: from.name.clone(),
-            endpoint,
-            slot: binding.to.name.clone(),
-            binding_name: binding.name.clone(),
-        });
+        match &binding.from {
+            BindingFrom::Component(from) => {
+                let endpoint = resolve_provide_endpoint(scenario, from.component, &from.name)?;
+                bindings.push(ResolvedBinding {
+                    provider: from.component,
+                    consumer: binding.to.component,
+                    provide: from.name.clone(),
+                    endpoint,
+                    slot: binding.to.name.clone(),
+                    binding_name: binding.name.clone(),
+                });
+            }
+            BindingFrom::External(slot) => {
+                external_bindings.push(ResolvedExternalBinding {
+                    consumer: binding.to.component,
+                    slot: binding.to.name.clone(),
+                    external_slot: slot.name.clone(),
+                    binding_name: binding.name.clone(),
+                });
+            }
+            BindingFrom::Framework(_) => {}
+        }
     }
 
     let mut exports = Vec::with_capacity(scenario.exports.len());
@@ -181,6 +204,7 @@ pub(crate) fn build_mesh_plan(
         manifests,
         program_components,
         bindings,
+        external_bindings,
         exports,
         strong_deps,
     })
@@ -189,16 +213,6 @@ pub(crate) fn build_mesh_plan(
 pub(crate) fn component_label(scenario: &Scenario, id: ComponentId) -> String {
     scenario.component(id).moniker.as_str().to_string()
 }
-
-fn binding_from_component(from: &BindingFrom) -> Result<&ProvideRef, MeshError> {
-    match from {
-        BindingFrom::Component(provide) => Ok(provide),
-        BindingFrom::Framework(name) => Err(MeshError::new(format!(
-            "framework binding framework.{name} should be rejected before planning"
-        ))),
-    }
-}
-
 fn resolve_provide_endpoint(
     scenario: &Scenario,
     component_id: ComponentId,
