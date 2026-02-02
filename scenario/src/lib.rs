@@ -206,7 +206,7 @@ pub struct Component {
     /// Declared output provides (capability outputs).
     pub provides: BTreeMap<String, ProvideDecl>,
 
-    /// Optional free-form metadata from the manifest.
+    /// Optional user-defined metadata from the manifest.
     pub metadata: Option<Value>,
 
     /// Containment edges (component tree).

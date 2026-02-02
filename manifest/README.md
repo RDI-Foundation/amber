@@ -492,17 +492,17 @@ Framework capabilities are a fixed compiler-known list. **Today the list is empt
 
 ## `metadata`
 
-Optional free-form JSON value that Amber passes through to the Scenario IR without interpreting.
+Optional user-defined JSON value that Amber passes through to the Scenario IR without interpreting.
 Useful for application-specific data such as agent registry identifiers that downstream tools
 can discover by walking the IR graph.
 
 ```json5
 metadata: {
-  agentbeats_id: "...",
+  my_special_id: "...",
 }
 ```
 
-Amber does not validate or act on the contents. `metadata` is excluded from the manifest digest.
+Amber does not interpret the contents. `metadata` is excluded from the manifest digest.
 
 ---
 
