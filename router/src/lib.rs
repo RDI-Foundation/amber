@@ -268,7 +268,9 @@ fn join_url(base: &Url, uri: &Uri) -> Url {
     let req_path = uri.path();
     let joined = join_paths(base_path, req_path);
     out.set_path(&joined);
-    out.set_query(uri.query());
+    if out.query().is_none() {
+        out.set_query(uri.query());
+    }
     out
 }
 
@@ -349,6 +351,31 @@ mod tests {
         assert_eq!(join_paths("/v1", "/chat"), "/v1/chat");
         assert_eq!(join_paths("/v1/", "/chat"), "/v1/chat");
         assert_eq!(join_paths("/v1", "/"), "/v1");
+    }
+
+    #[test]
+    fn join_url_copies_request_query_when_base_has_none() {
+        let base = Url::parse("http://example.com/v1").expect("base url");
+        let uri: Uri = "/chat?model=gpt".parse().expect("request uri");
+        let out = join_url(&base, &uri);
+        assert_eq!(out.as_str(), "http://example.com/v1/chat?model=gpt");
+    }
+
+    #[test]
+    fn join_url_preserves_base_query_over_request_query() {
+        let base = Url::parse("http://example.com/v1?token=abc").expect("base url");
+        let uri: Uri = "/chat?model=gpt".parse().expect("request uri");
+        let out = join_url(&base, &uri);
+        assert_eq!(out.as_str(), "http://example.com/v1/chat?token=abc");
+    }
+
+    #[test]
+    fn join_url_preserves_empty_base_query() {
+        let base = Url::parse("http://example.com/v1?").expect("base url");
+        let uri: Uri = "/chat?model=gpt".parse().expect("request uri");
+        let out = join_url(&base, &uri);
+        assert_eq!(out.path(), "/v1/chat");
+        assert_eq!(out.query(), Some(""));
     }
 
     #[test]
