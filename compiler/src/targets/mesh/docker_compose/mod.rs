@@ -8,7 +8,7 @@ use amber_config as rc;
 use amber_images::{AMBER_HELPER, AMBER_ROUTER, AMBER_SIDECAR};
 use amber_scenario::{ComponentId, Scenario};
 use miette::LabeledSpan;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     CompileOutput,
@@ -53,6 +53,89 @@ impl Reporter for DockerComposeReporter {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct DockerComposeFile {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    volumes: BTreeMap<String, EmptyMap>,
+    services: BTreeMap<String, Service>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    networks: BTreeMap<String, Network>,
+    #[serde(rename = "x-amber", default, skip_serializing_if = "Option::is_none")]
+    x_amber: Option<AmberExtension>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct AmberExtension {
+    exports: BTreeMap<String, ExportMetadata>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct EmptyMap {}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct Network {
+    driver: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct Service {
+    image: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cap_add: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cap_drop: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    security_opt: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    networks: BTreeMap<String, EmptyMap>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entrypoint: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment: Option<Environment>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ports: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    volumes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depends_on: Option<DependsOn>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restart: Option<String>,
+}
+
+impl Service {
+    fn new(image: impl Into<String>) -> Self {
+        Self {
+            image: image.into(),
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum Environment {
+    List(Vec<String>),
+    Map(BTreeMap<String, String>),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum DependsOn {
+    List(Vec<String>),
+    Conditions(BTreeMap<String, DependsOnCondition>),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct DependsOnCondition {
+    condition: String,
+}
+
 #[derive(Clone, Debug)]
 struct ServiceNames {
     program: String,
@@ -66,7 +149,7 @@ struct SlotProxy {
     remote_port: u16,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ExportMetadata {
     published_host: String,
     published_port: u16,
@@ -498,8 +581,6 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     }
 
     // Compose YAML
-    let mut out = String::new();
-
     // ---- runtime config / helper decision ----
     let config_plan = crate::targets::mesh::config::build_config_plan(
         s,
@@ -538,70 +619,29 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     let program_plans = &config_plan.program_plans;
     let any_helper = config_plan.uses_helper;
 
-    // ---- YAML headers ----
-    if any_helper {
-        writeln!(&mut out, "volumes:").unwrap();
-        push_line(&mut out, 2, &format!("{HELPER_VOLUME_NAME}: {{}}"));
-    }
-
-    writeln!(&mut out, "services:").unwrap();
+    let mut compose = DockerComposeFile::default();
 
     if any_helper {
-        push_line(&mut out, 2, &format!("{HELPER_INIT_SERVICE}:"));
-        push_line(&mut out, 4, &format!("image: {}", yaml_str(HELPER_IMAGE)));
-        push_line(&mut out, 4, "entrypoint:");
-        push_line(&mut out, 6, &format!("- {}", yaml_str("/amber-helper")));
-        push_line(&mut out, 6, &format!("- {}", yaml_str("install")));
-        push_line(
-            &mut out,
-            6,
-            &format!("- {}", yaml_str(&format!("{HELPER_BIN_DIR}/amber-helper"))),
-        );
-        push_line(&mut out, 4, "volumes:");
-        push_line(
-            &mut out,
-            6,
-            &format!("- {}:{}", HELPER_VOLUME_NAME, HELPER_BIN_DIR),
-        );
-        push_line(&mut out, 4, &format!("restart: {}", yaml_str("no")));
+        compose
+            .volumes
+            .insert(HELPER_VOLUME_NAME.to_string(), EmptyMap::default());
+
+        let mut helper_init = Service::new(HELPER_IMAGE);
+        helper_init.entrypoint = Some(vec![
+            "/amber-helper".to_string(),
+            "install".to_string(),
+            format!("{HELPER_BIN_DIR}/amber-helper"),
+        ]);
+        helper_init
+            .volumes
+            .push(format!("{HELPER_VOLUME_NAME}:{HELPER_BIN_DIR}"));
+        helper_init.restart = Some("no".to_string());
+        compose
+            .services
+            .insert(HELPER_INIT_SERVICE.to_string(), helper_init);
     }
 
     if needs_router {
-        // ---- router sidecar ----
-        push_line(&mut out, 2, &format!("{}:", router_names.sidecar));
-        push_line(&mut out, 4, &format!("image: {}", yaml_str(SIDECAR_IMAGE)));
-        push_line(&mut out, 4, "cap_add:");
-        push_line(&mut out, 6, "- NET_ADMIN");
-        push_line(&mut out, 4, "cap_drop:");
-        push_line(&mut out, 6, "- ALL");
-        push_line(&mut out, 4, "security_opt:");
-        push_line(&mut out, 6, "- no-new-privileges:true");
-        push_line(&mut out, 4, "networks:");
-        push_line(&mut out, 6, &format!("{MESH_NETWORK_NAME}: {{}}"));
-
-        if !exports_by_name.is_empty() {
-            push_line(&mut out, 4, "ports:");
-            for (export_name, meta) in &exports_by_name {
-                let router_port = export_ports_by_name
-                    .get(export_name)
-                    .expect("router export port missing");
-                let spec = format!(
-                    "{}:{}:{}",
-                    meta.published_host, meta.published_port, router_port
-                );
-                push_line(&mut out, 6, &format!("- {}", yaml_str(&spec)));
-            }
-
-            let labels_json = serde_json::to_string(&exports_by_name)
-                .map_err(|err| format!("failed to serialize router export labels: {err}"))?;
-            push_line(&mut out, 4, "labels:");
-            push_line(
-                &mut out,
-                6,
-                &format!("amber.exports: {}", yaml_str(&labels_json)),
-            );
-        }
-
         let router_inbound: Vec<(u16, &BTreeSet<String>)> = router_inbound_allow
             .iter()
             .map(|(port, srcs)| (*port, srcs))
@@ -617,51 +657,54 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
             None,
             false,
         );
+        let router_script = escape_compose_interpolation(&router_script).into_owned();
 
-        push_line(&mut out, 4, "command:");
-        push_line(&mut out, 6, "- /bin/sh");
-        push_line(&mut out, 6, "- -lc");
-        push_line(&mut out, 6, "- |-");
-        for line in router_script.lines() {
-            let escaped = escape_compose_interpolation(line);
-            push_line(&mut out, 8, escaped.as_ref());
+        let mut router_sidecar = sidecar_service(router_script);
+        if !exports_by_name.is_empty() {
+            for (export_name, meta) in &exports_by_name {
+                let router_port = export_ports_by_name
+                    .get(export_name)
+                    .expect("router export port missing");
+                let spec = format!(
+                    "{}:{}:{}",
+                    meta.published_host, meta.published_port, router_port
+                );
+                router_sidecar.ports.push(spec);
+            }
+
+            let labels_json = serde_json::to_string(&exports_by_name)
+                .map_err(|err| format!("failed to serialize router export labels: {err}"))?;
+            router_sidecar
+                .labels
+                .insert("amber.exports".to_string(), labels_json);
         }
 
-        // ---- router program ----
-        push_line(&mut out, 2, &format!("{}:", router_names.program));
-        push_line(&mut out, 4, &format!("image: {}", yaml_str(ROUTER_IMAGE)));
-        push_line(
-            &mut out,
-            4,
-            &format!(
-                "network_mode: {}",
-                yaml_str(&format!("service:{}", router_names.sidecar))
-            ),
-        );
-        push_line(&mut out, 4, "environment:");
-        for entry in &router_env_passthrough {
-            push_line(&mut out, 6, &format!("- {}", yaml_str(entry)));
-        }
+        compose
+            .services
+            .insert(router_names.sidecar.clone(), router_sidecar);
+
+        let mut router_program = Service::new(ROUTER_IMAGE);
+        router_program.network_mode = Some(format!("service:{}", router_names.sidecar));
+
+        let mut env_entries = router_env_passthrough.clone();
         let router_config_b64 = router_config_b64
             .as_ref()
             .expect("router config should be computed");
-        push_line(
-            &mut out,
-            6,
-            &format!(
-                "- {}",
-                yaml_str(&format!("AMBER_ROUTER_CONFIG_B64={router_config_b64}"))
-            ),
+        env_entries.push(format!("AMBER_ROUTER_CONFIG_B64={router_config_b64}"));
+        router_program.environment = Some(Environment::List(env_entries));
+
+        let mut depends = BTreeMap::new();
+        depends.insert(
+            router_names.sidecar.clone(),
+            DependsOnCondition {
+                condition: "service_started".to_string(),
+            },
         );
-        push_line(&mut out, 4, "depends_on:");
-        push_line(
-            &mut out,
-            6,
-            &format!(
-                "{}: {{ condition: service_started }}",
-                yaml_str(&router_names.sidecar)
-            ),
-        );
+        router_program.depends_on = Some(DependsOn::Conditions(depends));
+
+        compose
+            .services
+            .insert(router_names.program.clone(), router_program);
     }
 
     // Emit services in stable (component id) order, sidecar then program.
@@ -669,23 +712,6 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         let c = s.component(*id);
         let svc = names.get(id).unwrap();
 
-        // ---- sidecar ----
-        push_line(&mut out, 2, &format!("{}:", svc.sidecar));
-
-        push_line(&mut out, 4, &format!("image: {}", yaml_str(SIDECAR_IMAGE)));
-
-        push_line(&mut out, 4, "cap_add:");
-        push_line(&mut out, 6, "- NET_ADMIN");
-        push_line(&mut out, 4, "cap_drop:");
-        push_line(&mut out, 6, "- ALL");
-        push_line(&mut out, 4, "security_opt:");
-        push_line(&mut out, 6, "- no-new-privileges:true");
-
-        // Attach sidecar to mesh network (Compose assigns IPs + DNS names).
-        push_line(&mut out, 4, "networks:");
-        push_line(&mut out, 6, &format!("{MESH_NETWORK_NAME}: {{}}"));
-
-        // Sidecar command script
         let script = build_sidecar_script(
             *id,
             inbound_allow
@@ -696,33 +722,14 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
             slot_proxies_by_component.get(id),
             true,
         );
-
-        push_line(&mut out, 4, "command:");
-        push_line(&mut out, 6, "- /bin/sh");
-        push_line(&mut out, 6, "- -lc");
-        push_line(&mut out, 6, "- |-");
-        for line in script.lines() {
-            let escaped = escape_compose_interpolation(line);
-            push_line(&mut out, 8, escaped.as_ref());
-        }
-
-        // ---- program ----
-        push_line(&mut out, 2, &format!("{}:", svc.program));
+        let script = escape_compose_interpolation(&script).into_owned();
+        compose
+            .services
+            .insert(svc.sidecar.clone(), sidecar_service(script));
 
         let program = c.program.as_ref().unwrap();
-        push_line(
-            &mut out,
-            4,
-            &format!("image: {}", yaml_str(program.image.as_ref())),
-        );
-        push_line(
-            &mut out,
-            4,
-            &format!(
-                "network_mode: {}",
-                yaml_str(&format!("service:{}", svc.sidecar))
-            ),
-        );
+        let mut program_service = Service::new(program.image.as_str());
+        program_service.network_mode = Some(format!("service:{}", svc.sidecar));
 
         // depends_on: own sidecar + strong deps provider programs (+ amber-init for helper-backed services)
         let program_plan = program_plans.get(id).expect("program plan computed");
@@ -747,35 +754,23 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 }
             }
         }
-        if !deps.is_empty() {
-            push_line(&mut out, 4, "depends_on:");
-            if any_helper {
-                for (name, cond) in deps {
-                    push_line(&mut out, 6, &format!("{name}:"));
-                    push_line(&mut out, 8, &format!("condition: {cond}"));
-                }
-            } else {
-                for (name, _) in deps {
-                    push_line(&mut out, 6, &format!("- {}", name));
-                }
-            }
-        }
+        program_service.depends_on = build_depends_on(any_helper, deps);
 
         match program_plan {
             ProgramPlan::Direct { entrypoint, env } => {
                 // Use entrypoint so image entrypoints are ignored.
-                push_line(&mut out, 4, "entrypoint:");
-                for a in entrypoint {
-                    let escaped = escape_compose_interpolation(a);
-                    push_line(&mut out, 6, &format!("- {}", yaml_str(escaped.as_ref())));
-                }
+                let entrypoint = entrypoint
+                    .iter()
+                    .map(|a| escape_compose_interpolation(a).into_owned())
+                    .collect::<Vec<_>>();
+                program_service.entrypoint = Some(entrypoint);
 
                 if !env.is_empty() {
-                    push_line(&mut out, 4, "environment:");
-                    for (k, v) in env {
-                        let escaped = escape_compose_interpolation(v);
-                        push_line(&mut out, 6, &format!("{k}: {}", yaml_str(escaped.as_ref())));
-                    }
+                    let env_map = env
+                        .iter()
+                        .map(|(k, v)| (k.clone(), escape_compose_interpolation(v).into_owned()))
+                        .collect::<BTreeMap<_, _>>();
+                    program_service.environment = Some(Environment::Map(env_map));
                 }
             }
             ProgramPlan::Helper {
@@ -793,111 +788,89 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 .map_err(|e| DockerComposeError::Other(e.to_string()))?;
 
                 // Mount helper binary and run it as PID1; it execs the program entrypoint.
-                push_line(&mut out, 4, "volumes:");
-                push_line(
-                    &mut out,
-                    6,
-                    &format!("- {}:{}:ro", HELPER_VOLUME_NAME, HELPER_BIN_DIR),
-                );
-                push_line(&mut out, 4, "entrypoint:");
-                push_line(&mut out, 6, &format!("- {}", yaml_str(HELPER_BIN_PATH)));
-                push_line(&mut out, 6, &format!("- {}", yaml_str("run")));
+                program_service
+                    .volumes
+                    .push(format!("{HELPER_VOLUME_NAME}:{HELPER_BIN_DIR}:ro"));
+                program_service.entrypoint =
+                    Some(vec![HELPER_BIN_PATH.to_string(), "run".to_string()]);
 
-                push_line(&mut out, 4, "environment:");
-                // Emit as list so pass-through entries can remain unset.
-                for entry in &root_env_entries {
-                    push_line(&mut out, 6, &format!("- {}", yaml_str(entry)));
-                }
-
+                let mut env_entries = root_env_entries.clone();
                 let root_schema_b64 = root_schema_b64.as_ref().expect("helper enabled");
-                push_line(
-                    &mut out,
-                    6,
-                    &format!(
-                        "- {}",
-                        yaml_str(&format!("AMBER_ROOT_CONFIG_SCHEMA_B64={root_schema_b64}"))
-                    ),
-                );
-                push_line(
-                    &mut out,
-                    6,
-                    &format!(
-                        "- {}",
-                        yaml_str(&format!(
-                            "AMBER_COMPONENT_CONFIG_SCHEMA_B64={}",
-                            payload.component_schema_b64
-                        ))
-                    ),
-                );
-                push_line(
-                    &mut out,
-                    6,
-                    &format!(
-                        "- {}",
-                        yaml_str(&format!(
-                            "AMBER_COMPONENT_CONFIG_TEMPLATE_B64={}",
-                            payload.component_cfg_template_b64
-                        ))
-                    ),
-                );
-                push_line(
-                    &mut out,
-                    6,
-                    &format!(
-                        "- {}",
-                        yaml_str(&format!(
-                            "AMBER_TEMPLATE_SPEC_B64={}",
-                            payload.template_spec_b64
-                        ))
-                    ),
-                );
+                env_entries.push(format!("AMBER_ROOT_CONFIG_SCHEMA_B64={root_schema_b64}"));
+                env_entries.push(format!(
+                    "AMBER_COMPONENT_CONFIG_SCHEMA_B64={}",
+                    payload.component_schema_b64
+                ));
+                env_entries.push(format!(
+                    "AMBER_COMPONENT_CONFIG_TEMPLATE_B64={}",
+                    payload.component_cfg_template_b64
+                ));
+                env_entries.push(format!(
+                    "AMBER_TEMPLATE_SPEC_B64={}",
+                    payload.template_spec_b64
+                ));
+                program_service.environment = Some(Environment::List(env_entries));
             }
         }
+
+        compose
+            .services
+            .insert(svc.program.clone(), program_service);
     }
 
-    // Networks
-    writeln!(&mut out, "networks:").unwrap();
-    push_line(&mut out, 2, &format!("{MESH_NETWORK_NAME}:"));
-    push_line(&mut out, 4, "driver: bridge");
+    compose.networks.insert(
+        MESH_NETWORK_NAME.to_string(),
+        Network {
+            driver: "bridge".to_string(),
+        },
+    );
 
     if !exports_by_name.is_empty() {
-        writeln!(&mut out, "x-amber:").unwrap();
-        push_line(&mut out, 2, "exports:");
-        for (export_name, meta) in &exports_by_name {
-            push_line(&mut out, 4, &format!("{}:", yaml_str(export_name)));
-            push_line(
-                &mut out,
-                6,
-                &format!("published_host: {}", yaml_str(&meta.published_host)),
-            );
-            push_line(
-                &mut out,
-                6,
-                &format!("published_port: {}", meta.published_port),
-            );
-            push_line(&mut out, 6, &format!("target_port: {}", meta.target_port));
-            push_line(
-                &mut out,
-                6,
-                &format!("component: {}", yaml_str(&meta.component)),
-            );
-            push_line(
-                &mut out,
-                6,
-                &format!("provide: {}", yaml_str(&meta.provide)),
-            );
-            push_line(
-                &mut out,
-                6,
-                &format!("endpoint: {}", yaml_str(&meta.endpoint)),
-            );
-        }
+        compose.x_amber = Some(AmberExtension {
+            exports: exports_by_name.clone(),
+        });
     }
 
-    Ok(out)
+    serde_yaml::to_string(&compose).map_err(|e| {
+        DockerComposeError::Other(format!("failed to serialize docker-compose yaml: {e}"))
+    })
 }
 
 // ---- helpers ----
+
+fn sidecar_service(script: String) -> Service {
+    let mut service = Service::new(SIDECAR_IMAGE);
+    service.cap_add = vec!["NET_ADMIN".to_string()];
+    service.cap_drop = vec!["ALL".to_string()];
+    service.security_opt = vec!["no-new-privileges:true".to_string()];
+    service
+        .networks
+        .insert(MESH_NETWORK_NAME.to_string(), EmptyMap::default());
+    service.command = Some(vec!["/bin/sh".to_string(), "-lc".to_string(), script]);
+    service
+}
+
+fn build_depends_on(any_helper: bool, deps: Vec<(String, &'static str)>) -> Option<DependsOn> {
+    if deps.is_empty() {
+        return None;
+    }
+    if any_helper {
+        let mut map = BTreeMap::new();
+        for (name, cond) in deps {
+            map.insert(
+                name,
+                DependsOnCondition {
+                    condition: cond.to_string(),
+                },
+            );
+        }
+        Some(DependsOn::Conditions(map))
+    } else {
+        Some(DependsOn::List(
+            deps.into_iter().map(|(name, _)| name).collect(),
+        ))
+    }
+}
 
 fn service_base_name(id: ComponentId, local_name: &str) -> String {
     // Ensure injective via numeric prefix; keep human-readable suffix.
@@ -1199,32 +1172,6 @@ fn build_sidecar_script(
     writeln!(&mut script, "exec tail -f /dev/null").unwrap();
 
     script
-}
-
-fn push_line(out: &mut String, indent: usize, line: &str) {
-    for _ in 0..indent {
-        out.push(' ');
-    }
-    out.push_str(line);
-    out.push('\n');
-}
-
-fn yaml_str(s: &str) -> String {
-    // Double-quoted YAML scalar with minimal escaping.
-    let mut out = String::new();
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(ch),
-        }
-    }
-    out.push('"');
-    out
 }
 
 fn escape_compose_interpolation<'a>(line: &'a str) -> Cow<'a, str> {

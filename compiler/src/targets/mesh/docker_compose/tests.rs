@@ -227,22 +227,48 @@ fn require_same_platform(images: &[(&str, String)]) -> String {
     first_platform.clone()
 }
 
-fn extract_compose_env_value(yaml: &str, key: &str) -> Option<String> {
-    let prefix = format!("{key}=");
-    for line in yaml.lines() {
-        let line = line.trim();
-        let Some(entry) = line.strip_prefix("- ") else {
-            continue;
-        };
-        let mut entry = entry.trim();
-        if entry.starts_with('"') && entry.ends_with('"') && entry.len() >= 2 {
-            entry = &entry[1..entry.len() - 1];
-        }
-        if let Some(value) = entry.strip_prefix(&prefix) {
-            return Some(value.to_string());
+fn parse_compose(yaml: &str) -> super::DockerComposeFile {
+    serde_yaml::from_str(yaml).expect("compose yaml should parse")
+}
+
+fn service<'a>(compose: &'a super::DockerComposeFile, name: &str) -> &'a super::Service {
+    compose
+        .services
+        .get(name)
+        .unwrap_or_else(|| panic!("service {name} missing"))
+}
+
+fn env_value(service: &super::Service, key: &str) -> Option<String> {
+    let env = service.environment.as_ref()?;
+    match env {
+        super::Environment::Map(map) => map.get(key).cloned(),
+        super::Environment::List(list) => {
+            let prefix = format!("{key}=");
+            list.iter().find_map(|entry| {
+                if entry == key {
+                    Some(String::new())
+                } else {
+                    entry.strip_prefix(&prefix).map(|v| v.to_string())
+                }
+            })
         }
     }
-    None
+}
+
+fn command_script(service: &super::Service) -> Option<&str> {
+    service
+        .command
+        .as_ref()
+        .and_then(|cmd| cmd.last())
+        .map(|s| s.as_str())
+}
+
+fn extract_compose_env_value(yaml: &str, key: &str) -> Option<String> {
+    let compose = parse_compose(yaml);
+    compose
+        .services
+        .values()
+        .find_map(|svc| env_value(svc, key))
 }
 
 #[test]
@@ -333,41 +359,46 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
     let yaml = DockerComposeReporter
         .emit(&output)
         .expect("compose render ok");
+    let compose = parse_compose(&yaml);
 
     // Service names should be injective and include sidecars.
-    assert!(yaml.contains("c1-server-net:"), "{yaml}");
-    assert!(yaml.contains("c1-server:"), "{yaml}");
-    assert!(yaml.contains("c2-client-net:"), "{yaml}");
-    assert!(yaml.contains("c2-client:"), "{yaml}");
+    assert!(compose.services.contains_key("c1-server-net"), "{yaml}");
+    assert!(compose.services.contains_key("c1-server"), "{yaml}");
+    assert!(compose.services.contains_key("c2-client-net"), "{yaml}");
+    assert!(compose.services.contains_key("c2-client"), "{yaml}");
 
     // Program uses sidecar netns.
-    assert!(
-        yaml.contains(r#"network_mode: "service:c2-client-net""#),
-        "{yaml}"
+    assert_eq!(
+        service(&compose, "c2-client").network_mode.as_deref(),
+        Some("service:c2-client-net")
     );
 
     // Sidecar image should be pulled from GHCR.
-    assert!(
-        yaml.contains(&format!(r#"image: "{SIDECAR_IMAGE}""#)),
-        "{yaml}"
-    );
+    assert_eq!(service(&compose, "c1-server-net").image, SIDECAR_IMAGE);
 
     // Compose should not pin static IPs or subnets.
     assert!(!yaml.contains("ipv4_address:"), "{yaml}");
     assert!(!yaml.contains("ipam:"), "{yaml}");
 
     // Server sidecar should allow inbound from client on 8080 via DNS resolution.
-    assert!(yaml.contains(r#"resolve_ipv4 "c2-client-net""#), "{yaml}");
+    let server_sidecar_script =
+        command_script(service(&compose, "c1-server-net")).expect("server sidecar command script");
+    assert!(server_sidecar_script.contains(r#"resolve_ipv4 "c2-client-net""#));
     assert!(
-        yaml.contains(r#"add_rule "-s $$ip/32 -p tcp -m tcp --dport 8080 -j ACCEPT""#),
-        "{yaml}"
+        server_sidecar_script
+            .contains(r#"add_rule "-s $$ip/32 -p tcp -m tcp --dport 8080 -j ACCEPT""#)
     );
 
     // Sidecar proxies should target DNS names, not static IPs.
-    assert!(yaml.contains("TCP:c1-server-net:8080"), "{yaml}");
+    let client_sidecar_script =
+        command_script(service(&compose, "c2-client-net")).expect("client sidecar command script");
+    assert!(client_sidecar_script.contains("TCP:c1-server-net:8080"));
 
     // Slot URL should be rendered with local proxy port base (20000).
-    assert!(yaml.contains(r#"URL: "http://127.0.0.1:20000""#), "{yaml}");
+    assert_eq!(
+        env_value(service(&compose, "c2-client"), "URL").as_deref(),
+        Some("http://127.0.0.1:20000")
+    );
 }
 
 #[test]
@@ -402,8 +433,18 @@ fn compose_escapes_entrypoint_dollars() {
     let yaml = DockerComposeReporter
         .emit(&output)
         .expect("compose render ok");
+    let compose = parse_compose(&yaml);
 
-    assert!(yaml.contains(r#"- "echo $$API_URL""#), "{yaml}");
+    let service = compose
+        .services
+        .values()
+        .find(|svc| svc.image == "alpine:3.20")
+        .expect("program service should exist");
+    let entrypoint = service
+        .entrypoint
+        .as_ref()
+        .expect("entrypoint should exist");
+    assert!(entrypoint.iter().any(|arg| arg == "echo $$API_URL"));
 }
 
 #[test]
@@ -550,15 +591,17 @@ fn compose_resolves_binding_urls_in_child_config() {
     let yaml = DockerComposeReporter
         .emit(&output)
         .expect("compose render ok");
+    let compose = parse_compose(&yaml);
 
     assert!(
-        yaml.contains(r#"BIND_URL: "http://127.0.0.1:20000""#),
-        "{yaml}"
+        compose
+            .services
+            .values()
+            .any(|svc| { env_value(svc, "BIND_URL").as_deref() == Some("http://127.0.0.1:20000") })
     );
-    assert!(
-        yaml.contains(r#"UPSTREAM_URL: "http://127.0.0.1:20000""#),
-        "{yaml}"
-    );
+    assert!(compose.services.values().any(|svc| {
+        env_value(svc, "UPSTREAM_URL").as_deref() == Some("http://127.0.0.1:20000")
+    }));
     assert!(
         !yaml.contains("AMBER_COMPONENT_CONFIG_TEMPLATE_B64"),
         "{yaml}"
@@ -763,11 +806,11 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
     let yaml = DockerComposeReporter
         .emit(&output)
         .expect("compose render ok");
+    let compose = parse_compose(&yaml);
 
-    assert!(
-        yaml.contains(r#"UPSTREAM_URL: "http://127.0.0.1:20000""#),
-        "{yaml}"
-    );
+    assert!(compose.services.values().any(|svc| {
+        env_value(svc, "UPSTREAM_URL").as_deref() == Some("http://127.0.0.1:20000")
+    }));
     assert!(
         !yaml.contains("AMBER_COMPONENT_CONFIG_TEMPLATE_B64"),
         "{yaml}"
@@ -836,19 +879,36 @@ fn compose_emits_export_metadata_and_labels() {
     let yaml = DockerComposeReporter
         .emit(&output)
         .expect("compose render ok");
+    let compose = parse_compose(&yaml);
 
-    assert!(yaml.contains("x-amber:"), "{yaml}");
-    assert!(yaml.contains(r#"exports:"#), "{yaml}");
-    assert!(yaml.contains(r#""public":"#), "{yaml}");
-    assert!(yaml.contains(r#"published_host: "127.0.0.1""#), "{yaml}");
-    assert!(yaml.contains("published_port: 18000"), "{yaml}");
-    assert!(yaml.contains("target_port: 8080"), "{yaml}");
-    assert!(yaml.contains(r#"component: "/server""#), "{yaml}");
-    assert!(yaml.contains(r#"provide: "api""#), "{yaml}");
-    assert!(yaml.contains(r#"endpoint: "api""#), "{yaml}");
-    assert!(yaml.contains("127.0.0.1:18000:22000"), "{yaml}");
-    assert!(yaml.contains(r#"amber.exports: "{\"public\""#), "{yaml}");
-    assert!(yaml.contains(r#"\"published_port\":18000"#), "{yaml}");
+    let exports = compose
+        .x_amber
+        .as_ref()
+        .expect("x-amber should be present")
+        .exports
+        .get("public")
+        .expect("public export should exist");
+    assert_eq!(exports.published_host, "127.0.0.1");
+    assert_eq!(exports.published_port, 18000);
+    assert_eq!(exports.target_port, 8080);
+    assert_eq!(exports.component, "/server");
+    assert_eq!(exports.provide, "api");
+    assert_eq!(exports.endpoint, "api");
+
+    let router_sidecar = service(&compose, "amber-router-net");
+    assert!(
+        router_sidecar
+            .ports
+            .iter()
+            .any(|p| p == "127.0.0.1:18000:22000")
+    );
+    let labels_json = router_sidecar
+        .labels
+        .get("amber.exports")
+        .expect("router export labels missing");
+    let labels_value: serde_json::Value =
+        serde_json::from_str(labels_json).expect("labels should be json");
+    assert_eq!(labels_value["public"]["published_port"], 18000);
 }
 
 #[test]
@@ -912,12 +972,20 @@ fn compose_routes_external_slots_through_router() {
     let yaml = DockerComposeReporter
         .emit(&output)
         .expect("compose render ok");
+    let compose = parse_compose(&yaml);
 
-    assert!(yaml.contains("amber-router-net"), "{yaml}");
-    assert!(yaml.contains("AMBER_EXTERNAL_SLOT_API_URL"), "{yaml}");
+    assert!(compose.services.contains_key("amber-router-net"));
     assert!(
-        yaml.contains(r#"API_URL: "http://127.0.0.1:20000""#),
-        "{yaml}"
+        compose
+            .services
+            .values()
+            .any(|svc| env_value(svc, "AMBER_EXTERNAL_SLOT_API_URL").is_some())
+    );
+    assert!(
+        compose
+            .services
+            .values()
+            .any(|svc| { env_value(svc, "API_URL").as_deref() == Some("http://127.0.0.1:20000") })
     );
 
     let b64 =

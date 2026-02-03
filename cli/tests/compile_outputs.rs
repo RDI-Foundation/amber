@@ -2,6 +2,7 @@ use std::{fs, path::Path, process::Command};
 
 use amber_images::AMBER_SIDECAR;
 use serde_json::Value;
+use serde_yaml::Value as YamlValue;
 
 #[test]
 fn compile_writes_primary_output_and_dot_artifact() {
@@ -138,8 +139,17 @@ fn compile_writes_primary_output_and_dot_artifact() {
         compose_contents.contains("services:"),
         "docker compose output missing services section"
     );
+    let compose_yaml: YamlValue =
+        serde_yaml::from_str(&compose_contents).expect("docker compose output invalid yaml");
+    let services = compose_yaml
+        .get("services")
+        .and_then(YamlValue::as_mapping)
+        .expect("compose services should be a map");
+    let has_sidecar_image = services.values().any(|service| {
+        service.get("image").and_then(YamlValue::as_str) == Some(AMBER_SIDECAR.reference)
+    });
     assert!(
-        compose_contents.contains(&format!(r#"image: "{ref}""#, ref = AMBER_SIDECAR.reference)),
+        has_sidecar_image,
         "docker compose output missing sidecar image"
     );
 }
