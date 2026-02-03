@@ -5,6 +5,7 @@ use std::{
 };
 
 use amber_config as rc;
+use amber_images::{AMBER_HELPER, AMBER_ROUTER, AMBER_SIDECAR};
 use amber_scenario::{ComponentId, Scenario};
 use miette::LabeledSpan;
 use serde::Serialize;
@@ -26,9 +27,9 @@ use crate::{
 
 const MESH_NETWORK_NAME: &str = "amber_mesh";
 
-const SIDECAR_IMAGE: &str = "ghcr.io/rdi-foundation/amber-sidecar:main";
-const HELPER_IMAGE: &str = "ghcr.io/rdi-foundation/amber-helper:v1";
-const ROUTER_IMAGE: &str = "ghcr.io/rdi-foundation/amber-router:v1";
+const SIDECAR_IMAGE: &str = AMBER_SIDECAR.reference;
+const HELPER_IMAGE: &str = AMBER_HELPER.reference;
+const ROUTER_IMAGE: &str = AMBER_ROUTER.reference;
 const ROUTER_SERVICE_NAME: &str = "amber-router";
 const HELPER_VOLUME_NAME: &str = "amber-helper-bin";
 const HELPER_INIT_SERVICE: &str = "amber-init";

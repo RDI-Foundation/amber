@@ -29,6 +29,7 @@ COPY cli/Cargo.toml cli/
 COPY config/Cargo.toml config/
 COPY compiler/Cargo.toml compiler/
 COPY helper/Cargo.toml helper/
+COPY images/Cargo.toml images/
 COPY json5/Cargo.toml json5/
 COPY manifest/Cargo.toml manifest/
 COPY router/Cargo.toml router/
@@ -37,15 +38,16 @@ COPY scenario/Cargo.toml scenario/
 COPY template/Cargo.toml template/
 COPY node/Cargo.toml node/
 
-RUN mkdir -p cli/src config/src compiler/src helper/src json5/src manifest/src router/src resolver/src scenario/src template/src node/src && \
-    touch cli/src/main.rs config/src/lib.rs compiler/src/lib.rs helper/src/main.rs json5/src/lib.rs manifest/src/lib.rs router/src/main.rs resolver/src/lib.rs scenario/src/lib.rs template/src/lib.rs node/src/main.rs
+RUN mkdir -p cli/src config/src compiler/src helper/src images/src json5/src manifest/src router/src resolver/src scenario/src template/src node/src && \
+    touch cli/src/main.rs config/src/lib.rs compiler/src/lib.rs helper/src/main.rs images/src/lib.rs json5/src/lib.rs manifest/src/lib.rs router/src/main.rs resolver/src/lib.rs scenario/src/lib.rs template/src/lib.rs node/src/main.rs
 RUN cargo fetch --locked
-RUN rm -rf cli/src config/src compiler/src helper/src json5/src manifest/src router/src resolver/src scenario/src template/src node/src
+RUN rm -rf cli/src config/src compiler/src helper/src images/src json5/src manifest/src router/src resolver/src scenario/src template/src node/src
 
 COPY cli ./cli
 COPY config ./config
 COPY compiler ./compiler
 COPY helper ./helper
+COPY images ./images
 COPY json5 ./json5
 COPY manifest ./manifest
 COPY router ./router
@@ -53,6 +55,7 @@ COPY resolver ./resolver
 COPY scenario ./scenario
 COPY template ./template
 COPY node ./node
+COPY docker/images.json docker/images.json
 
 RUN target=$(cat /tmp/rust-target) && \
     cargo build -p amber-helper --release --locked --target "${target}" && \

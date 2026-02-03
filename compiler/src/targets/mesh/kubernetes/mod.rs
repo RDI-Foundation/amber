@@ -6,6 +6,7 @@ use std::{
 };
 
 use amber_config as rc;
+use amber_images::{AMBER_HELPER, AMBER_ROUTER};
 use amber_scenario::{ComponentId, Scenario};
 pub use resources::*;
 use serde::Serialize;
@@ -29,11 +30,11 @@ use crate::{
 // an init container installs the amber-helper binary into a shared volume, then the
 // main container uses the helper as its entrypoint to resolve config templates and
 // exec the actual program.
-const HELPER_IMAGE: &str = "ghcr.io/rdi-foundation/amber-helper:v1";
+const HELPER_IMAGE: &str = AMBER_HELPER.reference;
 const HELPER_VOLUME_NAME: &str = "amber-helper";
 const HELPER_BIN_DIR: &str = "/amber/bin";
 const HELPER_BIN_PATH: &str = "/amber/bin/amber-helper";
-const ROUTER_IMAGE: &str = "ghcr.io/rdi-foundation/amber-router:v1";
+const ROUTER_IMAGE: &str = AMBER_ROUTER.reference;
 const ROUTER_NAME: &str = "amber-router";
 const ROUTER_EXTERNAL_SECRET_NAME: &str = "amber-router-external";
 const ROUTER_EXTERNAL_PORT_BASE: u16 = 21000;

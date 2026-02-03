@@ -1,0 +1,11 @@
+[package]
+name = "amber-images"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+
+[build-dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

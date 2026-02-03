@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 amber-config = { workspace = true }
+amber-images = { workspace = true }
 amber-manifest = { workspace = true }
 amber-resolver = { workspace = true }
 amber-scenario = { workspace = true }

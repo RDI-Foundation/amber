@@ -58,53 +58,44 @@ jobs:
       - name: Test Kubernetes external slot routing with KinD
         run: cargo test -p amber-compiler --all-features kubernetes_smoke_external_slot_routes_to_outside_service -- --ignored --test-threads=1
 
+  image-matrix:
+    name: Image Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      build_matrix: ${{ steps.matrix.outputs.build_matrix }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build image matrix
+        id: matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          matrix=$(jq -c '{
+            include: [
+              .images[] as $img |
+              ($img.arches // ["amd64", "arm64"])[] as $arch |
+              {
+                image: $img.name,
+                context: $img.context,
+                file: $img.dockerfile,
+                arch: $arch,
+                runner: (if $arch == "arm64" then "ubuntu-24.04-arm" else "ubuntu-latest" end)
+              }
+            ]
+          }' docker/images.json)
+          echo "build_matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   docker-build:
     name: Build Docker Images (${{ matrix.image }} ${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     if: github.event_name == 'pull_request'
+    needs: image-matrix
     permissions:
       contents: read
       packages: write
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - image: amber-cli
-            context: .
-            file: Dockerfile
-            cache_scope: amber-pr-${{ github.event.pull_request.number }}
-            runner: ubuntu-latest
-            arch: amd64
-          - image: amber-cli
-            context: .
-            file: Dockerfile
-            cache_scope: amber-pr-${{ github.event.pull_request.number }}
-            runner: ubuntu-24.04-arm
-            arch: arm64
-          - image: amber-sidecar
-            context: docker/amber-sidecar
-            file: docker/amber-sidecar/Dockerfile
-            cache_scope: amber-sidecar-pr-${{ github.event.pull_request.number }}
-            runner: ubuntu-latest
-            arch: amd64
-          - image: amber-sidecar
-            context: docker/amber-sidecar
-            file: docker/amber-sidecar/Dockerfile
-            cache_scope: amber-sidecar-pr-${{ github.event.pull_request.number }}
-            runner: ubuntu-24.04-arm
-            arch: arm64
-          - image: amber-helper
-            context: .
-            file: docker/amber-helper/Dockerfile
-            cache_scope: amber-helper-pr-${{ github.event.pull_request.number }}
-            runner: ubuntu-latest
-            arch: amd64
-          - image: amber-helper
-            context: .
-            file: docker/amber-helper/Dockerfile
-            cache_scope: amber-helper-pr-${{ github.event.pull_request.number }}
-            runner: ubuntu-24.04-arm
-            arch: arm64
+      matrix: ${{ fromJSON(needs.image-matrix.outputs.build_matrix) }}
     steps:
       - uses: actions/checkout@v5
       - name: Compute image registry (lowercase owner for GHCR)
@@ -134,18 +125,19 @@ jobs:
           tags: ${{ steps.registry.outputs.image_registry }}/${{ matrix.image }}:${{ github.sha }}-${{ matrix.arch }}
           cache-from: |
             type=gha,scope=refs/heads/main-${{ matrix.image }}-${{ matrix.arch }}
-            type=gha,scope=${{ matrix.cache_scope }}-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}-${{ matrix.arch }}
+            type=gha,scope=${{ matrix.image }}-pr-${{ github.event.pull_request.number }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-pr-${{ github.event.pull_request.number }}-${{ matrix.arch }}
 
   docker-merge:
     name: Create Multi-Arch Manifests
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
-    needs: docker-build
+    needs: [image-matrix, docker-build]
     permissions:
       contents: read
       packages: write
     steps:
+      - uses: actions/checkout@v5
       - name: Compute image registry (lowercase owner for GHCR)
         id: registry
         shell: bash
@@ -155,30 +147,31 @@ jobs:
           image_registry="ghcr.io/${owner_lc}"
           echo "image_registry=${image_registry}" >> "$GITHUB_OUTPUT"
           echo "IMAGE_REGISTRY=${image_registry}" >> "$GITHUB_ENV"
+      - name: List images
+        id: images
+        shell: bash
+        run: |
+          set -euo pipefail
+          images=$(jq -r --arg reg "$IMAGE_REGISTRY" '.images[].name | "\($reg)/\(.)"' docker/images.json)
+          {
+            echo "images<<EOF"
+            echo "$images"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Create amber-cli manifest
+      - name: Create multi-arch manifests
         run: |
           set -euo pipefail
-          docker buildx imagetools create \
-            -t "${IMAGE_REGISTRY}/amber-cli:${{ github.sha }}" \
-            "${IMAGE_REGISTRY}/amber-cli:${{ github.sha }}-amd64" \
-            "${IMAGE_REGISTRY}/amber-cli:${{ github.sha }}-arm64"
-      - name: Create amber-sidecar manifest
-        run: |
-          set -euo pipefail
-          docker buildx imagetools create \
-            -t "${IMAGE_REGISTRY}/amber-sidecar:${{ github.sha }}" \
-            "${IMAGE_REGISTRY}/amber-sidecar:${{ github.sha }}-amd64" \
-            "${IMAGE_REGISTRY}/amber-sidecar:${{ github.sha }}-arm64"
-      - name: Create amber-helper manifest
-        run: |
-          set -euo pipefail
-          docker buildx imagetools create \
-            -t "${IMAGE_REGISTRY}/amber-helper:${{ github.sha }}" \
-            "${IMAGE_REGISTRY}/amber-helper:${{ github.sha }}-amd64" \
-            "${IMAGE_REGISTRY}/amber-helper:${{ github.sha }}-arm64"
+          images="${{ steps.images.outputs.images }}"
+          while read -r image; do
+            [ -z "$image" ] && continue
+            docker buildx imagetools create \
+              -t "${image}:${{ github.sha }}" \
+              "${image}:${{ github.sha }}-amd64" \
+              "${image}:${{ github.sha }}-arm64"
+          done <<< "$images"

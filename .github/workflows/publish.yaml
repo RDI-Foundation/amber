@@ -8,55 +8,55 @@ on:
       - "v*"
 
 jobs:
+  image-matrix:
+    name: Image Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      build_matrix: ${{ steps.matrix.outputs.build_matrix }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build image matrix
+        id: matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          matrix=$(jq -c '{
+            include: [
+              .images[] as $img |
+              ($img.arches // ["amd64", "arm64"])[] as $arch |
+              {
+                image: $img.name,
+                context: $img.context,
+                file: $img.dockerfile,
+                arch: $arch,
+                runner: (if $arch == "arm64" then "ubuntu-24.04-arm" else "ubuntu-latest" end)
+              }
+            ]
+          }' docker/images.json)
+          echo "build_matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   build-push:
     name: Build and Push (${{ matrix.image }} ${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    needs: image-matrix
     permissions:
       contents: read
       packages: write
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - image: amber-cli
-            context: .
-            file: Dockerfile
-            runner: ubuntu-latest
-            arch: amd64
-          - image: amber-cli
-            context: .
-            file: Dockerfile
-            runner: ubuntu-24.04-arm
-            arch: arm64
-          - image: amber-sidecar
-            context: docker/amber-sidecar
-            file: docker/amber-sidecar/Dockerfile
-            runner: ubuntu-latest
-            arch: amd64
-          - image: amber-sidecar
-            context: docker/amber-sidecar
-            file: docker/amber-sidecar/Dockerfile
-            runner: ubuntu-24.04-arm
-            arch: arm64
-          - image: amber-helper
-            context: .
-            file: docker/amber-helper/Dockerfile
-            runner: ubuntu-latest
-            arch: amd64
-          - image: amber-helper
-            context: .
-            file: docker/amber-helper/Dockerfile
-            runner: ubuntu-24.04-arm
-            arch: arm64
+      matrix: ${{ fromJSON(needs.image-matrix.outputs.build_matrix) }}
     steps:
       - uses: actions/checkout@v5
-      - name: Compute image registry (lowercase owner for GHCR)
+      - name: Read image registry
         id: registry
         shell: bash
         run: |
           set -euo pipefail
-          owner_lc="$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
-          image_registry="ghcr.io/${owner_lc}"
+          image_registry="$(jq -r '.registry' docker/images.json)"
+          if [ -z "$image_registry" ] || [ "$image_registry" = "null" ]; then
+            echo "docker/images.json registry is missing" >&2
+            exit 1
+          fi
           echo "image_registry=${image_registry}" >> "$GITHUB_OUTPUT"
           echo "IMAGE_REGISTRY=${image_registry}" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@v3
@@ -100,14 +100,90 @@ jobs:
       contents: read
       packages: write
     steps:
-      - name: Compute image registry (lowercase owner for GHCR)
+      - uses: actions/checkout@v5
+      - name: Read image registry
         id: registry
         shell: bash
         run: |
           set -euo pipefail
-          owner_lc="$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
-          image_registry="ghcr.io/${owner_lc}"
+          image_registry="$(jq -r '.registry' docker/images.json)"
+          if [ -z "$image_registry" ] || [ "$image_registry" = "null" ]; then
+            echo "docker/images.json registry is missing" >&2
+            exit 1
+          fi
           echo "image_registry=${image_registry}" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_REGISTRY=${image_registry}" >> "$GITHUB_ENV"
+      - name: List images
+        id: images
+        shell: bash
+        run: |
+          set -euo pipefail
+          images=$(jq -r --arg reg "$IMAGE_REGISTRY" '.images[].name | "\($reg)/\(.)"' docker/images.json)
+          {
+            echo "images<<EOF"
+            echo "$images"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Configure tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.images.outputs.images }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
+      - name: Publish multi-arch manifests
+        run: |
+          set -euo pipefail
+          tags="${{ steps.meta.outputs.tags }}"
+          while read -r tag; do
+            [ -z "$tag" ] && continue
+            docker buildx imagetools create -t "$tag" "${tag}-amd64" "${tag}-arm64"
+          done <<< "$tags"
+      - name: Publish floating tags
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          floating=$(jq -c '.images[] | {name, tags: ([.code_tag] + (.floating_tags // [])) | map(select(. != null)) | unique} | select(.tags | length > 0)' docker/images.json)
+          while IFS= read -r entry; do
+            name=$(jq -r '.name' <<< "$entry")
+            for tag in $(jq -r '.tags[]' <<< "$entry"); do
+              if [ "$tag" = "main" ]; then
+                continue
+              fi
+              docker buildx imagetools create \
+                -t "${IMAGE_REGISTRY}/${name}:${tag}" \
+                "${IMAGE_REGISTRY}/${name}:main"
+            done
+          done <<< "$floating"
+
+  verify-image-tags:
+    name: Verify Internal Image Tags
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    needs: merge-manifests
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v5
+      - name: Read image registry
+        id: registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_registry="$(jq -r '.registry' docker/images.json)"
+          if [ -z "$image_registry" ] || [ "$image_registry" = "null" ]; then
+            echo "docker/images.json registry is missing" >&2
+            exit 1
+          fi
           echo "IMAGE_REGISTRY=${image_registry}" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
@@ -115,57 +191,21 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Configure cli tags
-        id: cli_meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ steps.registry.outputs.image_registry }}/amber-cli
-          tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=sha
-      - name: Publish amber-cli manifests
+      - name: Verify tags exist
+        shell: bash
         run: |
           set -euo pipefail
-          tags="${{ steps.cli_meta.outputs.tags }}"
-          while read -r tag; do
-            [ -z "$tag" ] && continue
-            docker buildx imagetools create -t "$tag" "${tag}-amd64" "${tag}-arm64"
+          tags=$(jq -r '.images[] | .name as $name | ([.code_tag] + (.floating_tags // [])) | map(select(. != null)) | unique | .[] | "\($name):\(.)"' docker/images.json)
+          missing=0
+          while read -r spec; do
+            [ -z "$spec" ] && continue
+            image="${IMAGE_REGISTRY}/${spec}"
+            if ! docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
+              echo "::error::Missing image tag ${image}"
+              missing=1
+            fi
           done <<< "$tags"
-      - name: Configure sidecar tags
-        id: sidecar_meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ steps.registry.outputs.image_registry }}/amber-sidecar
-          tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=sha
-      - name: Publish amber-sidecar manifests
-        run: |
-          set -euo pipefail
-          tags="${{ steps.sidecar_meta.outputs.tags }}"
-          while read -r tag; do
-            [ -z "$tag" ] && continue
-            docker buildx imagetools create -t "$tag" "${tag}-amd64" "${tag}-arm64"
-          done <<< "$tags"
-      - name: Configure helper tags
-        id: helper_meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ steps.registry.outputs.image_registry }}/amber-helper
-          tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=sha
-      - name: Publish amber-helper manifests
-        run: |
-          set -euo pipefail
-          tags="${{ steps.helper_meta.outputs.tags }}"
-          while read -r tag; do
-            [ -z "$tag" ] && continue
-            docker buildx imagetools create -t "$tag" "${tag}-amd64" "${tag}-arm64"
-          done <<< "$tags"
+          exit "$missing"
 
   cli-artifacts:
     name: Build amber-cli artifacts (${{ matrix.platform }})

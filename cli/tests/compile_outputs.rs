@@ -1,5 +1,6 @@
 use std::{fs, path::Path, process::Command};
 
+use amber_images::AMBER_SIDECAR;
 use serde_json::Value;
 
 #[test]
@@ -138,7 +139,7 @@ fn compile_writes_primary_output_and_dot_artifact() {
         "docker compose output missing services section"
     );
     assert!(
-        compose_contents.contains(r#"image: "ghcr.io/rdi-foundation/amber-sidecar:main""#),
+        compose_contents.contains(&format!(r#"image: "{ref}""#, ref = AMBER_SIDECAR.reference)),
         "docker compose output missing sidecar image"
     );
 }

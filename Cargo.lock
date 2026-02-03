@@ -51,6 +51,7 @@ name = "amber-cli"
 version = "0.1.0"
 dependencies = [
  "amber-compiler",
+ "amber-images",
  "amber-manifest",
  "amber-resolver",
  "clap",
@@ -71,6 +72,7 @@ name = "amber-compiler"
 version = "0.1.0"
 dependencies = [
  "amber-config",
+ "amber-images",
  "amber-manifest",
  "amber-resolver",
  "amber-scenario",
@@ -110,6 +112,14 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.17",
+]
+
+[[package]]
+name = "amber-images"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
