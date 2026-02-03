@@ -57,6 +57,7 @@ dependencies = [
  "clap",
  "miette",
  "serde_json",
+ "serde_yaml",
  "similar",
  "strip-ansi-escapes",
  "tempfile",

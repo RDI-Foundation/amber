@@ -5,6 +5,7 @@ use miette::{Diagnostic, LabeledSpan, NamedSource, Severity};
 use crate::CompileOutput;
 
 pub mod dot;
+pub mod metadata;
 pub mod scenario_ir;
 
 pub use docker_compose::DockerComposeReporter;

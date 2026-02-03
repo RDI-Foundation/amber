@@ -12,6 +12,7 @@ use amber_compiler::{
         docker_compose::DockerComposeReporter,
         dot::DotReporter,
         kubernetes::{KubernetesReporter, KubernetesReporterConfig},
+        metadata::MetadataReporter,
         scenario_ir::ScenarioIrReporter,
     },
 };
@@ -67,6 +68,10 @@ struct CompileArgs {
         allow_hyphen_values = true
     )]
     docker_compose: Option<PathBuf>,
+
+    /// Write component metadata (moniker -> metadata JSON) to this path, or `-` for stdout.
+    #[arg(long = "metadata", value_name = "FILE", allow_hyphen_values = true)]
+    metadata: Option<PathBuf>,
 
     /// Write a manifest bundle to this directory.
     #[arg(long = "bundle", value_name = "DIR")]
@@ -205,6 +210,16 @@ async fn compile(args: CompileArgs) -> Result<()> {
         };
         let artifact = reporter.emit(&output).map_err(miette::Report::new)?;
         write_kubernetes_output(&kubernetes_dest, &artifact)?;
+    }
+
+    if let Some(metadata_dest) = outputs.metadata {
+        let metadata = MetadataReporter
+            .emit(&output)
+            .map_err(miette::Report::new)?;
+        match metadata_dest {
+            ArtifactOutput::Stdout => print!("{metadata}"),
+            ArtifactOutput::File(path) => write_artifact(&path, metadata.as_bytes())?,
+        }
     }
 
     if let Some(bundle_root) = resolve_bundle_root(&args)? {
@@ -476,6 +491,7 @@ struct OutputPaths {
     primary: Option<PathBuf>,
     dot: Option<ArtifactOutput>,
     docker_compose: Option<ArtifactOutput>,
+    metadata: Option<ArtifactOutput>,
     kubernetes: Option<PathBuf>,
 }
 
@@ -483,6 +499,7 @@ fn ensure_outputs_requested(args: &CompileArgs) -> Result<()> {
     if args.output.is_some()
         || args.dot.is_some()
         || args.docker_compose.is_some()
+        || args.metadata.is_some()
         || args.bundle.is_some()
         || args.kubernetes.is_some()
     {
@@ -491,7 +508,7 @@ fn ensure_outputs_requested(args: &CompileArgs) -> Result<()> {
 
     Err(miette::miette!(
         help = "Request at least one output with `--output`, `--dot`, `--docker-compose`, \
-                `--kubernetes`, or `--bundle`.",
+                `--metadata`, `--kubernetes`, or `--bundle`.",
         "no outputs requested for `amber compile`"
     ))
 }
@@ -500,6 +517,7 @@ fn resolve_output_paths(args: &CompileArgs) -> Result<OutputPaths> {
     let primary = args.output.clone();
     let dot = resolve_optional_output(&args.dot);
     let docker_compose = resolve_optional_output(&args.docker_compose);
+    let metadata = resolve_optional_output(&args.metadata);
     let kubernetes = args.kubernetes.clone();
 
     if let (Some(primary_path), Some(ArtifactOutput::File(dot_path))) =
@@ -522,6 +540,16 @@ fn resolve_output_paths(args: &CompileArgs) -> Result<OutputPaths> {
         ));
     }
 
+    if let (Some(primary_path), Some(ArtifactOutput::File(metadata_path))) =
+        (primary.as_ref(), metadata.as_ref())
+        && metadata_path == primary_path
+    {
+        return Err(miette::miette!(
+            "metadata output path `{}` must not match the primary output path",
+            metadata_path.display()
+        ));
+    }
+
     if let (Some(ArtifactOutput::File(dot_path)), Some(ArtifactOutput::File(compose_path))) =
         (dot.as_ref(), docker_compose.as_ref())
         && dot_path == compose_path
@@ -532,10 +560,31 @@ fn resolve_output_paths(args: &CompileArgs) -> Result<OutputPaths> {
         ));
     }
 
+    if let (Some(ArtifactOutput::File(dot_path)), Some(ArtifactOutput::File(metadata_path))) =
+        (dot.as_ref(), metadata.as_ref())
+        && dot_path == metadata_path
+    {
+        return Err(miette::miette!(
+            "dot output path `{}` must not match metadata output path",
+            dot_path.display()
+        ));
+    }
+
+    if let (Some(ArtifactOutput::File(compose_path)), Some(ArtifactOutput::File(metadata_path))) =
+        (docker_compose.as_ref(), metadata.as_ref())
+        && compose_path == metadata_path
+    {
+        return Err(miette::miette!(
+            "docker compose output path `{}` must not match metadata output path",
+            compose_path.display()
+        ));
+    }
+
     Ok(OutputPaths {
         primary,
         dot,
         docker_compose,
+        metadata,
         kubernetes,
     })
 }
