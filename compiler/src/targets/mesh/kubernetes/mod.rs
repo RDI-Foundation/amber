@@ -13,16 +13,11 @@ use serde::Serialize;
 
 use crate::{
     CompileOutput,
-    binding_query::BindingObject,
     reporter::{Reporter, ReporterError},
-    slot_query::SlotObject,
     targets::mesh::{
+        addressing::{Addressing, RouterPortBases, WorkloadId, build_address_plan},
         config::{ProgramPlan, encode_helper_payload, encode_schema_b64},
         plan::{MeshOptions, component_label},
-        router_config::{
-            RouterConfig, RouterExport, RouterExternalSlot, allocate_external_slot_ports,
-            build_router_external_slots, encode_router_config_b64,
-        },
     },
 };
 
@@ -70,6 +65,66 @@ impl Reporter for KubernetesReporter {
     fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError> {
         render_kubernetes(output, &self.config)
     }
+}
+
+struct KubernetesAddressing<'a> {
+    scenario: &'a Scenario,
+    names: &'a HashMap<ComponentId, ComponentNames>,
+    namespace: &'a str,
+}
+
+impl Addressing for KubernetesAddressing<'_> {
+    type Extra = ();
+    type Error = crate::targets::mesh::plan::MeshError;
+
+    fn resolve_binding_url(
+        &mut self,
+        binding: &crate::targets::mesh::plan::ResolvedBinding,
+    ) -> Result<String, Self::Error> {
+        let endpoint_port = binding.endpoint.port;
+        if binding.provider == binding.consumer {
+            return Ok(format!("http://127.0.0.1:{endpoint_port}"));
+        }
+        let provider_names = self.names.get(&binding.provider).ok_or_else(|| {
+            Self::Error::new(format!(
+                "internal error: missing names for provider {}",
+                component_label(self.scenario, binding.provider)
+            ))
+        })?;
+        Ok(format!(
+            "http://{}.{}.svc.cluster.local:{}",
+            provider_names.service, self.namespace, endpoint_port
+        ))
+    }
+
+    fn resolve_external_binding_url(
+        &mut self,
+        _binding: &crate::targets::mesh::plan::ResolvedExternalBinding,
+        router_port: u16,
+    ) -> Result<String, Self::Error> {
+        Ok(format!(
+            "http://{}.{}.svc.cluster.local:{}",
+            ROUTER_NAME, self.namespace, router_port
+        ))
+    }
+
+    fn resolve_export_target_url(
+        &mut self,
+        export: &crate::targets::mesh::plan::ResolvedExport,
+    ) -> Result<String, Self::Error> {
+        let provider_names = self.names.get(&export.provider).ok_or_else(|| {
+            Self::Error::new(format!(
+                "internal error: missing names for export provider {}",
+                component_label(self.scenario, export.provider)
+            ))
+        })?;
+        Ok(format!(
+            "http://{}.{}.svc.cluster.local:{}",
+            provider_names.service, self.namespace, export.endpoint.port
+        ))
+    }
+
+    fn finalize(self) -> Self::Extra {}
 }
 
 // ---- Internal types ----
@@ -152,127 +207,68 @@ fn render_kubernetes(
             },
         );
     }
-    let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
-
-    // Build slot values and binding values for each component (resolved URLs to services).
-    let mut slot_values_by_component: HashMap<ComponentId, BTreeMap<String, SlotObject>> =
-        HashMap::new();
-    let mut binding_values_by_component: HashMap<ComponentId, BTreeMap<String, BindingObject>> =
-        HashMap::new();
-    for id in program_components {
-        slot_values_by_component.insert(*id, BTreeMap::new());
-        binding_values_by_component.insert(*id, BTreeMap::new());
-    }
-
-    // Track inbound allowlist: provider -> set of (consumer_component, port)
-    let mut inbound_allow: HashMap<ComponentId, Vec<(ComponentId, u16)>> = HashMap::new();
-    let mut router_inbound_allow: BTreeMap<u16, Vec<ComponentId>> = BTreeMap::new();
-    let mut router_export_allow: HashMap<ComponentId, BTreeSet<u16>> = HashMap::new();
-    let mut egress_allow: HashMap<ComponentId, BTreeMap<ComponentId, BTreeSet<u16>>> =
-        HashMap::new();
-    let mut egress_router_allow: HashMap<ComponentId, BTreeSet<u16>> = HashMap::new();
-
-    for binding in &mesh_plan.bindings {
-        let provider = binding.provider;
-        let consumer = binding.consumer;
-        let endpoint_port = binding.endpoint.port;
-        let provider_names = names.get(&provider).ok_or_else(|| {
-            ReporterError::new(format!(
-                "internal error: missing names for provider {}",
-                component_label(s, provider)
-            ))
-        })?;
-
-        let url = if provider == consumer {
-            // Self-reference: use localhost
-            format!("http://127.0.0.1:{}", endpoint_port)
-        } else {
-            // Slot resolves to Kubernetes service DNS.
-            format!(
-                "http://{}.{}.svc.cluster.local:{}",
-                provider_names.service, namespace, endpoint_port
-            )
-        };
-
-        slot_values_by_component
-            .entry(consumer)
-            .or_default()
-            .insert(binding.slot.clone(), SlotObject { url: url.clone() });
-
-        if let Some(name) = binding.binding_name.as_ref() {
-            binding_values_by_component
-                .entry(consumer)
-                .or_default()
-                .insert(name.clone(), BindingObject { url });
-        }
-
-        // Track for NetworkPolicy
-        if provider != consumer {
-            inbound_allow
-                .entry(provider)
-                .or_default()
-                .push((consumer, endpoint_port));
-            egress_allow
-                .entry(consumer)
-                .or_default()
-                .entry(provider)
-                .or_default()
-                .insert(endpoint_port);
-        }
-    }
-
     let root_manifest = manifests[s.root.0]
         .as_ref()
         .expect("root manifest should exist");
 
-    let external_slot_ports =
-        allocate_external_slot_ports(&mesh_plan.external_bindings, ROUTER_EXTERNAL_PORT_BASE)
-            .map_err(ReporterError::new)?;
+    let addressing = KubernetesAddressing {
+        scenario: s,
+        names: &names,
+        namespace: &namespace,
+    };
+    let address_plan = build_address_plan(
+        &mesh_plan,
+        root_manifest,
+        RouterPortBases {
+            external: ROUTER_EXTERNAL_PORT_BASE,
+            export: ROUTER_EXPORT_PORT_BASE,
+        },
+        addressing,
+    )
+    .map_err(|e| ReporterError::new(e.to_string()))?;
+    let needs_router = address_plan.router.needs_router;
 
-    for binding in &mesh_plan.external_bindings {
-        let consumer = binding.consumer;
-        let router_port = *external_slot_ports
-            .get(&binding.external_slot)
-            .ok_or_else(|| {
-                ReporterError::new(format!(
-                    "missing router port for external slot {}",
-                    binding.external_slot
-                ))
-            })?;
+    let mut egress_allow: HashMap<ComponentId, BTreeMap<ComponentId, BTreeSet<u16>>> =
+        HashMap::new();
+    let mut egress_router_allow: HashMap<ComponentId, BTreeSet<u16>> = HashMap::new();
 
-        let url = format!(
-            "http://{}.{}.svc.cluster.local:{}",
-            ROUTER_NAME, namespace, router_port
-        );
-
-        slot_values_by_component
-            .entry(consumer)
-            .or_default()
-            .insert(binding.slot.clone(), SlotObject { url: url.clone() });
-
-        if let Some(name) = binding.binding_name.as_ref() {
-            binding_values_by_component
-                .entry(consumer)
-                .or_default()
-                .insert(name.clone(), BindingObject { url });
+    for (provider, by_port) in &address_plan.allow.by_provider {
+        match provider {
+            WorkloadId::Component(provider_id) => {
+                for (port, consumers) in by_port {
+                    for consumer in consumers {
+                        if let WorkloadId::Component(consumer_id) = consumer {
+                            egress_allow
+                                .entry(*consumer_id)
+                                .or_default()
+                                .entry(*provider_id)
+                                .or_default()
+                                .insert(*port);
+                        }
+                    }
+                }
+            }
+            WorkloadId::Router => {
+                for (port, consumers) in by_port {
+                    for consumer in consumers {
+                        if let WorkloadId::Component(consumer_id) = consumer {
+                            egress_router_allow
+                                .entry(*consumer_id)
+                                .or_default()
+                                .insert(*port);
+                        }
+                    }
+                }
+            }
         }
-
-        router_inbound_allow
-            .entry(router_port)
-            .or_default()
-            .push(consumer);
-        egress_router_allow
-            .entry(consumer)
-            .or_default()
-            .insert(router_port);
     }
 
     let config_plan = crate::targets::mesh::config::build_config_plan(
         s,
         manifests,
         program_components,
-        &slot_values_by_component,
-        &binding_values_by_component,
+        &address_plan.slot_values_by_component,
+        &address_plan.binding_values_by_component,
     )
     .map_err(|e| ReporterError::new(e.to_string()))?;
     let root_schema = config_plan.root_schema.as_ref();
@@ -322,59 +318,16 @@ fn render_kubernetes(
     let program_plans = &config_plan.program_plans;
     let any_helper = config_plan.uses_helper;
 
-    let mut export_ports_by_name: BTreeMap<String, u16> = BTreeMap::new();
-    let mut router_export_ports: BTreeSet<u16> = BTreeSet::new();
-    if !mesh_plan.exports.is_empty() {
-        let mut next_port = ROUTER_EXPORT_PORT_BASE;
-        for ex in &mesh_plan.exports {
-            let listen_port = next_port;
-            next_port = next_port
-                .checked_add(1)
-                .ok_or_else(|| ReporterError::new("ran out of router export ports".to_string()))?;
-            export_ports_by_name.insert(ex.name.clone(), listen_port);
-            router_export_ports.insert(listen_port);
-            router_export_allow
-                .entry(ex.provider)
-                .or_default()
-                .insert(ex.endpoint.port);
-        }
-    }
-
-    let mut router_external_slots: Vec<RouterExternalSlot> = Vec::new();
-    let mut router_exports: Vec<RouterExport> = Vec::new();
-    let mut router_config_b64: Option<String> = None;
-    let mut router_env_passthrough: Vec<String> = Vec::new();
+    let export_ports_by_name = &address_plan.router.export_ports_by_name;
+    let router_export_ports = &address_plan.router.export_ports;
+    let router_external_slots = &address_plan.router.router_external_slots;
+    let router_exports = &address_plan.router.router_exports;
+    let router_env_passthrough = &address_plan.router.router_env_passthrough;
+    let router_config_b64 = &address_plan.router.router_config_b64;
     let mut router_container_ports: Vec<ContainerPort> = Vec::new();
     let mut router_service_ports: Vec<ServicePort> = Vec::new();
 
     if needs_router {
-        router_external_slots = build_router_external_slots(root_manifest, &external_slot_ports);
-        router_env_passthrough = router_external_slots
-            .iter()
-            .map(|slot| slot.url_env.clone())
-            .collect();
-
-        for ex in &mesh_plan.exports {
-            let listen_port = *export_ports_by_name.get(&ex.name).ok_or_else(|| {
-                ReporterError::new(format!("missing router port for export {}", ex.name))
-            })?;
-            let provider_names = names.get(&ex.provider).ok_or_else(|| {
-                ReporterError::new(format!(
-                    "missing names for export provider {}",
-                    component_label(s, ex.provider)
-                ))
-            })?;
-            let target_url = format!(
-                "http://{}.{}.svc.cluster.local:{}",
-                provider_names.service, namespace, ex.endpoint.port
-            );
-            router_exports.push(RouterExport {
-                name: ex.name.clone(),
-                listen_port,
-                target_url,
-            });
-        }
-
         for (idx, slot) in router_external_slots.iter().enumerate() {
             let name = format!("ext-{}", idx + 1);
             router_container_ports.push(ContainerPort {
@@ -404,15 +357,6 @@ fn render_kubernetes(
                 protocol: "TCP",
             });
         }
-
-        let router_config = RouterConfig {
-            external_slots: router_external_slots.clone(),
-            exports: router_exports.clone(),
-        };
-        let b64 = encode_router_config_b64(&router_config).map_err(|err| {
-            ReporterError::new(format!("failed to serialize router config: {err}"))
-        })?;
-        router_config_b64 = Some(b64);
     }
 
     // Build kustomization (will be populated at the end if helper mode is used).
@@ -487,7 +431,7 @@ fn render_kubernetes(
 
         let mut env_content = String::new();
         env_content.push_str("# Router external slot URLs - fill in values before deploying\n");
-        for env_var in &router_env_passthrough {
+        for env_var in router_env_passthrough {
             env_content.push_str(&format!("{env_var}=\n"));
         }
         files.insert(PathBuf::from("router-external.env"), env_content);
@@ -885,66 +829,51 @@ fn render_kubernetes(
 
         let mut netpol = NetworkPolicy::new(&cnames.netpol, &namespace, labels, pod_selector);
 
-        // Add ingress rules for bound consumers.
-        if let Some(allowed) = inbound_allow.get(id) {
-            // Group by port.
-            let mut by_port: BTreeMap<u16, Vec<ComponentId>> = BTreeMap::new();
-            for (consumer, port) in allowed {
-                by_port.entry(*port).or_default().push(*consumer);
-            }
-
-            for (port, consumers) in by_port {
+        // Add ingress rules for bound consumers + router exports.
+        if let Some(allowed) = address_plan.allow.for_component(*id) {
+            for (port, consumers) in allowed {
                 let from: Vec<NetworkPolicyPeer> = consumers
                     .iter()
-                    .map(|cid| {
-                        let consumer_names = names.get(cid).unwrap();
-                        NetworkPolicyPeer {
+                    .map(|consumer| match consumer {
+                        WorkloadId::Component(cid) => {
+                            let consumer_names = names.get(cid).unwrap();
+                            NetworkPolicyPeer {
+                                pod_selector: Some(LabelSelector {
+                                    match_labels: {
+                                        let mut m = BTreeMap::new();
+                                        m.insert(
+                                            "amber.io/component".to_string(),
+                                            consumer_names.service.clone(),
+                                        );
+                                        m
+                                    },
+                                }),
+                                namespace_selector: None,
+                                ip_block: None,
+                            }
+                        }
+                        WorkloadId::Router => NetworkPolicyPeer {
                             pod_selector: Some(LabelSelector {
-                                match_labels: {
-                                    let mut m = BTreeMap::new();
-                                    m.insert(
-                                        "amber.io/component".to_string(),
-                                        consumer_names.service.clone(),
-                                    );
-                                    m
-                                },
+                                match_labels: router_selector.clone(),
                             }),
                             namespace_selector: None,
                             ip_block: None,
-                        }
+                        },
                     })
                     .collect();
+
+                if from.is_empty() {
+                    continue;
+                }
 
                 netpol.add_ingress_rule(NetworkPolicyIngressRule {
                     from,
                     ports: vec![NetworkPolicyPort {
                         protocol: "TCP",
-                        port,
+                        port: *port,
                     }],
                 });
             }
-        }
-
-        if needs_router
-            && let Some(ports) = router_export_allow.get(id)
-            && !ports.is_empty()
-        {
-            netpol.add_ingress_rule(NetworkPolicyIngressRule {
-                from: vec![NetworkPolicyPeer {
-                    pod_selector: Some(LabelSelector {
-                        match_labels: router_selector.clone(),
-                    }),
-                    namespace_selector: None,
-                    ip_block: None,
-                }],
-                ports: ports
-                    .iter()
-                    .map(|port| NetworkPolicyPort {
-                        protocol: "TCP",
-                        port: *port,
-                    })
-                    .collect(),
-            });
         }
 
         let egress_from_consumers = egress_allow.get(id);
@@ -1032,39 +961,46 @@ fn render_kubernetes(
             router_selector.clone(),
         );
 
-        for (port, consumers) in &router_inbound_allow {
-            let mut unique = BTreeSet::new();
-            let mut from = Vec::new();
-            for consumer in consumers {
-                if !unique.insert(*consumer) {
+        if let Some(allowed) = address_plan.allow.for_router() {
+            for (port, consumers) in allowed {
+                let from: Vec<NetworkPolicyPeer> = consumers
+                    .iter()
+                    .filter_map(|consumer| match consumer {
+                        WorkloadId::Component(cid) => {
+                            let consumer_names = names
+                                .get(cid)
+                                .expect("router consumer should be a runnable component");
+                            Some(NetworkPolicyPeer {
+                                pod_selector: Some(LabelSelector {
+                                    match_labels: {
+                                        let mut m = BTreeMap::new();
+                                        m.insert(
+                                            "amber.io/component".to_string(),
+                                            consumer_names.service.clone(),
+                                        );
+                                        m
+                                    },
+                                }),
+                                namespace_selector: None,
+                                ip_block: None,
+                            })
+                        }
+                        WorkloadId::Router => None,
+                    })
+                    .collect();
+
+                if from.is_empty() {
                     continue;
                 }
-                let consumer_names = names
-                    .get(consumer)
-                    .expect("router consumer should be a runnable component");
-                from.push(NetworkPolicyPeer {
-                    pod_selector: Some(LabelSelector {
-                        match_labels: {
-                            let mut m = BTreeMap::new();
-                            m.insert(
-                                "amber.io/component".to_string(),
-                                consumer_names.service.clone(),
-                            );
-                            m
-                        },
-                    }),
-                    namespace_selector: None,
-                    ip_block: None,
+
+                netpol.add_ingress_rule(NetworkPolicyIngressRule {
+                    from,
+                    ports: vec![NetworkPolicyPort {
+                        protocol: "TCP",
+                        port: *port,
+                    }],
                 });
             }
-
-            netpol.add_ingress_rule(NetworkPolicyIngressRule {
-                from,
-                ports: vec![NetworkPolicyPort {
-                    protocol: "TCP",
-                    port: *port,
-                }],
-            });
         }
 
         if !router_export_ports.is_empty() {
@@ -1144,7 +1080,7 @@ fn render_kubernetes(
     }
 
     let mut external_slot_metadata: BTreeMap<String, ExternalSlotMetadata> = BTreeMap::new();
-    for slot_name in external_slot_ports.keys() {
+    for slot_name in address_plan.router.external_slot_ports.keys() {
         let decl = root_manifest
             .slots()
             .get(slot_name.as_str())
