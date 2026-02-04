@@ -40,12 +40,12 @@ jobs:
       - run: cargo test -p amber-compiler --all-features docker_smoke_ocap_blocks_unbound_callers -- --ignored --test-threads=1
       - run: cargo test -p amber-compiler --all-features docker_smoke_config_forwarding_runtime_validation -- --ignored --test-threads=1
       - run: cargo test -p amber-compiler --all-features docker_smoke_external_slot_routes_to_outside_service -- --ignored --test-threads=1
+      - run: cargo test -p amber-compiler --all-features docker_smoke_export_routes_to_host -- --ignored --test-threads=1
       - run: cargo test -p amber-helper --all-features helper_image_executes_run_plan_in_scratch -- --ignored --test-threads=1
 
   kubernetes-tests:
     name: Kubernetes Reporter Tests
     runs-on: ubuntu-latest
-    continue-on-error: true
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
@@ -53,10 +53,26 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Ensure KinD is available
+        run: |
+          if ! command -v kind >/dev/null 2>&1; then
+            curl -fsSL -o /tmp/kind https://kind.sigs.k8s.io/dl/v0.22.0/kind-linux-amd64
+            chmod +x /tmp/kind
+            sudo mv /tmp/kind /usr/local/bin/kind
+          fi
+      - name: Ensure kubectl is available
+        run: |
+          if ! command -v kubectl >/dev/null 2>&1; then
+            curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            chmod +x /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+          fi
       - name: Test Kubernetes reporter with KinD
         run: cargo test -p amber-compiler --all-features kubernetes_smoke_config_roundtrip -- --ignored --test-threads=1
       - name: Test Kubernetes external slot routing with KinD
         run: cargo test -p amber-compiler --all-features kubernetes_smoke_external_slot_routes_to_outside_service -- --ignored --test-threads=1
+      - name: Test Kubernetes export routing with KinD
+        run: cargo test -p amber-compiler --all-features kubernetes_smoke_export_routes_to_host -- --ignored --test-threads=1
 
   image-matrix:
     name: Image Matrix

@@ -94,7 +94,7 @@ fn compile_writes_primary_output_and_dot_artifact() {
         .expect("child program should be an object");
     assert_eq!(
         child_program.get("image").and_then(Value::as_str),
-        Some("example/child")
+        Some("busybox:stable")
     );
     let child_slots = child_component["slots"]
         .as_object()

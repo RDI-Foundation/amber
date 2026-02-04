@@ -1,6 +1,8 @@
 use std::{
     collections::BTreeMap,
     fs,
+    io::{Read, Write},
+    net::TcpStream,
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
@@ -261,6 +263,17 @@ fn command_script(service: &super::Service) -> Option<&str> {
         .as_ref()
         .and_then(|cmd| cmd.last())
         .map(|s| s.as_str())
+}
+
+fn http_get(host: &str, port: u16) -> std::io::Result<String> {
+    let mut stream = TcpStream::connect((host, port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes())?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
 }
 
 fn extract_compose_env_value(yaml: &str, key: &str) -> Option<String> {
@@ -1238,6 +1251,163 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
 }
 
 #[test]
+#[ignore = "requires docker + docker compose; run manually"]
+fn docker_smoke_export_routes_to_host() {
+    use tempfile::tempdir;
+
+    struct ComposeGuard {
+        project: PathBuf,
+    }
+
+    impl ComposeGuard {
+        fn new(project: &Path) -> Self {
+            Self {
+                project: project.to_path_buf(),
+            }
+        }
+    }
+
+    impl Drop for ComposeGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("docker")
+                .current_dir(&self.project)
+                .arg("compose")
+                .args([
+                    "down",
+                    "-v",
+                    "--remove-orphans",
+                    "--rmi",
+                    "local",
+                    "--timeout",
+                    "1",
+                ])
+                .status();
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let project = dir.path();
+    let sidecar_platform = build_sidecar_image();
+    let router_platform = build_router_image();
+    let platform = require_same_platform(&[
+        (SIDECAR_IMAGE, sidecar_platform),
+        (ROUTER_IMAGE, router_platform),
+    ]);
+    ensure_image_platform("busybox:1.36.1", &platform);
+
+    let server_program = serde_json::from_value(json!({
+        "image": "busybox:1.36.1",
+        "args": ["sh", "-lc", "mkdir -p /www && echo export-ok > /www/index.html && httpd -f -p 8080 -h /www"],
+        "network": { "endpoints": [ { "name": "api", "port": 8080, "protocol": "http" } ] }
+    }))
+    .unwrap();
+
+    let provide_http: ProvideDecl = serde_json::from_value(json!({
+        "kind": "http",
+        "endpoint": "api"
+    }))
+    .unwrap();
+    let export_capability = provide_http.decl.clone();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        metadata: None,
+        children: vec![ComponentId(1)],
+    };
+
+    let server = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/server"),
+        digest: digest(1),
+        config: None,
+        program: Some(server_program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(server)],
+        bindings: vec![],
+        exports: vec![ScenarioExport {
+            name: "public".to_string(),
+            capability: export_capability,
+            from: ProvideRef {
+                component: ComponentId(1),
+                name: "api".to_string(),
+            },
+        }],
+    };
+
+    let output = compile_output(scenario);
+    let yaml = DockerComposeReporter
+        .emit(&output)
+        .expect("compose render ok");
+    let compose = parse_compose(&yaml);
+
+    let export = compose
+        .x_amber
+        .as_ref()
+        .expect("x-amber should be present")
+        .exports
+        .get("public")
+        .expect("public export should exist");
+    let published_port = export.published_port;
+    let published_host = if export.published_host == "0.0.0.0" {
+        "127.0.0.1".to_string()
+    } else {
+        export.published_host.clone()
+    };
+
+    fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
+
+    let _compose_guard = ComposeGuard::new(project);
+    let status = Command::new("docker")
+        .current_dir(project)
+        .arg("compose")
+        .args(["up", "-d"])
+        .status()
+        .unwrap();
+    assert!(status.success(), "docker compose up failed");
+
+    let mut ok = false;
+    for _ in 0..30 {
+        if let Ok(response) = http_get(&published_host, published_port) {
+            if response.contains("export-ok") {
+                ok = true;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    if !ok {
+        let compose_logs = Command::new("docker")
+            .current_dir(project)
+            .arg("compose")
+            .args(["logs", "--no-color"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_else(|err| format!("failed to capture compose logs: {err}"));
+        panic!(
+            "export not reachable from host via router \
+             ({published_host}:{published_port})\ncompose logs:\n{}",
+            compose_logs
+        );
+    }
+}
+
+#[test]
 fn errors_on_shared_port_with_different_endpoints() {
     let server_program = serde_json::from_value(json!({
         "image": "alpine:3.20",
@@ -1577,7 +1747,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         "c2-allowed",
         "sh",
         "-lc",
-        r#"i=0; while [ $i -lt 10 ]; do if wget -qO- --timeout=1 --tries=1 "$URL" 2>/dev/null | grep -q hello; then exit 0; fi; i=$((i+1)); sleep 1; done; exit 1"#,
+        r#"i=0; while [ $i -lt 6 ]; do if wget -qO- --timeout=1 --tries=1 "$URL" 2>/dev/null | grep -q hello; then exit 0; fi; i=$((i+1)); sleep 1; done; exit 1"#,
     ])
     .output()
     .unwrap();
@@ -1616,28 +1786,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         panic!("allowed client could not reach server via binding\n{debug}");
     }
 
-    // Allowed should reach the public internet (example.com). If Docker itself can't reach a
-    // public IP, skip the external check to avoid false failures in restricted environments.
-    let docker_public_ok = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "alpine:3.20",
-            "sh",
-            "-lc",
-            r#"wget -qO- --timeout=2 --tries=1 "http://1.1.1.1/" >/dev/null 2>&1"#,
-        ])
-        .status()
-        .ok()
-        .is_some_and(|status| status.success());
-    if docker_public_ok {
-        let external = compose(&[
-            "exec",
-            "-T",
-            "c2-allowed",
-            "sh",
-            "-lc",
-            r#"
+    let external_check_script = r#"retries="${RETRIES:-5}"
 is_private_ip() {
   ip="$1"
   case "$ip" in
@@ -1661,28 +1810,51 @@ fi
 
 if [ -n "$ip" ] && is_private_ip "$ip"; then
   echo "example.com resolved to private $ip; checking public IP instead" 1>&2
-  i=0; while [ $i -lt 10 ]; do
+  i=0; while [ $i -lt "$retries" ]; do
     if wget -qO- --timeout=2 --tries=1 "http://1.1.1.1/" >/dev/null 2>&1; then exit 0; fi
     i=$((i+1)); sleep 1
   done
   exit 1
 fi
 
-i=0; while [ $i -lt 10 ]; do
+i=0; while [ $i -lt "$retries" ]; do
   if wget -qO- --timeout=2 --tries=1 "http://example.com/" >/dev/null 2>&1; then exit 0; fi
   i=$((i+1)); sleep 1
 done
 echo "example.com fetch failed; checking public IP instead" 1>&2
-i=0; while [ $i -lt 10 ]; do
+i=0; while [ $i -lt "$retries" ]; do
   if wget -qO- --timeout=2 --tries=1 "http://1.1.1.1/" >/dev/null 2>&1; then exit 0; fi
   i=$((i+1)); sleep 1
 done
 exit 1
-"#,
+"#;
+
+    // Allowed should reach the public internet (example.com). If Docker itself can't reach a
+    // public IP, skip the external check to avoid false failures in restricted environments.
+    let docker_public_ok = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "alpine:3.20",
+            "sh",
+            "-lc",
+            r#"wget -qO- --timeout=2 --tries=1 "http://1.1.1.1/" >/dev/null 2>&1"#,
+        ])
+        .status()
+        .ok()
+        .is_some_and(|status| status.success());
+    if docker_public_ok {
+        let fast_external = compose(&[
+            "exec",
+            "-T",
+            "c2-allowed",
+            "sh",
+            "-lc",
+            &format!("RETRIES=1\n{external_check_script}"),
         ])
         .output()
         .unwrap();
-        if !external.status.success() {
+        if !fast_external.status.success() {
             let iptables_output =
                 dump(&["exec", "-T", "c2-allowed-net", "sh", "-lc", "iptables -S"]);
             let output_accept = iptables_output.contains("-P OUTPUT ACCEPT");
@@ -1698,22 +1870,34 @@ exit 1
                     "skipping external egress assertion: OUTPUT is ACCEPT and no global \
                      drop/reject rules"
                 );
-                return;
-            }
-            let debug = format!(
-                "external stdout:\n{}\nexternal stderr:\n{}\n\nallowed sidecar:\n{}",
-                String::from_utf8_lossy(&external.stdout),
-                String::from_utf8_lossy(&external.stderr),
-                dump(&[
+            } else {
+                let external = compose(&[
                     "exec",
                     "-T",
-                    "c2-allowed-net",
+                    "c2-allowed",
                     "sh",
                     "-lc",
-                    "ip -4 addr && iptables -S && cat /etc/resolv.conf"
+                    &format!("RETRIES=5\n{external_check_script}"),
                 ])
-            );
-            panic!("allowed client could not reach example.com\n{debug}");
+                .output()
+                .unwrap();
+                if !external.status.success() {
+                    let debug = format!(
+                        "external stdout:\n{}\nexternal stderr:\n{}\n\nallowed sidecar:\n{}",
+                        String::from_utf8_lossy(&external.stdout),
+                        String::from_utf8_lossy(&external.stderr),
+                        dump(&[
+                            "exec",
+                            "-T",
+                            "c2-allowed-net",
+                            "sh",
+                            "-lc",
+                            "ip -4 addr && iptables -S && cat /etc/resolv.conf"
+                        ])
+                    );
+                    panic!("allowed client could not reach example.com\n{debug}");
+                }
+            }
         }
     } else {
         eprintln!("skipping external egress check: docker cannot reach public IP");
