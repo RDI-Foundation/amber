@@ -4,6 +4,7 @@ use amber_manifest::CapabilityKind;
 use amber_scenario::{BindingFrom, Component, ComponentId, Scenario};
 
 use super::{Reporter, ReporterError};
+use crate::CompileOutput;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DotReporter;
@@ -11,8 +12,8 @@ pub struct DotReporter;
 impl Reporter for DotReporter {
     type Artifact = String;
 
-    fn emit(&self, scenario: &Scenario) -> Result<Self::Artifact, ReporterError> {
-        Ok(render_dot_with_exports(scenario))
+    fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError> {
+        Ok(render_dot_with_exports(&output.scenario))
     }
 }
 

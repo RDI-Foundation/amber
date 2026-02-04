@@ -112,8 +112,8 @@ amber compile amber-demo/parent.json \
 docker compose -f /tmp/amber-compose.yaml up
 ```
 
-The Docker Compose output references the sidecar and helper images used to
-enforce the wiring: `ghcr.io/rdi-foundation/amber-sidecar:main` and
+The Docker Compose output references the router and helper images used to
+enforce the wiring: `ghcr.io/rdi-foundation/amber-router:v1` and
 `ghcr.io/rdi-foundation/amber-helper:v1`. Docker Compose will pull them automatically;
 if you're in a restricted environment, pre-pull them ahead of time.
 

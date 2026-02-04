@@ -1,19 +1,17 @@
 use std::{collections::HashSet, env};
 
-use amber_images::{AMBER_HELPER, AMBER_ROUTER, AMBER_SIDECAR, ImageRef};
+use amber_images::{AMBER_HELPER, AMBER_ROUTER, ImageRef};
 
 const DEV_IMAGE_TAGS_ENV: &str = "AMBER_DEV_IMAGE_TAGS";
 
 #[derive(Clone, Debug)]
 pub(crate) struct InternalImages {
-    pub(crate) sidecar: String,
     pub(crate) helper: String,
     pub(crate) router: String,
 }
 
 pub(crate) fn resolve_internal_images() -> Result<InternalImages, String> {
     let mut images = InternalImages {
-        sidecar: default_reference(&AMBER_SIDECAR),
         helper: default_reference(&AMBER_HELPER),
         router: default_reference(&AMBER_ROUTER),
     };
@@ -29,8 +27,7 @@ pub(crate) fn resolve_internal_images() -> Result<InternalImages, String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err(format!(
-            "{DEV_IMAGE_TAGS_ENV} is set but empty; expected format \
-             \"router=<tag>,sidecar=<tag>,helper=<tag>\""
+            "{DEV_IMAGE_TAGS_ENV} is set but empty; expected format \"router=<tag>,helper=<tag>\""
         ));
     }
 
@@ -40,7 +37,7 @@ pub(crate) fn resolve_internal_images() -> Result<InternalImages, String> {
         if entry.is_empty() {
             return Err(format!(
                 "{DEV_IMAGE_TAGS_ENV} contains an empty entry; expected format \
-                 \"router=<tag>,sidecar=<tag>,helper=<tag>\""
+                 \"router=<tag>,helper=<tag>\""
             ));
         }
 
@@ -69,12 +66,10 @@ pub(crate) fn resolve_internal_images() -> Result<InternalImages, String> {
 
         match key {
             "router" => images.router = override_reference(&AMBER_ROUTER, value),
-            "sidecar" => images.sidecar = override_reference(&AMBER_SIDECAR, value),
             "helper" => images.helper = override_reference(&AMBER_HELPER, value),
             _ => {
                 return Err(format!(
-                    "{DEV_IMAGE_TAGS_ENV} contains unknown key \"{key}\"; expected router, \
-                     sidecar, helper"
+                    "{DEV_IMAGE_TAGS_ENV} contains unknown key \"{key}\"; expected router, helper"
                 ));
             }
         }

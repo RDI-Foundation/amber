@@ -6,6 +6,7 @@ members = [
   "helper",
   "images",
   "json5",
+  "mesh",
   "manifest",
   "node",
   "resolver",
@@ -21,7 +22,9 @@ amber-config = { path = "config" }
 amber-images = { path = "images" }
 amber-json5 = { path = "json5" }
 amber-manifest = { path = "manifest" }
+amber-mesh = { path = "mesh" }
 amber-resolver = { path = "resolver" }
+amber-router = { path = "router" }
 amber-scenario = { path = "scenario" }
 amber-template = { path = "template" }
 base64 = "0.22.1"
