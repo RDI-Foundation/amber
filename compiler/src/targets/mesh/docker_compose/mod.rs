@@ -71,6 +71,12 @@ struct AmberExtension {
 struct EmptyMap {}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct NetworkConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    aliases: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct Network {
     driver: String,
     #[serde(
@@ -91,7 +97,7 @@ struct Service {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     security_opt: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    networks: BTreeMap<String, EmptyMap>,
+    networks: BTreeMap<String, NetworkConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     network_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -628,7 +634,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         );
         let router_script = escape_compose_interpolation(&router_script).into_owned();
 
-        let mut router_sidecar = sidecar_service(router_script);
+        let mut router_sidecar = sidecar_service(&router_names.sidecar, router_script);
         if !exports_by_name.is_empty() {
             for (export_name, meta) in &exports_by_name {
                 let router_port = address_plan
@@ -699,7 +705,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         let script = escape_compose_interpolation(&script).into_owned();
         compose
             .services
-            .insert(svc.sidecar.clone(), sidecar_service(script));
+            .insert(svc.sidecar.clone(), sidecar_service(&svc.sidecar, script));
 
         let program = c.program.as_ref().unwrap();
         let mut program_service = Service::new(program.image.as_str());
@@ -816,14 +822,17 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
 
 // ---- helpers ----
 
-fn sidecar_service(script: String) -> Service {
+fn sidecar_service(name: &str, script: String) -> Service {
     let mut service = Service::new(SIDECAR_IMAGE);
     service.cap_add = vec!["NET_ADMIN".to_string()];
     service.cap_drop = vec!["ALL".to_string()];
     service.security_opt = vec!["no-new-privileges:true".to_string()];
-    service
-        .networks
-        .insert(MESH_NETWORK_NAME.to_string(), EmptyMap::default());
+    service.networks.insert(
+        MESH_NETWORK_NAME.to_string(),
+        NetworkConfig {
+            aliases: vec![name.to_string()],
+        },
+    );
     service.command = Some(vec!["/bin/sh".to_string(), "-lc".to_string(), script]);
     service
 }
