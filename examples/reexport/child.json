@@ -1,8 +1,12 @@
 {
   "manifest_version": "0.1.0",
   "program": {
-    "image": "example/child",
-    "entrypoint": ["sleep", "infinity"],
+    "image": "busybox:stable",
+    "entrypoint": [
+      "/bin/sh",
+      "-c",
+      "mkdir -p /www && echo 'ok' > /www/index.html && exec busybox httpd -f -p 8080 -h /www"
+    ],
     "network": {
       "endpoints": [{ "name": "endpoint", "port": 8080 }]
     }
