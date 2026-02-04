@@ -8,6 +8,7 @@ use std::{
 
 use amber_manifest::ManifestRef;
 use amber_resolver::Resolver;
+use base64::Engine as _;
 use tempfile::tempdir;
 use url::Url;
 
@@ -218,10 +219,22 @@ impl Drop for KindClusterGuard {
 struct PortForwardGuard {
     child: std::process::Child,
     log_path: PathBuf,
+    local_port: u16,
+    remote_port: u16,
 }
 
 impl PortForwardGuard {
     fn new(namespace: &str, pod: &str, log_path: &Path) -> Self {
+        Self::new_with_ports(namespace, pod, 8080, 8080, log_path)
+    }
+
+    fn new_with_ports(
+        namespace: &str,
+        pod: &str,
+        local_port: u16,
+        remote_port: u16,
+        log_path: &Path,
+    ) -> Self {
         let log = fs::File::create(log_path).expect("create port-forward log");
         let log_err = log.try_clone().expect("clone port-forward log");
         let child = Command::new("kubectl")
@@ -229,7 +242,7 @@ impl PortForwardGuard {
             .arg("-n")
             .arg(namespace)
             .arg(format!("pod/{pod}"))
-            .arg("8080:8080")
+            .arg(format!("{local_port}:{remote_port}"))
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err))
             .spawn()
@@ -237,6 +250,8 @@ impl PortForwardGuard {
         Self {
             child,
             log_path: log_path.to_path_buf(),
+            local_port,
+            remote_port,
         }
     }
 
@@ -261,7 +276,12 @@ impl PortForwardGuard {
             }
 
             let logs = self.logs();
-            if logs.contains("Forwarding from") && logs.contains(":8080") {
+            let local_marker = format!(":{}", self.local_port);
+            let remote_marker = format!("-> {}", self.remote_port);
+            if logs.contains("Forwarding from")
+                && logs.contains(&local_marker)
+                && logs.contains(&remote_marker)
+            {
                 return;
             }
 
@@ -875,4 +895,184 @@ spec:
             client_logs, router_logs, external_logs
         );
     }
+}
+
+#[test]
+#[ignore = "requires docker + kind + kubectl; run manually"]
+fn kubernetes_smoke_export_routes_to_host() {
+    if !k8s_smoke_preflight() {
+        return;
+    }
+
+    let dir = tempdir().expect("temp dir");
+    let root_path = dir.path().join("root.json5");
+    let server_path = dir.path().join("server.json5");
+
+    fs::write(
+        &root_path,
+        r##"
+        {
+          manifest_version: "0.1.0",
+          components: { server: "./server.json5" },
+          exports: { public: "#server.api" }
+        }
+        "##,
+    )
+    .expect("write root manifest");
+
+    fs::write(
+        &server_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "busybox:1.36.1",
+            args: ["sh", "-lc", "mkdir -p /www && echo export-ok > /www/index.html && httpd -f -p 8080 -h /www"],
+            network: { endpoints: [ { name: "api", port: 8080, protocol: "http" } ] }
+          },
+          provides: { api: { kind: "http", endpoint: "api" } }
+        }
+        "#,
+    )
+    .expect("write server manifest");
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let mut opts = CompileOptions::default();
+    opts.optimize = OptimizeOptions { dce: false };
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let output = rt
+        .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
+        .expect("compile scenario");
+
+    let reporter = KubernetesReporter {
+        config: KubernetesReporterConfig {
+            disable_networkpolicy_check: true,
+        },
+    };
+    let artifact = reporter.emit(&output).expect("render kubernetes output");
+
+    let router_deploy = artifact
+        .files
+        .get(&PathBuf::from("03-deployments/amber-router.yaml"))
+        .expect("router deployment");
+    let deploy_doc: serde_yaml::Value =
+        serde_yaml::from_str(router_deploy).expect("parse router deployment");
+    let envs = deploy_doc["spec"]["template"]["spec"]["containers"][0]["env"]
+        .as_sequence()
+        .expect("router env list");
+    let b64 = envs
+        .iter()
+        .find_map(|item| {
+            if item["name"].as_str() == Some("AMBER_ROUTER_CONFIG_B64") {
+                item["value"].as_str().map(|v| v.to_string())
+            } else {
+                None
+            }
+        })
+        .expect("router config env var");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .expect("decode router config");
+    let config: serde_json::Value = serde_json::from_slice(&decoded).expect("parse router config");
+    let exports = config["exports"].as_array().expect("router exports");
+    assert_eq!(exports.len(), 1, "expected one export");
+    let export_port = exports[0]["listen_port"]
+        .as_u64()
+        .expect("export listen_port") as u16;
+
+    let output_dir = dir.path().join("kubernetes");
+    write_kubernetes_output(&output_dir, &artifact);
+
+    let kustomization =
+        fs::read_to_string(output_dir.join("kustomization.yaml")).expect("read kustomization");
+    let kust_doc: serde_yaml::Value =
+        serde_yaml::from_str(&kustomization).expect("parse kustomization");
+    let namespace = kust_doc["namespace"]
+        .as_str()
+        .expect("kustomization namespace");
+
+    let platform = docker_platform();
+    build_router_image();
+    ensure_image_platform("busybox:1.36.1", &platform);
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_secs();
+    let cluster_name = format!("amber-test-{}-{nonce}", std::process::id());
+    let _cluster_guard = match KindClusterGuard::try_new(cluster_name.clone()) {
+        Ok(guard) => guard,
+        Err(err) => {
+            eprintln!("skipping kubernetes smoke test: {err}");
+            return;
+        }
+    };
+
+    for image in [ROUTER_IMAGE, "busybox:1.36.1"] {
+        let mut cmd = Command::new("kind");
+        cmd.arg("load")
+            .arg("docker-image")
+            .arg(image)
+            .arg("--name")
+            .arg(&cluster_name);
+        checked_status(&mut cmd, &format!("kind load {image} image"));
+    }
+
+    let mut cmd = Command::new("kubectl");
+    cmd.arg("apply").arg("-k").arg(&output_dir);
+    checked_status(&mut cmd, "kubectl apply amber");
+
+    let mut cmd = Command::new("kubectl");
+    cmd.arg("wait")
+        .arg("--for=condition=available")
+        .arg("--timeout=120s")
+        .arg("deployment")
+        .arg("--all")
+        .arg("-n")
+        .arg(namespace);
+    checked_status(&mut cmd, "kubectl wait for deployments");
+
+    let router_pod = {
+        let mut cmd = Command::new("kubectl");
+        cmd.arg("get")
+            .arg("pod")
+            .arg("-n")
+            .arg(namespace)
+            .arg("-l")
+            .arg("amber.io/component=amber-router")
+            .arg("-o")
+            .arg("jsonpath={.items[0].metadata.name}");
+        let output = checked_output(&mut cmd, "kubectl get router pod");
+        let pod = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert!(!pod.is_empty(), "no router pod found");
+        pod
+    };
+
+    let mut cmd = Command::new("kubectl");
+    cmd.arg("wait")
+        .arg("--for=condition=ready")
+        .arg("--timeout=120s")
+        .arg("pod")
+        .arg("-n")
+        .arg(namespace)
+        .arg(&router_pod);
+    checked_status(&mut cmd, "kubectl wait for router pod");
+
+    let port_forward_log = dir.path().join("port-forward-router.log");
+    let mut port_forward = PortForwardGuard::new_with_ports(
+        namespace,
+        &router_pod,
+        18080,
+        export_port,
+        &port_forward_log,
+    );
+    port_forward.wait_until_ready(Duration::from_secs(30));
+
+    let response = fetch(
+        "http://localhost:18080",
+        &mut port_forward,
+        namespace,
+        &router_pod,
+    );
+    assert_eq!(response, "export-ok");
 }
