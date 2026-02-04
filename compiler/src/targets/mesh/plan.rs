@@ -1,12 +1,15 @@
 use std::{
     collections::{BTreeSet, HashMap},
     fmt,
+    sync::Arc,
 };
 
 use amber_manifest::{
-    CapabilityDecl, FrameworkBindingShape, FrameworkCapabilityName, framework_capability,
+    FrameworkBindingShape, FrameworkCapabilityName, Manifest, NetworkProtocol, framework_capability,
 };
 use amber_scenario::{BindingFrom, ComponentId, Scenario};
+
+use crate::{DigestStore, manifest_table};
 
 #[derive(Clone, Debug)]
 pub(crate) struct MeshOptions {
@@ -15,6 +18,7 @@ pub(crate) struct MeshOptions {
 
 #[derive(Clone, Debug)]
 pub(crate) struct MeshPlan {
+    pub(crate) manifests: Vec<Option<Arc<Manifest>>>,
     pub(crate) program_components: Vec<ComponentId>,
     pub(crate) bindings: Vec<ResolvedBinding>,
     pub(crate) external_bindings: Vec<ResolvedExternalBinding>,
@@ -39,7 +43,6 @@ pub(crate) struct ResolvedExport {
     pub(crate) provider: ComponentId,
     pub(crate) provide: String,
     pub(crate) endpoint: EndpointInfo,
-    pub(crate) capability: CapabilityDecl,
 }
 
 #[derive(Clone, Debug)]
@@ -60,8 +63,8 @@ pub(crate) struct ResolvedFrameworkBinding {
 
 #[derive(Clone, Debug)]
 pub(crate) struct EndpointInfo {
-    pub(crate) name: String,
     pub(crate) port: u16,
+    pub(crate) protocol: NetworkProtocol,
 }
 
 #[derive(Debug)]
@@ -93,8 +96,17 @@ impl From<String> for MeshError {
 
 pub(crate) fn build_mesh_plan(
     scenario: &Scenario,
+    store: &DigestStore,
     options: MeshOptions,
 ) -> Result<MeshPlan, MeshError> {
+    let manifests =
+        manifest_table::build_manifest_table(&scenario.components, store).map_err(|e| {
+            MeshError::new(format!(
+                "internal error: missing manifest content for {} (digest {})",
+                component_label(scenario, e.component),
+                e.digest
+            ))
+        })?;
     let program_components: Vec<ComponentId> = scenario
         .components_iter()
         .filter_map(|(id, c)| c.program.as_ref().map(|_| id))
@@ -208,11 +220,11 @@ pub(crate) fn build_mesh_plan(
             provider: ex.from.component,
             provide: ex.from.name.clone(),
             endpoint,
-            capability: ex.capability.clone(),
         });
     }
 
     Ok(MeshPlan {
+        manifests,
         program_components,
         bindings,
         external_bindings,
@@ -278,7 +290,7 @@ fn resolve_provide_endpoint(
         })?;
 
     Ok(EndpointInfo {
-        name: endpoint.name.clone(),
         port: endpoint.port,
+        protocol: endpoint.protocol,
     })
 }

@@ -7,6 +7,10 @@ use std::{
 
 use amber_config as rc;
 use amber_manifest::{MountSource, span_for_json_pointer};
+use amber_mesh::{
+    MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MESH_PROVISION_PLAN_VERSION, MeshProvisionOutput,
+    MeshProvisionPlan, MeshProvisionTarget, MeshProvisionTargetKind,
+};
 use amber_scenario::{ComponentId, Scenario};
 use miette::{LabeledSpan, NamedSource, SourceSpan};
 pub use resources::*;
@@ -16,8 +20,7 @@ use crate::{
     CompileOutput,
     reporter::{Reporter, ReporterError},
     targets::mesh::{
-        LOCAL_NETWORK_CIDRS,
-        addressing::{Addressing, RouterPortBases, WorkloadId, build_address_plan},
+        addressing::{Addressing, WorkloadId, build_address_plan, build_allow_plan},
         config::{
             ProgramImageOrigin, ProgramImagePart, ProgramImagePlan, ProgramPlan, build_config_plan,
             encode_component_payload, encode_direct_entrypoint_b64, encode_direct_env_b64,
@@ -25,7 +28,14 @@ use crate::{
             mount_specs_need_config,
         },
         internal_images::resolve_internal_images,
-        plan::{MeshOptions, component_label},
+        mesh_config::{MeshAddressing, RouterPorts, build_mesh_config_plan},
+        plan::{MeshError, MeshOptions, component_label},
+        ports::{allocate_mesh_ports, allocate_slot_ports},
+        proxy_metadata::{
+            DEFAULT_EXTERNAL_ENV_FILE, ExportMetadata, ExternalSlotMetadata,
+            PROXY_METADATA_FILENAME, PROXY_METADATA_VERSION, ProxyMetadata, RouterMetadata,
+            collect_exports_metadata, collect_external_slot_metadata,
+        },
     },
 };
 
@@ -36,10 +46,20 @@ use crate::{
 const HELPER_VOLUME_NAME: &str = "amber-helper";
 const HELPER_BIN_DIR: &str = "/amber/bin";
 const HELPER_BIN_PATH: &str = "/amber/bin/amber-helper";
+const MESH_CONFIG_DIR: &str = "/amber/mesh";
+const MESH_SECRET_VOLUME_NAME: &str = "amber-mesh";
 const ROUTER_NAME: &str = "amber-router";
+const PROVISIONER_NAME: &str = "amber-provisioner";
+const PROVISIONER_CONFIGMAP_NAME: &str = "amber-mesh-provision";
+const PROVISIONER_SERVICE_ACCOUNT: &str = "amber-provisioner";
+const PROVISIONER_ROLE_NAME: &str = "amber-provisioner";
+const PROVISIONER_ROLE_BINDING_NAME: &str = "amber-provisioner";
+const PROVISIONER_PLAN_KEY: &str = "mesh-plan.json";
+const PROVISIONER_JOB_BACKOFF_LIMIT: u32 = 6;
 const ROUTER_EXTERNAL_SECRET_NAME: &str = "amber-router-external";
-const ROUTER_EXTERNAL_PORT_BASE: u16 = 21000;
-const ROUTER_EXPORT_PORT_BASE: u16 = 22000;
+const COMPONENT_MESH_PORT_BASE: u16 = 23000;
+const ROUTER_MESH_PORT_BASE: u16 = 24000;
+const ROUTER_CONTROL_PORT_BASE: u16 = 24100;
 
 // Root config Secret/ConfigMap names.
 const ROOT_CONFIG_SECRET_NAME: &str = "amber-root-config-secret";
@@ -68,50 +88,33 @@ pub struct KubernetesArtifact {
 impl Reporter for KubernetesReporter {
     type Artifact = KubernetesArtifact;
 
-    fn emit(&self, scenario: &Scenario) -> Result<Self::Artifact, ReporterError> {
-        render_kubernetes(scenario, &self.config)
+    fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError> {
+        render_kubernetes(output, &self.config)
     }
 }
 
 struct KubernetesAddressing<'a> {
     scenario: &'a Scenario,
-    names: &'a HashMap<ComponentId, ComponentNames>,
-    namespace: &'a str,
+    slot_ports_by_component: &'a HashMap<ComponentId, BTreeMap<String, u16>>,
 }
 
 impl Addressing for KubernetesAddressing<'_> {
-    type Extra = ();
     type Error = crate::targets::mesh::plan::MeshError;
 
     fn resolve_binding_url(
         &mut self,
         binding: &crate::targets::mesh::plan::ResolvedBinding,
     ) -> Result<String, Self::Error> {
-        let endpoint_port = binding.endpoint.port;
-        if binding.provider == binding.consumer {
-            return Ok(format!("http://127.0.0.1:{endpoint_port}"));
-        }
-        let provider_names = self.names.get(&binding.provider).ok_or_else(|| {
-            Self::Error::new(format!(
-                "internal error: missing names for provider {}",
-                component_label(self.scenario, binding.provider)
-            ))
-        })?;
-        Ok(format!(
-            "http://{}.{}.svc.cluster.local:{}",
-            provider_names.service, self.namespace, endpoint_port
-        ))
+        let local_port = self.local_slot_port(binding.consumer, &binding.slot)?;
+        Ok(format!("http://127.0.0.1:{local_port}"))
     }
 
     fn resolve_external_binding_url(
         &mut self,
-        _binding: &crate::targets::mesh::plan::ResolvedExternalBinding,
-        router_port: u16,
+        binding: &crate::targets::mesh::plan::ResolvedExternalBinding,
     ) -> Result<String, Self::Error> {
-        Ok(format!(
-            "http://{}.{}.svc.cluster.local:{}",
-            ROUTER_NAME, self.namespace, router_port
-        ))
+        let local_port = self.local_slot_port(binding.consumer, &binding.slot)?;
+        Ok(format!("http://127.0.0.1:{local_port}"))
     }
 
     fn resolve_framework_binding_url(
@@ -129,24 +132,22 @@ impl Addressing for KubernetesAddressing<'_> {
              (missing docker-gateway wiring)",
         ))
     }
+}
 
-    fn resolve_export_target_url(
-        &mut self,
-        export: &crate::targets::mesh::plan::ResolvedExport,
-    ) -> Result<String, Self::Error> {
-        let provider_names = self.names.get(&export.provider).ok_or_else(|| {
-            Self::Error::new(format!(
-                "internal error: missing names for export provider {}",
-                component_label(self.scenario, export.provider)
-            ))
-        })?;
-        Ok(format!(
-            "http://{}.{}.svc.cluster.local:{}",
-            provider_names.service, self.namespace, export.endpoint.port
-        ))
+impl KubernetesAddressing<'_> {
+    fn local_slot_port(&self, component: ComponentId, slot: &str) -> Result<u16, MeshError> {
+        self.slot_ports_by_component
+            .get(&component)
+            .and_then(|ports| ports.get(slot))
+            .copied()
+            .ok_or_else(|| {
+                MeshError::new(format!(
+                    "internal error: missing local port allocation for {}.{}",
+                    component_label(self.scenario, component),
+                    slot
+                ))
+            })
     }
-
-    fn finalize(self) -> Self::Extra {}
 }
 
 // ---- Internal types ----
@@ -159,28 +160,11 @@ struct ComponentNames {
     netpol: String,
 }
 
-/// Metadata about a scenario export for the amber-metadata ConfigMap.
-#[derive(Clone, Debug, Serialize)]
-struct ExportMetadata {
-    component: String,
-    provide: String,
-    service: String,
-    port: u16,
-    kind: String,
-}
-
 /// Metadata about a config input for the amber-metadata ConfigMap.
 #[derive(Clone, Debug, Serialize)]
 struct InputMetadata {
     required: bool,
     secret: bool,
-}
-
-/// Metadata about an external slot input for the amber-metadata ConfigMap.
-#[derive(Clone, Debug, Serialize)]
-struct ExternalSlotMetadata {
-    required: bool,
-    kind: String,
 }
 
 #[derive(Clone, Debug)]
@@ -189,7 +173,6 @@ struct ProgramImageSource {
     span: SourceSpan,
     label: String,
 }
-
 /// Full scenario metadata stored in amber-metadata ConfigMap.
 #[derive(Clone, Debug, Serialize)]
 struct ScenarioMetadata {
@@ -206,23 +189,17 @@ pub fn render_kubernetes_with_output(
     output: &CompileOutput,
     config: &KubernetesReporterConfig,
 ) -> KubernetesResult<KubernetesArtifact> {
-    render_kubernetes_inner(&output.scenario, config, Some(output))
+    render_kubernetes(output, config)
 }
 
 fn render_kubernetes(
-    s: &Scenario,
+    output: &CompileOutput,
     config: &KubernetesReporterConfig,
 ) -> KubernetesResult<KubernetesArtifact> {
-    render_kubernetes_inner(s, config, None)
-}
-
-fn render_kubernetes_inner(
-    s: &Scenario,
-    config: &KubernetesReporterConfig,
-    output: Option<&CompileOutput>,
-) -> KubernetesResult<KubernetesArtifact> {
+    let s = &output.scenario;
     let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
         s,
+        &output.store,
         MeshOptions {
             backend_label: "kubernetes reporter",
         },
@@ -247,6 +224,8 @@ fn render_kubernetes_inner(
     let images = resolve_internal_images().map_err(ReporterError::new)?;
 
     let program_components = mesh_plan.program_components.as_slice();
+    let manifests = &mesh_plan.manifests;
+
     // Generate namespace name.
     let namespace = generate_namespace_name(s);
 
@@ -263,34 +242,96 @@ fn render_kubernetes_inner(
             },
         );
     }
-    let root_slots = &s.component(s.root).slots;
+    let root_manifest = manifests[s.root.0]
+        .as_ref()
+        .expect("root manifest should exist");
+
+    let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
+
+    let slot_ports_by_component = allocate_slot_ports(s, program_components)
+        .map_err(|e| ReporterError::new(e.to_string()))?;
+    let mesh_ports_by_component = allocate_mesh_ports(
+        s,
+        program_components,
+        COMPONENT_MESH_PORT_BASE,
+        &slot_ports_by_component,
+    )
+    .map_err(|e| ReporterError::new(e.to_string()))?;
+    let router_ports = needs_router.then_some(RouterPorts {
+        mesh: ROUTER_MESH_PORT_BASE,
+        control: ROUTER_CONTROL_PORT_BASE,
+    });
+    let router_mesh_port_opt = router_ports.map(|ports| ports.mesh);
 
     let addressing = KubernetesAddressing {
         scenario: s,
+        slot_ports_by_component: &slot_ports_by_component,
+    };
+    let address_plan = build_address_plan(&mesh_plan, addressing)
+        .map_err(|e| ReporterError::new(e.to_string()))?;
+
+    struct KubernetesMeshAddressing<'a> {
+        names: &'a HashMap<ComponentId, ComponentNames>,
+        namespace: &'a str,
+        mesh_ports_by_component: &'a HashMap<ComponentId, u16>,
+        router_mesh_port: u16,
+    }
+
+    impl MeshAddressing for KubernetesMeshAddressing<'_> {
+        fn mesh_addr_for_component(&self, id: ComponentId) -> Result<String, MeshError> {
+            let svc = self.names.get(&id).ok_or_else(|| {
+                MeshError::new(format!("missing service name for component {id:?}"))
+            })?;
+            let port = *self
+                .mesh_ports_by_component
+                .get(&id)
+                .ok_or_else(|| MeshError::new(format!("missing mesh port for component {id:?}")))?;
+            Ok(format!(
+                "{}.{}.svc.cluster.local:{}",
+                svc.service, self.namespace, port
+            ))
+        }
+
+        fn mesh_addr_for_router(&self) -> Result<String, MeshError> {
+            Ok(format!(
+                "{}.{}.svc.cluster.local:{}",
+                ROUTER_NAME, self.namespace, self.router_mesh_port
+            ))
+        }
+    }
+
+    let router_mesh_port = router_ports
+        .as_ref()
+        .map(|ports| ports.mesh)
+        .unwrap_or(ROUTER_MESH_PORT_BASE);
+    let mesh_addressing = KubernetesMeshAddressing {
         names: &names,
         namespace: &namespace,
+        mesh_ports_by_component: &mesh_ports_by_component,
+        router_mesh_port,
     };
-    let address_plan = build_address_plan(
+    let mesh_config_plan = build_mesh_config_plan(
+        s,
         &mesh_plan,
-        root_slots,
-        RouterPortBases {
-            external: ROUTER_EXTERNAL_PORT_BASE,
-            export: ROUTER_EXPORT_PORT_BASE,
-        },
-        addressing,
+        root_manifest,
+        &slot_ports_by_component,
+        &mesh_ports_by_component,
+        router_ports,
+        &mesh_addressing,
     )
     .map_err(|e| ReporterError::new(e.to_string()))?;
-    let needs_router = address_plan.router.needs_router;
+    let mesh_provision_plan =
+        build_provision_plan(&mesh_config_plan, program_components, &names, &namespace)
+            .map_err(|err| ReporterError::new(err.to_string()))?;
+
+    let allow_plan = build_allow_plan(&mesh_plan, &mesh_ports_by_component, router_mesh_port_opt)
+        .map_err(|e| ReporterError::new(e.to_string()))?;
 
     let mut egress_allow: HashMap<ComponentId, BTreeMap<ComponentId, BTreeSet<u16>>> =
         HashMap::new();
     let mut egress_router_allow: HashMap<ComponentId, BTreeSet<u16>> = HashMap::new();
-    let local_cidrs: Vec<String> = LOCAL_NETWORK_CIDRS
-        .iter()
-        .map(|cidr| (*cidr).to_string())
-        .collect();
 
-    for (provider, by_port) in &address_plan.allow.by_provider {
+    for (provider, by_port) in &allow_plan.by_provider {
         match provider {
             WorkloadId::Component(provider_id) => {
                 for (port, consumers) in by_port {
@@ -376,42 +417,26 @@ fn render_kubernetes_inner(
         .collect();
     let program_plans = &config_plan.program_plans;
 
-    let export_ports_by_name = &address_plan.router.export_ports_by_name;
-    let router_export_ports = &address_plan.router.export_ports;
-    let router_external_slots = &address_plan.router.router_external_slots;
-    let router_exports = &address_plan.router.router_exports;
-    let router_env_passthrough = &address_plan.router.router_env_passthrough;
-    let router_config_b64 = &address_plan.router.router_config_b64;
+    let router_env_passthrough = &mesh_config_plan.router_env_passthrough;
     let mut router_container_ports: Vec<ContainerPort> = Vec::new();
     let mut router_service_ports: Vec<ServicePort> = Vec::new();
 
     if needs_router {
-        for (idx, slot) in router_external_slots.iter().enumerate() {
-            let name = format!("ext-{}", idx + 1);
+        router_container_ports.push(ContainerPort {
+            name: "mesh".to_string(),
+            container_port: router_mesh_port,
+            protocol: "TCP",
+        });
+        router_service_ports.push(ServicePort {
+            name: "mesh".to_string(),
+            port: router_mesh_port,
+            target_port: router_mesh_port,
+            protocol: "TCP",
+        });
+        if let Some(ports) = router_ports {
             router_container_ports.push(ContainerPort {
-                name: name.clone(),
-                container_port: slot.listen_port,
-                protocol: "TCP",
-            });
-            router_service_ports.push(ServicePort {
-                name,
-                port: slot.listen_port,
-                target_port: slot.listen_port,
-                protocol: "TCP",
-            });
-        }
-
-        for (idx, export) in router_exports.iter().enumerate() {
-            let name = format!("exp-{}", idx + 1);
-            router_container_ports.push(ContainerPort {
-                name: name.clone(),
-                container_port: export.listen_port,
-                protocol: "TCP",
-            });
-            router_service_ports.push(ServicePort {
-                name,
-                port: export.listen_port,
-                target_port: export.listen_port,
+                name: "control".to_string(),
+                container_port: ports.control,
                 protocol: "TCP",
             });
         }
@@ -476,11 +501,11 @@ fn render_kubernetes_inner(
         // Don't insert kustomization yet - we'll do it at the end after collecting all resource paths
     }
 
-    if needs_router && !router_external_slots.is_empty() {
+    if needs_router && !router_env_passthrough.is_empty() {
         kustomization.secret_generator.push(SecretGenerator {
             name: ROUTER_EXTERNAL_SECRET_NAME.to_string(),
             namespace: Some(namespace.clone()),
-            env_files: vec!["router-external.env".to_string()],
+            env_files: vec![DEFAULT_EXTERNAL_ENV_FILE.to_string()],
             literals: Vec::new(),
             options: Some(GeneratorOptions {
                 disable_name_suffix_hash: Some(true),
@@ -492,7 +517,7 @@ fn render_kubernetes_inner(
         for env_var in router_env_passthrough {
             env_content.push_str(&format!("{env_var}=\n"));
         }
-        files.insert(PathBuf::from("router-external.env"), env_content);
+        files.insert(PathBuf::from(DEFAULT_EXTERNAL_ENV_FILE), env_content);
     }
 
     // Note: Per-component ConfigMaps/Secrets are not generated because:
@@ -514,9 +539,9 @@ fn render_kubernetes_inner(
         let labels = component_labels(*id, &cnames.service);
         let program = c.program.as_ref().unwrap();
         let program_plan = program_plans.get(id).unwrap();
+        let mesh_port = *mesh_ports_by_component.get(id).expect("mesh port missing");
         let label = component_label(s, *id);
-        let image_source = output
-            .and_then(|output| program_image_source(output, s, *id, program_plan.image_origin()));
+        let image_source = program_image_source(output, s, *id, program_plan.image_origin());
         let (program_image, image_source_env_var) = render_kubernetes_image(
             program_plan.image(),
             &root_leaf_by_path,
@@ -589,7 +614,7 @@ fn render_kubernetes_inner(
         };
 
         // Build container based on program mode.
-        let (container, volumes) = match program_plan {
+        let (container, mut volumes) = match program_plan {
             ProgramPlan::Direct {
                 entrypoint, env, ..
             } if !needs_helper_for_component => {
@@ -670,6 +695,40 @@ fn render_kubernetes_inner(
                 build_helper_runner_container(program_image.clone(), ports, container_env)
             }
         };
+        let mesh_secret = mesh_secret_name(&cnames.service);
+        volumes.push(Volume::secret(
+            MESH_SECRET_VOLUME_NAME.to_string(),
+            mesh_secret,
+        ));
+
+        let sidecar = Container {
+            name: "sidecar".to_string(),
+            image: images.router.clone(),
+            command: Vec::new(),
+            args: Vec::new(),
+            env: vec![
+                EnvVar::literal(
+                    "AMBER_ROUTER_CONFIG_PATH",
+                    format!("{MESH_CONFIG_DIR}/{MESH_CONFIG_FILENAME}"),
+                ),
+                EnvVar::literal(
+                    "AMBER_ROUTER_IDENTITY_PATH",
+                    format!("{MESH_CONFIG_DIR}/{MESH_IDENTITY_FILENAME}"),
+                ),
+            ],
+            env_from: Vec::new(),
+            ports: vec![ContainerPort {
+                name: "mesh".to_string(),
+                container_port: mesh_port,
+                protocol: "TCP",
+            }],
+            readiness_probe: None,
+            volume_mounts: vec![VolumeMount {
+                name: MESH_SECRET_VOLUME_NAME.to_string(),
+                mount_path: MESH_CONFIG_DIR.to_string(),
+                read_only: Some(true),
+            }],
+        };
 
         if let Some(env_var) = image_source_env_var {
             kustomization.replacements.push(Replacement {
@@ -741,8 +800,10 @@ fn render_kubernetes_inner(
 
         let pod_spec = PodSpec {
             init_containers,
-            containers: vec![container],
+            containers: vec![sidecar, container],
             volumes,
+            service_account_name: None,
+            automount_service_account_token: Some(false),
             restart_policy: None,
         };
 
@@ -782,16 +843,17 @@ fn render_kubernetes_inner(
 
     if needs_router {
         let mut env = Vec::new();
-        let router_config_b64 = router_config_b64
-            .as_ref()
-            .expect("router config should be computed");
         env.push(EnvVar::literal(
-            "AMBER_ROUTER_CONFIG_B64",
-            router_config_b64,
+            "AMBER_ROUTER_CONFIG_PATH",
+            format!("{MESH_CONFIG_DIR}/{MESH_CONFIG_FILENAME}"),
+        ));
+        env.push(EnvVar::literal(
+            "AMBER_ROUTER_IDENTITY_PATH",
+            format!("{MESH_CONFIG_DIR}/{MESH_IDENTITY_FILENAME}"),
         ));
 
         let mut env_from = Vec::new();
-        if !router_external_slots.is_empty() {
+        if !router_env_passthrough.is_empty() {
             env_from.push(EnvFromSource {
                 config_map_ref: None,
                 secret_ref: Some(LocalObjectReference {
@@ -810,8 +872,13 @@ fn render_kubernetes_inner(
             env_from,
             ports: router_container_ports.clone(),
             readiness_probe: None,
-            volume_mounts: Vec::new(),
+            volume_mounts: vec![VolumeMount {
+                name: MESH_SECRET_VOLUME_NAME.to_string(),
+                mount_path: MESH_CONFIG_DIR.to_string(),
+                read_only: Some(true),
+            }],
         };
+        let router_secret = mesh_secret_name(ROUTER_NAME);
 
         let deployment = Deployment {
             api_version: "apps/v1",
@@ -835,7 +902,12 @@ fn render_kubernetes_inner(
                     spec: PodSpec {
                         init_containers: Vec::new(),
                         containers: vec![container],
-                        volumes: Vec::new(),
+                        volumes: vec![Volume::secret(
+                            MESH_SECRET_VOLUME_NAME.to_string(),
+                            router_secret,
+                        )],
+                        service_account_name: None,
+                        automount_service_account_token: Some(false),
                         restart_policy: None,
                     },
                 },
@@ -864,36 +936,22 @@ fn render_kubernetes_inner(
 
     // Services (only for components with provides)
     for id in program_components {
-        let c = s.component(*id);
-        if c.provides.is_empty() {
-            continue;
-        }
-
         let cnames = names.get(id).unwrap();
         let labels = component_labels(*id, &cnames.service);
-        let program = c.program.as_ref().unwrap();
-
-        let mut service_ports: Vec<ServicePort> = Vec::new();
-        if let Some(network) = &program.network {
-            for ep in &network.endpoints {
-                service_ports.push(ServicePort {
-                    name: sanitize_port_name(&ep.name),
-                    port: ep.port,
-                    target_port: ep.port,
-                    protocol: "TCP",
-                });
-            }
-        }
-
-        if service_ports.is_empty() {
-            continue;
-        }
+        let mesh_port = *mesh_ports_by_component.get(id).expect("mesh port missing");
 
         let selector = {
             let mut m = BTreeMap::new();
             m.insert("amber.io/component".to_string(), cnames.service.clone());
             m
         };
+
+        let service_ports = vec![ServicePort {
+            name: "mesh".to_string(),
+            port: mesh_port,
+            target_port: mesh_port,
+            protocol: "TCP",
+        }];
 
         let svc = Service::new(&cnames.service, &namespace, labels, selector, service_ports);
 
@@ -917,7 +975,7 @@ fn render_kubernetes_inner(
         let mut netpol = NetworkPolicy::new(&cnames.netpol, &namespace, labels, pod_selector);
 
         // Add ingress rules for bound consumers + router exports.
-        if let Some(allowed) = address_plan.allow.for_component(*id) {
+        if let Some(allowed) = allow_plan.for_component(*id) {
             for (port, consumers) in allowed {
                 let from: Vec<NetworkPolicyPeer> = consumers
                     .iter()
@@ -965,52 +1023,60 @@ fn render_kubernetes_inner(
 
         let egress_from_consumers = egress_allow.get(id);
         let egress_to_router = egress_router_allow.get(id);
-        // Allow DNS (cluster resolvers are usually local).
-        netpol.add_egress_rule(NetworkPolicyEgressRule {
-            to: vec![NetworkPolicyPeer {
-                pod_selector: None,
-                namespace_selector: None,
-                ip_block: Some(IpBlock {
-                    cidr: "0.0.0.0/0".to_string(),
-                    except: Vec::new(),
-                }),
-            }],
-            ports: vec![
-                NetworkPolicyPort {
-                    protocol: "UDP",
-                    port: 53,
-                },
-                NetworkPolicyPort {
-                    protocol: "TCP",
-                    port: 53,
-                },
-            ],
-        });
-        // Allow internet egress while blocking local/private ranges.
-        netpol.add_egress_rule(NetworkPolicyEgressRule {
-            to: vec![NetworkPolicyPeer {
-                pod_selector: None,
-                namespace_selector: None,
-                ip_block: Some(IpBlock {
-                    cidr: "0.0.0.0/0".to_string(),
-                    except: local_cidrs.clone(),
-                }),
-            }],
-            ports: Vec::new(),
-        });
+        if egress_from_consumers.is_some() || egress_to_router.is_some() {
+            netpol.add_egress_rule(NetworkPolicyEgressRule {
+                to: vec![NetworkPolicyPeer {
+                    pod_selector: None,
+                    namespace_selector: None,
+                    ip_block: Some(IpBlock {
+                        cidr: "0.0.0.0/0".to_string(),
+                        except: Vec::new(),
+                    }),
+                }],
+                ports: vec![
+                    NetworkPolicyPort {
+                        protocol: "UDP",
+                        port: 53,
+                    },
+                    NetworkPolicyPort {
+                        protocol: "TCP",
+                        port: 53,
+                    },
+                ],
+            });
 
-        if let Some(by_provider) = egress_from_consumers {
-            for (provider, ports) in by_provider {
-                let provider_names = names.get(provider).unwrap();
-                let mut selector = BTreeMap::new();
-                selector.insert(
-                    "amber.io/component".to_string(),
-                    provider_names.service.clone(),
-                );
+            if let Some(by_provider) = egress_from_consumers {
+                for (provider, ports) in by_provider {
+                    let provider_names = names.get(provider).unwrap();
+                    let mut selector = BTreeMap::new();
+                    selector.insert(
+                        "amber.io/component".to_string(),
+                        provider_names.service.clone(),
+                    );
+                    netpol.add_egress_rule(NetworkPolicyEgressRule {
+                        to: vec![NetworkPolicyPeer {
+                            pod_selector: Some(LabelSelector {
+                                match_labels: selector,
+                            }),
+                            namespace_selector: None,
+                            ip_block: None,
+                        }],
+                        ports: ports
+                            .iter()
+                            .map(|port| NetworkPolicyPort {
+                                protocol: "TCP",
+                                port: *port,
+                            })
+                            .collect(),
+                    });
+                }
+            }
+
+            if let Some(ports) = egress_to_router {
                 netpol.add_egress_rule(NetworkPolicyEgressRule {
                     to: vec![NetworkPolicyPeer {
                         pod_selector: Some(LabelSelector {
-                            match_labels: selector,
+                            match_labels: router_selector.clone(),
                         }),
                         namespace_selector: None,
                         ip_block: None,
@@ -1024,25 +1090,6 @@ fn render_kubernetes_inner(
                         .collect(),
                 });
             }
-        }
-
-        if let Some(ports) = egress_to_router {
-            netpol.add_egress_rule(NetworkPolicyEgressRule {
-                to: vec![NetworkPolicyPeer {
-                    pod_selector: Some(LabelSelector {
-                        match_labels: router_selector.clone(),
-                    }),
-                    namespace_selector: None,
-                    ip_block: None,
-                }],
-                ports: ports
-                    .iter()
-                    .map(|port| NetworkPolicyPort {
-                        protocol: "TCP",
-                        port: *port,
-                    })
-                    .collect(),
-            });
         }
 
         files.insert(
@@ -1059,7 +1106,7 @@ fn render_kubernetes_inner(
             router_selector.clone(),
         );
 
-        if let Some(allowed) = address_plan.allow.for_router() {
+        if let Some(allowed) = allow_plan.for_router() {
             for (port, consumers) in allowed {
                 let from: Vec<NetworkPolicyPeer> = consumers
                     .iter()
@@ -1101,14 +1148,7 @@ fn render_kubernetes_inner(
             }
         }
 
-        if !router_export_ports.is_empty() {
-            let ports = router_export_ports
-                .iter()
-                .map(|port| NetworkPolicyPort {
-                    protocol: "TCP",
-                    port: *port,
-                })
-                .collect();
+        if !mesh_plan.exports.is_empty() {
             netpol.add_ingress_rule(NetworkPolicyIngressRule {
                 from: vec![NetworkPolicyPeer {
                     pod_selector: None,
@@ -1118,7 +1158,10 @@ fn render_kubernetes_inner(
                         except: Vec::new(),
                     }),
                 }],
-                ports,
+                ports: vec![NetworkPolicyPort {
+                    protocol: "TCP",
+                    port: router_mesh_port,
+                }],
             });
         }
 
@@ -1141,30 +1184,7 @@ fn render_kubernetes_inner(
     }
 
     // Metadata ConfigMap
-    let mut export_metadata: BTreeMap<String, ExportMetadata> = BTreeMap::new();
-    for ex in &mesh_plan.exports {
-        let provider = ex.provider;
-        let provider_names = names.get(&provider).unwrap();
-        let (service, port) = if needs_router {
-            let port = *export_ports_by_name
-                .get(&ex.name)
-                .unwrap_or(&ex.endpoint.port);
-            (ROUTER_NAME.to_string(), port)
-        } else {
-            (provider_names.service.clone(), ex.endpoint.port)
-        };
-
-        export_metadata.insert(
-            ex.name.clone(),
-            ExportMetadata {
-                component: s.component(provider).moniker.as_str().to_string(),
-                provide: ex.provide.clone(),
-                service,
-                port,
-                kind: format!("{}", ex.capability.kind),
-            },
-        );
-    }
+    let export_metadata = collect_exports_metadata(s, &mesh_plan, router_mesh_port);
 
     let mut input_metadata: BTreeMap<String, InputMetadata> = BTreeMap::new();
     for leaf in root_leaves {
@@ -1177,30 +1197,14 @@ fn render_kubernetes_inner(
         );
     }
 
-    let mut external_slot_metadata: BTreeMap<String, ExternalSlotMetadata> = BTreeMap::new();
-    for slot in router_external_slots {
-        let decl = root_slots.get(slot.name.as_str()).ok_or_else(|| {
-            ReporterError::new(format!(
-                "internal error: external slot `{}` is referenced by router metadata but missing \
-                 from root slot declarations",
-                slot.name
-            ))
-        })?;
-        external_slot_metadata.insert(
-            slot.name.clone(),
-            ExternalSlotMetadata {
-                required: !decl.optional,
-                kind: format!("{}", decl.decl.kind),
-            },
-        );
-    }
+    let external_slot_metadata = collect_external_slot_metadata(root_manifest, &mesh_plan);
 
     let scenario_metadata = ScenarioMetadata {
         version: "1",
         digest: s.component(s.root).digest.to_string(),
-        exports: export_metadata,
+        exports: export_metadata.clone(),
         inputs: input_metadata,
-        external_slots: external_slot_metadata,
+        external_slots: external_slot_metadata.clone(),
     };
 
     let metadata_json = serde_json::to_string_pretty(&scenario_metadata)
@@ -1220,6 +1224,145 @@ fn render_kubernetes_inner(
         to_yaml(&metadata_cm)?,
     );
 
+    if !mesh_provision_plan.targets.is_empty() {
+        let mut secret_names = BTreeSet::new();
+        for target in &mesh_provision_plan.targets {
+            if let MeshProvisionOutput::KubernetesSecret { name, .. } = &target.output {
+                secret_names.insert(name.clone());
+            }
+        }
+        let secret_names: Vec<String> = secret_names.into_iter().collect();
+
+        let plan_json = serde_json::to_string_pretty(&mesh_provision_plan)
+            .map_err(|e| ReporterError::new(format!("failed to serialize mesh plan: {e}")))?;
+        let mut plan_data = BTreeMap::new();
+        plan_data.insert(PROVISIONER_PLAN_KEY.to_string(), plan_json);
+        let plan_cm = ConfigMap::new(
+            PROVISIONER_CONFIGMAP_NAME,
+            &namespace,
+            scenario_labels(&[("amber.io/type", "mesh-provision")]),
+            plan_data,
+        );
+        files.insert(
+            PathBuf::from("01-configmaps/amber-mesh-provision.yaml"),
+            to_yaml(&plan_cm)?,
+        );
+
+        let service_account = ServiceAccount::new(PROVISIONER_SERVICE_ACCOUNT, &namespace);
+        files.insert(
+            PathBuf::from("02-rbac/amber-provisioner-sa.yaml"),
+            to_yaml(&service_account)?,
+        );
+
+        let role = Role::new(
+            PROVISIONER_ROLE_NAME,
+            &namespace,
+            vec![
+                PolicyRule {
+                    api_groups: vec!["".to_string()],
+                    resources: vec!["secrets".to_string()],
+                    verbs: vec!["create".to_string()],
+                    resource_names: None,
+                },
+                PolicyRule {
+                    api_groups: vec!["".to_string()],
+                    resources: vec!["secrets".to_string()],
+                    verbs: vec!["get".to_string(), "update".to_string()],
+                    resource_names: Some(secret_names),
+                },
+            ],
+        );
+        files.insert(
+            PathBuf::from("02-rbac/amber-provisioner-role.yaml"),
+            to_yaml(&role)?,
+        );
+
+        let role_binding = RoleBinding::new(
+            PROVISIONER_ROLE_BINDING_NAME,
+            &namespace,
+            Subject {
+                kind: "ServiceAccount".to_string(),
+                name: PROVISIONER_SERVICE_ACCOUNT.to_string(),
+                namespace: Some(namespace.clone()),
+            },
+            RoleRef {
+                api_group: "rbac.authorization.k8s.io".to_string(),
+                kind: "Role".to_string(),
+                name: PROVISIONER_ROLE_NAME.to_string(),
+            },
+        );
+        files.insert(
+            PathBuf::from("02-rbac/amber-provisioner-rolebinding.yaml"),
+            to_yaml(&role_binding)?,
+        );
+
+        let plan_mount_name = "mesh-plan";
+        let plan_mount_dir = "/etc/amber";
+        let container = Container {
+            name: PROVISIONER_NAME.to_string(),
+            image: images.provisioner.clone(),
+            command: Vec::new(),
+            args: Vec::new(),
+            env: vec![EnvVar::literal(
+                "AMBER_MESH_PROVISION_PLAN_PATH",
+                format!("{plan_mount_dir}/{PROVISIONER_PLAN_KEY}"),
+            )],
+            env_from: Vec::new(),
+            ports: Vec::new(),
+            readiness_probe: None,
+            volume_mounts: vec![VolumeMount {
+                name: plan_mount_name.to_string(),
+                mount_path: plan_mount_dir.to_string(),
+                read_only: Some(true),
+            }],
+        };
+
+        let job = Job::new_with_backoff_limit(
+            PROVISIONER_NAME,
+            &namespace,
+            scenario_labels(&[("amber.io/type", "provisioner")]),
+            PodTemplateSpec {
+                metadata: ObjectMeta {
+                    labels: scenario_labels(&[("amber.io/type", "provisioner")]),
+                    ..Default::default()
+                },
+                spec: PodSpec {
+                    init_containers: Vec::new(),
+                    containers: vec![container],
+                    volumes: vec![Volume::config_map(
+                        plan_mount_name.to_string(),
+                        PROVISIONER_CONFIGMAP_NAME,
+                    )],
+                    service_account_name: Some(PROVISIONER_SERVICE_ACCOUNT.to_string()),
+                    automount_service_account_token: None,
+                    restart_policy: Some("Never"),
+                },
+            },
+            Some(PROVISIONER_JOB_BACKOFF_LIMIT),
+        );
+        files.insert(
+            PathBuf::from("02-rbac/amber-provisioner-job.yaml"),
+            to_yaml(&job)?,
+        );
+    }
+
+    if needs_router {
+        let router_metadata = RouterMetadata {
+            mesh_port: router_mesh_port,
+            control_port: router_ports.as_ref().expect("router ports missing").control,
+            control_socket: None,
+        };
+        let proxy_metadata = ProxyMetadata {
+            version: PROXY_METADATA_VERSION.to_string(),
+            router: Some(router_metadata),
+            exports: export_metadata.clone(),
+            external_slots: external_slot_metadata.clone(),
+        };
+        let proxy_json = serde_json::to_string_pretty(&proxy_metadata)
+            .map_err(|e| ReporterError::new(format!("failed to serialize proxy metadata: {e}")))?;
+        files.insert(PathBuf::from(PROXY_METADATA_FILENAME), proxy_json);
+    }
+
     // Build and insert kustomization with actual file paths.
     // Always generate kustomization.yaml for consistency, even if not using helper mode.
     let mut kust_resources = Vec::new();
@@ -1228,9 +1371,10 @@ fn render_kubernetes_inner(
     for path in files.keys() {
         if path == &PathBuf::from("root-config.env")
             || path == &PathBuf::from("root-config-secret.env")
-            || path == &PathBuf::from("router-external.env")
+            || path == &PathBuf::from(DEFAULT_EXTERNAL_ENV_FILE)
+            || path == &PathBuf::from(PROXY_METADATA_FILENAME)
         {
-            continue; // Skip .env template files
+            continue; // Skip non-resource files.
         }
         kust_resources.push(path.to_string_lossy().to_string());
     }
@@ -1382,6 +1526,60 @@ fn program_image_error(
             )]);
     }
     error
+}
+
+fn build_provision_plan(
+    mesh_config_plan: &crate::targets::mesh::mesh_config::MeshConfigPlan,
+    program_components: &[ComponentId],
+    names: &HashMap<ComponentId, ComponentNames>,
+    namespace: &str,
+) -> Result<MeshProvisionPlan, String> {
+    let mut targets = Vec::new();
+    for id in program_components {
+        let cnames = names
+            .get(id)
+            .ok_or_else(|| format!("missing service name for component {id:?}"))?;
+        let template = mesh_config_plan
+            .component_configs
+            .get(id)
+            .ok_or_else(|| format!("missing config template for component {id:?}"))?
+            .clone();
+        targets.push(MeshProvisionTarget {
+            kind: MeshProvisionTargetKind::Component,
+            config: template,
+            output: MeshProvisionOutput::KubernetesSecret {
+                name: mesh_secret_name(&cnames.service),
+                namespace: Some(namespace.to_string()),
+            },
+        });
+    }
+    if let Some(router_template) = mesh_config_plan.router_config.as_ref() {
+        let mut router_template = router_template.clone();
+        if let Some(control_listen) = router_template.control_listen {
+            router_template.control_listen = Some(
+                format!("127.0.0.1:{}", control_listen.port())
+                    .parse()
+                    .expect("control listen"),
+            );
+        }
+        router_template.control_allow = Some(vec!["127.0.0.1".to_string(), "::1".to_string()]);
+        targets.push(MeshProvisionTarget {
+            kind: MeshProvisionTargetKind::Router,
+            config: router_template,
+            output: MeshProvisionOutput::KubernetesSecret {
+                name: mesh_secret_name(ROUTER_NAME),
+                namespace: Some(namespace.to_string()),
+            },
+        });
+    }
+    Ok(MeshProvisionPlan {
+        version: MESH_PROVISION_PLAN_VERSION.to_string(),
+        targets,
+    })
+}
+
+fn mesh_secret_name(service: &str) -> String {
+    format!("{service}-mesh")
 }
 
 fn generate_namespace_name(s: &Scenario) -> String {
@@ -1615,6 +1813,8 @@ fn generate_netpol_enforcement_check(
                         ..Default::default()
                     }],
                     volumes: Vec::new(),
+                    service_account_name: None,
+                    automount_service_account_token: Some(false),
                     restart_policy: None,
                 },
             },
@@ -1803,6 +2003,8 @@ while true; do echo "ready" | nc -l -p 8080 >/dev/null; done
                         ..Default::default()
                     }],
                     volumes: Vec::new(),
+                    service_account_name: None,
+                    automount_service_account_token: Some(false),
                     restart_policy: None,
                 },
             },

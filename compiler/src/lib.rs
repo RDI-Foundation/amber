@@ -22,6 +22,7 @@ mod environment;
 mod frontend;
 mod linker;
 mod manifest_table;
+pub mod mesh;
 mod mir;
 mod provenance;
 mod slot_query;
