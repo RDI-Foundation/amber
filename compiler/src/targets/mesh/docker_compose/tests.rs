@@ -1553,6 +1553,18 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         cmd.current_dir(project).arg("compose").args(args);
         cmd
     };
+    let dump = |args: &[&str]| -> String {
+        let output = compose(args).output();
+        match output {
+            Ok(output) => format!(
+                "status: {}\nstdout:\n{}\nstderr:\n{}\n",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(err) => format!("failed to run {:?}: {err}\n", args),
+        }
+    };
 
     // Up
     let status = compose(&["up", "-d"]).status().unwrap();
@@ -1570,18 +1582,6 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
     .output()
     .unwrap();
     if !ok.status.success() {
-        let dump = |args: &[&str]| -> String {
-            let output = compose(args).output();
-            match output {
-                Ok(output) => format!(
-                    "status: {}\nstdout:\n{}\nstderr:\n{}\n",
-                    output.status,
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-                Err(err) => format!("failed to run {:?}: {err}\n", args),
-            }
-        };
         let debug = format!(
             "allowed stdout:\n{}\nallowed stderr:\n{}\n\nserver container:\n{}\nserver \
              sidecar:\n{}\nallowed sidecar:\n{}\ncompose logs:\n{}",
@@ -1614,6 +1614,109 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
             dump(&["logs", "--no-color"]),
         );
         panic!("allowed client could not reach server via binding\n{debug}");
+    }
+
+    // Allowed should reach the public internet (example.com). If Docker itself can't reach a
+    // public IP, skip the external check to avoid false failures in restricted environments.
+    let docker_public_ok = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "alpine:3.20",
+            "sh",
+            "-lc",
+            r#"wget -qO- --timeout=2 --tries=1 "http://1.1.1.1/" >/dev/null 2>&1"#,
+        ])
+        .status()
+        .ok()
+        .is_some_and(|status| status.success());
+    if docker_public_ok {
+        let external = compose(&[
+            "exec",
+            "-T",
+            "c2-allowed",
+            "sh",
+            "-lc",
+            r#"
+is_private_ip() {
+  ip="$1"
+  case "$ip" in
+    10.*|192.168.*|169.254.*) return 0 ;;
+    172.*)
+      o2="$(printf '%s' "$ip" | cut -d. -f2)"
+      [ "$o2" -ge 16 ] && [ "$o2" -le 31 ] && return 0
+      ;;
+    100.*)
+      o2="$(printf '%s' "$ip" | cut -d. -f2)"
+      [ "$o2" -ge 64 ] && [ "$o2" -le 127 ] && return 0
+      ;;
+  esac
+  return 1
+}
+
+ip=""
+if command -v getent >/dev/null 2>&1; then
+  ip="$(getent hosts example.com | awk 'NR==1 {print $1}')"
+fi
+
+if [ -n "$ip" ] && is_private_ip "$ip"; then
+  echo "example.com resolved to private $ip; checking public IP instead" 1>&2
+  i=0; while [ $i -lt 10 ]; do
+    if wget -qO- --timeout=2 --tries=1 "http://1.1.1.1/" >/dev/null 2>&1; then exit 0; fi
+    i=$((i+1)); sleep 1
+  done
+  exit 1
+fi
+
+i=0; while [ $i -lt 10 ]; do
+  if wget -qO- --timeout=2 --tries=1 "http://example.com/" >/dev/null 2>&1; then exit 0; fi
+  i=$((i+1)); sleep 1
+done
+echo "example.com fetch failed; checking public IP instead" 1>&2
+i=0; while [ $i -lt 10 ]; do
+  if wget -qO- --timeout=2 --tries=1 "http://1.1.1.1/" >/dev/null 2>&1; then exit 0; fi
+  i=$((i+1)); sleep 1
+done
+exit 1
+"#,
+        ])
+        .output()
+        .unwrap();
+        if !external.status.success() {
+            let iptables_output =
+                dump(&["exec", "-T", "c2-allowed-net", "sh", "-lc", "iptables -S"]);
+            let output_accept = iptables_output.contains("-P OUTPUT ACCEPT");
+            let has_global_reject = iptables_output
+                .lines()
+                .filter(|line| line.starts_with("-A OUTPUT "))
+                .any(|line| {
+                    (line.contains(" -j DROP") || line.contains(" -j REJECT"))
+                        && !line.contains(" -d ")
+                });
+            if output_accept && !has_global_reject {
+                eprintln!(
+                    "skipping external egress assertion: OUTPUT is ACCEPT and no global \
+                     drop/reject rules"
+                );
+                return;
+            }
+            let debug = format!(
+                "external stdout:\n{}\nexternal stderr:\n{}\n\nallowed sidecar:\n{}",
+                String::from_utf8_lossy(&external.stdout),
+                String::from_utf8_lossy(&external.stderr),
+                dump(&[
+                    "exec",
+                    "-T",
+                    "c2-allowed-net",
+                    "sh",
+                    "-lc",
+                    "ip -4 addr && iptables -S && cat /etc/resolv.conf"
+                ])
+            );
+            panic!("allowed client could not reach example.com\n{debug}");
+        }
+    } else {
+        eprintln!("skipping external egress check: docker cannot reach public IP");
     }
 
     // Denied should fail when calling server sidecar DNS name directly.

@@ -30,6 +30,32 @@ fn docker_platform() -> String {
     format!("linux/{arch}")
 }
 
+fn tool_available(cmd: &str, args: &[&str]) -> bool {
+    Command::new(cmd)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()
+        .is_some_and(|status| status.success())
+}
+
+fn k8s_smoke_preflight() -> bool {
+    if !tool_available("docker", &["info"]) {
+        eprintln!("skipping kubernetes smoke test: docker daemon unavailable");
+        return false;
+    }
+    if !tool_available("kind", &["version"]) {
+        eprintln!("skipping kubernetes smoke test: kind not available");
+        return false;
+    }
+    if !tool_available("kubectl", &["version", "--client=true", "--short"]) {
+        eprintln!("skipping kubernetes smoke test: kubectl not available");
+        return false;
+    }
+    true
+}
+
 fn image_platform_opt(tag: &str) -> Option<String> {
     let output = Command::new("docker")
         .arg("image")
@@ -156,16 +182,25 @@ struct KindClusterGuard {
 }
 
 impl KindClusterGuard {
-    fn new(name: String) -> Self {
-        let mut cmd = Command::new("kind");
-        cmd.arg("create")
+    fn try_new(name: String) -> Result<Self, String> {
+        let output = Command::new("kind")
+            .arg("create")
             .arg("cluster")
             .arg("--name")
             .arg(&name)
             .arg("--wait")
-            .arg("120s");
-        checked_status(&mut cmd, "kind create cluster");
-        Self { name }
+            .arg("120s")
+            .output()
+            .map_err(|err| format!("failed to run kind create cluster: {err}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "kind create cluster failed (status: {})\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(Self { name })
     }
 }
 
@@ -409,6 +444,10 @@ fn kubernetes_emits_router_for_external_slots() {
 #[test]
 #[ignore = "requires docker + kind + kubectl + curl; run manually"]
 fn kubernetes_smoke_config_roundtrip() {
+    if !k8s_smoke_preflight() {
+        return;
+    }
+
     let workspace = workspace_root();
     let scenario_path = workspace.join("test-scenarios/kubernetes-basic/scenario.json5");
 
@@ -453,7 +492,13 @@ fn kubernetes_smoke_config_roundtrip() {
         .expect("system time")
         .as_secs();
     let cluster_name = format!("amber-test-{}-{nonce}", std::process::id());
-    let _cluster_guard = KindClusterGuard::new(cluster_name.clone());
+    let _cluster_guard = match KindClusterGuard::try_new(cluster_name.clone()) {
+        Ok(guard) => guard,
+        Err(err) => {
+            eprintln!("skipping kubernetes smoke test: {err}");
+            return;
+        }
+    };
 
     for image in [HELPER_IMAGE, ROUTER_IMAGE, "busybox:1.36"] {
         let mut cmd = Command::new("kind");
@@ -557,6 +602,10 @@ fn kubernetes_smoke_config_roundtrip() {
 #[test]
 #[ignore = "requires docker + kind + kubectl; run manually"]
 fn kubernetes_smoke_external_slot_routes_to_outside_service() {
+    if !k8s_smoke_preflight() {
+        return;
+    }
+
     let dir = tempdir().expect("temp dir");
     let root_path = dir.path().join("root.json5");
     let client_path = dir.path().join("client.json5");
@@ -635,7 +684,13 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
         .expect("system time")
         .as_secs();
     let cluster_name = format!("amber-test-{}-{nonce}", std::process::id());
-    let _cluster_guard = KindClusterGuard::new(cluster_name.clone());
+    let _cluster_guard = match KindClusterGuard::try_new(cluster_name.clone()) {
+        Ok(guard) => guard,
+        Err(err) => {
+            eprintln!("skipping kubernetes smoke test: {err}");
+            return;
+        }
+    };
 
     for image in [ROUTER_IMAGE, "busybox:1.36.1"] {
         let mut cmd = Command::new("kind");

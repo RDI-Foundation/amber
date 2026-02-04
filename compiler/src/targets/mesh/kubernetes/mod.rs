@@ -15,6 +15,7 @@ use crate::{
     CompileOutput,
     reporter::{Reporter, ReporterError},
     targets::mesh::{
+        LOCAL_NETWORK_CIDRS,
         addressing::{Addressing, RouterPortBases, WorkloadId, build_address_plan},
         config::{ProgramPlan, encode_helper_payload, encode_schema_b64},
         plan::{MeshOptions, component_label},
@@ -231,6 +232,10 @@ fn render_kubernetes(
     let mut egress_allow: HashMap<ComponentId, BTreeMap<ComponentId, BTreeSet<u16>>> =
         HashMap::new();
     let mut egress_router_allow: HashMap<ComponentId, BTreeSet<u16>> = HashMap::new();
+    let local_cidrs: Vec<String> = LOCAL_NETWORK_CIDRS
+        .iter()
+        .map(|cidr| (*cidr).to_string())
+        .collect();
 
     for (provider, by_port) in &address_plan.allow.by_provider {
         match provider {
@@ -878,60 +883,52 @@ fn render_kubernetes(
 
         let egress_from_consumers = egress_allow.get(id);
         let egress_to_router = egress_router_allow.get(id);
-        if egress_from_consumers.is_some() || egress_to_router.is_some() {
-            netpol.add_egress_rule(NetworkPolicyEgressRule {
-                to: vec![NetworkPolicyPeer {
-                    pod_selector: None,
-                    namespace_selector: None,
-                    ip_block: Some(IpBlock {
-                        cidr: "0.0.0.0/0".to_string(),
-                        except: Vec::new(),
-                    }),
-                }],
-                ports: vec![
-                    NetworkPolicyPort {
-                        protocol: "UDP",
-                        port: 53,
-                    },
-                    NetworkPolicyPort {
-                        protocol: "TCP",
-                        port: 53,
-                    },
-                ],
-            });
+        // Allow DNS (cluster resolvers are usually local).
+        netpol.add_egress_rule(NetworkPolicyEgressRule {
+            to: vec![NetworkPolicyPeer {
+                pod_selector: None,
+                namespace_selector: None,
+                ip_block: Some(IpBlock {
+                    cidr: "0.0.0.0/0".to_string(),
+                    except: Vec::new(),
+                }),
+            }],
+            ports: vec![
+                NetworkPolicyPort {
+                    protocol: "UDP",
+                    port: 53,
+                },
+                NetworkPolicyPort {
+                    protocol: "TCP",
+                    port: 53,
+                },
+            ],
+        });
+        // Allow internet egress while blocking local/private ranges.
+        netpol.add_egress_rule(NetworkPolicyEgressRule {
+            to: vec![NetworkPolicyPeer {
+                pod_selector: None,
+                namespace_selector: None,
+                ip_block: Some(IpBlock {
+                    cidr: "0.0.0.0/0".to_string(),
+                    except: local_cidrs.clone(),
+                }),
+            }],
+            ports: Vec::new(),
+        });
 
-            if let Some(by_provider) = egress_from_consumers {
-                for (provider, ports) in by_provider {
-                    let provider_names = names.get(provider).unwrap();
-                    let mut selector = BTreeMap::new();
-                    selector.insert(
-                        "amber.io/component".to_string(),
-                        provider_names.service.clone(),
-                    );
-                    netpol.add_egress_rule(NetworkPolicyEgressRule {
-                        to: vec![NetworkPolicyPeer {
-                            pod_selector: Some(LabelSelector {
-                                match_labels: selector,
-                            }),
-                            namespace_selector: None,
-                            ip_block: None,
-                        }],
-                        ports: ports
-                            .iter()
-                            .map(|port| NetworkPolicyPort {
-                                protocol: "TCP",
-                                port: *port,
-                            })
-                            .collect(),
-                    });
-                }
-            }
-
-            if let Some(ports) = egress_to_router {
+        if let Some(by_provider) = egress_from_consumers {
+            for (provider, ports) in by_provider {
+                let provider_names = names.get(provider).unwrap();
+                let mut selector = BTreeMap::new();
+                selector.insert(
+                    "amber.io/component".to_string(),
+                    provider_names.service.clone(),
+                );
                 netpol.add_egress_rule(NetworkPolicyEgressRule {
                     to: vec![NetworkPolicyPeer {
                         pod_selector: Some(LabelSelector {
-                            match_labels: router_selector.clone(),
+                            match_labels: selector,
                         }),
                         namespace_selector: None,
                         ip_block: None,
@@ -945,6 +942,25 @@ fn render_kubernetes(
                         .collect(),
                 });
             }
+        }
+
+        if let Some(ports) = egress_to_router {
+            netpol.add_egress_rule(NetworkPolicyEgressRule {
+                to: vec![NetworkPolicyPeer {
+                    pod_selector: Some(LabelSelector {
+                        match_labels: router_selector.clone(),
+                    }),
+                    namespace_selector: None,
+                    ip_block: None,
+                }],
+                ports: ports
+                    .iter()
+                    .map(|port| NetworkPolicyPort {
+                        protocol: "TCP",
+                        port: *port,
+                    })
+                    .collect(),
+            });
         }
 
         files.insert(

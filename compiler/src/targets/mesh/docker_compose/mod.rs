@@ -14,6 +14,7 @@ use crate::{
     CompileOutput,
     reporter::{Reporter, ReporterError},
     targets::mesh::{
+        LOCAL_NETWORK_CIDRS,
         addressing::{Addressing, RouterPortBases, WorkloadId, build_address_plan},
         config::{ProgramPlan, encode_helper_payload, encode_schema_b64},
         plan::{
@@ -72,6 +73,12 @@ struct EmptyMap {}
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct Network {
     driver: String,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        rename = "driver_opts"
+    )]
+    driver_opts: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -789,6 +796,10 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         MESH_NETWORK_NAME.to_string(),
         Network {
             driver: "bridge".to_string(),
+            driver_opts: BTreeMap::from([(
+                "com.docker.network.bridge.enable_ip_masquerade".to_string(),
+                "true".to_string(),
+            )]),
         },
     );
 
@@ -946,12 +957,12 @@ fn build_sidecar_script(
     inbound: Vec<(u16, &BTreeSet<String>)>,
     exported_ports: Option<&BTreeSet<u16>>,
     proxies: Option<&Vec<SlotProxy>>,
-    restrict_egress: bool,
+    block_local_egress: bool,
 ) -> String {
     let mut script = String::new();
 
     let mut egress_targets: Vec<(String, u16)> = Vec::new();
-    if restrict_egress && let Some(ps) = proxies {
+    if block_local_egress && let Some(ps) = proxies {
         let mut seen: BTreeSet<(String, u16)> = BTreeSet::new();
         for p in ps {
             seen.insert((p.remote_host.clone(), p.remote_port));
@@ -967,19 +978,14 @@ fn build_sidecar_script(
     writeln!(&mut script, "iptables -w -X").unwrap();
     writeln!(&mut script, "iptables -w -P INPUT DROP").unwrap();
     writeln!(&mut script, "iptables -w -P FORWARD DROP").unwrap();
-    writeln!(
-        &mut script,
-        "iptables -w -P OUTPUT {}",
-        if restrict_egress { "DROP" } else { "ACCEPT" }
-    )
-    .unwrap();
+    writeln!(&mut script, "iptables -w -P OUTPUT ACCEPT").unwrap();
     writeln!(&mut script, "iptables -w -A INPUT -i lo -j ACCEPT").unwrap();
     writeln!(
         &mut script,
         "iptables -w -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
     )
     .unwrap();
-    if restrict_egress {
+    if block_local_egress {
         writeln!(&mut script, "iptables -w -A OUTPUT -o lo -j ACCEPT").unwrap();
         writeln!(
             &mut script,
@@ -1005,6 +1011,14 @@ fn build_sidecar_script(
         writeln!(&mut script, "done").unwrap();
         writeln!(&mut script, "iptables -w -N AMBER-ALLOW-OUT").unwrap();
         writeln!(&mut script, "iptables -w -A OUTPUT -j AMBER-ALLOW-OUT").unwrap();
+        for cidr in LOCAL_NETWORK_CIDRS {
+            writeln!(
+                &mut script,
+                "iptables -w -A OUTPUT -d {cidr} -p tcp -j REJECT --reject-with tcp-reset"
+            )
+            .unwrap();
+            writeln!(&mut script, "iptables -w -A OUTPUT -d {cidr} -j REJECT").unwrap();
+        }
     }
     writeln!(&mut script, "iptables -w -N AMBER-ALLOW").unwrap();
     writeln!(&mut script, "iptables -w -A INPUT -j AMBER-ALLOW").unwrap();
@@ -1025,7 +1039,7 @@ fn build_sidecar_script(
     .unwrap();
     writeln!(&mut script, "  fi").unwrap();
     writeln!(&mut script, "}}").unwrap();
-    if restrict_egress {
+    if block_local_egress {
         writeln!(&mut script, "add_out_rule() {{").unwrap();
         writeln!(&mut script, "  if [ -n \"$1\" ]; then").unwrap();
         writeln!(&mut script, "    printf '%s\\n' \"$1\" >> \"$desired_out\"").unwrap();
@@ -1036,7 +1050,7 @@ fn build_sidecar_script(
     writeln!(&mut script, "  set +e").unwrap();
     writeln!(&mut script, "  desired_rules=\"/tmp/amber-allowlist\"").unwrap();
     writeln!(&mut script, "  : > \"$desired_rules\"").unwrap();
-    if restrict_egress {
+    if block_local_egress {
         writeln!(&mut script, "  desired_out=\"/tmp/amber-allowlist-out\"").unwrap();
         writeln!(&mut script, "  : > \"$desired_out\"").unwrap();
     }
@@ -1078,7 +1092,7 @@ fn build_sidecar_script(
             writeln!(&mut script, "  fi").unwrap();
         }
     }
-    if restrict_egress {
+    if block_local_egress {
         for (host, port) in &egress_targets {
             writeln!(&mut script, "  for ip in $(resolve_ipv4 \"{host}\"); do").unwrap();
             writeln!(
