@@ -37,11 +37,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: mozilla-actions/sccache-action@v0.0.9
       - run: cargo test --workspace --all-features
-      - run: cargo test -p amber-compiler --all-features docker_smoke_ocap_blocks_unbound_callers -- --ignored --test-threads=1
-      - run: cargo test -p amber-compiler --all-features docker_smoke_config_forwarding_runtime_validation -- --ignored --test-threads=1
-      - run: cargo test -p amber-compiler --all-features docker_smoke_external_slot_routes_to_outside_service -- --ignored --test-threads=1
-      - run: cargo test -p amber-compiler --all-features docker_smoke_export_routes_to_host -- --ignored --test-threads=1
-      - run: cargo test -p amber-helper --all-features helper_image_executes_run_plan_in_scratch -- --ignored --test-threads=1
 
   kubernetes-tests:
     name: Kubernetes Reporter Tests
@@ -191,3 +186,62 @@ jobs:
               "${image}:${{ github.sha }}-amd64" \
               "${image}:${{ github.sha }}-arm64"
           done <<< "$images"
+
+  docker-tests:
+    name: Docker Smoke Tests (prebuilt images)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    needs: docker-merge
+    permissions:
+      contents: read
+      packages: read
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      AMBER_TEST_USE_PREBUILT_IMAGES: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Compute image registries
+        id: registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner_lc="$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          ci_registry="ghcr.io/${owner_lc}"
+          code_registry="$(jq -r '.registry' docker/images.json)"
+          if [ -z "$code_registry" ] || [ "$code_registry" = "null" ]; then
+            echo "docker/images.json registry is missing" >&2
+            exit 1
+          fi
+          code_registry="${code_registry%/}"
+          echo "CI_IMAGE_REGISTRY=${ci_registry}" >> "$GITHUB_ENV"
+          echo "CODE_IMAGE_REGISTRY=${code_registry}" >> "$GITHUB_ENV"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull and retag images for tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -c '.images[] | select(.code_tag != null) | {name, code_tag}' docker/images.json | while read -r spec; do
+            name="$(jq -r '.name' <<< "$spec")"
+            code_tag="$(jq -r '.code_tag' <<< "$spec")"
+            src="${CI_IMAGE_REGISTRY}/${name}:${GITHUB_SHA}"
+            docker pull "$src"
+            docker tag "$src" "${CODE_IMAGE_REGISTRY}/${name}:${code_tag}"
+            if [ "$name" = "amber-helper" ]; then
+              docker tag "$src" "amber-helper:e2e"
+            fi
+          done
+      - name: Run docker compose smoke tests
+        run: |
+          cargo test -p amber-compiler --all-features docker_smoke_ocap_blocks_unbound_callers -- --ignored --test-threads=1
+          cargo test -p amber-compiler --all-features docker_smoke_config_forwarding_runtime_validation -- --ignored --test-threads=1
+          cargo test -p amber-compiler --all-features docker_smoke_external_slot_routes_to_outside_service -- --ignored --test-threads=1
+          cargo test -p amber-compiler --all-features docker_smoke_export_routes_to_host -- --ignored --test-threads=1
+      - name: Run helper docker smoke test
+        run: cargo test -p amber-helper --all-features helper_image_executes_run_plan_in_scratch -- --ignored --test-threads=1

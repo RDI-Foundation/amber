@@ -47,6 +47,19 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn use_prebuilt_images() -> bool {
+    std::env::var("AMBER_TEST_USE_PREBUILT_IMAGES").is_ok()
+}
+
+fn prebuilt_image_platform(tag: &str) -> String {
+    image_platform_opt(tag).unwrap_or_else(|| {
+        panic!(
+            "AMBER_TEST_USE_PREBUILT_IMAGES is set but {tag} is not available locally. Ensure the \
+             image is pulled and tagged before running tests."
+        )
+    })
+}
+
 fn image_platform_opt(tag: &str) -> Option<String> {
     let output = std::process::Command::new("docker")
         .arg("image")
@@ -100,6 +113,9 @@ fn ensure_image_platform(tag: &str, platform: &str) {
 }
 
 fn build_docker_image(tag: &str, dockerfile: &Path, context: &Path) -> String {
+    if use_prebuilt_images() {
+        return prebuilt_image_platform(tag);
+    }
     let status = std::process::Command::new("docker")
         .arg("buildx")
         .arg("build")
