@@ -5,7 +5,6 @@ use std::{
 };
 
 use amber_config as rc;
-use amber_images::{AMBER_HELPER, AMBER_ROUTER, AMBER_SIDECAR};
 use amber_scenario::{ComponentId, Scenario};
 use miette::LabeledSpan;
 use serde::{Deserialize, Serialize};
@@ -17,6 +16,7 @@ use crate::{
         LOCAL_NETWORK_CIDRS,
         addressing::{Addressing, RouterPortBases, WorkloadId, build_address_plan},
         config::{ProgramPlan, encode_helper_payload, encode_schema_b64},
+        internal_images::resolve_internal_images,
         plan::{
             MeshOptions, ResolvedBinding, ResolvedExport, ResolvedExternalBinding, component_label,
         },
@@ -25,9 +25,6 @@ use crate::{
 
 const MESH_NETWORK_NAME: &str = "amber_mesh";
 
-const SIDECAR_IMAGE: &str = AMBER_SIDECAR.reference;
-const HELPER_IMAGE: &str = AMBER_HELPER.reference;
-const ROUTER_IMAGE: &str = AMBER_ROUTER.reference;
 const ROUTER_SERVICE_NAME: &str = "amber-router";
 const HELPER_VOLUME_NAME: &str = "amber-helper-bin";
 const HELPER_INIT_SERVICE: &str = "amber-init";
@@ -525,6 +522,7 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
         },
     )
     .map_err(|e| DockerComposeError::Other(e.to_string()))?;
+    let images = resolve_internal_images().map_err(DockerComposeError::Other)?;
 
     let program_components = mesh_plan.program_components.as_slice();
 
@@ -667,7 +665,7 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
             .volumes
             .insert(HELPER_VOLUME_NAME.to_string(), EmptyMap::default());
 
-        let mut helper_init = Service::new(HELPER_IMAGE);
+        let mut helper_init = Service::new(images.helper.clone());
         helper_init.entrypoint = Some(vec![
             "/amber-helper".to_string(),
             "install".to_string(),
@@ -701,7 +699,8 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
         );
         let router_script = escape_compose_interpolation(&router_script).into_owned();
 
-        let mut router_sidecar = sidecar_service(&router_names.sidecar, router_script);
+        let mut router_sidecar =
+            sidecar_service(&router_names.sidecar, &images.sidecar, router_script);
         if !exports_by_name.is_empty() {
             for (export_name, meta) in &exports_by_name {
                 let router_port = address_plan
@@ -727,7 +726,7 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
             .services
             .insert(router_names.sidecar.clone(), router_sidecar);
 
-        let mut router_program = Service::new(ROUTER_IMAGE);
+        let mut router_program = Service::new(images.router.clone());
         router_program.network_mode = Some(format!("service:{}", router_names.sidecar));
 
         let mut env_entries = address_plan.router.router_env_passthrough.clone();
@@ -770,9 +769,10 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
             true,
         );
         let script = escape_compose_interpolation(&script).into_owned();
-        compose
-            .services
-            .insert(svc.sidecar.clone(), sidecar_service(&svc.sidecar, script));
+        compose.services.insert(
+            svc.sidecar.clone(),
+            sidecar_service(&svc.sidecar, &images.sidecar, script),
+        );
 
         let program = c.program.as_ref().unwrap();
         let mut program_service = Service::new(program.image.as_str());
@@ -889,8 +889,8 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
 
 // ---- helpers ----
 
-fn sidecar_service(name: &str, script: String) -> Service {
-    let mut service = Service::new(SIDECAR_IMAGE);
+fn sidecar_service(name: &str, image: &str, script: String) -> Service {
+    let mut service = Service::new(image);
     service.cap_add = vec!["NET_ADMIN".to_string()];
     service.cap_drop = vec!["ALL".to_string()];
     service.security_opt = vec!["no-new-privileges:true".to_string()];

@@ -6,14 +6,18 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use amber_images::{AMBER_HELPER, AMBER_ROUTER};
 use amber_manifest::ManifestRef;
 use amber_resolver::Resolver;
 use base64::Engine as _;
 use tempfile::tempdir;
 use url::Url;
 
-use super::{HELPER_IMAGE, KubernetesReporter, KubernetesReporterConfig, ROUTER_IMAGE};
+use super::{KubernetesReporter, KubernetesReporterConfig};
 use crate::{CompileOptions, Compiler, DigestStore, OptimizeOptions, reporter::Reporter as _};
+
+const HELPER_IMAGE: &str = AMBER_HELPER.reference;
+const ROUTER_IMAGE: &str = AMBER_ROUTER.reference;
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

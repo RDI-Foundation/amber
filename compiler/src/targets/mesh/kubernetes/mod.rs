@@ -6,7 +6,6 @@ use std::{
 };
 
 use amber_config as rc;
-use amber_images::{AMBER_HELPER, AMBER_ROUTER};
 use amber_scenario::{ComponentId, Scenario};
 pub use resources::*;
 use serde::Serialize;
@@ -17,6 +16,7 @@ use crate::{
         LOCAL_NETWORK_CIDRS,
         addressing::{Addressing, RouterPortBases, WorkloadId, build_address_plan},
         config::{ProgramPlan, encode_helper_payload, encode_schema_b64},
+        internal_images::resolve_internal_images,
         plan::{MeshOptions, component_label},
     },
 };
@@ -25,11 +25,9 @@ use crate::{
 // an init container installs the amber-helper binary into a shared volume, then the
 // main container uses the helper as its entrypoint to resolve config templates and
 // exec the actual program.
-const HELPER_IMAGE: &str = AMBER_HELPER.reference;
 const HELPER_VOLUME_NAME: &str = "amber-helper";
 const HELPER_BIN_DIR: &str = "/amber/bin";
 const HELPER_BIN_PATH: &str = "/amber/bin/amber-helper";
-const ROUTER_IMAGE: &str = AMBER_ROUTER.reference;
 const ROUTER_NAME: &str = "amber-router";
 const ROUTER_EXTERNAL_SECRET_NAME: &str = "amber-router-external";
 const ROUTER_EXTERNAL_PORT_BASE: u16 = 21000;
@@ -184,6 +182,7 @@ fn render_kubernetes(
         },
     )
     .map_err(|e| ReporterError::new(e.to_string()))?;
+    let images = resolve_internal_images().map_err(ReporterError::new)?;
 
     let program_components = mesh_plan.program_components.as_slice();
     // Generate namespace name.
@@ -606,7 +605,7 @@ fn render_kubernetes(
         if matches!(program_plan, ProgramPlan::Helper { .. }) {
             init_containers.push(Container {
                 name: "install-helper".to_string(),
-                image: HELPER_IMAGE.to_string(),
+                image: images.helper.clone(),
                 command: vec![
                     "/amber-helper".to_string(),
                     "install".to_string(),
@@ -712,7 +711,7 @@ fn render_kubernetes(
 
         let container = Container {
             name: "router".to_string(),
-            image: ROUTER_IMAGE.to_string(),
+            image: images.router.clone(),
             command: Vec::new(),
             args: Vec::new(),
             env,
