@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use amber_images::{AMBER_HELPER, AMBER_ROUTER, AMBER_SIDECAR};
 use amber_manifest::{FrameworkCapabilityName, ManifestDigest, ManifestRef, ProvideDecl, SlotDecl};
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
@@ -19,8 +20,12 @@ use base64::Engine as _;
 use serde_json::json;
 use url::Url;
 
-use super::{DockerComposeReporter, HELPER_IMAGE, ROUTER_IMAGE, SIDECAR_IMAGE};
+use super::DockerComposeReporter;
 use crate::reporter::Reporter as _;
+
+const SIDECAR_IMAGE: &str = AMBER_SIDECAR.reference;
+const HELPER_IMAGE: &str = AMBER_HELPER.reference;
+const ROUTER_IMAGE: &str = AMBER_ROUTER.reference;
 
 fn digest(byte: u8) -> ManifestDigest {
     ManifestDigest::new([byte; 32])
