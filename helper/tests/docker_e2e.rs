@@ -32,6 +32,20 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn use_prebuilt_images() -> bool {
+    std::env::var("AMBER_TEST_USE_PREBUILT_IMAGES").is_ok()
+}
+
+fn image_exists(tag: &str) -> bool {
+    Command::new("docker")
+        .arg("image")
+        .arg("inspect")
+        .arg(tag)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 fn docker_target_arch() -> &'static str {
     match std::env::consts::ARCH {
         "x86_64" => "amd64",
@@ -41,6 +55,14 @@ fn docker_target_arch() -> &'static str {
 }
 
 fn build_helper_image(tag: &str) {
+    if use_prebuilt_images() {
+        assert!(
+            image_exists(tag),
+            "AMBER_TEST_USE_PREBUILT_IMAGES is set but {tag} is not available locally. Ensure the \
+             image is pulled and tagged before running tests."
+        );
+        return;
+    }
     let root = workspace_root();
     let dockerfile = root.join("docker/amber-helper/Dockerfile");
     let status = Command::new("docker")
