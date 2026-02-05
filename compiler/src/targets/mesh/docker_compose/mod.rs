@@ -46,8 +46,8 @@ pub struct DockerComposeReporter;
 impl Reporter for DockerComposeReporter {
     type Artifact = String;
 
-    fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError> {
-        render_docker_compose(output)
+    fn emit(&self, scenario: &Scenario) -> Result<Self::Artifact, ReporterError> {
+        render_docker_compose(scenario)
     }
 }
 
@@ -212,7 +212,7 @@ impl From<crate::targets::mesh::plan::MeshError> for DockerComposeError {
 }
 
 impl DockerComposeError {
-    fn into_reporter_error(self, output: &CompileOutput) -> ReporterError {
+    fn into_reporter_error(self, scenario: &Scenario) -> ReporterError {
         match self {
             DockerComposeError::Other(message) => ReporterError::new(message),
             DockerComposeError::PortConflict(conflict) => {
@@ -224,7 +224,7 @@ impl DockerComposeError {
                     provide,
                     endpoint,
                 } = *conflict;
-                let component_moniker = output.scenario.component(component).moniker.as_str();
+                let component_moniker = scenario.component(component).moniker.as_str();
                 let message = format!(
                     "docker-compose output cannot enforce separate capabilities for provides \
                      `{first_provide}` and `{provide}` in component `{component_moniker}`: both \
@@ -232,81 +232,154 @@ impl DockerComposeError {
                 );
                 let help = "Expose each capability on its own port, or add an explicit L7 proxy \
                             component that maps each capability to a separate port.";
-
-                let prov = output.provenance.for_component(component);
-                let Some((src, spans)) = output.store.diagnostic_source(&prov.resolved_url) else {
-                    return ReporterError::new(message).with_help(help);
-                };
-
-                let mut labels = Vec::new();
-                let mut has_primary = false;
-
-                let provide_span = |name: &str| {
-                    spans
-                        .provides
-                        .get(name)
-                        .map(|s| s.capability.name)
-                        .or_else(|| spans.provides.get(name).map(|s| s.capability.whole))
-                };
-
-                let endpoint_span = |name: &str| {
-                    spans
-                        .program
-                        .as_ref()?
-                        .endpoints
-                        .iter()
-                        .find(|endpoint| endpoint.name.as_ref() == name)
-                };
-
-                if let Some(endpoint) = endpoint_span(&first_endpoint) {
-                    let span = endpoint.port_span.unwrap_or(endpoint.whole);
-
-                    labels.push(LabeledSpan::new_primary_with_span(
-                        Some(format!("port used by provide `{first_provide}`")),
-                        span,
-                    ));
-                    has_primary = true;
-                }
-                if let Some(endpoint) = endpoint_span(&endpoint) {
-                    let span = endpoint.port_span.unwrap_or(endpoint.whole);
-
-                    let label = Some(format!("port used by provide `{provide}`"));
-                    if has_primary {
-                        labels.push(LabeledSpan::new_with_span(label, span));
-                    } else {
-                        labels.push(LabeledSpan::new_primary_with_span(label, span));
-                        has_primary = true;
-                    }
-                }
-
-                if !has_primary {
-                    if let Some(span) = provide_span(&first_provide) {
-                        labels.push(LabeledSpan::new_primary_with_span(
-                            Some(format!("provide `{first_provide}`")),
-                            span,
-                        ));
-                        has_primary = true;
-                    }
-                    if let Some(span) = provide_span(&provide) {
-                        let label = Some(format!("provide `{provide}`"));
-                        if has_primary {
-                            labels.push(LabeledSpan::new_with_span(label, span));
-                        } else {
-                            labels.push(LabeledSpan::new_primary_with_span(label, span));
-                        }
-                    }
-                }
-
-                ReporterError::new(message)
-                    .with_help(help)
-                    .with_source_code(src)
-                    .with_labels(labels)
+                ReporterError::new(message).with_help(help)
             }
+        }
+    }
+
+    fn into_reporter_error_with_spans(self, output: &CompileOutput) -> ReporterError {
+        match self {
+            DockerComposeError::Other(message) => ReporterError::new(message),
+            DockerComposeError::PortConflict(conflict) => port_conflict_report(output, &conflict),
         }
     }
 }
 
+fn port_conflict_report(output: &CompileOutput, conflict: &PortConflict) -> ReporterError {
+    let PortConflict {
+        component,
+        port,
+        first_provide,
+        first_endpoint,
+        provide,
+        endpoint,
+    } = conflict;
+    let component_moniker = output.scenario.component(*component).moniker.as_str();
+    let message = format!(
+        "docker-compose output cannot enforce separate capabilities for provides \
+         `{first_provide}` and `{provide}` in component `{component_moniker}`: both route to port \
+         {port} via endpoints `{first_endpoint}` and `{endpoint}`"
+    );
+    let help = "Expose each capability on its own port, or add an explicit L7 proxy component \
+                that maps each capability to a separate port.";
+
+    let prov = output.provenance.for_component(*component);
+    let Some((src, spans)) = output.store.diagnostic_source(&prov.resolved_url) else {
+        return ReporterError::new(message).with_help(help);
+    };
+
+    let mut labels = Vec::new();
+    let mut has_primary = false;
+
+    let provide_span = |name: &str| {
+        spans
+            .provides
+            .get(name)
+            .map(|s| s.capability.name)
+            .or_else(|| spans.provides.get(name).map(|s| s.capability.whole))
+    };
+
+    let endpoint_span = |name: &str| {
+        spans
+            .program
+            .as_ref()?
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.name.as_ref() == name)
+    };
+
+    if let Some(endpoint_span) = endpoint_span(first_endpoint) {
+        let span = endpoint_span.port_span.unwrap_or(endpoint_span.whole);
+        labels.push(LabeledSpan::new_primary_with_span(
+            Some(format!("port used by provide `{first_provide}`")),
+            span,
+        ));
+        has_primary = true;
+    }
+    if let Some(endpoint_span) = endpoint_span(endpoint) {
+        let span = endpoint_span.port_span.unwrap_or(endpoint_span.whole);
+        let label = Some(format!("port used by provide `{provide}`"));
+        if has_primary {
+            labels.push(LabeledSpan::new_with_span(label, span));
+        } else {
+            labels.push(LabeledSpan::new_primary_with_span(label, span));
+            has_primary = true;
+        }
+    }
+
+    if !has_primary {
+        if let Some(span) = provide_span(first_provide) {
+            labels.push(LabeledSpan::new_primary_with_span(
+                Some(format!("provide `{first_provide}`")),
+                span,
+            ));
+            has_primary = true;
+        }
+        if let Some(span) = provide_span(provide) {
+            let label = Some(format!("provide `{provide}`"));
+            if has_primary {
+                labels.push(LabeledSpan::new_with_span(label, span));
+            } else {
+                labels.push(LabeledSpan::new_primary_with_span(label, span));
+            }
+        }
+    }
+
+    ReporterError::new(message)
+        .with_help(help)
+        .with_source_code(src)
+        .with_labels(labels)
+}
+
 type DcResult<T> = Result<T, DockerComposeError>;
+
+pub fn validate_docker_compose(output: &CompileOutput) -> Result<(), ReporterError> {
+    let s = &output.scenario;
+
+    let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
+        s,
+        MeshOptions {
+            backend_label: "docker-compose reporter",
+        },
+    )
+    .map_err(|e| ReporterError::new(e.to_string()))?;
+
+    let program_components = mesh_plan.program_components.as_slice();
+
+    let mut names: HashMap<ComponentId, ServiceNames> = HashMap::new();
+    for id in program_components {
+        let c = s.component(*id);
+        let base = service_base_name(*id, c.moniker.local_name().unwrap_or("component"));
+        let sidecar = format!("{base}-net");
+        names.insert(
+            *id,
+            ServiceNames {
+                program: base,
+                sidecar,
+            },
+        );
+    }
+    let router_names = ServiceNames {
+        program: ROUTER_SERVICE_NAME.to_string(),
+        sidecar: format!("{ROUTER_SERVICE_NAME}-net"),
+    };
+
+    let root_slots = &s.component(s.root).slots;
+    let addressing = ComposeAddressing::new(s, program_components, &names, router_names)
+        .map_err(|err| err.into_reporter_error_with_spans(output))?;
+    build_address_plan(
+        &mesh_plan,
+        root_slots,
+        RouterPortBases {
+            external: ROUTER_EXTERNAL_PORT_BASE,
+            export: ROUTER_EXPORT_PORT_BASE,
+        },
+        addressing,
+    )
+    .map_err(|err| err.into_reporter_error_with_spans(output))?;
+
+    Ok(())
+}
 
 impl<'a> ComposeAddressing<'a> {
     fn new(
@@ -440,16 +513,13 @@ impl Addressing for ComposeAddressing<'_> {
     }
 }
 
-fn render_docker_compose(output: &CompileOutput) -> Result<String, ReporterError> {
-    render_docker_compose_inner(output).map_err(|err| err.into_reporter_error(output))
+fn render_docker_compose(scenario: &Scenario) -> Result<String, ReporterError> {
+    render_docker_compose_inner(scenario).map_err(|err| err.into_reporter_error(scenario))
 }
 
-fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
-    let s = &output.scenario;
-
+fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
     let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
         s,
-        &output.store,
         MeshOptions {
             backend_label: "docker-compose reporter",
         },
@@ -477,14 +547,12 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         sidecar: format!("{ROUTER_SERVICE_NAME}-net"),
     };
 
-    let root_manifest = mesh_plan.manifests[s.root.0]
-        .as_ref()
-        .expect("root manifest should exist");
+    let root_slots = &s.component(s.root).slots;
 
     let addressing = ComposeAddressing::new(s, program_components, &names, router_names.clone())?;
     let address_plan = build_address_plan(
         &mesh_plan,
-        root_manifest,
+        root_slots,
         RouterPortBases {
             external: ROUTER_EXTERNAL_PORT_BASE,
             export: ROUTER_EXPORT_PORT_BASE,
@@ -558,7 +626,6 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     // ---- runtime config / helper decision ----
     let config_plan = crate::targets::mesh::config::build_config_plan(
         s,
-        &mesh_plan.manifests,
         program_components,
         &address_plan.slot_values_by_component,
         &address_plan.binding_values_by_component,

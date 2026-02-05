@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use amber_manifest::Manifest;
+use amber_manifest::SlotDecl;
 use amber_scenario::ComponentId;
 
 use crate::{
@@ -95,7 +95,7 @@ pub(crate) trait Addressing {
 
 pub(crate) fn build_address_plan<A: Addressing>(
     mesh_plan: &MeshPlan,
-    root_manifest: &Manifest,
+    root_slots: &BTreeMap<String, SlotDecl>,
     router_ports: RouterPortBases,
     mut addressing: A,
 ) -> Result<MeshAddressPlan<A::Extra>, A::Error> {
@@ -184,7 +184,7 @@ pub(crate) fn build_address_plan<A: Addressing>(
     let mut router_config_b64: Option<String> = None;
 
     if needs_router {
-        router_external_slots = build_router_external_slots(root_manifest, &external_slot_ports);
+        router_external_slots = build_router_external_slots(root_slots, &external_slot_ports);
         router_env_passthrough = router_external_slots
             .iter()
             .map(|slot| slot.url_env.clone())

@@ -4,7 +4,6 @@ use amber_manifest::CapabilityKind;
 use amber_scenario::{BindingFrom, Component, ComponentId, Scenario};
 
 use super::{Reporter, ReporterError};
-use crate::CompileOutput;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DotReporter;
@@ -12,8 +11,8 @@ pub struct DotReporter;
 impl Reporter for DotReporter {
     type Artifact = String;
 
-    fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError> {
-        Ok(render_dot_with_exports(output))
+    fn emit(&self, scenario: &Scenario) -> Result<Self::Artifact, ReporterError> {
+        Ok(render_dot_with_exports(scenario))
     }
 }
 
@@ -29,9 +28,7 @@ struct ExportEdge {
     kind: CapabilityKind,
 }
 
-fn render_dot_with_exports(output: &CompileOutput) -> String {
-    let s = &output.scenario;
-
+fn render_dot_with_exports(s: &Scenario) -> String {
     let mut exports = Vec::with_capacity(s.exports.len());
     for export in &s.exports {
         let from = export.from.component;

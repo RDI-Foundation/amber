@@ -56,6 +56,32 @@ impl LinkIndex {
     }
 }
 
+fn collect_binding_decls(
+    id: ComponentId,
+    manifest: &Manifest,
+    link_index: &LinkIndex,
+) -> BTreeMap<String, SlotRef> {
+    let mut out = BTreeMap::new();
+    for (target, binding) in manifest.bindings() {
+        let Some(name) = binding.name.as_ref() else {
+            continue;
+        };
+        let (target_component, slot_name) = match target {
+            BindingTarget::SelfSlot(slot) => (id, slot.as_str()),
+            BindingTarget::ChildSlot { child, slot } => (link_index.child_id(child), slot.as_str()),
+            _ => continue,
+        };
+        out.insert(
+            name.to_string(),
+            SlotRef {
+                component: target_component,
+                name: slot_name.to_string(),
+            },
+        );
+    }
+    out
+}
+
 fn component(components: &[Option<Component>], id: ComponentId) -> &Component {
     components[id.0].as_ref().expect("component should exist")
 }
@@ -582,7 +608,7 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
             }
         })?;
 
-    for (c, m) in components.iter_mut().zip(&manifests) {
+    for (id, (c, m)) in components.iter_mut().zip(&manifests).enumerate() {
         let (Some(c), Some(m)) = (c.as_mut(), m.as_ref()) else {
             continue;
         };
@@ -597,6 +623,8 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
             .iter()
             .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
             .collect();
+        c.config_schema = m.config_schema().map(|schema| schema.0.clone());
+        c.binding_decls = collect_binding_decls(ComponentId(id), m, &link_index[id]);
         c.metadata = m.metadata().cloned();
     }
 
@@ -835,9 +863,11 @@ fn flatten(
         moniker,
         digest: node.digest,
         config: node.config.clone(),
+        config_schema: None,
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     }));
@@ -1198,7 +1228,7 @@ fn validate_config_tree(
         validate_program_config_refs(id, components, manifests, provenance, store, schema, errors);
     }
 
-    let composed = config_templates::compose_root_config_templates(root, components, manifests);
+    let composed = config_templates::compose_root_config_templates(root, components);
 
     for err in &composed.errors {
         let component_path = component_path_for(components, err.component);

@@ -1,14 +1,12 @@
 use std::collections::BTreeMap;
 
-use amber_manifest::{FrameworkCapabilityName, Manifest, ManifestDigest, ManifestRef};
+use amber_manifest::{FrameworkCapabilityName, Manifest, ManifestDigest};
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
     ScenarioExport, SlotRef,
 };
-use url::Url;
 
 use super::{render_dot, render_dot_with_exports};
-use crate::CompileOutput;
 
 fn component(id: usize, moniker: &str) -> Component {
     Component {
@@ -17,9 +15,11 @@ fn component(id: usize, moniker: &str) -> Component {
         moniker: Moniker::from(moniker.to_string()),
         digest: ManifestDigest::new([id as u8; 32]),
         config: None,
+        config_schema: None,
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     }
@@ -27,6 +27,7 @@ fn component(id: usize, moniker: &str) -> Component {
 
 fn apply_manifest(component: &mut Component, manifest: &Manifest) {
     component.program = manifest.program().cloned();
+    component.config_schema = manifest.config_schema().map(|schema| schema.0.clone());
     component.slots = manifest
         .slots()
         .iter()
@@ -233,7 +234,6 @@ fn dot_renders_root_exports_as_endpoints() {
         .decl
         .clone();
 
-    let store = crate::DigestStore::new();
     let root_digest = root_manifest.digest();
     let a_digest = a_manifest.digest();
     let b_digest = b_manifest.digest();
@@ -257,10 +257,6 @@ fn dot_renders_root_exports_as_endpoints() {
     apply_manifest(components[0].as_mut().unwrap(), &root_manifest);
     apply_manifest(components[1].as_mut().unwrap(), &a_manifest);
     apply_manifest(components[2].as_mut().unwrap(), &b_manifest);
-
-    store.put(root_digest, std::sync::Arc::new(root_manifest));
-    store.put(a_digest, std::sync::Arc::new(a_manifest));
-    store.put(b_digest, std::sync::Arc::new(b_manifest));
 
     let scenario = Scenario {
         root: ComponentId(0),
@@ -287,39 +283,7 @@ fn dot_renders_root_exports_as_endpoints() {
         }],
     };
 
-    let url = Url::parse("file:///scenario.json5").unwrap();
-    let output = CompileOutput {
-        scenario,
-        store,
-        provenance: crate::Provenance {
-            components: vec![
-                crate::ComponentProvenance {
-                    authored_moniker: Moniker::from("/".to_string()),
-                    declared_ref: ManifestRef::from_url(url.clone()),
-                    resolved_url: url.clone(),
-                    digest: root_digest,
-                    observed_url: None,
-                },
-                crate::ComponentProvenance {
-                    authored_moniker: Moniker::from("/a".to_string()),
-                    declared_ref: ManifestRef::from_url(url.clone()),
-                    resolved_url: url.clone(),
-                    digest: a_digest,
-                    observed_url: None,
-                },
-                crate::ComponentProvenance {
-                    authored_moniker: Moniker::from("/b".to_string()),
-                    declared_ref: ManifestRef::from_url(url.clone()),
-                    resolved_url: url,
-                    digest: b_digest,
-                    observed_url: None,
-                },
-            ],
-        },
-        diagnostics: Vec::new(),
-    };
-
-    let dot = render_dot_with_exports(&output);
+    let dot = render_dot_with_exports(&scenario);
     let expected = r#"digraph scenario {
   rankdir=LR;
   compound=true;
@@ -362,14 +326,11 @@ fn dot_renders_root_exports_from_root_component() {
         .decl
         .clone();
 
-    let store = crate::DigestStore::new();
     let root_digest = root_manifest.digest();
 
     let mut components = vec![Some(component(0, "/"))];
     components[0].as_mut().unwrap().digest = root_digest;
     apply_manifest(components[0].as_mut().unwrap(), &root_manifest);
-
-    store.put(root_digest, std::sync::Arc::new(root_manifest));
 
     let scenario = Scenario {
         root: ComponentId(0),
@@ -385,23 +346,7 @@ fn dot_renders_root_exports_from_root_component() {
         }],
     };
 
-    let url = Url::parse("file:///scenario.json5").unwrap();
-    let output = CompileOutput {
-        scenario,
-        store,
-        provenance: crate::Provenance {
-            components: vec![crate::ComponentProvenance {
-                authored_moniker: Moniker::from("/".to_string()),
-                declared_ref: ManifestRef::from_url(url.clone()),
-                resolved_url: url,
-                digest: root_digest,
-                observed_url: None,
-            }],
-        },
-        diagnostics: Vec::new(),
-    };
-
-    let dot = render_dot_with_exports(&output);
+    let dot = render_dot_with_exports(&scenario);
     assert!(dot.contains("c0 [label=\"program\"]"));
     assert!(dot.contains("e0 [label=\"http:80\", shape=box]"));
     assert!(dot.contains("c0 -> e0 [label=\"http\"]"));

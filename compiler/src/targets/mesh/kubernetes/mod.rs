@@ -12,7 +12,6 @@ pub use resources::*;
 use serde::Serialize;
 
 use crate::{
-    CompileOutput,
     reporter::{Reporter, ReporterError},
     targets::mesh::{
         LOCAL_NETWORK_CIDRS,
@@ -63,8 +62,8 @@ pub struct KubernetesArtifact {
 impl Reporter for KubernetesReporter {
     type Artifact = KubernetesArtifact;
 
-    fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError> {
-        render_kubernetes(output, &self.config)
+    fn emit(&self, scenario: &Scenario) -> Result<Self::Artifact, ReporterError> {
+        render_kubernetes(scenario, &self.config)
     }
 }
 
@@ -175,14 +174,11 @@ struct ScenarioMetadata {
 type KubernetesResult<T> = Result<T, ReporterError>;
 
 fn render_kubernetes(
-    output: &CompileOutput,
+    s: &Scenario,
     config: &KubernetesReporterConfig,
 ) -> KubernetesResult<KubernetesArtifact> {
-    let s = &output.scenario;
-
     let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
         s,
-        &output.store,
         MeshOptions {
             backend_label: "kubernetes reporter",
         },
@@ -190,8 +186,6 @@ fn render_kubernetes(
     .map_err(|e| ReporterError::new(e.to_string()))?;
 
     let program_components = mesh_plan.program_components.as_slice();
-    let manifests = &mesh_plan.manifests;
-
     // Generate namespace name.
     let namespace = generate_namespace_name(s);
 
@@ -208,9 +202,7 @@ fn render_kubernetes(
             },
         );
     }
-    let root_manifest = manifests[s.root.0]
-        .as_ref()
-        .expect("root manifest should exist");
+    let root_slots = &s.component(s.root).slots;
 
     let addressing = KubernetesAddressing {
         scenario: s,
@@ -219,7 +211,7 @@ fn render_kubernetes(
     };
     let address_plan = build_address_plan(
         &mesh_plan,
-        root_manifest,
+        root_slots,
         RouterPortBases {
             external: ROUTER_EXTERNAL_PORT_BASE,
             export: ROUTER_EXPORT_PORT_BASE,
@@ -270,7 +262,6 @@ fn render_kubernetes(
 
     let config_plan = crate::targets::mesh::config::build_config_plan(
         s,
-        manifests,
         program_components,
         &address_plan.slot_values_by_component,
         &address_plan.binding_values_by_component,
@@ -1097,8 +1088,7 @@ fn render_kubernetes(
 
     let mut external_slot_metadata: BTreeMap<String, ExternalSlotMetadata> = BTreeMap::new();
     for slot_name in address_plan.router.external_slot_ports.keys() {
-        let decl = root_manifest
-            .slots()
+        let decl = root_slots
             .get(slot_name.as_str())
             .expect("external slot should exist on root");
         external_slot_metadata.insert(

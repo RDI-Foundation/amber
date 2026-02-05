@@ -10,15 +10,13 @@ use std::{
     time::Duration,
 };
 
-use amber_manifest::{
-    FrameworkCapabilityName, Manifest, ManifestDigest, ManifestRef, ProvideDecl, SlotDecl,
-};
+use amber_manifest::{FrameworkCapabilityName, ManifestDigest, ManifestRef, ProvideDecl, SlotDecl};
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
     ScenarioExport, SlotRef,
 };
 use base64::Engine as _;
-use serde_json::{Map, Value, json};
+use serde_json::json;
 use url::Url;
 
 use super::{DockerComposeReporter, HELPER_IMAGE, ROUTER_IMAGE, SIDECAR_IMAGE};
@@ -30,78 +28,6 @@ fn digest(byte: u8) -> ManifestDigest {
 
 fn moniker(path: &str) -> Moniker {
     Moniker::from(Arc::from(path))
-}
-
-fn compile_output_with_manifest_overrides(
-    scenario: Scenario,
-    overrides: BTreeMap<ComponentId, Map<String, Value>>,
-) -> crate::CompileOutput {
-    let url = Url::parse("file:///scenario.json5").expect("test URL should parse");
-    let store = crate::DigestStore::new();
-
-    for component in scenario.components.iter().flatten() {
-        let mut manifest = serde_json::Map::new();
-        manifest.insert(
-            "manifest_version".to_string(),
-            Value::String("0.1.0".to_string()),
-        );
-        if let Some(program) = &component.program {
-            manifest.insert(
-                "program".to_string(),
-                serde_json::to_value(program).unwrap(),
-            );
-        }
-        if !component.slots.is_empty() {
-            manifest.insert(
-                "slots".to_string(),
-                serde_json::to_value(&component.slots).unwrap(),
-            );
-        }
-        if !component.provides.is_empty() {
-            manifest.insert(
-                "provides".to_string(),
-                serde_json::to_value(&component.provides).unwrap(),
-            );
-        }
-        if let Some(extra) = overrides.get(&component.id) {
-            for (key, value) in extra {
-                manifest.insert(key.clone(), value.clone());
-            }
-        }
-
-        let manifest: Manifest = serde_json::from_value(Value::Object(manifest)).unwrap();
-        store.put(component.digest, Arc::new(manifest));
-    }
-
-    let provenance = crate::Provenance {
-        components: scenario
-            .components
-            .iter()
-            .map(|component| {
-                let component = component
-                    .as_ref()
-                    .expect("test scenario component should exist");
-                crate::ComponentProvenance {
-                    authored_moniker: component.moniker.clone(),
-                    declared_ref: ManifestRef::from_url(url.clone()),
-                    resolved_url: url.clone(),
-                    digest: component.digest,
-                    observed_url: None,
-                }
-            })
-            .collect(),
-    };
-
-    crate::CompileOutput {
-        scenario,
-        store,
-        provenance,
-        diagnostics: Vec::new(),
-    }
-}
-
-fn compile_output(scenario: Scenario) -> crate::CompileOutput {
-    compile_output_with_manifest_overrides(scenario, BTreeMap::new())
 }
 
 fn error_contains(err: &crate::Error, needle: &str) -> bool {
@@ -317,9 +243,11 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         moniker: moniker("/"),
         digest: digest(0),
         config: None,
+        config_schema: None,
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(2), ComponentId(1)],
     };
@@ -330,9 +258,11 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         moniker: moniker("/server"),
         digest: digest(1),
         config: None,
+        config_schema: None,
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -343,9 +273,11 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         moniker: moniker("/client"),
         digest: digest(2),
         config: None,
+        config_schema: None,
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -368,9 +300,8 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         exports: vec![],
     };
 
-    let output = compile_output(scenario);
     let yaml = DockerComposeReporter
-        .emit(&output)
+        .emit(&scenario)
         .expect("compose render ok");
     let compose = parse_compose(&yaml);
 
@@ -428,9 +359,11 @@ fn compose_escapes_entrypoint_dollars() {
         moniker: moniker("/"),
         digest: digest(0),
         config: None,
+        config_schema: None,
         program: Some(program),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -442,9 +375,8 @@ fn compose_escapes_entrypoint_dollars() {
         exports: vec![],
     };
 
-    let output = compile_output(scenario);
     let yaml = DockerComposeReporter
-        .emit(&output)
+        .emit(&scenario)
         .expect("compose render ok");
     let compose = parse_compose(&yaml);
 
@@ -502,9 +434,17 @@ fn compose_resolves_binding_urls_in_child_config() {
         moniker: moniker("/"),
         digest: digest(0),
         config: None,
+        config_schema: None,
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::from([(
+            "bind".to_string(),
+            SlotRef {
+                component: ComponentId(2),
+                name: "api".to_string(),
+            },
+        )]),
         metadata: None,
         children: vec![ComponentId(3), ComponentId(2), ComponentId(1)],
     };
@@ -515,9 +455,11 @@ fn compose_resolves_binding_urls_in_child_config() {
         moniker: moniker("/server"),
         digest: digest(1),
         config: None,
+        config_schema: None,
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -528,9 +470,11 @@ fn compose_resolves_binding_urls_in_child_config() {
         moniker: moniker("/client"),
         digest: digest(2),
         config: None,
+        config_schema: None,
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -543,9 +487,18 @@ fn compose_resolves_binding_urls_in_child_config() {
         config: Some(json!({
             "upstream_url": "${bindings.bind.url}"
         })),
+        config_schema: Some(json!({
+            "type": "object",
+            "properties": {
+                "upstream_url": { "type": "string" }
+            },
+            "required": ["upstream_url"],
+            "additionalProperties": false
+        })),
         program: Some(observer_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -568,41 +521,8 @@ fn compose_resolves_binding_urls_in_child_config() {
         exports: vec![],
     };
 
-    let mut overrides = BTreeMap::new();
-    let mut root_overrides = Map::new();
-    root_overrides.insert(
-        "components".to_string(),
-        json!({
-            "server": "file:///server.json5",
-            "client": "file:///client.json5",
-            "observer": "file:///observer.json5",
-        }),
-    );
-    root_overrides.insert(
-        "bindings".to_string(),
-        json!([
-            { "name": "bind", "to": "#client.api", "from": "#server.api" }
-        ]),
-    );
-    overrides.insert(ComponentId(0), root_overrides);
-
-    let mut observer_overrides = Map::new();
-    observer_overrides.insert(
-        "config_schema".to_string(),
-        json!({
-            "type": "object",
-            "properties": {
-                "upstream_url": { "type": "string" }
-            },
-            "required": ["upstream_url"],
-            "additionalProperties": false
-        }),
-    );
-    overrides.insert(ComponentId(3), observer_overrides);
-
-    let output = compile_output_with_manifest_overrides(scenario, overrides);
     let yaml = DockerComposeReporter
-        .emit(&output)
+        .emit(&scenario)
         .expect("compose render ok");
     let compose = parse_compose(&yaml);
 
@@ -661,9 +581,17 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         moniker: moniker("/"),
         digest: digest(0),
         config: None,
+        config_schema: None,
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::from([(
+            "bind".to_string(),
+            SlotRef {
+                component: ComponentId(2),
+                name: "api".to_string(),
+            },
+        )]),
         metadata: None,
         children: vec![ComponentId(3), ComponentId(2), ComponentId(1)],
     };
@@ -674,9 +602,11 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         moniker: moniker("/server"),
         digest: digest(1),
         config: None,
+        config_schema: None,
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -687,12 +617,23 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         moniker: moniker("/client"),
         digest: digest(2),
         config: None,
+        config_schema: None,
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
+
+    let upstream_schema = json!({
+        "type": "object",
+        "properties": {
+            "upstream_url": { "type": "string" }
+        },
+        "required": ["upstream_url"],
+        "additionalProperties": false
+    });
 
     let grandparent = Component {
         id: ComponentId(3),
@@ -702,9 +643,11 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         config: Some(json!({
             "upstream_url": "${bindings.bind.url}"
         })),
+        config_schema: Some(upstream_schema.clone()),
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(4)],
     };
@@ -717,9 +660,11 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         config: Some(json!({
             "upstream_url": "${config.upstream_url}"
         })),
+        config_schema: Some(upstream_schema.clone()),
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(5)],
     };
@@ -732,9 +677,11 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         config: Some(json!({
             "upstream_url": "${config.upstream_url}"
         })),
+        config_schema: Some(upstream_schema.clone()),
         program: Some(child_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -764,60 +711,8 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         exports: vec![],
     };
 
-    let upstream_schema = json!({
-        "type": "object",
-        "properties": {
-            "upstream_url": { "type": "string" }
-        },
-        "required": ["upstream_url"],
-        "additionalProperties": false
-    });
-
-    let mut overrides = BTreeMap::new();
-    let mut root_overrides = Map::new();
-    root_overrides.insert(
-        "components".to_string(),
-        json!({
-            "server": "file:///server.json5",
-            "client": "file:///client.json5",
-            "grandparent": "file:///grandparent.json5",
-        }),
-    );
-    root_overrides.insert(
-        "bindings".to_string(),
-        json!([
-            { "name": "bind", "to": "#client.api", "from": "#server.api" }
-        ]),
-    );
-    overrides.insert(ComponentId(0), root_overrides);
-
-    let mut grandparent_overrides = Map::new();
-    grandparent_overrides.insert(
-        "components".to_string(),
-        json!({
-            "parent": "file:///parent.json5"
-        }),
-    );
-    grandparent_overrides.insert("config_schema".to_string(), upstream_schema.clone());
-    overrides.insert(ComponentId(3), grandparent_overrides);
-
-    let mut parent_overrides = Map::new();
-    parent_overrides.insert(
-        "components".to_string(),
-        json!({
-            "child": "file:///child.json5"
-        }),
-    );
-    parent_overrides.insert("config_schema".to_string(), upstream_schema.clone());
-    overrides.insert(ComponentId(4), parent_overrides);
-
-    let mut child_overrides = Map::new();
-    child_overrides.insert("config_schema".to_string(), upstream_schema);
-    overrides.insert(ComponentId(5), child_overrides);
-
-    let output = compile_output_with_manifest_overrides(scenario, overrides);
     let yaml = DockerComposeReporter
-        .emit(&output)
+        .emit(&scenario)
         .expect("compose render ok");
     let compose = parse_compose(&yaml);
 
@@ -854,9 +749,11 @@ fn compose_emits_export_metadata_and_labels() {
         moniker: moniker("/"),
         digest: digest(0),
         config: None,
+        config_schema: None,
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1)],
     };
@@ -867,9 +764,11 @@ fn compose_emits_export_metadata_and_labels() {
         moniker: moniker("/server"),
         digest: digest(1),
         config: None,
+        config_schema: None,
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -888,9 +787,8 @@ fn compose_emits_export_metadata_and_labels() {
         }],
     };
 
-    let output = compile_output(scenario);
     let yaml = DockerComposeReporter
-        .emit(&output)
+        .emit(&scenario)
         .expect("compose render ok");
     let compose = parse_compose(&yaml);
 
@@ -943,9 +841,11 @@ fn compose_routes_external_slots_through_router() {
         moniker: moniker("/"),
         digest: digest(0),
         config: None,
+        config_schema: None,
         program: None,
         slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1)],
     };
@@ -956,9 +856,11 @@ fn compose_routes_external_slots_through_router() {
         moniker: moniker("/client"),
         digest: digest(1),
         config: None,
+        config_schema: None,
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -981,9 +883,8 @@ fn compose_routes_external_slots_through_router() {
         exports: Vec::new(),
     };
 
-    let output = compile_output(scenario);
     let yaml = DockerComposeReporter
-        .emit(&output)
+        .emit(&scenario)
         .expect("compose render ok");
     let compose = parse_compose(&yaml);
 
@@ -1126,9 +1027,11 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
         moniker: moniker("/"),
         digest: digest(0),
         config: None,
+        config_schema: None,
         program: None,
         slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1)],
     };
@@ -1139,9 +1042,11 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
         moniker: moniker("/client"),
         digest: digest(1),
         config: None,
+        config_schema: None,
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -1164,9 +1069,8 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
         exports: Vec::new(),
     };
 
-    let output = compile_output(scenario);
     let yaml = DockerComposeReporter
-        .emit(&output)
+        .emit(&scenario)
         .expect("compose render ok");
     fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
 
@@ -1315,9 +1219,11 @@ fn docker_smoke_export_routes_to_host() {
         moniker: moniker("/"),
         digest: digest(0),
         config: None,
+        config_schema: None,
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1)],
     };
@@ -1328,9 +1234,11 @@ fn docker_smoke_export_routes_to_host() {
         moniker: moniker("/server"),
         digest: digest(1),
         config: None,
+        config_schema: None,
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -1349,9 +1257,8 @@ fn docker_smoke_export_routes_to_host() {
         }],
     };
 
-    let output = compile_output(scenario);
     let yaml = DockerComposeReporter
-        .emit(&output)
+        .emit(&scenario)
         .expect("compose render ok");
     let compose = parse_compose(&yaml);
 
@@ -1441,9 +1348,11 @@ fn errors_on_shared_port_with_different_endpoints() {
         moniker: moniker("/"),
         digest: digest(0),
         config: None,
+        config_schema: None,
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(2), ComponentId(1)],
     };
@@ -1454,12 +1363,14 @@ fn errors_on_shared_port_with_different_endpoints() {
         moniker: moniker("/server"),
         digest: digest(1),
         config: None,
+        config_schema: None,
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([
             ("v1".to_string(), provide_v1),
             ("admin".to_string(), provide_admin),
         ]),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -1470,12 +1381,14 @@ fn errors_on_shared_port_with_different_endpoints() {
         moniker: moniker("/client"),
         digest: digest(2),
         config: None,
+        config_schema: None,
         program: Some(client_program),
         slots: BTreeMap::from([
             ("v1".to_string(), slot_http.clone()),
             ("admin".to_string(), slot_http),
         ]),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -1512,8 +1425,7 @@ fn errors_on_shared_port_with_different_endpoints() {
         exports: vec![],
     };
 
-    let output = compile_output(scenario);
-    let err = DockerComposeReporter.emit(&output).unwrap_err();
+    let err = DockerComposeReporter.emit(&scenario).unwrap_err();
     assert!(
         err.to_string()
             .contains("docker-compose output cannot enforce separate capabilities"),
@@ -1533,9 +1445,11 @@ fn docker_compose_rejects_framework_bindings() {
         moniker: moniker("/"),
         digest: digest(0),
         config: None,
+        config_schema: None,
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -1557,8 +1471,7 @@ fn docker_compose_rejects_framework_bindings() {
         exports: Vec::new(),
     };
 
-    let output = compile_output(scenario);
-    let err = DockerComposeReporter.emit(&output).unwrap_err();
+    let err = DockerComposeReporter.emit(&scenario).unwrap_err();
     let message = err.to_string();
     assert!(
         message.contains("framework.dynamic_children"),
@@ -1648,9 +1561,11 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         moniker: moniker("/"),
         digest: digest(0),
         config: None,
+        config_schema: None,
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(2), ComponentId(3), ComponentId(1)],
     };
@@ -1661,9 +1576,11 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         moniker: moniker("/server"),
         digest: digest(1),
         config: None,
+        config_schema: None,
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -1674,9 +1591,11 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         moniker: moniker("/allowed"),
         digest: digest(2),
         config: None,
+        config_schema: None,
         program: Some(sleeper_program(json!({ "URL": "${slots.api.url}" }))),
         slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -1687,9 +1606,11 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         moniker: moniker("/denied"),
         digest: digest(3),
         config: None,
+        config_schema: None,
         program: Some(sleeper_program(json!({}))),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -1712,9 +1633,8 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         exports: vec![],
     };
 
-    let output = compile_output(scenario);
     let yaml = DockerComposeReporter
-        .emit(&output)
+        .emit(&scenario)
         .expect("compose render ok");
     fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
 
@@ -2060,7 +1980,7 @@ fn docker_smoke_config_forwarding_runtime_validation() {
         .expect("compile ok");
 
     let yaml = DockerComposeReporter
-        .emit(&output)
+        .emit(&output.scenario)
         .expect("compose render ok");
     fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
 

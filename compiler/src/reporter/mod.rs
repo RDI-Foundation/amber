@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
+use amber_scenario::Scenario;
 use miette::{Diagnostic, LabeledSpan, NamedSource, Severity};
-
-use crate::CompileOutput;
 
 pub mod dot;
 pub mod metadata;
@@ -72,5 +71,5 @@ impl Diagnostic for ReporterError {
 pub trait Reporter {
     type Artifact;
 
-    fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError>;
+    fn emit(&self, scenario: &Scenario) -> Result<Self::Artifact, ReporterError>;
 }

@@ -1,13 +1,10 @@
 use std::{
     collections::{BTreeSet, HashMap},
     fmt,
-    sync::Arc,
 };
 
-use amber_manifest::{CapabilityDecl, Manifest};
+use amber_manifest::CapabilityDecl;
 use amber_scenario::{BindingFrom, ComponentId, Scenario};
-
-use crate::{DigestStore, manifest_table};
 
 #[derive(Clone, Debug)]
 pub(crate) struct MeshOptions {
@@ -16,7 +13,6 @@ pub(crate) struct MeshOptions {
 
 #[derive(Clone, Debug)]
 pub(crate) struct MeshPlan {
-    pub(crate) manifests: Vec<Option<Arc<Manifest>>>,
     pub(crate) program_components: Vec<ComponentId>,
     pub(crate) bindings: Vec<ResolvedBinding>,
     pub(crate) external_bindings: Vec<ResolvedExternalBinding>,
@@ -86,18 +82,8 @@ impl From<String> for MeshError {
 
 pub(crate) fn build_mesh_plan(
     scenario: &Scenario,
-    store: &DigestStore,
     options: MeshOptions,
 ) -> Result<MeshPlan, MeshError> {
-    let manifests =
-        manifest_table::build_manifest_table(&scenario.components, store).map_err(|e| {
-            MeshError::new(format!(
-                "internal error: missing manifest content for {} (digest {})",
-                component_label(scenario, e.component),
-                e.digest
-            ))
-        })?;
-
     for binding in &scenario.bindings {
         if let BindingFrom::Framework(name) = &binding.from {
             return Err(MeshError::new(format!(
@@ -201,7 +187,6 @@ pub(crate) fn build_mesh_plan(
     }
 
     Ok(MeshPlan {
-        manifests,
         program_components,
         bindings,
         external_bindings,

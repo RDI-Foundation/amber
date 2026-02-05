@@ -11,8 +11,10 @@ path = "src/main.rs"
 amber-compiler = { workspace = true }
 amber-manifest = { workspace = true }
 amber-resolver = { workspace = true }
+amber-scenario = { workspace = true }
 clap = { version = "4.5.46", features = ["derive"] }
 miette = { workspace = true, features = ["fancy"] }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing = "0.1.44"
 tracing-error = "0.2.1"
@@ -21,7 +23,6 @@ url = { workspace = true }
 
 [dev-dependencies]
 amber-images = { workspace = true }
-serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 similar = "2.7.0"
 strip-ansi-escapes = "0.2"

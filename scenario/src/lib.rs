@@ -203,6 +203,9 @@ pub struct Component {
     /// Optional instance config (authored at the use-site).
     pub config: Option<Value>,
 
+    /// Optional config schema declared by this component.
+    pub config_schema: Option<Value>,
+
     /// Program definition (image/entrypoint/env/network) extracted from the manifest.
     pub program: Option<Program>,
 
@@ -211,6 +214,9 @@ pub struct Component {
 
     /// Declared output provides (capability outputs).
     pub provides: BTreeMap<String, ProvideDecl>,
+
+    /// Named bindings declared by this component (binding name -> target slot).
+    pub binding_decls: BTreeMap<String, SlotRef>,
 
     /// Optional user-defined metadata from the manifest.
     pub metadata: Option<Value>,

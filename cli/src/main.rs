@@ -5,7 +5,7 @@ use std::{
 };
 
 use amber_compiler::{
-    CompileOptions, CompileOutput, Compiler, ResolverRegistry,
+    CompileOptions, Compiler, ResolverRegistry,
     bundle::{BundleBuilder, BundleLoader},
     reporter::{
         Reporter as _,
@@ -18,6 +18,7 @@ use amber_compiler::{
 };
 use amber_manifest::ManifestRef;
 use amber_resolver::Resolver;
+use amber_scenario::{SCENARIO_IR_SCHEMA, Scenario, ScenarioIr};
 use clap::{ArgAction, Args, Parser, Subcommand};
 use miette::{
     Context as _, Diagnostic, GraphicalReportHandler, IntoDiagnostic as _, Result, Severity,
@@ -89,7 +90,7 @@ struct CompileArgs {
     #[arg(long = "no-opt")]
     no_opt: bool,
 
-    /// Root manifest or bundle to compile (URL or local path).
+    /// Root manifest, bundle, or scenario IR to compile (URL or local path).
     #[arg(value_name = "MANIFEST")]
     manifest: String,
 }
@@ -156,77 +157,57 @@ async fn compile(args: CompileArgs) -> Result<()> {
     ensure_outputs_requested(&args)?;
     let outputs = resolve_output_paths(&args)?;
 
-    let resolved = resolve_input(&args.manifest).await?;
-    let compiler =
-        Compiler::new(resolved.resolver, Default::default()).with_registry(resolved.registry);
-    let mut opts = CompileOptions::default();
-    if args.no_opt {
-        opts.optimize.dce = false;
-    }
+    match resolve_compile_input(&args.manifest).await? {
+        CompileInput::Manifest(resolved) => {
+            let compiler = Compiler::new(resolved.resolver, Default::default())
+                .with_registry(resolved.registry);
+            let mut opts = CompileOptions::default();
+            if args.no_opt {
+                opts.optimize.dce = false;
+            }
 
-    let tree = compiler
-        .resolve_tree(resolved.manifest.clone(), opts.resolve)
-        .await
-        .wrap_err("compile failed")?;
-    let bundle_tree = args.bundle.as_ref().map(|_| tree.clone());
+            let tree = compiler
+                .resolve_tree(resolved.manifest.clone(), opts.resolve)
+                .await
+                .wrap_err("compile failed")?;
+            let bundle_tree = args.bundle.as_ref().map(|_| tree.clone());
 
-    let output = compiler
-        .compile_from_tree(tree, opts.optimize)
-        .wrap_err("compile failed")?;
+            let output = compiler
+                .compile_from_tree(tree, opts.optimize)
+                .wrap_err("compile failed")?;
 
-    let deny = DenySet::new(&args.deny);
-    let has_error = print_diagnostics(&output.diagnostics, &deny)?;
-    if has_error {
-        return Err(miette::miette!("compilation failed"));
-    }
+            let deny = DenySet::new(&args.deny);
+            let has_error = print_diagnostics(&output.diagnostics, &deny)?;
+            if has_error {
+                return Err(miette::miette!("compilation failed"));
+            }
 
-    if let Some(primary) = outputs.primary.as_ref() {
-        write_primary_output(primary, &output)?;
-    }
+            if outputs.docker_compose.is_some()
+                && let Err(err) =
+                    amber_compiler::reporter::docker_compose::validate_docker_compose(&output)
+            {
+                return Err(miette::Report::new(err));
+            }
 
-    if let Some(dot_dest) = outputs.dot {
-        let dot = DotReporter.emit(&output).map_err(miette::Report::new)?;
-        match dot_dest {
-            ArtifactOutput::Stdout => print!("{dot}"),
-            ArtifactOutput::File(path) => write_artifact(&path, dot.as_bytes())?,
+            let scenario = output.scenario;
+            write_outputs(&outputs, &scenario, &args)?;
+
+            if let Some(bundle_root) = resolve_bundle_root(&args)? {
+                let tree = bundle_tree.expect("bundle requested");
+                prepare_bundle_dir(&bundle_root)?;
+                BundleBuilder::build(&tree, compiler.store(), &bundle_root)
+                    .wrap_err("bundle generation failed")?;
+            }
         }
-    }
+        CompileInput::ScenarioIr(scenario) => {
+            if args.bundle.is_some() {
+                return Err(miette::miette!(
+                    "cannot generate a bundle from scenario IR input"
+                ));
+            }
 
-    if let Some(compose_dest) = outputs.docker_compose {
-        let compose = DockerComposeReporter
-            .emit(&output)
-            .map_err(miette::Report::new)?;
-        match compose_dest {
-            ArtifactOutput::Stdout => print!("{compose}"),
-            ArtifactOutput::File(path) => write_artifact(&path, compose.as_bytes())?,
+            write_outputs(&outputs, &scenario, &args)?;
         }
-    }
-
-    if let Some(kubernetes_dest) = outputs.kubernetes {
-        let reporter = KubernetesReporter {
-            config: KubernetesReporterConfig {
-                disable_networkpolicy_check: args.disable_networkpolicy_check,
-            },
-        };
-        let artifact = reporter.emit(&output).map_err(miette::Report::new)?;
-        write_kubernetes_output(&kubernetes_dest, &artifact)?;
-    }
-
-    if let Some(metadata_dest) = outputs.metadata {
-        let metadata = MetadataReporter
-            .emit(&output)
-            .map_err(miette::Report::new)?;
-        match metadata_dest {
-            ArtifactOutput::Stdout => print!("{metadata}"),
-            ArtifactOutput::File(path) => write_artifact(&path, metadata.as_bytes())?,
-        }
-    }
-
-    if let Some(bundle_root) = resolve_bundle_root(&args)? {
-        let tree = bundle_tree.expect("bundle requested");
-        prepare_bundle_dir(&bundle_root)?;
-        BundleBuilder::build(&tree, compiler.store(), &bundle_root)
-            .wrap_err("bundle generation failed")?;
     }
 
     Ok(())
@@ -424,6 +405,11 @@ struct ResolvedInput {
     registry: ResolverRegistry,
 }
 
+enum CompileInput {
+    Manifest(ResolvedInput),
+    ScenarioIr(Scenario),
+}
+
 async fn resolve_input(input: &str) -> Result<ResolvedInput> {
     if let Some(path) = local_input_path(input)?
         && let Some(loader) = BundleLoader::from_path(&path)?
@@ -442,6 +428,42 @@ async fn resolve_input(input: &str) -> Result<ResolvedInput> {
         resolver: Resolver::new(),
         registry: ResolverRegistry::default(),
     })
+}
+
+async fn resolve_compile_input(input: &str) -> Result<CompileInput> {
+    if let Some(path) = local_input_path(input)?
+        && let Some(ir) = try_load_scenario_ir(&path)?
+    {
+        let scenario =
+            Scenario::try_from(ir).map_err(|e| miette::miette!("invalid scenario IR: {e}"))?;
+        return Ok(CompileInput::ScenarioIr(scenario));
+    }
+
+    Ok(CompileInput::Manifest(resolve_input(input).await?))
+}
+
+fn try_load_scenario_ir(path: &Path) -> Result<Option<ScenarioIr>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).into_diagnostic(),
+    };
+
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let schema = value.get("schema").and_then(serde_json::Value::as_str);
+    if schema != Some(SCENARIO_IR_SCHEMA) {
+        return Ok(None);
+    }
+
+    let ir = serde_json::from_value(value)
+        .map_err(|e| miette::miette!("failed to parse scenario IR: {e}"))?;
+    Ok(Some(ir))
 }
 
 fn local_input_path(input: &str) -> Result<Option<PathBuf>> {
@@ -617,9 +639,55 @@ fn prepare_bundle_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_primary_output(path: &Path, output: &CompileOutput) -> Result<()> {
+fn write_outputs(outputs: &OutputPaths, scenario: &Scenario, args: &CompileArgs) -> Result<()> {
+    if let Some(primary) = outputs.primary.as_ref() {
+        write_primary_output(primary, scenario)?;
+    }
+
+    if let Some(dot_dest) = outputs.dot.as_ref() {
+        let dot = DotReporter.emit(scenario).map_err(miette::Report::new)?;
+        match dot_dest {
+            ArtifactOutput::Stdout => print!("{dot}"),
+            ArtifactOutput::File(path) => write_artifact(path, dot.as_bytes())?,
+        }
+    }
+
+    if let Some(compose_dest) = outputs.docker_compose.as_ref() {
+        let compose = DockerComposeReporter
+            .emit(scenario)
+            .map_err(miette::Report::new)?;
+        match compose_dest {
+            ArtifactOutput::Stdout => print!("{compose}"),
+            ArtifactOutput::File(path) => write_artifact(path, compose.as_bytes())?,
+        }
+    }
+
+    if let Some(kubernetes_dest) = outputs.kubernetes.as_ref() {
+        let reporter = KubernetesReporter {
+            config: KubernetesReporterConfig {
+                disable_networkpolicy_check: args.disable_networkpolicy_check,
+            },
+        };
+        let artifact = reporter.emit(scenario).map_err(miette::Report::new)?;
+        write_kubernetes_output(kubernetes_dest, &artifact)?;
+    }
+
+    if let Some(metadata_dest) = outputs.metadata.as_ref() {
+        let metadata = MetadataReporter
+            .emit(scenario)
+            .map_err(miette::Report::new)?;
+        match metadata_dest {
+            ArtifactOutput::Stdout => print!("{metadata}"),
+            ArtifactOutput::File(path) => write_artifact(path, metadata.as_bytes())?,
+        }
+    }
+
+    Ok(())
+}
+
+fn write_primary_output(path: &Path, scenario: &Scenario) -> Result<()> {
     let ir = ScenarioIrReporter
-        .emit(output)
+        .emit(scenario)
         .map_err(miette::Report::new)?;
     write_artifact(path, ir.as_bytes())
         .wrap_err_with(|| format!("failed to write primary output `{}`", path.display()))

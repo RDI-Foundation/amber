@@ -4,6 +4,22 @@ use amber_images::AMBER_SIDECAR;
 use serde_json::Value;
 use serde_yaml::Value as YamlValue;
 
+fn env_value(service: &YamlValue, key: &str) -> Option<String> {
+    let env = service.get("environment")?;
+    match env {
+        YamlValue::Mapping(map) => map
+            .get(&YamlValue::String(key.to_string()))
+            .and_then(YamlValue::as_str)
+            .map(str::to_string),
+        YamlValue::Sequence(seq) => seq.iter().find_map(|entry| {
+            let entry = entry.as_str()?;
+            let (k, v) = entry.split_once('=')?;
+            if k == key { Some(v.to_string()) } else { None }
+        }),
+        _ => None,
+    }
+}
+
 #[test]
 fn compile_writes_primary_output_and_dot_artifact() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -151,5 +167,251 @@ fn compile_writes_primary_output_and_dot_artifact() {
     assert!(
         has_sidecar_image,
         "docker compose output missing sidecar image"
+    );
+}
+
+#[test]
+fn compile_from_scenario_ir_to_compose() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+    let manifest = workspace_root
+        .join("examples")
+        .join("reexport")
+        .join("scenario.json");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("outputs-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let ir_output = outputs_dir.path().join("scenario.ir.json");
+    let compose_output = outputs_dir.path().join("scenario.docker-compose.yaml");
+
+    let ir_compile = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--no-opt")
+        .arg("--output")
+        .arg(&ir_output)
+        .arg(&manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile: {err}"));
+    if !ir_compile.status.success() {
+        panic!(
+            "amber compile (ir) failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            ir_compile.status,
+            String::from_utf8_lossy(&ir_compile.stdout),
+            String::from_utf8_lossy(&ir_compile.stderr)
+        );
+    }
+
+    let compose_compile = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--docker-compose")
+        .arg(&compose_output)
+        .arg(&ir_output)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile: {err}"));
+    if !compose_compile.status.success() {
+        panic!(
+            "amber compile (compose) failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            compose_compile.status,
+            String::from_utf8_lossy(&compose_compile.stdout),
+            String::from_utf8_lossy(&compose_compile.stderr)
+        );
+    }
+
+    assert!(
+        compose_output.is_file(),
+        "expected docker compose output file at {}",
+        compose_output.display()
+    );
+    let compose_contents =
+        fs::read_to_string(&compose_output).expect("failed to read docker compose output file");
+    assert!(
+        compose_contents.contains("services:"),
+        "docker compose output missing services section"
+    );
+}
+
+#[test]
+fn compile_from_scenario_ir_with_binding_interpolation() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("outputs-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let manifests_dir = outputs_dir.path().join("manifests");
+    fs::create_dir_all(&manifests_dir).expect("failed to create manifests directory");
+
+    let root_manifest = manifests_dir.join("scenario.json5");
+    let server_manifest = manifests_dir.join("server.json5");
+    let client_manifest = manifests_dir.join("client.json5");
+    let observer_manifest = manifests_dir.join("observer.json5");
+
+    fs::write(
+        &root_manifest,
+        r##"{
+  "manifest_version": "0.1.0",
+  "components": {
+    "server": "./server.json5",
+    "client": "./client.json5",
+    "observer": {
+      "manifest": "./observer.json5",
+      "config": {
+        "upstream_url": "${bindings.bind.url}"
+      }
+    }
+  },
+  "bindings": [
+    { "name": "bind", "from": "#server.api", "to": "#client.api" }
+  ]
+}
+"##,
+    )
+    .expect("failed to write root manifest");
+
+    fs::write(
+        &server_manifest,
+        r#"{
+  "manifest_version": "0.1.0",
+  "program": {
+    "image": "alpine:3.20",
+    "entrypoint": ["server"],
+    "env": {},
+    "network": {
+      "endpoints": [
+        { "name": "api", "port": 8080, "protocol": "http" }
+      ]
+    }
+  },
+  "provides": {
+    "api": { "kind": "http", "endpoint": "api" }
+  },
+  "exports": {
+    "api": "api"
+  }
+}
+"#,
+    )
+    .expect("failed to write server manifest");
+
+    fs::write(
+        &client_manifest,
+        r#"{
+  "manifest_version": "0.1.0",
+  "program": {
+    "image": "alpine:3.20",
+    "entrypoint": ["client"],
+    "env": {
+      "BIND_URL": "${slots.api.url}"
+    }
+  },
+  "slots": {
+    "api": { "kind": "http" }
+  }
+}
+"#,
+    )
+    .expect("failed to write client manifest");
+
+    fs::write(
+        &observer_manifest,
+        r#"{
+  "manifest_version": "0.1.0",
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "upstream_url": { "type": "string" }
+    },
+    "required": ["upstream_url"],
+    "additionalProperties": false
+  },
+  "program": {
+    "image": "alpine:3.20",
+    "entrypoint": ["observer"],
+    "env": {
+      "UPSTREAM_URL": "${config.upstream_url}"
+    }
+  }
+}
+"#,
+    )
+    .expect("failed to write observer manifest");
+
+    let ir_output = outputs_dir.path().join("scenario.ir.json");
+    let compose_output = outputs_dir.path().join("scenario.docker-compose.yaml");
+
+    let ir_compile = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--no-opt")
+        .arg("--output")
+        .arg(&ir_output)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile: {err}"));
+    if !ir_compile.status.success() {
+        panic!(
+            "amber compile (ir) failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            ir_compile.status,
+            String::from_utf8_lossy(&ir_compile.stdout),
+            String::from_utf8_lossy(&ir_compile.stderr)
+        );
+    }
+
+    let compose_compile = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--docker-compose")
+        .arg(&compose_output)
+        .arg(&ir_output)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile: {err}"));
+    if !compose_compile.status.success() {
+        panic!(
+            "amber compile (compose) failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            compose_compile.status,
+            String::from_utf8_lossy(&compose_compile.stdout),
+            String::from_utf8_lossy(&compose_compile.stderr)
+        );
+    }
+
+    assert!(
+        compose_output.is_file(),
+        "expected docker compose output file at {}",
+        compose_output.display()
+    );
+    let compose_contents =
+        fs::read_to_string(&compose_output).expect("failed to read docker compose output file");
+    let compose_yaml: YamlValue =
+        serde_yaml::from_str(&compose_contents).expect("docker compose output invalid yaml");
+    let services = compose_yaml
+        .get("services")
+        .and_then(YamlValue::as_mapping)
+        .expect("compose services should be a map");
+
+    let bind_url = services
+        .values()
+        .find_map(|service| env_value(service, "BIND_URL"));
+    assert_eq!(
+        bind_url.as_deref(),
+        Some("http://127.0.0.1:20000"),
+        "expected client BIND_URL to resolve from scenario IR"
+    );
+
+    let upstream_url = services
+        .values()
+        .find_map(|service| env_value(service, "UPSTREAM_URL"));
+    assert_eq!(
+        upstream_url.as_deref(),
+        Some("http://127.0.0.1:20000"),
+        "expected observer UPSTREAM_URL to resolve from scenario IR"
     );
 }
