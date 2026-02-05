@@ -4,7 +4,6 @@ use amber_scenario::Scenario;
 use serde_json::Value;
 
 use super::{Reporter, ReporterError};
-use crate::CompileOutput;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MetadataReporter;
@@ -12,8 +11,8 @@ pub struct MetadataReporter;
 impl Reporter for MetadataReporter {
     type Artifact = String;
 
-    fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError> {
-        render_metadata(&output.scenario)
+    fn emit(&self, scenario: &Scenario) -> Result<Self::Artifact, ReporterError> {
+        render_metadata(scenario)
     }
 }
 
@@ -61,9 +60,11 @@ mod tests {
             moniker: Moniker::from(moniker.to_string()),
             digest: ManifestDigest::new([id as u8; 32]),
             config: None,
+            config_schema: None,
             program: None,
             slots: BTreeMap::new(),
             provides: BTreeMap::new(),
+            binding_decls: BTreeMap::new(),
             metadata: None,
             children: Vec::new(),
         }

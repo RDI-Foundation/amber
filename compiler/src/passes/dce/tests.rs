@@ -18,9 +18,11 @@ fn component(id: usize, moniker: &str) -> Component {
         moniker: Moniker::from(Arc::from(moniker)),
         digest: amber_manifest::ManifestDigest::new([id as u8; 32]),
         config: None,
+        config_schema: None,
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     }
@@ -28,6 +30,7 @@ fn component(id: usize, moniker: &str) -> Component {
 
 fn apply_manifest(component: &mut Component, manifest: &Manifest) {
     component.program = manifest.program().cloned();
+    component.config_schema = manifest.config_schema().map(|schema| schema.0.clone());
     component.slots = manifest
         .slots()
         .iter()

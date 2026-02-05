@@ -178,9 +178,11 @@ mod tests {
             moniker: Moniker::from(Arc::from(moniker)),
             digest: ManifestDigest::new([id as u8; 32]),
             config: None,
+            config_schema: None,
             program: None,
             slots: BTreeMap::new(),
             provides: BTreeMap::new(),
+            binding_decls: BTreeMap::new(),
             metadata: None,
             children: Vec::new(),
         }

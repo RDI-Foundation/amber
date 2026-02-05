@@ -99,6 +99,20 @@ impl TryFrom<ScenarioIr> for Scenario {
             }
         }
 
+        for component in components.iter().flatten() {
+            for (name, slot) in &component.binding_decls {
+                ensure_name_no_dot(name)?;
+                ensure_name_no_dot(&slot.name)?;
+                let context = format!(
+                    "binding declaration `{name}` in component {} (id {})",
+                    component.moniker.as_str(),
+                    component.id.0
+                );
+                ensure_component(&components, slot.component.0, || context.clone())?;
+                ensure_slot(&components, slot.component, &slot.name, || context.clone())?;
+            }
+        }
+
         for binding in &ir.bindings {
             if let Some(name) = binding.name.as_deref() {
                 ensure_name_no_dot(name)?;
@@ -159,11 +173,17 @@ pub struct ComponentIr {
     pub digest: ManifestDigest,
     pub config: Option<Value>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_schema: Option<Value>,
+    #[serde(default)]
     pub program: Option<Program>,
     #[serde(default)]
     pub slots: BTreeMap<String, SlotDecl>,
     #[serde(default)]
     pub provides: BTreeMap<String, ProvideDecl>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub binding_decls: BTreeMap<String, SlotRefIr>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
@@ -178,9 +198,15 @@ impl ComponentIr {
             children: component.children.iter().map(|id| id.0).collect(),
             digest: component.digest,
             config: component.config.clone(),
+            config_schema: component.config_schema.clone(),
             program: component.program.clone(),
             slots: component.slots.clone(),
             provides: component.provides.clone(),
+            binding_decls: component
+                .binding_decls
+                .iter()
+                .map(|(name, slot)| (name.clone(), SlotRefIr::from(slot)))
+                .collect(),
             metadata: component.metadata.clone(),
         }
     }
@@ -192,9 +218,15 @@ impl ComponentIr {
             moniker: Moniker::from(self.moniker),
             digest: self.digest,
             config: self.config,
+            config_schema: self.config_schema,
             program: self.program,
             slots: self.slots,
             provides: self.provides,
+            binding_decls: self
+                .binding_decls
+                .into_iter()
+                .map(|(name, slot)| (name, slot.into_slot_ref()))
+                .collect(),
             metadata: self.metadata,
             children: self.children.into_iter().map(ComponentId).collect(),
         }
@@ -369,6 +401,15 @@ pub enum ScenarioIrError {
     DuplicateComponentId { id: usize },
     #[error("scenario IR missing component {id} referenced by {context}")]
     MissingComponent { id: usize, context: String },
+    #[error(
+        "{context} targets missing slot {slot:?} on component {component_moniker} (id {component})"
+    )]
+    MissingSlot {
+        component: usize,
+        component_moniker: String,
+        slot: String,
+        context: String,
+    },
     #[error("scenario IR has invalid name {name:?}: dots are reserved")]
     InvalidName { name: String },
 }
@@ -387,6 +428,28 @@ fn ensure_component(
     } else {
         Err(ScenarioIrError::MissingComponent {
             id,
+            context: context(),
+        })
+    }
+}
+
+fn ensure_slot(
+    components: &[Option<Component>],
+    component: ComponentId,
+    slot: &str,
+    context: impl FnOnce() -> String,
+) -> Result<(), ScenarioIrError> {
+    let target = components
+        .get(component.0)
+        .and_then(|component| component.as_ref())
+        .expect("component should exist");
+    if target.slots.contains_key(slot) {
+        Ok(())
+    } else {
+        Err(ScenarioIrError::MissingSlot {
+            component: component.0,
+            component_moniker: target.moniker.to_string(),
+            slot: slot.to_string(),
             context: context(),
         })
     }
@@ -423,9 +486,11 @@ mod tests {
                 moniker: Moniker::from("/".to_string()),
                 digest: ManifestDigest::new([0u8; 32]),
                 config: None,
+                config_schema: None,
                 program: None,
                 slots: BTreeMap::new(),
                 provides: BTreeMap::new(),
+                binding_decls: BTreeMap::new(),
                 metadata: None,
                 children: vec![ComponentId(1)],
             }),
@@ -435,6 +500,7 @@ mod tests {
                 moniker: Moniker::from("/child".to_string()),
                 digest: ManifestDigest::new([1u8; 32]),
                 config: None,
+                config_schema: None,
                 program: Some(
                     serde_json::from_value(json!({
                         "image": "example/child",
@@ -465,6 +531,7 @@ mod tests {
                     }))
                     .expect("deserialize provide decl"),
                 )]),
+                binding_decls: BTreeMap::new(),
                 metadata: None,
                 children: Vec::new(),
             }),
@@ -625,9 +692,11 @@ mod tests {
             moniker: Moniker::from("/".to_string()),
             digest: ManifestDigest::new([0u8; 32]),
             config: None,
+            config_schema: None,
             program: None,
             slots: BTreeMap::new(),
             provides: BTreeMap::new(),
+            binding_decls: BTreeMap::new(),
             metadata: None,
             children: Vec::new(),
         })];
@@ -738,6 +807,44 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("invalid name"), "{message}");
         assert!(message.contains("dots are reserved"), "{message}");
+    }
+
+    #[test]
+    fn scenario_ir_rejects_binding_decl_missing_slot() {
+        let payload = json!({
+            "schema": SCENARIO_IR_SCHEMA,
+            "version": SCENARIO_IR_VERSION,
+            "root": 0,
+            "components": [
+                {
+                    "id": 0,
+                    "moniker": "/",
+                    "parent": null,
+                    "children": [1],
+                    "digest": ManifestDigest::new([0u8; 32]).to_string(),
+                    "config": null,
+                    "binding_decls": {
+                        "bind": { "component": 1, "slot": "api" }
+                    }
+                },
+                {
+                    "id": 1,
+                    "moniker": "/child",
+                    "parent": 0,
+                    "children": [],
+                    "digest": ManifestDigest::new([1u8; 32]).to_string(),
+                    "config": null
+                }
+            ],
+            "bindings": [],
+            "exports": []
+        });
+
+        let ir: ScenarioIr = serde_json::from_value(payload).expect("deserialize scenario IR");
+        let err = Scenario::try_from(ir).expect_err("invalid binding decl");
+        let message = err.to_string();
+        assert!(message.contains("binding declaration"), "{message}");
+        assert!(message.contains("targets missing slot"), "{message}");
     }
 
     #[test]

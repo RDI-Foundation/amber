@@ -1,7 +1,6 @@
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use amber_config as rc;
-use amber_manifest::Manifest;
 use amber_scenario::{Component, ComponentId};
 use serde_json::Value;
 
@@ -22,12 +21,10 @@ pub struct ComposedTemplates {
 pub fn compose_root_config_templates(
     root: ComponentId,
     components: &[Option<Component>],
-    manifests: &[Option<Arc<Manifest>>],
 ) -> ComposedTemplates {
-    let root_schema = manifests[root.0]
+    let root_schema = components[root.0]
         .as_ref()
-        .and_then(|m| m.config_schema())
-        .map(|s| &s.0);
+        .and_then(|component| component.config_schema.as_ref());
 
     let root_template = if root_schema.is_some() {
         rc::RootConfigTemplate::Root
@@ -43,7 +40,6 @@ pub fn compose_root_config_templates(
         root: ComponentId,
         components: &[Option<Component>],
         id: ComponentId,
-        manifests: &[Option<Arc<Manifest>>],
         parent_schema: Option<&Value>,
         parent_template: &rc::RootConfigTemplate,
         binding_scope: ComponentId,
@@ -51,8 +47,7 @@ pub fn compose_root_config_templates(
         errors: &mut Vec<TemplateError>,
     ) {
         let c = components[id.0].as_ref().expect("component should exist");
-        let m = manifests[id.0].as_ref().expect("manifest should exist");
-        let schema = m.config_schema().map(|s| &s.0);
+        let schema = c.config_schema.as_ref();
 
         let this_template = if id == root {
             if schema.is_some() {
@@ -109,7 +104,6 @@ pub fn compose_root_config_templates(
                 root,
                 components,
                 child,
-                manifests,
                 schema,
                 &this_template,
                 id,
@@ -123,7 +117,6 @@ pub fn compose_root_config_templates(
         root,
         components,
         root,
-        manifests,
         root_schema,
         &root_template,
         root,

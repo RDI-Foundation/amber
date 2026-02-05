@@ -1,10 +1,7 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-};
+use std::collections::{BTreeMap, HashMap};
 
 use amber_config as rc;
-use amber_manifest::{BindingTarget, InterpolatedPart, InterpolationSource, Manifest};
+use amber_manifest::{InterpolatedPart, InterpolationSource};
 use amber_scenario::{ComponentId, Scenario};
 use amber_template::{ProgramTemplateSpec, TemplatePart, TemplateSpec, TemplateString};
 use base64::Engine as _;
@@ -47,16 +44,12 @@ pub(crate) struct HelperPayload {
 
 pub(crate) fn build_config_plan(
     scenario: &Scenario,
-    manifests: &[Option<Arc<Manifest>>],
     program_components: &[ComponentId],
     slot_values_by_component: &HashMap<ComponentId, BTreeMap<String, SlotObject>>,
     binding_values_by_component: &HashMap<ComponentId, BTreeMap<String, BindingObject>>,
 ) -> Result<ConfigPlan, MeshError> {
-    let composed = config_templates::compose_root_config_templates(
-        scenario.root,
-        &scenario.components,
-        manifests,
-    );
+    let composed =
+        config_templates::compose_root_config_templates(scenario.root, &scenario.components);
     if let Some(err) = composed.errors.first() {
         return Err(MeshError::new(format!(
             "failed to compose component config templates: {}",
@@ -64,15 +57,15 @@ pub(crate) fn build_config_plan(
         )));
     }
 
-    let binding_urls_by_scope =
-        binding_urls_by_scope(scenario, manifests, slot_values_by_component)?;
+    let binding_urls_by_scope = binding_urls_by_scope(scenario, slot_values_by_component)?;
     let resolved_templates =
         resolve_binding_templates(composed.templates, &binding_urls_by_scope, scenario)?;
 
-    let root_schema = manifests[scenario.root.0]
+    let root_schema = scenario
+        .component(scenario.root)
+        .config_schema
         .as_ref()
-        .and_then(|m| m.config_schema())
-        .map(|s| s.0.clone());
+        .cloned();
 
     let root_leaves = if let Some(schema) = &root_schema {
         rc::collect_leaf_paths(schema).map_err(|e| {
@@ -112,10 +105,7 @@ pub(crate) fn build_config_plan(
         })?;
         let template_opt = component_template.node();
 
-        let component_schema = manifests[id.0]
-            .as_ref()
-            .and_then(|m| m.config_schema())
-            .map(|s| s.0.clone());
+        let component_schema = scenario.component(*id).config_schema.as_ref().cloned();
 
         let plan = build_program_plan(
             scenario,
@@ -193,51 +183,31 @@ pub(crate) fn encode_schema_b64(label: &str, schema: &Value) -> Result<String, M
 
 fn binding_urls_by_scope(
     scenario: &Scenario,
-    manifests: &[Option<Arc<Manifest>>],
     slot_values_by_component: &HashMap<ComponentId, BTreeMap<String, SlotObject>>,
 ) -> Result<HashMap<u64, BTreeMap<String, BindingObject>>, MeshError> {
     let mut out: HashMap<u64, BTreeMap<String, BindingObject>> = HashMap::new();
 
-    for (idx, manifest) in manifests.iter().enumerate() {
-        let Some(manifest) = manifest else {
+    for (idx, component) in scenario.components.iter().enumerate() {
+        let Some(component) = component else {
             continue;
         };
         let realm = ComponentId(idx);
         let mut by_name = BTreeMap::new();
 
-        for (target, binding) in manifest.bindings() {
-            let Some(name) = binding.name.as_ref() else {
-                continue;
-            };
-
-            let (target_component, slot_name) = match target {
-                BindingTarget::SelfSlot(slot) => (realm, slot.as_str()),
-                BindingTarget::ChildSlot { child, slot } => {
-                    let child_id = child_component_id_for_name(scenario, realm, child.as_str())?;
-                    (child_id, slot.as_str())
-                }
-                _ => {
-                    return Err(MeshError::new(format!(
-                        "unsupported binding target {:?} in {}",
-                        target,
-                        component_label(scenario, realm)
-                    )));
-                }
-            };
-
+        for (name, slot_ref) in &component.binding_decls {
             let slot_values = slot_values_by_component
-                .get(&target_component)
+                .get(&slot_ref.component)
                 .ok_or_else(|| {
                     MeshError::new(format!(
                         "internal error: missing slot values for {}",
-                        component_label(scenario, target_component)
+                        component_label(scenario, slot_ref.component)
                     ))
                 })?;
-            let slot = slot_values.get(slot_name).ok_or_else(|| {
+            let slot = slot_values.get(slot_ref.name.as_str()).ok_or_else(|| {
                 MeshError::new(format!(
                     "internal error: missing slot url for {}.{}",
-                    component_label(scenario, target_component),
-                    slot_name
+                    component_label(scenario, slot_ref.component),
+                    slot_ref.name
                 ))
             })?;
 
@@ -321,24 +291,6 @@ fn resolve_binding_parts_in_config(
         }
         other => Ok(other.clone()),
     }
-}
-
-fn child_component_id_for_name(
-    scenario: &Scenario,
-    parent: ComponentId,
-    child_name: &str,
-) -> Result<ComponentId, MeshError> {
-    let parent_component = scenario.component(parent);
-    for child_id in &parent_component.children {
-        let child = scenario.component(*child_id);
-        if child.moniker.local_name() == Some(child_name) {
-            return Ok(*child_id);
-        }
-    }
-    Err(MeshError::new(format!(
-        "internal error: missing child {child_name:?} for {}",
-        component_label(scenario, parent)
-    )))
 }
 
 #[derive(Debug)]

@@ -54,6 +54,7 @@ dependencies = [
  "amber-images",
  "amber-manifest",
  "amber-resolver",
+ "amber-scenario",
  "clap",
  "miette",
  "serde_json",

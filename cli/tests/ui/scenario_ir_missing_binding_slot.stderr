@@ -1,0 +1,2 @@
+Error:   × invalid scenario IR: binding declaration `bind` in component / (id 0)
+  │ targets missing slot "api" on component /child (id 1)

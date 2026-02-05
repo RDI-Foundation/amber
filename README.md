@@ -128,6 +128,9 @@ If you're working in this repo, the internal image list and tags live in
 amber compile path/to/root.json5 --output /tmp/scenario.json
 ```
 
+You can also use an existing Scenario IR as input for `amber compile` to produce other outputs
+(for example, Docker Compose or Kubernetes manifests).
+
 ### Check-only (linting + diagnostics)
 
 ```sh

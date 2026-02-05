@@ -396,7 +396,9 @@ fn kubernetes_emits_router_for_external_slots() {
             disable_networkpolicy_check: true,
         },
     };
-    let artifact = reporter.emit(&output).expect("render kubernetes output");
+    let artifact = reporter
+        .emit(&output.scenario)
+        .expect("render kubernetes output");
 
     let router_deploy = artifact
         .files
@@ -485,7 +487,9 @@ fn kubernetes_smoke_config_roundtrip() {
             disable_networkpolicy_check: true,
         },
     };
-    let artifact = reporter.emit(&output).expect("render kubernetes output");
+    let artifact = reporter
+        .emit(&output.scenario)
+        .expect("render kubernetes output");
 
     let dir = tempdir().expect("create temp dir");
     let output_dir = dir.path().join("kubernetes");
@@ -676,7 +680,9 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
             disable_networkpolicy_check: true,
         },
     };
-    let artifact = reporter.emit(&output).expect("render kubernetes output");
+    let artifact = reporter
+        .emit(&output.scenario)
+        .expect("render kubernetes output");
 
     let output_dir = dir.path().join("kubernetes");
     write_kubernetes_output(&output_dir, &artifact);
@@ -949,7 +955,9 @@ fn kubernetes_smoke_export_routes_to_host() {
             disable_networkpolicy_check: true,
         },
     };
-    let artifact = reporter.emit(&output).expect("render kubernetes output");
+    let artifact = reporter
+        .emit(&output.scenario)
+        .expect("render kubernetes output");
 
     let router_deploy = artifact
         .files

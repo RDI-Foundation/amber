@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use amber_manifest::Manifest;
+use amber_manifest::SlotDecl;
 use base64::Engine as _;
 use serde::Serialize;
 
@@ -53,13 +53,12 @@ pub(crate) fn allocate_external_slot_ports(
 }
 
 pub(crate) fn build_router_external_slots(
-    root_manifest: &Manifest,
+    root_slots: &BTreeMap<String, SlotDecl>,
     external_slot_ports: &BTreeMap<String, u16>,
 ) -> Vec<RouterExternalSlot> {
     let mut router_external_slots = Vec::with_capacity(external_slot_ports.len());
     for (slot_name, listen_port) in external_slot_ports {
-        let decl = root_manifest
-            .slots()
+        let decl = root_slots
             .get(slot_name.as_str())
             .expect("external slot should exist on root");
         let url_env = external_slot_env_var(slot_name);
