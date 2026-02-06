@@ -7,13 +7,6 @@
       "dockerfile": "Dockerfile"
     },
     {
-      "name": "amber-sidecar",
-      "context": "docker/amber-sidecar",
-      "dockerfile": "docker/amber-sidecar/Dockerfile",
-      "code_tag": "main",
-      "floating_tags": ["main"]
-    },
-    {
       "name": "amber-helper",
       "context": ".",
       "dockerfile": "docker/amber-helper/Dockerfile",

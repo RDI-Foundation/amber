@@ -1,0 +1,12 @@
+[package]
+name = "amber-mesh"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = { workspace = true }
+ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

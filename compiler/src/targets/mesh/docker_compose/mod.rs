@@ -1,25 +1,23 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    fmt::Write as _,
+    collections::{BTreeMap, HashMap},
 };
 
 use amber_config as rc;
 use amber_scenario::{ComponentId, Scenario};
-use miette::LabeledSpan;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     CompileOutput,
     reporter::{Reporter, ReporterError},
     targets::mesh::{
-        LOCAL_NETWORK_CIDRS,
-        addressing::{Addressing, RouterPortBases, WorkloadId, build_address_plan},
+        addressing::{Addressing, build_address_plan},
         config::{ProgramPlan, encode_helper_payload, encode_schema_b64},
         internal_images::resolve_internal_images,
-        plan::{
-            MeshOptions, ResolvedBinding, ResolvedExport, ResolvedExternalBinding, component_label,
-        },
+        mesh_config::{MeshAddressing, RouterPorts, build_mesh_config_plan},
+        plan::{MeshError, MeshOptions, ResolvedBinding, ResolvedExternalBinding, component_label},
+        ports::{allocate_mesh_ports, allocate_slot_ports},
+        proxy_metadata::{ProxyMetadata, RouterMetadata, build_proxy_metadata},
     },
 };
 
@@ -31,11 +29,9 @@ const HELPER_INIT_SERVICE: &str = "amber-init";
 const HELPER_BIN_DIR: &str = "/amber/bin";
 const HELPER_BIN_PATH: &str = "/amber/bin/amber-helper";
 
-const LOCAL_PROXY_PORT_BASE: u16 = 20000;
-const ROUTER_EXTERNAL_PORT_BASE: u16 = 21000;
-const ROUTER_EXPORT_PORT_BASE: u16 = 22000;
-const EXPORT_PORT_BASE: u16 = 18000;
-const EXPORT_HOST: &str = "127.0.0.1";
+const COMPONENT_MESH_PORT_BASE: u16 = 23000;
+const ROUTER_MESH_PORT_BASE: u16 = 24000;
+const ROUTER_CONTROL_PORT_BASE: u16 = 24100;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DockerComposeReporter;
@@ -43,8 +39,8 @@ pub struct DockerComposeReporter;
 impl Reporter for DockerComposeReporter {
     type Artifact = String;
 
-    fn emit(&self, scenario: &Scenario) -> Result<Self::Artifact, ReporterError> {
-        render_docker_compose(scenario)
+    fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError> {
+        render_docker_compose(output)
     }
 }
 
@@ -56,32 +52,15 @@ struct DockerComposeFile {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     networks: BTreeMap<String, Network>,
     #[serde(rename = "x-amber", default, skip_serializing_if = "Option::is_none")]
-    x_amber: Option<AmberExtension>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-struct AmberExtension {
-    exports: BTreeMap<String, ExportMetadata>,
+    x_amber: Option<ProxyMetadata>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct EmptyMap {}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-struct NetworkConfig {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    aliases: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct Network {
     driver: String,
-    #[serde(
-        default,
-        skip_serializing_if = "BTreeMap::is_empty",
-        rename = "driver_opts"
-    )]
-    driver_opts: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -94,7 +73,7 @@ struct Service {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     security_opt: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    networks: BTreeMap<String, NetworkConfig>,
+    networks: BTreeMap<String, EmptyMap>,
     #[serde(skip_serializing_if = "Option::is_none")]
     network_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -103,10 +82,14 @@ struct Service {
     entrypoint: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     environment: Option<Environment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    env_file: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     labels: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     ports: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    extra_hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     volumes: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -149,51 +132,14 @@ struct ServiceNames {
     sidecar: String,
 }
 
-#[derive(Clone, Debug)]
-struct SlotProxy {
-    local_port: u16,
-    remote_host: String,
-    remote_port: u16,
-}
-
-#[derive(Clone, Debug)]
-struct ComposeAddressExtra {
-    slot_proxies_by_component: HashMap<ComponentId, Vec<SlotProxy>>,
-}
-
 struct ComposeAddressing<'a> {
     scenario: &'a Scenario,
-    names: &'a HashMap<ComponentId, ServiceNames>,
-    router_names: ServiceNames,
     slot_ports_by_component: HashMap<ComponentId, BTreeMap<String, u16>>,
-    slot_proxies_by_component: HashMap<ComponentId, Vec<SlotProxy>>,
-    port_owner: HashMap<(ComponentId, u16), (String, String)>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct ExportMetadata {
-    published_host: String,
-    published_port: u16,
-    target_port: u16,
-    component: String,
-    provide: String,
-    endpoint: String,
-}
-
-#[derive(Debug)]
-struct PortConflict {
-    component: ComponentId,
-    port: u16,
-    first_provide: String,
-    first_endpoint: String,
-    provide: String,
-    endpoint: String,
 }
 
 #[derive(Debug)]
 enum DockerComposeError {
     Other(String),
-    PortConflict(Box<PortConflict>),
 }
 
 impl From<String> for DockerComposeError {
@@ -209,205 +155,24 @@ impl From<crate::targets::mesh::plan::MeshError> for DockerComposeError {
 }
 
 impl DockerComposeError {
-    fn into_reporter_error(self, scenario: &Scenario) -> ReporterError {
+    fn into_reporter_error(self, _output: &CompileOutput) -> ReporterError {
         match self {
             DockerComposeError::Other(message) => ReporterError::new(message),
-            DockerComposeError::PortConflict(conflict) => {
-                let PortConflict {
-                    component,
-                    port,
-                    first_provide,
-                    first_endpoint,
-                    provide,
-                    endpoint,
-                } = *conflict;
-                let component_moniker = scenario.component(component).moniker.as_str();
-                let message = format!(
-                    "docker-compose output cannot enforce separate capabilities for provides \
-                     `{first_provide}` and `{provide}` in component `{component_moniker}`: both \
-                     route to port {port} via endpoints `{first_endpoint}` and `{endpoint}`"
-                );
-                let help = "Expose each capability on its own port, or add an explicit L7 proxy \
-                            component that maps each capability to a separate port.";
-                ReporterError::new(message).with_help(help)
-            }
         }
     }
-
-    fn into_reporter_error_with_spans(self, output: &CompileOutput) -> ReporterError {
-        match self {
-            DockerComposeError::Other(message) => ReporterError::new(message),
-            DockerComposeError::PortConflict(conflict) => port_conflict_report(output, &conflict),
-        }
-    }
-}
-
-fn port_conflict_report(output: &CompileOutput, conflict: &PortConflict) -> ReporterError {
-    let PortConflict {
-        component,
-        port,
-        first_provide,
-        first_endpoint,
-        provide,
-        endpoint,
-    } = conflict;
-    let component_moniker = output.scenario.component(*component).moniker.as_str();
-    let message = format!(
-        "docker-compose output cannot enforce separate capabilities for provides \
-         `{first_provide}` and `{provide}` in component `{component_moniker}`: both route to port \
-         {port} via endpoints `{first_endpoint}` and `{endpoint}`"
-    );
-    let help = "Expose each capability on its own port, or add an explicit L7 proxy component \
-                that maps each capability to a separate port.";
-
-    let prov = output.provenance.for_component(*component);
-    let Some((src, spans)) = output.store.diagnostic_source(&prov.resolved_url) else {
-        return ReporterError::new(message).with_help(help);
-    };
-
-    let mut labels = Vec::new();
-    let mut has_primary = false;
-
-    let provide_span = |name: &str| {
-        spans
-            .provides
-            .get(name)
-            .map(|s| s.capability.name)
-            .or_else(|| spans.provides.get(name).map(|s| s.capability.whole))
-    };
-
-    let endpoint_span = |name: &str| {
-        spans
-            .program
-            .as_ref()?
-            .endpoints
-            .iter()
-            .find(|endpoint| endpoint.name.as_ref() == name)
-    };
-
-    if let Some(endpoint_span) = endpoint_span(first_endpoint) {
-        let span = endpoint_span.port_span.unwrap_or(endpoint_span.whole);
-        labels.push(LabeledSpan::new_primary_with_span(
-            Some(format!("port used by provide `{first_provide}`")),
-            span,
-        ));
-        has_primary = true;
-    }
-    if let Some(endpoint_span) = endpoint_span(endpoint) {
-        let span = endpoint_span.port_span.unwrap_or(endpoint_span.whole);
-        let label = Some(format!("port used by provide `{provide}`"));
-        if has_primary {
-            labels.push(LabeledSpan::new_with_span(label, span));
-        } else {
-            labels.push(LabeledSpan::new_primary_with_span(label, span));
-            has_primary = true;
-        }
-    }
-
-    if !has_primary {
-        if let Some(span) = provide_span(first_provide) {
-            labels.push(LabeledSpan::new_primary_with_span(
-                Some(format!("provide `{first_provide}`")),
-                span,
-            ));
-            has_primary = true;
-        }
-        if let Some(span) = provide_span(provide) {
-            let label = Some(format!("provide `{provide}`"));
-            if has_primary {
-                labels.push(LabeledSpan::new_with_span(label, span));
-            } else {
-                labels.push(LabeledSpan::new_primary_with_span(label, span));
-            }
-        }
-    }
-
-    ReporterError::new(message)
-        .with_help(help)
-        .with_source_code(src)
-        .with_labels(labels)
 }
 
 type DcResult<T> = Result<T, DockerComposeError>;
 
-pub fn validate_docker_compose(output: &CompileOutput) -> Result<(), ReporterError> {
-    let s = &output.scenario;
-
-    let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
-        s,
-        MeshOptions {
-            backend_label: "docker-compose reporter",
-        },
-    )
-    .map_err(|e| ReporterError::new(e.to_string()))?;
-
-    let program_components = mesh_plan.program_components.as_slice();
-
-    let mut names: HashMap<ComponentId, ServiceNames> = HashMap::new();
-    for id in program_components {
-        let c = s.component(*id);
-        let base = service_base_name(*id, c.moniker.local_name().unwrap_or("component"));
-        let sidecar = format!("{base}-net");
-        names.insert(
-            *id,
-            ServiceNames {
-                program: base,
-                sidecar,
-            },
-        );
-    }
-    let router_names = ServiceNames {
-        program: ROUTER_SERVICE_NAME.to_string(),
-        sidecar: format!("{ROUTER_SERVICE_NAME}-net"),
-    };
-
-    let root_slots = &s.component(s.root).slots;
-    let addressing = ComposeAddressing::new(s, program_components, &names, router_names)
-        .map_err(|err| err.into_reporter_error_with_spans(output))?;
-    build_address_plan(
-        &mesh_plan,
-        root_slots,
-        RouterPortBases {
-            external: ROUTER_EXTERNAL_PORT_BASE,
-            export: ROUTER_EXPORT_PORT_BASE,
-        },
-        addressing,
-    )
-    .map_err(|err| err.into_reporter_error_with_spans(output))?;
-
-    Ok(())
-}
-
 impl<'a> ComposeAddressing<'a> {
     fn new(
         scenario: &'a Scenario,
-        program_components: &'a [ComponentId],
-        names: &'a HashMap<ComponentId, ServiceNames>,
-        router_names: ServiceNames,
+        slot_ports_by_component: HashMap<ComponentId, BTreeMap<String, u16>>,
     ) -> Result<Self, DockerComposeError> {
-        let slot_ports_by_component = allocate_local_proxy_ports(scenario, program_components)?;
-
         Ok(Self {
             scenario,
-            names,
-            router_names,
             slot_ports_by_component,
-            slot_proxies_by_component: HashMap::new(),
-            port_owner: HashMap::new(),
         })
-    }
-
-    fn sidecar_host(&self, component: ComponentId) -> Result<String, DockerComposeError> {
-        self.names
-            .get(&component)
-            .ok_or_else(|| {
-                format!(
-                    "internal error: missing sidecar name for component {}",
-                    component_label(self.scenario, component)
-                )
-            })
-            .map(|svc| svc.sidecar.clone())
-            .map_err(DockerComposeError::Other)
     }
 
     fn local_proxy_port(
@@ -427,48 +192,13 @@ impl<'a> ComposeAddressing<'a> {
                 ))
             })
     }
-
-    fn record_proxy(
-        &mut self,
-        consumer: ComponentId,
-        local_port: u16,
-        remote_host: String,
-        remote_port: u16,
-    ) {
-        self.slot_proxies_by_component
-            .entry(consumer)
-            .or_default()
-            .push(SlotProxy {
-                local_port,
-                remote_host,
-                remote_port,
-            });
-    }
 }
 
 impl Addressing for ComposeAddressing<'_> {
-    type Extra = ComposeAddressExtra;
     type Error = DockerComposeError;
 
     fn resolve_binding_url(&mut self, binding: &ResolvedBinding) -> Result<String, Self::Error> {
-        let endpoint = &binding.endpoint;
-
-        enforce_single_endpoint_per_port(
-            &mut self.port_owner,
-            binding.provider,
-            endpoint.port,
-            &binding.provide,
-            &endpoint.name,
-        )?;
-
         let local_port = self.local_proxy_port(binding.consumer, &binding.slot)?;
-        let remote_host = if binding.provider == binding.consumer {
-            "127.0.0.1".to_string()
-        } else {
-            self.sidecar_host(binding.provider)?
-        };
-
-        self.record_proxy(binding.consumer, local_port, remote_host, endpoint.port);
 
         Ok(format!("http://127.0.0.1:{local_port}"))
     }
@@ -476,47 +206,23 @@ impl Addressing for ComposeAddressing<'_> {
     fn resolve_external_binding_url(
         &mut self,
         binding: &ResolvedExternalBinding,
-        router_port: u16,
     ) -> Result<String, Self::Error> {
         let local_port = self.local_proxy_port(binding.consumer, &binding.slot)?;
-        let remote_host = self.router_names.sidecar.clone();
-
-        self.record_proxy(binding.consumer, local_port, remote_host, router_port);
 
         Ok(format!("http://127.0.0.1:{local_port}"))
     }
-
-    fn resolve_export_target_url(
-        &mut self,
-        export: &ResolvedExport,
-    ) -> Result<String, Self::Error> {
-        let endpoint = &export.endpoint;
-        enforce_single_endpoint_per_port(
-            &mut self.port_owner,
-            export.provider,
-            endpoint.port,
-            &export.provide,
-            &endpoint.name,
-        )?;
-
-        let provider_host = self.sidecar_host(export.provider)?;
-        Ok(format!("http://{provider_host}:{}", endpoint.port))
-    }
-
-    fn finalize(self) -> Self::Extra {
-        ComposeAddressExtra {
-            slot_proxies_by_component: self.slot_proxies_by_component,
-        }
-    }
 }
 
-fn render_docker_compose(scenario: &Scenario) -> Result<String, ReporterError> {
-    render_docker_compose_inner(scenario).map_err(|err| err.into_reporter_error(scenario))
+fn render_docker_compose(output: &CompileOutput) -> Result<String, ReporterError> {
+    render_docker_compose_inner(output).map_err(|err| err.into_reporter_error(output))
 }
 
-fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
+fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
+    let s = &output.scenario;
+
     let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
         s,
+        &output.store,
         MeshOptions {
             backend_label: "docker-compose reporter",
         },
@@ -540,85 +246,91 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
             },
         );
     }
-    let router_names = ServiceNames {
-        program: ROUTER_SERVICE_NAME.to_string(),
-        sidecar: format!("{ROUTER_SERVICE_NAME}-net"),
-    };
+    let root_manifest = mesh_plan.manifests[s.root.0]
+        .as_ref()
+        .expect("root manifest should exist");
 
-    let root_slots = &s.component(s.root).slots;
+    let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
 
-    let addressing = ComposeAddressing::new(s, program_components, &names, router_names.clone())?;
-    let address_plan = build_address_plan(
-        &mesh_plan,
-        root_slots,
-        RouterPortBases {
-            external: ROUTER_EXTERNAL_PORT_BASE,
-            export: ROUTER_EXPORT_PORT_BASE,
-        },
-        addressing,
+    let slot_ports_by_component = allocate_slot_ports(s, program_components)?;
+    let mesh_ports_by_component = allocate_mesh_ports(
+        s,
+        program_components,
+        COMPONENT_MESH_PORT_BASE,
+        &slot_ports_by_component,
     )?;
-    let ComposeAddressExtra {
-        slot_proxies_by_component,
-    } = address_plan.extra;
-    let needs_router = address_plan.router.needs_router;
+    let router_ports = needs_router.then_some(RouterPorts {
+        mesh: ROUTER_MESH_PORT_BASE,
+        control: ROUTER_CONTROL_PORT_BASE,
+    });
 
-    let map_allowed_hosts =
-        |by_port: Option<&BTreeMap<u16, BTreeSet<WorkloadId>>>|
-         -> DcResult<BTreeMap<u16, BTreeSet<String>>> {
-        let mut out: BTreeMap<u16, BTreeSet<String>> = BTreeMap::new();
-        let Some(by_port) = by_port else {
-            return Ok(out);
-        };
-        for (port, consumers) in by_port {
-            let mut hosts: BTreeSet<String> = BTreeSet::new();
-            for consumer in consumers {
-                let host = match consumer {
-                    WorkloadId::Component(id) => names
-                        .get(id)
-                        .ok_or_else(|| {
-                            format!(
-                                "internal error: missing sidecar name for consumer {}",
-                                component_label(s, *id)
-                            )
-                        })?
-                        .sidecar
-                        .clone(),
-                    WorkloadId::Router => router_names.sidecar.clone(),
-                };
-                hosts.insert(host);
-            }
-            if !hosts.is_empty() {
-                out.insert(*port, hosts);
-            }
-        }
-        Ok(out)
-    };
+    let addressing = ComposeAddressing::new(s, slot_ports_by_component.clone())?;
+    let address_plan = build_address_plan(&mesh_plan, addressing)?;
 
-    // Scenario exports => publish to host loopback with stable host ports (via router).
-    let mut exports_by_name: BTreeMap<String, ExportMetadata> = BTreeMap::new();
-    {
-        let mut next_host_port = EXPORT_PORT_BASE;
-        for ex in &mesh_plan.exports {
-            let provider = ex.provider;
-            let endpoint = &ex.endpoint;
+    struct ComposeMeshAddressing<'a> {
+        names: &'a HashMap<ComponentId, ServiceNames>,
+        mesh_ports_by_component: &'a HashMap<ComponentId, u16>,
+        router_mesh_port: u16,
+    }
 
-            let published = next_host_port;
-            next_host_port = next_host_port.checked_add(1).ok_or_else(|| {
-                "ran out of host ports while allocating scenario exports".to_string()
+    impl MeshAddressing for ComposeMeshAddressing<'_> {
+        fn mesh_addr_for_component(&self, id: ComponentId) -> Result<String, MeshError> {
+            let svc = self.names.get(&id).ok_or_else(|| {
+                MeshError::new(format!("missing service name for component {id:?}"))
             })?;
+            let port = *self
+                .mesh_ports_by_component
+                .get(&id)
+                .ok_or_else(|| MeshError::new(format!("missing mesh port for component {id:?}")))?;
+            Ok(format!("{}:{}", svc.sidecar, port))
+        }
 
-            let metadata = ExportMetadata {
-                published_host: EXPORT_HOST.to_string(),
-                published_port: published,
-                target_port: endpoint.port,
-                component: component_label(s, provider),
-                provide: ex.provide.clone(),
-                endpoint: endpoint.name.clone(),
-            };
-
-            exports_by_name.insert(ex.name.clone(), metadata);
+        fn mesh_addr_for_router(&self) -> Result<String, MeshError> {
+            Ok(format!("{ROUTER_SERVICE_NAME}:{}", self.router_mesh_port))
         }
     }
+
+    let router_mesh_port = router_ports
+        .as_ref()
+        .map(|ports| ports.mesh)
+        .unwrap_or(ROUTER_MESH_PORT_BASE);
+    let mesh_addressing = ComposeMeshAddressing {
+        names: &names,
+        mesh_ports_by_component: &mesh_ports_by_component,
+        router_mesh_port,
+    };
+    let mesh_config_plan = build_mesh_config_plan(
+        s,
+        &mesh_plan,
+        root_manifest,
+        &slot_ports_by_component,
+        &mesh_ports_by_component,
+        router_ports,
+        &mesh_addressing,
+    )
+    .map_err(|err| DockerComposeError::Other(err.to_string()))?;
+    let has_external_slots = !mesh_plan.external_bindings.is_empty();
+    let router_config_b64 = mesh_config_plan
+        .router_config
+        .as_ref()
+        .map(amber_mesh::encode_config_b64)
+        .transpose()
+        .map_err(|err| DockerComposeError::Other(err.to_string()))?;
+    let router_metadata = router_config_b64.as_ref().map(|config_b64| RouterMetadata {
+        config_b64: config_b64.clone(),
+        mesh_port: router_mesh_port,
+        control_port: router_ports.as_ref().expect("router ports missing").control,
+    });
+    let proxy_metadata = needs_router.then_some(build_proxy_metadata(
+        s,
+        &mesh_plan,
+        root_manifest,
+        router_metadata,
+    ));
+    let exports_by_name = proxy_metadata
+        .as_ref()
+        .map(|meta| meta.exports.clone())
+        .unwrap_or_default();
 
     // Compose YAML
     // ---- runtime config / helper decision ----
@@ -681,75 +393,41 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
     }
 
     if needs_router {
-        let router_inbound_allow = map_allowed_hosts(address_plan.allow.for_router())?;
-        let router_inbound: Vec<(u16, &BTreeSet<String>)> = router_inbound_allow
-            .iter()
-            .map(|(port, srcs)| (*port, srcs))
-            .collect();
-        let router_script = build_sidecar_script(
-            s.root,
-            router_inbound,
-            if address_plan.router.export_ports.is_empty() {
-                None
-            } else {
-                Some(&address_plan.router.export_ports)
-            },
-            None,
-            false,
-        );
-        let router_script = escape_compose_interpolation(&router_script).into_owned();
+        let router_config_b64 = router_config_b64
+            .as_ref()
+            .expect("router config should exist");
+        let mut env_entries = mesh_config_plan.router_env_passthrough.clone();
+        env_entries.push(format!("AMBER_ROUTER_CONFIG_B64={router_config_b64}"));
+        let mut router_service = Service::new(images.router.clone());
+        router_service.environment = Some(Environment::List(env_entries));
+        if has_external_slots {
+            router_service
+                .extra_hosts
+                .push("host.docker.internal:host-gateway".to_string());
+        }
+        router_service
+            .networks
+            .insert(MESH_NETWORK_NAME.to_string(), EmptyMap::default());
+        router_service
+            .ports
+            .push(format!("127.0.0.1:{router_mesh_port}:{router_mesh_port}"));
+        if let Some(ports) = router_ports {
+            router_service
+                .ports
+                .push(format!("127.0.0.1:{}:{}", ports.control, ports.control));
+        }
 
-        let mut router_sidecar =
-            sidecar_service(&router_names.sidecar, &images.sidecar, router_script);
         if !exports_by_name.is_empty() {
-            for (export_name, meta) in &exports_by_name {
-                let router_port = address_plan
-                    .router
-                    .export_ports_by_name
-                    .get(export_name)
-                    .expect("router export port missing");
-                let spec = format!(
-                    "{}:{}:{}",
-                    meta.published_host, meta.published_port, router_port
-                );
-                router_sidecar.ports.push(spec);
-            }
-
             let labels_json = serde_json::to_string(&exports_by_name)
                 .map_err(|err| format!("failed to serialize router export labels: {err}"))?;
-            router_sidecar
+            router_service
                 .labels
                 .insert("amber.exports".to_string(), labels_json);
         }
 
         compose
             .services
-            .insert(router_names.sidecar.clone(), router_sidecar);
-
-        let mut router_program = Service::new(images.router.clone());
-        router_program.network_mode = Some(format!("service:{}", router_names.sidecar));
-
-        let mut env_entries = address_plan.router.router_env_passthrough.clone();
-        let router_config_b64 = address_plan
-            .router
-            .router_config_b64
-            .as_ref()
-            .expect("router config should be computed");
-        env_entries.push(format!("AMBER_ROUTER_CONFIG_B64={router_config_b64}"));
-        router_program.environment = Some(Environment::List(env_entries));
-
-        let mut depends = BTreeMap::new();
-        depends.insert(
-            router_names.sidecar.clone(),
-            DependsOnCondition {
-                condition: "service_started".to_string(),
-            },
-        );
-        router_program.depends_on = Some(DependsOn::Conditions(depends));
-
-        compose
-            .services
-            .insert(router_names.program.clone(), router_program);
+            .insert(ROUTER_SERVICE_NAME.to_string(), router_service);
     }
 
     // Emit services in stable (component id) order, sidecar then program.
@@ -757,22 +435,22 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
         let c = s.component(*id);
         let svc = names.get(id).unwrap();
 
-        let inbound_allow = map_allowed_hosts(address_plan.allow.for_component(*id))?;
-        let script = build_sidecar_script(
-            *id,
-            inbound_allow
-                .iter()
-                .map(|(port, srcs)| (*port, srcs))
-                .collect(),
-            None,
-            slot_proxies_by_component.get(id),
-            true,
-        );
-        let script = escape_compose_interpolation(&script).into_owned();
-        compose.services.insert(
-            svc.sidecar.clone(),
-            sidecar_service(&svc.sidecar, &images.sidecar, script),
-        );
+        let sidecar_config = mesh_config_plan
+            .component_configs
+            .get(id)
+            .expect("sidecar config missing");
+        let sidecar_config_b64 = amber_mesh::encode_config_b64(sidecar_config)
+            .map_err(|err| DockerComposeError::Other(err.to_string()))?;
+        let mut sidecar_service = Service::new(images.router.clone());
+        sidecar_service.environment = Some(Environment::List(vec![format!(
+            "AMBER_ROUTER_CONFIG_B64={sidecar_config_b64}"
+        )]));
+        sidecar_service
+            .networks
+            .insert(MESH_NETWORK_NAME.to_string(), EmptyMap::default());
+        compose
+            .services
+            .insert(svc.sidecar.clone(), sidecar_service);
 
         let program = c.program.as_ref().unwrap();
         let mut program_service = Service::new(program.image.as_str());
@@ -869,17 +547,11 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
         MESH_NETWORK_NAME.to_string(),
         Network {
             driver: "bridge".to_string(),
-            driver_opts: BTreeMap::from([(
-                "com.docker.network.bridge.enable_ip_masquerade".to_string(),
-                "true".to_string(),
-            )]),
         },
     );
 
-    if !exports_by_name.is_empty() {
-        compose.x_amber = Some(AmberExtension {
-            exports: exports_by_name.clone(),
-        });
+    if needs_router {
+        compose.x_amber = proxy_metadata;
     }
 
     serde_yaml::to_string(&compose).map_err(|e| {
@@ -888,21 +560,6 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
 }
 
 // ---- helpers ----
-
-fn sidecar_service(name: &str, image: &str, script: String) -> Service {
-    let mut service = Service::new(image);
-    service.cap_add = vec!["NET_ADMIN".to_string()];
-    service.cap_drop = vec!["ALL".to_string()];
-    service.security_opt = vec!["no-new-privileges:true".to_string()];
-    service.networks.insert(
-        MESH_NETWORK_NAME.to_string(),
-        NetworkConfig {
-            aliases: vec![name.to_string()],
-        },
-    );
-    service.command = Some(vec!["/bin/sh".to_string(), "-lc".to_string(), script]);
-    service
-}
 
 fn build_depends_on(any_helper: bool, deps: Vec<(String, &'static str)>) -> Option<DependsOn> {
     if deps.is_empty() {
@@ -950,286 +607,8 @@ fn sanitize_service_suffix(s: &str) -> String {
     }
 }
 
-fn enforce_single_endpoint_per_port(
-    owner: &mut HashMap<(ComponentId, u16), (String, String)>,
-    component: ComponentId,
-    port: u16,
-    provide_name: &str,
-    endpoint_name: &str,
-) -> Result<(), DockerComposeError> {
-    match owner.get(&(component, port)) {
-        None => {
-            owner.insert(
-                (component, port),
-                (provide_name.to_string(), endpoint_name.to_string()),
-            );
-            Ok(())
-        }
-        Some((_first_provide, first_endpoint)) if *first_endpoint == endpoint_name => Ok(()),
-        Some((first_provide, first_endpoint)) => {
-            Err(DockerComposeError::PortConflict(Box::new(PortConflict {
-                component,
-                port,
-                first_provide: first_provide.clone(),
-                first_endpoint: first_endpoint.clone(),
-                provide: provide_name.to_string(),
-                endpoint: endpoint_name.to_string(),
-            })))
-        }
-    }
-}
-
-fn allocate_local_proxy_ports(
-    s: &Scenario,
-    program_components: &[ComponentId],
-) -> Result<HashMap<ComponentId, BTreeMap<String, u16>>, String> {
-    let mut out: HashMap<ComponentId, BTreeMap<String, u16>> = HashMap::new();
-
-    for id in program_components {
-        let c = s.component(*id);
-        let program = c.program.as_ref().unwrap();
-
-        // Reserved: any ports the program listens on itself.
-        let mut reserved: HashSet<u16> = HashSet::new();
-        if let Some(net) = program.network.as_ref() {
-            for ep in &net.endpoints {
-                reserved.insert(ep.port);
-            }
-        }
-
-        let mut slot_ports: BTreeMap<String, u16> = BTreeMap::new();
-        let mut next = LOCAL_PROXY_PORT_BASE;
-
-        // Stable ordering by slot name.
-        for slot_name in c.slots.keys() {
-            while reserved.contains(&next) || slot_ports.values().any(|p| *p == next) {
-                next = next.checked_add(1).ok_or_else(|| {
-                    format!(
-                        "ran out of local proxy ports allocating for {}",
-                        component_label(s, *id)
-                    )
-                })?;
-            }
-            slot_ports.insert(slot_name.clone(), next);
-            next = next.checked_add(1).ok_or_else(|| {
-                format!(
-                    "ran out of local proxy ports allocating for {}",
-                    component_label(s, *id)
-                )
-            })?;
-        }
-
-        out.insert(*id, slot_ports);
-    }
-
-    Ok(out)
-}
-
 // NOTE: template interpolation is now handled structurally via `amber_manifest::InterpolatedString`
 // parts and the runtime helper payload IR. The old string re-parser has been removed.
-
-fn build_sidecar_script(
-    _component: ComponentId,
-    inbound: Vec<(u16, &BTreeSet<String>)>,
-    exported_ports: Option<&BTreeSet<u16>>,
-    proxies: Option<&Vec<SlotProxy>>,
-    block_local_egress: bool,
-) -> String {
-    let mut script = String::new();
-
-    let mut egress_targets: Vec<(String, u16)> = Vec::new();
-    if block_local_egress && let Some(ps) = proxies {
-        let mut seen: BTreeSet<(String, u16)> = BTreeSet::new();
-        for p in ps {
-            seen.insert((p.remote_host.clone(), p.remote_port));
-        }
-        egress_targets.extend(seen);
-    }
-
-    // Minimal, explicit, deterministic.
-    writeln!(&mut script, "set -eu").unwrap();
-
-    // Firewall baseline
-    writeln!(&mut script, "iptables -w -F").unwrap();
-    writeln!(&mut script, "iptables -w -X").unwrap();
-    writeln!(&mut script, "iptables -w -P INPUT DROP").unwrap();
-    writeln!(&mut script, "iptables -w -P FORWARD DROP").unwrap();
-    writeln!(&mut script, "iptables -w -P OUTPUT ACCEPT").unwrap();
-    writeln!(&mut script, "iptables -w -A INPUT -i lo -j ACCEPT").unwrap();
-    writeln!(
-        &mut script,
-        "iptables -w -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
-    )
-    .unwrap();
-    if block_local_egress {
-        writeln!(&mut script, "iptables -w -A OUTPUT -o lo -j ACCEPT").unwrap();
-        writeln!(
-            &mut script,
-            "iptables -w -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
-        )
-        .unwrap();
-        writeln!(
-            &mut script,
-            "for ns in $(awk '/^nameserver/{{print $2}}' /etc/resolv.conf | awk '$1 ~ \
-             /^[0-9]+(\\.[0-9]+){{3}}$/ {{print $1}}'); do"
-        )
-        .unwrap();
-        writeln!(
-            &mut script,
-            "  iptables -w -A OUTPUT -p udp -m udp --dport 53 -d \"$ns\" -j ACCEPT"
-        )
-        .unwrap();
-        writeln!(
-            &mut script,
-            "  iptables -w -A OUTPUT -p tcp -m tcp --dport 53 -d \"$ns\" -j ACCEPT"
-        )
-        .unwrap();
-        writeln!(&mut script, "done").unwrap();
-        writeln!(&mut script, "iptables -w -N AMBER-ALLOW-OUT").unwrap();
-        writeln!(&mut script, "iptables -w -A OUTPUT -j AMBER-ALLOW-OUT").unwrap();
-        for cidr in LOCAL_NETWORK_CIDRS {
-            writeln!(
-                &mut script,
-                "iptables -w -A OUTPUT -d {cidr} -p tcp -j REJECT --reject-with tcp-reset"
-            )
-            .unwrap();
-            writeln!(&mut script, "iptables -w -A OUTPUT -d {cidr} -j REJECT").unwrap();
-        }
-    }
-    writeln!(&mut script, "iptables -w -N AMBER-ALLOW").unwrap();
-    writeln!(&mut script, "iptables -w -A INPUT -j AMBER-ALLOW").unwrap();
-
-    writeln!(&mut script, "resolve_ipv4() {{").unwrap();
-    writeln!(
-        &mut script,
-        "  getent hosts \"$1\" | awk '$1 ~ /^[0-9]+(\\.[0-9]+){{3}}$/ {{print $1}}' || true"
-    )
-    .unwrap();
-    writeln!(&mut script, "}}").unwrap();
-    writeln!(&mut script, "add_rule() {{").unwrap();
-    writeln!(&mut script, "  if [ -n \"$1\" ]; then").unwrap();
-    writeln!(
-        &mut script,
-        "    printf '%s\\n' \"$1\" >> \"$desired_rules\""
-    )
-    .unwrap();
-    writeln!(&mut script, "  fi").unwrap();
-    writeln!(&mut script, "}}").unwrap();
-    if block_local_egress {
-        writeln!(&mut script, "add_out_rule() {{").unwrap();
-        writeln!(&mut script, "  if [ -n \"$1\" ]; then").unwrap();
-        writeln!(&mut script, "    printf '%s\\n' \"$1\" >> \"$desired_out\"").unwrap();
-        writeln!(&mut script, "  fi").unwrap();
-        writeln!(&mut script, "}}").unwrap();
-    }
-    writeln!(&mut script, "refresh_allowlist() {{").unwrap();
-    writeln!(&mut script, "  set +e").unwrap();
-    writeln!(&mut script, "  desired_rules=\"/tmp/amber-allowlist\"").unwrap();
-    writeln!(&mut script, "  : > \"$desired_rules\"").unwrap();
-    if block_local_egress {
-        writeln!(&mut script, "  desired_out=\"/tmp/amber-allowlist-out\"").unwrap();
-        writeln!(&mut script, "  : > \"$desired_out\"").unwrap();
-    }
-    writeln!(
-        &mut script,
-        "  gateway=\"$(ip -4 route show default | awk 'NR==1 {{print $3}}')\""
-    )
-    .unwrap();
-
-    // Allow inbound from bound consumers (resolved via DNS).
-    let mut inbound_sorted = inbound;
-    inbound_sorted.sort_by_key(|(port, _)| *port);
-    for (port, srcs) in inbound_sorted {
-        for src in srcs {
-            writeln!(&mut script, "  for ip in $(resolve_ipv4 \"{src}\"); do").unwrap();
-            writeln!(
-                &mut script,
-                "    add_rule \"-s $ip/32 -p tcp -m tcp --dport {port} -j ACCEPT\""
-            )
-            .unwrap();
-            writeln!(&mut script, "  done").unwrap();
-        }
-    }
-
-    // Allow inbound from host (exports): loopback + docker gateway.
-    if let Some(ports) = exported_ports {
-        for port in ports {
-            writeln!(
-                &mut script,
-                "  add_rule \"-s {EXPORT_HOST}/32 -p tcp -m tcp --dport {port} -j ACCEPT\""
-            )
-            .unwrap();
-            writeln!(&mut script, "  if [ -n \"$gateway\" ]; then").unwrap();
-            writeln!(
-                &mut script,
-                "    add_rule \"-s $gateway/32 -p tcp -m tcp --dport {port} -j ACCEPT\""
-            )
-            .unwrap();
-            writeln!(&mut script, "  fi").unwrap();
-        }
-    }
-    if block_local_egress {
-        for (host, port) in &egress_targets {
-            writeln!(&mut script, "  for ip in $(resolve_ipv4 \"{host}\"); do").unwrap();
-            writeln!(
-                &mut script,
-                "    add_out_rule \"-d $ip/32 -p tcp -m tcp --dport {port} -j ACCEPT\""
-            )
-            .unwrap();
-            writeln!(&mut script, "  done").unwrap();
-        }
-        writeln!(&mut script, "  if [ -s \"$desired_out\" ]; then").unwrap();
-        writeln!(&mut script, "    iptables -w -F AMBER-ALLOW-OUT").unwrap();
-        writeln!(&mut script, "    while read -r rule; do").unwrap();
-        writeln!(&mut script, "      [ -z \"$rule\" ] && continue").unwrap();
-        writeln!(&mut script, "      iptables -w -A AMBER-ALLOW-OUT $rule").unwrap();
-        writeln!(&mut script, "    done < \"$desired_out\"").unwrap();
-        writeln!(&mut script, "  fi").unwrap();
-    }
-    writeln!(&mut script, "  if [ -s \"$desired_rules\" ]; then").unwrap();
-    writeln!(&mut script, "    iptables -w -F AMBER-ALLOW").unwrap();
-    writeln!(&mut script, "    while read -r rule; do").unwrap();
-    writeln!(&mut script, "      [ -z \"$rule\" ] && continue").unwrap();
-    writeln!(&mut script, "      iptables -w -A AMBER-ALLOW $rule").unwrap();
-    writeln!(&mut script, "    done < \"$desired_rules\"").unwrap();
-    writeln!(&mut script, "  fi").unwrap();
-    writeln!(&mut script, "  set -e").unwrap();
-    writeln!(&mut script, "  return 0").unwrap();
-    writeln!(&mut script, "}}").unwrap();
-    writeln!(&mut script, "fast_refresh=1").unwrap();
-    writeln!(&mut script, "slow_refresh=5").unwrap();
-    writeln!(&mut script, "warmup_rounds=10").unwrap();
-    writeln!(&mut script, "refresh_allowlist || true").unwrap();
-    writeln!(
-        &mut script,
-        "while true; do refresh_allowlist || true; if [ \"$warmup_rounds\" -gt 0 ]; then \
-         warmup_rounds=$((warmup_rounds-1)); sleep \"$fast_refresh\"; else sleep \
-         \"$slow_refresh\"; fi; done &"
-    )
-    .unwrap();
-
-    // Start local TCP proxies for slots.
-    if let Some(ps) = proxies {
-        // Stable ordering
-        let mut ps = ps.clone();
-        ps.sort_by_key(|p| p.local_port);
-
-        for p in ps {
-            // socat forwards raw TCP; higher-level schemes are handled by the program.
-            writeln!(
-                &mut script,
-                "socat TCP-LISTEN:{},fork,reuseaddr,bind=127.0.0.1 TCP:{}:{} &",
-                p.local_port, p.remote_host, p.remote_port
-            )
-            .unwrap();
-        }
-    }
-
-    // Keep the sidecar alive; program shares this netns.
-    writeln!(&mut script, "exec tail -f /dev/null").unwrap();
-
-    script
-}
 
 fn escape_compose_interpolation<'a>(line: &'a str) -> Cow<'a, str> {
     if line.contains('$') {
