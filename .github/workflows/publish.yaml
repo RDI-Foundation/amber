@@ -73,7 +73,7 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=tag
-            type=sha
+            type=raw,value=${{ github.sha }}
           flavor: |
             suffix=-${{ matrix.arch }}
       - name: Build and push
@@ -138,7 +138,7 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=tag
-            type=sha
+            type=raw,value=${{ github.sha }}
       - name: Publish multi-arch manifests
         run: |
           set -euo pipefail
