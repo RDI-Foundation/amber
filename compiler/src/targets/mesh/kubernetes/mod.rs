@@ -6,6 +6,10 @@ use std::{
 };
 
 use amber_config as rc;
+use amber_mesh::{
+    MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MESH_PROVISION_PLAN_VERSION, MeshProvisionOutput,
+    MeshProvisionPlan, MeshProvisionTarget, MeshProvisionTargetKind,
+};
 use amber_scenario::{ComponentId, Scenario};
 pub use resources::*;
 use serde::Serialize;
@@ -35,7 +39,16 @@ use crate::{
 const HELPER_VOLUME_NAME: &str = "amber-helper";
 const HELPER_BIN_DIR: &str = "/amber/bin";
 const HELPER_BIN_PATH: &str = "/amber/bin/amber-helper";
+const MESH_CONFIG_DIR: &str = "/amber/mesh";
+const MESH_SECRET_VOLUME_NAME: &str = "amber-mesh";
 const ROUTER_NAME: &str = "amber-router";
+const PROVISIONER_NAME: &str = "amber-provisioner";
+const PROVISIONER_CONFIGMAP_NAME: &str = "amber-mesh-provision";
+const PROVISIONER_SERVICE_ACCOUNT: &str = "amber-provisioner";
+const PROVISIONER_ROLE_NAME: &str = "amber-provisioner";
+const PROVISIONER_ROLE_BINDING_NAME: &str = "amber-provisioner";
+const PROVISIONER_PLAN_KEY: &str = "mesh-plan.json";
+const PROVISIONER_JOB_BACKOFF_LIMIT: u32 = 6;
 const ROUTER_EXTERNAL_SECRET_NAME: &str = "amber-router-external";
 const COMPONENT_MESH_PORT_BASE: u16 = 23000;
 const ROUTER_MESH_PORT_BASE: u16 = 24000;
@@ -256,12 +269,9 @@ fn render_kubernetes(
         &mesh_addressing,
     )
     .map_err(|e| ReporterError::new(e.to_string()))?;
-    let router_config_b64 = mesh_config_plan
-        .router_config
-        .as_ref()
-        .map(amber_mesh::encode_config_b64)
-        .transpose()
-        .map_err(|err| ReporterError::new(err.to_string()))?;
+    let mesh_provision_plan =
+        build_provision_plan(&mesh_config_plan, program_components, &names, &namespace)
+            .map_err(|err| ReporterError::new(err.to_string()))?;
 
     let allow_plan = build_allow_plan(&mesh_plan, &mesh_ports_by_component, router_mesh_port_opt)
         .map_err(|e| ReporterError::new(e.to_string()))?;
@@ -494,12 +504,6 @@ fn render_kubernetes(
         let program = c.program.as_ref().unwrap();
         let program_plan = program_plans.get(id).unwrap();
         let mesh_port = *mesh_ports_by_component.get(id).expect("mesh port missing");
-        let sidecar_config = mesh_config_plan
-            .component_configs
-            .get(id)
-            .expect("sidecar config missing");
-        let sidecar_config_b64 = amber_mesh::encode_config_b64(sidecar_config)
-            .map_err(|err| ReporterError::new(err.to_string()))?;
 
         // Container ports.
         let mut ports: Vec<ContainerPort> = Vec::new();
@@ -514,7 +518,7 @@ fn render_kubernetes(
         }
 
         // Build container based on program mode.
-        let (container, volumes) = match program_plan {
+        let (container, mut volumes) = match program_plan {
             ProgramPlan::Direct { entrypoint, env } => {
                 // Direct mode: use resolved entrypoint and env directly.
                 // Config values are already baked into the entrypoint/env strings,
@@ -630,16 +634,27 @@ fn render_kubernetes(
                 (container, volumes)
             }
         };
+        let mesh_secret = mesh_secret_name(&cnames.service);
+        volumes.push(Volume::secret(
+            MESH_SECRET_VOLUME_NAME.to_string(),
+            mesh_secret,
+        ));
 
         let sidecar = Container {
             name: "sidecar".to_string(),
             image: images.router.clone(),
             command: Vec::new(),
             args: Vec::new(),
-            env: vec![EnvVar::literal(
-                "AMBER_ROUTER_CONFIG_B64",
-                &sidecar_config_b64,
-            )],
+            env: vec![
+                EnvVar::literal(
+                    "AMBER_ROUTER_CONFIG_PATH",
+                    format!("{MESH_CONFIG_DIR}/{MESH_CONFIG_FILENAME}"),
+                ),
+                EnvVar::literal(
+                    "AMBER_ROUTER_IDENTITY_PATH",
+                    format!("{MESH_CONFIG_DIR}/{MESH_IDENTITY_FILENAME}"),
+                ),
+            ],
             env_from: Vec::new(),
             ports: vec![ContainerPort {
                 name: "mesh".to_string(),
@@ -647,7 +662,11 @@ fn render_kubernetes(
                 protocol: "TCP",
             }],
             readiness_probe: None,
-            volume_mounts: Vec::new(),
+            volume_mounts: vec![VolumeMount {
+                name: MESH_SECRET_VOLUME_NAME.to_string(),
+                mount_path: MESH_CONFIG_DIR.to_string(),
+                read_only: Some(true),
+            }],
         };
 
         // Add init containers.
@@ -703,6 +722,8 @@ fn render_kubernetes(
             init_containers,
             containers: vec![sidecar, container],
             volumes,
+            service_account_name: None,
+            automount_service_account_token: Some(false),
             restart_policy: None,
         };
 
@@ -742,12 +763,13 @@ fn render_kubernetes(
 
     if needs_router {
         let mut env = Vec::new();
-        let router_config_b64 = router_config_b64
-            .as_ref()
-            .expect("router config should be computed");
         env.push(EnvVar::literal(
-            "AMBER_ROUTER_CONFIG_B64",
-            router_config_b64.as_str(),
+            "AMBER_ROUTER_CONFIG_PATH",
+            format!("{MESH_CONFIG_DIR}/{MESH_CONFIG_FILENAME}"),
+        ));
+        env.push(EnvVar::literal(
+            "AMBER_ROUTER_IDENTITY_PATH",
+            format!("{MESH_CONFIG_DIR}/{MESH_IDENTITY_FILENAME}"),
         ));
 
         let mut env_from = Vec::new();
@@ -770,8 +792,13 @@ fn render_kubernetes(
             env_from,
             ports: router_container_ports.clone(),
             readiness_probe: None,
-            volume_mounts: Vec::new(),
+            volume_mounts: vec![VolumeMount {
+                name: MESH_SECRET_VOLUME_NAME.to_string(),
+                mount_path: MESH_CONFIG_DIR.to_string(),
+                read_only: Some(true),
+            }],
         };
+        let router_secret = mesh_secret_name(ROUTER_NAME);
 
         let deployment = Deployment {
             api_version: "apps/v1",
@@ -795,7 +822,12 @@ fn render_kubernetes(
                     spec: PodSpec {
                         init_containers: Vec::new(),
                         containers: vec![container],
-                        volumes: Vec::new(),
+                        volumes: vec![Volume::secret(
+                            MESH_SECRET_VOLUME_NAME.to_string(),
+                            router_secret,
+                        )],
+                        service_account_name: None,
+                        automount_service_account_token: Some(false),
                         restart_policy: None,
                     },
                 },
@@ -1112,12 +1144,126 @@ fn render_kubernetes(
         to_yaml(&metadata_cm)?,
     );
 
+    if !mesh_provision_plan.targets.is_empty() {
+        let mut secret_names = BTreeSet::new();
+        for target in &mesh_provision_plan.targets {
+            if let MeshProvisionOutput::KubernetesSecret { name, .. } = &target.output {
+                secret_names.insert(name.clone());
+            }
+        }
+        let secret_names: Vec<String> = secret_names.into_iter().collect();
+
+        let plan_json = serde_json::to_string_pretty(&mesh_provision_plan)
+            .map_err(|e| ReporterError::new(format!("failed to serialize mesh plan: {e}")))?;
+        let mut plan_data = BTreeMap::new();
+        plan_data.insert(PROVISIONER_PLAN_KEY.to_string(), plan_json);
+        let plan_cm = ConfigMap::new(
+            PROVISIONER_CONFIGMAP_NAME,
+            &namespace,
+            scenario_labels(&[("amber.io/type", "mesh-provision")]),
+            plan_data,
+        );
+        files.insert(
+            PathBuf::from("01-configmaps/amber-mesh-provision.yaml"),
+            to_yaml(&plan_cm)?,
+        );
+
+        let service_account = ServiceAccount::new(PROVISIONER_SERVICE_ACCOUNT, &namespace);
+        files.insert(
+            PathBuf::from("02-rbac/amber-provisioner-sa.yaml"),
+            to_yaml(&service_account)?,
+        );
+
+        let role = Role::new(
+            PROVISIONER_ROLE_NAME,
+            &namespace,
+            vec![PolicyRule {
+                api_groups: vec!["".to_string()],
+                resources: vec!["secrets".to_string()],
+                verbs: vec![
+                    "get".to_string(),
+                    "create".to_string(),
+                    "update".to_string(),
+                ],
+                resource_names: Some(secret_names),
+            }],
+        );
+        files.insert(
+            PathBuf::from("02-rbac/amber-provisioner-role.yaml"),
+            to_yaml(&role)?,
+        );
+
+        let role_binding = RoleBinding::new(
+            PROVISIONER_ROLE_BINDING_NAME,
+            &namespace,
+            Subject {
+                kind: "ServiceAccount".to_string(),
+                name: PROVISIONER_SERVICE_ACCOUNT.to_string(),
+                namespace: Some(namespace.clone()),
+            },
+            RoleRef {
+                api_group: "rbac.authorization.k8s.io".to_string(),
+                kind: "Role".to_string(),
+                name: PROVISIONER_ROLE_NAME.to_string(),
+            },
+        );
+        files.insert(
+            PathBuf::from("02-rbac/amber-provisioner-rolebinding.yaml"),
+            to_yaml(&role_binding)?,
+        );
+
+        let plan_mount_name = "mesh-plan";
+        let plan_mount_dir = "/etc/amber";
+        let container = Container {
+            name: PROVISIONER_NAME.to_string(),
+            image: images.provisioner.clone(),
+            command: Vec::new(),
+            args: Vec::new(),
+            env: vec![EnvVar::literal(
+                "AMBER_MESH_PROVISION_PLAN_PATH",
+                format!("{plan_mount_dir}/{PROVISIONER_PLAN_KEY}"),
+            )],
+            env_from: Vec::new(),
+            ports: Vec::new(),
+            readiness_probe: None,
+            volume_mounts: vec![VolumeMount {
+                name: plan_mount_name.to_string(),
+                mount_path: plan_mount_dir.to_string(),
+                read_only: Some(true),
+            }],
+        };
+
+        let job = Job::new_with_backoff_limit(
+            PROVISIONER_NAME,
+            &namespace,
+            scenario_labels(&[("amber.io/type", "provisioner")]),
+            PodTemplateSpec {
+                metadata: ObjectMeta {
+                    labels: scenario_labels(&[("amber.io/type", "provisioner")]),
+                    ..Default::default()
+                },
+                spec: PodSpec {
+                    init_containers: Vec::new(),
+                    containers: vec![container],
+                    volumes: vec![Volume::config_map(
+                        plan_mount_name.to_string(),
+                        PROVISIONER_CONFIGMAP_NAME,
+                    )],
+                    service_account_name: Some(PROVISIONER_SERVICE_ACCOUNT.to_string()),
+                    automount_service_account_token: None,
+                    restart_policy: Some("Never"),
+                },
+            },
+            Some(PROVISIONER_JOB_BACKOFF_LIMIT),
+        );
+        files.insert(
+            PathBuf::from("02-rbac/amber-provisioner-job.yaml"),
+            to_yaml(&job)?,
+        );
+    }
+
     if needs_router {
         let router_metadata = RouterMetadata {
-            config_b64: router_config_b64
-                .as_ref()
-                .expect("router config should be computed")
-                .clone(),
             mesh_port: router_mesh_port,
             control_port: router_ports.as_ref().expect("router ports missing").control,
         };
@@ -1160,6 +1306,51 @@ fn render_kubernetes(
 }
 
 // ---- Helper functions ----
+
+fn build_provision_plan(
+    mesh_config_plan: &crate::targets::mesh::mesh_config::MeshConfigPlan,
+    program_components: &[ComponentId],
+    names: &HashMap<ComponentId, ComponentNames>,
+    namespace: &str,
+) -> Result<MeshProvisionPlan, String> {
+    let mut targets = Vec::new();
+    for id in program_components {
+        let cnames = names
+            .get(id)
+            .ok_or_else(|| format!("missing service name for component {id:?}"))?;
+        let template = mesh_config_plan
+            .component_configs
+            .get(id)
+            .ok_or_else(|| format!("missing config template for component {id:?}"))?
+            .clone();
+        targets.push(MeshProvisionTarget {
+            kind: MeshProvisionTargetKind::Component,
+            config: template,
+            output: MeshProvisionOutput::KubernetesSecret {
+                name: mesh_secret_name(&cnames.service),
+                namespace: Some(namespace.to_string()),
+            },
+        });
+    }
+    if let Some(router_template) = mesh_config_plan.router_config.as_ref() {
+        targets.push(MeshProvisionTarget {
+            kind: MeshProvisionTargetKind::Router,
+            config: router_template.clone(),
+            output: MeshProvisionOutput::KubernetesSecret {
+                name: mesh_secret_name(ROUTER_NAME),
+                namespace: Some(namespace.to_string()),
+            },
+        });
+    }
+    Ok(MeshProvisionPlan {
+        version: MESH_PROVISION_PLAN_VERSION.to_string(),
+        targets,
+    })
+}
+
+fn mesh_secret_name(service: &str) -> String {
+    format!("{service}-mesh")
+}
 
 fn generate_namespace_name(s: &Scenario) -> String {
     let root = s.component(s.root);
@@ -1384,6 +1575,8 @@ fn generate_netpol_enforcement_check(
                         ..Default::default()
                     }],
                     volumes: Vec::new(),
+                    service_account_name: None,
+                    automount_service_account_token: Some(false),
                     restart_policy: None,
                 },
             },
@@ -1572,6 +1765,8 @@ while true; do echo "ready" | nc -l -p 8080 >/dev/null; done
                         ..Default::default()
                     }],
                     volumes: Vec::new(),
+                    service_account_name: None,
+                    automount_service_account_token: Some(false),
                     restart_policy: None,
                 },
             },

@@ -19,6 +19,13 @@
       "dockerfile": "docker/amber-router/Dockerfile",
       "code_tag": "v1",
       "floating_tags": ["v1"]
+    },
+    {
+      "name": "amber-provisioner",
+      "context": ".",
+      "dockerfile": "docker/amber-provisioner/Dockerfile",
+      "code_tag": "v1",
+      "floating_tags": ["v1"]
     }
   ]
 }

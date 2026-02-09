@@ -4,6 +4,10 @@ use std::{
 };
 
 use amber_config as rc;
+use amber_mesh::{
+    MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MESH_PROVISION_PLAN_VERSION, MeshProvisionOutput,
+    MeshProvisionPlan, MeshProvisionTarget, MeshProvisionTargetKind,
+};
 use amber_scenario::{ComponentId, Scenario};
 use serde::{Deserialize, Serialize};
 
@@ -14,7 +18,7 @@ use crate::{
         addressing::{Addressing, build_address_plan},
         config::{ProgramPlan, encode_helper_payload, encode_schema_b64},
         internal_images::resolve_internal_images,
-        mesh_config::{MeshAddressing, RouterPorts, build_mesh_config_plan},
+        mesh_config::{MeshAddressing, MeshConfigPlan, RouterPorts, build_mesh_config_plan},
         plan::{MeshError, MeshOptions, ResolvedBinding, ResolvedExternalBinding, component_label},
         ports::{allocate_mesh_ports, allocate_slot_ports},
         proxy_metadata::{ProxyMetadata, RouterMetadata, build_proxy_metadata},
@@ -24,10 +28,15 @@ use crate::{
 const MESH_NETWORK_NAME: &str = "amber_mesh";
 
 const ROUTER_SERVICE_NAME: &str = "amber-router";
+const PROVISIONER_SERVICE_NAME: &str = "amber-provisioner";
 const HELPER_VOLUME_NAME: &str = "amber-helper-bin";
 const HELPER_INIT_SERVICE: &str = "amber-init";
 const HELPER_BIN_DIR: &str = "/amber/bin";
 const HELPER_BIN_PATH: &str = "/amber/bin/amber-helper";
+const MESH_CONFIG_DIR: &str = "/amber/mesh";
+const PROVISIONER_CONFIG_ROOT: &str = "/amber/provision";
+const PROVISIONER_PLAN_CONFIG_NAME: &str = "amber-mesh-provision-plan";
+const PROVISIONER_PLAN_PATH: &str = "/amber/plan/mesh-provision-plan.json";
 
 const COMPONENT_MESH_PORT_BASE: u16 = 23000;
 const ROUTER_MESH_PORT_BASE: u16 = 24000;
@@ -50,6 +59,8 @@ struct DockerComposeFile {
     volumes: BTreeMap<String, EmptyMap>,
     services: BTreeMap<String, Service>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    configs: BTreeMap<String, ComposeConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     networks: BTreeMap<String, Network>,
     #[serde(rename = "x-amber", default, skip_serializing_if = "Option::is_none")]
     x_amber: Option<ProxyMetadata>,
@@ -64,8 +75,22 @@ struct Network {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct ComposeConfig {
+    content: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct ServiceConfigMount {
+    source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct Service {
     image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     cap_add: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -92,6 +117,8 @@ struct Service {
     extra_hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     volumes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    configs: Vec<ServiceConfigMount>,
     #[serde(skip_serializing_if = "Option::is_none")]
     depends_on: Option<DependsOn>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -310,17 +337,14 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     )
     .map_err(|err| DockerComposeError::Other(err.to_string()))?;
     let has_external_slots = !mesh_plan.external_bindings.is_empty();
-    let router_config_b64 = mesh_config_plan
-        .router_config
-        .as_ref()
-        .map(amber_mesh::encode_config_b64)
-        .transpose()
-        .map_err(|err| DockerComposeError::Other(err.to_string()))?;
-    let router_metadata = router_config_b64.as_ref().map(|config_b64| RouterMetadata {
-        config_b64: config_b64.clone(),
-        mesh_port: router_mesh_port,
-        control_port: router_ports.as_ref().expect("router ports missing").control,
-    });
+    let router_metadata = if needs_router {
+        Some(RouterMetadata {
+            mesh_port: router_mesh_port,
+            control_port: router_ports.as_ref().expect("router ports missing").control,
+        })
+    } else {
+        None
+    };
     let proxy_metadata = needs_router.then_some(build_proxy_metadata(
         s,
         &mesh_plan,
@@ -331,6 +355,21 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         .as_ref()
         .map(|meta| meta.exports.clone())
         .unwrap_or_default();
+    let mesh_provision_plan = build_provision_plan(&mesh_config_plan, program_components, &names)
+        .map_err(|err| DockerComposeError::Other(err.to_string()))?;
+    let mut provisioner_mounts = Vec::new();
+    for id in program_components {
+        let svc = names.get(id).expect("service name missing");
+        let volume = mesh_volume_name(&svc.sidecar);
+        let mount_dir = provisioner_mount_dir(&svc.sidecar);
+        provisioner_mounts.push((volume, mount_dir));
+    }
+    if needs_router {
+        let volume = mesh_volume_name(ROUTER_SERVICE_NAME);
+        let mount_dir = provisioner_mount_dir(ROUTER_SERVICE_NAME);
+        provisioner_mounts.push((volume, mount_dir));
+    }
+    let needs_provisioner = !provisioner_mounts.is_empty();
 
     // Compose YAML
     // ---- runtime config / helper decision ----
@@ -392,12 +431,50 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
             .insert(HELPER_INIT_SERVICE.to_string(), helper_init);
     }
 
+    if needs_provisioner {
+        let plan_json = serde_json::to_string(&mesh_provision_plan).map_err(|err| {
+            DockerComposeError::Other(format!("failed to serialize mesh provision plan: {err}"))
+        })?;
+
+        let mut provisioner_service = Service::new(images.provisioner.clone());
+        provisioner_service.user = Some("0:0".to_string());
+        provisioner_service.cap_drop.push("ALL".to_string());
+        provisioner_service
+            .security_opt
+            .push("no-new-privileges:true".to_string());
+        provisioner_service.environment = Some(Environment::List(vec![format!(
+            "AMBER_MESH_PROVISION_PLAN_PATH={PROVISIONER_PLAN_PATH}"
+        )]));
+        provisioner_service.configs.push(ServiceConfigMount {
+            source: PROVISIONER_PLAN_CONFIG_NAME.to_string(),
+            target: Some(PROVISIONER_PLAN_PATH.to_string()),
+        });
+        compose.configs.insert(
+            PROVISIONER_PLAN_CONFIG_NAME.to_string(),
+            ComposeConfig { content: plan_json },
+        );
+        for (volume, mount_dir) in &provisioner_mounts {
+            compose
+                .volumes
+                .entry(volume.clone())
+                .or_insert_with(EmptyMap::default);
+            provisioner_service
+                .volumes
+                .push(format!("{volume}:{mount_dir}"));
+        }
+        provisioner_service.restart = Some("no".to_string());
+        compose
+            .services
+            .insert(PROVISIONER_SERVICE_NAME.to_string(), provisioner_service);
+    }
+
     if needs_router {
-        let router_config_b64 = router_config_b64
-            .as_ref()
-            .expect("router config should exist");
         let mut env_entries = mesh_config_plan.router_env_passthrough.clone();
-        env_entries.push(format!("AMBER_ROUTER_CONFIG_B64={router_config_b64}"));
+        env_entries.push(format!("AMBER_ROUTER_CONFIG_PATH={}", mesh_config_path()));
+        env_entries.push(format!(
+            "AMBER_ROUTER_IDENTITY_PATH={}",
+            mesh_identity_path()
+        ));
         let mut router_service = Service::new(images.router.clone());
         router_service.environment = Some(Environment::List(env_entries));
         if has_external_slots {
@@ -425,6 +502,22 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 .insert("amber.exports".to_string(), labels_json);
         }
 
+        let router_volume = mesh_volume_name(ROUTER_SERVICE_NAME);
+        compose
+            .volumes
+            .entry(router_volume.clone())
+            .or_insert_with(EmptyMap::default);
+        router_service
+            .volumes
+            .push(format!("{router_volume}:{MESH_CONFIG_DIR}:ro"));
+        router_service.depends_on = build_depends_on(
+            false,
+            vec![(
+                PROVISIONER_SERVICE_NAME.to_string(),
+                "service_completed_successfully",
+            )],
+        );
+
         compose
             .services
             .insert(ROUTER_SERVICE_NAME.to_string(), router_service);
@@ -435,19 +528,29 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         let c = s.component(*id);
         let svc = names.get(id).unwrap();
 
-        let sidecar_config = mesh_config_plan
-            .component_configs
-            .get(id)
-            .expect("sidecar config missing");
-        let sidecar_config_b64 = amber_mesh::encode_config_b64(sidecar_config)
-            .map_err(|err| DockerComposeError::Other(err.to_string()))?;
         let mut sidecar_service = Service::new(images.router.clone());
-        sidecar_service.environment = Some(Environment::List(vec![format!(
-            "AMBER_ROUTER_CONFIG_B64={sidecar_config_b64}"
-        )]));
+        sidecar_service.environment = Some(Environment::List(vec![
+            format!("AMBER_ROUTER_CONFIG_PATH={}", mesh_config_path()),
+            format!("AMBER_ROUTER_IDENTITY_PATH={}", mesh_identity_path()),
+        ]));
         sidecar_service
             .networks
             .insert(MESH_NETWORK_NAME.to_string(), EmptyMap::default());
+        let sidecar_volume = mesh_volume_name(&svc.sidecar);
+        compose
+            .volumes
+            .entry(sidecar_volume.clone())
+            .or_insert_with(EmptyMap::default);
+        sidecar_service
+            .volumes
+            .push(format!("{sidecar_volume}:{MESH_CONFIG_DIR}:ro"));
+        sidecar_service.depends_on = build_depends_on(
+            false,
+            vec![(
+                PROVISIONER_SERVICE_NAME.to_string(),
+                "service_completed_successfully",
+            )],
+        );
         compose
             .services
             .insert(svc.sidecar.clone(), sidecar_service);
@@ -561,11 +664,66 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
 
 // ---- helpers ----
 
+fn mesh_volume_name(service: &str) -> String {
+    format!("{service}-mesh")
+}
+
+fn mesh_config_path() -> String {
+    format!("{MESH_CONFIG_DIR}/{MESH_CONFIG_FILENAME}")
+}
+
+fn mesh_identity_path() -> String {
+    format!("{MESH_CONFIG_DIR}/{MESH_IDENTITY_FILENAME}")
+}
+
+fn provisioner_mount_dir(service: &str) -> String {
+    format!("{PROVISIONER_CONFIG_ROOT}/{service}")
+}
+
+fn build_provision_plan(
+    mesh_config_plan: &MeshConfigPlan,
+    program_components: &[ComponentId],
+    names: &HashMap<ComponentId, ServiceNames>,
+) -> Result<MeshProvisionPlan, String> {
+    let mut targets = Vec::new();
+    for id in program_components {
+        let svc = names
+            .get(id)
+            .ok_or_else(|| format!("missing service name for component {id:?}"))?;
+        let template = mesh_config_plan
+            .component_configs
+            .get(id)
+            .ok_or_else(|| format!("missing config template for component {id:?}"))?
+            .clone();
+        targets.push(MeshProvisionTarget {
+            kind: MeshProvisionTargetKind::Component,
+            config: template,
+            output: MeshProvisionOutput::Filesystem {
+                dir: provisioner_mount_dir(&svc.sidecar),
+            },
+        });
+    }
+    if let Some(router_template) = mesh_config_plan.router_config.as_ref() {
+        targets.push(MeshProvisionTarget {
+            kind: MeshProvisionTargetKind::Router,
+            config: router_template.clone(),
+            output: MeshProvisionOutput::Filesystem {
+                dir: provisioner_mount_dir(ROUTER_SERVICE_NAME),
+            },
+        });
+    }
+    Ok(MeshProvisionPlan {
+        version: MESH_PROVISION_PLAN_VERSION.to_string(),
+        targets,
+    })
+}
+
 fn build_depends_on(any_helper: bool, deps: Vec<(String, &'static str)>) -> Option<DependsOn> {
     if deps.is_empty() {
         return None;
     }
-    if any_helper {
+    let needs_conditions = any_helper || deps.iter().any(|(_, cond)| *cond != "service_started");
+    if needs_conditions {
         let mut map = BTreeMap::new();
         for (name, cond) in deps {
             map.insert(

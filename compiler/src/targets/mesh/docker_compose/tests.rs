@@ -11,7 +11,7 @@ use std::{
 use amber_manifest::{
     FrameworkCapabilityName, Manifest, ManifestDigest, ManifestRef, ProvideDecl, SlotDecl,
 };
-use amber_mesh::{InboundTarget, MeshConfig};
+use amber_mesh::{InboundTarget, MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTarget};
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
     ScenarioExport, SlotRef,
@@ -211,6 +211,16 @@ fn build_router_image() -> String {
     )
 }
 
+fn build_provisioner_image() -> String {
+    let root = workspace_root();
+    let images = internal_images();
+    build_docker_image(
+        &images.provisioner,
+        &root.join("docker/amber-provisioner/Dockerfile"),
+        &root,
+    )
+}
+
 fn require_same_platform(images: &[(&str, String)]) -> String {
     let (first_tag, first_platform) = images
         .first()
@@ -252,12 +262,24 @@ fn env_value(service: &super::Service, key: &str) -> Option<String> {
     }
 }
 
-fn extract_compose_env_value(yaml: &str, key: &str) -> Option<String> {
-    let compose = parse_compose(yaml);
-    compose
-        .services
-        .values()
-        .find_map(|svc| env_value(svc, key))
+fn provision_plan(compose: &super::DockerComposeFile) -> MeshProvisionPlan {
+    let raw = &compose
+        .configs
+        .get(super::PROVISIONER_PLAN_CONFIG_NAME)
+        .expect("mesh provision plan config missing")
+        .content;
+    serde_json::from_str(raw).expect("parse mesh provision plan")
+}
+
+fn target_for_service<'a>(plan: &'a MeshProvisionPlan, service: &str) -> &'a MeshProvisionTarget {
+    let suffix = format!("/{service}");
+    plan.targets
+        .iter()
+        .find(|target| match &target.output {
+            MeshProvisionOutput::Filesystem { dir } => dir.ends_with(&suffix),
+            MeshProvisionOutput::KubernetesSecret { .. } => false,
+        })
+        .unwrap_or_else(|| panic!("mesh provision target missing for {service}"))
 }
 
 #[test]
@@ -356,6 +378,31 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         .expect("compose render ok");
     let compose = parse_compose(&yaml);
     let images = internal_images();
+    let plan = provision_plan(&compose);
+
+    let provisioner = service(&compose, "amber-provisioner");
+    assert_eq!(
+        env_value(provisioner, "AMBER_MESH_PROVISION_PLAN_PATH").as_deref(),
+        Some(super::PROVISIONER_PLAN_PATH),
+        "{yaml}"
+    );
+    assert!(
+        env_value(provisioner, "AMBER_MESH_PROVISION_PLAN_B64").is_none(),
+        "{yaml}"
+    );
+    assert!(
+        provisioner.configs.iter().any(|mount| {
+            mount.source == super::PROVISIONER_PLAN_CONFIG_NAME
+                && mount.target.as_deref() == Some(super::PROVISIONER_PLAN_PATH)
+        }),
+        "{yaml}"
+    );
+    assert!(
+        compose
+            .configs
+            .contains_key(super::PROVISIONER_PLAN_CONFIG_NAME),
+        "{yaml}"
+    );
 
     // Service names should be injective and include sidecars.
     assert!(compose.services.contains_key("c1-server-net"), "{yaml}");
@@ -377,14 +424,9 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
     assert!(!yaml.contains("ipam:"), "{yaml}");
 
     // Server sidecar config should expose the provide on the program port.
-    let server_config_b64 = env_value(
-        service(&compose, "c1-server-net"),
-        "AMBER_ROUTER_CONFIG_B64",
-    )
-    .expect("missing server sidecar config");
-    let server_config: MeshConfig =
-        amber_mesh::decode_config_b64(&server_config_b64).expect("decode server config");
-    let inbound = server_config
+    let server_target = target_for_service(&plan, "c1-server-net");
+    let inbound = server_target
+        .config
         .inbound
         .iter()
         .find(|route| route.capability == "api")
@@ -392,14 +434,9 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
     assert_eq!(inbound.allowed_issuers.len(), 1);
 
     // Client sidecar config should listen on the local slot port.
-    let client_config_b64 = env_value(
-        service(&compose, "c2-client-net"),
-        "AMBER_ROUTER_CONFIG_B64",
-    )
-    .expect("missing client sidecar config");
-    let client_config: MeshConfig =
-        amber_mesh::decode_config_b64(&client_config_b64).expect("decode client config");
-    let outbound = client_config
+    let client_target = target_for_service(&plan, "c2-client-net");
+    let outbound = client_target
+        .config
         .outbound
         .iter()
         .find(|route| route.slot == "api")
@@ -1067,11 +1104,11 @@ fn compose_routes_external_slots_through_router() {
     assert_eq!(external_meta.kind, "http");
     assert_eq!(external_meta.url_env, "AMBER_EXTERNAL_SLOT_API_URL");
 
-    let b64 =
-        extract_compose_env_value(&yaml, "AMBER_ROUTER_CONFIG_B64").expect("router config env var");
-    let config: MeshConfig = amber_mesh::decode_config_b64(&b64).expect("parse router config");
-    assert!(config.outbound.is_empty());
-    let inbound = config
+    let plan = provision_plan(&compose);
+    let router_target = target_for_service(&plan, "amber-router");
+    assert!(router_target.config.outbound.is_empty());
+    let inbound = router_target
+        .config
         .inbound
         .iter()
         .find(|route| route.capability == "api")
@@ -1168,8 +1205,12 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
     let dir = tempdir().unwrap();
     let project = dir.path();
     let router_platform = build_router_image();
+    let provisioner_platform = build_provisioner_image();
     let images = internal_images();
-    let platform = require_same_platform(&[(&images.router, router_platform)]);
+    let platform = require_same_platform(&[
+        (&images.router, router_platform),
+        (&images.provisioner, provisioner_platform),
+    ]);
     ensure_image_platform("busybox:1.36.1", &platform);
     ensure_image_platform("alpine:3.20", &platform);
 
@@ -1304,6 +1345,244 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
 }
 
 #[test]
+#[ignore = "requires docker + docker compose; run manually"]
+fn docker_smoke_sidecar_restart_rejoins_mesh() {
+    use tempfile::tempdir;
+
+    struct ComposeGuard {
+        project: PathBuf,
+        envs: Vec<(String, String)>,
+    }
+
+    impl ComposeGuard {
+        fn new(project: &Path, envs: &[(&str, &str)]) -> Self {
+            Self {
+                project: project.to_path_buf(),
+                envs: envs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for ComposeGuard {
+        fn drop(&mut self) {
+            let mut cmd = Command::new("docker");
+            cmd.current_dir(&self.project).arg("compose").args([
+                "down",
+                "-v",
+                "--remove-orphans",
+                "--rmi",
+                "local",
+                "--timeout",
+                "1",
+            ]);
+            for (k, v) in &self.envs {
+                cmd.env(k, v);
+            }
+            let _ = cmd.status();
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let project = dir.path();
+    let router_platform = build_router_image();
+    let provisioner_platform = build_provisioner_image();
+    let images = internal_images();
+    let platform = require_same_platform(&[
+        (&images.router, router_platform),
+        (&images.provisioner, provisioner_platform),
+    ]);
+    ensure_image_platform("busybox:1.36.1", &platform);
+    ensure_image_platform("alpine:3.20", &platform);
+
+    let server_program = serde_json::from_value(json!({
+        "image": "busybox:1.36.1",
+        "args": ["sh", "-lc", "mkdir -p /www && echo rejoin-ok > /www/index.html && httpd -f -p 8080 -h /www"],
+        "network": {
+            "endpoints": [
+                { "name": "api", "port": 8080, "protocol": "http" }
+            ]
+        }
+    }))
+    .unwrap();
+
+    let client_program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "args": ["sh", "-lc", "sleep infinity"],
+        "env": {
+            "URL": "${slots.api.url}"
+        }
+    }))
+    .unwrap();
+
+    let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
+    let provide_http: ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "api" })).unwrap();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: vec![ComponentId(1), ComponentId(2)],
+    };
+
+    let server = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/server"),
+        digest: digest(1),
+        config: None,
+        config_schema: None,
+        program: Some(server_program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let client = Component {
+        id: ComponentId(2),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/client"),
+        digest: digest(2),
+        config: None,
+        config_schema: None,
+        program: Some(client_program),
+        slots: BTreeMap::from([("api".to_string(), slot_http)]),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(server), Some(client)],
+        bindings: vec![BindingEdge {
+            name: None,
+            from: BindingFrom::Component(ProvideRef {
+                component: ComponentId(1),
+                name: "api".to_string(),
+            }),
+            to: SlotRef {
+                component: ComponentId(2),
+                name: "api".to_string(),
+            },
+            weak: false,
+        }],
+        exports: Vec::new(),
+    };
+
+    let output = compile_output(scenario);
+    let yaml = DockerComposeReporter
+        .emit(&output)
+        .expect("compose render ok");
+    fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
+
+    let project_name = format!("amber-sidecar-restart-{}", std::process::id());
+    let envs = [("COMPOSE_PROJECT_NAME", project_name.as_str())];
+    let _compose_guard = ComposeGuard::new(project, &envs);
+
+    let compose = |args: &[&str]| {
+        let mut cmd = Command::new("docker");
+        cmd.current_dir(project).arg("compose").args(args);
+        for (k, v) in &envs {
+            cmd.env(k, v);
+        }
+        cmd
+    };
+
+    let status = compose(&["up", "-d"]).status().unwrap();
+    assert!(status.success(), "docker compose up failed");
+
+    let check = || {
+        for _ in 0..30 {
+            let output = compose(&[
+                "exec",
+                "-T",
+                "c2-client",
+                "sh",
+                "-lc",
+                r#"wget -qO- --timeout=2 --tries=1 "$URL" 2>/dev/null"#,
+            ])
+            .output()
+            .unwrap();
+            if output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("rejoin-ok")
+            {
+                return true;
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+        false
+    };
+
+    if !check() {
+        let compose_logs = compose(&["logs", "--no-color"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_else(|err| format!("failed to capture compose logs: {err}"));
+        panic!(
+            "client could not reach server before restart\ncompose logs:\n{}",
+            compose_logs
+        );
+    }
+
+    let status = compose(&["restart", "c1-server-net"]).status().unwrap();
+    assert!(status.success(), "docker compose restart failed");
+
+    let wait_running = |service: &str| {
+        for _ in 0..20 {
+            let output = compose(&["ps", "-q", service]).output().unwrap();
+            if !output.status.success() {
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if id.is_empty() {
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            let output = Command::new("docker")
+                .args(["inspect", "-f", "{{.State.Running}}", &id])
+                .output()
+                .unwrap();
+            if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true" {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        false
+    };
+    assert!(wait_running("c1-server-net"), "sidecar did not start");
+
+    let status = compose(&["restart", "c1-server"]).status().unwrap();
+    assert!(status.success(), "docker compose restart failed");
+
+    if !check() {
+        let compose_logs = compose(&["logs", "--no-color"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_else(|err| format!("failed to capture compose logs: {err}"));
+        panic!(
+            "client could not reach server after restart\ncompose logs:\n{}",
+            compose_logs
+        );
+    }
+}
+
+#[test]
 fn docker_compose_allows_shared_port_with_different_endpoints() {
     let server_program = serde_json::from_value(json!({
         "image": "alpine:3.20",
@@ -1419,25 +1698,26 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
         .emit(&output)
         .expect("compose render should succeed");
     let compose = parse_compose(&yaml);
-    let mut server_config = None;
-    for service in compose.services.values() {
-        let Some(b64) = env_value(service, "AMBER_ROUTER_CONFIG_B64") else {
-            continue;
-        };
-        let config: MeshConfig = amber_mesh::decode_config_b64(&b64).expect("decode mesh config");
-        let has_v1 = config.inbound.iter().any(|route| route.capability == "v1");
-        let has_admin = config
-            .inbound
-            .iter()
-            .any(|route| route.capability == "admin");
-        if has_v1 && has_admin {
-            server_config = Some(config);
-            break;
-        }
-    }
-
-    let config = server_config.expect("server mesh config missing");
-    let v1_port = config
+    let plan = provision_plan(&compose);
+    let server_target = plan
+        .targets
+        .iter()
+        .find(|target| {
+            let has_v1 = target
+                .config
+                .inbound
+                .iter()
+                .any(|route| route.capability == "v1");
+            let has_admin = target
+                .config
+                .inbound
+                .iter()
+                .any(|route| route.capability == "admin");
+            has_v1 && has_admin
+        })
+        .expect("server mesh config missing");
+    let v1_port = server_target
+        .config
         .inbound
         .iter()
         .find(|route| route.capability == "v1")
@@ -1446,7 +1726,8 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
             _ => None,
         })
         .expect("v1 inbound local target");
-    let admin_port = config
+    let admin_port = server_target
+        .config
         .inbound
         .iter()
         .find(|route| route.capability == "admin")
@@ -1551,7 +1832,13 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
     // NOTE: This test builds the router image locally and uses its platform.
     let dir = tempdir().unwrap();
     let project = dir.path();
-    let platform = build_router_image();
+    let router_platform = build_router_image();
+    let provisioner_platform = build_provisioner_image();
+    let images = internal_images();
+    let platform = require_same_platform(&[
+        (&images.router, router_platform),
+        (&images.provisioner, provisioner_platform),
+    ]);
     ensure_image_platform("busybox:1.36.1", &platform);
     ensure_image_platform("alpine:3.20", &platform);
     let _compose_guard = ComposeGuard::new(project);
@@ -1751,10 +2038,12 @@ fn docker_smoke_config_forwarding_runtime_validation() {
     let project = dir.path();
     let router_platform = build_router_image();
     let helper_platform = build_helper_image();
+    let provisioner_platform = build_provisioner_image();
     let images = internal_images();
     let platform = require_same_platform(&[
         (&images.router, router_platform),
         (&images.helper, helper_platform),
+        (&images.provisioner, provisioner_platform),
     ]);
     ensure_image_platform("busybox:1.36.1", &platform);
 

@@ -1,8 +1,8 @@
 use std::{collections::HashMap, env, net::SocketAddr, sync::Arc};
 
 use amber_mesh::{
-    Caveat, InboundRoute, InboundTarget, MeshConfig, MeshIdentity, MeshPeer, MeshProtocol,
-    SignedMacaroon, Token, TokenClaims,
+    Caveat, InboundRoute, InboundTarget, MeshConfig, MeshConfigPublic, MeshIdentity,
+    MeshIdentitySecret, MeshPeer, MeshProtocol, SignedMacaroon, Token, TokenClaims,
 };
 use base64::Engine as _;
 use bytes::Bytes;
@@ -28,8 +28,15 @@ use url::Url;
 
 #[derive(Debug, Error)]
 pub enum RouterError {
-    #[error("missing router config (set AMBER_ROUTER_CONFIG_B64 or AMBER_ROUTER_CONFIG_JSON)")]
+    #[error(
+        "missing router config (set AMBER_ROUTER_CONFIG_PATH, AMBER_ROUTER_CONFIG_B64, or \
+         AMBER_ROUTER_CONFIG_JSON)"
+    )]
     MissingConfig,
+    #[error(
+        "missing router identity (set AMBER_ROUTER_IDENTITY_PATH or AMBER_ROUTER_IDENTITY_JSON)"
+    )]
+    MissingIdentity,
     #[error("invalid router config: {0}")]
     InvalidConfig(String),
     #[error("failed to bind {addr}: {source}")]
@@ -90,6 +97,12 @@ const MAX_FRAME: usize = 64 * 1024;
 const MAX_PLAINTEXT: usize = 16 * 1024;
 
 pub fn config_from_env() -> Result<MeshConfig, RouterError> {
+    if let Ok(path) = env::var("AMBER_ROUTER_CONFIG_PATH") {
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|err| RouterError::InvalidConfig(format!("failed to read {path}: {err}")))?;
+        return parse_config_json(&raw, load_identity_from_env);
+    }
+
     if let Ok(b64) = env::var("AMBER_ROUTER_CONFIG_B64") {
         if b64.trim().is_empty() {
             return Err(RouterError::MissingConfig);
@@ -102,12 +115,44 @@ pub fn config_from_env() -> Result<MeshConfig, RouterError> {
         if raw.trim().is_empty() {
             return Err(RouterError::MissingConfig);
         }
-        let parsed = serde_json::from_str(&raw)
-            .map_err(|err| RouterError::InvalidConfig(err.to_string()))?;
-        return Ok(parsed);
+        return parse_config_json(&raw, load_identity_from_env);
     }
 
     Err(RouterError::MissingConfig)
+}
+
+fn parse_config_json(
+    raw: &str,
+    identity: impl FnOnce() -> Result<MeshIdentitySecret, RouterError>,
+) -> Result<MeshConfig, RouterError> {
+    if let Ok(parsed) = serde_json::from_str::<MeshConfig>(raw) {
+        return Ok(parsed);
+    }
+    let public: MeshConfigPublic =
+        serde_json::from_str(raw).map_err(|err| RouterError::InvalidConfig(err.to_string()))?;
+    let secret = identity()?;
+    public
+        .with_identity_secret(secret)
+        .map_err(|err| RouterError::InvalidConfig(err.to_string()))
+}
+
+fn load_identity_from_env() -> Result<MeshIdentitySecret, RouterError> {
+    if let Ok(path) = env::var("AMBER_ROUTER_IDENTITY_PATH") {
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|err| RouterError::InvalidConfig(format!("failed to read {path}: {err}")))?;
+        return parse_identity_json(&raw);
+    }
+    if let Ok(raw) = env::var("AMBER_ROUTER_IDENTITY_JSON") {
+        return parse_identity_json(&raw);
+    }
+    Err(RouterError::MissingIdentity)
+}
+
+fn parse_identity_json(raw: &str) -> Result<MeshIdentitySecret, RouterError> {
+    if raw.trim().is_empty() {
+        return Err(RouterError::MissingIdentity);
+    }
+    serde_json::from_str(raw).map_err(|err| RouterError::InvalidConfig(err.to_string()))
 }
 
 pub async fn run(config: MeshConfig) -> Result<(), RouterError> {

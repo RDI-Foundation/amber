@@ -38,11 +38,12 @@ COPY resolver/Cargo.toml resolver/
 COPY scenario/Cargo.toml scenario/
 COPY template/Cargo.toml template/
 COPY node/Cargo.toml node/
+COPY provisioner/Cargo.toml provisioner/
 
-RUN mkdir -p cli/src config/src compiler/src helper/src images/src json5/src manifest/src mesh/src router/src resolver/src scenario/src template/src node/src && \
-    touch cli/src/main.rs config/src/lib.rs compiler/src/lib.rs helper/src/main.rs images/src/lib.rs json5/src/lib.rs manifest/src/lib.rs mesh/src/lib.rs router/src/main.rs resolver/src/lib.rs scenario/src/lib.rs template/src/lib.rs node/src/main.rs
+RUN mkdir -p cli/src config/src compiler/src helper/src images/src json5/src manifest/src mesh/src router/src resolver/src scenario/src template/src node/src provisioner/src && \
+    touch cli/src/main.rs config/src/lib.rs compiler/src/lib.rs helper/src/main.rs images/src/lib.rs json5/src/lib.rs manifest/src/lib.rs mesh/src/lib.rs router/src/main.rs resolver/src/lib.rs scenario/src/lib.rs template/src/lib.rs node/src/main.rs provisioner/src/main.rs
 RUN cargo fetch --locked
-RUN rm -rf cli/src config/src compiler/src helper/src images/src json5/src manifest/src router/src resolver/src scenario/src template/src node/src
+RUN rm -rf cli/src config/src compiler/src helper/src images/src json5/src manifest/src router/src resolver/src scenario/src template/src node/src provisioner/src
 
 COPY cli ./cli
 COPY config ./config
@@ -57,6 +58,7 @@ COPY resolver ./resolver
 COPY scenario ./scenario
 COPY template ./template
 COPY node ./node
+COPY provisioner ./provisioner
 COPY docker/images.json docker/images.json
 
 ARG BUILD_MODE=release

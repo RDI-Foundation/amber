@@ -8,10 +8,7 @@ use std::{
 use amber_compiler::{
     CompileOptions, CompileOutput, Compiler, ResolverRegistry,
     bundle::{BundleBuilder, BundleLoader},
-    mesh::{
-        PROXY_METADATA_FILENAME, PROXY_METADATA_VERSION, ProxyMetadata, RouterMetadata,
-        external_slot_env_var,
-    },
+    mesh::{PROXY_METADATA_FILENAME, PROXY_METADATA_VERSION, ProxyMetadata, external_slot_env_var},
     reporter::{
         Reporter as _,
         docker_compose::DockerComposeReporter,
@@ -279,7 +276,11 @@ async fn compile(args: CompileArgs) -> Result<()> {
             .map_err(miette::Report::new)?;
         match compose_dest {
             ArtifactOutput::Stdout => print!("{compose}"),
-            ArtifactOutput::File(path) => write_artifact(&path, compose.as_bytes())?,
+            ArtifactOutput::File(path) => {
+                write_artifact(&path, compose.as_bytes()).wrap_err_with(|| {
+                    format!("failed to write docker compose output `{}`", path.display())
+                })?
+            }
         }
     }
 
@@ -347,8 +348,7 @@ fn docs(args: DocsArgs) -> Result<()> {
 
 async fn proxy(args: ProxyArgs) -> Result<()> {
     let target = load_proxy_target(&args.output)?;
-    let router_metadata = target.metadata.router.as_ref();
-    let router_config = load_router_config(&args, router_metadata)?;
+    let router_config = load_router_config(&args)?;
     let router_port = router_config.mesh_listen.port();
     if router_port == 0 {
         return Err(miette::miette!(
@@ -518,7 +518,7 @@ async fn proxy(args: ProxyArgs) -> Result<()> {
     Ok(())
 }
 
-fn load_router_config(args: &ProxyArgs, metadata: Option<&RouterMetadata>) -> Result<MeshConfig> {
+fn load_router_config(args: &ProxyArgs) -> Result<MeshConfig> {
     if let Some(b64) = args.router_config_b64.as_ref() {
         return amber_mesh::decode_config_b64(b64)
             .map_err(|err| miette::miette!("invalid router config: {err}"));
@@ -538,11 +538,6 @@ fn load_router_config(args: &ProxyArgs, metadata: Option<&RouterMetadata>) -> Re
             .map_err(|err| miette::miette!("invalid router config: {err}"));
     }
 
-    if let Some(metadata) = metadata {
-        return amber_mesh::decode_config_b64(&metadata.config_b64)
-            .map_err(|err| miette::miette!("invalid router config: {err}"));
-    }
-
     if let Ok(b64) = std::env::var("AMBER_ROUTER_CONFIG_B64") {
         return amber_mesh::decode_config_b64(&b64)
             .map_err(|err| miette::miette!("invalid router config: {err}"));
@@ -555,7 +550,8 @@ fn load_router_config(args: &ProxyArgs, metadata: Option<&RouterMetadata>) -> Re
     }
 
     Err(miette::miette!(
-        "router config missing; re-run `amber compile` for this output"
+        "router config missing; supply --router-config/--router-config-b64 or set \
+         AMBER_ROUTER_CONFIG_B64"
     ))
 }
 

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use super::plan::{MeshPlan, component_label};
 
-pub const PROXY_METADATA_VERSION: &str = "1";
+pub const PROXY_METADATA_VERSION: &str = "2";
 pub const PROXY_METADATA_FILENAME: &str = "amber-proxy.json";
 pub const DEFAULT_EXTERNAL_ENV_FILE: &str = "router-external.env";
 
@@ -23,7 +23,6 @@ pub struct ProxyMetadata {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RouterMetadata {
-    pub config_b64: String,
     pub mesh_port: u16,
     pub control_port: u16,
 }

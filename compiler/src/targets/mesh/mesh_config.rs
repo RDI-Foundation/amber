@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use amber_manifest::{Manifest, NetworkProtocol};
 use amber_mesh::{
-    Caveat, InboundRoute, InboundTarget, MeshConfig, MeshIdentity, MeshPeer, MeshProtocol,
-    OutboundRoute,
+    Caveat, InboundRoute, InboundTarget, MeshConfigTemplate, MeshIdentityTemplate,
+    MeshPeerTemplate, MeshProtocol, OutboundRoute,
 };
 use amber_scenario::{ComponentId, Scenario};
 use base64::Engine as _;
@@ -24,8 +24,8 @@ pub(crate) struct RouterPorts {
 
 #[derive(Clone, Debug)]
 pub(crate) struct MeshConfigPlan {
-    pub(crate) component_configs: HashMap<ComponentId, MeshConfig>,
-    pub(crate) router_config: Option<MeshConfig>,
+    pub(crate) component_configs: HashMap<ComponentId, MeshConfigTemplate>,
+    pub(crate) router_config: Option<MeshConfigTemplate>,
     pub(crate) router_env_passthrough: Vec<String>,
 }
 
@@ -50,33 +50,34 @@ pub(crate) fn build_mesh_config_plan(
 
     let mesh_scope = scenario_mesh_scope(scenario)?;
 
-    let mut identities_by_component: HashMap<ComponentId, MeshIdentity> = HashMap::new();
+    let mut identities_by_component: HashMap<ComponentId, MeshIdentityTemplate> = HashMap::new();
     for id in &mesh_plan.program_components {
-        let identity = MeshIdentity::generate(
-            scenario.component(*id).moniker.as_str(),
-            Some(mesh_scope.clone()),
-        );
+        let identity = MeshIdentityTemplate {
+            id: scenario.component(*id).moniker.as_str().to_string(),
+            mesh_scope: Some(mesh_scope.clone()),
+        };
         identities_by_component.insert(*id, identity);
     }
 
     let router_identity = if needs_router {
-        Some(MeshIdentity::generate(ROUTER_ID, Some(mesh_scope.clone())))
+        Some(MeshIdentityTemplate {
+            id: ROUTER_ID.to_string(),
+            mesh_scope: Some(mesh_scope.clone()),
+        })
     } else {
         None
     };
 
-    let mut peers: Vec<MeshPeer> = Vec::new();
+    let mut peers: Vec<MeshPeerTemplate> = Vec::new();
     for (id, identity) in &identities_by_component {
-        peers.push(MeshPeer {
+        peers.push(MeshPeerTemplate {
             id: identity.id.clone(),
-            public_key: identity.public_key,
         });
         let _ = id;
     }
     if let Some(identity) = router_identity.as_ref() {
-        peers.push(MeshPeer {
+        peers.push(MeshPeerTemplate {
             id: identity.id.clone(),
-            public_key: identity.public_key,
         });
     }
 
@@ -102,7 +103,7 @@ pub(crate) fn build_mesh_config_plan(
         exported_provides.insert((export.provider, export.provide.clone()));
     }
 
-    let mut component_configs: HashMap<ComponentId, MeshConfig> = HashMap::new();
+    let mut component_configs: HashMap<ComponentId, MeshConfigTemplate> = HashMap::new();
     for id in &mesh_plan.program_components {
         let identity = identities_by_component
             .get(id)
@@ -243,14 +244,14 @@ pub(crate) fn build_mesh_config_plan(
         }
 
         let mesh_listen = format!("0.0.0.0:{mesh_port}").parse().expect("mesh listen");
-        let mut config_peers: Vec<MeshPeer> = Vec::new();
+        let mut config_peers: Vec<MeshPeerTemplate> = Vec::new();
         for peer in &peers {
             if peer.id != identity.id {
                 config_peers.push(peer.clone());
             }
         }
 
-        let config = MeshConfig {
+        let config = MeshConfigTemplate {
             identity,
             mesh_listen,
             control_listen: None,
@@ -326,13 +327,13 @@ pub(crate) fn build_mesh_config_plan(
                 .parse()
                 .expect("control listen"),
         );
-        let config_peers: Vec<MeshPeer> = peers
+        let config_peers: Vec<MeshPeerTemplate> = peers
             .iter()
             .filter(|peer| peer.id != router_identity.id)
             .cloned()
             .collect();
 
-        Some(MeshConfig {
+        Some(MeshConfigTemplate {
             identity: router_identity,
             mesh_listen,
             control_listen,

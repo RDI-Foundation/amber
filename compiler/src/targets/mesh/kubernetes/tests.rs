@@ -1,23 +1,30 @@
 use std::{
     fs,
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use amber_images::{AMBER_HELPER, AMBER_ROUTER};
+use amber_images::{AMBER_HELPER, AMBER_PROVISIONER, AMBER_ROUTER};
 use amber_manifest::ManifestRef;
+use amber_mesh::{
+    Caveat, MeshConfig, MeshConfigPublic, MeshIdentitySecret, MeshPeer, MeshProtocol,
+    OutboundRoute, TransportConfig,
+};
 use amber_resolver::Resolver;
+use amber_router as router;
 use base64::Engine as _;
 use tempfile::tempdir;
 use url::Url;
 
-use super::{KubernetesReporter, KubernetesReporterConfig};
+use super::{KubernetesReporter, KubernetesReporterConfig, PROVISIONER_NAME};
 use crate::{CompileOptions, Compiler, DigestStore, OptimizeOptions, reporter::Reporter as _};
 
 const HELPER_IMAGE: &str = AMBER_HELPER.reference;
 const ROUTER_IMAGE: &str = AMBER_ROUTER.reference;
+const PROVISIONER_IMAGE: &str = AMBER_PROVISIONER.reference;
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -105,6 +112,20 @@ fn build_router_image() {
         .arg(&dockerfile)
         .arg(&root);
     checked_status(&mut cmd, "docker build amber-router image");
+}
+
+fn build_provisioner_image() {
+    let root = workspace_root();
+    let dockerfile = root.join("docker/amber-provisioner/Dockerfile");
+    let mut cmd = Command::new("docker");
+    cmd.arg("build")
+        .env("DOCKER_BUILDKIT", "1")
+        .arg("-t")
+        .arg(PROVISIONER_IMAGE)
+        .arg("-f")
+        .arg(&dockerfile)
+        .arg(&root);
+    checked_status(&mut cmd, "docker build amber-provisioner image");
 }
 
 fn file_url(path: &Path) -> Url {
@@ -418,8 +439,10 @@ fn kubernetes_emits_router_for_external_slots() {
     .expect("write client manifest");
 
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let mut opts = CompileOptions::default();
-    opts.optimize = OptimizeOptions { dce: false };
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..Default::default()
+    };
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let output = rt
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
@@ -439,7 +462,11 @@ fn kubernetes_emits_router_for_external_slots() {
         .get(&PathBuf::from("03-deployments/amber-router.yaml"))
         .expect("router deployment");
     assert!(
-        router_deploy.contains("AMBER_ROUTER_CONFIG_B64"),
+        router_deploy.contains("AMBER_ROUTER_CONFIG_PATH"),
+        "{router_deploy}"
+    );
+    assert!(
+        router_deploy.contains("AMBER_ROUTER_IDENTITY_PATH"),
         "{router_deploy}"
     );
     assert!(
@@ -486,8 +513,8 @@ fn kubernetes_emits_router_for_external_slots() {
         .expect("proxy metadata file");
     let proxy_meta: serde_json::Value =
         serde_json::from_str(proxy_json).expect("parse proxy metadata json");
-    assert_eq!(proxy_meta["version"], "1");
-    assert!(proxy_meta["router"]["config_b64"].as_str().is_some());
+    assert_eq!(proxy_meta["version"], "2");
+    assert_eq!(proxy_meta["router"]["mesh_port"], 24000);
     assert_eq!(proxy_meta["router"]["control_port"], 24100);
     assert_eq!(proxy_meta["external_slots"]["api"]["kind"], "http");
 
@@ -557,6 +584,7 @@ fn kubernetes_smoke_config_roundtrip() {
     let platform = docker_platform();
     build_helper_image();
     build_router_image();
+    build_provisioner_image();
     ensure_image_platform("busybox:1.36", &platform);
 
     let nonce = SystemTime::now()
@@ -566,7 +594,12 @@ fn kubernetes_smoke_config_roundtrip() {
     let cluster_name = format!("amber-test-{}-{nonce}", std::process::id());
     let _cluster_guard = KindClusterGuard::new(cluster_name.clone(), &kubeconfig);
 
-    for image in [HELPER_IMAGE, ROUTER_IMAGE, "busybox:1.36"] {
+    for image in [
+        HELPER_IMAGE,
+        ROUTER_IMAGE,
+        PROVISIONER_IMAGE,
+        "busybox:1.36",
+    ] {
         let mut cmd = kind_cmd(&kubeconfig);
         cmd.arg("load")
             .arg("docker-image")
@@ -714,8 +747,10 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
     .expect("write client manifest");
 
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let mut opts = CompileOptions::default();
-    opts.optimize = OptimizeOptions { dce: false };
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..Default::default()
+    };
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let output = rt
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
@@ -749,6 +784,7 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
 
     let platform = docker_platform();
     build_router_image();
+    build_provisioner_image();
     ensure_image_platform("busybox:1.36.1", &platform);
 
     let nonce = SystemTime::now()
@@ -758,7 +794,7 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
     let cluster_name = format!("amber-test-{}-{nonce}", std::process::id());
     let _cluster_guard = KindClusterGuard::new(cluster_name.clone(), &kubeconfig);
 
-    for image in [ROUTER_IMAGE, "busybox:1.36.1"] {
+    for image in [ROUTER_IMAGE, PROVISIONER_IMAGE, "busybox:1.36.1"] {
         let mut cmd = kind_cmd(&kubeconfig);
         cmd.arg("load")
             .arg("docker-image")
@@ -984,8 +1020,10 @@ fn kubernetes_smoke_export_routes_to_host() {
     .expect("write server manifest");
 
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let mut opts = CompileOptions::default();
-    opts.optimize = OptimizeOptions { dce: false };
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..Default::default()
+    };
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let output = rt
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
@@ -997,35 +1035,6 @@ fn kubernetes_smoke_export_routes_to_host() {
         },
     };
     let artifact = reporter.emit(&output).expect("render kubernetes output");
-
-    let router_deploy = artifact
-        .files
-        .get(&PathBuf::from("03-deployments/amber-router.yaml"))
-        .expect("router deployment");
-    let deploy_doc: serde_yaml::Value =
-        serde_yaml::from_str(router_deploy).expect("parse router deployment");
-    let envs = deploy_doc["spec"]["template"]["spec"]["containers"][0]["env"]
-        .as_sequence()
-        .expect("router env list");
-    let b64 = envs
-        .iter()
-        .find_map(|item| {
-            if item["name"].as_str() == Some("AMBER_ROUTER_CONFIG_B64") {
-                item["value"].as_str().map(|v| v.to_string())
-            } else {
-                None
-            }
-        })
-        .expect("router config env var");
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(b64.as_bytes())
-        .expect("decode router config");
-    let config: serde_json::Value = serde_json::from_slice(&decoded).expect("parse router config");
-    let exports = config["exports"].as_array().expect("router exports");
-    assert_eq!(exports.len(), 1, "expected one export");
-    let export_port = exports[0]["listen_port"]
-        .as_u64()
-        .expect("export listen_port") as u16;
 
     let output_dir = dir.path().join("kubernetes");
     write_kubernetes_output(&output_dir, &artifact);
@@ -1040,6 +1049,7 @@ fn kubernetes_smoke_export_routes_to_host() {
 
     let platform = docker_platform();
     build_router_image();
+    build_provisioner_image();
     ensure_image_platform("busybox:1.36.1", &platform);
 
     let nonce = SystemTime::now()
@@ -1049,7 +1059,7 @@ fn kubernetes_smoke_export_routes_to_host() {
     let cluster_name = format!("amber-test-{}-{nonce}", std::process::id());
     let _cluster_guard = KindClusterGuard::new(cluster_name.clone(), &kubeconfig);
 
-    for image in [ROUTER_IMAGE, "busybox:1.36.1"] {
+    for image in [ROUTER_IMAGE, PROVISIONER_IMAGE, "busybox:1.36.1"] {
         let mut cmd = kind_cmd(&kubeconfig);
         cmd.arg("load")
             .arg("docker-image")
@@ -1065,6 +1075,16 @@ fn kubernetes_smoke_export_routes_to_host() {
 
     let mut cmd = kubectl_cmd(&kubeconfig);
     cmd.arg("wait")
+        .arg("--for=condition=complete")
+        .arg("--timeout=120s")
+        .arg("job")
+        .arg(PROVISIONER_NAME)
+        .arg("-n")
+        .arg(namespace);
+    checked_status(&mut cmd, "kubectl wait for provisioner job");
+
+    let mut cmd = kubectl_cmd(&kubeconfig);
+    cmd.arg("wait")
         .arg("--for=condition=available")
         .arg("--timeout=120s")
         .arg("deployment")
@@ -1072,6 +1092,43 @@ fn kubernetes_smoke_export_routes_to_host() {
         .arg("-n")
         .arg(namespace);
     checked_status(&mut cmd, "kubectl wait for deployments");
+
+    let mut cmd = kubectl_cmd(&kubeconfig);
+    cmd.arg("get")
+        .arg("secret")
+        .arg("amber-router-mesh")
+        .arg("-n")
+        .arg(namespace)
+        .arg("-o")
+        .arg("json");
+    let secret_output = checked_output(&mut cmd, "kubectl get router mesh secret (json)");
+    let secret_doc: serde_json::Value =
+        serde_json::from_slice(&secret_output.stdout).expect("parse router mesh secret json");
+    let data = secret_doc["data"]
+        .as_object()
+        .expect("router mesh secret data should be an object");
+    let config_b64 = data
+        .get("mesh-config.json")
+        .and_then(|v| v.as_str())
+        .expect("router mesh secret missing mesh-config.json");
+    let identity_b64 = data
+        .get("mesh-identity.json")
+        .and_then(|v| v.as_str())
+        .expect("router mesh secret missing mesh-identity.json");
+    let config_raw = base64::engine::general_purpose::STANDARD
+        .decode(config_b64.as_bytes())
+        .expect("decode mesh-config.json");
+    let identity_raw = base64::engine::general_purpose::STANDARD
+        .decode(identity_b64.as_bytes())
+        .expect("decode mesh-identity.json");
+    let config_public: MeshConfigPublic =
+        serde_json::from_slice(&config_raw).expect("parse mesh-config.json");
+    let identity_secret: MeshIdentitySecret =
+        serde_json::from_slice(&identity_raw).expect("parse mesh-identity.json");
+    let router_config = config_public
+        .with_identity_secret(identity_secret)
+        .expect("combine router config with identity secret");
+    let router_mesh_port = router_config.mesh_listen.port();
 
     let router_pod = {
         let mut cmd = kubectl_cmd(&kubeconfig);
@@ -1089,33 +1146,95 @@ fn kubernetes_smoke_export_routes_to_host() {
         pod
     };
 
-    let mut cmd = kubectl_cmd(&kubeconfig);
-    cmd.arg("wait")
-        .arg("--for=condition=ready")
-        .arg("--timeout=120s")
-        .arg("pod")
-        .arg("-n")
-        .arg(namespace)
-        .arg(&router_pod);
-    checked_status(&mut cmd, "kubectl wait for router pod");
-
-    let port_forward_log = dir.path().join("port-forward-router.log");
-    let mut port_forward = PortForwardGuard::new_with_ports(
+    // Port-forward router mesh port so we can connect from the host.
+    let router_mesh_forward_log = dir.path().join("port-forward-router-mesh.log");
+    let mut router_mesh_forward = PortForwardGuard::new_with_ports(
         namespace,
         &router_pod,
-        18080,
-        export_port,
-        &port_forward_log,
+        19000,
+        router_mesh_port,
+        &router_mesh_forward_log,
         &kubeconfig,
     );
-    port_forward.wait_until_ready(Duration::from_secs(30));
+    router_mesh_forward.wait_until_ready(Duration::from_secs(30));
 
-    let response = fetch(
-        "http://localhost:18080",
-        &mut port_forward,
-        namespace,
-        &router_pod,
-        &kubeconfig,
-    );
-    assert_eq!(response, "export-ok");
+    // Start a local proxy that issues an export token (signed by the router identity) and tunnels
+    // HTTP over the mesh connection to the in-cluster router.
+    let export_name = "public";
+    let proxy_listen = SocketAddr::from(([127, 0, 0, 1], 18080));
+    let router_addr = SocketAddr::from(([127, 0, 0, 1], 19000));
+    let router_id = router_config.identity.id.clone();
+    let router_peer = MeshPeer {
+        id: router_id.clone(),
+        public_key: router_config.identity.public_key,
+    };
+    let proxy_config = MeshConfig {
+        identity: router_config.identity.clone(),
+        mesh_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        control_listen: None,
+        peers: vec![router_peer],
+        inbound: Vec::new(),
+        outbound: vec![OutboundRoute {
+            slot: export_name.to_string(),
+            listen_port: proxy_listen.port(),
+            listen_addr: Some(proxy_listen.ip().to_string()),
+            protocol: MeshProtocol::Http,
+            peer_addr: router_addr.to_string(),
+            peer_id: router_id.clone(),
+            capability: export_name.to_string(),
+            token_caveats: vec![
+                Caveat::new("cap", export_name),
+                Caveat::new("aud", router_id),
+                Caveat::new("proto", "http"),
+            ],
+        }],
+        transport: TransportConfig::NoiseIk {},
+    };
+    let proxy_handle = rt.spawn(async move { router::run(proxy_config).await });
+
+    let url = format!("http://{}", proxy_listen);
+    let mut last_err: Option<String> = None;
+    let mut ok = false;
+    for _ in 0..60 {
+        let output = Command::new("curl")
+            .arg("-fsS")
+            .arg("--max-time")
+            .arg("2")
+            .arg(&url)
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                let body = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if body == "export-ok" {
+                    ok = true;
+                    break;
+                }
+                last_err = Some(format!("unexpected response body: {body:?}"));
+            }
+            Ok(output) => {
+                last_err = Some(format!(
+                    "curl failed (status: {})\nstdout:\n{}\nstderr:\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            Err(err) => last_err = Some(format!("failed to run curl: {err}")),
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    proxy_handle.abort();
+
+    if !ok {
+        let forward_logs = router_mesh_forward.logs();
+        let router_logs = kubectl_logs(namespace, &router_pod, &kubeconfig);
+        panic!(
+            "export was not reachable via local proxy at {url}\n{}\n\nport-forward \
+             logs:\n{}\nrouter logs:\n{}",
+            last_err.unwrap_or_else(|| "no curl output captured".to_string()),
+            forward_logs,
+            router_logs
+        );
+    }
 }

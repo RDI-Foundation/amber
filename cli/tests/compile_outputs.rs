@@ -7,10 +7,7 @@ use serde_yaml::Value as YamlValue;
 fn env_value(service: &YamlValue, key: &str) -> Option<String> {
     let env = service.get("environment")?;
     match env {
-        YamlValue::Mapping(map) => map
-            .get(&YamlValue::String(key.to_string()))
-            .and_then(YamlValue::as_str)
-            .map(str::to_string),
+        YamlValue::Mapping(map) => map.get(key).and_then(YamlValue::as_str).map(str::to_string),
         YamlValue::Sequence(seq) => seq.iter().find_map(|entry| {
             let entry = entry.as_str()?;
             let (k, v) = entry.split_once('=')?;
@@ -168,6 +165,42 @@ fn compile_writes_primary_output_and_dot_artifact() {
         has_router_image,
         "docker compose output missing router image"
     );
+
+    let provisioner = services
+        .get("amber-provisioner")
+        .expect("compose missing provisioner service");
+    assert_eq!(
+        env_value(provisioner, "AMBER_MESH_PROVISION_PLAN_PATH").as_deref(),
+        Some("/amber/plan/mesh-provision-plan.json")
+    );
+    assert!(env_value(provisioner, "AMBER_MESH_PROVISION_PLAN_B64").is_none());
+
+    let configs = provisioner
+        .get("configs")
+        .and_then(YamlValue::as_sequence)
+        .expect("provisioner configs should be a list");
+    assert!(
+        configs.iter().any(|c| {
+            c.get("source").and_then(YamlValue::as_str) == Some("amber-mesh-provision-plan")
+                && c.get("target").and_then(YamlValue::as_str)
+                    == Some("/amber/plan/mesh-provision-plan.json")
+        }),
+        "provisioner missing plan config mount"
+    );
+
+    let configs = compose_yaml
+        .get("configs")
+        .and_then(YamlValue::as_mapping)
+        .expect("compose configs should be a map");
+    let plan_config = configs
+        .get("amber-mesh-provision-plan")
+        .and_then(YamlValue::as_mapping)
+        .expect("compose missing plan config");
+    let plan_json = plan_config
+        .get("content")
+        .and_then(YamlValue::as_str)
+        .expect("plan config missing content");
+    serde_json::from_str::<Value>(plan_json).expect("plan config content should be JSON");
 }
 
 #[test]
@@ -352,5 +385,13 @@ fn compile_with_binding_interpolation() {
         upstream_url.as_deref(),
         Some("http://127.0.0.1:20000"),
         "expected observer UPSTREAM_URL to resolve in docker compose output"
+    );
+
+    let provisioner = services
+        .get("amber-provisioner")
+        .expect("compose missing provisioner service");
+    assert_eq!(
+        env_value(provisioner, "AMBER_MESH_PROVISION_PLAN_PATH").as_deref(),
+        Some("/amber/plan/mesh-provision-plan.json")
     );
 }
