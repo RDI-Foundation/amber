@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -448,6 +448,161 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         env_value(service(&compose, "c2-client"), "URL").as_deref(),
         Some("http://127.0.0.1:20000")
     );
+}
+
+#[test]
+fn compose_emits_minimal_peer_keys() {
+    let server1_program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["server1"],
+        "network": {
+            "endpoints": [
+                { "name": "api1", "port": 8080, "protocol": "http" }
+            ]
+        }
+    }))
+    .unwrap();
+
+    let server2_program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["server2"],
+        "network": {
+            "endpoints": [
+                { "name": "api2", "port": 8081, "protocol": "http" }
+            ]
+        }
+    }))
+    .unwrap();
+
+    let client_program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["client"],
+        "env": {
+            "URL": "${slots.api1.url}"
+        }
+    }))
+    .unwrap();
+
+    let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
+    let provide_api1: ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "api1" })).unwrap();
+    let provide_api2: ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "api2" })).unwrap();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: vec![ComponentId(1), ComponentId(2), ComponentId(3)],
+    };
+
+    let server1 = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/server1"),
+        digest: digest(1),
+        config: None,
+        config_schema: None,
+        program: Some(server1_program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::from([("api1".to_string(), provide_api1)]),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let server2 = Component {
+        id: ComponentId(2),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/server2"),
+        digest: digest(2),
+        config: None,
+        config_schema: None,
+        program: Some(server2_program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::from([("api2".to_string(), provide_api2)]),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let client = Component {
+        id: ComponentId(3),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/client"),
+        digest: digest(3),
+        config: None,
+        config_schema: None,
+        program: Some(client_program),
+        slots: BTreeMap::from([("api1".to_string(), slot_http)]),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(server1), Some(server2), Some(client)],
+        bindings: vec![BindingEdge {
+            name: None,
+            from: BindingFrom::Component(ProvideRef {
+                component: ComponentId(1),
+                name: "api1".to_string(),
+            }),
+            to: SlotRef {
+                component: ComponentId(3),
+                name: "api1".to_string(),
+            },
+            weak: false,
+        }],
+        exports: vec![],
+    };
+
+    let output = compile_output(scenario);
+    let yaml = DockerComposeReporter
+        .emit(&output)
+        .expect("compose render should succeed");
+    let compose = parse_compose(&yaml);
+    let plan = provision_plan(&compose);
+
+    let server1_target = target_for_service(&plan, "c1-server1-net");
+    let server2_target = target_for_service(&plan, "c2-server2-net");
+    let client_target = target_for_service(&plan, "c3-client-net");
+
+    let server1_peers: BTreeSet<String> = server1_target
+        .config
+        .peers
+        .iter()
+        .map(|peer| peer.id.clone())
+        .collect();
+    let server2_peers: BTreeSet<String> = server2_target
+        .config
+        .peers
+        .iter()
+        .map(|peer| peer.id.clone())
+        .collect();
+    let client_peers: BTreeSet<String> = client_target
+        .config
+        .peers
+        .iter()
+        .map(|peer| peer.id.clone())
+        .collect();
+
+    let expected_server1: BTreeSet<String> = ["/client".to_string()].into_iter().collect();
+    let expected_client: BTreeSet<String> = ["/server1".to_string()].into_iter().collect();
+
+    assert_eq!(server1_peers, expected_server1);
+    assert!(server2_peers.is_empty());
+    assert_eq!(client_peers, expected_client);
 }
 
 #[test]

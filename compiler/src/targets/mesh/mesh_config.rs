@@ -68,19 +68,6 @@ pub(crate) fn build_mesh_config_plan(
         None
     };
 
-    let mut peers: Vec<MeshPeerTemplate> = Vec::new();
-    for (id, identity) in &identities_by_component {
-        peers.push(MeshPeerTemplate {
-            id: identity.id.clone(),
-        });
-        let _ = id;
-    }
-    if let Some(identity) = router_identity.as_ref() {
-        peers.push(MeshPeerTemplate {
-            id: identity.id.clone(),
-        });
-    }
-
     let mut consumers_by_provider: HashMap<(ComponentId, String), BTreeSet<ComponentId>> =
         HashMap::new();
     for binding in &mesh_plan.bindings {
@@ -244,12 +231,7 @@ pub(crate) fn build_mesh_config_plan(
         }
 
         let mesh_listen = format!("0.0.0.0:{mesh_port}").parse().expect("mesh listen");
-        let mut config_peers: Vec<MeshPeerTemplate> = Vec::new();
-        for peer in &peers {
-            if peer.id != identity.id {
-                config_peers.push(peer.clone());
-            }
-        }
+        let config_peers = required_peers(&identity.id, &inbound, &outbound);
 
         let config = MeshConfigTemplate {
             identity,
@@ -327,11 +309,8 @@ pub(crate) fn build_mesh_config_plan(
                 .parse()
                 .expect("control listen"),
         );
-        let config_peers: Vec<MeshPeerTemplate> = peers
-            .iter()
-            .filter(|peer| peer.id != router_identity.id)
-            .cloned()
-            .collect();
+        let outbound = Vec::new();
+        let config_peers = required_peers(&router_identity.id, &inbound, &outbound);
 
         Some(MeshConfigTemplate {
             identity: router_identity,
@@ -339,7 +318,7 @@ pub(crate) fn build_mesh_config_plan(
             control_listen,
             peers: config_peers,
             inbound,
-            outbound: Vec::new(),
+            outbound,
             transport: amber_mesh::TransportConfig::NoiseIk {},
         })
     } else {
@@ -373,6 +352,35 @@ fn protocol_string(protocol: MeshProtocol) -> String {
         MeshProtocol::Tcp => "tcp".to_string(),
         MeshProtocol::Udp => "udp".to_string(),
     }
+}
+
+fn required_peers(
+    identity_id: &str,
+    inbound: &[InboundRoute],
+    outbound: &[OutboundRoute],
+) -> Vec<MeshPeerTemplate> {
+    let mut peer_ids = BTreeSet::new();
+    for route in inbound {
+        for issuer in &route.allowed_issuers {
+            if issuer != identity_id {
+                peer_ids.insert(issuer.clone());
+            }
+        }
+        if let InboundTarget::MeshForward { peer_id, .. } = &route.target
+            && peer_id != identity_id
+        {
+            peer_ids.insert(peer_id.clone());
+        }
+    }
+    for route in outbound {
+        if route.peer_id != identity_id {
+            peer_ids.insert(route.peer_id.clone());
+        }
+    }
+    peer_ids
+        .into_iter()
+        .map(|id| MeshPeerTemplate { id })
+        .collect()
 }
 
 struct RouterExternalSlot {
