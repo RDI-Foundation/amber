@@ -393,6 +393,7 @@ async fn proxy(args: ProxyArgs) -> Result<()> {
             identity: router_config.identity.clone(),
             mesh_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             control_listen: None,
+            control_allow: None,
             peers: vec![router_peer.clone()],
             inbound: Vec::new(),
             outbound: vec![OutboundRoute {
@@ -458,6 +459,7 @@ async fn proxy(args: ProxyArgs) -> Result<()> {
         identity: identity.clone(),
         mesh_listen,
         control_listen: None,
+        control_allow: None,
         peers: vec![router_peer.clone()],
         inbound: vec![InboundRoute {
             capability: slot.to_string(),

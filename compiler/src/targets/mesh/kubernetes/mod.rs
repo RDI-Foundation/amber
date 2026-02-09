@@ -1333,9 +1333,18 @@ fn build_provision_plan(
         });
     }
     if let Some(router_template) = mesh_config_plan.router_config.as_ref() {
+        let mut router_template = router_template.clone();
+        if let Some(control_listen) = router_template.control_listen {
+            router_template.control_listen = Some(
+                format!("127.0.0.1:{}", control_listen.port())
+                    .parse()
+                    .expect("control listen"),
+            );
+        }
+        router_template.control_allow = Some(vec!["127.0.0.1".to_string(), "::1".to_string()]);
         targets.push(MeshProvisionTarget {
             kind: MeshProvisionTargetKind::Router,
-            config: router_template.clone(),
+            config: router_template,
             output: MeshProvisionOutput::KubernetesSecret {
                 name: mesh_secret_name(ROUTER_NAME),
                 namespace: Some(namespace.to_string()),

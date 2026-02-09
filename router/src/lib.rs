@@ -1,4 +1,9 @@
-use std::{collections::HashMap, env, net::SocketAddr, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use amber_mesh::{
     InboundRoute, InboundTarget, MeshConfig, MeshConfigPublic, MeshIdentity, MeshIdentitySecret,
@@ -85,6 +90,7 @@ struct MeshExternalTarget {
 }
 
 type ExternalOverrides = Arc<RwLock<HashMap<String, String>>>;
+type ControlAllowlist = Arc<HashSet<IpAddr>>;
 
 #[derive(Debug, Deserialize)]
 struct ControlExternalSlot {
@@ -158,6 +164,10 @@ pub async fn run(config: MeshConfig) -> Result<(), RouterError> {
     validate_config(&config)?;
     let trust = Arc::new(TrustBundle::new(&config)?);
     let inbound_routes = Arc::new(build_inbound_routes(&config));
+    let control_allow = match config.control_allow.as_ref() {
+        Some(entries) => Some(resolve_control_allowlist(entries).await?),
+        None => None,
+    };
     let config = Arc::new(config);
     let external_overrides = Arc::new(RwLock::new(HashMap::new()));
 
@@ -192,8 +202,9 @@ pub async fn run(config: MeshConfig) -> Result<(), RouterError> {
 
     if let Some(addr) = config.control_listen {
         let external_overrides = external_overrides.clone();
+        let control_allow = control_allow.clone();
         let handle = tokio::spawn(async move {
-            if let Err(err) = run_control_server(addr, external_overrides).await {
+            if let Err(err) = run_control_server(addr, external_overrides, control_allow).await {
                 eprintln!("control listener failed: {err}");
             }
         });
@@ -448,16 +459,34 @@ async fn handle_outbound(
 async fn run_control_server(
     addr: SocketAddr,
     external_overrides: ExternalOverrides,
+    control_allow: Option<ControlAllowlist>,
 ) -> Result<(), RouterError> {
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|source| RouterError::BindFailed { addr, source })?;
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, peer) = listener.accept().await?;
         let external_overrides = external_overrides.clone();
+        let control_allow = control_allow.clone();
         tokio::spawn(async move {
-            let service = service_fn(move |req| control_service(req, external_overrides.clone()));
+            let allowed = match control_allow.as_ref() {
+                Some(allow) => allow.contains(&peer.ip()),
+                None => true,
+            };
+            let service = service_fn(move |req| {
+                let external_overrides = external_overrides.clone();
+                async move {
+                    if allowed {
+                        control_service(req, external_overrides).await
+                    } else {
+                        Ok(error_response(
+                            StatusCode::FORBIDDEN,
+                            "control access denied",
+                        ))
+                    }
+                }
+            });
             if let Err(err) = http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
                 .await
@@ -466,6 +495,44 @@ async fn run_control_server(
             }
         });
     }
+}
+
+async fn resolve_control_allowlist(entries: &[String]) -> Result<ControlAllowlist, RouterError> {
+    let mut allowed = HashSet::new();
+    for entry in entries {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Err(RouterError::InvalidConfig(
+                "control allow entry must not be empty".to_string(),
+            ));
+        }
+        if let Ok(ip) = entry.parse::<IpAddr>() {
+            allowed.insert(ip);
+            continue;
+        }
+        if entry.contains(':') {
+            return Err(RouterError::InvalidConfig(format!(
+                "control allow entry must be a hostname or IP (got {entry})"
+            )));
+        }
+        let host = format!("{entry}:0");
+        let addrs = tokio::net::lookup_host(host).await.map_err(|err| {
+            RouterError::InvalidConfig(format!(
+                "failed to resolve control allow entry {entry}: {err}"
+            ))
+        })?;
+        let mut found = false;
+        for addr in addrs {
+            allowed.insert(addr.ip());
+            found = true;
+        }
+        if !found {
+            return Err(RouterError::InvalidConfig(format!(
+                "control allow entry {entry} did not resolve to an address"
+            )));
+        }
+    }
+    Ok(Arc::new(allowed))
 }
 
 async fn control_service(

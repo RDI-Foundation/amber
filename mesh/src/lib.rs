@@ -111,6 +111,8 @@ pub struct MeshConfig {
     pub mesh_listen: SocketAddr,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_listen: Option<SocketAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_allow: Option<Vec<String>>,
     pub peers: Vec<MeshPeer>,
     pub inbound: Vec<InboundRoute>,
     pub outbound: Vec<OutboundRoute>,
@@ -125,6 +127,8 @@ pub struct MeshConfigPublic {
     pub mesh_listen: SocketAddr,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_listen: Option<SocketAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_allow: Option<Vec<String>>,
     pub peers: Vec<MeshPeer>,
     pub inbound: Vec<InboundRoute>,
     pub outbound: Vec<OutboundRoute>,
@@ -153,6 +157,8 @@ pub struct MeshConfigTemplate {
     pub mesh_listen: SocketAddr,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_listen: Option<SocketAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_allow: Option<Vec<String>>,
     pub peers: Vec<MeshPeerTemplate>,
     pub inbound: Vec<InboundRoute>,
     pub outbound: Vec<OutboundRoute>,
@@ -279,6 +285,7 @@ impl MeshConfigPublic {
             identity: MeshIdentityPublic::from_identity(&config.identity),
             mesh_listen: config.mesh_listen,
             control_listen: config.control_listen,
+            control_allow: config.control_allow.clone(),
             peers: config.peers.clone(),
             inbound: config.inbound.clone(),
             outbound: config.outbound.clone(),
@@ -311,6 +318,7 @@ impl MeshConfigPublic {
             },
             mesh_listen: self.mesh_listen,
             control_listen: self.control_listen,
+            control_allow: self.control_allow,
             peers: self.peers,
             inbound: self.inbound,
             outbound: self.outbound,
@@ -341,6 +349,7 @@ impl MeshConfigTemplate {
             identity: MeshIdentityPublic::from_identity(identity),
             mesh_listen: self.mesh_listen,
             control_listen: self.control_listen,
+            control_allow: self.control_allow.clone(),
             peers,
             inbound: self.inbound.clone(),
             outbound: self.outbound.clone(),

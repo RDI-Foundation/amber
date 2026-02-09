@@ -37,6 +37,8 @@ const MESH_CONFIG_DIR: &str = "/amber/mesh";
 const PROVISIONER_CONFIG_ROOT: &str = "/amber/provision";
 const PROVISIONER_PLAN_CONFIG_NAME: &str = "amber-mesh-provision-plan";
 const PROVISIONER_PLAN_PATH: &str = "/amber/plan/mesh-provision-plan.json";
+const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
+const HOST_GATEWAY_ENTRY: &str = "host.docker.internal:host-gateway";
 
 const COMPONENT_MESH_PORT_BASE: u16 = 23000;
 const ROUTER_MESH_PORT_BASE: u16 = 24000;
@@ -336,7 +338,6 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         &mesh_addressing,
     )
     .map_err(|err| DockerComposeError::Other(err.to_string()))?;
-    let has_external_slots = !mesh_plan.external_bindings.is_empty();
     let router_metadata = if needs_router {
         Some(RouterMetadata {
             mesh_port: router_mesh_port,
@@ -477,11 +478,9 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         ));
         let mut router_service = Service::new(images.router.clone());
         router_service.environment = Some(Environment::List(env_entries));
-        if has_external_slots {
-            router_service
-                .extra_hosts
-                .push("host.docker.internal:host-gateway".to_string());
-        }
+        router_service
+            .extra_hosts
+            .push(HOST_GATEWAY_ENTRY.to_string());
         router_service
             .networks
             .insert(MESH_NETWORK_NAME.to_string(), EmptyMap::default());
@@ -704,9 +703,11 @@ fn build_provision_plan(
         });
     }
     if let Some(router_template) = mesh_config_plan.router_config.as_ref() {
+        let mut router_template = router_template.clone();
+        router_template.control_allow = Some(vec![HOST_DOCKER_INTERNAL.to_string()]);
         targets.push(MeshProvisionTarget {
             kind: MeshProvisionTargetKind::Router,
-            config: router_template.clone(),
+            config: router_template,
             output: MeshProvisionOutput::Filesystem {
                 dir: provisioner_mount_dir(ROUTER_SERVICE_NAME),
             },

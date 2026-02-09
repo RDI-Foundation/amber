@@ -35,6 +35,8 @@ amber proxy /tmp/amber-external.yaml --slot api --upstream 127.0.0.1:8081
 router over its control port, and starts the mesh proxy.
 You can run it before or after `docker compose up`; it will register once the control port is
 reachable.
+The control port only accepts connections from the host; other containers in the scenario cannot
+reach it.
 
 5. Verify the root program is calling your local component:
 
@@ -76,3 +78,5 @@ amber proxy /tmp/amber-external --slot api --upstream 127.0.0.1:8081
 Make sure the router can reach your machine (for example via a VPN, port-forward, or NodePort)
 if you proxy from outside the cluster. The control port is recorded in
 `/tmp/amber-external/amber-proxy.json`.
+The control port listens on localhost inside the router pod, so host access requires a
+`kubectl port-forward`.
