@@ -1,63 +1,82 @@
 # Externalized slots
 
-This example is a single manifest with a root program that imports an external HTTP slot and
-exports its own HTTP capability. The root program reads `${slots.api.url}`, so the unbound `api`
-slot is treated as an externalized root input.
-
-The program also serves HTTP on port 9000 and exports it as `public`.
+This example shows the most common local-dev workflow: run a scenario and plug in a local HTTP
+service for an external slot. The root program reads `${slots.api.url}` (the external `api` slot),
+and it also exports an HTTP capability named `public`.
 
 ## Docker Compose
 
-1) Start any HTTP server on your host (for example):
+1. Start your local component (any HTTP server on your host):
 
 ```sh
 python3 -m http.server 8081
 ```
 
-2) Compile to Docker Compose:
+2. Compile the scenario to Docker Compose:
 
 ```sh
 amber compile examples/externalized-slots/scenario.json5 \
   --docker-compose /tmp/amber-external.yaml
 ```
 
-3) Run and provide the external slot URL (reachable from inside the containers):
+3. Run the scenario:
 
 ```sh
-# macOS/Windows
-AMBER_EXTERNAL_SLOT_API_URL=http://host.docker.internal:8081 \
-  docker compose -f /tmp/amber-external.yaml up
-
-# Linux
-HOST_IP="$(ip route get 1.1.1.1 | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
-AMBER_EXTERNAL_SLOT_API_URL="http://$HOST_IP:8081" \
-  docker compose -f /tmp/amber-external.yaml up
+docker compose -f /tmp/amber-external.yaml up
 ```
 
-4) Verify the root program is calling the external slot:
+4. In another terminal, bridge your local server into the scenario:
+
+```sh
+amber proxy /tmp/amber-external.yaml --slot api --upstream 127.0.0.1:8081
+```
+
+`amber proxy` reads the `x-amber` metadata from the compose file, registers the slot with the
+router over its control port, and starts the mesh proxy.
+You can run it before or after `docker compose up`; it will register once the control port is
+reachable.
+The control port only accepts connections from the host; other containers in the scenario cannot
+reach it.
+
+5. Verify the root program is calling your local component:
 
 ```sh
 docker compose -f /tmp/amber-external.yaml logs -f c0-component
 ```
 
-## Kubernetes
+## Exported capability (optional)
 
-1) Compile to Kubernetes:
+To expose the scenario's `public` export on your machine:
+
+```sh
+amber proxy /tmp/amber-external.yaml --export public --listen 127.0.0.1:18080
+```
+
+Then:
+
+```sh
+curl http://127.0.0.1:18080
+```
+
+## Kubernetes (same flow, different output)
+
+`amber proxy` also accepts Kubernetes output directories and registers with the
+router control port:
 
 ```sh
 amber compile examples/externalized-slots/scenario.json5 --kubernetes /tmp/amber-external
-```
-
-2) Set the external slot URL to anything reachable from the cluster (a service DNS
-name or public URL both work):
-
-```sh
-echo "AMBER_EXTERNAL_SLOT_API_URL=http://your-service-or-host:8081" \
-  > /tmp/amber-external/router-external.env
-```
-
-3) Apply the kustomization:
-
-```sh
 kubectl apply -k /tmp/amber-external
 ```
+
+Then port-forward the router control port and register the slot:
+
+```sh
+kubectl -n <namespace> port-forward deploy/amber-router 24100:24100
+amber proxy /tmp/amber-external --slot api --upstream 127.0.0.1:8081
+```
+
+Make sure the router can reach your machine (for example via a VPN, port-forward, or NodePort)
+if you proxy from outside the cluster. The control port is recorded in
+`/tmp/amber-external/amber-proxy.json`.
+The control port listens on localhost inside the router pod, so host access requires a
+`kubectl port-forward`.

@@ -216,7 +216,7 @@ fn flatten_removes_pure_routing_nodes_and_preserves_debug_data() {
         provenance,
         diagnostics: Vec::new(),
     };
-    let dot = DotReporter.emit(&output.scenario).unwrap();
+    let dot = DotReporter.emit(&output).unwrap();
     assert!(dot.contains("c2 [label=\"/parent/child\"]"), "{dot}");
     assert!(dot.contains("c2 -> e0 [label=\"http\"]"));
 }

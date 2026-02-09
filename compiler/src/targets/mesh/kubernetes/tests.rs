@@ -1,23 +1,30 @@
 use std::{
     fs,
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use amber_images::{AMBER_HELPER, AMBER_ROUTER};
+use amber_images::{AMBER_HELPER, AMBER_PROVISIONER, AMBER_ROUTER};
 use amber_manifest::ManifestRef;
+use amber_mesh::{
+    MeshConfig, MeshConfigPublic, MeshIdentitySecret, MeshPeer, MeshProtocol, OutboundRoute,
+    TransportConfig,
+};
 use amber_resolver::Resolver;
+use amber_router as router;
 use base64::Engine as _;
 use tempfile::tempdir;
 use url::Url;
 
-use super::{KubernetesReporter, KubernetesReporterConfig};
+use super::{KubernetesReporter, KubernetesReporterConfig, PROVISIONER_NAME};
 use crate::{CompileOptions, Compiler, DigestStore, OptimizeOptions, reporter::Reporter as _};
 
 const HELPER_IMAGE: &str = AMBER_HELPER.reference;
 const ROUTER_IMAGE: &str = AMBER_ROUTER.reference;
+const PROVISIONER_IMAGE: &str = AMBER_PROVISIONER.reference;
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -107,6 +114,20 @@ fn build_router_image() {
     checked_status(&mut cmd, "docker build amber-router image");
 }
 
+fn build_provisioner_image() {
+    let root = workspace_root();
+    let dockerfile = root.join("docker/amber-provisioner/Dockerfile");
+    let mut cmd = Command::new("docker");
+    cmd.arg("build")
+        .env("DOCKER_BUILDKIT", "1")
+        .arg("-t")
+        .arg(PROVISIONER_IMAGE)
+        .arg("-f")
+        .arg(&dockerfile)
+        .arg(&root);
+    checked_status(&mut cmd, "docker build amber-provisioner image");
+}
+
 fn file_url(path: &Path) -> Url {
     Url::from_file_path(path).expect("path should be valid file URL")
 }
@@ -184,34 +205,47 @@ fn build_helper_image() {
 
 struct KindClusterGuard {
     name: String,
+    kubeconfig: PathBuf,
 }
 
 impl KindClusterGuard {
-    fn try_new(name: String) -> Result<Self, String> {
-        let output = Command::new("kind")
-            .arg("create")
+    fn new(name: String, kubeconfig: &Path) -> Self {
+        let _ = kind_cmd(kubeconfig)
+            .arg("delete")
+            .arg("cluster")
+            .arg("--name")
+            .arg(&name)
+            .status();
+        let mut cmd = kind_cmd(kubeconfig);
+        cmd.arg("create")
             .arg("cluster")
             .arg("--name")
             .arg(&name)
             .arg("--wait")
-            .arg("120s")
-            .output()
-            .map_err(|err| format!("failed to run kind create cluster: {err}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "kind create cluster failed (status: {})\nstdout:\n{}\nstderr:\n{}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ));
+            .arg("120s");
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        let status = cmd.status().unwrap_or_else(|err| {
+            panic!("failed to run kind create cluster: {err}");
+        });
+        if !status.success() {
+            let _ = kind_cmd(kubeconfig)
+                .arg("delete")
+                .arg("cluster")
+                .arg("--name")
+                .arg(&name)
+                .status();
+            panic!("kind create cluster failed (status: {status})");
         }
-        Ok(Self { name })
+        Self {
+            name,
+            kubeconfig: kubeconfig.to_path_buf(),
+        }
     }
 }
 
 impl Drop for KindClusterGuard {
     fn drop(&mut self) {
-        let _ = Command::new("kind")
+        let _ = kind_cmd(&self.kubeconfig)
             .arg("delete")
             .arg("cluster")
             .arg("--name")
@@ -228,8 +262,8 @@ struct PortForwardGuard {
 }
 
 impl PortForwardGuard {
-    fn new(namespace: &str, pod: &str, log_path: &Path) -> Self {
-        Self::new_with_ports(namespace, pod, 8080, 8080, log_path)
+    fn new(namespace: &str, pod: &str, log_path: &Path, kubeconfig: &Path) -> Self {
+        Self::new_with_ports(namespace, pod, 8080, 8080, log_path, kubeconfig)
     }
 
     fn new_with_ports(
@@ -238,10 +272,11 @@ impl PortForwardGuard {
         local_port: u16,
         remote_port: u16,
         log_path: &Path,
+        kubeconfig: &Path,
     ) -> Self {
         let log = fs::File::create(log_path).expect("create port-forward log");
         let log_err = log.try_clone().expect("clone port-forward log");
-        let child = Command::new("kubectl")
+        let child = kubectl_cmd(kubeconfig)
             .arg("port-forward")
             .arg("-n")
             .arg(namespace)
@@ -298,6 +333,18 @@ impl PortForwardGuard {
     }
 }
 
+fn kind_cmd(kubeconfig: &Path) -> Command {
+    let mut cmd = Command::new("kind");
+    cmd.env("KUBECONFIG", kubeconfig);
+    cmd
+}
+
+fn kubectl_cmd(kubeconfig: &Path) -> Command {
+    let mut cmd = Command::new("kubectl");
+    cmd.env("KUBECONFIG", kubeconfig);
+    cmd
+}
+
 impl Drop for PortForwardGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -305,8 +352,8 @@ impl Drop for PortForwardGuard {
     }
 }
 
-fn kubectl_logs(namespace: &str, pod: &str) -> String {
-    let output = Command::new("kubectl")
+fn kubectl_logs(namespace: &str, pod: &str, kubeconfig: &Path) -> String {
+    let output = kubectl_cmd(kubeconfig)
         .arg("logs")
         .arg("-n")
         .arg(namespace)
@@ -318,10 +365,16 @@ fn kubectl_logs(namespace: &str, pod: &str) -> String {
     }
 }
 
-fn fetch(url: &str, port_forward: &mut PortForwardGuard, namespace: &str, pod: &str) -> String {
+fn fetch(
+    url: &str,
+    port_forward: &mut PortForwardGuard,
+    namespace: &str,
+    pod: &str,
+    kubeconfig: &Path,
+) -> String {
     if !port_forward.is_running() {
         let logs = port_forward.logs();
-        let pod_logs = kubectl_logs(namespace, pod);
+        let pod_logs = kubectl_logs(namespace, pod, kubeconfig);
         panic!(
             "port-forward exited before fetching {url}\nport-forward logs:\n{logs}\npod \
              logs:\n{pod_logs}"
@@ -338,7 +391,7 @@ fn fetch(url: &str, port_forward: &mut PortForwardGuard, namespace: &str, pod: &
     }
 
     let logs = port_forward.logs();
-    let pod_logs = kubectl_logs(namespace, pod);
+    let pod_logs = kubectl_logs(namespace, pod, kubeconfig);
     panic!(
         "curl failed for {url} (status: {})\nstdout:\n{}\nstderr:\n{}\nport-forward \
          logs:\n{logs}\npod logs:\n{pod_logs}",
@@ -386,8 +439,10 @@ fn kubernetes_emits_router_for_external_slots() {
     .expect("write client manifest");
 
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let mut opts = CompileOptions::default();
-    opts.optimize = OptimizeOptions { dce: false };
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..Default::default()
+    };
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let output = rt
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
@@ -400,16 +455,18 @@ fn kubernetes_emits_router_for_external_slots() {
             disable_networkpolicy_check: true,
         },
     };
-    let artifact = reporter
-        .emit(&output.scenario)
-        .expect("render kubernetes output");
+    let artifact = reporter.emit(&output).expect("render kubernetes output");
 
     let router_deploy = artifact
         .files
         .get(&PathBuf::from("03-deployments/amber-router.yaml"))
         .expect("router deployment");
     assert!(
-        router_deploy.contains("AMBER_ROUTER_CONFIG_B64"),
+        router_deploy.contains("AMBER_ROUTER_CONFIG_PATH"),
+        "{router_deploy}"
+    );
+    assert!(
+        router_deploy.contains("AMBER_ROUTER_IDENTITY_PATH"),
         "{router_deploy}"
     );
     assert!(
@@ -421,11 +478,11 @@ fn kubernetes_emits_router_for_external_slots() {
         .files
         .get(&PathBuf::from("04-services/amber-router.yaml"))
         .expect("router service");
-    assert!(router_service.contains("port: 21000"), "{router_service}");
+    assert!(router_service.contains("port: 24000"), "{router_service}");
 
     let router_env = artifact
         .files
-        .get(&PathBuf::from("router-external.env"))
+        .get(&PathBuf::from(super::DEFAULT_EXTERNAL_ENV_FILE))
         .expect("router env template");
     assert!(
         router_env.contains("AMBER_EXTERNAL_SLOT_API_URL="),
@@ -443,8 +500,23 @@ fn kubernetes_emits_router_for_external_slots() {
         .expect("kustomization resources list");
     let contains_env = resources
         .iter()
-        .any(|item| item.as_str() == Some("router-external.env"));
+        .any(|item| item.as_str() == Some(super::DEFAULT_EXTERNAL_ENV_FILE));
     assert!(!contains_env, "{kustomization}");
+    let contains_proxy = resources
+        .iter()
+        .any(|item| item.as_str() == Some(super::PROXY_METADATA_FILENAME));
+    assert!(!contains_proxy, "{kustomization}");
+
+    let proxy_json = artifact
+        .files
+        .get(&PathBuf::from(super::PROXY_METADATA_FILENAME))
+        .expect("proxy metadata file");
+    let proxy_meta: serde_json::Value =
+        serde_json::from_str(proxy_json).expect("parse proxy metadata json");
+    assert_eq!(proxy_meta["version"], "2");
+    assert_eq!(proxy_meta["router"]["mesh_port"], 24000);
+    assert_eq!(proxy_meta["router"]["control_port"], 24100);
+    assert_eq!(proxy_meta["external_slots"]["api"]["kind"], "http");
 
     let metadata_yaml = artifact
         .files
@@ -491,11 +563,10 @@ fn kubernetes_smoke_config_roundtrip() {
             disable_networkpolicy_check: true,
         },
     };
-    let artifact = reporter
-        .emit(&output.scenario)
-        .expect("render kubernetes output");
+    let artifact = reporter.emit(&output).expect("render kubernetes output");
 
     let dir = tempdir().expect("create temp dir");
+    let kubeconfig = dir.path().join("kubeconfig");
     let output_dir = dir.path().join("kubernetes");
     write_kubernetes_output(&output_dir, &artifact);
 
@@ -513,23 +584,23 @@ fn kubernetes_smoke_config_roundtrip() {
     let platform = docker_platform();
     build_helper_image();
     build_router_image();
+    build_provisioner_image();
     ensure_image_platform("busybox:1.36", &platform);
 
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time")
-        .as_secs();
+        .as_nanos();
     let cluster_name = format!("amber-test-{}-{nonce}", std::process::id());
-    let _cluster_guard = match KindClusterGuard::try_new(cluster_name.clone()) {
-        Ok(guard) => guard,
-        Err(err) => {
-            eprintln!("skipping kubernetes smoke test: {err}");
-            return;
-        }
-    };
+    let _cluster_guard = KindClusterGuard::new(cluster_name.clone(), &kubeconfig);
 
-    for image in [HELPER_IMAGE, ROUTER_IMAGE, "busybox:1.36"] {
-        let mut cmd = Command::new("kind");
+    for image in [
+        HELPER_IMAGE,
+        ROUTER_IMAGE,
+        PROVISIONER_IMAGE,
+        "busybox:1.36",
+    ] {
+        let mut cmd = kind_cmd(&kubeconfig);
         cmd.arg("load")
             .arg("docker-image")
             .arg(image)
@@ -538,12 +609,12 @@ fn kubernetes_smoke_config_roundtrip() {
         checked_status(&mut cmd, &format!("kind load {image} image"));
     }
 
-    let mut cmd = Command::new("kubectl");
+    let mut cmd = kubectl_cmd(&kubeconfig);
     cmd.arg("apply").arg("-k").arg(&output_dir);
     checked_status(&mut cmd, "kubectl apply");
 
     let namespace = {
-        let mut cmd = Command::new("kubectl");
+        let mut cmd = kubectl_cmd(&kubeconfig);
         cmd.arg("get")
             .arg("namespaces")
             .arg("-l")
@@ -556,7 +627,7 @@ fn kubernetes_smoke_config_roundtrip() {
         name
     };
 
-    let mut cmd = Command::new("kubectl");
+    let mut cmd = kubectl_cmd(&kubeconfig);
     cmd.arg("wait")
         .arg("--for=condition=available")
         .arg("--timeout=120s")
@@ -567,7 +638,7 @@ fn kubernetes_smoke_config_roundtrip() {
     checked_status(&mut cmd, "kubectl wait for deployments");
 
     let client_pod = {
-        let mut cmd = Command::new("kubectl");
+        let mut cmd = kubectl_cmd(&kubeconfig);
         cmd.arg("get")
             .arg("pod")
             .arg("-n")
@@ -582,7 +653,7 @@ fn kubernetes_smoke_config_roundtrip() {
         pod
     };
 
-    let mut cmd = Command::new("kubectl");
+    let mut cmd = kubectl_cmd(&kubeconfig);
     cmd.arg("wait")
         .arg("--for=condition=ready")
         .arg("--timeout=120s")
@@ -593,7 +664,8 @@ fn kubernetes_smoke_config_roundtrip() {
     checked_status(&mut cmd, "kubectl wait for client pod");
 
     let port_forward_log = dir.path().join("port-forward.log");
-    let mut port_forward = PortForwardGuard::new(&namespace, &client_pod, &port_forward_log);
+    let mut port_forward =
+        PortForwardGuard::new(&namespace, &client_pod, &port_forward_log, &kubeconfig);
     port_forward.wait_until_ready(Duration::from_secs(30));
 
     let runtime_secret = fetch(
@@ -601,24 +673,28 @@ fn kubernetes_smoke_config_roundtrip() {
         &mut port_forward,
         &namespace,
         &client_pod,
+        &kubeconfig,
     );
     let runtime_config = fetch(
         "http://localhost:8080/runtime_config.txt",
         &mut port_forward,
         &namespace,
         &client_pod,
+        &kubeconfig,
     );
     let static_secret = fetch(
         "http://localhost:8080/static_secret.txt",
         &mut port_forward,
         &namespace,
         &client_pod,
+        &kubeconfig,
     );
     let static_config = fetch(
         "http://localhost:8080/static_config.txt",
         &mut port_forward,
         &namespace,
         &client_pod,
+        &kubeconfig,
     );
 
     assert_eq!(runtime_secret, "test-secret-value");
@@ -635,6 +711,7 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
     }
 
     let dir = tempdir().expect("temp dir");
+    let kubeconfig = dir.path().join("kubeconfig");
     let root_path = dir.path().join("root.json5");
     let client_path = dir.path().join("client.json5");
 
@@ -670,8 +747,10 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
     .expect("write client manifest");
 
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let mut opts = CompileOptions::default();
-    opts.optimize = OptimizeOptions { dce: false };
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..Default::default()
+    };
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let output = rt
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
@@ -684,9 +763,7 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
             disable_networkpolicy_check: true,
         },
     };
-    let artifact = reporter
-        .emit(&output.scenario)
-        .expect("render kubernetes output");
+    let artifact = reporter.emit(&output).expect("render kubernetes output");
 
     let output_dir = dir.path().join("kubernetes");
     write_kubernetes_output(&output_dir, &artifact);
@@ -700,30 +777,25 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
         .expect("kustomization namespace");
 
     set_env_value(
-        &output_dir.join("router-external.env"),
+        &output_dir.join(super::DEFAULT_EXTERNAL_ENV_FILE),
         "AMBER_EXTERNAL_SLOT_API_URL",
         "http://external-echo:8080",
     );
 
     let platform = docker_platform();
     build_router_image();
+    build_provisioner_image();
     ensure_image_platform("busybox:1.36.1", &platform);
 
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time")
-        .as_secs();
+        .as_nanos();
     let cluster_name = format!("amber-test-{}-{nonce}", std::process::id());
-    let _cluster_guard = match KindClusterGuard::try_new(cluster_name.clone()) {
-        Ok(guard) => guard,
-        Err(err) => {
-            eprintln!("skipping kubernetes smoke test: {err}");
-            return;
-        }
-    };
+    let _cluster_guard = KindClusterGuard::new(cluster_name.clone(), &kubeconfig);
 
-    for image in [ROUTER_IMAGE, "busybox:1.36.1"] {
-        let mut cmd = Command::new("kind");
+    for image in [ROUTER_IMAGE, PROVISIONER_IMAGE, "busybox:1.36.1"] {
+        let mut cmd = kind_cmd(&kubeconfig);
         cmd.arg("load")
             .arg("docker-image")
             .arg(image)
@@ -732,7 +804,7 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
         checked_status(&mut cmd, &format!("kind load {image} image"));
     }
 
-    let mut cmd = Command::new("kubectl");
+    let mut cmd = kubectl_cmd(&kubeconfig);
     cmd.arg("apply").arg("-k").arg(&output_dir);
     checked_status(&mut cmd, "kubectl apply amber");
 
@@ -782,11 +854,11 @@ spec:
     )
     .expect("write external service manifest");
 
-    let mut cmd = Command::new("kubectl");
+    let mut cmd = kubectl_cmd(&kubeconfig);
     cmd.arg("apply").arg("-f").arg(&external_path);
     checked_status(&mut cmd, "kubectl apply external service");
 
-    let mut cmd = Command::new("kubectl");
+    let mut cmd = kubectl_cmd(&kubeconfig);
     cmd.arg("wait")
         .arg("--for=condition=available")
         .arg("--timeout=120s")
@@ -797,7 +869,7 @@ spec:
     checked_status(&mut cmd, "kubectl wait for deployments");
 
     let client_pod = {
-        let mut cmd = Command::new("kubectl");
+        let mut cmd = kubectl_cmd(&kubeconfig);
         cmd.arg("get")
             .arg("pod")
             .arg("-n")
@@ -812,7 +884,7 @@ spec:
         pod
     };
 
-    let mut cmd = Command::new("kubectl");
+    let mut cmd = kubectl_cmd(&kubeconfig);
     cmd.arg("wait")
         .arg("--for=condition=ready")
         .arg("--timeout=120s")
@@ -822,7 +894,7 @@ spec:
         .arg(&client_pod);
     checked_status(&mut cmd, "kubectl wait for client pod");
 
-    let bypass = Command::new("kubectl")
+    let bypass = kubectl_cmd(&kubeconfig)
         .arg("exec")
         .arg("-n")
         .arg(namespace)
@@ -844,7 +916,7 @@ spec:
 
     let mut ok = false;
     for _ in 0..30 {
-        let output = Command::new("kubectl")
+        let output = kubectl_cmd(&kubeconfig)
             .arg("exec")
             .arg("-n")
             .arg(namespace)
@@ -866,7 +938,7 @@ spec:
 
     if !ok {
         let client_logs = {
-            let mut cmd = Command::new("kubectl");
+            let mut cmd = kubectl_cmd(&kubeconfig);
             cmd.arg("logs")
                 .arg("-n")
                 .arg(namespace)
@@ -878,7 +950,7 @@ spec:
                 .unwrap_or_else(|err| format!("failed to capture client logs: {err}"))
         };
         let router_logs = {
-            let mut cmd = Command::new("kubectl");
+            let mut cmd = kubectl_cmd(&kubeconfig);
             cmd.arg("logs")
                 .arg("-n")
                 .arg(namespace)
@@ -889,7 +961,7 @@ spec:
                 .unwrap_or_else(|err| format!("failed to capture router logs: {err}"))
         };
         let external_logs = {
-            let mut cmd = Command::new("kubectl");
+            let mut cmd = kubectl_cmd(&kubeconfig);
             cmd.arg("logs")
                 .arg("-n")
                 .arg(namespace)
@@ -915,6 +987,7 @@ fn kubernetes_smoke_export_routes_to_host() {
     }
 
     let dir = tempdir().expect("temp dir");
+    let kubeconfig = dir.path().join("kubeconfig");
     let root_path = dir.path().join("root.json5");
     let server_path = dir.path().join("server.json5");
 
@@ -947,8 +1020,10 @@ fn kubernetes_smoke_export_routes_to_host() {
     .expect("write server manifest");
 
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let mut opts = CompileOptions::default();
-    opts.optimize = OptimizeOptions { dce: false };
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..Default::default()
+    };
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let output = rt
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
@@ -959,38 +1034,7 @@ fn kubernetes_smoke_export_routes_to_host() {
             disable_networkpolicy_check: true,
         },
     };
-    let artifact = reporter
-        .emit(&output.scenario)
-        .expect("render kubernetes output");
-
-    let router_deploy = artifact
-        .files
-        .get(&PathBuf::from("03-deployments/amber-router.yaml"))
-        .expect("router deployment");
-    let deploy_doc: serde_yaml::Value =
-        serde_yaml::from_str(router_deploy).expect("parse router deployment");
-    let envs = deploy_doc["spec"]["template"]["spec"]["containers"][0]["env"]
-        .as_sequence()
-        .expect("router env list");
-    let b64 = envs
-        .iter()
-        .find_map(|item| {
-            if item["name"].as_str() == Some("AMBER_ROUTER_CONFIG_B64") {
-                item["value"].as_str().map(|v| v.to_string())
-            } else {
-                None
-            }
-        })
-        .expect("router config env var");
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(b64.as_bytes())
-        .expect("decode router config");
-    let config: serde_json::Value = serde_json::from_slice(&decoded).expect("parse router config");
-    let exports = config["exports"].as_array().expect("router exports");
-    assert_eq!(exports.len(), 1, "expected one export");
-    let export_port = exports[0]["listen_port"]
-        .as_u64()
-        .expect("export listen_port") as u16;
+    let artifact = reporter.emit(&output).expect("render kubernetes output");
 
     let output_dir = dir.path().join("kubernetes");
     write_kubernetes_output(&output_dir, &artifact);
@@ -1005,6 +1049,7 @@ fn kubernetes_smoke_export_routes_to_host() {
 
     let platform = docker_platform();
     build_router_image();
+    build_provisioner_image();
     ensure_image_platform("busybox:1.36.1", &platform);
 
     let nonce = SystemTime::now()
@@ -1012,16 +1057,10 @@ fn kubernetes_smoke_export_routes_to_host() {
         .expect("system time")
         .as_secs();
     let cluster_name = format!("amber-test-{}-{nonce}", std::process::id());
-    let _cluster_guard = match KindClusterGuard::try_new(cluster_name.clone()) {
-        Ok(guard) => guard,
-        Err(err) => {
-            eprintln!("skipping kubernetes smoke test: {err}");
-            return;
-        }
-    };
+    let _cluster_guard = KindClusterGuard::new(cluster_name.clone(), &kubeconfig);
 
-    for image in [ROUTER_IMAGE, "busybox:1.36.1"] {
-        let mut cmd = Command::new("kind");
+    for image in [ROUTER_IMAGE, PROVISIONER_IMAGE, "busybox:1.36.1"] {
+        let mut cmd = kind_cmd(&kubeconfig);
         cmd.arg("load")
             .arg("docker-image")
             .arg(image)
@@ -1030,11 +1069,21 @@ fn kubernetes_smoke_export_routes_to_host() {
         checked_status(&mut cmd, &format!("kind load {image} image"));
     }
 
-    let mut cmd = Command::new("kubectl");
+    let mut cmd = kubectl_cmd(&kubeconfig);
     cmd.arg("apply").arg("-k").arg(&output_dir);
     checked_status(&mut cmd, "kubectl apply amber");
 
-    let mut cmd = Command::new("kubectl");
+    let mut cmd = kubectl_cmd(&kubeconfig);
+    cmd.arg("wait")
+        .arg("--for=condition=complete")
+        .arg("--timeout=120s")
+        .arg("job")
+        .arg(PROVISIONER_NAME)
+        .arg("-n")
+        .arg(namespace);
+    checked_status(&mut cmd, "kubectl wait for provisioner job");
+
+    let mut cmd = kubectl_cmd(&kubeconfig);
     cmd.arg("wait")
         .arg("--for=condition=available")
         .arg("--timeout=120s")
@@ -1044,8 +1093,45 @@ fn kubernetes_smoke_export_routes_to_host() {
         .arg(namespace);
     checked_status(&mut cmd, "kubectl wait for deployments");
 
+    let mut cmd = kubectl_cmd(&kubeconfig);
+    cmd.arg("get")
+        .arg("secret")
+        .arg("amber-router-mesh")
+        .arg("-n")
+        .arg(namespace)
+        .arg("-o")
+        .arg("json");
+    let secret_output = checked_output(&mut cmd, "kubectl get router mesh secret (json)");
+    let secret_doc: serde_json::Value =
+        serde_json::from_slice(&secret_output.stdout).expect("parse router mesh secret json");
+    let data = secret_doc["data"]
+        .as_object()
+        .expect("router mesh secret data should be an object");
+    let config_b64 = data
+        .get("mesh-config.json")
+        .and_then(|v| v.as_str())
+        .expect("router mesh secret missing mesh-config.json");
+    let identity_b64 = data
+        .get("mesh-identity.json")
+        .and_then(|v| v.as_str())
+        .expect("router mesh secret missing mesh-identity.json");
+    let config_raw = base64::engine::general_purpose::STANDARD
+        .decode(config_b64.as_bytes())
+        .expect("decode mesh-config.json");
+    let identity_raw = base64::engine::general_purpose::STANDARD
+        .decode(identity_b64.as_bytes())
+        .expect("decode mesh-identity.json");
+    let config_public: MeshConfigPublic =
+        serde_json::from_slice(&config_raw).expect("parse mesh-config.json");
+    let identity_secret: MeshIdentitySecret =
+        serde_json::from_slice(&identity_raw).expect("parse mesh-identity.json");
+    let router_config = config_public
+        .with_identity_secret(identity_secret)
+        .expect("combine router config with identity secret");
+    let router_mesh_port = router_config.mesh_listen.port();
+
     let router_pod = {
-        let mut cmd = Command::new("kubectl");
+        let mut cmd = kubectl_cmd(&kubeconfig);
         cmd.arg("get")
             .arg("pod")
             .arg("-n")
@@ -1060,31 +1146,91 @@ fn kubernetes_smoke_export_routes_to_host() {
         pod
     };
 
-    let mut cmd = Command::new("kubectl");
-    cmd.arg("wait")
-        .arg("--for=condition=ready")
-        .arg("--timeout=120s")
-        .arg("pod")
-        .arg("-n")
-        .arg(namespace)
-        .arg(&router_pod);
-    checked_status(&mut cmd, "kubectl wait for router pod");
-
-    let port_forward_log = dir.path().join("port-forward-router.log");
-    let mut port_forward = PortForwardGuard::new_with_ports(
+    // Port-forward router mesh port so we can connect from the host.
+    let router_mesh_forward_log = dir.path().join("port-forward-router-mesh.log");
+    let mut router_mesh_forward = PortForwardGuard::new_with_ports(
         namespace,
         &router_pod,
-        18080,
-        export_port,
-        &port_forward_log,
+        19000,
+        router_mesh_port,
+        &router_mesh_forward_log,
+        &kubeconfig,
     );
-    port_forward.wait_until_ready(Duration::from_secs(30));
+    router_mesh_forward.wait_until_ready(Duration::from_secs(30));
 
-    let response = fetch(
-        "http://localhost:18080",
-        &mut port_forward,
-        namespace,
-        &router_pod,
-    );
-    assert_eq!(response, "export-ok");
+    // Start a local proxy that issues an export token (signed by the router identity) and tunnels
+    // HTTP over the mesh connection to the in-cluster router.
+    let export_name = "public";
+    let proxy_listen = SocketAddr::from(([127, 0, 0, 1], 18080));
+    let router_addr = SocketAddr::from(([127, 0, 0, 1], 19000));
+    let router_id = router_config.identity.id.clone();
+    let router_peer = MeshPeer {
+        id: router_id.clone(),
+        public_key: router_config.identity.public_key,
+    };
+    let proxy_config = MeshConfig {
+        identity: router_config.identity.clone(),
+        mesh_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        control_listen: None,
+        control_allow: None,
+        peers: vec![router_peer],
+        inbound: Vec::new(),
+        outbound: vec![OutboundRoute {
+            slot: export_name.to_string(),
+            listen_port: proxy_listen.port(),
+            listen_addr: Some(proxy_listen.ip().to_string()),
+            protocol: MeshProtocol::Http,
+            peer_addr: router_addr.to_string(),
+            peer_id: router_id.clone(),
+            capability: export_name.to_string(),
+        }],
+        transport: TransportConfig::NoiseIk {},
+    };
+    let proxy_handle = rt.spawn(async move { router::run(proxy_config).await });
+
+    let url = format!("http://{}", proxy_listen);
+    let mut last_err: Option<String> = None;
+    let mut ok = false;
+    for _ in 0..60 {
+        let output = Command::new("curl")
+            .arg("-fsS")
+            .arg("--max-time")
+            .arg("2")
+            .arg(&url)
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                let body = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if body == "export-ok" {
+                    ok = true;
+                    break;
+                }
+                last_err = Some(format!("unexpected response body: {body:?}"));
+            }
+            Ok(output) => {
+                last_err = Some(format!(
+                    "curl failed (status: {})\nstdout:\n{}\nstderr:\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            Err(err) => last_err = Some(format!("failed to run curl: {err}")),
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    proxy_handle.abort();
+
+    if !ok {
+        let forward_logs = router_mesh_forward.logs();
+        let router_logs = kubectl_logs(namespace, &router_pod, &kubeconfig);
+        panic!(
+            "export was not reachable via local proxy at {url}\n{}\n\nport-forward \
+             logs:\n{}\nrouter logs:\n{}",
+            last_err.unwrap_or_else(|| "no curl output captured".to_string()),
+            forward_logs,
+            router_logs
+        );
+    }
 }

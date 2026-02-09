@@ -1,16 +1,13 @@
 use std::{fs, path::Path, process::Command};
 
-use amber_images::AMBER_SIDECAR;
+use amber_images::AMBER_ROUTER;
 use serde_json::Value;
 use serde_yaml::Value as YamlValue;
 
 fn env_value(service: &YamlValue, key: &str) -> Option<String> {
     let env = service.get("environment")?;
     match env {
-        YamlValue::Mapping(map) => map
-            .get(&YamlValue::String(key.to_string()))
-            .and_then(YamlValue::as_str)
-            .map(str::to_string),
+        YamlValue::Mapping(map) => map.get(key).and_then(YamlValue::as_str).map(str::to_string),
         YamlValue::Sequence(seq) => seq.iter().find_map(|entry| {
             let entry = entry.as_str()?;
             let (k, v) = entry.split_once('=')?;
@@ -161,83 +158,53 @@ fn compile_writes_primary_output_and_dot_artifact() {
         .get("services")
         .and_then(YamlValue::as_mapping)
         .expect("compose services should be a map");
-    let has_sidecar_image = services.values().any(|service| {
-        service.get("image").and_then(YamlValue::as_str) == Some(AMBER_SIDECAR.reference)
+    let has_router_image = services.values().any(|service| {
+        service.get("image").and_then(YamlValue::as_str) == Some(AMBER_ROUTER.reference)
     });
     assert!(
-        has_sidecar_image,
-        "docker compose output missing sidecar image"
+        has_router_image,
+        "docker compose output missing router image"
     );
+
+    let provisioner = services
+        .get("amber-provisioner")
+        .expect("compose missing provisioner service");
+    assert_eq!(
+        env_value(provisioner, "AMBER_MESH_PROVISION_PLAN_PATH").as_deref(),
+        Some("/amber/plan/mesh-provision-plan.json")
+    );
+    assert!(env_value(provisioner, "AMBER_MESH_PROVISION_PLAN_B64").is_none());
+
+    let configs = provisioner
+        .get("configs")
+        .and_then(YamlValue::as_sequence)
+        .expect("provisioner configs should be a list");
+    assert!(
+        configs.iter().any(|c| {
+            c.get("source").and_then(YamlValue::as_str) == Some("amber-mesh-provision-plan")
+                && c.get("target").and_then(YamlValue::as_str)
+                    == Some("/amber/plan/mesh-provision-plan.json")
+        }),
+        "provisioner missing plan config mount"
+    );
+
+    let configs = compose_yaml
+        .get("configs")
+        .and_then(YamlValue::as_mapping)
+        .expect("compose configs should be a map");
+    let plan_config = configs
+        .get("amber-mesh-provision-plan")
+        .and_then(YamlValue::as_mapping)
+        .expect("compose missing plan config");
+    let plan_json = plan_config
+        .get("content")
+        .and_then(YamlValue::as_str)
+        .expect("plan config missing content");
+    serde_json::from_str::<Value>(plan_json).expect("plan config content should be JSON");
 }
 
 #[test]
-fn compile_from_scenario_ir_to_compose() {
-    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("cli crate should live under the workspace root");
-    let manifest = workspace_root
-        .join("examples")
-        .join("reexport")
-        .join("scenario.json");
-
-    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
-    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
-    let outputs_dir = tempfile::Builder::new()
-        .prefix("outputs-")
-        .tempdir_in(&outputs_root)
-        .expect("failed to create outputs directory");
-
-    let ir_output = outputs_dir.path().join("scenario.ir.json");
-    let compose_output = outputs_dir.path().join("scenario.docker-compose.yaml");
-
-    let ir_compile = Command::new(env!("CARGO_BIN_EXE_amber"))
-        .arg("compile")
-        .arg("--no-opt")
-        .arg("--output")
-        .arg(&ir_output)
-        .arg(&manifest)
-        .output()
-        .unwrap_or_else(|err| panic!("failed to run amber compile: {err}"));
-    if !ir_compile.status.success() {
-        panic!(
-            "amber compile (ir) failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-            ir_compile.status,
-            String::from_utf8_lossy(&ir_compile.stdout),
-            String::from_utf8_lossy(&ir_compile.stderr)
-        );
-    }
-
-    let compose_compile = Command::new(env!("CARGO_BIN_EXE_amber"))
-        .arg("compile")
-        .arg("--docker-compose")
-        .arg(&compose_output)
-        .arg(&ir_output)
-        .output()
-        .unwrap_or_else(|err| panic!("failed to run amber compile: {err}"));
-    if !compose_compile.status.success() {
-        panic!(
-            "amber compile (compose) failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-            compose_compile.status,
-            String::from_utf8_lossy(&compose_compile.stdout),
-            String::from_utf8_lossy(&compose_compile.stderr)
-        );
-    }
-
-    assert!(
-        compose_output.is_file(),
-        "expected docker compose output file at {}",
-        compose_output.display()
-    );
-    let compose_contents =
-        fs::read_to_string(&compose_output).expect("failed to read docker compose output file");
-    assert!(
-        compose_contents.contains("services:"),
-        "docker compose output missing services section"
-    );
-}
-
-#[test]
-fn compile_from_scenario_ir_with_binding_interpolation() {
+fn compile_with_binding_interpolation() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("cli crate should live under the workspace root");
@@ -313,10 +280,21 @@ fn compile_from_scenario_ir_with_binding_interpolation() {
     "entrypoint": ["client"],
     "env": {
       "BIND_URL": "${slots.api.url}"
+    },
+    "network": {
+      "endpoints": [
+        { "name": "health", "port": 9101, "protocol": "http" }
+      ]
     }
   },
   "slots": {
     "api": { "kind": "http" }
+  },
+  "provides": {
+    "health": { "kind": "http", "endpoint": "health" }
+  },
+  "exports": {
+    "health": "health"
   }
 }
 "#,
@@ -340,38 +318,32 @@ fn compile_from_scenario_ir_with_binding_interpolation() {
     "entrypoint": ["observer"],
     "env": {
       "UPSTREAM_URL": "${config.upstream_url}"
+    },
+    "network": {
+      "endpoints": [
+        { "name": "health", "port": 9102, "protocol": "http" }
+      ]
     }
+  },
+  "provides": {
+    "health": { "kind": "http", "endpoint": "health" }
+  },
+  "exports": {
+    "health": "health"
   }
 }
 "#,
     )
     .expect("failed to write observer manifest");
 
-    let ir_output = outputs_dir.path().join("scenario.ir.json");
     let compose_output = outputs_dir.path().join("scenario.docker-compose.yaml");
-
-    let ir_compile = Command::new(env!("CARGO_BIN_EXE_amber"))
-        .arg("compile")
-        .arg("--no-opt")
-        .arg("--output")
-        .arg(&ir_output)
-        .arg(&root_manifest)
-        .output()
-        .unwrap_or_else(|err| panic!("failed to run amber compile: {err}"));
-    if !ir_compile.status.success() {
-        panic!(
-            "amber compile (ir) failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-            ir_compile.status,
-            String::from_utf8_lossy(&ir_compile.stdout),
-            String::from_utf8_lossy(&ir_compile.stderr)
-        );
-    }
 
     let compose_compile = Command::new(env!("CARGO_BIN_EXE_amber"))
         .arg("compile")
+        .arg("--no-opt")
         .arg("--docker-compose")
         .arg(&compose_output)
-        .arg(&ir_output)
+        .arg(&root_manifest)
         .output()
         .unwrap_or_else(|err| panic!("failed to run amber compile: {err}"));
     if !compose_compile.status.success() {
@@ -403,7 +375,7 @@ fn compile_from_scenario_ir_with_binding_interpolation() {
     assert_eq!(
         bind_url.as_deref(),
         Some("http://127.0.0.1:20000"),
-        "expected client BIND_URL to resolve from scenario IR"
+        "expected client BIND_URL to resolve in docker compose output"
     );
 
     let upstream_url = services
@@ -412,6 +384,14 @@ fn compile_from_scenario_ir_with_binding_interpolation() {
     assert_eq!(
         upstream_url.as_deref(),
         Some("http://127.0.0.1:20000"),
-        "expected observer UPSTREAM_URL to resolve from scenario IR"
+        "expected observer UPSTREAM_URL to resolve in docker compose output"
+    );
+
+    let provisioner = services
+        .get("amber-provisioner")
+        .expect("compose missing provisioner service");
+    assert_eq!(
+        env_value(provisioner, "AMBER_MESH_PROVISION_PLAN_PATH").as_deref(),
+        Some("/amber/plan/mesh-provision-plan.json")
     );
 }

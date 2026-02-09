@@ -1,12 +1,14 @@
 use std::{
     collections::BTreeSet,
-    fmt,
+    fmt, fs,
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     path::{Path, PathBuf},
 };
 
 use amber_compiler::{
-    CompileOptions, Compiler, ResolverRegistry,
+    CompileOptions, CompileOutput, Compiler, ResolverRegistry,
     bundle::{BundleBuilder, BundleLoader},
+    mesh::{PROXY_METADATA_FILENAME, PROXY_METADATA_VERSION, ProxyMetadata, external_slot_env_var},
     reporter::{
         Reporter as _,
         docker_compose::DockerComposeReporter,
@@ -17,15 +19,24 @@ use amber_compiler::{
     },
 };
 use amber_manifest::ManifestRef;
+use amber_mesh::{
+    InboundRoute, InboundTarget, MeshConfig, MeshIdentity, MeshPeer, MeshProtocol, OutboundRoute,
+    TransportConfig,
+};
 use amber_resolver::Resolver;
-use amber_scenario::{SCENARIO_IR_SCHEMA, Scenario, ScenarioIr};
+use amber_router as router;
+use base64::Engine as _;
 use clap::{ArgAction, Args, Parser, Subcommand};
 use miette::{
     Context as _, Diagnostic, GraphicalReportHandler, IntoDiagnostic as _, Result, Severity,
 };
+use tokio::{
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    time::{Duration, sleep},
+};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{EnvFilter, fmt as tracing_fmt, prelude::*};
-use url::Url;
+use url::{Url, form_urlencoded};
 
 #[derive(Parser)]
 #[command(name = "amber")]
@@ -45,6 +56,7 @@ enum Command {
     Compile(CompileArgs),
     Check(CheckArgs),
     Docs(DocsArgs),
+    Proxy(ProxyArgs),
 }
 
 #[derive(Args)]
@@ -90,7 +102,7 @@ struct CompileArgs {
     #[arg(long = "no-opt")]
     no_opt: bool,
 
-    /// Root manifest, bundle, or scenario IR to compile (URL or local path).
+    /// Root manifest or bundle to compile (URL or local path).
     #[arg(value_name = "MANIFEST")]
     manifest: String,
 }
@@ -117,6 +129,70 @@ enum DocsCommand {
     Manifest,
 }
 
+#[derive(Args)]
+struct ProxyArgs {
+    /// Docker Compose file or Kubernetes output directory from `amber compile`.
+    #[arg(value_name = "OUTPUT")]
+    output: String,
+
+    /// Export name to proxy.
+    #[arg(
+        long = "export",
+        value_name = "NAME",
+        conflicts_with = "slot",
+        requires = "listen"
+    )]
+    export: Option<String>,
+
+    /// External slot name to provide into the scenario.
+    #[arg(
+        long = "slot",
+        value_name = "SLOT",
+        conflicts_with = "export",
+        requires = "upstream"
+    )]
+    slot: Option<String>,
+
+    /// Local address to listen on (e.g. 127.0.0.1:8080).
+    #[arg(long = "listen", value_name = "ADDR:PORT")]
+    listen: Option<std::net::SocketAddr>,
+
+    /// Local program address to forward to (slot mode).
+    #[arg(long = "upstream", value_name = "ADDR:PORT")]
+    upstream: Option<std::net::SocketAddr>,
+
+    /// Mesh address to advertise to the router (slot mode).
+    #[arg(long = "mesh-addr", value_name = "HOST:PORT")]
+    mesh_addr: Option<String>,
+
+    /// Router mesh address override (defaults to 127.0.0.1:<router mesh port>).
+    #[arg(long = "router-addr", value_name = "ADDR:PORT")]
+    router_addr: Option<std::net::SocketAddr>,
+
+    /// Router control address override (defaults to 127.0.0.1:<router control port>).
+    #[arg(long = "router-control-addr", value_name = "HOST:PORT")]
+    router_control_addr: Option<String>,
+
+    /// Router config base64 override.
+    #[arg(long = "router-config-b64", value_name = "B64", hide = true)]
+    router_config_b64: Option<String>,
+
+    /// Router config file (JSON or base64) override.
+    #[arg(long = "router-config", value_name = "FILE", hide = true)]
+    router_config: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProxyTargetKind {
+    DockerCompose,
+    Kubernetes,
+}
+
+struct ProxyTarget {
+    kind: ProxyTargetKind,
+    metadata: ProxyMetadata,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     miette::set_panic_hook();
@@ -127,6 +203,7 @@ async fn main() -> Result<()> {
         Command::Compile(args) => compile(args).await,
         Command::Check(args) => check(args).await,
         Command::Docs(args) => docs(args),
+        Command::Proxy(args) => proxy(args).await,
     }
 }
 
@@ -157,57 +234,81 @@ async fn compile(args: CompileArgs) -> Result<()> {
     ensure_outputs_requested(&args)?;
     let outputs = resolve_output_paths(&args)?;
 
-    match resolve_compile_input(&args.manifest).await? {
-        CompileInput::Manifest(resolved) => {
-            let compiler = Compiler::new(resolved.resolver, Default::default())
-                .with_registry(resolved.registry);
-            let mut opts = CompileOptions::default();
-            if args.no_opt {
-                opts.optimize.dce = false;
-            }
+    let resolved = resolve_input(&args.manifest).await?;
+    let compiler =
+        Compiler::new(resolved.resolver, Default::default()).with_registry(resolved.registry);
+    let mut opts = CompileOptions::default();
+    if args.no_opt {
+        opts.optimize.dce = false;
+    }
 
-            let tree = compiler
-                .resolve_tree(resolved.manifest.clone(), opts.resolve)
-                .await
-                .wrap_err("compile failed")?;
-            let bundle_tree = args.bundle.as_ref().map(|_| tree.clone());
+    let tree = compiler
+        .resolve_tree(resolved.manifest.clone(), opts.resolve)
+        .await
+        .wrap_err("compile failed")?;
+    let bundle_tree = args.bundle.as_ref().map(|_| tree.clone());
 
-            let output = compiler
-                .compile_from_tree(tree, opts.optimize)
-                .wrap_err("compile failed")?;
+    let output = compiler
+        .compile_from_tree(tree, opts.optimize)
+        .wrap_err("compile failed")?;
 
-            let deny = DenySet::new(&args.deny);
-            let has_error = print_diagnostics(&output.diagnostics, &deny)?;
-            if has_error {
-                return Err(miette::miette!("compilation failed"));
-            }
+    let deny = DenySet::new(&args.deny);
+    let has_error = print_diagnostics(&output.diagnostics, &deny)?;
+    if has_error {
+        return Err(miette::miette!("compilation failed"));
+    }
 
-            if outputs.docker_compose.is_some()
-                && let Err(err) =
-                    amber_compiler::reporter::docker_compose::validate_docker_compose(&output)
-            {
-                return Err(miette::Report::new(err));
-            }
+    if let Some(primary) = outputs.primary.as_ref() {
+        write_primary_output(primary, &output)?;
+    }
 
-            let scenario = output.scenario;
-            write_outputs(&outputs, &scenario, &args)?;
+    if let Some(dot_dest) = outputs.dot {
+        let dot = DotReporter.emit(&output).map_err(miette::Report::new)?;
+        match dot_dest {
+            ArtifactOutput::Stdout => print!("{dot}"),
+            ArtifactOutput::File(path) => write_artifact(&path, dot.as_bytes())?,
+        }
+    }
 
-            if let Some(bundle_root) = resolve_bundle_root(&args)? {
-                let tree = bundle_tree.expect("bundle requested");
-                prepare_bundle_dir(&bundle_root)?;
-                BundleBuilder::build(&tree, compiler.store(), &bundle_root)
-                    .wrap_err("bundle generation failed")?;
+    if let Some(compose_dest) = outputs.docker_compose {
+        let compose = DockerComposeReporter
+            .emit(&output)
+            .map_err(miette::Report::new)?;
+        match compose_dest {
+            ArtifactOutput::Stdout => print!("{compose}"),
+            ArtifactOutput::File(path) => {
+                write_artifact(&path, compose.as_bytes()).wrap_err_with(|| {
+                    format!("failed to write docker compose output `{}`", path.display())
+                })?
             }
         }
-        CompileInput::ScenarioIr(scenario) => {
-            if args.bundle.is_some() {
-                return Err(miette::miette!(
-                    "cannot generate a bundle from scenario IR input"
-                ));
-            }
+    }
 
-            write_outputs(&outputs, &scenario, &args)?;
+    if let Some(kubernetes_dest) = outputs.kubernetes {
+        let reporter = KubernetesReporter {
+            config: KubernetesReporterConfig {
+                disable_networkpolicy_check: args.disable_networkpolicy_check,
+            },
+        };
+        let artifact = reporter.emit(&output).map_err(miette::Report::new)?;
+        write_kubernetes_output(&kubernetes_dest, &artifact)?;
+    }
+
+    if let Some(metadata_dest) = outputs.metadata {
+        let metadata = MetadataReporter
+            .emit(&output)
+            .map_err(miette::Report::new)?;
+        match metadata_dest {
+            ArtifactOutput::Stdout => print!("{metadata}"),
+            ArtifactOutput::File(path) => write_artifact(&path, metadata.as_bytes())?,
         }
+    }
+
+    if let Some(bundle_root) = resolve_bundle_root(&args)? {
+        let tree = bundle_tree.expect("bundle requested");
+        prepare_bundle_dir(&bundle_root)?;
+        BundleBuilder::build(&tree, compiler.store(), &bundle_root)
+            .wrap_err("bundle generation failed")?;
     }
 
     Ok(())
@@ -243,6 +344,428 @@ fn docs(args: DocsArgs) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn proxy(args: ProxyArgs) -> Result<()> {
+    let target = load_proxy_target(&args.output)?;
+    let router_config = load_router_config(&args)?;
+    let router_port = router_config.mesh_listen.port();
+    if router_port == 0 {
+        return Err(miette::miette!(
+            "router mesh port is 0; compile output is missing router metadata"
+        ));
+    }
+
+    let (export, slot) = (args.export.as_ref(), args.slot.as_ref());
+    if export.is_none() && slot.is_none() {
+        return Err(miette::miette!("--export or --slot is required"));
+    }
+
+    if let Some(export) = export {
+        let listen = args
+            .listen
+            .ok_or_else(|| miette::miette!("--listen is required for --export"))?;
+        if listen.port() == 0 {
+            return Err(miette::miette!("--listen port must be non-zero"));
+        }
+
+        let export_meta = target
+            .metadata
+            .exports
+            .get(export)
+            .ok_or_else(|| miette::miette!("export {} not found in output", export))?;
+        let protocol = mesh_protocol_from_metadata(&export_meta.protocol)?;
+        if protocol == MeshProtocol::Udp {
+            return Err(miette::miette!("udp exports are not supported yet"));
+        }
+
+        let router_addr = args
+            .router_addr
+            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], router_port)));
+
+        let router_id = router_config.identity.id.clone();
+        let router_peer = MeshPeer {
+            id: router_id.clone(),
+            public_key: router_config.identity.public_key,
+        };
+
+        let proxy_config = MeshConfig {
+            identity: router_config.identity.clone(),
+            mesh_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            control_listen: None,
+            control_allow: None,
+            peers: vec![router_peer.clone()],
+            inbound: Vec::new(),
+            outbound: vec![OutboundRoute {
+                slot: export.to_string(),
+                listen_port: listen.port(),
+                listen_addr: Some(listen.ip().to_string()),
+                protocol,
+                peer_addr: router_addr.to_string(),
+                peer_id: router_id.clone(),
+                capability: export.to_string(),
+            }],
+            transport: TransportConfig::NoiseIk {},
+        };
+
+        let local_url = match protocol {
+            MeshProtocol::Http => format!("http://{}", listen),
+            MeshProtocol::Tcp => format!("tcp://{}", listen),
+            MeshProtocol::Udp => format!("udp://{}", listen),
+        };
+        println!("{local_url}");
+
+        router::run(proxy_config)
+            .await
+            .map_err(|err| miette::miette!("proxy failed: {err}"))?;
+        return Ok(());
+    }
+
+    let slot = slot.expect("slot mode validated");
+    let upstream = args
+        .upstream
+        .ok_or_else(|| miette::miette!("--upstream is required for --slot"))?;
+    if !upstream.ip().is_loopback() {
+        return Err(miette::miette!(
+            "--upstream must be a loopback address (e.g. 127.0.0.1:PORT)"
+        ));
+    }
+
+    let slot_meta = target
+        .metadata
+        .external_slots
+        .get(slot)
+        .ok_or_else(|| miette::miette!("slot {} not found in output", slot))?;
+    if !matches!(slot_meta.kind.as_str(), "http" | "https") {
+        return Err(miette::miette!(
+            "slot {} uses {} but amber proxy only supports http slots",
+            slot,
+            slot_meta.kind
+        ));
+    }
+
+    let (mesh_addr, mesh_listen) = resolve_mesh_addresses(&args, &target)?;
+
+    let proxy_id = format!("/proxy/{slot}");
+    let identity = MeshIdentity::generate(&proxy_id, None);
+    let router_id = router_config.identity.id.clone();
+    let router_peer = MeshPeer {
+        id: router_id.clone(),
+        public_key: router_config.identity.public_key,
+    };
+    let protocol = MeshProtocol::Http;
+
+    let proxy_config = MeshConfig {
+        identity: identity.clone(),
+        mesh_listen,
+        control_listen: None,
+        control_allow: None,
+        peers: vec![router_peer.clone()],
+        inbound: vec![InboundRoute {
+            capability: slot.to_string(),
+            protocol,
+            target: InboundTarget::Local {
+                port: upstream.port(),
+            },
+            allowed_issuers: vec![router_id.clone()],
+        }],
+        outbound: Vec::new(),
+        transport: TransportConfig::NoiseIk {},
+    };
+
+    let peer_key = base64::engine::general_purpose::STANDARD.encode(identity.public_key);
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair("peer_id", &identity.id)
+        .append_pair("peer_key", &peer_key)
+        .finish();
+    let mesh_url = format!("mesh://{mesh_addr}?{query}");
+    let control_addr = resolve_control_addr(&args, &target)?;
+    let env_var = if slot_meta.url_env.is_empty() {
+        external_slot_env_var(slot)
+    } else {
+        slot_meta.url_env.clone()
+    };
+    match try_send_control_update(&control_addr, slot, &mesh_url).await {
+        Ok(()) => {
+            println!("registered slot {slot} via router control ({control_addr})");
+        }
+        Err(ControlUpdateError::Retryable) => {
+            eprintln!("waiting for router control at {control_addr}...");
+            let control_addr = control_addr.clone();
+            let slot = slot.to_string();
+            let mesh_url = mesh_url.clone();
+            let env_var = env_var.clone();
+            tokio::spawn(async move {
+                register_control_with_retry(control_addr, slot, mesh_url, env_var).await;
+            });
+        }
+        Err(ControlUpdateError::Fatal(err)) => {
+            eprintln!(
+                "failed to register slot via router control ({}): {err}\nfallback: set \
+                 {env_var}={mesh_url} before starting the scenario",
+                control_addr
+            );
+        }
+    }
+
+    router::run(proxy_config)
+        .await
+        .map_err(|err| miette::miette!("proxy failed: {err}"))?;
+
+    Ok(())
+}
+
+fn load_router_config(args: &ProxyArgs) -> Result<MeshConfig> {
+    if let Some(b64) = args.router_config_b64.as_ref() {
+        return amber_mesh::decode_config_b64(b64)
+            .map_err(|err| miette::miette!("invalid router config: {err}"));
+    }
+
+    if let Some(path) = args.router_config.as_ref() {
+        let raw = fs::read_to_string(path).map_err(|err| {
+            miette::miette!("failed to read router config {}: {err}", path.display())
+        })?;
+        let trimmed = raw.trim();
+        if trimmed.starts_with('{') {
+            let parsed = serde_json::from_str(trimmed)
+                .map_err(|err| miette::miette!("invalid router config: {err}"))?;
+            return Ok(parsed);
+        }
+        return amber_mesh::decode_config_b64(trimmed)
+            .map_err(|err| miette::miette!("invalid router config: {err}"));
+    }
+
+    if let Ok(b64) = std::env::var("AMBER_ROUTER_CONFIG_B64") {
+        return amber_mesh::decode_config_b64(&b64)
+            .map_err(|err| miette::miette!("invalid router config: {err}"));
+    }
+
+    if let Ok(raw) = std::env::var("AMBER_ROUTER_CONFIG_JSON") {
+        let parsed = serde_json::from_str(&raw)
+            .map_err(|err| miette::miette!("invalid router config: {err}"))?;
+        return Ok(parsed);
+    }
+
+    Err(miette::miette!(
+        "router config missing; supply --router-config/--router-config-b64 or set \
+         AMBER_ROUTER_CONFIG_B64"
+    ))
+}
+
+fn load_proxy_target(output: &str) -> Result<ProxyTarget> {
+    let path = Path::new(output);
+    if !path.exists() {
+        return Err(miette::miette!("proxy target not found: {}", output));
+    }
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().into_diagnostic()?.join(path)
+    };
+    let abs = abs
+        .canonicalize()
+        .map_err(|err| miette::miette!("failed to resolve output path {}: {err}", abs.display()))?;
+
+    if abs.is_dir() {
+        let metadata_path = abs.join(PROXY_METADATA_FILENAME);
+        let metadata = load_proxy_metadata_file(&metadata_path)?;
+        validate_proxy_metadata(&metadata, &metadata_path)?;
+        return Ok(ProxyTarget {
+            kind: ProxyTargetKind::Kubernetes,
+            metadata,
+        });
+    }
+
+    if abs.file_name().and_then(|name| name.to_str()) == Some(PROXY_METADATA_FILENAME) {
+        let metadata = load_proxy_metadata_file(&abs)?;
+        validate_proxy_metadata(&metadata, &abs)?;
+        return Ok(ProxyTarget {
+            kind: ProxyTargetKind::Kubernetes,
+            metadata,
+        });
+    }
+
+    let metadata = load_compose_metadata(&abs)?;
+    validate_proxy_metadata(&metadata, &abs)?;
+    Ok(ProxyTarget {
+        kind: ProxyTargetKind::DockerCompose,
+        metadata,
+    })
+}
+
+fn load_proxy_metadata_file(path: &Path) -> Result<ProxyMetadata> {
+    let raw = fs::read_to_string(path)
+        .map_err(|err| miette::miette!("failed to read {}: {err}", path.display()))?;
+    serde_json::from_str(&raw)
+        .map_err(|err| miette::miette!("invalid proxy metadata {}: {err}", path.display()))
+}
+
+fn load_compose_metadata(path: &Path) -> Result<ProxyMetadata> {
+    let raw = fs::read_to_string(path)
+        .map_err(|err| miette::miette!("failed to read {}: {err}", path.display()))?;
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&raw)
+        .map_err(|err| miette::miette!("invalid docker-compose YAML: {err}"))?;
+    let mapping = yaml
+        .as_mapping()
+        .ok_or_else(|| miette::miette!("output {} is not a docker-compose file", path.display()))?;
+    let key = serde_yaml::Value::String("services".to_string());
+    if !mapping.contains_key(&key) {
+        return Err(miette::miette!(
+            "output {} is not a docker-compose file",
+            path.display()
+        ));
+    }
+    let x_amber_key = serde_yaml::Value::String("x-amber".to_string());
+    let x_amber = mapping.get(&x_amber_key).ok_or_else(|| {
+        miette::miette!(
+            "docker-compose output {} is missing x-amber metadata; re-run `amber compile`",
+            path.display()
+        )
+    })?;
+    serde_yaml::from_value(x_amber.clone()).map_err(|err| {
+        miette::miette!(
+            "docker-compose output {} has invalid x-amber metadata: {err}",
+            path.display()
+        )
+    })
+}
+
+fn validate_proxy_metadata(metadata: &ProxyMetadata, path: &Path) -> Result<()> {
+    if metadata.version != PROXY_METADATA_VERSION {
+        return Err(miette::miette!(
+            "proxy metadata version {} in {} is not supported",
+            metadata.version,
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_mesh_addresses(args: &ProxyArgs, target: &ProxyTarget) -> Result<(String, SocketAddr)> {
+    if let Some(mesh_addr) = args.mesh_addr.as_ref() {
+        let port = parse_mesh_addr_port(mesh_addr)?;
+        let listen = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+        return Ok((mesh_addr.to_string(), listen));
+    }
+
+    let port = pick_free_port()?;
+    let mesh_addr = default_mesh_addr(target, port)?;
+    let listen = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+    Ok((mesh_addr, listen))
+}
+
+fn default_mesh_addr(target: &ProxyTarget, port: u16) -> Result<String> {
+    match target.kind {
+        ProxyTargetKind::DockerCompose => Ok(format!("host.docker.internal:{port}")),
+        ProxyTargetKind::Kubernetes => Err(miette::miette!(
+            "--mesh-addr is required when proxying against Kubernetes output"
+        )),
+    }
+}
+
+fn parse_mesh_addr_port(addr: &str) -> Result<u16> {
+    let url = Url::parse(&format!("mesh://{addr}"))
+        .map_err(|err| miette::miette!("invalid --mesh-addr {addr}: {err}"))?;
+    url.port_or_known_default()
+        .ok_or_else(|| miette::miette!("--mesh-addr must include a port (got {addr})"))
+}
+
+fn pick_free_port() -> Result<u16> {
+    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+        .into_diagnostic()?;
+    Ok(listener.local_addr().into_diagnostic()?.port())
+}
+
+fn resolve_control_addr(args: &ProxyArgs, target: &ProxyTarget) -> Result<String> {
+    if let Some(addr) = args.router_control_addr.as_ref() {
+        return Ok(addr.clone());
+    }
+    let router = target
+        .metadata
+        .router
+        .as_ref()
+        .ok_or_else(|| miette::miette!("router metadata missing; re-run `amber compile`"))?;
+    Ok(format!("127.0.0.1:{}", router.control_port))
+}
+
+async fn register_control_with_retry(addr: String, slot: String, url: String, env_var: String) {
+    loop {
+        match try_send_control_update(&addr, &slot, &url).await {
+            Ok(()) => {
+                println!("registered slot {slot} via router control ({addr})");
+                return;
+            }
+            Err(ControlUpdateError::Retryable) => {
+                sleep(Duration::from_millis(250)).await;
+            }
+            Err(ControlUpdateError::Fatal(err)) => {
+                eprintln!(
+                    "failed to register slot via router control ({}): {err}\nfallback: set \
+                     {env_var}={url} before starting the scenario",
+                    addr
+                );
+                return;
+            }
+        }
+    }
+}
+
+enum ControlUpdateError {
+    Retryable,
+    Fatal(String),
+}
+
+async fn try_send_control_update(
+    addr: &str,
+    slot: &str,
+    url: &str,
+) -> Result<(), ControlUpdateError> {
+    let payload = serde_json::json!({ "url": url }).to_string();
+    let request = format!(
+        "PUT /external-slots/{slot} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: \
+         application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    );
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(|_| ControlUpdateError::Retryable)?;
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|_| ControlUpdateError::Retryable)?;
+    let mut buf = Vec::new();
+    stream
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|_| ControlUpdateError::Retryable)?;
+    let response = String::from_utf8_lossy(&buf);
+    let status_line = response.lines().next().unwrap_or("");
+    let code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or(ControlUpdateError::Retryable)?;
+    if !(200..300).contains(&code) {
+        return Err(if code >= 500 {
+            ControlUpdateError::Retryable
+        } else {
+            ControlUpdateError::Fatal(format!("router control returned HTTP {code}"))
+        });
+    }
+    Ok(())
+}
+
+fn mesh_protocol_from_metadata(protocol: &str) -> Result<MeshProtocol> {
+    Ok(match protocol {
+        "http" | "https" => MeshProtocol::Http,
+        "tcp" => MeshProtocol::Tcp,
+        "udp" => MeshProtocol::Udp,
+        _ => {
+            return Err(miette::miette!(
+                "unsupported network protocol for mesh routing"
+            ));
+        }
+    })
 }
 
 #[derive(Default)]
@@ -405,11 +928,6 @@ struct ResolvedInput {
     registry: ResolverRegistry,
 }
 
-enum CompileInput {
-    Manifest(ResolvedInput),
-    ScenarioIr(Scenario),
-}
-
 async fn resolve_input(input: &str) -> Result<ResolvedInput> {
     if let Some(path) = local_input_path(input)?
         && let Some(loader) = BundleLoader::from_path(&path)?
@@ -428,42 +946,6 @@ async fn resolve_input(input: &str) -> Result<ResolvedInput> {
         resolver: Resolver::new(),
         registry: ResolverRegistry::default(),
     })
-}
-
-async fn resolve_compile_input(input: &str) -> Result<CompileInput> {
-    if let Some(path) = local_input_path(input)?
-        && let Some(ir) = try_load_scenario_ir(&path)?
-    {
-        let scenario =
-            Scenario::try_from(ir).map_err(|e| miette::miette!("invalid scenario IR: {e}"))?;
-        return Ok(CompileInput::ScenarioIr(scenario));
-    }
-
-    Ok(CompileInput::Manifest(resolve_input(input).await?))
-}
-
-fn try_load_scenario_ir(path: &Path) -> Result<Option<ScenarioIr>> {
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err).into_diagnostic(),
-    };
-
-    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
-    };
-    let schema = value.get("schema").and_then(serde_json::Value::as_str);
-    if schema != Some(SCENARIO_IR_SCHEMA) {
-        return Ok(None);
-    }
-
-    let ir = serde_json::from_value(value)
-        .map_err(|e| miette::miette!("failed to parse scenario IR: {e}"))?;
-    Ok(Some(ir))
 }
 
 fn local_input_path(input: &str) -> Result<Option<PathBuf>> {
@@ -639,55 +1121,9 @@ fn prepare_bundle_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_outputs(outputs: &OutputPaths, scenario: &Scenario, args: &CompileArgs) -> Result<()> {
-    if let Some(primary) = outputs.primary.as_ref() {
-        write_primary_output(primary, scenario)?;
-    }
-
-    if let Some(dot_dest) = outputs.dot.as_ref() {
-        let dot = DotReporter.emit(scenario).map_err(miette::Report::new)?;
-        match dot_dest {
-            ArtifactOutput::Stdout => print!("{dot}"),
-            ArtifactOutput::File(path) => write_artifact(path, dot.as_bytes())?,
-        }
-    }
-
-    if let Some(compose_dest) = outputs.docker_compose.as_ref() {
-        let compose = DockerComposeReporter
-            .emit(scenario)
-            .map_err(miette::Report::new)?;
-        match compose_dest {
-            ArtifactOutput::Stdout => print!("{compose}"),
-            ArtifactOutput::File(path) => write_artifact(path, compose.as_bytes())?,
-        }
-    }
-
-    if let Some(kubernetes_dest) = outputs.kubernetes.as_ref() {
-        let reporter = KubernetesReporter {
-            config: KubernetesReporterConfig {
-                disable_networkpolicy_check: args.disable_networkpolicy_check,
-            },
-        };
-        let artifact = reporter.emit(scenario).map_err(miette::Report::new)?;
-        write_kubernetes_output(kubernetes_dest, &artifact)?;
-    }
-
-    if let Some(metadata_dest) = outputs.metadata.as_ref() {
-        let metadata = MetadataReporter
-            .emit(scenario)
-            .map_err(miette::Report::new)?;
-        match metadata_dest {
-            ArtifactOutput::Stdout => print!("{metadata}"),
-            ArtifactOutput::File(path) => write_artifact(path, metadata.as_bytes())?,
-        }
-    }
-
-    Ok(())
-}
-
-fn write_primary_output(path: &Path, scenario: &Scenario) -> Result<()> {
+fn write_primary_output(path: &Path, output: &CompileOutput) -> Result<()> {
     let ir = ScenarioIrReporter
-        .emit(scenario)
+        .emit(output)
         .map_err(miette::Report::new)?;
     write_artifact(path, ir.as_bytes())
         .wrap_err_with(|| format!("failed to write primary output `{}`", path.display()))

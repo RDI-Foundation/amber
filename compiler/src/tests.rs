@@ -1546,7 +1546,7 @@ async fn bundle_compile_matches_direct_ir() {
     let direct = compiler
         .compile_from_tree(tree.clone(), opts.optimize)
         .unwrap();
-    let direct_ir = ScenarioIrReporter.emit(&direct.scenario).unwrap();
+    let direct_ir = ScenarioIrReporter.emit(&direct).unwrap();
 
     let bundle_dir = dir.path().join("bundle");
     BundleBuilder::build(&tree, compiler.store(), &bundle_dir).unwrap();
@@ -1562,7 +1562,7 @@ async fn bundle_compile_matches_direct_ir() {
         .compile(bundle.root, CompileOptions::default())
         .await
         .unwrap();
-    let bundled_ir = ScenarioIrReporter.emit(&bundled.scenario).unwrap();
+    let bundled_ir = ScenarioIrReporter.emit(&bundled).unwrap();
 
     assert_eq!(direct_ir, bundled_ir);
 }
