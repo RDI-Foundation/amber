@@ -1,8 +1,8 @@
 use std::{collections::HashMap, env, net::SocketAddr, sync::Arc};
 
 use amber_mesh::{
-    Caveat, InboundRoute, InboundTarget, MeshConfig, MeshConfigPublic, MeshIdentity,
-    MeshIdentitySecret, MeshPeer, MeshProtocol, SignedMacaroon, Token, TokenClaims,
+    InboundRoute, InboundTarget, MeshConfig, MeshConfigPublic, MeshIdentity, MeshIdentitySecret,
+    MeshPeer, MeshProtocol,
 };
 use base64::Engine as _;
 use bytes::Bytes;
@@ -59,7 +59,6 @@ pub enum RouterError {
 struct OpenFrame {
     capability: String,
     protocol: MeshProtocol,
-    token: Token,
 }
 
 #[derive(Clone)]
@@ -283,24 +282,16 @@ async fn handle_inbound(
         .ok_or_else(|| RouterError::Auth("unknown capability".to_string()))?
         .clone();
 
-    let required = vec![
-        Caveat::new("cap", route.capability.clone()),
-        Caveat::new("aud", config.identity.id.clone()),
-        Caveat::new("proto", protocol_string(route.protocol)),
-    ];
-
-    let claims = verify_token(&open.token, &required, &trust)?;
-    if !route.allowed_issuers.contains(&claims.issuer_id) {
-        return Err(RouterError::Auth("issuer not allowed".to_string()));
-    }
-    if let Some(remote_id) = session.remote_id.clone()
-        && claims.issuer_id != remote_id
-    {
-        return Err(RouterError::Auth("issuer does not match peer".to_string()));
-    }
-
     if open.capability != route.capability || open.protocol != route.protocol {
         return Err(RouterError::Auth("open frame mismatch".to_string()));
+    }
+
+    let remote_id = session
+        .remote_id
+        .clone()
+        .ok_or_else(|| RouterError::Auth("unknown peer".to_string()))?;
+    if !route.allowed_issuers.contains(&remote_id) {
+        return Err(RouterError::Auth("peer not allowed".to_string()));
     }
 
     match route.target {
@@ -327,16 +318,9 @@ async fn handle_inbound(
                         &config,
                     )
                     .await?;
-                    let required = vec![
-                        Caveat::new("cap", route.capability.clone()),
-                        Caveat::new("aud", mesh.peer_id.clone()),
-                        Caveat::new("proto", protocol_string(route.protocol)),
-                    ];
-                    let token = issue_token(&config.identity, &required)?;
                     let open = OpenFrame {
                         capability: route.capability.clone(),
                         protocol: route.protocol,
-                        token,
                     };
                     outbound.send_open(&open).await?;
                     proxy_noise_to_noise(&mut session, outbound).await?;
@@ -369,16 +353,9 @@ async fn handle_inbound(
                         &config,
                     )
                     .await?;
-                    let required = vec![
-                        Caveat::new("cap", route.capability.clone()),
-                        Caveat::new("aud", mesh.peer_id.clone()),
-                        Caveat::new("proto", protocol_string(route.protocol)),
-                    ];
-                    let token = issue_token(&config.identity, &required)?;
                     let open = OpenFrame {
                         capability: route.capability.clone(),
                         protocol: route.protocol,
-                        token,
                     };
                     outbound.send_open(&open).await?;
                     proxy_noise_to_noise(&mut session, outbound).await?;
@@ -405,16 +382,9 @@ async fn handle_inbound(
             capability,
         } => {
             let outbound = connect_noise(&peer_addr, &peer_id, &config, &trust).await?;
-            let required = vec![
-                Caveat::new("cap", capability.clone()),
-                Caveat::new("aud", peer_id.clone()),
-                Caveat::new("proto", protocol_string(route.protocol)),
-            ];
-            let token = issue_token(&config.identity, &required)?;
             let open = OpenFrame {
                 capability,
                 protocol: route.protocol,
-                token,
             };
             outbound.send_open(&open).await?;
             proxy_noise_to_noise(&mut session, outbound).await?;
@@ -465,11 +435,9 @@ async fn handle_outbound(
 ) -> Result<(), RouterError> {
     let mut outbound = connect_noise(&route.peer_addr, &route.peer_id, &config, &trust).await?;
 
-    let token = issue_token(&config.identity, &route.token_caveats)?;
     let open = OpenFrame {
         capability: route.capability,
         protocol: route.protocol,
-        token,
     };
     outbound.send_open(&open).await?;
     proxy_noise_to_plain(&mut outbound, stream).await?;
@@ -615,44 +583,6 @@ fn protocol_string(protocol: MeshProtocol) -> String {
         MeshProtocol::Tcp => "tcp".to_string(),
         MeshProtocol::Udp => "udp".to_string(),
     }
-}
-
-fn issue_token(identity: &MeshIdentity, caveats: &[Caveat]) -> Result<Token, RouterError> {
-    let payload = amber_mesh::MacaroonPayload {
-        issuer_id: identity.id.clone(),
-        caveats: caveats.to_vec(),
-    };
-    let signed = SignedMacaroon::sign(payload, &identity.signing_key());
-    signed
-        .encode()
-        .map_err(|err| RouterError::Auth(err.to_string()))
-}
-
-fn verify_token(
-    token: &Token,
-    required: &[Caveat],
-    trust: &TrustBundle,
-) -> Result<TokenClaims, RouterError> {
-    let signed = SignedMacaroon::decode(token).map_err(|err| RouterError::Auth(err.to_string()))?;
-    let issuer_id = signed.payload.issuer_id.clone();
-    let verifier = trust
-        .verifier(&issuer_id)
-        .ok_or_else(|| RouterError::Auth("unknown issuer".to_string()))?;
-    let payload = signed
-        .verify(verifier)
-        .map_err(|err| RouterError::Auth(err.to_string()))?;
-    for required in required {
-        if !payload.caveats.iter().any(|c| c == required) {
-            return Err(RouterError::Auth(format!(
-                "missing caveat {}",
-                required.key
-            )));
-        }
-    }
-    Ok(TokenClaims {
-        issuer_id: payload.issuer_id,
-        caveats: payload.caveats,
-    })
 }
 
 #[derive(Clone)]
@@ -1203,33 +1133,23 @@ fn ed25519_public_to_x25519(public: [u8; 32]) -> Result<[u8; 32], RouterError> {
 }
 
 struct TrustBundle {
-    by_id: HashMap<String, ed25519_dalek::VerifyingKey>,
     noise_by_id: HashMap<String, [u8; 32]>,
     id_by_noise: HashMap<[u8; 32], String>,
 }
 
 impl TrustBundle {
     fn new(config: &MeshConfig) -> Result<Self, RouterError> {
-        let mut by_id = HashMap::new();
         let mut noise_by_id = HashMap::new();
         let mut id_by_noise = HashMap::new();
 
-        let local = config.identity.verifying_key();
-        by_id.insert(config.identity.id.clone(), local);
-
         for peer in &config.peers {
-            insert_peer(peer, &mut by_id, &mut noise_by_id, &mut id_by_noise)?;
+            insert_peer(peer, &mut noise_by_id, &mut id_by_noise)?;
         }
 
         Ok(Self {
-            by_id,
             noise_by_id,
             id_by_noise,
         })
-    }
-
-    fn verifier(&self, id: &str) -> Option<&ed25519_dalek::VerifyingKey> {
-        self.by_id.get(id)
     }
 
     fn noise_key(&self, id: &str) -> Option<&[u8; 32]> {
@@ -1243,14 +1163,10 @@ impl TrustBundle {
 
 fn insert_peer(
     peer: &MeshPeer,
-    by_id: &mut HashMap<String, ed25519_dalek::VerifyingKey>,
     noise_by_id: &mut HashMap<String, [u8; 32]>,
     id_by_noise: &mut HashMap<[u8; 32], String>,
 ) -> Result<(), RouterError> {
-    let verify = ed25519_dalek::VerifyingKey::from_bytes(&peer.public_key)
-        .map_err(|err| RouterError::Auth(err.to_string()))?;
     let noise = ed25519_public_to_x25519(peer.public_key)?;
-    by_id.insert(peer.id.clone(), verify);
     noise_by_id.insert(peer.id.clone(), noise);
     id_by_noise.insert(noise, peer.id.clone());
     Ok(())

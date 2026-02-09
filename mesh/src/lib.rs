@@ -1,7 +1,7 @@
 use std::{collections::HashMap, net::SocketAddr};
 
 use base64::Engine as _;
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -218,7 +218,6 @@ pub struct OutboundRoute {
     pub peer_addr: String,
     pub peer_id: String,
     pub capability: String,
-    pub token_caveats: Vec<Caveat>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -237,22 +236,6 @@ pub enum InboundTarget {
         peer_id: String,
         capability: String,
     },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub struct Caveat {
-    pub key: String,
-    pub value: String,
-}
-
-impl Caveat {
-    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
-        Self {
-            key: key.into(),
-            value: value.into(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -364,90 +347,6 @@ impl MeshConfigTemplate {
             transport: self.transport.clone(),
         })
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct Token(pub String);
-
-impl AsRef<str> for Token {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct MacaroonPayload {
-    pub issuer_id: String,
-    pub caveats: Vec<Caveat>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct SignedMacaroon {
-    pub payload: MacaroonPayload,
-    #[serde(with = "key_serde_64")]
-    pub signature: [u8; 64],
-}
-
-#[derive(Debug, Error)]
-pub enum TokenError {
-    #[error("invalid token encoding")]
-    InvalidEncoding,
-    #[error("invalid token json: {0}")]
-    InvalidJson(String),
-    #[error("invalid token signature")]
-    InvalidSignature,
-    #[error("token missing required caveat {0}")]
-    MissingCaveat(String),
-}
-
-impl SignedMacaroon {
-    pub fn sign(payload: MacaroonPayload, signer: &SigningKey) -> Self {
-        let bytes =
-            serde_json::to_vec(&payload).expect("macaroon payload serialization should not fail");
-        let signature = signer.sign(&bytes).to_bytes();
-        Self { payload, signature }
-    }
-
-    pub fn verify(&self, verifier: &VerifyingKey) -> Result<MacaroonPayload, TokenError> {
-        let bytes = serde_json::to_vec(&self.payload)
-            .map_err(|err| TokenError::InvalidJson(err.to_string()))?;
-        let signature = ed25519_dalek::Signature::from_bytes(&self.signature);
-        verifier
-            .verify_strict(&bytes, &signature)
-            .map_err(|_| TokenError::InvalidSignature)?;
-        Ok(self.payload.clone())
-    }
-
-    pub fn encode(&self) -> Result<Token, TokenError> {
-        let json =
-            serde_json::to_vec(self).map_err(|err| TokenError::InvalidJson(err.to_string()))?;
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
-        Ok(Token(encoded))
-    }
-
-    pub fn decode(token: &Token) -> Result<Self, TokenError> {
-        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(token.0.as_bytes())
-            .map_err(|_| TokenError::InvalidEncoding)?;
-        serde_json::from_slice(&decoded).map_err(|err| TokenError::InvalidJson(err.to_string()))
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct TokenClaims {
-    pub issuer_id: String,
-    pub caveats: Vec<Caveat>,
-}
-
-pub trait TokenIssuer {
-    fn issue(&self, caveats: &[Caveat]) -> Result<Token, TokenError>;
-}
-
-pub trait TokenVerifier {
-    fn verify(&self, token: &Token, required: &[Caveat]) -> Result<TokenClaims, TokenError>;
 }
 
 mod key_serde_32 {

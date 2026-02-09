@@ -20,8 +20,8 @@ use amber_compiler::{
 };
 use amber_manifest::ManifestRef;
 use amber_mesh::{
-    Caveat, InboundRoute, InboundTarget, MeshConfig, MeshIdentity, MeshPeer, MeshProtocol,
-    OutboundRoute, TransportConfig,
+    InboundRoute, InboundTarget, MeshConfig, MeshIdentity, MeshPeer, MeshProtocol, OutboundRoute,
+    TransportConfig,
 };
 use amber_resolver::Resolver;
 use amber_router as router;
@@ -403,11 +403,6 @@ async fn proxy(args: ProxyArgs) -> Result<()> {
                 peer_addr: router_addr.to_string(),
                 peer_id: router_id.clone(),
                 capability: export.to_string(),
-                token_caveats: vec![
-                    Caveat::new("cap", export.to_string()),
-                    Caveat::new("aud", router_id),
-                    Caveat::new("proto", protocol_string(protocol)),
-                ],
             }],
             transport: TransportConfig::NoiseIk {},
         };
@@ -769,14 +764,6 @@ fn mesh_protocol_from_metadata(protocol: &str) -> Result<MeshProtocol> {
             ));
         }
     })
-}
-
-fn protocol_string(protocol: MeshProtocol) -> String {
-    match protocol {
-        MeshProtocol::Http => "http".to_string(),
-        MeshProtocol::Tcp => "tcp".to_string(),
-        MeshProtocol::Udp => "udp".to_string(),
-    }
 }
 
 #[derive(Default)]

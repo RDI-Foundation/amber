@@ -10,8 +10,8 @@ use std::{
 use amber_images::{AMBER_HELPER, AMBER_PROVISIONER, AMBER_ROUTER};
 use amber_manifest::ManifestRef;
 use amber_mesh::{
-    Caveat, MeshConfig, MeshConfigPublic, MeshIdentitySecret, MeshPeer, MeshProtocol,
-    OutboundRoute, TransportConfig,
+    MeshConfig, MeshConfigPublic, MeshIdentitySecret, MeshPeer, MeshProtocol, OutboundRoute,
+    TransportConfig,
 };
 use amber_resolver::Resolver;
 use amber_router as router;
@@ -1182,11 +1182,6 @@ fn kubernetes_smoke_export_routes_to_host() {
             peer_addr: router_addr.to_string(),
             peer_id: router_id.clone(),
             capability: export_name.to_string(),
-            token_caveats: vec![
-                Caveat::new("cap", export_name),
-                Caveat::new("aud", router_id),
-                Caveat::new("proto", "http"),
-            ],
         }],
         transport: TransportConfig::NoiseIk {},
     };

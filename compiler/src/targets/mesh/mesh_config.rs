@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use amber_manifest::{Manifest, NetworkProtocol};
 use amber_mesh::{
-    Caveat, InboundRoute, InboundTarget, MeshConfigTemplate, MeshIdentityTemplate,
-    MeshPeerTemplate, MeshProtocol, OutboundRoute,
+    InboundRoute, InboundTarget, MeshConfigTemplate, MeshIdentityTemplate, MeshPeerTemplate,
+    MeshProtocol, OutboundRoute,
 };
 use amber_scenario::{ComponentId, Scenario};
 use base64::Engine as _;
@@ -184,11 +184,6 @@ pub(crate) fn build_mesh_config_plan(
                 peer_addr,
                 peer_id: peer_id.clone(),
                 capability: binding.provide.clone(),
-                token_caveats: vec![
-                    Caveat::new("cap", binding.provide.clone()),
-                    Caveat::new("aud", peer_id),
-                    Caveat::new("proto", protocol_string(protocol)),
-                ],
             });
         }
 
@@ -222,11 +217,6 @@ pub(crate) fn build_mesh_config_plan(
                 peer_addr: router_addr,
                 peer_id: router_identity.id.clone(),
                 capability: binding.external_slot.clone(),
-                token_caveats: vec![
-                    Caveat::new("cap", binding.external_slot.clone()),
-                    Caveat::new("aud", router_identity.id.clone()),
-                    Caveat::new("proto", protocol_string(protocol)),
-                ],
             });
         }
 
@@ -344,14 +334,6 @@ fn mesh_protocol(protocol: NetworkProtocol) -> Result<MeshProtocol, MeshError> {
         }
     };
     Ok(mapped)
-}
-
-fn protocol_string(protocol: MeshProtocol) -> String {
-    match protocol {
-        MeshProtocol::Http => "http".to_string(),
-        MeshProtocol::Tcp => "tcp".to_string(),
-        MeshProtocol::Udp => "udp".to_string(),
-    }
 }
 
 fn required_peers(
