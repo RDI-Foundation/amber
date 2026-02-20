@@ -1,6 +1,7 @@
 use amber_scenario::{Scenario, ScenarioIr};
 
 use super::{Reporter, ReporterError};
+use crate::CompileOutput;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScenarioIrReporter;
@@ -8,8 +9,8 @@ pub struct ScenarioIrReporter;
 impl Reporter for ScenarioIrReporter {
     type Artifact = String;
 
-    fn emit(&self, scenario: &Scenario) -> Result<Self::Artifact, ReporterError> {
-        render_scenario_ir(scenario)
+    fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError> {
+        render_scenario_ir(&output.scenario)
     }
 }
 

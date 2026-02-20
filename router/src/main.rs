@@ -1,8 +1,8 @@
-use amber_router::{RouterConfig, run};
+use amber_router::{config_from_env, run};
 
 #[tokio::main]
 async fn main() {
-    let config = match RouterConfig::from_env() {
+    let config = match config_from_env() {
         Ok(config) => config,
         Err(err) => {
             eprintln!("router config error: {err}");

@@ -1,8 +1,6 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
-    io::{Read, Write},
-    net::TcpStream,
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
@@ -10,22 +8,19 @@ use std::{
     time::Duration,
 };
 
-use amber_images::{AMBER_HELPER, AMBER_ROUTER, AMBER_SIDECAR};
-use amber_manifest::{FrameworkCapabilityName, ManifestDigest, ManifestRef, ProvideDecl, SlotDecl};
+use amber_manifest::{
+    FrameworkCapabilityName, Manifest, ManifestDigest, ManifestRef, ProvideDecl, SlotDecl,
+};
+use amber_mesh::{InboundTarget, MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTarget};
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
     ScenarioExport, SlotRef,
 };
-use base64::Engine as _;
-use serde_json::json;
+use serde_json::{Map, Value, json};
 use url::Url;
 
 use super::DockerComposeReporter;
-use crate::reporter::Reporter as _;
-
-const SIDECAR_IMAGE: &str = AMBER_SIDECAR.reference;
-const HELPER_IMAGE: &str = AMBER_HELPER.reference;
-const ROUTER_IMAGE: &str = AMBER_ROUTER.reference;
+use crate::{reporter::Reporter as _, targets::mesh::internal_images::resolve_internal_images};
 
 fn digest(byte: u8) -> ManifestDigest {
     ManifestDigest::new([byte; 32])
@@ -33,6 +28,82 @@ fn digest(byte: u8) -> ManifestDigest {
 
 fn moniker(path: &str) -> Moniker {
     Moniker::from(Arc::from(path))
+}
+
+fn internal_images() -> crate::targets::mesh::internal_images::InternalImages {
+    resolve_internal_images().expect("internal images should resolve for tests")
+}
+
+fn compile_output_with_manifest_overrides(
+    scenario: Scenario,
+    overrides: BTreeMap<ComponentId, Map<String, Value>>,
+) -> crate::CompileOutput {
+    let url = Url::parse("file:///scenario.json5").expect("test URL should parse");
+    let store = crate::DigestStore::new();
+
+    for component in scenario.components.iter().flatten() {
+        let mut manifest = serde_json::Map::new();
+        manifest.insert(
+            "manifest_version".to_string(),
+            Value::String("0.1.0".to_string()),
+        );
+        if let Some(program) = &component.program {
+            manifest.insert(
+                "program".to_string(),
+                serde_json::to_value(program).unwrap(),
+            );
+        }
+        if !component.slots.is_empty() {
+            manifest.insert(
+                "slots".to_string(),
+                serde_json::to_value(&component.slots).unwrap(),
+            );
+        }
+        if !component.provides.is_empty() {
+            manifest.insert(
+                "provides".to_string(),
+                serde_json::to_value(&component.provides).unwrap(),
+            );
+        }
+        if let Some(extra) = overrides.get(&component.id) {
+            for (key, value) in extra {
+                manifest.insert(key.clone(), value.clone());
+            }
+        }
+
+        let manifest: Manifest = serde_json::from_value(Value::Object(manifest)).unwrap();
+        store.put(component.digest, Arc::new(manifest));
+    }
+
+    let provenance = crate::Provenance {
+        components: scenario
+            .components
+            .iter()
+            .map(|component| {
+                let component = component
+                    .as_ref()
+                    .expect("test scenario component should exist");
+                crate::ComponentProvenance {
+                    authored_moniker: component.moniker.clone(),
+                    declared_ref: ManifestRef::from_url(url.clone()),
+                    resolved_url: url.clone(),
+                    digest: component.digest,
+                    observed_url: None,
+                }
+            })
+            .collect(),
+    };
+
+    crate::CompileOutput {
+        scenario,
+        store,
+        provenance,
+        diagnostics: Vec::new(),
+    }
+}
+
+fn compile_output(scenario: Scenario) -> crate::CompileOutput {
+    compile_output_with_manifest_overrides(scenario, BTreeMap::new())
 }
 
 fn error_contains(err: &crate::Error, needle: &str) -> bool {
@@ -50,19 +121,6 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("compiler crate should live under the workspace root")
         .to_path_buf()
-}
-
-fn use_prebuilt_images() -> bool {
-    std::env::var("AMBER_TEST_USE_PREBUILT_IMAGES").is_ok()
-}
-
-fn prebuilt_image_platform(tag: &str) -> String {
-    image_platform_opt(tag).unwrap_or_else(|| {
-        panic!(
-            "AMBER_TEST_USE_PREBUILT_IMAGES is set but {tag} is not available locally. Ensure the \
-             image is pulled and tagged before running tests."
-        )
-    })
 }
 
 fn image_platform_opt(tag: &str) -> Option<String> {
@@ -118,9 +176,6 @@ fn ensure_image_platform(tag: &str, platform: &str) {
 }
 
 fn build_docker_image(tag: &str, dockerfile: &Path, context: &Path) -> String {
-    if use_prebuilt_images() {
-        return prebuilt_image_platform(tag);
-    }
     let status = std::process::Command::new("docker")
         .arg("buildx")
         .arg("build")
@@ -136,19 +191,11 @@ fn build_docker_image(tag: &str, dockerfile: &Path, context: &Path) -> String {
     image_platform(tag)
 }
 
-fn build_sidecar_image() -> String {
-    let root = workspace_root();
-    build_docker_image(
-        SIDECAR_IMAGE,
-        &root.join("docker/amber-sidecar/Dockerfile"),
-        &root.join("docker/amber-sidecar"),
-    )
-}
-
 fn build_helper_image() -> String {
     let root = workspace_root();
+    let images = internal_images();
     build_docker_image(
-        HELPER_IMAGE,
+        &images.helper,
         &root.join("docker/amber-helper/Dockerfile"),
         &root,
     )
@@ -156,9 +203,20 @@ fn build_helper_image() -> String {
 
 fn build_router_image() -> String {
     let root = workspace_root();
+    let images = internal_images();
     build_docker_image(
-        ROUTER_IMAGE,
+        &images.router,
         &root.join("docker/amber-router/Dockerfile"),
+        &root,
+    )
+}
+
+fn build_provisioner_image() -> String {
+    let root = workspace_root();
+    let images = internal_images();
+    build_docker_image(
+        &images.provisioner,
+        &root.join("docker/amber-provisioner/Dockerfile"),
         &root,
     )
 }
@@ -204,31 +262,24 @@ fn env_value(service: &super::Service, key: &str) -> Option<String> {
     }
 }
 
-fn command_script(service: &super::Service) -> Option<&str> {
-    service
-        .command
-        .as_ref()
-        .and_then(|cmd| cmd.last())
-        .map(|s| s.as_str())
+fn provision_plan(compose: &super::DockerComposeFile) -> MeshProvisionPlan {
+    let raw = &compose
+        .configs
+        .get(super::PROVISIONER_PLAN_CONFIG_NAME)
+        .expect("mesh provision plan config missing")
+        .content;
+    serde_json::from_str(raw).expect("parse mesh provision plan")
 }
 
-fn http_get(host: &str, port: u16) -> std::io::Result<String> {
-    let mut stream = TcpStream::connect((host, port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes())?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    Ok(response)
-}
-
-fn extract_compose_env_value(yaml: &str, key: &str) -> Option<String> {
-    let compose = parse_compose(yaml);
-    compose
-        .services
-        .values()
-        .find_map(|svc| env_value(svc, key))
+fn target_for_service<'a>(plan: &'a MeshProvisionPlan, service: &str) -> &'a MeshProvisionTarget {
+    let suffix = format!("/{service}");
+    plan.targets
+        .iter()
+        .find(|target| match &target.output {
+            MeshProvisionOutput::Filesystem { dir } => dir.ends_with(&suffix),
+            MeshProvisionOutput::KubernetesSecret { .. } => false,
+        })
+        .unwrap_or_else(|| panic!("mesh provision target missing for {service}"))
 }
 
 #[test]
@@ -321,10 +372,37 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         exports: vec![],
     };
 
+    let output = compile_output(scenario);
     let yaml = DockerComposeReporter
-        .emit(&scenario)
+        .emit(&output)
         .expect("compose render ok");
     let compose = parse_compose(&yaml);
+    let images = internal_images();
+    let plan = provision_plan(&compose);
+
+    let provisioner = service(&compose, "amber-provisioner");
+    assert_eq!(
+        env_value(provisioner, "AMBER_MESH_PROVISION_PLAN_PATH").as_deref(),
+        Some(super::PROVISIONER_PLAN_PATH),
+        "{yaml}"
+    );
+    assert!(
+        env_value(provisioner, "AMBER_MESH_PROVISION_PLAN_B64").is_none(),
+        "{yaml}"
+    );
+    assert!(
+        provisioner.configs.iter().any(|mount| {
+            mount.source == super::PROVISIONER_PLAN_CONFIG_NAME
+                && mount.target.as_deref() == Some(super::PROVISIONER_PLAN_PATH)
+        }),
+        "{yaml}"
+    );
+    assert!(
+        compose
+            .configs
+            .contains_key(super::PROVISIONER_PLAN_CONFIG_NAME),
+        "{yaml}"
+    );
 
     // Service names should be injective and include sidecars.
     assert!(compose.services.contains_key("c1-server-net"), "{yaml}");
@@ -338,32 +416,193 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         Some("service:c2-client-net")
     );
 
-    // Sidecar image should be pulled from GHCR.
-    assert_eq!(service(&compose, "c1-server-net").image, SIDECAR_IMAGE);
+    // Sidecar image should be the router binary.
+    assert_eq!(service(&compose, "c1-server-net").image, images.router);
 
     // Compose should not pin static IPs or subnets.
     assert!(!yaml.contains("ipv4_address:"), "{yaml}");
     assert!(!yaml.contains("ipam:"), "{yaml}");
 
-    // Server sidecar should allow inbound from client on 8080 via DNS resolution.
-    let server_sidecar_script =
-        command_script(service(&compose, "c1-server-net")).expect("server sidecar command script");
-    assert!(server_sidecar_script.contains(r#"resolve_ipv4 "c2-client-net""#));
-    assert!(
-        server_sidecar_script
-            .contains(r#"add_rule "-s $$ip/32 -p tcp -m tcp --dport 8080 -j ACCEPT""#)
-    );
+    // Server sidecar config should expose the provide on the program port.
+    let server_target = target_for_service(&plan, "c1-server-net");
+    let inbound = server_target
+        .config
+        .inbound
+        .iter()
+        .find(|route| route.capability == "api")
+        .expect("server inbound route missing");
+    assert_eq!(inbound.allowed_issuers.len(), 1);
 
-    // Sidecar proxies should target DNS names, not static IPs.
-    let client_sidecar_script =
-        command_script(service(&compose, "c2-client-net")).expect("client sidecar command script");
-    assert!(client_sidecar_script.contains("TCP:c1-server-net:8080"));
+    // Client sidecar config should listen on the local slot port.
+    let client_target = target_for_service(&plan, "c2-client-net");
+    let outbound = client_target
+        .config
+        .outbound
+        .iter()
+        .find(|route| route.slot == "api")
+        .expect("client outbound route missing");
+    assert_eq!(outbound.listen_port, 20000);
 
     // Slot URL should be rendered with local proxy port base (20000).
     assert_eq!(
         env_value(service(&compose, "c2-client"), "URL").as_deref(),
         Some("http://127.0.0.1:20000")
     );
+}
+
+#[test]
+fn compose_emits_minimal_peer_keys() {
+    let server1_program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["server1"],
+        "network": {
+            "endpoints": [
+                { "name": "api1", "port": 8080, "protocol": "http" }
+            ]
+        }
+    }))
+    .unwrap();
+
+    let server2_program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["server2"],
+        "network": {
+            "endpoints": [
+                { "name": "api2", "port": 8081, "protocol": "http" }
+            ]
+        }
+    }))
+    .unwrap();
+
+    let client_program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["client"],
+        "env": {
+            "URL": "${slots.api1.url}"
+        }
+    }))
+    .unwrap();
+
+    let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
+    let provide_api1: ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "api1" })).unwrap();
+    let provide_api2: ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "api2" })).unwrap();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: vec![ComponentId(1), ComponentId(2), ComponentId(3)],
+    };
+
+    let server1 = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/server1"),
+        digest: digest(1),
+        config: None,
+        config_schema: None,
+        program: Some(server1_program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::from([("api1".to_string(), provide_api1)]),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let server2 = Component {
+        id: ComponentId(2),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/server2"),
+        digest: digest(2),
+        config: None,
+        config_schema: None,
+        program: Some(server2_program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::from([("api2".to_string(), provide_api2)]),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let client = Component {
+        id: ComponentId(3),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/client"),
+        digest: digest(3),
+        config: None,
+        config_schema: None,
+        program: Some(client_program),
+        slots: BTreeMap::from([("api1".to_string(), slot_http)]),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(server1), Some(server2), Some(client)],
+        bindings: vec![BindingEdge {
+            name: None,
+            from: BindingFrom::Component(ProvideRef {
+                component: ComponentId(1),
+                name: "api1".to_string(),
+            }),
+            to: SlotRef {
+                component: ComponentId(3),
+                name: "api1".to_string(),
+            },
+            weak: false,
+        }],
+        exports: vec![],
+    };
+
+    let output = compile_output(scenario);
+    let yaml = DockerComposeReporter
+        .emit(&output)
+        .expect("compose render should succeed");
+    let compose = parse_compose(&yaml);
+    let plan = provision_plan(&compose);
+
+    let server1_target = target_for_service(&plan, "c1-server1-net");
+    let server2_target = target_for_service(&plan, "c2-server2-net");
+    let client_target = target_for_service(&plan, "c3-client-net");
+
+    let server1_peers: BTreeSet<String> = server1_target
+        .config
+        .peers
+        .iter()
+        .map(|peer| peer.id.clone())
+        .collect();
+    let server2_peers: BTreeSet<String> = server2_target
+        .config
+        .peers
+        .iter()
+        .map(|peer| peer.id.clone())
+        .collect();
+    let client_peers: BTreeSet<String> = client_target
+        .config
+        .peers
+        .iter()
+        .map(|peer| peer.id.clone())
+        .collect();
+
+    let expected_server1: BTreeSet<String> = ["/client".to_string()].into_iter().collect();
+    let expected_client: BTreeSet<String> = ["/server1".to_string()].into_iter().collect();
+
+    assert_eq!(server1_peers, expected_server1);
+    assert!(server2_peers.is_empty());
+    assert_eq!(client_peers, expected_client);
 }
 
 #[test]
@@ -396,8 +635,9 @@ fn compose_escapes_entrypoint_dollars() {
         exports: vec![],
     };
 
+    let output = compile_output(scenario);
     let yaml = DockerComposeReporter
-        .emit(&scenario)
+        .emit(&output)
         .expect("compose render ok");
     let compose = parse_compose(&yaml);
 
@@ -448,6 +688,14 @@ fn compose_resolves_binding_urls_in_child_config() {
     let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
     let provide_http: ProvideDecl =
         serde_json::from_value(json!({ "kind": "http", "endpoint": "api" })).unwrap();
+    let upstream_schema = json!({
+        "type": "object",
+        "properties": {
+            "upstream_url": { "type": "string" }
+        },
+        "required": ["upstream_url"],
+        "additionalProperties": false
+    });
 
     let root = Component {
         id: ComponentId(0),
@@ -508,14 +756,7 @@ fn compose_resolves_binding_urls_in_child_config() {
         config: Some(json!({
             "upstream_url": "${bindings.bind.url}"
         })),
-        config_schema: Some(json!({
-            "type": "object",
-            "properties": {
-                "upstream_url": { "type": "string" }
-            },
-            "required": ["upstream_url"],
-            "additionalProperties": false
-        })),
+        config_schema: Some(upstream_schema),
         program: Some(observer_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
@@ -542,8 +783,41 @@ fn compose_resolves_binding_urls_in_child_config() {
         exports: vec![],
     };
 
+    let mut overrides = BTreeMap::new();
+    let mut root_overrides = Map::new();
+    root_overrides.insert(
+        "components".to_string(),
+        json!({
+            "server": "file:///server.json5",
+            "client": "file:///client.json5",
+            "observer": "file:///observer.json5",
+        }),
+    );
+    root_overrides.insert(
+        "bindings".to_string(),
+        json!([
+            { "name": "bind", "to": "#client.api", "from": "#server.api" }
+        ]),
+    );
+    overrides.insert(ComponentId(0), root_overrides);
+
+    let mut observer_overrides = Map::new();
+    observer_overrides.insert(
+        "config_schema".to_string(),
+        json!({
+            "type": "object",
+            "properties": {
+                "upstream_url": { "type": "string" }
+            },
+            "required": ["upstream_url"],
+            "additionalProperties": false
+        }),
+    );
+    overrides.insert(ComponentId(3), observer_overrides);
+
+    let output = compile_output_with_manifest_overrides(scenario, overrides);
     let yaml = DockerComposeReporter
-        .emit(&scenario)
+        .emit(&output)
         .expect("compose render ok");
     let compose = parse_compose(&yaml);
 
@@ -595,6 +869,14 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
     let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
     let provide_http: ProvideDecl =
         serde_json::from_value(json!({ "kind": "http", "endpoint": "api" })).unwrap();
+    let upstream_schema = json!({
+        "type": "object",
+        "properties": {
+            "upstream_url": { "type": "string" }
+        },
+        "required": ["upstream_url"],
+        "additionalProperties": false
+    });
 
     let root = Component {
         id: ComponentId(0),
@@ -646,15 +928,6 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         metadata: None,
         children: Vec::new(),
     };
-
-    let upstream_schema = json!({
-        "type": "object",
-        "properties": {
-            "upstream_url": { "type": "string" }
-        },
-        "required": ["upstream_url"],
-        "additionalProperties": false
-    });
 
     let grandparent = Component {
         id: ComponentId(3),
@@ -732,8 +1005,51 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         exports: vec![],
     };
 
+    let mut overrides = BTreeMap::new();
+    let mut root_overrides = Map::new();
+    root_overrides.insert(
+        "components".to_string(),
+        json!({
+            "server": "file:///server.json5",
+            "client": "file:///client.json5",
+            "grandparent": "file:///grandparent.json5",
+        }),
+    );
+    root_overrides.insert(
+        "bindings".to_string(),
+        json!([
+            { "name": "bind", "to": "#client.api", "from": "#server.api" }
+        ]),
+    );
+    overrides.insert(ComponentId(0), root_overrides);
+
+    let mut grandparent_overrides = Map::new();
+    grandparent_overrides.insert(
+        "components".to_string(),
+        json!({
+            "parent": "file:///parent.json5"
+        }),
+    );
+    grandparent_overrides.insert("config_schema".to_string(), upstream_schema.clone());
+    overrides.insert(ComponentId(3), grandparent_overrides);
+
+    let mut parent_overrides = Map::new();
+    parent_overrides.insert(
+        "components".to_string(),
+        json!({
+            "child": "file:///child.json5"
+        }),
+    );
+    parent_overrides.insert("config_schema".to_string(), upstream_schema.clone());
+    overrides.insert(ComponentId(4), parent_overrides);
+
+    let mut child_overrides = Map::new();
+    child_overrides.insert("config_schema".to_string(), upstream_schema);
+    overrides.insert(ComponentId(5), child_overrides);
+
+    let output = compile_output_with_manifest_overrides(scenario, overrides);
     let yaml = DockerComposeReporter
-        .emit(&scenario)
+        .emit(&output)
         .expect("compose render ok");
     let compose = parse_compose(&yaml);
 
@@ -808,8 +1124,9 @@ fn compose_emits_export_metadata_and_labels() {
         }],
     };
 
+    let output = compile_output(scenario);
     let yaml = DockerComposeReporter
-        .emit(&scenario)
+        .emit(&output)
         .expect("compose render ok");
     let compose = parse_compose(&yaml);
 
@@ -820,27 +1137,34 @@ fn compose_emits_export_metadata_and_labels() {
         .exports
         .get("public")
         .expect("public export should exist");
-    assert_eq!(exports.published_host, "127.0.0.1");
-    assert_eq!(exports.published_port, 18000);
-    assert_eq!(exports.target_port, 8080);
     assert_eq!(exports.component, "/server");
     assert_eq!(exports.provide, "api");
-    assert_eq!(exports.endpoint, "api");
+    assert_eq!(exports.protocol, "http");
+    assert_eq!(exports.router_mesh_port, 24000);
+    let router_meta = compose
+        .x_amber
+        .as_ref()
+        .expect("x-amber should be present")
+        .router
+        .as_ref()
+        .expect("router metadata missing");
+    assert_eq!(router_meta.mesh_port, 24000);
+    assert_eq!(router_meta.control_port, 24100);
 
-    let router_sidecar = service(&compose, "amber-router-net");
+    let router_service = service(&compose, "amber-router");
     assert!(
-        router_sidecar
+        router_service
             .ports
             .iter()
-            .any(|p| p == "127.0.0.1:18000:22000")
+            .any(|p| p == "127.0.0.1:24000:24000")
     );
-    let labels_json = router_sidecar
+    let labels_json = router_service
         .labels
         .get("amber.exports")
         .expect("router export labels missing");
     let labels_value: serde_json::Value =
         serde_json::from_str(labels_json).expect("labels should be json");
-    assert_eq!(labels_value["public"]["published_port"], 18000);
+    assert_eq!(labels_value["public"]["router_mesh_port"], 24000);
 }
 
 #[test]
@@ -904,17 +1228,20 @@ fn compose_routes_external_slots_through_router() {
         exports: Vec::new(),
     };
 
+    let output = compile_output(scenario);
     let yaml = DockerComposeReporter
-        .emit(&scenario)
+        .emit(&output)
         .expect("compose render ok");
     let compose = parse_compose(&yaml);
 
-    assert!(compose.services.contains_key("amber-router-net"));
+    assert!(compose.services.contains_key("amber-router"));
+    let router_service = service(&compose, "amber-router");
+    assert!(env_value(router_service, "AMBER_EXTERNAL_SLOT_API_URL").is_some());
     assert!(
-        compose
-            .services
-            .values()
-            .any(|svc| env_value(svc, "AMBER_EXTERNAL_SLOT_API_URL").is_some())
+        router_service
+            .extra_hosts
+            .iter()
+            .any(|entry| entry == "host.docker.internal:host-gateway")
     );
     assert!(
         compose
@@ -922,21 +1249,31 @@ fn compose_routes_external_slots_through_router() {
             .values()
             .any(|svc| { env_value(svc, "API_URL").as_deref() == Some("http://127.0.0.1:20000") })
     );
+    let external_meta = compose
+        .x_amber
+        .as_ref()
+        .expect("x-amber should be present")
+        .external_slots
+        .get("api")
+        .expect("external slot metadata missing");
+    assert_eq!(external_meta.kind, "http");
+    assert_eq!(external_meta.url_env, "AMBER_EXTERNAL_SLOT_API_URL");
 
-    let b64 =
-        extract_compose_env_value(&yaml, "AMBER_ROUTER_CONFIG_B64").expect("router config env var");
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(b64.as_bytes())
-        .expect("decode router config");
-    let config: serde_json::Value = serde_json::from_slice(&decoded).expect("parse router config");
-
-    assert_eq!(config["external_slots"][0]["name"], "api");
-    assert_eq!(config["external_slots"][0]["listen_port"], 21000);
-    assert_eq!(
-        config["external_slots"][0]["url_env"],
-        "AMBER_EXTERNAL_SLOT_API_URL"
-    );
-    assert!(config["exports"].as_array().unwrap().is_empty());
+    let plan = provision_plan(&compose);
+    let router_target = target_for_service(&plan, "amber-router");
+    assert!(router_target.config.outbound.is_empty());
+    let inbound = router_target
+        .config
+        .inbound
+        .iter()
+        .find(|route| route.capability == "api")
+        .expect("router external route missing");
+    match &inbound.target {
+        amber_mesh::InboundTarget::External { url_env, .. } => {
+            assert_eq!(url_env, "AMBER_EXTERNAL_SLOT_API_URL");
+        }
+        other => panic!("unexpected router target: {other:?}"),
+    }
 }
 
 #[test]
@@ -1022,11 +1359,12 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
 
     let dir = tempdir().unwrap();
     let project = dir.path();
-    let sidecar_platform = build_sidecar_image();
     let router_platform = build_router_image();
+    let provisioner_platform = build_provisioner_image();
+    let images = internal_images();
     let platform = require_same_platform(&[
-        (SIDECAR_IMAGE, sidecar_platform),
-        (ROUTER_IMAGE, router_platform),
+        (&images.router, router_platform),
+        (&images.provisioner, provisioner_platform),
     ]);
     ensure_image_platform("busybox:1.36.1", &platform);
     ensure_image_platform("alpine:3.20", &platform);
@@ -1090,8 +1428,9 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
         exports: Vec::new(),
     };
 
+    let output = compile_output(scenario);
     let yaml = DockerComposeReporter
-        .emit(&scenario)
+        .emit(&output)
         .expect("compose render ok");
     fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
 
@@ -1119,21 +1458,6 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
 
     let network = format!("{project_name}_amber_mesh");
     let _external_guard = ExternalContainerGuard::new(&external_name, &network);
-
-    let bypass = compose(&[
-        "exec",
-        "-T",
-        "c1-client",
-        "sh",
-        "-lc",
-        &format!(r#"wget -qO- --timeout=2 --tries=1 "http://{external_name}:8080" 2>/dev/null"#),
-    ])
-    .status()
-    .unwrap();
-    assert!(
-        !bypass.success(),
-        "client bypassed router by reaching {external_name} directly"
-    );
 
     let mut ok = false;
     for _ in 0..30 {
@@ -1177,62 +1501,80 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
 
 #[test]
 #[ignore = "requires docker + docker compose; run manually"]
-fn docker_smoke_export_routes_to_host() {
+fn docker_smoke_sidecar_restart_rejoins_mesh() {
     use tempfile::tempdir;
 
     struct ComposeGuard {
         project: PathBuf,
+        envs: Vec<(String, String)>,
     }
 
     impl ComposeGuard {
-        fn new(project: &Path) -> Self {
+        fn new(project: &Path, envs: &[(&str, &str)]) -> Self {
             Self {
                 project: project.to_path_buf(),
+                envs: envs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
             }
         }
     }
 
     impl Drop for ComposeGuard {
         fn drop(&mut self) {
-            let _ = Command::new("docker")
-                .current_dir(&self.project)
-                .arg("compose")
-                .args([
-                    "down",
-                    "-v",
-                    "--remove-orphans",
-                    "--rmi",
-                    "local",
-                    "--timeout",
-                    "1",
-                ])
-                .status();
+            let mut cmd = Command::new("docker");
+            cmd.current_dir(&self.project).arg("compose").args([
+                "down",
+                "-v",
+                "--remove-orphans",
+                "--rmi",
+                "local",
+                "--timeout",
+                "1",
+            ]);
+            for (k, v) in &self.envs {
+                cmd.env(k, v);
+            }
+            let _ = cmd.status();
         }
     }
 
     let dir = tempdir().unwrap();
     let project = dir.path();
-    let sidecar_platform = build_sidecar_image();
     let router_platform = build_router_image();
+    let provisioner_platform = build_provisioner_image();
+    let images = internal_images();
     let platform = require_same_platform(&[
-        (SIDECAR_IMAGE, sidecar_platform),
-        (ROUTER_IMAGE, router_platform),
+        (&images.router, router_platform),
+        (&images.provisioner, provisioner_platform),
     ]);
     ensure_image_platform("busybox:1.36.1", &platform);
+    ensure_image_platform("alpine:3.20", &platform);
 
     let server_program = serde_json::from_value(json!({
         "image": "busybox:1.36.1",
-        "args": ["sh", "-lc", "mkdir -p /www && echo export-ok > /www/index.html && httpd -f -p 8080 -h /www"],
-        "network": { "endpoints": [ { "name": "api", "port": 8080, "protocol": "http" } ] }
+        "args": ["sh", "-lc", "mkdir -p /www && echo rejoin-ok > /www/index.html && httpd -f -p 8080 -h /www"],
+        "network": {
+            "endpoints": [
+                { "name": "api", "port": 8080, "protocol": "http" }
+            ]
+        }
     }))
     .unwrap();
 
-    let provide_http: ProvideDecl = serde_json::from_value(json!({
-        "kind": "http",
-        "endpoint": "api"
+    let client_program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "args": ["sh", "-lc", "sleep infinity"],
+        "env": {
+            "URL": "${slots.api.url}"
+        }
     }))
     .unwrap();
-    let export_capability = provide_http.decl.clone();
+
+    let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
+    let provide_http: ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "api" })).unwrap();
 
     let root = Component {
         id: ComponentId(0),
@@ -1246,7 +1588,7 @@ fn docker_smoke_export_routes_to_host() {
         provides: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
-        children: vec![ComponentId(1)],
+        children: vec![ComponentId(1), ComponentId(2)],
     };
 
     let server = Component {
@@ -1264,79 +1606,139 @@ fn docker_smoke_export_routes_to_host() {
         children: Vec::new(),
     };
 
+    let client = Component {
+        id: ComponentId(2),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/client"),
+        digest: digest(2),
+        config: None,
+        config_schema: None,
+        program: Some(client_program),
+        slots: BTreeMap::from([("api".to_string(), slot_http)]),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
     let scenario = Scenario {
         root: ComponentId(0),
-        components: vec![Some(root), Some(server)],
-        bindings: vec![],
-        exports: vec![ScenarioExport {
-            name: "public".to_string(),
-            capability: export_capability,
-            from: ProvideRef {
+        components: vec![Some(root), Some(server), Some(client)],
+        bindings: vec![BindingEdge {
+            name: None,
+            from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(1),
                 name: "api".to_string(),
+            }),
+            to: SlotRef {
+                component: ComponentId(2),
+                name: "api".to_string(),
             },
+            weak: false,
         }],
+        exports: Vec::new(),
     };
 
+    let output = compile_output(scenario);
     let yaml = DockerComposeReporter
-        .emit(&scenario)
+        .emit(&output)
         .expect("compose render ok");
-    let compose = parse_compose(&yaml);
-
-    let export = compose
-        .x_amber
-        .as_ref()
-        .expect("x-amber should be present")
-        .exports
-        .get("public")
-        .expect("public export should exist");
-    let published_port = export.published_port;
-    let published_host = if export.published_host == "0.0.0.0" {
-        "127.0.0.1".to_string()
-    } else {
-        export.published_host.clone()
-    };
-
     fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
 
-    let _compose_guard = ComposeGuard::new(project);
-    let status = Command::new("docker")
-        .current_dir(project)
-        .arg("compose")
-        .args(["up", "-d"])
-        .status()
-        .unwrap();
+    let project_name = format!("amber-sidecar-restart-{}", std::process::id());
+    let envs = [("COMPOSE_PROJECT_NAME", project_name.as_str())];
+    let _compose_guard = ComposeGuard::new(project, &envs);
+
+    let compose = |args: &[&str]| {
+        let mut cmd = Command::new("docker");
+        cmd.current_dir(project).arg("compose").args(args);
+        for (k, v) in &envs {
+            cmd.env(k, v);
+        }
+        cmd
+    };
+
+    let status = compose(&["up", "-d"]).status().unwrap();
     assert!(status.success(), "docker compose up failed");
 
-    let mut ok = false;
-    for _ in 0..30 {
-        if let Ok(response) = http_get(&published_host, published_port) {
-            if response.contains("export-ok") {
-                ok = true;
-                break;
+    let check = || {
+        for _ in 0..30 {
+            let output = compose(&[
+                "exec",
+                "-T",
+                "c2-client",
+                "sh",
+                "-lc",
+                r#"wget -qO- --timeout=2 --tries=1 "$URL" 2>/dev/null"#,
+            ])
+            .output()
+            .unwrap();
+            if output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("rejoin-ok")
+            {
+                return true;
             }
+            thread::sleep(Duration::from_secs(1));
         }
-        thread::sleep(Duration::from_secs(1));
-    }
+        false
+    };
 
-    if !ok {
-        let compose_logs = Command::new("docker")
-            .current_dir(project)
-            .arg("compose")
-            .args(["logs", "--no-color"])
+    if !check() {
+        let compose_logs = compose(&["logs", "--no-color"])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_else(|err| format!("failed to capture compose logs: {err}"));
         panic!(
-            "export not reachable from host via router \
-             ({published_host}:{published_port})\ncompose logs:\n{}",
+            "client could not reach server before restart\ncompose logs:\n{}",
+            compose_logs
+        );
+    }
+
+    let status = compose(&["restart", "c1-server-net"]).status().unwrap();
+    assert!(status.success(), "docker compose restart failed");
+
+    let wait_running = |service: &str| {
+        for _ in 0..20 {
+            let output = compose(&["ps", "-q", service]).output().unwrap();
+            if !output.status.success() {
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if id.is_empty() {
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            let output = Command::new("docker")
+                .args(["inspect", "-f", "{{.State.Running}}", &id])
+                .output()
+                .unwrap();
+            if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "true" {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        false
+    };
+    assert!(wait_running("c1-server-net"), "sidecar did not start");
+
+    let status = compose(&["restart", "c1-server"]).status().unwrap();
+    assert!(status.success(), "docker compose restart failed");
+
+    if !check() {
+        let compose_logs = compose(&["logs", "--no-color"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_else(|err| format!("failed to capture compose logs: {err}"));
+        panic!(
+            "client could not reach server after restart\ncompose logs:\n{}",
             compose_logs
         );
     }
 }
 
 #[test]
-fn errors_on_shared_port_with_different_endpoints() {
+fn docker_compose_allows_shared_port_with_different_endpoints() {
     let server_program = serde_json::from_value(json!({
         "image": "alpine:3.20",
         "entrypoint": ["server"],
@@ -1446,16 +1848,51 @@ fn errors_on_shared_port_with_different_endpoints() {
         exports: vec![],
     };
 
-    let err = DockerComposeReporter.emit(&scenario).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("docker-compose output cannot enforce separate capabilities"),
-        "unexpected error: {err}"
-    );
-    assert!(
-        err.to_string().contains("route to port 80"),
-        "unexpected error: {err}"
-    );
+    let output = compile_output(scenario);
+    let yaml = DockerComposeReporter
+        .emit(&output)
+        .expect("compose render should succeed");
+    let compose = parse_compose(&yaml);
+    let plan = provision_plan(&compose);
+    let server_target = plan
+        .targets
+        .iter()
+        .find(|target| {
+            let has_v1 = target
+                .config
+                .inbound
+                .iter()
+                .any(|route| route.capability == "v1");
+            let has_admin = target
+                .config
+                .inbound
+                .iter()
+                .any(|route| route.capability == "admin");
+            has_v1 && has_admin
+        })
+        .expect("server mesh config missing");
+    let v1_port = server_target
+        .config
+        .inbound
+        .iter()
+        .find(|route| route.capability == "v1")
+        .and_then(|route| match route.target {
+            InboundTarget::Local { port } => Some(port),
+            _ => None,
+        })
+        .expect("v1 inbound local target");
+    let admin_port = server_target
+        .config
+        .inbound
+        .iter()
+        .find(|route| route.capability == "admin")
+        .and_then(|route| match route.target {
+            InboundTarget::Local { port } => Some(port),
+            _ => None,
+        })
+        .expect("admin inbound local target");
+    assert_eq!(v1_port, 80);
+    assert_eq!(admin_port, 80);
 }
 
 #[test]
@@ -1492,7 +1929,8 @@ fn docker_compose_rejects_framework_bindings() {
         exports: Vec::new(),
     };
 
-    let err = DockerComposeReporter.emit(&scenario).unwrap_err();
+    let output = compile_output(scenario);
+    let err = DockerComposeReporter.emit(&output).unwrap_err();
     let message = err.to_string();
     assert!(
         message.contains("framework.dynamic_children"),
@@ -1544,12 +1982,18 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
     // Build a tiny scenario:
     // - server runs busybox httpd on 8080
     // - allowed client has a binding and uses ${slots.api.url}
-    // - denied client has no binding and tries to call server directly by sidecar DNS name:8080
+    // - denied client has no binding and tries to call server mesh port directly
     //
-    // NOTE: This test builds the sidecar image locally and uses its platform.
+    // NOTE: This test builds the router image locally and uses its platform.
     let dir = tempdir().unwrap();
     let project = dir.path();
-    let platform = build_sidecar_image();
+    let router_platform = build_router_image();
+    let provisioner_platform = build_provisioner_image();
+    let images = internal_images();
+    let platform = require_same_platform(&[
+        (&images.router, router_platform),
+        (&images.provisioner, provisioner_platform),
+    ]);
     ensure_image_platform("busybox:1.36.1", &platform);
     ensure_image_platform("alpine:3.20", &platform);
     let _compose_guard = ComposeGuard::new(project);
@@ -1654,8 +2098,9 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         exports: vec![],
     };
 
+    let output = compile_output(scenario);
     let yaml = DockerComposeReporter
-        .emit(&scenario)
+        .emit(&output)
         .expect("compose render ok");
     fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
 
@@ -1663,18 +2108,6 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         let mut cmd = Command::new("docker");
         cmd.current_dir(project).arg("compose").args(args);
         cmd
-    };
-    let dump = |args: &[&str]| -> String {
-        let output = compose(args).output();
-        match output {
-            Ok(output) => format!(
-                "status: {}\nstdout:\n{}\nstderr:\n{}\n",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ),
-            Err(err) => format!("failed to run {:?}: {err}\n", args),
-        }
     };
 
     // Up
@@ -1688,14 +2121,26 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         "c2-allowed",
         "sh",
         "-lc",
-        r#"i=0; while [ $i -lt 6 ]; do if wget -qO- --timeout=1 --tries=1 "$URL" 2>/dev/null | grep -q hello; then exit 0; fi; i=$((i+1)); sleep 1; done; exit 1"#,
+        r#"i=0; while [ $i -lt 10 ]; do if wget -qO- --timeout=1 --tries=1 "$URL" 2>/dev/null | grep -q hello; then exit 0; fi; i=$((i+1)); sleep 1; done; exit 1"#,
     ])
     .output()
     .unwrap();
     if !ok.status.success() {
+        let dump = |args: &[&str]| -> String {
+            let output = compose(args).output();
+            match output {
+                Ok(output) => format!(
+                    "status: {}\nstdout:\n{}\nstderr:\n{}\n",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+                Err(err) => format!("failed to run {:?}: {err}\n", args),
+            }
+        };
         let debug = format!(
-            "allowed stdout:\n{}\nallowed stderr:\n{}\n\nserver container:\n{}\nserver \
-             sidecar:\n{}\nallowed sidecar:\n{}\ncompose logs:\n{}",
+            "allowed stdout:\n{}\nallowed stderr:\n{}\n\nserver container:\n{}\nallowed \
+             sidecar:\n{}\ncompose logs:\n{}",
             String::from_utf8_lossy(&ok.stdout),
             String::from_utf8_lossy(&ok.stderr),
             dump(&[
@@ -1705,14 +2150,6 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
                 "sh",
                 "-lc",
                 "ps && (netstat -ltn || ss -ltn || true)"
-            ]),
-            dump(&[
-                "exec",
-                "-T",
-                "c1-server-net",
-                "sh",
-                "-lc",
-                "ip -4 addr && iptables -S"
             ]),
             dump(&[
                 "exec",
@@ -1727,131 +2164,14 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         panic!("allowed client could not reach server via binding\n{debug}");
     }
 
-    let external_check_script = r#"retries="${RETRIES:-5}"
-is_private_ip() {
-  ip="$1"
-  case "$ip" in
-    10.*|192.168.*|169.254.*) return 0 ;;
-    172.*)
-      o2="$(printf '%s' "$ip" | cut -d. -f2)"
-      [ "$o2" -ge 16 ] && [ "$o2" -le 31 ] && return 0
-      ;;
-    100.*)
-      o2="$(printf '%s' "$ip" | cut -d. -f2)"
-      [ "$o2" -ge 64 ] && [ "$o2" -le 127 ] && return 0
-      ;;
-  esac
-  return 1
-}
-
-ip=""
-if command -v getent >/dev/null 2>&1; then
-  ip="$(getent hosts example.com | awk 'NR==1 {print $1}')"
-fi
-
-if [ -n "$ip" ] && is_private_ip "$ip"; then
-  echo "example.com resolved to private $ip; checking public IP instead" 1>&2
-  i=0; while [ $i -lt "$retries" ]; do
-    if wget -qO- --timeout=2 --tries=1 "http://1.1.1.1/" >/dev/null 2>&1; then exit 0; fi
-    i=$((i+1)); sleep 1
-  done
-  exit 1
-fi
-
-i=0; while [ $i -lt "$retries" ]; do
-  if wget -qO- --timeout=2 --tries=1 "http://example.com/" >/dev/null 2>&1; then exit 0; fi
-  i=$((i+1)); sleep 1
-done
-echo "example.com fetch failed; checking public IP instead" 1>&2
-i=0; while [ $i -lt "$retries" ]; do
-  if wget -qO- --timeout=2 --tries=1 "http://1.1.1.1/" >/dev/null 2>&1; then exit 0; fi
-  i=$((i+1)); sleep 1
-done
-exit 1
-"#;
-
-    // Allowed should reach the public internet (example.com). If Docker itself can't reach a
-    // public IP, skip the external check to avoid false failures in restricted environments.
-    let docker_public_ok = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "alpine:3.20",
-            "sh",
-            "-lc",
-            r#"wget -qO- --timeout=2 --tries=1 "http://1.1.1.1/" >/dev/null 2>&1"#,
-        ])
-        .status()
-        .ok()
-        .is_some_and(|status| status.success());
-    if docker_public_ok {
-        let fast_external = compose(&[
-            "exec",
-            "-T",
-            "c2-allowed",
-            "sh",
-            "-lc",
-            &format!("RETRIES=1\n{external_check_script}"),
-        ])
-        .output()
-        .unwrap();
-        if !fast_external.status.success() {
-            let iptables_output =
-                dump(&["exec", "-T", "c2-allowed-net", "sh", "-lc", "iptables -S"]);
-            let output_accept = iptables_output.contains("-P OUTPUT ACCEPT");
-            let has_global_reject = iptables_output
-                .lines()
-                .filter(|line| line.starts_with("-A OUTPUT "))
-                .any(|line| {
-                    (line.contains(" -j DROP") || line.contains(" -j REJECT"))
-                        && !line.contains(" -d ")
-                });
-            if output_accept && !has_global_reject {
-                eprintln!(
-                    "skipping external egress assertion: OUTPUT is ACCEPT and no global \
-                     drop/reject rules"
-                );
-            } else {
-                let external = compose(&[
-                    "exec",
-                    "-T",
-                    "c2-allowed",
-                    "sh",
-                    "-lc",
-                    &format!("RETRIES=5\n{external_check_script}"),
-                ])
-                .output()
-                .unwrap();
-                if !external.status.success() {
-                    let debug = format!(
-                        "external stdout:\n{}\nexternal stderr:\n{}\n\nallowed sidecar:\n{}",
-                        String::from_utf8_lossy(&external.stdout),
-                        String::from_utf8_lossy(&external.stderr),
-                        dump(&[
-                            "exec",
-                            "-T",
-                            "c2-allowed-net",
-                            "sh",
-                            "-lc",
-                            "ip -4 addr && iptables -S && cat /etc/resolv.conf"
-                        ])
-                    );
-                    panic!("allowed client could not reach example.com\n{debug}");
-                }
-            }
-        }
-    } else {
-        eprintln!("skipping external egress check: docker cannot reach public IP");
-    }
-
-    // Denied should fail when calling server sidecar DNS name directly.
+    // Denied should fail when calling server mesh port directly.
     let denied = compose(&[
         "exec",
         "-T",
         "c3-denied",
         "sh",
         "-lc",
-        &format!(r#"wget -qO- --timeout=2 --tries=1 "http://{server_host}:8080/" 2>/dev/null"#),
+        &format!(r#"wget -qO- --timeout=2 --tries=1 "http://{server_host}:23000/" 2>/dev/null"#),
     ])
     .status()
     .unwrap();
@@ -1871,11 +2191,14 @@ fn docker_smoke_config_forwarding_runtime_validation() {
 
     let dir = tempdir().unwrap();
     let project = dir.path();
-    let sidecar_platform = build_sidecar_image();
+    let router_platform = build_router_image();
     let helper_platform = build_helper_image();
+    let provisioner_platform = build_provisioner_image();
+    let images = internal_images();
     let platform = require_same_platform(&[
-        (SIDECAR_IMAGE, sidecar_platform),
-        (HELPER_IMAGE, helper_platform),
+        (&images.router, router_platform),
+        (&images.helper, helper_platform),
+        (&images.provisioner, provisioner_platform),
     ]);
     ensure_image_platform("busybox:1.36.1", &platform);
 
@@ -2001,7 +2324,7 @@ fn docker_smoke_config_forwarding_runtime_validation() {
         .expect("compile ok");
 
     let yaml = DockerComposeReporter
-        .emit(&output.scenario)
+        .emit(&output)
         .expect("compose render ok");
     fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
 

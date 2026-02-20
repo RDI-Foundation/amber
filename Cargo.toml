@@ -6,8 +6,10 @@ members = [
   "helper",
   "images",
   "json5",
+  "mesh",
   "manifest",
   "node",
+  "provisioner",
   "resolver",
   "router",
   "scenario",
@@ -21,7 +23,9 @@ amber-config = { path = "config" }
 amber-images = { path = "images" }
 amber-json5 = { path = "json5" }
 amber-manifest = { path = "manifest" }
+amber-mesh = { path = "mesh" }
 amber-resolver = { path = "resolver" }
+amber-router = { path = "router" }
 amber-scenario = { path = "scenario" }
 amber-template = { path = "template" }
 base64 = "0.22.1"
@@ -35,6 +39,7 @@ tempfile = "3.24.0"
 thiserror = "2.0.9"
 tokio = "1.48.0"
 url = "2.5.7"
+reqwest = { version = "0.13.1", default-features = false, features = ["json", "rustls", "stream"] }
 
 [profile.release]
 lto = "thin"

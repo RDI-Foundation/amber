@@ -39,6 +39,118 @@ impl Namespace {
     }
 }
 
+// ---- ServiceAccount ----
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceAccount {
+    pub api_version: &'static str,
+    pub kind: &'static str,
+    pub metadata: ObjectMeta,
+}
+
+impl ServiceAccount {
+    pub fn new(name: impl Into<String>, namespace: impl Into<String>) -> Self {
+        Self {
+            api_version: "v1",
+            kind: "ServiceAccount",
+            metadata: ObjectMeta {
+                name: name.into(),
+                namespace: Some(namespace.into()),
+                ..Default::default()
+            },
+        }
+    }
+}
+
+// ---- Role / RoleBinding ----
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Role {
+    pub api_version: &'static str,
+    pub kind: &'static str,
+    pub metadata: ObjectMeta,
+    pub rules: Vec<PolicyRule>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyRule {
+    pub api_groups: Vec<String>,
+    pub resources: Vec<String>,
+    pub verbs: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_names: Option<Vec<String>>,
+}
+
+impl Role {
+    pub fn new(
+        name: impl Into<String>,
+        namespace: impl Into<String>,
+        rules: Vec<PolicyRule>,
+    ) -> Self {
+        Self {
+            api_version: "rbac.authorization.k8s.io/v1",
+            kind: "Role",
+            metadata: ObjectMeta {
+                name: name.into(),
+                namespace: Some(namespace.into()),
+                ..Default::default()
+            },
+            rules,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleBinding {
+    pub api_version: &'static str,
+    pub kind: &'static str,
+    pub metadata: ObjectMeta,
+    pub subjects: Vec<Subject>,
+    pub role_ref: RoleRef,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Subject {
+    pub kind: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleRef {
+    pub api_group: String,
+    pub kind: String,
+    pub name: String,
+}
+
+impl RoleBinding {
+    pub fn new(
+        name: impl Into<String>,
+        namespace: impl Into<String>,
+        subject: Subject,
+        role_ref: RoleRef,
+    ) -> Self {
+        Self {
+            api_version: "rbac.authorization.k8s.io/v1",
+            kind: "RoleBinding",
+            metadata: ObjectMeta {
+                name: name.into(),
+                namespace: Some(namespace.into()),
+                ..Default::default()
+            },
+            subjects: vec![subject],
+            role_ref,
+        }
+    }
+}
+
 // ---- ConfigMap ----
 
 #[derive(Clone, Debug, Serialize)]
@@ -203,6 +315,10 @@ pub struct PodSpec {
     pub containers: Vec<Container>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<Volume>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_account_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub automount_service_account_token: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restart_policy: Option<&'static str>,
 }
@@ -544,7 +660,7 @@ impl NetworkPolicy {
     }
 }
 
-// ---- Job (for NetworkPolicy enforcement check) ----
+// ---- Job ----
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -570,6 +686,16 @@ impl Job {
         labels: BTreeMap<String, String>,
         template: PodTemplateSpec,
     ) -> Self {
+        Self::new_with_backoff_limit(name, namespace, labels, template, Some(0))
+    }
+
+    pub fn new_with_backoff_limit(
+        name: impl Into<String>,
+        namespace: impl Into<String>,
+        labels: BTreeMap<String, String>,
+        template: PodTemplateSpec,
+        backoff_limit: Option<u32>,
+    ) -> Self {
         Self {
             api_version: "batch/v1",
             kind: "Job",
@@ -580,7 +706,7 @@ impl Job {
                 ..Default::default()
             },
             spec: JobSpec {
-                backoff_limit: Some(0),
+                backoff_limit,
                 template,
             },
         }
