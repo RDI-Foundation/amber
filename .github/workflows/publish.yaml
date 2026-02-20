@@ -272,16 +272,18 @@ jobs:
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: linux-amd64
             runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
           - platform: linux-arm64
             runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
           - platform: macos-arm64
             runner: macos-14
             target: aarch64-apple-darwin
@@ -291,6 +293,11 @@ jobs:
         with:
           toolchain: nightly-2025-10-30
       - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'linux-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}
       - name: Build amber-cli
