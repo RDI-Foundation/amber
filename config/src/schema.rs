@@ -754,3 +754,131 @@ pub fn canonical_json(v: &Value) -> Value {
         other => other.clone(),
     }
 }
+
+// Produce a minimized schema that only includes explicitly allowed leaf paths.
+// This is used to avoid exposing unrelated config/schema data to untrusted runtimes.
+pub fn prune_schema(schema: &Value, allowed_leaf_paths: &BTreeSet<String>) -> Result<Value> {
+    let mut visited = BTreeSet::new();
+    prune_schema_inner(schema, schema, allowed_leaf_paths, "", &mut visited)
+}
+
+fn prune_schema_inner(
+    schema: &Value,
+    root: &Value,
+    allowed_leaf_paths: &BTreeSet<String>,
+    prefix: &str,
+    visited: &mut BTreeSet<String>,
+) -> Result<Value> {
+    let Value::Object(map) = schema else {
+        return Ok(schema.clone());
+    };
+
+    if let Some(reference) = map.get("$ref").and_then(|v| v.as_str()) {
+        if map.len() == 1 {
+            let (resolved, pointer) = resolve_local_ref(root, reference)?;
+            if !visited.insert(pointer.clone()) {
+                return Err(ConfigError::schema(
+                    "config_schema contains a cyclic $ref".to_string(),
+                ));
+            }
+            let out = prune_schema_inner(resolved, root, allowed_leaf_paths, prefix, visited)?;
+            visited.remove(&pointer);
+            return Ok(out);
+        }
+
+        let mut rest = map.clone();
+        rest.remove("$ref");
+        let mut ref_map = Map::new();
+        ref_map.insert("$ref".to_string(), Value::String(reference.to_string()));
+        let all_of = Value::Array(vec![Value::Object(ref_map), Value::Object(rest)]);
+        let mut merged = Map::new();
+        merged.insert("allOf".to_string(), all_of);
+        let merged = Value::Object(merged);
+        return prune_schema_inner(&merged, root, allowed_leaf_paths, prefix, visited);
+    }
+
+    let mut out = Map::new();
+    let mut kept_keys = BTreeSet::new();
+
+    if let Some(props) = schema_properties(schema) {
+        let mut keys: Vec<&String> = props.keys().collect();
+        keys.sort();
+
+        let mut pruned_props = Map::new();
+        for key in keys {
+            let child_path = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            if !path_allowed(&child_path, allowed_leaf_paths) {
+                continue;
+            }
+            let child_schema = props.get(key.as_str()).expect("key exists");
+            let pruned =
+                prune_schema_inner(child_schema, root, allowed_leaf_paths, &child_path, visited)?;
+            pruned_props.insert(key.clone(), pruned);
+            kept_keys.insert(key.clone());
+        }
+
+        if !pruned_props.is_empty() {
+            out.insert("properties".to_string(), Value::Object(pruned_props));
+        }
+    }
+
+    if let Some(required) = map.get("required").and_then(|v| v.as_array()) {
+        let mut filtered = Vec::new();
+        for item in required {
+            let Some(name) = item.as_str() else {
+                continue;
+            };
+            if kept_keys.contains(name) {
+                filtered.push(Value::String(name.to_string()));
+            }
+        }
+        if !filtered.is_empty() {
+            out.insert("required".to_string(), Value::Array(filtered));
+        }
+    }
+
+    if let Some(all_of) = map.get("allOf").and_then(|v| v.as_array()) {
+        let mut pruned_all_of = Vec::new();
+        for subschema in all_of {
+            let pruned = prune_schema_inner(subschema, root, allowed_leaf_paths, prefix, visited)?;
+            if !is_empty_schema(&pruned) {
+                pruned_all_of.push(pruned);
+            }
+        }
+        if !pruned_all_of.is_empty() {
+            out.insert("allOf".to_string(), Value::Array(pruned_all_of));
+        }
+    }
+
+    for (key, value) in map {
+        if matches!(
+            key.as_str(),
+            "$ref" | "properties" | "required" | "allOf" | "definitions" | "$defs"
+        ) {
+            continue;
+        }
+        out.insert(key.clone(), value.clone());
+    }
+
+    Ok(Value::Object(out))
+}
+
+fn path_allowed(path: &str, allowed_leaf_paths: &BTreeSet<String>) -> bool {
+    for allowed in allowed_leaf_paths {
+        if allowed == path {
+            return true;
+        }
+        if allowed.starts_with(path) && allowed.as_bytes().get(path.len()) == Some(&b'.') {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_empty_schema(value: &Value) -> bool {
+    matches!(value, Value::Object(map) if map.is_empty())
+}

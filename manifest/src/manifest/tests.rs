@@ -918,6 +918,117 @@ fn endpoint_validation_passes_for_defined_reference() {
 }
 
 #[test]
+fn mounts_parse_config_and_secret_sources() {
+    let m: Manifest = r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              app: { type: "string" },
+              token: { type: "string", secret: true },
+            },
+            required: ["app", "token"],
+          },
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [
+              { path: "/run/app.txt", from: "config.app" },
+              { path: "/run/token.txt", from: "secret.token" },
+            ]
+          }
+        }
+        "#
+    .parse()
+    .unwrap();
+
+    let program = m.program.as_ref().expect("program");
+    assert_eq!(program.mounts.len(), 2);
+}
+
+#[test]
+fn config_mount_rejects_secret_path() {
+    let err = r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              token: { type: "string", secret: true },
+            },
+          },
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [
+              { path: "/run/token.txt", from: "config.token" },
+            ]
+          }
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    assert!(err.to_string().contains("config mount path"));
+    assert!(err.to_string().contains("secret config"));
+}
+
+#[test]
+fn secret_mount_requires_secret_path() {
+    let err = r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              token: { type: "string" },
+            },
+          },
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [
+              { path: "/run/token.txt", from: "secret.token" },
+            ]
+          }
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    assert!(err.to_string().contains("secret mount path"));
+    assert!(err.to_string().contains("not secret"));
+}
+
+#[test]
+fn duplicate_mount_paths_error() {
+    let err = r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              app: { type: "string" },
+            },
+          },
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [
+              { path: "/run/app.txt", from: "config.app" },
+              { path: "/run/app.txt", from: "config.app" },
+            ]
+          }
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    assert!(err.to_string().contains("duplicate mount path"));
+}
+
+#[test]
 fn duplicate_keys_in_components_map_errors() {
     let res: Result<Manifest, _> = r##"
         {

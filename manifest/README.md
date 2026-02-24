@@ -187,6 +187,13 @@ program: {
     API_URL: "${slots.backend.url}",
   },
 
+  // mounts: optional; default [].
+  // Mount config/secret values as files inside the container.
+  mounts: [
+    { path: "/run/config.json", from: "config.app" },
+    { path: "/run/secret.txt", from: "secret.api.token" },
+  ],
+
   // network: optional
   network: {
     // endpoints: optional; default []
@@ -200,6 +207,37 @@ program: {
   },
 }
 ```
+
+### `program.mounts`
+
+`mounts` mounts config/secret values as files inside the container. Each entry has:
+
+* `path` (required): absolute path inside the container.
+* `from` (required): source value.
+* `name` (optional): identifier for diagnostics.
+
+Supported `from` sources (current):
+
+* `config` or `config.<path>`: mount the component config (whole object or a path).
+* `secret.<path>`: mount a config value marked `secret: true` in the component’s config schema.
+
+Reserved (not implemented yet):
+
+* `slots.<name>`
+* `bindings.<name>`
+* `framework.<capability>`
+
+Mount value formatting:
+
+* leaf values (string/number/bool) -> text
+* objects/arrays -> JSON
+* null -> empty string
+
+Notes:
+
+* Mount paths must be absolute and must not include `..`.
+* `secret.<path>` requires the path to be secret in the component’s config schema.
+* `config.<path>` must not reference secret values.
 
 ### Interpolation in `image`, `args`, and `env`
 

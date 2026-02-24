@@ -596,6 +596,7 @@ mod tests {
                         "image": "example/child",
                         "args": [],
                         "env": {},
+                        "mounts": [],
                         "network": {
                             "endpoints": [
                                 {

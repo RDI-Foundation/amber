@@ -39,6 +39,10 @@ pub enum Error {
     #[diagnostic(code(manifest::invalid_binding))]
     InvalidBinding { input: String, message: String },
 
+    #[error("invalid mount source `{mount}`: {message}")]
+    #[diagnostic(code(manifest::invalid_mount_source))]
+    InvalidMountSource { mount: String, message: String },
+
     #[error("binding mixes dot form with `slot`/`capability`")]
     #[diagnostic(
         code(manifest::mixed_binding_form),
@@ -118,6 +122,38 @@ pub enum Error {
     #[error("provide `{name}` must declare an endpoint")]
     #[diagnostic(code(manifest::missing_provide_endpoint))]
     MissingProvideEndpoint { name: String },
+
+    #[error("duplicate mount name `{name}`")]
+    #[diagnostic(code(manifest::duplicate_mount_name))]
+    DuplicateMountName { name: String },
+
+    #[error("duplicate mount path `{path}`")]
+    #[diagnostic(code(manifest::duplicate_mount_path))]
+    DuplicateMountPath { path: String },
+
+    #[error("invalid mount path `{path}`: {message}")]
+    #[diagnostic(code(manifest::invalid_mount_path))]
+    InvalidMountPath { path: String, message: String },
+
+    #[error("invalid config mount path `{path}`: {message}")]
+    #[diagnostic(code(manifest::invalid_mount_config_path))]
+    InvalidMountConfigPath { path: String, message: String },
+
+    #[error("invalid secret mount path `{path}`: {message}")]
+    #[diagnostic(code(manifest::invalid_mount_secret_path))]
+    InvalidMountSecretPath { path: String, message: String },
+
+    #[error("config mount path `{path}` refers to secret config")]
+    #[diagnostic(code(manifest::mount_config_path_is_secret))]
+    MountConfigPathIsSecret { path: String },
+
+    #[error("secret mount path `{path}` is not secret")]
+    #[diagnostic(code(manifest::mount_secret_path_is_not_secret))]
+    MountSecretPathIsNotSecret { path: String },
+
+    #[error("mount source `{mount}` is reserved (not implemented)")]
+    #[diagnostic(code(manifest::unsupported_mount_source))]
+    UnsupportedMountSource { mount: String },
 
     #[error("invalid config definition: {0}")]
     #[diagnostic(code(manifest::invalid_config_schema))]

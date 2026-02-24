@@ -21,6 +21,18 @@ pub fn stringify_for_interpolation(v: &Value) -> Result<String> {
     }
 }
 
+pub fn stringify_for_mount(v: &Value) -> Result<String> {
+    match v {
+        Value::Null => Ok(String::new()),
+        Value::String(s) => Ok(s.clone()),
+        Value::Bool(b) => Ok(b.to_string()),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::Array(_) | Value::Object(_) => serde_json::to_string(v).map_err(|e| {
+            ConfigError::interp(format!("failed to serialize value as JSON for mount: {e}"))
+        }),
+    }
+}
+
 pub fn get_by_path<'a>(root: &'a Value, path: &str) -> Result<&'a Value> {
     if path.is_empty() {
         return Ok(root);

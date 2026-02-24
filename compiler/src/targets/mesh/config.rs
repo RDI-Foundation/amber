@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use amber_config as rc;
-use amber_manifest::{InterpolatedPart, InterpolationSource};
+use amber_manifest::{InterpolatedPart, InterpolationSource, MountSource};
 use amber_scenario::{ComponentId, Scenario};
 use amber_template::{ProgramTemplateSpec, TemplatePart, TemplateSpec, TemplateString};
 use base64::Engine as _;
+use serde::Serialize;
 use serde_json::Value;
 
 use super::plan::{MeshError, component_label};
@@ -19,8 +20,10 @@ pub(crate) struct ConfigPlan {
     pub(crate) root_schema: Option<Value>,
     pub(crate) root_leaves: Vec<rc::SchemaLeaf>,
     pub(crate) program_plans: HashMap<ComponentId, ProgramPlan>,
-    pub(crate) uses_helper: bool,
-    pub(crate) uses_runtime_image: bool,
+    pub(crate) mount_specs: HashMap<ComponentId, Vec<MountSpec>>,
+    pub(crate) component_templates: HashMap<ComponentId, rc::RootConfigTemplate>,
+    pub(crate) needs_helper: bool,
+    pub(crate) needs_runtime_config: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,6 +97,19 @@ pub(crate) struct HelperPayload {
     pub(crate) component_schema_b64: String,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ComponentConfigPayload {
+    pub(crate) component_cfg_template_b64: String,
+    pub(crate) component_schema_b64: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum MountSpec {
+    Literal { path: String, content: String },
+    Config { path: String, config: String },
+}
+
 pub(crate) fn build_config_plan(
     scenario: &Scenario,
     program_components: &[ComponentId],
@@ -132,12 +148,8 @@ pub(crate) fn build_config_plan(
         root_leaves.iter().map(|leaf| leaf.path.as_str()).collect();
 
     let mut program_plans = HashMap::new();
-    // `uses_helper` means at least one component needs helper-backed runtime
-    // interpolation in program.entrypoint/program.env.
-    let mut uses_helper = false;
-    // `uses_runtime_image` means at least one component has runtime-derived
-    // program.image interpolation. This is tracked separately from helper mode.
-    let mut uses_runtime_image = false;
+    let mut needs_helper = false;
+    let mut needs_runtime_config = false;
 
     for id in program_components {
         let c = scenario.component(*id);
@@ -177,12 +189,13 @@ pub(crate) fn build_config_plan(
             component_template,
         )?;
         if matches!(plan, ProgramPlan::Helper { .. }) {
-            uses_helper = true;
+            needs_helper = true;
+            needs_runtime_config = true;
         }
         let mut runtime_paths = BTreeSet::new();
         plan.image().collect_runtime_root_paths(&mut runtime_paths);
         if !runtime_paths.is_empty() {
-            uses_runtime_image = true;
+            needs_runtime_config = true;
         }
         for path in runtime_paths {
             if !root_leaf_paths.contains(path.as_str()) {
@@ -197,7 +210,29 @@ pub(crate) fn build_config_plan(
         program_plans.insert(*id, plan);
     }
 
-    if (uses_helper || uses_runtime_image) && root_schema.is_none() {
+    let mount_specs = build_mount_specs(scenario, program_components, &resolved_templates)?;
+    let mounts_need_runtime = mount_specs.values().any(|specs| {
+        specs
+            .iter()
+            .any(|spec| matches!(spec, MountSpec::Config { .. }))
+    });
+    needs_runtime_config = needs_runtime_config || mounts_need_runtime;
+    if !mount_specs.is_empty() {
+        needs_helper = true;
+    }
+
+    let mut component_templates = HashMap::new();
+    for id in program_components {
+        let template = resolved_templates.get(id).ok_or_else(|| {
+            MeshError::new(format!(
+                "no config template for component {}",
+                component_label(scenario, *id)
+            ))
+        })?;
+        component_templates.insert(*id, template.clone());
+    }
+
+    if needs_runtime_config && root_schema.is_none() {
         return Err(MeshError::new(
             "root component must declare `config_schema` when runtime config interpolation is \
              required",
@@ -208,8 +243,10 @@ pub(crate) fn build_config_plan(
         root_schema,
         root_leaves,
         program_plans,
-        uses_helper,
-        uses_runtime_image,
+        mount_specs,
+        component_templates,
+        needs_helper,
+        needs_runtime_config,
     })
 }
 
@@ -228,6 +265,23 @@ pub(crate) fn encode_helper_payload(
     })?;
     let spec_b64 = b64.encode(spec_json);
 
+    let component_payload =
+        encode_component_payload(component_label, component_template, component_schema)?;
+
+    Ok(HelperPayload {
+        template_spec_b64: spec_b64,
+        component_cfg_template_b64: component_payload.component_cfg_template_b64,
+        component_schema_b64: component_payload.component_schema_b64,
+    })
+}
+
+pub(crate) fn encode_component_payload(
+    component_label: &str,
+    component_template: &rc::RootConfigTemplate,
+    component_schema: &Value,
+) -> Result<ComponentConfigPayload, MeshError> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+
     let template_json = serde_json::to_vec(&component_template.to_json_ir()).map_err(|e| {
         MeshError::new(format!(
             "failed to serialize component config template for {component_label}: {e}"
@@ -242,8 +296,7 @@ pub(crate) fn encode_helper_payload(
     })?;
     let schema_b64 = b64.encode(schema_json);
 
-    Ok(HelperPayload {
-        template_spec_b64: spec_b64,
+    Ok(ComponentConfigPayload {
         component_cfg_template_b64: template_b64,
         component_schema_b64: schema_b64,
     })
@@ -254,6 +307,179 @@ pub(crate) fn encode_schema_b64(label: &str, schema: &Value) -> Result<String, M
     let schema_json = serde_json::to_vec(&rc::canonical_json(schema))
         .map_err(|e| MeshError::new(format!("failed to serialize {label}: {e}")))?;
     Ok(b64.encode(schema_json))
+}
+
+pub(crate) fn collect_config_refs(template: &rc::RootConfigTemplate) -> Option<BTreeSet<String>> {
+    fn collect_from_node(node: &rc::ConfigNode, acc: &mut BTreeSet<String>) {
+        match node {
+            rc::ConfigNode::ConfigRef(path) => {
+                acc.insert(path.clone());
+            }
+            rc::ConfigNode::StringTemplate(parts) => {
+                for part in parts {
+                    if let TemplatePart::Config { config } = part {
+                        acc.insert(config.clone());
+                    }
+                }
+            }
+            rc::ConfigNode::Array(items) => {
+                for item in items {
+                    collect_from_node(item, acc);
+                }
+            }
+            rc::ConfigNode::Object(map) => {
+                for value in map.values() {
+                    collect_from_node(value, acc);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    match template {
+        rc::RootConfigTemplate::Root => None,
+        rc::RootConfigTemplate::Node(node) => {
+            let mut paths = BTreeSet::new();
+            collect_from_node(node, &mut paths);
+            Some(paths)
+        }
+    }
+}
+
+pub(crate) fn allowed_root_leaf_paths(
+    root_leaves: &[rc::SchemaLeaf],
+    component_template: &rc::RootConfigTemplate,
+) -> BTreeSet<String> {
+    if matches!(component_template, rc::RootConfigTemplate::Root) {
+        return root_leaves.iter().map(|leaf| leaf.path.clone()).collect();
+    }
+
+    let Some(paths) = collect_config_refs(component_template) else {
+        return BTreeSet::new();
+    };
+
+    let mut allowed = BTreeSet::new();
+    for path in paths {
+        if path.is_empty() {
+            return root_leaves.iter().map(|leaf| leaf.path.clone()).collect();
+        }
+        for leaf in root_leaves {
+            if leaf.path == path {
+                allowed.insert(leaf.path.clone());
+                continue;
+            }
+            if leaf.path.starts_with(&path) && leaf.path.as_bytes().get(path.len()) == Some(&b'.') {
+                allowed.insert(leaf.path.clone());
+            }
+        }
+    }
+
+    allowed
+}
+
+pub(crate) fn prune_root_schema(
+    component_label: &str,
+    root_schema: &Value,
+    allowed_leaf_paths: &BTreeSet<String>,
+) -> Result<Value, MeshError> {
+    rc::prune_schema(root_schema, allowed_leaf_paths).map_err(|err| {
+        MeshError::new(format!(
+            "failed to prune root config schema for {component_label}: {err}"
+        ))
+    })
+}
+
+pub(crate) fn encode_mount_spec_b64(label: &str, specs: &[MountSpec]) -> Result<String, MeshError> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let spec_json =
+        serde_json::to_vec(specs).map_err(|e| MeshError::new(format!("{label}: {e}")))?;
+    Ok(b64.encode(spec_json))
+}
+
+pub(crate) fn encode_direct_entrypoint_b64(entrypoint: &[String]) -> Result<String, MeshError> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let payload = serde_json::to_vec(entrypoint).map_err(|e| MeshError::new(format!("{e}")))?;
+    Ok(b64.encode(payload))
+}
+
+pub(crate) fn encode_direct_env_b64(env: &BTreeMap<String, String>) -> Result<String, MeshError> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let payload = serde_json::to_vec(env).map_err(|e| MeshError::new(format!("{e}")))?;
+    Ok(b64.encode(payload))
+}
+
+pub(crate) fn mount_specs_need_config(specs: &[MountSpec]) -> bool {
+    specs
+        .iter()
+        .any(|spec| matches!(spec, MountSpec::Config { .. }))
+}
+
+fn build_mount_specs(
+    scenario: &Scenario,
+    program_components: &[ComponentId],
+    resolved_templates: &HashMap<ComponentId, rc::RootConfigTemplate>,
+) -> Result<HashMap<ComponentId, Vec<MountSpec>>, MeshError> {
+    let mut out = HashMap::new();
+
+    for id in program_components {
+        let component = scenario.component(*id);
+        let program = component
+            .program
+            .as_ref()
+            .expect("program component has program");
+        if program.mounts.is_empty() {
+            continue;
+        }
+
+        if component.config_schema.is_none() {
+            return Err(MeshError::new(format!(
+                "component {} requires config_schema when using program.mounts",
+                component_label(scenario, *id)
+            )));
+        }
+
+        let template = resolved_templates.get(id).ok_or_else(|| {
+            MeshError::new(format!(
+                "no config template for component {}",
+                component_label(scenario, *id)
+            ))
+        })?;
+        let template_opt = template.node();
+
+        let mut specs = Vec::new();
+        for mount in &program.mounts {
+            let query = match &mount.source {
+                MountSource::Config(path) | MountSource::Secret(path) => path,
+                other => {
+                    return Err(MeshError::new(format!(
+                        "reserved mount source {other} in {}",
+                        component_label(scenario, *id)
+                    )));
+                }
+            };
+
+            match resolve_config_query_for_mount(template_opt, query)? {
+                MountResolution::Static(value) => {
+                    let content = rc::stringify_for_mount(&value)
+                        .map_err(|e| MeshError::new(e.to_string()))?;
+                    specs.push(MountSpec::Literal {
+                        path: mount.path.clone(),
+                        content,
+                    });
+                }
+                MountResolution::Runtime => {
+                    specs.push(MountSpec::Config {
+                        path: mount.path.clone(),
+                        config: query.clone(),
+                    });
+                }
+            }
+        }
+
+        out.insert(*id, specs);
+    }
+
+    Ok(out)
 }
 
 fn binding_urls_by_scope(
@@ -378,6 +604,12 @@ enum ConfigResolution {
 enum ImageConfigResolution {
     Static(String),
     RuntimeTemplate(Vec<ProgramImagePart>),
+}
+
+#[derive(Debug)]
+enum MountResolution {
+    Static(Value),
+    Runtime,
 }
 
 fn resolve_config_query_for_program(
@@ -569,6 +801,60 @@ fn resolve_config_query_for_program_image(
         ))
     } else {
         resolve_program_image_runtime_node(cur)
+    }
+}
+
+fn resolve_config_query_for_mount(
+    template: Option<&rc::ConfigNode>,
+    query: &str,
+) -> Result<MountResolution, MeshError> {
+    let Some(template) = template else {
+        return Ok(MountResolution::Runtime);
+    };
+
+    if query.is_empty() {
+        return if !template.contains_runtime() {
+            let v = template
+                .evaluate_static()
+                .map_err(|e| MeshError::new(e.to_string()))?;
+            Ok(MountResolution::Static(v))
+        } else {
+            Ok(MountResolution::Runtime)
+        };
+    }
+
+    let mut cur = template;
+    for seg in query.split('.') {
+        if seg.is_empty() {
+            return Err(MeshError::new(format!(
+                "invalid config path {query:?}: empty segment"
+            )));
+        }
+        match cur {
+            rc::ConfigNode::Object(map) => {
+                let Some(next) = map.get(seg) else {
+                    return Err(MeshError::new(format!(
+                        "config.{query} not found (missing key {seg:?})"
+                    )));
+                };
+                cur = next;
+            }
+            rc::ConfigNode::ConfigRef(_) => return Ok(MountResolution::Runtime),
+            _ => {
+                return Err(MeshError::new(format!(
+                    "config.{query} not found (encountered non-object before segment {seg:?})"
+                )));
+            }
+        }
+    }
+
+    if !cur.contains_runtime() {
+        let v = cur
+            .evaluate_static()
+            .map_err(|e| MeshError::new(e.to_string()))?;
+        Ok(MountResolution::Static(v))
+    } else {
+        Ok(MountResolution::Runtime)
     }
 }
 

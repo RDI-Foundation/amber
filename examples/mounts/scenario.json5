@@ -1,0 +1,43 @@
+{
+  manifest_version: "0.1.0",
+
+  config_schema: {
+    type: "object",
+    properties: {
+      app: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          log_level: { type: "string" }
+        },
+        required: ["name", "log_level"]
+      },
+      token: { type: "string", secret: true }
+    },
+    required: ["app", "token"],
+    additionalProperties: false
+  },
+
+  program: {
+    image: "busybox:1.36",
+    args: [
+      "sh",
+      "-c",
+      "echo \"app.json:\"; cat /run/app.json; echo \"log_level:\"; cat /run/log_level.txt; echo \"token:\"; cat /run/token.txt; sleep infinity",
+    ],
+    network: {
+      endpoints: [
+        { name: "api", port: 8080 },
+      ],
+    },
+    mounts: [
+      { path: "/run/app.json", from: "config.app" },
+      { path: "/run/log_level.txt", from: "config.app.log_level" },
+      { path: "/run/token.txt", from: "secret.token" },
+    ],
+  },
+  provides: {
+    api: { kind: "http", endpoint: "api" },
+  },
+  exports: { api: "api" },
+}
