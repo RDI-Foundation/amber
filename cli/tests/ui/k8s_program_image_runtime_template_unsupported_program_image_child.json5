@@ -1,0 +1,22 @@
+{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: { tag: { type: "string" } },
+    required: ["tag"],
+    additionalProperties: false,
+  },
+  program: {
+    image: "busybox:${config.tag}",
+    entrypoint: ["child"],
+    network: {
+      endpoints: [{ name: "http", port: 8080 }],
+    },
+  },
+  provides: {
+    child: { kind: "http", endpoint: "http" },
+  },
+  exports: {
+    child: "child",
+  },
+}

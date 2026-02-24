@@ -1,0 +1,10 @@
+Error:   × program.image in /child resolves to a mixed runtime image template, but
+  │ kubernetes output only supports runtime images that resolve to exactly one
+  │ concrete config value (for example `${config.image}`).
+    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/k8s_program_image_runtime_template_unsupported.json5:12:24]
+ 11 │       manifest: "./k8s_program_image_runtime_template_unsupported_child.json5",
+ 12 │       config: { image: "busybox:${config.tag}" },
+    ·                        ───────────┬───────────
+    ·                                   ╰── component config image interpolation here
+ 13 │     },
+    ╰────

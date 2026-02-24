@@ -33,6 +33,7 @@ use crate::{
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Program {
+    #[serde(deserialize_with = "deserialize_program_image")]
     pub image: String,
     #[serde(default, alias = "entrypoint")]
     #[builder(default)]
@@ -43,6 +44,17 @@ pub struct Program {
     pub env: BTreeMap<String, InterpolatedString>,
     #[serde(default)]
     pub network: Option<Network>,
+}
+
+fn deserialize_program_image<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let image = String::deserialize(deserializer)?;
+    image
+        .parse::<InterpolatedString>()
+        .map_err(serde::de::Error::custom)?;
+    Ok(image)
 }
 
 #[derive(

@@ -951,54 +951,62 @@ fn validate_config_tree(
         let component_path = component_path_for(components, id);
         let site = ConfigErrorSite::new(components, provenance, store, id).config_site();
 
+        let mut validate_config_ref = |location: String, query: &str| {
+            let interp_suffix = if query.is_empty() {
+                "".to_string()
+            } else {
+                format!(".{query}")
+            };
+            let Some(schema) = schema else {
+                errors.push(Error::InvalidConfig {
+                    component_path: component_path.clone(),
+                    message: format!(
+                        "{location} references ${{config{interp_suffix}}}, but this component \
+                         does not declare `config_schema`"
+                    ),
+                    src: site.src.clone(),
+                    span: site.span,
+                    label: "config definition required".to_string(),
+                    related: Vec::new(),
+                });
+                return;
+            };
+            match rc::schema_lookup(schema, query) {
+                Ok(rc::SchemaLookup::Found) | Ok(rc::SchemaLookup::Unknown) => {}
+                Err(e) => {
+                    errors.push(Error::InvalidConfig {
+                        component_path: component_path.clone(),
+                        message: format!(
+                            "invalid ${{config{interp_suffix}}} reference in {location}: {e}"
+                        ),
+                        src: site.src.clone(),
+                        span: site.span,
+                        label: "invalid config reference".to_string(),
+                        related: Vec::new(),
+                    });
+                }
+            }
+        };
+
+        if let Ok(image) = program.image.parse::<InterpolatedString>() {
+            for part in &image.parts {
+                let InterpolatedPart::Interpolation { source, query } = part else {
+                    continue;
+                };
+                if *source == InterpolationSource::Config {
+                    validate_config_ref("program.image".to_string(), query);
+                }
+            }
+        }
+
         // entrypoint / env are structured (InterpolatedString), so we never need to re-parse `${...}`.
         for (arg_idx, arg) in program.args.0.iter().enumerate() {
             for part in &arg.parts {
                 let InterpolatedPart::Interpolation { source, query } = part else {
                     continue;
                 };
-                if *source != InterpolationSource::Config {
-                    continue;
-                }
-                let Some(schema) = schema else {
-                    errors.push(Error::InvalidConfig {
-                        component_path: component_path.clone(),
-                        message: format!(
-                            "program.entrypoint[{arg_idx}] references ${{config{}}}, but this \
-                             component does not declare `config_schema`",
-                            if query.is_empty() {
-                                "".to_string()
-                            } else {
-                                format!(".{query}")
-                            }
-                        ),
-                        src: site.src.clone(),
-                        span: site.span,
-                        label: "config definition required".to_string(),
-                        related: Vec::new(),
-                    });
-                    continue;
-                };
-                match rc::schema_lookup(schema, query.as_str()) {
-                    Ok(rc::SchemaLookup::Found) | Ok(rc::SchemaLookup::Unknown) => {}
-                    Err(e) => {
-                        errors.push(Error::InvalidConfig {
-                            component_path: component_path.clone(),
-                            message: format!(
-                                "invalid ${{config{}}} reference in \
-                                 program.entrypoint[{arg_idx}]: {e}",
-                                if query.is_empty() {
-                                    "".to_string()
-                                } else {
-                                    format!(".{query}")
-                                }
-                            ),
-                            src: site.src.clone(),
-                            span: site.span,
-                            label: "invalid config reference".to_string(),
-                            related: Vec::new(),
-                        });
-                    }
+                if *source == InterpolationSource::Config {
+                    validate_config_ref(format!("program.entrypoint[{arg_idx}]"), query);
                 }
             }
         }
@@ -1008,47 +1016,8 @@ fn validate_config_tree(
                 let InterpolatedPart::Interpolation { source, query } = part else {
                     continue;
                 };
-                if *source != InterpolationSource::Config {
-                    continue;
-                }
-                let Some(schema) = schema else {
-                    errors.push(Error::InvalidConfig {
-                        component_path: component_path.clone(),
-                        message: format!(
-                            "program.env.{k} references ${{config{}}}, but this component does \
-                             not declare `config_schema`",
-                            if query.is_empty() {
-                                "".to_string()
-                            } else {
-                                format!(".{query}")
-                            }
-                        ),
-                        src: site.src.clone(),
-                        span: site.span,
-                        label: "config definition required".to_string(),
-                        related: Vec::new(),
-                    });
-                    continue;
-                };
-                match rc::schema_lookup(schema, query.as_str()) {
-                    Ok(rc::SchemaLookup::Found) | Ok(rc::SchemaLookup::Unknown) => {}
-                    Err(e) => {
-                        errors.push(Error::InvalidConfig {
-                            component_path: component_path.clone(),
-                            message: format!(
-                                "invalid ${{config{}}} reference in program.env.{k}: {e}",
-                                if query.is_empty() {
-                                    "".to_string()
-                                } else {
-                                    format!(".{query}")
-                                }
-                            ),
-                            src: site.src.clone(),
-                            span: site.span,
-                            label: "invalid config reference".to_string(),
-                            related: Vec::new(),
-                        });
-                    }
+                if *source == InterpolationSource::Config {
+                    validate_config_ref(format!("program.env.{k}"), query);
                 }
             }
         }
@@ -2060,6 +2029,13 @@ fn collect_program_slot_uses(manifest: &Manifest) -> HashSet<String> {
     };
 
     let mut used_all = false;
+    if let Ok(image) = program.image.parse::<InterpolatedString>() {
+        used_all = add_program_slot_uses(manifest, &mut uses, &image);
+        if used_all {
+            return uses;
+        }
+    }
+
     for arg in &program.args.0 {
         used_all = add_program_slot_uses(manifest, &mut uses, arg);
         if used_all {

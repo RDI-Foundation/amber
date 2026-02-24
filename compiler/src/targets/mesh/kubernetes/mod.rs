@@ -6,16 +6,22 @@ use std::{
 };
 
 use amber_config as rc;
+use amber_manifest::span_for_json_pointer;
 use amber_scenario::{ComponentId, Scenario};
+use miette::{LabeledSpan, NamedSource, SourceSpan};
 pub use resources::*;
 use serde::Serialize;
 
 use crate::{
+    CompileOutput,
     reporter::{Reporter, ReporterError},
     targets::mesh::{
         LOCAL_NETWORK_CIDRS,
         addressing::{Addressing, RouterPortBases, WorkloadId, build_address_plan},
-        config::{ProgramPlan, encode_helper_payload, encode_schema_b64},
+        config::{
+            ProgramImageOrigin, ProgramImagePart, ProgramImagePlan, ProgramPlan,
+            encode_helper_payload, encode_schema_b64,
+        },
         internal_images::resolve_internal_images,
         plan::{MeshOptions, component_label},
     },
@@ -159,6 +165,13 @@ struct ExternalSlotMetadata {
     kind: String,
 }
 
+#[derive(Clone, Debug)]
+struct ProgramImageSource {
+    src: NamedSource<std::sync::Arc<str>>,
+    span: SourceSpan,
+    label: String,
+}
+
 /// Full scenario metadata stored in amber-metadata ConfigMap.
 #[derive(Clone, Debug, Serialize)]
 struct ScenarioMetadata {
@@ -171,9 +184,24 @@ struct ScenarioMetadata {
 
 type KubernetesResult<T> = Result<T, ReporterError>;
 
+pub fn render_kubernetes_with_output(
+    output: &CompileOutput,
+    config: &KubernetesReporterConfig,
+) -> KubernetesResult<KubernetesArtifact> {
+    render_kubernetes_inner(&output.scenario, config, Some(output))
+}
+
 fn render_kubernetes(
     s: &Scenario,
     config: &KubernetesReporterConfig,
+) -> KubernetesResult<KubernetesArtifact> {
+    render_kubernetes_inner(s, config, None)
+}
+
+fn render_kubernetes_inner(
+    s: &Scenario,
+    config: &KubernetesReporterConfig,
+    output: Option<&CompileOutput>,
 ) -> KubernetesResult<KubernetesArtifact> {
     let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
         s,
@@ -310,8 +338,14 @@ fn render_kubernetes(
     files.insert(PathBuf::from("00-namespace.yaml"), to_yaml(&ns)?);
 
     let root_leaves = &config_plan.root_leaves;
+    let root_leaf_by_path: BTreeMap<&str, &rc::SchemaLeaf> = root_leaves
+        .iter()
+        .map(|leaf| (leaf.path.as_str(), leaf))
+        .collect();
     let program_plans = &config_plan.program_plans;
     let any_helper = config_plan.uses_helper;
+    let any_runtime_image = config_plan.uses_runtime_image;
+    let needs_runtime_root_config = any_helper || any_runtime_image;
 
     let export_ports_by_name = &address_plan.router.export_ports_by_name;
     let router_export_ports = &address_plan.router.export_ports;
@@ -354,12 +388,12 @@ fn render_kubernetes(
         }
     }
 
-    // Build kustomization (will be populated at the end if helper mode is used).
+    // Build kustomization (resource list and generators/replacements are finalized at the end).
     let mut kustomization = Kustomization::new();
     kustomization.namespace = Some(namespace.clone());
 
-    // If any component needs helper, generate root config Secret/ConfigMap and .env templates.
-    if any_helper {
+    // If helper mode or runtime image interpolation is used, generate root config inputs.
+    if needs_runtime_root_config {
         // Separate root leaves into secret and non-secret.
         let (secret_leaves, config_leaves): (Vec<_>, Vec<_>) =
             root_leaves.iter().partition(|l| l.secret);
@@ -441,7 +475,7 @@ fn render_kubernetes(
     //   The helper reads config values from the root config Secret/ConfigMap at
     //   runtime and resolves templates, so secret values are not inlined.
     // The only ConfigMaps generated are amber-metadata and the Kustomize-generated
-    // root config (when helper mode is used).
+    // root config (when helper mode or runtime image interpolation is used).
 
     // Encode root schema for helper (needed for all helper components).
     let root_schema_b64 = if any_helper {
@@ -467,6 +501,16 @@ fn render_kubernetes(
         let labels = component_labels(*id, &cnames.service);
         let program = c.program.as_ref().unwrap();
         let program_plan = program_plans.get(id).unwrap();
+        let component = component_label(s, *id);
+        let image_source = output
+            .and_then(|output| program_image_source(output, s, *id, program_plan.image_origin()));
+        let (program_image, image_source_env_var) = render_kubernetes_image(
+            program_plan.image(),
+            &root_leaf_by_path,
+            &cnames.service,
+            &component,
+            image_source.as_ref(),
+        )?;
 
         // Container ports.
         let mut ports: Vec<ContainerPort> = Vec::new();
@@ -482,7 +526,9 @@ fn render_kubernetes(
 
         // Build container based on program mode.
         let (container, volumes) = match program_plan {
-            ProgramPlan::Direct { entrypoint, env } => {
+            ProgramPlan::Direct {
+                entrypoint, env, ..
+            } => {
                 // Direct mode: use resolved entrypoint and env directly.
                 // Config values are already baked into the entrypoint/env strings,
                 // so we don't need AMBER_CONFIG_* env vars here.
@@ -491,7 +537,7 @@ fn render_kubernetes(
 
                 let container = Container {
                     name: "main".to_string(),
-                    image: program.image.clone(),
+                    image: program_image.clone(),
                     command: entrypoint.clone(),
                     args: Vec::new(),
                     env: container_env,
@@ -507,6 +553,7 @@ fn render_kubernetes(
                 template_spec,
                 component_template,
                 component_schema,
+                ..
             } => {
                 let label = component_label(s, *id);
                 let payload = encode_helper_payload(
@@ -578,7 +625,7 @@ fn render_kubernetes(
 
                 let container = Container {
                     name: "main".to_string(),
-                    image: program.image.clone(),
+                    image: program_image.clone(),
                     command: vec![HELPER_BIN_PATH.to_string(), "run".to_string()],
                     args: Vec::new(),
                     env: container_env,
@@ -597,6 +644,25 @@ fn render_kubernetes(
                 (container, volumes)
             }
         };
+
+        if let Some(env_var) = image_source_env_var {
+            kustomization.replacements.push(Replacement {
+                source: ReplacementSource {
+                    kind: "ConfigMap".to_string(),
+                    name: ROOT_CONFIG_CONFIGMAP_NAME.to_string(),
+                    field_path: format!("data.{env_var}"),
+                },
+                targets: vec![ReplacementTarget {
+                    select: ReplacementSelect {
+                        kind: "Deployment".to_string(),
+                        name: cnames.service.clone(),
+                    },
+                    field_paths: vec![
+                        "spec.template.spec.containers.[name=main].image".to_string(),
+                    ],
+                }],
+            });
+        }
 
         // Add init containers.
         let mut init_containers = Vec::new();
@@ -1151,6 +1217,142 @@ fn render_kubernetes(
 }
 
 // ---- Helper functions ----
+
+fn render_kubernetes_image(
+    image: &ProgramImagePlan,
+    root_leaf_by_path: &BTreeMap<&str, &rc::SchemaLeaf>,
+    service_name: &str,
+    component: &str,
+    image_source: Option<&ProgramImageSource>,
+) -> KubernetesResult<(String, Option<String>)> {
+    match image {
+        ProgramImagePlan::Static(value) => Ok((value.clone(), None)),
+        ProgramImagePlan::RuntimeTemplate(parts) => {
+            let [ProgramImagePart::RootConfigPath(path)] = parts.as_slice() else {
+                return Err(program_image_error(
+                    component,
+                    "resolves to a mixed runtime image template, but kubernetes output only \
+                     supports runtime images that resolve to exactly one concrete config value \
+                     (for example `${config.image}`).",
+                    image_source,
+                ));
+            };
+
+            let leaf = root_leaf_by_path.get(path.as_str()).ok_or_else(|| {
+                program_image_error(
+                    component,
+                    format!(
+                        "references runtime config.{path}, but that path does not resolve to a \
+                         concrete config value"
+                    ),
+                    image_source,
+                )
+            })?;
+            if leaf.secret {
+                return Err(program_image_error(
+                    component,
+                    format!(
+                        "references config.{path}, but kubernetes runtime image interpolation \
+                         does not support secret config values"
+                    ),
+                    image_source,
+                ));
+            }
+
+            let env_var = rc::env_var_for_path(path).map_err(|e| {
+                ReporterError::new(format!(
+                    "failed to map runtime image path config.{path} to env var: {e}"
+                ))
+            })?;
+            Ok((format!("amber-runtime-image-{service_name}"), Some(env_var)))
+        }
+    }
+}
+
+fn program_image_source(
+    output: &CompileOutput,
+    scenario: &Scenario,
+    component: ComponentId,
+    origin: &ProgramImageOrigin,
+) -> Option<ProgramImageSource> {
+    match origin {
+        ProgramImageOrigin::ProgramImage => component_program_image_source(output, component),
+        ProgramImageOrigin::ComponentConfigPath(path) => {
+            component_config_image_source(output, scenario, component, path)
+        }
+    }
+}
+
+fn component_config_image_source(
+    output: &CompileOutput,
+    scenario: &Scenario,
+    component: ComponentId,
+    path: &str,
+) -> Option<ProgramImageSource> {
+    let component = scenario.component(component);
+    let parent = component.parent?;
+    let child_name = component.moniker.local_name()?;
+
+    let provenance = output.provenance.for_component(parent);
+    let url = &provenance.resolved_url;
+    let stored = output.store.get_source(url)?;
+    let root_span: SourceSpan = (0usize, stored.source.len()).into();
+    let child_ptr = json_pointer_escape(child_name);
+    let mut config_ptr = format!("/components/{child_ptr}/config");
+    for segment in path.split('.').filter(|segment| !segment.is_empty()) {
+        config_ptr.push('/');
+        config_ptr.push_str(&json_pointer_escape(segment));
+    }
+    let span = span_for_json_pointer(stored.source.as_ref(), root_span, &config_ptr)?;
+    let src =
+        NamedSource::new(crate::store::display_url(url), stored.source).with_language("json5");
+    Some(ProgramImageSource {
+        src,
+        span,
+        label: "component config image interpolation here".to_string(),
+    })
+}
+
+fn component_program_image_source(
+    output: &CompileOutput,
+    component: ComponentId,
+) -> Option<ProgramImageSource> {
+    let provenance = output.provenance.for_component(component);
+    let url = &provenance.resolved_url;
+    let stored = output.store.get_source(url)?;
+    let program = stored.spans.program.as_ref()?;
+    let root_span: SourceSpan = (0usize, stored.source.len()).into();
+    let span = span_for_json_pointer(stored.source.as_ref(), root_span, "/program/image")
+        .unwrap_or(program.whole);
+    let src =
+        NamedSource::new(crate::store::display_url(url), stored.source).with_language("json5");
+    Some(ProgramImageSource {
+        src,
+        span,
+        label: "program.image interpolation here".to_string(),
+    })
+}
+
+fn json_pointer_escape(segment: &str) -> String {
+    segment.replace('~', "~0").replace('/', "~1")
+}
+
+fn program_image_error(
+    component: &str,
+    message: impl Into<String>,
+    image_source: Option<&ProgramImageSource>,
+) -> ReporterError {
+    let mut error = ReporterError::new(format!("program.image in {component} {}", message.into()));
+    if let Some(image_source) = image_source {
+        error = error
+            .with_source_code(image_source.src.clone())
+            .with_labels(vec![LabeledSpan::new_primary_with_span(
+                Some(image_source.label.clone()),
+                image_source.span,
+            )]);
+    }
+    error
+}
 
 fn generate_namespace_name(s: &Scenario) -> String {
     let root = s.component(s.root);

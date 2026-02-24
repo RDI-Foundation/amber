@@ -414,6 +414,58 @@ fn compose_escapes_entrypoint_dollars() {
 }
 
 #[test]
+fn compose_renders_runtime_program_image_from_root_config() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "image": { "type": "string" }
+        },
+        "required": ["image"],
+        "additionalProperties": false
+    });
+    let program = serde_json::from_value(json!({
+        "image": "${config.image}",
+        "entrypoint": ["run"]
+    }))
+    .unwrap();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: Some(schema),
+        program: Some(program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root)],
+        bindings: vec![],
+        exports: vec![],
+    };
+
+    let yaml = DockerComposeReporter
+        .emit(&scenario)
+        .expect("compose render ok");
+    let compose = parse_compose(&yaml);
+
+    let service = compose
+        .services
+        .values()
+        .find(|svc| svc.image.contains("AMBER_CONFIG_IMAGE"))
+        .expect("program service should use runtime root config for image");
+    assert_eq!(service.image, "${AMBER_CONFIG_IMAGE?missing config.image}");
+    assert!(!yaml.contains("AMBER_TEMPLATE_SPEC_B64"), "{yaml}");
+}
+
+#[test]
 fn compose_resolves_binding_urls_in_child_config() {
     let server_program = serde_json::from_value(json!({
         "image": "alpine:3.20",

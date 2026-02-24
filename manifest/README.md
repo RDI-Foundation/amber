@@ -201,9 +201,9 @@ program: {
 }
 ```
 
-### Interpolation in `args` and `env`
+### Interpolation in `image`, `args`, and `env`
 
-`args` elements and `env` values support `${...}` interpolation.
+`image`, `args` elements, and `env` values support `${...}` interpolation.
 
 Supported sources:
 

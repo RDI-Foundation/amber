@@ -80,6 +80,45 @@ fn program_args_string_sugar_splits() {
 }
 
 #[test]
+fn program_image_supports_interpolation_syntax() {
+    let m: Manifest = r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: { image: { type: "string" } },
+          },
+          program: {
+            image: "${config.image}",
+            entrypoint: ["x"],
+          }
+        }
+        "#
+    .parse()
+    .unwrap();
+
+    let program = m.program.as_ref().expect("program should exist");
+    assert_eq!(program.image, "${config.image}");
+}
+
+#[test]
+fn invalid_program_image_interpolation_syntax_errors() {
+    let err = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "${config.image",
+            entrypoint: ["x"],
+          }
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("invalid interpolation"), "{msg}");
+}
+
+#[test]
 fn binding_sugar_forms_parse() {
     let m: Manifest = r##"
         {

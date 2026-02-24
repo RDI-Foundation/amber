@@ -1,0 +1,22 @@
+{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: { image: { type: "string" } },
+    required: ["image"],
+    additionalProperties: false,
+  },
+  program: {
+    image: "${config.image}",
+    entrypoint: ["child"],
+    network: {
+      endpoints: [{ name: "http", port: 8080 }],
+    },
+  },
+  provides: {
+    child: { kind: "http", endpoint: "http" },
+  },
+  exports: {
+    child: "child",
+  },
+}

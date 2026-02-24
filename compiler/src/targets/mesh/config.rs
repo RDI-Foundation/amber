@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use amber_config as rc;
 use amber_manifest::{InterpolatedPart, InterpolationSource};
@@ -20,19 +20,71 @@ pub(crate) struct ConfigPlan {
     pub(crate) root_leaves: Vec<rc::SchemaLeaf>,
     pub(crate) program_plans: HashMap<ComponentId, ProgramPlan>,
     pub(crate) uses_helper: bool,
+    pub(crate) uses_runtime_image: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProgramImagePart {
+    Literal(String),
+    RootConfigPath(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProgramImagePlan {
+    Static(String),
+    RuntimeTemplate(Vec<ProgramImagePart>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProgramImageOrigin {
+    ProgramImage,
+    ComponentConfigPath(String),
+}
+
+impl ProgramImagePlan {
+    pub(crate) fn collect_runtime_root_paths(&self, out: &mut BTreeSet<String>) {
+        let Self::RuntimeTemplate(parts) = self else {
+            return;
+        };
+        for part in parts {
+            if let ProgramImagePart::RootConfigPath(path) = part {
+                out.insert(path.clone());
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum ProgramPlan {
     Direct {
+        image: ProgramImagePlan,
+        image_origin: ProgramImageOrigin,
         entrypoint: Vec<String>,
         env: BTreeMap<String, String>,
     },
     Helper {
+        image: ProgramImagePlan,
+        image_origin: ProgramImageOrigin,
         template_spec: TemplateSpec,
         component_template: rc::RootConfigTemplate,
         component_schema: Value,
     },
+}
+
+impl ProgramPlan {
+    pub(crate) fn image(&self) -> &ProgramImagePlan {
+        match self {
+            Self::Direct { image, .. } => image,
+            Self::Helper { image, .. } => image,
+        }
+    }
+
+    pub(crate) fn image_origin(&self) -> &ProgramImageOrigin {
+        match self {
+            Self::Direct { image_origin, .. } => image_origin,
+            Self::Helper { image_origin, .. } => image_origin,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -76,9 +128,16 @@ pub(crate) fn build_config_plan(
     } else {
         Vec::new()
     };
+    let root_leaf_paths: BTreeSet<&str> =
+        root_leaves.iter().map(|leaf| leaf.path.as_str()).collect();
 
     let mut program_plans = HashMap::new();
+    // `uses_helper` means at least one component needs helper-backed runtime
+    // interpolation in program.entrypoint/program.env.
     let mut uses_helper = false;
+    // `uses_runtime_image` means at least one component has runtime-derived
+    // program.image interpolation. This is tracked separately from helper mode.
+    let mut uses_runtime_image = false;
 
     for id in program_components {
         let c = scenario.component(*id);
@@ -120,10 +179,25 @@ pub(crate) fn build_config_plan(
         if matches!(plan, ProgramPlan::Helper { .. }) {
             uses_helper = true;
         }
+        let mut runtime_paths = BTreeSet::new();
+        plan.image().collect_runtime_root_paths(&mut runtime_paths);
+        if !runtime_paths.is_empty() {
+            uses_runtime_image = true;
+        }
+        for path in runtime_paths {
+            if !root_leaf_paths.contains(path.as_str()) {
+                return Err(MeshError::new(format!(
+                    "program.image in {} requires runtime config path config.{path}, but runtime \
+                     image interpolation only supports paths that resolve to one concrete root \
+                     config value",
+                    component_label(scenario, *id)
+                )));
+            }
+        }
         program_plans.insert(*id, plan);
     }
 
-    if uses_helper && root_schema.is_none() {
+    if (uses_helper || uses_runtime_image) && root_schema.is_none() {
         return Err(MeshError::new(
             "root component must declare `config_schema` when runtime config interpolation is \
              required",
@@ -135,6 +209,7 @@ pub(crate) fn build_config_plan(
         root_leaves,
         program_plans,
         uses_helper,
+        uses_runtime_image,
     })
 }
 
@@ -299,6 +374,12 @@ enum ConfigResolution {
     Runtime,
 }
 
+#[derive(Debug)]
+enum ImageConfigResolution {
+    Static(String),
+    RuntimeTemplate(Vec<ProgramImagePart>),
+}
+
 fn resolve_config_query_for_program(
     template: Option<&rc::ConfigNode>,
     query: &str,
@@ -307,36 +388,170 @@ fn resolve_config_query_for_program(
         return Ok(ConfigResolution::Runtime);
     };
 
+    let cur = if query.is_empty() {
+        template
+    } else {
+        let mut current = template;
+        for seg in query.split('.') {
+            if seg.is_empty() {
+                return Err(MeshError::new(format!(
+                    "invalid config path {query:?}: empty segment"
+                )));
+            }
+            match current {
+                rc::ConfigNode::Object(map) => {
+                    let Some(next) = map.get(seg) else {
+                        return Err(MeshError::new(format!(
+                            "config.{query} not found (missing key {seg:?})"
+                        )));
+                    };
+                    current = next;
+                }
+                rc::ConfigNode::ConfigRef(_) => return Ok(ConfigResolution::Runtime),
+                _ => {
+                    return Err(MeshError::new(format!(
+                        "config.{query} not found (encountered non-object before segment {seg:?})"
+                    )));
+                }
+            }
+        }
+        current
+    };
+
+    if !cur.contains_runtime() {
+        let v = cur
+            .evaluate_static()
+            .map_err(|e| MeshError::new(e.to_string()))?;
+        Ok(ConfigResolution::Static(
+            rc::stringify_for_interpolation(&v).map_err(|e| MeshError::new(e.to_string()))?,
+        ))
+    } else {
+        Ok(ConfigResolution::Runtime)
+    }
+}
+
+fn resolve_program_image_runtime_node(
+    node: &rc::ConfigNode,
+) -> Result<ImageConfigResolution, MeshError> {
+    match node {
+        rc::ConfigNode::ConfigRef(path) => {
+            if path.is_empty() {
+                return Err(MeshError::new(
+                    "program.image cannot reference the entire runtime config object; reference a \
+                     string leaf like ${config.image}",
+                ));
+            }
+            Ok(ImageConfigResolution::RuntimeTemplate(vec![
+                ProgramImagePart::RootConfigPath(path.clone()),
+            ]))
+        }
+        rc::ConfigNode::StringTemplate(parts) => {
+            let mut out: Vec<ProgramImagePart> = Vec::with_capacity(parts.len());
+            for part in parts {
+                match part {
+                    TemplatePart::Lit { lit } => {
+                        if !lit.is_empty() {
+                            out.push(ProgramImagePart::Literal(lit.clone()));
+                        }
+                    }
+                    TemplatePart::Config { config } => {
+                        if config.is_empty() {
+                            return Err(MeshError::new(
+                                "program.image cannot reference the entire runtime config object; \
+                                 reference a string leaf like ${config.image}",
+                            ));
+                        }
+                        out.push(ProgramImagePart::RootConfigPath(config.clone()));
+                    }
+                    TemplatePart::Binding { binding, .. } => {
+                        return Err(MeshError::new(format!(
+                            "failed to resolve runtime image template: unresolved \
+                             bindings.{binding} interpolation"
+                        )));
+                    }
+                }
+            }
+            if out.is_empty() {
+                return Err(MeshError::new(
+                    "internal error: produced empty runtime template for program.image",
+                ));
+            }
+            Ok(ImageConfigResolution::RuntimeTemplate(out))
+        }
+        _ => Err(MeshError::new(
+            "program.image cannot interpolate a runtime-derived non-string config value; use a \
+             string config leaf containing the full image reference",
+        )),
+    }
+}
+
+fn resolve_config_query_for_program_image(
+    template: Option<&rc::ConfigNode>,
+    query: &str,
+) -> Result<ImageConfigResolution, MeshError> {
+    let Some(template) = template else {
+        if query.is_empty() {
+            return Err(MeshError::new(
+                "program.image cannot reference the entire runtime config object; reference a \
+                 string leaf like ${config.image}",
+            ));
+        }
+        for seg in query.split('.') {
+            if seg.is_empty() {
+                return Err(MeshError::new(format!(
+                    "invalid config path {query:?}: empty segment"
+                )));
+            }
+        }
+        return Ok(ImageConfigResolution::RuntimeTemplate(vec![
+            ProgramImagePart::RootConfigPath(query.to_string()),
+        ]));
+    };
+
     if query.is_empty() {
         return if !template.contains_runtime() {
             let v = template
                 .evaluate_static()
                 .map_err(|e| MeshError::new(e.to_string()))?;
-            Ok(ConfigResolution::Static(
+            Ok(ImageConfigResolution::Static(
                 rc::stringify_for_interpolation(&v).map_err(|e| MeshError::new(e.to_string()))?,
             ))
         } else {
-            Ok(ConfigResolution::Runtime)
+            resolve_program_image_runtime_node(template)
         };
     }
 
-    let mut cur = template;
-    for seg in query.split('.') {
+    let segments = query.split('.').collect::<Vec<_>>();
+    for seg in &segments {
         if seg.is_empty() {
             return Err(MeshError::new(format!(
                 "invalid config path {query:?}: empty segment"
             )));
         }
+    }
+
+    let mut cur = template;
+    for (idx, seg) in segments.iter().enumerate() {
         match cur {
             rc::ConfigNode::Object(map) => {
-                let Some(next) = map.get(seg) else {
+                let Some(next) = map.get(*seg) else {
                     return Err(MeshError::new(format!(
                         "config.{query} not found (missing key {seg:?})"
                     )));
                 };
                 cur = next;
             }
-            rc::ConfigNode::ConfigRef(_) => return Ok(ConfigResolution::Runtime),
+            rc::ConfigNode::ConfigRef(path) => {
+                let suffix = segments[idx..].join(".");
+                let full = if path.is_empty() {
+                    suffix
+                } else {
+                    format!("{path}.{suffix}")
+                };
+                return Ok(ImageConfigResolution::RuntimeTemplate(vec![
+                    ProgramImagePart::RootConfigPath(full),
+                ]));
+            }
             _ => {
                 return Err(MeshError::new(format!(
                     "config.{query} not found (encountered non-object before segment {seg:?})"
@@ -349,11 +564,11 @@ fn resolve_config_query_for_program(
         let v = cur
             .evaluate_static()
             .map_err(|e| MeshError::new(e.to_string()))?;
-        Ok(ConfigResolution::Static(
+        Ok(ImageConfigResolution::Static(
             rc::stringify_for_interpolation(&v).map_err(|e| MeshError::new(e.to_string()))?,
         ))
     } else {
-        Ok(ConfigResolution::Runtime)
+        resolve_program_image_runtime_node(cur)
     }
 }
 
@@ -374,6 +589,28 @@ fn render_template_string_static(ts: &TemplateString) -> Result<String, MeshErro
     Ok(out)
 }
 
+fn push_image_literal(parts: &mut Vec<ProgramImagePart>, lit: impl Into<String>) {
+    let lit = lit.into();
+    if lit.is_empty() {
+        return;
+    }
+    match parts.last_mut() {
+        Some(ProgramImagePart::Literal(existing)) => existing.push_str(&lit),
+        _ => parts.push(ProgramImagePart::Literal(lit)),
+    }
+}
+
+fn extend_image_parts(parts: &mut Vec<ProgramImagePart>, extra: Vec<ProgramImagePart>) {
+    for part in extra {
+        match part {
+            ProgramImagePart::Literal(lit) => push_image_literal(parts, lit),
+            ProgramImagePart::RootConfigPath(path) => {
+                parts.push(ProgramImagePart::RootConfigPath(path))
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_program_plan(
     scenario: &Scenario,
@@ -386,7 +623,100 @@ fn build_program_plan(
     component_template: &rc::RootConfigTemplate,
 ) -> Result<ProgramPlan, MeshError> {
     let mut entrypoint_ts: Vec<TemplateString> = Vec::new();
-    let mut needs_helper = false;
+    // Helper mode is required only for runtime config interpolation in
+    // program.entrypoint/program.env (not for program.image runtime interpolation).
+    let mut needs_helper_for_program_templates = false;
+    let mut image_parts: Vec<ProgramImagePart> = Vec::new();
+    let image = program
+        .image
+        .parse::<amber_manifest::InterpolatedString>()
+        .map_err(|err| {
+            MeshError::new(format!(
+                "failed to parse program.image interpolation in {}: {err}",
+                component_label(scenario, id)
+            ))
+        })?;
+    // If program.image is exactly one `${config...}` interpolation, image diagnostics should
+    // point at the corresponding component config path; otherwise they should point at
+    // program.image itself.
+    let image_origin = match image.parts.as_slice() {
+        [
+            InterpolatedPart::Interpolation {
+                source: InterpolationSource::Config,
+                query,
+            },
+        ] => ProgramImageOrigin::ComponentConfigPath(query.clone()),
+        _ => ProgramImageOrigin::ProgramImage,
+    };
+
+    for part in &image.parts {
+        match part {
+            InterpolatedPart::Literal(lit) => push_image_literal(&mut image_parts, lit.clone()),
+            InterpolatedPart::Interpolation { source, query } => match source {
+                InterpolationSource::Slots => {
+                    let value = resolve_slot_query(slots, query).map_err(|e| {
+                        MeshError::new(format!(
+                            "failed to resolve slot query in {}: {e}",
+                            component_label(scenario, id)
+                        ))
+                    })?;
+                    push_image_literal(&mut image_parts, value);
+                }
+                InterpolationSource::Bindings => {
+                    let value = resolve_binding_query(bindings, query).map_err(|e| {
+                        MeshError::new(format!(
+                            "failed to resolve binding query in {}: {e}",
+                            component_label(scenario, id)
+                        ))
+                    })?;
+                    push_image_literal(&mut image_parts, value);
+                }
+                InterpolationSource::Config => {
+                    match resolve_config_query_for_program_image(template_opt, query)? {
+                        ImageConfigResolution::Static(value) => {
+                            push_image_literal(&mut image_parts, value);
+                        }
+                        ImageConfigResolution::RuntimeTemplate(parts) => {
+                            extend_image_parts(&mut image_parts, parts);
+                        }
+                    }
+                }
+                other => {
+                    return Err(MeshError::new(format!(
+                        "unsupported interpolation source {other} in {} program.image",
+                        component_label(scenario, id)
+                    )));
+                }
+            },
+            _ => {
+                return Err(MeshError::new(format!(
+                    "unsupported interpolation part in {} program.image",
+                    component_label(scenario, id)
+                )));
+            }
+        }
+    }
+    if image_parts.is_empty() {
+        return Err(MeshError::new(format!(
+            "internal error: produced empty image template for {} program.image",
+            component_label(scenario, id)
+        )));
+    }
+    let image = if image_parts
+        .iter()
+        .any(|part| matches!(part, ProgramImagePart::RootConfigPath(_)))
+    {
+        ProgramImagePlan::RuntimeTemplate(image_parts)
+    } else {
+        let mut rendered = String::new();
+        for part in image_parts {
+            let ProgramImagePart::Literal(lit) = part else {
+                unreachable!("runtime root config path was handled above");
+            };
+            rendered.push_str(&lit);
+        }
+        ProgramImagePlan::Static(rendered)
+    };
 
     for (idx, arg) in program.args.0.iter().enumerate() {
         let mut ts: TemplateString = Vec::new();
@@ -417,7 +747,7 @@ fn build_program_plan(
                             ConfigResolution::Static(v) => ts.push(TemplatePart::lit(v)),
                             ConfigResolution::Runtime => {
                                 ts.push(TemplatePart::config(query.clone()));
-                                needs_helper = true;
+                                needs_helper_for_program_templates = true;
                             }
                         }
                     }
@@ -476,7 +806,7 @@ fn build_program_plan(
                             ConfigResolution::Static(vv) => ts.push(TemplatePart::lit(vv)),
                             ConfigResolution::Runtime => {
                                 ts.push(TemplatePart::config(query.clone()));
-                                needs_helper = true;
+                                needs_helper_for_program_templates = true;
                             }
                         }
                     }
@@ -498,7 +828,7 @@ fn build_program_plan(
         env_ts.insert(k.clone(), ts);
     }
 
-    if needs_helper {
+    if needs_helper_for_program_templates {
         let schema = component_schema.ok_or_else(|| {
             MeshError::new(format!(
                 "component {} requires config_schema when using runtime config interpolation",
@@ -514,6 +844,8 @@ fn build_program_plan(
         };
 
         Ok(ProgramPlan::Helper {
+            image,
+            image_origin,
             template_spec: spec,
             component_template: component_template.clone(),
             component_schema: schema.clone(),
@@ -530,6 +862,8 @@ fn build_program_plan(
         }
 
         Ok(ProgramPlan::Direct {
+            image,
+            image_origin,
             entrypoint: rendered_entrypoint,
             env: rendered_env,
         })
