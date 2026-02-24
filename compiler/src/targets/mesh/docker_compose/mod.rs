@@ -15,7 +15,10 @@ use crate::{
     targets::mesh::{
         LOCAL_NETWORK_CIDRS,
         addressing::{Addressing, RouterPortBases, WorkloadId, build_address_plan},
-        config::{ProgramPlan, encode_helper_payload, encode_schema_b64},
+        config::{
+            ProgramImagePart, ProgramImagePlan, ProgramPlan, encode_helper_payload,
+            encode_schema_b64,
+        },
         internal_images::resolve_internal_images,
         plan::{
             MeshOptions, ResolvedBinding, ResolvedExport, ResolvedExternalBinding, component_label,
@@ -630,9 +633,11 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
     )
     .map_err(|e| DockerComposeError::Other(e.to_string()))?;
 
-    // Root schema payloads + AMBER_CONFIG_* env list are only needed if at least one service uses the helper.
+    // Root schema payload + AMBER_CONFIG_* service env forwarding are helper-only.
+    // Runtime program.image interpolation is rendered directly in `image:` and
+    // resolved by Docker Compose variable substitution.
     let mut root_schema_b64: Option<String> = None;
-    let mut root_env_entries: Vec<String> = Vec::new();
+    let mut helper_root_env_entries: Vec<String> = Vec::new();
 
     if config_plan.uses_helper {
         let root_schema = config_plan
@@ -648,15 +653,21 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
             let var = rc::env_var_for_path(&leaf.path)
                 .map_err(|e| format!("failed to map config path {} to env var: {e}", leaf.path))?;
             if leaf.required {
-                root_env_entries.push(format!("{var}=${{{var}?missing config.{}}}", leaf.path));
+                helper_root_env_entries
+                    .push(format!("{var}=${{{var}?missing config.{}}}", leaf.path));
             } else {
-                root_env_entries.push(var);
+                helper_root_env_entries.push(var);
             }
         }
     }
 
     let program_plans = &config_plan.program_plans;
     let any_helper = config_plan.uses_helper;
+    let root_leaf_by_path: BTreeMap<&str, &rc::SchemaLeaf> = config_plan
+        .root_leaves
+        .iter()
+        .map(|leaf| (leaf.path.as_str(), leaf))
+        .collect();
 
     let mut compose = DockerComposeFile::default();
 
@@ -754,7 +765,6 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
 
     // Emit services in stable (component id) order, sidecar then program.
     for id in program_components {
-        let c = s.component(*id);
         let svc = names.get(id).unwrap();
 
         let inbound_allow = map_allowed_hosts(address_plan.allow.for_component(*id))?;
@@ -774,12 +784,12 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
             sidecar_service(&svc.sidecar, &images.sidecar, script),
         );
 
-        let program = c.program.as_ref().unwrap();
-        let mut program_service = Service::new(program.image.as_str());
-        program_service.network_mode = Some(format!("service:{}", svc.sidecar));
-
         // depends_on: own sidecar + strong deps provider programs (+ amber-init for helper-backed services)
         let program_plan = program_plans.get(id).expect("program plan computed");
+        let image = render_compose_image(program_plan.image(), &root_leaf_by_path)
+            .map_err(DockerComposeError::Other)?;
+        let mut program_service = Service::new(image);
+        program_service.network_mode = Some(format!("service:{}", svc.sidecar));
         let mut deps: Vec<(String, &'static str)> = Vec::new();
         if any_helper && matches!(program_plan, ProgramPlan::Helper { .. }) {
             deps.push((
@@ -804,7 +814,9 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
         program_service.depends_on = build_depends_on(any_helper, deps);
 
         match program_plan {
-            ProgramPlan::Direct { entrypoint, env } => {
+            ProgramPlan::Direct {
+                entrypoint, env, ..
+            } => {
                 // Use entrypoint so image entrypoints are ignored.
                 let entrypoint = entrypoint
                     .iter()
@@ -824,6 +836,7 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
                 template_spec,
                 component_template,
                 component_schema,
+                ..
             } => {
                 let label = component_label(s, *id);
                 let payload = encode_helper_payload(
@@ -841,7 +854,7 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
                 program_service.entrypoint =
                     Some(vec![HELPER_BIN_PATH.to_string(), "run".to_string()]);
 
-                let mut env_entries = root_env_entries.clone();
+                let mut env_entries = helper_root_env_entries.clone();
                 let root_schema_b64 = root_schema_b64.as_ref().expect("helper enabled");
                 env_entries.push(format!("AMBER_ROOT_CONFIG_SCHEMA_B64={root_schema_b64}"));
                 env_entries.push(format!(
@@ -923,6 +936,42 @@ fn build_depends_on(any_helper: bool, deps: Vec<(String, &'static str)>) -> Opti
         Some(DependsOn::List(
             deps.into_iter().map(|(name, _)| name).collect(),
         ))
+    }
+}
+
+fn render_compose_image(
+    image: &ProgramImagePlan,
+    root_leaf_by_path: &BTreeMap<&str, &rc::SchemaLeaf>,
+) -> Result<String, String> {
+    match image {
+        ProgramImagePlan::Static(value) => Ok(escape_compose_interpolation(value).into_owned()),
+        ProgramImagePlan::RuntimeTemplate(parts) => {
+            let mut rendered = String::new();
+            for part in parts {
+                match part {
+                    ProgramImagePart::Literal(lit) => {
+                        rendered.push_str(&escape_compose_interpolation(lit));
+                    }
+                    ProgramImagePart::RootConfigPath(path) => {
+                        let leaf = root_leaf_by_path.get(path.as_str()).ok_or_else(|| {
+                            format!(
+                                "runtime program.image path config.{path} is not a root config \
+                                 leaf"
+                            )
+                        })?;
+                        let env_var = rc::env_var_for_path(path).map_err(|err| {
+                            format!("failed to map config path {path} to env var: {err}")
+                        })?;
+                        if leaf.required {
+                            rendered.push_str(&format!("${{{env_var}?missing config.{path}}}"));
+                        } else {
+                            rendered.push_str(&format!("${{{env_var}}}"));
+                        }
+                    }
+                }
+            }
+            Ok(rendered)
+        }
     }
 }
 

@@ -94,6 +94,12 @@ fn validate_manifest_slot_interpolations(
         src_name,
     };
 
+    if let Ok(image) = program.image.parse::<InterpolatedString>() {
+        let location = SlotLocation::Image;
+        let span = location.span(source.as_ref(), spans);
+        validate_interpolated_string(&image, &ctx, location, span, &mut diagnostics);
+    }
+
     for (idx, arg) in program.args.0.iter().enumerate() {
         let location = SlotLocation::Entrypoint(idx);
         let span = location.span(source.as_ref(), spans);
@@ -111,6 +117,7 @@ fn validate_manifest_slot_interpolations(
 
 #[derive(Clone, Copy, Debug)]
 enum SlotLocation<'a> {
+    Image,
     Entrypoint(usize),
     Env(&'a str),
 }
@@ -118,6 +125,7 @@ enum SlotLocation<'a> {
 impl SlotLocation<'_> {
     fn label(self) -> String {
         match self {
+            SlotLocation::Image => "program.image".to_string(),
             SlotLocation::Entrypoint(idx) => format!("program.entrypoint[{idx}]"),
             SlotLocation::Env(key) => format!("program.env.{key}"),
         }
@@ -126,6 +134,9 @@ impl SlotLocation<'_> {
     fn span(self, source: &str, spans: &ManifestSpans) -> SourceSpan {
         let root = (0usize, source.len()).into();
         match self {
+            SlotLocation::Image => span_for_json_pointer(source, root, "/program/image")
+                .or_else(|| spans.program.as_ref().map(|p| p.whole))
+                .unwrap_or_else(|| (0usize, 0usize).into()),
             SlotLocation::Entrypoint(idx) => {
                 for key in ["args", "entrypoint"] {
                     let pointer = format!("/program/{key}/{idx}");

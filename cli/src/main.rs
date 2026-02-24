@@ -5,7 +5,7 @@ use std::{
 };
 
 use amber_compiler::{
-    CompileOptions, Compiler, ResolverRegistry,
+    CompileOptions, CompileOutput, Compiler, ResolverRegistry,
     bundle::{BundleBuilder, BundleLoader},
     reporter::{
         Reporter as _,
@@ -189,8 +189,7 @@ async fn compile(args: CompileArgs) -> Result<()> {
                 return Err(miette::Report::new(err));
             }
 
-            let scenario = output.scenario;
-            write_outputs(&outputs, &scenario, &args)?;
+            write_outputs(&outputs, &output.scenario, Some(&output), &args)?;
 
             if let Some(bundle_root) = resolve_bundle_root(&args)? {
                 let tree = bundle_tree.expect("bundle requested");
@@ -206,7 +205,7 @@ async fn compile(args: CompileArgs) -> Result<()> {
                 ));
             }
 
-            write_outputs(&outputs, &scenario, &args)?;
+            write_outputs(&outputs, &scenario, None, &args)?;
         }
     }
 
@@ -639,7 +638,12 @@ fn prepare_bundle_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_outputs(outputs: &OutputPaths, scenario: &Scenario, args: &CompileArgs) -> Result<()> {
+fn write_outputs(
+    outputs: &OutputPaths,
+    scenario: &Scenario,
+    output: Option<&CompileOutput>,
+    args: &CompileArgs,
+) -> Result<()> {
     if let Some(primary) = outputs.primary.as_ref() {
         write_primary_output(primary, scenario)?;
     }
@@ -663,12 +667,17 @@ fn write_outputs(outputs: &OutputPaths, scenario: &Scenario, args: &CompileArgs)
     }
 
     if let Some(kubernetes_dest) = outputs.kubernetes.as_ref() {
-        let reporter = KubernetesReporter {
-            config: KubernetesReporterConfig {
-                disable_networkpolicy_check: args.disable_networkpolicy_check,
-            },
+        let config = KubernetesReporterConfig {
+            disable_networkpolicy_check: args.disable_networkpolicy_check,
         };
-        let artifact = reporter.emit(scenario).map_err(miette::Report::new)?;
+        let artifact = if let Some(output) = output {
+            amber_compiler::reporter::kubernetes::render_kubernetes_with_output(output, &config)
+                .map_err(miette::Report::new)?
+        } else {
+            KubernetesReporter { config }
+                .emit(scenario)
+                .map_err(miette::Report::new)?
+        };
         write_kubernetes_output(kubernetes_dest, &artifact)?;
     }
 

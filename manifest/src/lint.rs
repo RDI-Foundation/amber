@@ -124,7 +124,7 @@ pub enum ManifestLint {
 fn add_program_slot_uses<'a>(
     manifest: &'a Manifest,
     used_slots: &mut BTreeSet<&'a SlotName>,
-    value: &'a InterpolatedString,
+    value: &InterpolatedString,
 ) -> bool {
     let used_all = value.visit_slot_uses(|slot_name| {
         if let Some((slot_key, _)) = manifest.slots().get_key_value(slot_name) {
@@ -176,6 +176,9 @@ fn collect_config_uses(manifest: &Manifest) -> ConfigUses {
     let mut uses = ConfigUses::default();
 
     if let Some(program) = manifest.program() {
+        if let Ok(image) = program.image.parse::<InterpolatedString>() {
+            collect_config_uses_from_interpolated(&image, &mut uses);
+        }
         for arg in &program.args.0 {
             collect_config_uses_from_interpolated(arg, &mut uses);
         }
@@ -254,10 +257,15 @@ pub fn lint_manifest(
     let mut program_used_slots = BTreeSet::new();
     if let Some(program) = manifest.program() {
         let mut used_all = false;
-        for arg in &program.args.0 {
-            used_all = add_program_slot_uses(manifest, &mut program_used_slots, arg);
-            if used_all {
-                break;
+        if let Ok(image) = program.image.parse::<InterpolatedString>() {
+            used_all = add_program_slot_uses(manifest, &mut program_used_slots, &image);
+        }
+        if !used_all {
+            for arg in &program.args.0 {
+                used_all = add_program_slot_uses(manifest, &mut program_used_slots, arg);
+                if used_all {
+                    break;
+                }
             }
         }
         if !used_all {

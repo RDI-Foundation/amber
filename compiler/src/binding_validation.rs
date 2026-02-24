@@ -200,6 +200,12 @@ fn validate_manifest_binding_interpolations(
         src_name,
     };
 
+    if let Ok(image) = program.image.parse::<InterpolatedString>() {
+        let location = ProgramLocation::Image;
+        let span = location.span(source.as_ref(), spans);
+        validate_interpolated_string(&image, &ctx, location, span, &mut diagnostics);
+    }
+
     for (idx, arg) in program.args.0.iter().enumerate() {
         let location = ProgramLocation::Entrypoint(idx);
         let span = location.span(source.as_ref(), spans);
@@ -399,6 +405,7 @@ fn validate_interpolated_config_string(
 
 #[derive(Clone, Copy, Debug)]
 enum ProgramLocation<'a> {
+    Image,
     Entrypoint(usize),
     Env(&'a str),
 }
@@ -406,6 +413,7 @@ enum ProgramLocation<'a> {
 impl ProgramLocation<'_> {
     fn label(self) -> String {
         match self {
+            ProgramLocation::Image => "program.image".to_string(),
             ProgramLocation::Entrypoint(idx) => format!("program.entrypoint[{idx}]"),
             ProgramLocation::Env(key) => format!("program.env.{key}"),
         }
@@ -414,6 +422,9 @@ impl ProgramLocation<'_> {
     fn span(self, source: &str, spans: &ManifestSpans) -> SourceSpan {
         let root = (0usize, source.len()).into();
         match self {
+            ProgramLocation::Image => span_for_json_pointer(source, root, "/program/image")
+                .or_else(|| spans.program.as_ref().map(|p| p.whole))
+                .unwrap_or_else(|| (0usize, 0usize).into()),
             ProgramLocation::Entrypoint(idx) => {
                 for key in ["args", "entrypoint"] {
                     let pointer = format!("/program/{key}/{idx}");

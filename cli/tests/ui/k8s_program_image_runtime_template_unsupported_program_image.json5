@@ -1,0 +1,18 @@
+{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: { tag: { type: "string" } },
+    required: ["tag"],
+    additionalProperties: false,
+  },
+  components: {
+    child: {
+      manifest: "./k8s_program_image_runtime_template_unsupported_program_image_child.json5",
+      config: { tag: "${config.tag}" },
+    },
+  },
+  exports: {
+    child: "#child.child",
+  },
+}

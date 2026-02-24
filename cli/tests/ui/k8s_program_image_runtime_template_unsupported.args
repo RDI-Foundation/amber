@@ -1,0 +1,2 @@
+--no-opt
+--kubernetes /tmp/amber-k8s-ui-output

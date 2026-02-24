@@ -468,6 +468,267 @@ fn kubernetes_emits_router_for_external_slots() {
 }
 
 #[test]
+fn kubernetes_renders_static_program_image_from_static_component_config() {
+    let dir = tempdir().expect("temp dir");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+
+    fs::write(
+        &root_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            child: {
+              manifest: "./child.json5",
+              config: { image: "busybox:1.36.1" }
+            },
+          },
+        }
+        "#,
+    )
+    .expect("write root manifest");
+
+    fs::write(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: { image: { type: "string" } },
+            required: ["image"],
+            additionalProperties: false,
+          },
+          program: {
+            image: "${config.image}",
+            entrypoint: ["child"],
+          },
+        }
+        "#,
+    )
+    .expect("write child manifest");
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..Default::default()
+    };
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let output = rt
+        .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
+        .expect("compile scenario");
+
+    let reporter = KubernetesReporter {
+        config: KubernetesReporterConfig {
+            disable_networkpolicy_check: true,
+        },
+    };
+    let artifact = reporter
+        .emit(&output.scenario)
+        .expect("render kubernetes output");
+
+    let child_deploy = artifact
+        .files
+        .get(&PathBuf::from("03-deployments/c1-child.yaml"))
+        .expect("child deployment");
+    assert!(
+        child_deploy.contains("image: busybox:1.36.1"),
+        "{child_deploy}"
+    );
+
+    let kustomization = artifact
+        .files
+        .get(&PathBuf::from("kustomization.yaml"))
+        .expect("kustomization");
+    assert!(!kustomization.contains("replacements:"), "{kustomization}");
+    assert!(
+        !artifact
+            .files
+            .contains_key(&PathBuf::from("root-config.env")),
+        "static image interpolation should not require runtime root config"
+    );
+}
+
+#[test]
+fn kubernetes_supports_runtime_program_image_when_whole_image_is_config_leaf() {
+    let dir = tempdir().expect("temp dir");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+
+    fs::write(
+        &root_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: { child_image: { type: "string" } },
+            required: ["child_image"],
+            additionalProperties: false,
+          },
+          components: {
+            child: {
+              manifest: "./child.json5",
+              config: { image: "${config.child_image}" }
+            },
+          },
+        }
+        "#,
+    )
+    .expect("write root manifest");
+
+    fs::write(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: { image: { type: "string" } },
+            required: ["image"],
+            additionalProperties: false,
+          },
+          program: {
+            image: "${config.image}",
+            entrypoint: ["child"],
+          },
+        }
+        "#,
+    )
+    .expect("write child manifest");
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..Default::default()
+    };
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let output = rt
+        .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
+        .expect("compile scenario");
+
+    let reporter = KubernetesReporter {
+        config: KubernetesReporterConfig {
+            disable_networkpolicy_check: true,
+        },
+    };
+    let artifact = reporter
+        .emit(&output.scenario)
+        .expect("render kubernetes output");
+
+    let child_deploy = artifact
+        .files
+        .get(&PathBuf::from("03-deployments/c1-child.yaml"))
+        .expect("child deployment");
+    assert!(
+        child_deploy.contains("image: amber-runtime-image-c1-child"),
+        "{child_deploy}"
+    );
+    assert!(
+        !child_deploy.contains("AMBER_TEMPLATE_SPEC_B64"),
+        "{child_deploy}"
+    );
+
+    let kustomization = artifact
+        .files
+        .get(&PathBuf::from("kustomization.yaml"))
+        .expect("kustomization");
+    assert!(kustomization.contains("replacements:"), "{kustomization}");
+    assert!(
+        kustomization.contains("name: amber-root-config"),
+        "{kustomization}"
+    );
+    assert!(
+        kustomization.contains("fieldPath: data.AMBER_CONFIG_CHILD_IMAGE"),
+        "{kustomization}"
+    );
+    assert!(
+        kustomization.contains("spec.template.spec.containers.[name=main].image"),
+        "{kustomization}"
+    );
+
+    let root_env = artifact
+        .files
+        .get(&PathBuf::from("root-config.env"))
+        .expect("runtime image should generate root-config.env");
+    assert!(root_env.contains("AMBER_CONFIG_CHILD_IMAGE="), "{root_env}");
+}
+
+#[test]
+fn kubernetes_rejects_runtime_program_image_templates() {
+    let dir = tempdir().expect("temp dir");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+
+    fs::write(
+        &root_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: { tag: { type: "string" } },
+            required: ["tag"],
+            additionalProperties: false,
+          },
+          components: {
+            child: {
+              manifest: "./child.json5",
+              config: { image: "busybox:${config.tag}" }
+            },
+          },
+        }
+        "#,
+    )
+    .expect("write root manifest");
+
+    fs::write(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: { image: { type: "string" } },
+            required: ["image"],
+            additionalProperties: false,
+          },
+          program: {
+            image: "${config.image}",
+            entrypoint: ["child"],
+          },
+        }
+        "#,
+    )
+    .expect("write child manifest");
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..Default::default()
+    };
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let output = rt
+        .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
+        .expect("compile scenario");
+
+    let reporter = KubernetesReporter {
+        config: KubernetesReporterConfig {
+            disable_networkpolicy_check: true,
+        },
+    };
+    let err = reporter
+        .emit(&output.scenario)
+        .expect_err("mixed runtime image should fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("resolves to a mixed runtime image template"),
+        "{msg}"
+    );
+}
+
+#[test]
 #[ignore = "requires docker + kind + kubectl + curl; run manually"]
 fn kubernetes_smoke_config_roundtrip() {
     if !k8s_smoke_preflight() {

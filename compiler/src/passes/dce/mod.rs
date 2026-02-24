@@ -136,6 +136,13 @@ fn mark_used_slots(
         }
     };
 
+    if let Ok(image) = program.image.parse::<amber_manifest::InterpolatedString>()
+        && image.visit_slot_uses(|slot| mark_slot(component.id.0, slot, live_slots, work))
+    {
+        mark_all(live_slots, work);
+        return;
+    }
+
     for arg in &program.args.0 {
         if arg.visit_slot_uses(|slot| mark_slot(component.id.0, slot, live_slots, work)) {
             mark_all(live_slots, work);

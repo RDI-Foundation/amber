@@ -605,6 +605,9 @@ pub struct Kustomization {
     /// Secret generators.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub secret_generator: Vec<SecretGenerator>,
+    /// Replacements applied to emitted resources.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub replacements: Vec<Replacement>,
     /// Namespace to apply to all resources.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
@@ -661,4 +664,35 @@ pub struct SecretGenerator {
 pub struct GeneratorOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disable_name_suffix_hash: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Replacement {
+    pub source: ReplacementSource,
+    pub targets: Vec<ReplacementTarget>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplacementSource {
+    pub kind: String,
+    pub name: String,
+    #[serde(rename = "fieldPath")]
+    pub field_path: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplacementTarget {
+    pub select: ReplacementSelect,
+    #[serde(rename = "fieldPaths")]
+    pub field_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplacementSelect {
+    pub kind: String,
+    pub name: String,
 }
