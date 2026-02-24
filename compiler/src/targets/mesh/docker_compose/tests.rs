@@ -799,6 +799,256 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
 }
 
 #[test]
+fn compose_mounts_use_helper_direct_mode() {
+    let program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["app"],
+        "mounts": [
+            { "path": "/run/app.txt", "from": "config.app" }
+        ]
+    }))
+    .unwrap();
+
+    let config_schema = json!({
+        "type": "object",
+        "properties": {
+            "app": { "type": "string" }
+        },
+        "required": ["app"]
+    });
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: vec![ComponentId(1)],
+    };
+
+    let child = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/child"),
+        digest: digest(1),
+        config: Some(json!({ "app": "static" })),
+        config_schema: Some(config_schema),
+        program: Some(program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(child)],
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    };
+
+    let yaml = DockerComposeReporter
+        .emit(&scenario)
+        .expect("compose render ok");
+    let compose = parse_compose(&yaml);
+
+    assert!(
+        compose.services.contains_key("amber-init"),
+        "helper init service missing"
+    );
+    assert!(yaml.contains("AMBER_DIRECT_ENTRYPOINT_B64"), "{yaml}");
+    assert!(yaml.contains("AMBER_MOUNT_SPEC_B64"), "{yaml}");
+    assert!(!yaml.contains("AMBER_ROOT_CONFIG_SCHEMA_B64"), "{yaml}");
+}
+
+#[test]
+fn compose_runtime_mount_requires_config_payload() {
+    let program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["app"],
+        "mounts": [
+            { "path": "/run/app.txt", "from": "config.app" }
+        ]
+    }))
+    .unwrap();
+
+    let config_schema = json!({
+        "type": "object",
+        "properties": {
+            "app": { "type": "string" }
+        },
+        "required": ["app"]
+    });
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: Some(config_schema.clone()),
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: vec![ComponentId(1)],
+    };
+
+    let child = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/child"),
+        digest: digest(1),
+        config: Some(json!({ "app": "${config.app}" })),
+        config_schema: Some(config_schema),
+        program: Some(program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(child)],
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    };
+
+    let yaml = DockerComposeReporter
+        .emit(&scenario)
+        .expect("compose render ok");
+
+    assert!(yaml.contains("AMBER_DIRECT_ENTRYPOINT_B64"), "{yaml}");
+    assert!(yaml.contains("AMBER_MOUNT_SPEC_B64"), "{yaml}");
+    assert!(yaml.contains("AMBER_ROOT_CONFIG_SCHEMA_B64"), "{yaml}");
+    assert!(
+        yaml.contains("AMBER_COMPONENT_CONFIG_TEMPLATE_B64"),
+        "{yaml}"
+    );
+}
+
+#[test]
+fn compose_scopes_root_config_env_and_schema() {
+    let program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["app"],
+        "mounts": [
+            { "path": "/run/app.json", "from": "config.app" }
+        ]
+    }))
+    .unwrap();
+
+    let root_schema = json!({
+        "type": "object",
+        "properties": {
+            "app": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "log_level": { "type": "string" }
+                }
+            },
+            "token": { "type": "string", "secret": true }
+        }
+    });
+
+    let component_schema = json!({
+        "type": "object",
+        "properties": {
+            "app": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "log_level": { "type": "string" }
+                }
+            }
+        }
+    });
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: Some(root_schema),
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: vec![ComponentId(1)],
+    };
+
+    let child = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/child"),
+        digest: digest(1),
+        config: Some(json!({ "app": "${config.app}" })),
+        config_schema: Some(component_schema),
+        program: Some(program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(child)],
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    };
+
+    let yaml = DockerComposeReporter
+        .emit(&scenario)
+        .expect("compose render ok");
+    let compose = parse_compose(&yaml);
+    let child_service = service(&compose, "c1-child");
+
+    assert!(
+        env_value(child_service, "AMBER_CONFIG_APP__NAME").is_some(),
+        "missing AMBER_CONFIG_APP__NAME"
+    );
+    assert!(
+        env_value(child_service, "AMBER_CONFIG_APP__LOG_LEVEL").is_some(),
+        "missing AMBER_CONFIG_APP__LOG_LEVEL"
+    );
+    assert!(
+        env_value(child_service, "AMBER_CONFIG_TOKEN").is_none(),
+        "unexpected AMBER_CONFIG_TOKEN exposure"
+    );
+
+    let root_schema_b64 =
+        env_value(child_service, "AMBER_ROOT_CONFIG_SCHEMA_B64").expect("root schema env var");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(root_schema_b64.as_bytes())
+        .expect("decode root schema");
+    let root_schema: serde_json::Value =
+        serde_json::from_slice(&decoded).expect("parse root schema");
+    assert!(
+        root_schema["properties"].get("app").is_some(),
+        "pruned schema missing app"
+    );
+    assert!(
+        root_schema["properties"].get("token").is_none(),
+        "pruned schema should not include token"
+    );
+}
+
+#[test]
 fn compose_emits_export_metadata_and_labels() {
     let server_program = serde_json::from_value(json!({
         "image": "alpine:3.20",

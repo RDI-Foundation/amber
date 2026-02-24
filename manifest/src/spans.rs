@@ -24,6 +24,7 @@ pub struct ManifestSpans {
 pub struct ProgramSpans {
     pub whole: SourceSpan,
     pub endpoints: Vec<EndpointSpans>,
+    pub mounts: Vec<ProgramMountSpans>,
 }
 
 #[derive(Clone, Debug)]
@@ -32,6 +33,17 @@ pub struct EndpointSpans {
     pub whole: SourceSpan,
     pub name_span: SourceSpan,
     pub port_span: Option<SourceSpan>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProgramMountSpans {
+    pub name_value: Option<Arc<str>>,
+    pub path_value: Option<Arc<str>>,
+    pub from_value: Option<Arc<str>>,
+    pub whole: SourceSpan,
+    pub name: Option<SourceSpan>,
+    pub path: Option<SourceSpan>,
+    pub from: Option<SourceSpan>,
 }
 
 #[derive(Clone, Debug)]
@@ -464,42 +476,68 @@ impl ManifestSpans {
 
 fn extract_program_spans(program_value: &Value, program: SpanCursor<'_>) -> ProgramSpans {
     let mut endpoints = Vec::new();
+    let mut mounts = Vec::new();
     let whole = program.span;
     let Some(program_obj) = program_value.as_object() else {
-        return ProgramSpans { whole, endpoints };
-    };
-    let Some(network) = program_obj.get("network") else {
-        return ProgramSpans { whole, endpoints };
-    };
-    let Some(endpoint_array) = network.get("endpoints").and_then(Value::as_array) else {
-        return ProgramSpans { whole, endpoints };
-    };
-    let Some(network) = program.child_cursor("network") else {
-        return ProgramSpans { whole, endpoints };
-    };
-    let Some(endpoints_span) = network.child_cursor("endpoints") else {
-        return ProgramSpans { whole, endpoints };
-    };
-
-    for (idx, endpoint) in endpoint_array.iter().enumerate() {
-        let Some(name) = endpoint.get("name").and_then(|v| v.as_str()) else {
-            continue;
+        return ProgramSpans {
+            whole,
+            endpoints,
+            mounts,
         };
-        let Some(endpoint_span) = endpoints_span.index_cursor(idx) else {
-            continue;
-        };
-        let Some(name_span) = endpoint_span.child_span("name") else {
-            continue;
-        };
-        endpoints.push(EndpointSpans {
-            name: name.into(),
-            whole: endpoint_span.span,
-            name_span,
-            port_span: endpoint_span.child_span("port"),
-        });
+    };
+    if let Some(endpoint_array) = program_obj
+        .get("network")
+        .and_then(|v| v.get("endpoints"))
+        .and_then(Value::as_array)
+        && let Some(network) = program.child_cursor("network")
+        && let Some(endpoints_span) = network.child_cursor("endpoints")
+    {
+        for (idx, endpoint) in endpoint_array.iter().enumerate() {
+            let Some(name) = endpoint.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(endpoint_span) = endpoints_span.index_cursor(idx) else {
+                continue;
+            };
+            let Some(name_span) = endpoint_span.child_span("name") else {
+                continue;
+            };
+            endpoints.push(EndpointSpans {
+                name: name.into(),
+                whole: endpoint_span.span,
+                name_span,
+                port_span: endpoint_span.child_span("port"),
+            });
+        }
     }
 
-    ProgramSpans { whole, endpoints }
+    if let Some(mounts_value) = program_obj.get("mounts").and_then(Value::as_array)
+        && let Some(mounts_span) = program.child_cursor("mounts")
+    {
+        for (idx, mount) in mounts_value.iter().enumerate() {
+            let Some(mount_span) = mounts_span.index_cursor(idx) else {
+                continue;
+            };
+            let name_value = mount.get("name").and_then(|v| v.as_str()).map(Arc::from);
+            let path_value = mount.get("path").and_then(|v| v.as_str()).map(Arc::from);
+            let from_value = mount.get("from").and_then(|v| v.as_str()).map(Arc::from);
+            mounts.push(ProgramMountSpans {
+                name_value,
+                path_value,
+                from_value,
+                whole: mount_span.span,
+                name: mount_span.child_span("name"),
+                path: mount_span.child_span("path"),
+                from: mount_span.child_span("from"),
+            });
+        }
+    }
+
+    ProgramSpans {
+        whole,
+        endpoints,
+        mounts,
+    }
 }
 
 fn pointer_for_key(key: &str) -> String {

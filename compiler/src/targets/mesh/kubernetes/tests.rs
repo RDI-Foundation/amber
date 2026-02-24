@@ -1,15 +1,19 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Arc,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use amber_images::{AMBER_HELPER, AMBER_ROUTER};
-use amber_manifest::ManifestRef;
+use amber_manifest::{ManifestDigest, ManifestRef};
 use amber_resolver::Resolver;
+use amber_scenario::{Component, ComponentId, Moniker, Scenario};
 use base64::Engine as _;
+use serde_json::json;
 use tempfile::tempdir;
 use url::Url;
 
@@ -18,6 +22,14 @@ use crate::{CompileOptions, Compiler, DigestStore, OptimizeOptions, reporter::Re
 
 const HELPER_IMAGE: &str = AMBER_HELPER.reference;
 const ROUTER_IMAGE: &str = AMBER_ROUTER.reference;
+
+fn digest(byte: u8) -> ManifestDigest {
+    ManifestDigest::new([byte; 32])
+}
+
+fn moniker(path: &str) -> Moniker {
+    Moniker::from(Arc::from(path))
+}
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -725,6 +737,312 @@ fn kubernetes_rejects_runtime_program_image_templates() {
     assert!(
         msg.contains("resolves to a mixed runtime image template"),
         "{msg}"
+    );
+}
+
+#[test]
+fn kubernetes_mounts_use_helper_direct_mode() {
+    use amber_manifest::Program;
+
+    let program: Program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["app"],
+        "mounts": [
+            { "path": "/run/app.txt", "from": "config.app" }
+        ]
+    }))
+    .unwrap();
+
+    let config_schema = json!({
+        "type": "object",
+        "properties": {
+            "app": { "type": "string" }
+        },
+        "required": ["app"]
+    });
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: vec![ComponentId(1)],
+    };
+
+    let child = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/child"),
+        digest: digest(1),
+        config: Some(json!({ "app": "static" })),
+        config_schema: Some(config_schema),
+        program: Some(program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(child)],
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    };
+
+    let reporter = KubernetesReporter {
+        config: KubernetesReporterConfig {
+            disable_networkpolicy_check: true,
+        },
+    };
+    let artifact = reporter.emit(&scenario).expect("render kubernetes output");
+
+    let any_direct = artifact
+        .files
+        .values()
+        .any(|doc| doc.contains("AMBER_DIRECT_ENTRYPOINT_B64"));
+    let any_mount = artifact
+        .files
+        .values()
+        .any(|doc| doc.contains("AMBER_MOUNT_SPEC_B64"));
+    let any_root_schema = artifact
+        .files
+        .values()
+        .any(|doc| doc.contains("AMBER_ROOT_CONFIG_SCHEMA_B64"));
+
+    assert!(any_direct, "direct helper env missing");
+    assert!(any_mount, "mount spec env missing");
+    assert!(!any_root_schema, "root schema should not be required");
+}
+
+#[test]
+fn kubernetes_runtime_mount_requires_config_payload() {
+    use amber_manifest::Program;
+
+    let program: Program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["app"],
+        "mounts": [
+            { "path": "/run/app.txt", "from": "config.app" }
+        ]
+    }))
+    .unwrap();
+
+    let config_schema = json!({
+        "type": "object",
+        "properties": {
+            "app": { "type": "string" }
+        },
+        "required": ["app"]
+    });
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: Some(config_schema.clone()),
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: vec![ComponentId(1)],
+    };
+
+    let child = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/child"),
+        digest: digest(1),
+        config: Some(json!({ "app": "${config.app}" })),
+        config_schema: Some(config_schema),
+        program: Some(program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(child)],
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    };
+
+    let reporter = KubernetesReporter {
+        config: KubernetesReporterConfig {
+            disable_networkpolicy_check: true,
+        },
+    };
+    let artifact = reporter.emit(&scenario).expect("render kubernetes output");
+
+    let any_direct = artifact
+        .files
+        .values()
+        .any(|doc| doc.contains("AMBER_DIRECT_ENTRYPOINT_B64"));
+    let any_mount = artifact
+        .files
+        .values()
+        .any(|doc| doc.contains("AMBER_MOUNT_SPEC_B64"));
+    let any_root_schema = artifact
+        .files
+        .values()
+        .any(|doc| doc.contains("AMBER_ROOT_CONFIG_SCHEMA_B64"));
+    let any_component_template = artifact
+        .files
+        .values()
+        .any(|doc| doc.contains("AMBER_COMPONENT_CONFIG_TEMPLATE_B64"));
+
+    assert!(any_direct, "direct helper env missing");
+    assert!(any_mount, "mount spec env missing");
+    assert!(any_root_schema, "root schema should be required");
+    assert!(any_component_template, "component template missing");
+}
+
+#[test]
+fn kubernetes_mount_includes_object_config_leaves() {
+    use amber_manifest::Program;
+
+    let program: Program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["app"],
+        "mounts": [
+            { "path": "/run/app.json", "from": "config.app" }
+        ]
+    }))
+    .unwrap();
+
+    let root_schema = json!({
+        "type": "object",
+        "properties": {
+            "app": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "log_level": { "type": "string" }
+                }
+            },
+            "token": { "type": "string", "secret": true }
+        }
+    });
+
+    let component_schema = json!({
+        "type": "object",
+        "properties": {
+            "app": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "log_level": { "type": "string" }
+                }
+            }
+        }
+    });
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: Some(root_schema.clone()),
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: vec![ComponentId(1)],
+    };
+
+    let child = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/child"),
+        digest: digest(1),
+        config: Some(json!({ "app": "${config.app}" })),
+        config_schema: Some(component_schema),
+        program: Some(program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(child)],
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    };
+
+    let reporter = KubernetesReporter {
+        config: KubernetesReporterConfig {
+            disable_networkpolicy_check: true,
+        },
+    };
+    let artifact = reporter.emit(&scenario).expect("render kubernetes output");
+
+    let deploy_doc = artifact
+        .files
+        .values()
+        .find(|doc| doc.contains("AMBER_MOUNT_SPEC_B64"))
+        .expect("component deployment");
+    let deploy_doc: serde_yaml::Value = serde_yaml::from_str(deploy_doc).expect("parse deployment");
+    let envs = deploy_doc["spec"]["template"]["spec"]["containers"][0]["env"]
+        .as_sequence()
+        .expect("env list");
+    let names: BTreeSet<String> = envs
+        .iter()
+        .filter_map(|item| item["name"].as_str().map(|s| s.to_string()))
+        .collect();
+    let root_schema_b64 = envs
+        .iter()
+        .find_map(|item| {
+            if item["name"].as_str() == Some("AMBER_ROOT_CONFIG_SCHEMA_B64") {
+                item["value"].as_str().map(|v| v.to_string())
+            } else {
+                None
+            }
+        })
+        .expect("root schema env var");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(root_schema_b64.as_bytes())
+        .expect("decode root schema");
+    let root_schema: serde_json::Value =
+        serde_json::from_slice(&decoded).expect("parse root schema");
+
+    assert!(
+        names.contains("AMBER_CONFIG_APP__NAME"),
+        "missing AMBER_CONFIG_APP__NAME"
+    );
+    assert!(
+        names.contains("AMBER_CONFIG_APP__LOG_LEVEL"),
+        "missing AMBER_CONFIG_APP__LOG_LEVEL"
+    );
+    assert!(
+        !names.contains("AMBER_CONFIG_TOKEN"),
+        "unexpected AMBER_CONFIG_TOKEN exposure"
+    );
+    assert!(
+        root_schema["properties"].get("app").is_some(),
+        "pruned schema missing app"
+    );
+    assert!(
+        root_schema["properties"].get("token").is_none(),
+        "pruned schema should not include token"
     );
 }
 

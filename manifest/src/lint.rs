@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::{
     BindingSource, ComponentDecl, ExportTarget, InterpolatedPart, InterpolatedString,
-    InterpolationSource, Manifest, ManifestSpans, SlotName,
+    InterpolationSource, Manifest, ManifestSpans, MountSource, SlotName,
 };
 
 #[allow(unused_assignments)]
@@ -184,6 +184,12 @@ fn collect_config_uses(manifest: &Manifest) -> ConfigUses {
         }
         for value in program.env.values() {
             collect_config_uses_from_interpolated(value, &mut uses);
+        }
+        for mount in &program.mounts {
+            match &mount.source {
+                MountSource::Config(path) | MountSource::Secret(path) => uses.add_query(path),
+                MountSource::Slot(_) | MountSource::Binding(_) | MountSource::Framework(_) => {}
+            }
         }
     }
 

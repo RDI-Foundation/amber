@@ -44,6 +44,123 @@ pub struct Program {
     pub env: BTreeMap<String, InterpolatedString>,
     #[serde(default)]
     pub network: Option<Network>,
+    #[serde(default)]
+    #[builder(default)]
+    pub mounts: Vec<ProgramMount>,
+}
+
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, bon::Builder,
+)]
+#[builder(on(String, into))]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ProgramMount {
+    #[serde(default)]
+    pub name: Option<String>,
+    pub path: String,
+    #[serde(rename = "from")]
+    pub source: MountSource,
+}
+
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, DeserializeFromStr, SerializeDisplay,
+)]
+#[non_exhaustive]
+pub enum MountSource {
+    Config(String),
+    Secret(String),
+    Slot(String),
+    Binding(String),
+    Framework(FrameworkCapabilityName),
+}
+
+impl fmt::Display for MountSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MountSource::Config(path) => write_prefixed(f, "config", path),
+            MountSource::Secret(path) => write_prefixed(f, "secret", path),
+            MountSource::Slot(name) => write_prefixed(f, "slots", name),
+            MountSource::Binding(name) => write_prefixed(f, "bindings", name),
+            MountSource::Framework(name) => write!(f, "framework.{name}"),
+        }
+    }
+}
+
+impl FromStr for MountSource {
+    type Err = Error;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        fn ensure_path(input: &str, path: &str) -> Result<String, Error> {
+            if path.is_empty() {
+                return Err(Error::InvalidMountSource {
+                    mount: input.to_string(),
+                    message: "expected a path segment".to_string(),
+                });
+            }
+            if path.split('.').any(|seg| seg.is_empty()) {
+                return Err(Error::InvalidMountSource {
+                    mount: input.to_string(),
+                    message: "path contains an empty segment".to_string(),
+                });
+            }
+            Ok(path.to_string())
+        }
+
+        if input == "config" {
+            return Ok(MountSource::Config(String::new()));
+        }
+        if let Some(path) = input.strip_prefix("config.") {
+            return Ok(MountSource::Config(ensure_path(input, path)?));
+        }
+        if let Some(path) = input.strip_prefix("secret.") {
+            return Ok(MountSource::Secret(ensure_path(input, path)?));
+        }
+        if input == "secret" {
+            return Err(Error::InvalidMountSource {
+                mount: input.to_string(),
+                message: "secret mounts require an explicit path (secret.<path>)".to_string(),
+            });
+        }
+        if let Some(name) = input.strip_prefix("slots.") {
+            let name = ensure_path(input, name)?;
+            return Ok(MountSource::Slot(name));
+        }
+        if let Some(name) = input.strip_prefix("bindings.") {
+            let name = ensure_path(input, name)?;
+            return Ok(MountSource::Binding(name));
+        }
+        if let Some(name) = input.strip_prefix("framework.") {
+            let name = ensure_path(input, name)?;
+            let cap = FrameworkCapabilityName::try_from(name.as_str()).map_err(|_| {
+                Error::InvalidMountSource {
+                    mount: input.to_string(),
+                    message: "framework capability name contains an invalid character".to_string(),
+                }
+            })?;
+            return Ok(MountSource::Framework(cap));
+        }
+        if input == "framework" {
+            return Err(Error::InvalidMountSource {
+                mount: input.to_string(),
+                message: "framework mounts require a capability name (framework.<capability>)"
+                    .to_string(),
+            });
+        }
+
+        Err(Error::InvalidMountSource {
+            mount: input.to_string(),
+            message: "unknown mount source".to_string(),
+        })
+    }
+}
+
+fn write_prefixed(f: &mut fmt::Formatter<'_>, prefix: &str, path: &str) -> fmt::Result {
+    if path.is_empty() {
+        f.write_str(prefix)
+    } else {
+        write!(f, "{prefix}.{path}")
+    }
 }
 
 fn deserialize_program_image<'de, D>(deserializer: D) -> Result<String, D::Error>

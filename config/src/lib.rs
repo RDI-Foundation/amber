@@ -11,12 +11,12 @@ pub use error::{ConfigError, Result};
 pub use node::{ConfigNode, RootConfigTemplate, compose_config_template};
 pub use schema::{
     SchemaLeaf, SchemaLookup, SchemaWalkResult, canonical_json, collect_leaf_paths,
-    collect_schema_leaves, is_valid_config_key, schema_lookup, schema_lookup_ref,
+    collect_schema_leaves, is_valid_config_key, prune_schema, schema_lookup, schema_lookup_ref,
     validate_config_schema,
 };
 pub use template::{
     eval_config_template, get_by_path, render_template_string, stringify_for_interpolation,
-    template_string_is_runtime,
+    stringify_for_mount, template_string_is_runtime,
 };
 
 #[cfg(test)]
@@ -108,6 +108,15 @@ mod tests {
                 "label": "token=secret"
             })
         );
+    }
+
+    #[test]
+    fn stringify_for_mount_handles_null_and_objects() {
+        assert_eq!(stringify_for_mount(&json!(null)).unwrap(), "");
+        assert_eq!(stringify_for_mount(&json!("hi")).unwrap(), "hi");
+        assert_eq!(stringify_for_mount(&json!(true)).unwrap(), "true");
+        assert_eq!(stringify_for_mount(&json!(3)).unwrap(), "3");
+        assert_eq!(stringify_for_mount(&json!({"a": 1})).unwrap(), r#"{"a":1}"#);
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::{
     sync::OnceLock,
 };
 
+use amber_config as rc;
 use bon::bon;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -17,8 +18,8 @@ use crate::{
     refs::{ManifestDigest, ManifestRef, ManifestUrl},
     schema::{
         Binding, BindingSource, BindingSourceRef, BindingTarget, ComponentDecl, ConfigSchema,
-        EnvironmentDecl, ExportTarget, LocalComponentRef, Program, ProvideDecl, RawBinding,
-        RawExportTarget, SlotDecl,
+        EnvironmentDecl, ExportTarget, LocalComponentRef, MountSource, Program, ProvideDecl,
+        RawBinding, RawExportTarget, SlotDecl,
     },
 };
 
@@ -432,6 +433,129 @@ fn validate_endpoints(
     Ok(())
 }
 
+fn validate_mounts(
+    program: Option<&Program>,
+    config_schema: Option<&ConfigSchema>,
+) -> Result<(), Error> {
+    let Some(program) = program else {
+        return Ok(());
+    };
+
+    let mut names = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+
+    for mount in &program.mounts {
+        if let Some(name) = mount.name.as_deref() {
+            ensure_name_no_dot(name, "mount")?;
+            if !names.insert(name) {
+                return Err(Error::DuplicateMountName {
+                    name: name.to_string(),
+                });
+            }
+        }
+
+        if !mount.path.starts_with('/') {
+            return Err(Error::InvalidMountPath {
+                path: mount.path.clone(),
+                message: "mount path must be absolute".to_string(),
+            });
+        }
+        if mount.path.split('/').any(|seg| seg == "..") {
+            return Err(Error::InvalidMountPath {
+                path: mount.path.clone(),
+                message: "mount path must not contain `..`".to_string(),
+            });
+        }
+        if !paths.insert(mount.path.as_str()) {
+            return Err(Error::DuplicateMountPath {
+                path: mount.path.clone(),
+            });
+        }
+
+        match &mount.source {
+            MountSource::Config(path) => {
+                let Some(schema) = config_schema else {
+                    return Err(Error::InvalidMountConfigPath {
+                        path: path.clone(),
+                        message: "component has no config_schema".to_string(),
+                    });
+                };
+                validate_mount_path(&schema.0, path).map_err(|message| {
+                    Error::InvalidMountConfigPath {
+                        path: path.clone(),
+                        message,
+                    }
+                })?;
+                let (any_secret, _) = mount_secret_flags(&schema.0, path)?;
+                if any_secret {
+                    return Err(Error::MountConfigPathIsSecret { path: path.clone() });
+                }
+            }
+            MountSource::Secret(path) => {
+                let Some(schema) = config_schema else {
+                    return Err(Error::InvalidMountSecretPath {
+                        path: path.clone(),
+                        message: "component has no config_schema".to_string(),
+                    });
+                };
+                validate_mount_path(&schema.0, path).map_err(|message| {
+                    Error::InvalidMountSecretPath {
+                        path: path.clone(),
+                        message,
+                    }
+                })?;
+                let (any_secret, any_non_secret) = mount_secret_flags(&schema.0, path)?;
+                if !any_secret || any_non_secret {
+                    return Err(Error::MountSecretPathIsNotSecret { path: path.clone() });
+                }
+            }
+            MountSource::Slot(_) | MountSource::Binding(_) | MountSource::Framework(_) => {
+                return Err(Error::UnsupportedMountSource {
+                    mount: mount.source.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_mount_path(schema: &Value, path: &str) -> Result<(), String> {
+    match rc::schema_lookup(schema, path) {
+        Ok(rc::SchemaLookup::Found) | Ok(rc::SchemaLookup::Unknown) => Ok(()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn mount_secret_flags(schema: &Value, path: &str) -> Result<(bool, bool), Error> {
+    let walk = rc::collect_schema_leaves(schema);
+    let prefix = if path.is_empty() {
+        None
+    } else {
+        Some(format!("{path}."))
+    };
+
+    let mut any_secret = false;
+    let mut any_non_secret = false;
+
+    for leaf in walk.leaves {
+        let matches = match &prefix {
+            None => true,
+            Some(prefix) => leaf.path == path || leaf.path.starts_with(prefix),
+        };
+        if !matches {
+            continue;
+        }
+        if leaf.secret {
+            any_secret = true;
+        } else {
+            any_non_secret = true;
+        }
+    }
+
+    Ok((any_secret, any_non_secret))
+}
+
 impl RawManifest {
     fn digest(&self) -> ManifestDigest {
         ManifestDigest::digest(self)
@@ -489,6 +613,7 @@ impl RawManifest {
         let bindings_out = build_bindings(bindings, &ctx)?;
         let exports_out = build_exports(exports, &ctx)?;
         validate_endpoints(program.as_ref(), &provides)?;
+        validate_mounts(program.as_ref(), config_schema.as_ref())?;
 
         if let Some(program) = program.as_ref()
             && program.args.0.is_empty()

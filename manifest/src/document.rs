@@ -150,6 +150,35 @@ fn labels_for_manifest_error(err: &ManifestError, spans: &ManifestSpans) -> Vec<
         ManifestError::MissingProvideEndpoint { name } => {
             labels_for_missing_provide_endpoint(spans, name)
         }
+        ManifestError::DuplicateMountName { name } => {
+            labels_for_mount_name(spans, name, "duplicate mount name")
+        }
+        ManifestError::DuplicateMountPath { path } => {
+            labels_for_mount_path(spans, path, "duplicate mount path")
+        }
+        ManifestError::InvalidMountSource { mount, .. } => {
+            labels_for_mount_source(spans, mount, "mount source here")
+        }
+        ManifestError::InvalidMountPath { path, .. } => {
+            labels_for_mount_path(spans, path, "invalid mount path")
+        }
+        ManifestError::InvalidMountConfigPath { path, .. }
+        | ManifestError::MountConfigPathIsSecret { path } => {
+            let source = if path.is_empty() {
+                "config".to_string()
+            } else {
+                format!("config.{path}")
+            };
+            labels_for_mount_source(spans, &source, "mount source here")
+        }
+        ManifestError::InvalidMountSecretPath { path, .. }
+        | ManifestError::MountSecretPathIsNotSecret { path } => {
+            let source = format!("secret.{path}");
+            labels_for_mount_source(spans, &source, "mount source here")
+        }
+        ManifestError::UnsupportedMountSource { mount } => {
+            labels_for_mount_source(spans, mount, "reserved mount source")
+        }
         ManifestError::InvalidConfigSchema(_) => vec![primary(
             span_or_default(spans.config_schema),
             Some("invalid config definition here".to_string()),
@@ -199,6 +228,9 @@ fn labels_for_invalid_name(
             "slot" => spans.slots.get(name).map(|s| s.name),
             "provide" => spans.provides.get(name).map(|s| s.capability.name),
             "export" => spans.exports.get(name).map(|s| s.name),
+            "mount" => {
+                return labels_for_mount_name(spans, name, "invalid mount name");
+            }
             "binding" => spans.bindings_by_index.iter().find_map(|binding| {
                 match binding.name_value.as_deref() {
                     Some(value) if value == name => binding.name.or(Some(binding.whole)),
@@ -211,6 +243,57 @@ fn labels_for_invalid_name(
         span_or_default(span),
         Some("invalid name".to_string()),
     )]
+}
+
+fn labels_for_mount_name(spans: &ManifestSpans, name: &str, label: &str) -> Vec<LabeledSpan> {
+    let Some(program) = spans.program.as_ref() else {
+        return Vec::new();
+    };
+    program
+        .mounts
+        .iter()
+        .filter(|mount| mount.name_value.as_deref() == Some(name))
+        .map(|mount| {
+            primary(
+                span_or_default(mount.name.or(Some(mount.whole))),
+                Some(label.to_string()),
+            )
+        })
+        .collect()
+}
+
+fn labels_for_mount_path(spans: &ManifestSpans, path: &str, label: &str) -> Vec<LabeledSpan> {
+    let Some(program) = spans.program.as_ref() else {
+        return Vec::new();
+    };
+    program
+        .mounts
+        .iter()
+        .filter(|mount| mount.path_value.as_deref() == Some(path))
+        .map(|mount| {
+            primary(
+                span_or_default(mount.path.or(Some(mount.whole))),
+                Some(label.to_string()),
+            )
+        })
+        .collect()
+}
+
+fn labels_for_mount_source(spans: &ManifestSpans, source: &str, label: &str) -> Vec<LabeledSpan> {
+    let Some(program) = spans.program.as_ref() else {
+        return Vec::new();
+    };
+    program
+        .mounts
+        .iter()
+        .filter(|mount| mount.from_value.as_deref() == Some(source))
+        .map(|mount| {
+            primary(
+                span_or_default(mount.from.or(Some(mount.whole))),
+                Some(label.to_string()),
+            )
+        })
+        .collect()
 }
 
 fn labels_for_mixed_binding_form(spans: &ManifestSpans, to: &str, from: &str) -> Vec<LabeledSpan> {

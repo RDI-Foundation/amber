@@ -29,8 +29,8 @@ pub(crate) use schema::binding_target_key_for_binding;
 pub use schema::{
     Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityDecl, CapabilityKind,
     ComponentDecl, ComponentRef, ConfigSchema, Endpoint, EnvironmentDecl, ExportTarget,
-    LocalComponentRef, Network, NetworkProtocol, Program, ProvideDecl, RawBinding, RawExportTarget,
-    SlotDecl,
+    LocalComponentRef, MountSource, Network, NetworkProtocol, Program, ProgramMount, ProvideDecl,
+    RawBinding, RawExportTarget, SlotDecl,
 };
 pub use spans::{
     BindingSpans, BindingTargetKey, CapabilityDeclSpans, ComponentDeclSpans, EndpointSpans,

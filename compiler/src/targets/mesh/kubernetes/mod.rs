@@ -20,17 +20,19 @@ use crate::{
         addressing::{Addressing, RouterPortBases, WorkloadId, build_address_plan},
         config::{
             ProgramImageOrigin, ProgramImagePart, ProgramImagePlan, ProgramPlan,
-            encode_helper_payload, encode_schema_b64,
+            allowed_root_leaf_paths, encode_component_payload, encode_direct_entrypoint_b64,
+            encode_direct_env_b64, encode_helper_payload, encode_mount_spec_b64, encode_schema_b64,
+            mount_specs_need_config, prune_root_schema,
         },
         internal_images::resolve_internal_images,
         plan::{MeshOptions, component_label},
     },
 };
 
-// Helper injection system: When a component requires runtime config interpolation,
-// an init container installs the amber-helper binary into a shared volume, then the
-// main container uses the helper as its entrypoint to resolve config templates and
-// exec the actual program.
+// Helper injection system: When a component requires runtime config interpolation
+// or mounts, an init container installs the amber-helper binary into a shared
+// volume, then the main container uses the helper as its entrypoint to resolve
+// config/templates, materialize mounts, and exec the actual program.
 const HELPER_VOLUME_NAME: &str = "amber-helper";
 const HELPER_BIN_DIR: &str = "/amber/bin";
 const HELPER_BIN_PATH: &str = "/amber/bin/amber-helper";
@@ -294,8 +296,6 @@ fn render_kubernetes_inner(
         &address_plan.binding_values_by_component,
     )
     .map_err(|e| ReporterError::new(e.to_string()))?;
-    let root_schema = config_plan.root_schema.as_ref();
-
     // Standard labels for all resources.
     let scenario_labels = |extra: &[(&str, &str)]| -> BTreeMap<String, String> {
         let mut labels = BTreeMap::new();
@@ -343,9 +343,7 @@ fn render_kubernetes_inner(
         .map(|leaf| (leaf.path.as_str(), leaf))
         .collect();
     let program_plans = &config_plan.program_plans;
-    let any_helper = config_plan.uses_helper;
-    let any_runtime_image = config_plan.uses_runtime_image;
-    let needs_runtime_root_config = any_helper || any_runtime_image;
+    let component_templates = &config_plan.component_templates;
 
     let export_ports_by_name = &address_plan.router.export_ports_by_name;
     let router_export_ports = &address_plan.router.export_ports;
@@ -392,8 +390,8 @@ fn render_kubernetes_inner(
     let mut kustomization = Kustomization::new();
     kustomization.namespace = Some(namespace.clone());
 
-    // If helper mode or runtime image interpolation is used, generate root config inputs.
-    if needs_runtime_root_config {
+    // If runtime config is needed, generate root config Secret/ConfigMap and .env templates.
+    if config_plan.needs_runtime_config {
         // Separate root leaves into secret and non-secret.
         let (secret_leaves, config_leaves): (Vec<_>, Vec<_>) =
             root_leaves.iter().partition(|l| l.secret);
@@ -475,24 +473,10 @@ fn render_kubernetes_inner(
     //   The helper reads config values from the root config Secret/ConfigMap at
     //   runtime and resolves templates, so secret values are not inlined.
     // The only ConfigMaps generated are amber-metadata and the Kustomize-generated
-    // root config (when helper mode or runtime image interpolation is used).
+    // root config (when runtime config is needed). Pods only reference explicitly
+    // granted keys, so unassigned config never becomes visible inside containers.
 
-    // Encode root schema for helper (needed for all helper components).
-    let root_schema_b64 = if any_helper {
-        let root_schema = root_schema.ok_or_else(|| {
-            ReporterError::new(
-                "root component must declare `config_schema` when runtime config interpolation is \
-                 required"
-                    .to_string(),
-            )
-        })?;
-        Some(
-            encode_schema_b64("root config definition", root_schema)
-                .map_err(|e| ReporterError::new(e.to_string()))?,
-        )
-    } else {
-        None
-    };
+    let root_schema = config_plan.root_schema.as_ref();
 
     // Deployments
     for id in program_components {
@@ -511,6 +495,12 @@ fn render_kubernetes_inner(
             &component,
             image_source.as_ref(),
         )?;
+        let mount_specs = config_plan.mount_specs.get(id);
+        let mounts_need_config = mount_specs.is_some_and(|specs| mount_specs_need_config(specs));
+        let needs_config_payload =
+            matches!(program_plan, ProgramPlan::Helper { .. }) || mounts_need_config;
+        let needs_helper_for_component =
+            matches!(program_plan, ProgramPlan::Helper { .. }) || mount_specs.is_some();
 
         // Container ports.
         let mut ports: Vec<ContainerPort> = Vec::new();
@@ -528,7 +518,7 @@ fn render_kubernetes_inner(
         let (container, volumes) = match program_plan {
             ProgramPlan::Direct {
                 entrypoint, env, ..
-            } => {
+            } if !needs_helper_for_component => {
                 // Direct mode: use resolved entrypoint and env directly.
                 // Config values are already baked into the entrypoint/env strings,
                 // so we don't need AMBER_CONFIG_* env vars here.
@@ -549,6 +539,90 @@ fn render_kubernetes_inner(
 
                 (container, Vec::new())
             }
+            ProgramPlan::Direct {
+                entrypoint, env, ..
+            } => {
+                let entrypoint_b64 = encode_direct_entrypoint_b64(entrypoint)
+                    .map_err(|e| ReporterError::new(e.to_string()))?;
+                let env_b64 =
+                    encode_direct_env_b64(env).map_err(|e| ReporterError::new(e.to_string()))?;
+
+                let mut container_env = Vec::new();
+                container_env.push(EnvVar::literal(
+                    "AMBER_DIRECT_ENTRYPOINT_B64",
+                    entrypoint_b64,
+                ));
+                container_env.push(EnvVar::literal("AMBER_DIRECT_ENV_B64", env_b64));
+
+                if needs_config_payload {
+                    let label = component_label(s, *id);
+                    let component_template = component_templates
+                        .get(id)
+                        .expect("component template computed");
+                    // Security: only expose explicitly granted root config leaves to the pod.
+                    let allowed_leaf_paths =
+                        allowed_root_leaf_paths(root_leaves, component_template);
+                    let mut config_env =
+                        build_component_config_env(root_leaves, &allowed_leaf_paths)?;
+                    container_env.append(&mut config_env);
+
+                    let root_schema = root_schema.expect("config payload requires root schema");
+                    let pruned_schema = prune_root_schema(&label, root_schema, &allowed_leaf_paths)
+                        .map_err(|e| ReporterError::new(e.to_string()))?;
+                    let root_schema_b64 = encode_schema_b64(
+                        &format!("root config definition for {label}"),
+                        &pruned_schema,
+                    )
+                    .map_err(|e| ReporterError::new(e.to_string()))?;
+                    container_env.push(EnvVar::literal(
+                        "AMBER_ROOT_CONFIG_SCHEMA_B64",
+                        root_schema_b64,
+                    ));
+
+                    let component_schema = c
+                        .config_schema
+                        .as_ref()
+                        .expect("component config schema required");
+                    let payload =
+                        encode_component_payload(&label, component_template, component_schema)
+                            .map_err(|e| ReporterError::new(e.to_string()))?;
+                    container_env.push(EnvVar::literal(
+                        "AMBER_COMPONENT_CONFIG_SCHEMA_B64",
+                        &payload.component_schema_b64,
+                    ));
+                    container_env.push(EnvVar::literal(
+                        "AMBER_COMPONENT_CONFIG_TEMPLATE_B64",
+                        &payload.component_cfg_template_b64,
+                    ));
+                }
+
+                if let Some(specs) = mount_specs {
+                    let label = component_label(s, *id);
+                    let mount_b64 = encode_mount_spec_b64(&label, specs)
+                        .map_err(|e| ReporterError::new(e.to_string()))?;
+                    container_env.push(EnvVar::literal("AMBER_MOUNT_SPEC_B64", mount_b64));
+                }
+
+                let container = Container {
+                    name: "main".to_string(),
+                    image: program_image.clone(),
+                    command: vec![HELPER_BIN_PATH.to_string(), "run".to_string()],
+                    args: Vec::new(),
+                    env: container_env,
+                    env_from: Vec::new(),
+                    ports,
+                    readiness_probe: None,
+                    volume_mounts: vec![VolumeMount {
+                        name: HELPER_VOLUME_NAME.to_string(),
+                        mount_path: HELPER_BIN_DIR.to_string(),
+                        read_only: Some(true),
+                    }],
+                };
+
+                let volumes = vec![Volume::empty_dir(HELPER_VOLUME_NAME)];
+
+                (container, volumes)
+            }
             ProgramPlan::Helper {
                 template_spec,
                 component_template,
@@ -565,47 +639,20 @@ fn render_kubernetes_inner(
                 .map_err(|e| ReporterError::new(e.to_string()))?;
 
                 // Helper mode: use helper binary as entrypoint, mount shared volume.
-                let mut container_env: Vec<EnvVar> = Vec::new();
-
-                // Collect config paths referenced by this component's template.
-                let referenced_paths = collect_config_refs(component_template);
-
-                // Add only the root config env vars that are actually referenced by this component.
-                // If referenced_paths is None, it means the component template is Root and needs all config.
-                for leaf in root_leaves {
-                    // Check if this leaf path is referenced by the component template.
-                    let should_include = match &referenced_paths {
-                        Some(paths) => paths.contains(&leaf.path),
-                        None => true, // Root template needs all config
-                    };
-
-                    if !should_include {
-                        continue;
-                    }
-
-                    let env_var = rc::env_var_for_path(&leaf.path).map_err(|e| {
-                        ReporterError::new(format!("failed to map config path: {e}"))
-                    })?;
-
-                    if leaf.secret {
-                        container_env.push(EnvVar::from_secret(
-                            &env_var,
-                            ROOT_CONFIG_SECRET_NAME,
-                            &env_var,
-                        ));
-                    } else {
-                        container_env.push(EnvVar::from_config_map(
-                            &env_var,
-                            ROOT_CONFIG_CONFIGMAP_NAME,
-                            &env_var,
-                        ));
-                    }
-                }
+                // Security: only expose explicitly granted root config leaves to the pod.
+                let allowed_leaf_paths = allowed_root_leaf_paths(root_leaves, component_template);
+                let mut container_env =
+                    build_component_config_env(root_leaves, &allowed_leaf_paths)?;
 
                 // Add helper-specific env vars.
-                let root_schema_b64 = root_schema_b64
-                    .as_ref()
-                    .expect("helper mode requires root schema");
+                let root_schema = root_schema.expect("helper mode requires root schema");
+                let pruned_schema = prune_root_schema(&label, root_schema, &allowed_leaf_paths)
+                    .map_err(|e| ReporterError::new(e.to_string()))?;
+                let root_schema_b64 = encode_schema_b64(
+                    &format!("root config definition for {label}"),
+                    &pruned_schema,
+                )
+                .map_err(|e| ReporterError::new(e.to_string()))?;
                 container_env.push(EnvVar::literal(
                     "AMBER_ROOT_CONFIG_SCHEMA_B64",
                     root_schema_b64,
@@ -622,6 +669,11 @@ fn render_kubernetes_inner(
                     "AMBER_TEMPLATE_SPEC_B64",
                     &payload.template_spec_b64,
                 ));
+                if let Some(specs) = mount_specs {
+                    let mount_b64 = encode_mount_spec_b64(&label, specs)
+                        .map_err(|e| ReporterError::new(e.to_string()))?;
+                    container_env.push(EnvVar::literal("AMBER_MOUNT_SPEC_B64", mount_b64));
+                }
 
                 let container = Container {
                     name: "main".to_string(),
@@ -668,7 +720,7 @@ fn render_kubernetes_inner(
         let mut init_containers = Vec::new();
 
         // For helper mode, add init container to install the helper binary.
-        if matches!(program_plan, ProgramPlan::Helper { .. }) {
+        if needs_helper_for_component {
             init_containers.push(Container {
                 name: "install-helper".to_string(),
                 image: images.helper.clone(),
@@ -1435,55 +1487,39 @@ fn sanitize_port_name(s: &str) -> String {
     truncate_dns_name(&sanitized, 15)
 }
 
-// ---- Runtime config / helper mode support ----
+fn build_component_config_env(
+    root_leaves: &[rc::SchemaLeaf],
+    allowed_leaf_paths: &std::collections::BTreeSet<String>,
+) -> Result<Vec<EnvVar>, ReporterError> {
+    let mut env = Vec::new();
 
-/// Collect all config paths referenced in a RootConfigTemplate.
-/// Returns None if the template is Root (indicating all config should be provided).
-/// Returns Some(paths) with the specific paths referenced in the template.
-fn collect_config_refs(
-    template: &rc::RootConfigTemplate,
-) -> Option<std::collections::BTreeSet<String>> {
-    use std::collections::BTreeSet;
+    for leaf in root_leaves {
+        if !allowed_leaf_paths.contains(&leaf.path) {
+            continue;
+        }
 
-    fn collect_from_node(node: &rc::ConfigNode, acc: &mut BTreeSet<String>) {
-        match node {
-            rc::ConfigNode::ConfigRef(path) => {
-                acc.insert(path.clone());
-            }
-            rc::ConfigNode::StringTemplate(parts) => {
-                for part in parts {
-                    if let amber_template::TemplatePart::Config { config } = part {
-                        acc.insert(config.clone());
-                    }
-                }
-            }
-            rc::ConfigNode::Array(items) => {
-                for item in items {
-                    collect_from_node(item, acc);
-                }
-            }
-            rc::ConfigNode::Object(map) => {
-                for value in map.values() {
-                    collect_from_node(value, acc);
-                }
-            }
-            _ => {}
+        let env_var = rc::env_var_for_path(&leaf.path)
+            .map_err(|e| ReporterError::new(format!("failed to map config path: {e}")))?;
+
+        if leaf.secret {
+            env.push(EnvVar::from_secret(
+                &env_var,
+                ROOT_CONFIG_SECRET_NAME,
+                &env_var,
+            ));
+        } else {
+            env.push(EnvVar::from_config_map(
+                &env_var,
+                ROOT_CONFIG_CONFIGMAP_NAME,
+                &env_var,
+            ));
         }
     }
 
-    match template {
-        rc::RootConfigTemplate::Root => {
-            // Root template means the component IS the root and receives the entire root config.
-            // Return None to indicate all config paths should be provided.
-            None
-        }
-        rc::RootConfigTemplate::Node(node) => {
-            let mut paths = BTreeSet::new();
-            collect_from_node(node, &mut paths);
-            Some(paths)
-        }
-    }
+    Ok(env)
 }
+
+// ---- Runtime config / helper mode support ----
 
 /// Generates NetworkPolicy enforcement check resources.
 ///
