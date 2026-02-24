@@ -259,6 +259,7 @@ pub enum CapabilityKind {
     Mcp,
     Llm,
     Http,
+    Docker,
     A2a,
 }
 
@@ -268,6 +269,7 @@ impl fmt::Display for CapabilityKind {
             CapabilityKind::Mcp => "mcp",
             CapabilityKind::Llm => "llm",
             CapabilityKind::Http => "http",
+            CapabilityKind::Docker => "docker",
             CapabilityKind::A2a => "a2a",
         };
         f.write_str(s)

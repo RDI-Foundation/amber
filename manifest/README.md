@@ -368,7 +368,7 @@ config_schema: {
 
 Both slots and provides share:
 
-* `kind`: `"mcp" | "llm" | "http" | "a2a"`
+* `kind`: `"mcp" | "llm" | "http" | "docker" | "a2a"`
 * `profile` (optional): string qualifier (often used for `"mcp"`)
 
 Example:

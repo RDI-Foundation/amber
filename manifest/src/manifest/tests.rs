@@ -918,6 +918,36 @@ fn endpoint_validation_passes_for_defined_reference() {
 }
 
 #[test]
+fn docker_capability_kind_parses_for_slots_and_provides() {
+    let m: Manifest = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            network: { endpoints: [ { name: "endpoint", port: 80 } ] }
+          },
+          slots: {
+            worker: { kind: "docker" }
+          },
+          provides: {
+            api: { kind: "docker", endpoint: "endpoint" }
+          },
+          exports: { api: "api" },
+        }
+        "#
+    .parse()
+    .unwrap();
+
+    let worker = m.slots.get("worker").expect("worker slot");
+    assert_eq!(worker.decl.kind, CapabilityKind::Docker);
+
+    let api = m.provides.get("api").expect("api provide");
+    assert_eq!(api.decl.kind, CapabilityKind::Docker);
+    assert_eq!(api.endpoint.as_deref(), Some("endpoint"));
+}
+
+#[test]
 fn mounts_parse_config_and_secret_sources() {
     let m: Manifest = r#"
         {
