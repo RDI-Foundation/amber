@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs,
     future::Future,
     io::{Read as _, Write as _},
@@ -15,9 +15,9 @@ use std::{
 
 use amber_manifest::{Manifest, ManifestRef};
 use amber_resolver::{Backend, RemoteResolver, Resolution, Resolver};
-use amber_scenario::{BindingFrom, graph};
+use amber_scenario::{BindingFrom, ComponentId, graph};
 use base64::Engine as _;
-use miette::Severity;
+use miette::{Diagnostic, Severity};
 use tempfile::TempDir;
 use url::Url;
 
@@ -51,6 +51,80 @@ fn write_file(path: &Path, contents: &str) {
 
 fn file_url(path: &Path) -> Url {
     Url::from_file_path(path).unwrap()
+}
+
+fn component_moniker(scenario: &amber_scenario::Scenario, id: ComponentId) -> String {
+    scenario
+        .components
+        .get(id.0)
+        .and_then(|component| component.as_ref())
+        .map(|component| component.moniker.as_str().to_string())
+        .unwrap_or_else(|| format!("#{}", id.0))
+}
+
+fn binding_source_label(scenario: &amber_scenario::Scenario, from: &BindingFrom) -> String {
+    match from {
+        BindingFrom::Component(provide) => {
+            format!(
+                "{}.{}",
+                component_moniker(scenario, provide.component),
+                provide.name
+            )
+        }
+        BindingFrom::External(slot) => {
+            format!(
+                "external:{}.{}",
+                component_moniker(scenario, slot.component),
+                slot.name
+            )
+        }
+        BindingFrom::Framework(name) => format!("framework.{name}"),
+    }
+}
+
+fn binding_resolution_signature(scenario: &amber_scenario::Scenario) -> BTreeMap<String, String> {
+    let usage = crate::binding_usage::collect_binding_usage(scenario);
+    let mut out = BTreeMap::new();
+
+    for (&scope, names) in usage.iter() {
+        let scope_label = component_moniker(scenario, scope);
+        for name in names {
+            let mut sources: BTreeSet<String> = BTreeSet::new();
+
+            for binding in &scenario.bindings {
+                if binding.to.component == scope && binding.name.as_deref() == Some(name.as_str()) {
+                    sources.insert(binding_source_label(scenario, &binding.from));
+                }
+            }
+
+            if sources.is_empty()
+                && let Some(component) = scenario.components.get(scope.0).and_then(|c| c.as_ref())
+                && let Some(slot_ref) = component.binding_decls.get(name)
+            {
+                for binding in &scenario.bindings {
+                    if binding.to == *slot_ref {
+                        sources.insert(binding_source_label(scenario, &binding.from));
+                    }
+                }
+            }
+
+            let value = if sources.is_empty() {
+                "<missing>".to_string()
+            } else {
+                sources.into_iter().collect::<Vec<_>>().join(",")
+            };
+            out.insert(format!("{scope_label}::{name}"), value);
+        }
+    }
+
+    out
+}
+
+fn has_diagnostic_code(diagnostics: &[miette::Report], code: &str) -> bool {
+    diagnostics.iter().any(|report| {
+        let diag: &dyn Diagnostic = &**report;
+        diag.code().is_some_and(|c| c.to_string() == code)
+    })
 }
 
 fn accept_with_deadline(listener: &TcpListener, deadline: Instant) -> std::net::TcpStream {
@@ -779,6 +853,386 @@ async fn binding_interpolation_error_points_to_config_value() {
     let offset = root_source.find(needle).unwrap();
     assert_eq!(label.offset(), offset);
     assert_eq!(label.len(), needle.len());
+}
+
+#[tokio::test]
+async fn named_binding_resolution_is_stable_across_opt_modes() {
+    let cases = [("program-binding", true), ("config-binding", false)];
+
+    for (label, is_program_case) in cases {
+        let dir = tmp_dir(&format!("binding-opt-parity-{label}"));
+        let root_path = dir.path().join("root.json5");
+        let provider_path = dir.path().join("provider.json5");
+        let consumer_path = dir.path().join("consumer.json5");
+
+        if is_program_case {
+            let program_path = dir.path().join("program.json5");
+            write_file(
+                &program_path,
+                r#"
+                {
+                  manifest_version: "0.1.0",
+                  program: {
+                    image: "alpine:3.20",
+                    args: ["sleep", "infinity"],
+                    env: {
+                      AGENT_URL: "${bindings.agent.url}",
+                    },
+                    network: {
+                      endpoints: [{ name: "app", port: 8080 }],
+                    },
+                  },
+                  slots: {
+                    agent: { kind: "a2a" },
+                  },
+                  provides: {
+                    app: { kind: "http", endpoint: "app" },
+                  },
+                  exports: {
+                    app: "app",
+                  },
+                }
+                "#,
+            );
+            write_file(
+                &consumer_path,
+                &format!(
+                    r##"
+                    {{
+                      manifest_version: "0.1.0",
+                      components: {{
+                        program: "{program}",
+                      }},
+                      slots: {{
+                        agent: {{ kind: "a2a" }},
+                      }},
+                      bindings: [
+                        {{ name: "agent", to: "#program.agent", from: "self.agent" }},
+                      ],
+                      exports: {{
+                        app: "#program.app",
+                      }},
+                    }}
+                    "##,
+                    program = file_url(&program_path),
+                ),
+            );
+            write_file(
+                &provider_path,
+                r#"
+                {
+                  manifest_version: "0.1.0",
+                  program: {
+                    image: "alpine:3.20",
+                    args: ["sleep", "infinity"],
+                    network: {
+                      endpoints: [{ name: "a2a", port: 9000 }],
+                    },
+                  },
+                  provides: {
+                    a2a: { kind: "a2a", endpoint: "a2a" },
+                  },
+                  exports: {
+                    a2a: "a2a",
+                  },
+                }
+                "#,
+            );
+            write_file(
+                &root_path,
+                &format!(
+                    r##"
+                    {{
+                      manifest_version: "0.1.0",
+                      components: {{
+                        green: "{green}",
+                        agent: "{agent}",
+                      }},
+                      bindings: [
+                        {{ name: "agent", to: "#green.agent", from: "#agent.a2a" }},
+                      ],
+                      exports: {{
+                        app: "#green.app",
+                      }},
+                    }}
+                    "##,
+                    green = file_url(&consumer_path),
+                    agent = file_url(&provider_path),
+                ),
+            );
+        } else {
+            write_file(
+                &provider_path,
+                r#"
+                {
+                  manifest_version: "0.1.0",
+                  program: {
+                    image: "provider",
+                    entrypoint: ["provider"],
+                    network: {
+                      endpoints: [{ name: "api", port: 8080 }],
+                    },
+                  },
+                  provides: {
+                    api: { kind: "http", endpoint: "api" },
+                  },
+                  exports: {
+                    api: "api",
+                  },
+                }
+                "#,
+            );
+            write_file(
+                &consumer_path,
+                r#"
+                {
+                  manifest_version: "0.1.0",
+                  config_schema: {
+                    type: "object",
+                    properties: { url: { type: "string" } },
+                    required: ["url"],
+                    additionalProperties: false,
+                  },
+                  program: {
+                    image: "consumer",
+                    entrypoint: ["consumer"],
+                    env: {
+                      UPSTREAM_URL: "${config.url}",
+                    },
+                  },
+                  slots: {
+                    api: { kind: "http" },
+                  },
+                }
+                "#,
+            );
+            write_file(
+                &root_path,
+                &format!(
+                    r##"
+                    {{
+                      manifest_version: "0.1.0",
+                      components: {{
+                        provider: "{provider}",
+                        consumer: {{
+                          manifest: "{consumer}",
+                          config: {{
+                            url: "${{bindings.upstream.url}}",
+                          }},
+                        }},
+                      }},
+                      bindings: [
+                        {{ name: "upstream", to: "#consumer.api", from: "#provider.api" }},
+                      ],
+                    }}
+                    "##,
+                    provider = file_url(&provider_path),
+                    consumer = file_url(&consumer_path),
+                ),
+            );
+        }
+
+        let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+        let root_ref = ManifestRef::from_url(file_url(&root_path));
+
+        let with_opt = compiler
+            .compile(
+                root_ref.clone(),
+                CompileOptions {
+                    resolve: crate::ResolveOptions { max_concurrency: 8 },
+                    optimize: OptimizeOptions { dce: true },
+                },
+            )
+            .await
+            .expect("compile with optimizations");
+        let without_opt = compiler
+            .compile(
+                root_ref,
+                CompileOptions {
+                    resolve: crate::ResolveOptions { max_concurrency: 8 },
+                    optimize: OptimizeOptions { dce: false },
+                },
+            )
+            .await
+            .expect("compile without optimizations");
+
+        let with_opt_sig = binding_resolution_signature(&with_opt.scenario);
+        let without_opt_sig = binding_resolution_signature(&without_opt.scenario);
+        assert_eq!(
+            with_opt_sig, without_opt_sig,
+            "binding resolution signature changed across opt modes for {label}"
+        );
+        assert!(
+            with_opt_sig.values().all(|value| value != "<missing>"),
+            "missing binding resolution in opt mode for {label}: {with_opt_sig:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn renamed_binding_chain_is_stable_across_opt_modes() {
+    let dir = tmp_dir("binding-opt-parity-rename-chain");
+    let root_path = dir.path().join("root.json5");
+    let middle_path = dir.path().join("middle.json5");
+    let leaf_path = dir.path().join("leaf.json5");
+    let provider_path = dir.path().join("provider.json5");
+
+    write_file(
+        &leaf_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "alpine:3.20",
+            args: ["sleep", "infinity"],
+            env: {
+              AGENT_URL: "${bindings.agent.url}",
+            },
+            network: {
+              endpoints: [{ name: "app", port: 8080 }],
+            },
+          },
+          slots: {
+            up: { kind: "http" },
+          },
+          provides: {
+            app: { kind: "http", endpoint: "app" },
+          },
+          exports: {
+            app: "app",
+          },
+        }
+        "#,
+    );
+
+    write_file(
+        &middle_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              components: {{
+                leaf: "{leaf}",
+              }},
+              slots: {{
+                up: {{ kind: "http" }},
+              }},
+              bindings: [
+                {{ name: "agent", to: "#leaf.up", from: "self.up" }},
+              ],
+              exports: {{
+                app: "#leaf.app",
+              }},
+            }}
+            "##,
+            leaf = file_url(&leaf_path),
+        ),
+    );
+
+    write_file(
+        &provider_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "alpine:3.20",
+            args: ["sleep", "infinity"],
+            network: {
+              endpoints: [{ name: "api", port: 9000 }],
+            },
+          },
+          provides: {
+            api: { kind: "http", endpoint: "api" },
+          },
+          exports: {
+            api: "api",
+          },
+        }
+        "#,
+    );
+
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              components: {{
+                middle: "{middle}",
+                provider: "{provider}",
+              }},
+              bindings: [
+                {{ name: "upstream", to: "#middle.up", from: "#provider.api" }},
+              ],
+              exports: {{
+                app: "#middle.app",
+              }},
+            }}
+            "##,
+            middle = file_url(&middle_path),
+            provider = file_url(&provider_path),
+        ),
+    );
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+
+    let with_opt = compiler
+        .compile(
+            root_ref.clone(),
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: true },
+            },
+        )
+        .await
+        .expect("compile with optimizations");
+    let without_opt = compiler
+        .compile(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
+            },
+        )
+        .await
+        .expect("compile without optimizations");
+
+    assert!(
+        !has_diagnostic_code(
+            &with_opt.diagnostics,
+            "compiler::invalid_bindings_interpolation"
+        ),
+        "invalid bindings interpolation diagnostic in opt mode: {:?}",
+        with_opt
+            .diagnostics
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !has_diagnostic_code(
+            &without_opt.diagnostics,
+            "compiler::invalid_bindings_interpolation"
+        ),
+        "invalid bindings interpolation diagnostic in non-opt mode: {:?}",
+        without_opt
+            .diagnostics
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
+
+    let with_opt_sig = binding_resolution_signature(&with_opt.scenario);
+    let without_opt_sig = binding_resolution_signature(&without_opt.scenario);
+    assert_eq!(
+        with_opt_sig, without_opt_sig,
+        "binding resolution signature changed across opt modes for renamed binding chain"
+    );
+    assert!(
+        with_opt_sig.values().all(|value| value != "<missing>"),
+        "missing binding resolution in opt mode for renamed chain: {with_opt_sig:?}"
+    );
 }
 
 #[tokio::test]

@@ -8,7 +8,7 @@ pub mod dce;
 pub mod flatten;
 
 pub use dce::DcePass;
-pub use flatten::FlattenPass;
+pub use flatten::{CanonicalizeBindingsPass, FlattenPass};
 
 fn prune_and_rebuild_scenario(
     scenario: Scenario,
