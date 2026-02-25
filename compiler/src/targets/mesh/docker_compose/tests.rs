@@ -12,6 +12,7 @@ use std::{
 
 use amber_images::{AMBER_HELPER, AMBER_ROUTER, AMBER_SIDECAR};
 use amber_manifest::{FrameworkCapabilityName, ManifestDigest, ManifestRef, ProvideDecl, SlotDecl};
+use amber_resolver::Resolver;
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
     ScenarioExport, SlotRef,
@@ -21,7 +22,7 @@ use serde_json::json;
 use url::Url;
 
 use super::DockerComposeReporter;
-use crate::reporter::Reporter as _;
+use crate::{CompileOptions, Compiler, DigestStore, OptimizeOptions, reporter::Reporter as _};
 
 const SIDECAR_IMAGE: &str = AMBER_SIDECAR.reference;
 const HELPER_IMAGE: &str = AMBER_HELPER.reference;
@@ -2297,6 +2298,147 @@ exit 1
     assert!(
         !denied.success(),
         "denied client unexpectedly reached server"
+    );
+}
+
+#[test]
+fn docker_compose_flattens_routing_components_with_and_without_dce() {
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let root_path = dir.path().join("root.json5");
+    let green_path = dir.path().join("green.json5");
+    let green_program_path = dir.path().join("green_program.json5");
+    let agent_path = dir.path().join("agent.json5");
+
+    fs::write(
+        &root_path,
+        r##"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            green: "green.json5",
+            agent: "agent.json5",
+          },
+          bindings: [
+            { name: "agent", to: "#green.agent", from: "#agent.a2a" },
+          ],
+          exports: {
+            app: "#green.app",
+          },
+        }
+        "##,
+    )
+    .unwrap();
+
+    fs::write(
+        &green_path,
+        r##"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            program: "green_program.json5",
+          },
+          slots: {
+            agent: { kind: "a2a" },
+          },
+          bindings: [
+            { name: "agent", to: "#program.agent", from: "self.agent" },
+          ],
+          exports: {
+            app: "#program.app",
+          },
+        }
+        "##,
+    )
+    .unwrap();
+
+    fs::write(
+        &green_program_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "alpine:3.20",
+            args: ["sleep", "infinity"],
+            env: {
+              AGENT_URL: "${bindings.agent.url}",
+            },
+            network: {
+              endpoints: [{ name: "app", port: 8080 }],
+            },
+          },
+          slots: {
+            agent: { kind: "a2a" },
+          },
+          provides: {
+            app: { kind: "http", endpoint: "app" },
+          },
+          exports: {
+            app: "app",
+          },
+        }
+        "#,
+    )
+    .unwrap();
+
+    fs::write(
+        &agent_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "alpine:3.20",
+            args: ["sleep", "infinity"],
+            network: {
+              endpoints: [{ name: "a2a", port: 9000 }],
+            },
+          },
+          provides: {
+            a2a: { kind: "a2a", endpoint: "a2a" },
+          },
+          exports: {
+            a2a: "a2a",
+          },
+        }
+        "#,
+    )
+    .unwrap();
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let mut agent_urls = Vec::new();
+    for dce in [true, false] {
+        let opts = CompileOptions {
+            optimize: OptimizeOptions { dce },
+            ..CompileOptions::default()
+        };
+        let output = rt
+            .block_on(compiler.compile(
+                ManifestRef::from_url(Url::from_file_path(&root_path).unwrap()),
+                opts,
+            ))
+            .expect("compile ok");
+
+        let yaml = DockerComposeReporter
+            .emit(&output.scenario)
+            .expect("compose render ok");
+        let compose = parse_compose(&yaml);
+        let agent_url = compose
+            .services
+            .values()
+            .find_map(|service| env_value(service, "AGENT_URL"))
+            .expect("AGENT_URL env missing");
+        assert!(
+            agent_url.starts_with("http://127.0.0.1:"),
+            "AGENT_URL did not resolve to a local proxy URL: {agent_url}"
+        );
+        agent_urls.push(agent_url);
+    }
+    assert_eq!(
+        agent_urls[0], agent_urls[1],
+        "DCE should not change resolved binding URLs"
     );
 }
 

@@ -64,6 +64,9 @@ impl ScenarioPass for DcePass {
             }
         }
 
+        let binding_usage = crate::binding_usage::collect_binding_usage(&scenario);
+        mark_slots_required_by_binding_usage(&scenario, &binding_usage, &mut live_slots, &mut work);
+
         while let Some(item) = work.pop_front() {
             match item {
                 WorkItem::Provide(key) => {
@@ -154,6 +157,31 @@ fn mark_used_slots(
         if value.visit_slot_uses(|slot| mark_slot(component.id.0, slot, live_slots, work)) {
             mark_all(live_slots, work);
             return;
+        }
+    }
+}
+
+fn mark_slots_required_by_binding_usage(
+    scenario: &Scenario,
+    usage: &crate::binding_usage::BindingUsage,
+    live_slots: &mut HashSet<CapKey>,
+    work: &mut VecDeque<WorkItem>,
+) {
+    for (&scope, names) in usage.iter() {
+        for name in names {
+            for binding in &scenario.bindings {
+                if binding.to.component == scope && binding.name.as_deref() == Some(name.as_str()) {
+                    mark_slot(binding.to.component.0, &binding.to.name, live_slots, work);
+                }
+            }
+
+            let Some(component) = scenario.components.get(scope.0).and_then(|c| c.as_ref()) else {
+                continue;
+            };
+            let Some(slot_ref) = component.binding_decls.get(name) else {
+                continue;
+            };
+            mark_slot(slot_ref.component.0, &slot_ref.name, live_slots, work);
         }
     }
 }

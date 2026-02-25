@@ -1,13 +1,16 @@
 #[cfg(test)]
 mod tests;
 
+use std::collections::{BTreeSet, HashMap};
+
 use amber_manifest::{ManifestRef, lint::lint_manifest};
 use amber_resolver::Resolver;
-use amber_scenario::Scenario;
+use amber_scenario::{ComponentId, Scenario};
 use miette::{Diagnostic, Report};
 use thiserror::Error;
 
 mod binding_query;
+mod binding_usage;
 mod binding_validation;
 pub(crate) mod config_scope;
 mod config_template;
@@ -127,6 +130,8 @@ impl Compiler {
             ),
         );
         let (scenario, provenance) = linker::link(tree, &self.store)?;
+        let used_bindings = binding_usage::collect_binding_usage(&scenario);
+        let declared_bindings = declared_bindings_by_scope(&scenario);
         diagnostics.extend(collect_manifest_diagnostics(
             &scenario,
             &provenance,
@@ -135,12 +140,14 @@ impl Compiler {
 
         let (scenario, provenance) = {
             let mut pm = passes::PassManager::new();
+            pm.push(passes::CanonicalizeBindingsPass);
             if opts.dce {
                 pm.push(passes::DcePass);
                 pm.push(passes::FlattenPass);
             }
             pm.run(scenario, provenance, &self.store)?
         };
+        ensure_binding_interpolations_resolvable(&scenario, &used_bindings, &declared_bindings)?;
 
         Ok(CompileOutput {
             scenario,
@@ -202,6 +209,100 @@ impl Compiler {
         let tree = self.resolve_tree(root, opts.resolve).await?;
         self.check_from_tree(tree)
     }
+}
+
+fn declared_bindings_by_scope(scenario: &Scenario) -> HashMap<ComponentId, BTreeSet<String>> {
+    let mut out: HashMap<ComponentId, BTreeSet<String>> = HashMap::new();
+    for (id, component) in scenario.components_iter() {
+        for name in component.binding_decls.keys() {
+            out.entry(id).or_default().insert(name.clone());
+        }
+    }
+    for binding in &scenario.bindings {
+        let Some(name) = binding.name.as_ref() else {
+            continue;
+        };
+        out.entry(binding.to.component)
+            .or_default()
+            .insert(name.clone());
+    }
+    out
+}
+
+fn ensure_binding_interpolations_resolvable(
+    scenario: &Scenario,
+    usage: &binding_usage::BindingUsage,
+    declared_bindings: &HashMap<ComponentId, BTreeSet<String>>,
+) -> Result<(), passes::PassError> {
+    let mut failures = Vec::new();
+
+    for (&scope, names) in usage.iter() {
+        let scope_label = scenario
+            .components
+            .get(scope.0)
+            .and_then(|component| component.as_ref())
+            .map(|component| component.moniker.as_str().to_string())
+            .unwrap_or_else(|| format!("#{}", scope.0));
+
+        for name in names {
+            let Some(declared_names) = declared_bindings.get(&scope) else {
+                continue;
+            };
+            if !declared_names.contains(name) {
+                continue;
+            }
+
+            let direct_named_edge = scenario.bindings.iter().any(|binding| {
+                binding.to.component == scope && binding.name.as_deref() == Some(name.as_str())
+            });
+            if direct_named_edge {
+                continue;
+            }
+
+            let Some(scope_component) = scenario.components.get(scope.0).and_then(|c| c.as_ref())
+            else {
+                continue;
+            };
+            let Some(slot_ref) = scope_component.binding_decls.get(name) else {
+                failures.push(format!(
+                    "{scope_label}: bindings.{name}.url has no binding declaration"
+                ));
+                continue;
+            };
+
+            let slot_reachable = scenario
+                .bindings
+                .iter()
+                .any(|binding| binding.to == *slot_ref);
+            if slot_reachable {
+                continue;
+            }
+
+            let target_component = scenario
+                .components
+                .get(slot_ref.component.0)
+                .and_then(|component| component.as_ref())
+                .map(|component| component.moniker.as_str().to_string())
+                .unwrap_or_else(|| format!("#{}", slot_ref.component.0));
+            failures.push(format!(
+                "{scope_label}: bindings.{name}.url resolves to {target_component}.{}, but no \
+                 binding edge reaches that slot",
+                slot_ref.name
+            ));
+        }
+    }
+
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    Err(passes::PassError::Failed {
+        pass: "binding_invariant",
+        message: format!(
+            "unresolvable bindings interpolation paths after passes: {}",
+            failures.join("; ")
+        ),
+    })
 }
 
 #[derive(Debug)]

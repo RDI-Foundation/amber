@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
-    binding_query::{BindingObject, resolve_binding_query},
+    binding_query::{BindingObject, parse_binding_query, resolve_binding_query},
     config_scope::{RuntimeConfigView, build_runtime_config_view},
     config_templates,
     slot_query::{SlotObject, resolve_slot_query},
@@ -124,7 +124,12 @@ pub(crate) fn build_config_plan(
         )));
     }
 
-    let binding_urls_by_scope = binding_urls_by_scope(scenario, slot_values_by_component)?;
+    let required_bindings_by_scope = collect_required_bindings_by_scope(&composed.templates)?;
+    let binding_urls_by_scope = binding_urls_by_scope(
+        scenario,
+        slot_values_by_component,
+        &required_bindings_by_scope,
+    )?;
     let resolved_templates =
         resolve_binding_templates(composed.templates, &binding_urls_by_scope, scenario)?;
 
@@ -470,17 +475,26 @@ fn build_mount_specs(
 fn binding_urls_by_scope(
     scenario: &Scenario,
     slot_values_by_component: &HashMap<ComponentId, BTreeMap<String, SlotObject>>,
+    required_bindings_by_scope: &HashMap<u64, BTreeSet<String>>,
 ) -> Result<HashMap<u64, BTreeMap<String, BindingObject>>, MeshError> {
     let mut out: HashMap<u64, BTreeMap<String, BindingObject>> = HashMap::new();
 
-    for (idx, component) in scenario.components.iter().enumerate() {
-        let Some(component) = component else {
-            continue;
+    for (&scope, required_names) in required_bindings_by_scope {
+        let realm = ComponentId(scope as usize);
+        let Some(component) = scenario.components.get(realm.0).and_then(|c| c.as_ref()) else {
+            return Err(MeshError::new(format!(
+                "internal error: missing bindings scope component id {scope}"
+            )));
         };
-        let realm = ComponentId(idx);
         let mut by_name = BTreeMap::new();
 
-        for (name, slot_ref) in &component.binding_decls {
+        for name in required_names {
+            let slot_ref = component.binding_decls.get(name).ok_or_else(|| {
+                MeshError::new(format!(
+                    "internal error: missing binding declaration `{name}` in {}",
+                    component.moniker.as_str()
+                ))
+            })?;
             let slot_values = slot_values_by_component
                 .get(&slot_ref.component)
                 .ok_or_else(|| {
@@ -498,17 +512,71 @@ fn binding_urls_by_scope(
             })?;
 
             by_name.insert(
-                name.to_string(),
+                name.clone(),
                 BindingObject {
                     url: slot.url.clone(),
                 },
             );
         }
 
-        out.insert(realm.0 as u64, by_name);
+        out.insert(scope, by_name);
     }
 
     Ok(out)
+}
+
+fn collect_required_bindings_by_scope(
+    templates: &HashMap<ComponentId, rc::RootConfigTemplate>,
+) -> Result<HashMap<u64, BTreeSet<String>>, MeshError> {
+    let mut out: HashMap<u64, BTreeSet<String>> = HashMap::new();
+    for template in templates.values() {
+        let Some(node) = template.node() else {
+            continue;
+        };
+        collect_required_bindings_in_node(node, &mut out)?;
+    }
+    Ok(out)
+}
+
+fn collect_required_bindings_in_node(
+    node: &rc::ConfigNode,
+    out: &mut HashMap<u64, BTreeSet<String>>,
+) -> Result<(), MeshError> {
+    match node {
+        rc::ConfigNode::StringTemplate(parts) => {
+            for part in parts {
+                let TemplatePart::Binding { binding, scope } = part else {
+                    continue;
+                };
+                let parsed = parse_binding_query(binding).map_err(|err| {
+                    let label = if binding.is_empty() {
+                        "bindings".to_string()
+                    } else {
+                        format!("bindings.{binding}")
+                    };
+                    MeshError::new(format!(
+                        "internal error: invalid binding query `{label}` in composed config \
+                         template: {err}"
+                    ))
+                })?;
+                out.entry(*scope)
+                    .or_default()
+                    .insert(parsed.name.to_string());
+            }
+        }
+        rc::ConfigNode::Array(values) => {
+            for value in values {
+                collect_required_bindings_in_node(value, out)?;
+            }
+        }
+        rc::ConfigNode::Object(map) => {
+            for value in map.values() {
+                collect_required_bindings_in_node(value, out)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn resolve_binding_templates(
