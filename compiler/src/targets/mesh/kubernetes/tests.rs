@@ -398,8 +398,10 @@ fn kubernetes_emits_router_for_external_slots() {
     .expect("write client manifest");
 
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let mut opts = CompileOptions::default();
-    opts.optimize = OptimizeOptions { dce: false };
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..CompileOptions::default()
+    };
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let output = rt
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
@@ -947,7 +949,8 @@ fn kubernetes_mount_includes_object_config_leaves() {
                     "name": { "type": "string" },
                     "log_level": { "type": "string" }
                 }
-            }
+            },
+            "token": { "type": "string" }
         }
     });
 
@@ -971,7 +974,7 @@ fn kubernetes_mount_includes_object_config_leaves() {
         parent: Some(ComponentId(0)),
         moniker: moniker("/child"),
         digest: digest(1),
-        config: Some(json!({ "app": "${config.app}" })),
+        config: Some(json!({ "app": "${config.app}", "token": "${config.token}" })),
         config_schema: Some(component_schema),
         program: Some(program),
         slots: BTreeMap::new(),
@@ -1043,6 +1046,63 @@ fn kubernetes_mount_includes_object_config_leaves() {
     assert!(
         root_schema["properties"].get("token").is_none(),
         "pruned schema should not include token"
+    );
+
+    let component_schema_b64 = envs
+        .iter()
+        .find_map(|item| {
+            if item["name"].as_str() == Some("AMBER_COMPONENT_CONFIG_SCHEMA_B64") {
+                item["value"].as_str().map(|v| v.to_string())
+            } else {
+                None
+            }
+        })
+        .expect("component schema env var");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(component_schema_b64.as_bytes())
+        .expect("decode component schema");
+    let component_schema: serde_json::Value =
+        serde_json::from_slice(&decoded).expect("parse component schema");
+    assert!(
+        component_schema["properties"]["app"]["properties"]
+            .get("name")
+            .is_some(),
+        "pruned component schema missing app.name"
+    );
+    assert!(
+        component_schema["properties"]["app"]["properties"]
+            .get("log_level")
+            .is_some(),
+        "pruned component schema missing app.log_level"
+    );
+    assert!(
+        component_schema["properties"].get("token").is_none(),
+        "pruned component schema should not include token"
+    );
+
+    let component_template_b64 = envs
+        .iter()
+        .find_map(|item| {
+            if item["name"].as_str() == Some("AMBER_COMPONENT_CONFIG_TEMPLATE_B64") {
+                item["value"].as_str().map(|v| v.to_string())
+            } else {
+                None
+            }
+        })
+        .expect("component template env var");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(component_template_b64.as_bytes())
+        .expect("decode component template");
+    let template: serde_json::Value =
+        serde_json::from_slice(&decoded).expect("parse component template");
+    let template_json = template.to_string();
+    assert!(
+        template_json.contains("log_level"),
+        "pruned component template missing app.log_level"
+    );
+    assert!(
+        !template_json.contains("token"),
+        "pruned component template should not include token"
     );
 }
 
@@ -1249,8 +1309,10 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
     .expect("write client manifest");
 
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let mut opts = CompileOptions::default();
-    opts.optimize = OptimizeOptions { dce: false };
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..CompileOptions::default()
+    };
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let output = rt
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
@@ -1526,8 +1588,10 @@ fn kubernetes_smoke_export_routes_to_host() {
     .expect("write server manifest");
 
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let mut opts = CompileOptions::default();
-    opts.optimize = OptimizeOptions { dce: false };
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..CompileOptions::default()
+    };
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let output = rt
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))

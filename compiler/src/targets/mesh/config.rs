@@ -1,3 +1,4 @@
+// Mesh config planning: resolve program templates/mounts and compute per-component scope.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use amber_config as rc;
@@ -8,22 +9,22 @@ use base64::Engine as _;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::plan::{MeshError, component_label};
 use crate::{
     binding_query::{BindingObject, resolve_binding_query},
+    config_scope::{RuntimeConfigView, build_runtime_config_view},
     config_templates,
     slot_query::{SlotObject, resolve_slot_query},
+    targets::mesh::plan::{MeshError, component_label},
 };
 
 #[derive(Clone, Debug)]
 pub(crate) struct ConfigPlan {
-    pub(crate) root_schema: Option<Value>,
     pub(crate) root_leaves: Vec<rc::SchemaLeaf>,
     pub(crate) program_plans: HashMap<ComponentId, ProgramPlan>,
     pub(crate) mount_specs: HashMap<ComponentId, Vec<MountSpec>>,
-    pub(crate) component_templates: HashMap<ComponentId, rc::RootConfigTemplate>,
     pub(crate) needs_helper: bool,
     pub(crate) needs_runtime_config: bool,
+    pub(crate) runtime_views: HashMap<ComponentId, RuntimeConfigView>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,8 +70,6 @@ pub(crate) enum ProgramPlan {
         image: ProgramImagePlan,
         image_origin: ProgramImageOrigin,
         template_spec: TemplateSpec,
-        component_template: rc::RootConfigTemplate,
-        component_schema: Value,
     },
 }
 
@@ -186,7 +185,6 @@ pub(crate) fn build_config_plan(
             bindings,
             template_opt,
             component_schema.as_ref(),
-            component_template,
         )?;
         if matches!(plan, ProgramPlan::Helper { .. }) {
             needs_helper = true;
@@ -221,17 +219,6 @@ pub(crate) fn build_config_plan(
         needs_helper = true;
     }
 
-    let mut component_templates = HashMap::new();
-    for id in program_components {
-        let template = resolved_templates.get(id).ok_or_else(|| {
-            MeshError::new(format!(
-                "no config template for component {}",
-                component_label(scenario, *id)
-            ))
-        })?;
-        component_templates.insert(*id, template.clone());
-    }
-
     if needs_runtime_config && root_schema.is_none() {
         return Err(MeshError::new(
             "root component must declare `config_schema` when runtime config interpolation is \
@@ -239,14 +226,53 @@ pub(crate) fn build_config_plan(
         ));
     }
 
+    let mut runtime_views = HashMap::new();
+    if needs_runtime_config {
+        let root_schema = root_schema
+            .as_ref()
+            .expect("root schema required for runtime config");
+        for id in program_components {
+            let program_plan = program_plans
+                .get(id)
+                .expect("program plan should exist for program component");
+            let mount_specs = mount_specs.get(id);
+            let needs_config_payload = matches!(program_plan, ProgramPlan::Helper { .. })
+                || mount_specs.is_some_and(|specs| mount_specs_need_config(specs));
+            if !needs_config_payload {
+                continue;
+            }
+
+            let component_schema = scenario
+                .component(*id)
+                .config_schema
+                .as_ref()
+                .expect("component config schema required");
+            let component_template = resolved_templates
+                .get(id)
+                .expect("component template should exist");
+            let used_paths =
+                used_component_paths(program_plan, mount_specs.map(|specs| specs.as_slice()));
+
+            let view = build_runtime_config_view(
+                &component_label(scenario, *id),
+                root_schema,
+                &root_leaves,
+                component_template,
+                component_schema,
+                &used_paths,
+            )
+            .map_err(|e| MeshError::new(e.to_string()))?;
+            runtime_views.insert(*id, view);
+        }
+    }
+
     Ok(ConfigPlan {
-        root_schema,
         root_leaves,
         program_plans,
         mount_specs,
-        component_templates,
         needs_helper,
         needs_runtime_config,
+        runtime_views,
     })
 }
 
@@ -309,84 +335,26 @@ pub(crate) fn encode_schema_b64(label: &str, schema: &Value) -> Result<String, M
     Ok(b64.encode(schema_json))
 }
 
-pub(crate) fn collect_config_refs(template: &rc::RootConfigTemplate) -> Option<BTreeSet<String>> {
-    fn collect_from_node(node: &rc::ConfigNode, acc: &mut BTreeSet<String>) {
-        match node {
-            rc::ConfigNode::ConfigRef(path) => {
-                acc.insert(path.clone());
-            }
-            rc::ConfigNode::StringTemplate(parts) => {
-                for part in parts {
-                    if let TemplatePart::Config { config } = part {
-                        acc.insert(config.clone());
-                    }
-                }
-            }
-            rc::ConfigNode::Array(items) => {
-                for item in items {
-                    collect_from_node(item, acc);
-                }
-            }
-            rc::ConfigNode::Object(map) => {
-                for value in map.values() {
-                    collect_from_node(value, acc);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    match template {
-        rc::RootConfigTemplate::Root => None,
-        rc::RootConfigTemplate::Node(node) => {
-            let mut paths = BTreeSet::new();
-            collect_from_node(node, &mut paths);
-            Some(paths)
-        }
-    }
-}
-
-pub(crate) fn allowed_root_leaf_paths(
-    root_leaves: &[rc::SchemaLeaf],
-    component_template: &rc::RootConfigTemplate,
+// Security: only expose runtime config needed by program templates and mounts.
+fn used_component_paths(
+    program_plan: &ProgramPlan,
+    mount_specs: Option<&[MountSpec]>,
 ) -> BTreeSet<String> {
-    if matches!(component_template, rc::RootConfigTemplate::Root) {
-        return root_leaves.iter().map(|leaf| leaf.path.clone()).collect();
+    let mut used = BTreeSet::new();
+
+    if let ProgramPlan::Helper { template_spec, .. } = program_plan {
+        collect_used_paths_from_template_spec(template_spec, &mut used);
     }
 
-    let Some(paths) = collect_config_refs(component_template) else {
-        return BTreeSet::new();
-    };
-
-    let mut allowed = BTreeSet::new();
-    for path in paths {
-        if path.is_empty() {
-            return root_leaves.iter().map(|leaf| leaf.path.clone()).collect();
-        }
-        for leaf in root_leaves {
-            if leaf.path == path {
-                allowed.insert(leaf.path.clone());
-                continue;
-            }
-            if leaf.path.starts_with(&path) && leaf.path.as_bytes().get(path.len()) == Some(&b'.') {
-                allowed.insert(leaf.path.clone());
+    if let Some(specs) = mount_specs {
+        for spec in specs {
+            if let MountSpec::Config { config, .. } = spec {
+                used.insert(config.clone());
             }
         }
     }
 
-    allowed
-}
-
-pub(crate) fn prune_root_schema(
-    component_label: &str,
-    root_schema: &Value,
-    allowed_leaf_paths: &BTreeSet<String>,
-) -> Result<Value, MeshError> {
-    rc::prune_schema(root_schema, allowed_leaf_paths).map_err(|err| {
-        MeshError::new(format!(
-            "failed to prune root config schema for {component_label}: {err}"
-        ))
-    })
+    used
 }
 
 pub(crate) fn encode_mount_spec_b64(label: &str, specs: &[MountSpec]) -> Result<String, MeshError> {
@@ -412,6 +380,23 @@ pub(crate) fn mount_specs_need_config(specs: &[MountSpec]) -> bool {
     specs
         .iter()
         .any(|spec| matches!(spec, MountSpec::Config { .. }))
+}
+
+fn collect_used_paths_from_template_spec(spec: &TemplateSpec, out: &mut BTreeSet<String>) {
+    for ts in &spec.program.entrypoint {
+        collect_used_paths_from_template_string(ts, out);
+    }
+    for ts in spec.program.env.values() {
+        collect_used_paths_from_template_string(ts, out);
+    }
+}
+
+fn collect_used_paths_from_template_string(ts: &TemplateString, out: &mut BTreeSet<String>) {
+    for part in ts {
+        if let TemplatePart::Config { config } = part {
+            out.insert(config.clone());
+        }
+    }
 }
 
 fn build_mount_specs(
@@ -906,7 +891,6 @@ fn build_program_plan(
     bindings: &BTreeMap<String, BindingObject>,
     template_opt: Option<&rc::ConfigNode>,
     component_schema: Option<&Value>,
-    component_template: &rc::RootConfigTemplate,
 ) -> Result<ProgramPlan, MeshError> {
     let mut entrypoint_ts: Vec<TemplateString> = Vec::new();
     // Helper mode is required only for runtime config interpolation in
@@ -1115,7 +1099,7 @@ fn build_program_plan(
     }
 
     if needs_helper_for_program_templates {
-        let schema = component_schema.ok_or_else(|| {
+        component_schema.ok_or_else(|| {
             MeshError::new(format!(
                 "component {} requires config_schema when using runtime config interpolation",
                 component_label(scenario, id)
@@ -1133,8 +1117,6 @@ fn build_program_plan(
             image,
             image_origin,
             template_spec: spec,
-            component_template: component_template.clone(),
-            component_schema: schema.clone(),
         })
     } else {
         let mut rendered_entrypoint: Vec<String> = Vec::new();
