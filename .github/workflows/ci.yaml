@@ -24,7 +24,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: mozilla-actions/sccache-action@v0.0.9
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-features -- -D warnings -D clippy::dbg_macro
+      - run: cargo clippy --workspace --all-features --all-targets -- -D warnings -D clippy::dbg_macro
 
   rust-tests:
     name: Rust Tests

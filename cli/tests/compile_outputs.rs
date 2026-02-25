@@ -8,7 +8,7 @@ fn env_value(service: &YamlValue, key: &str) -> Option<String> {
     let env = service.get("environment")?;
     match env {
         YamlValue::Mapping(map) => map
-            .get(&YamlValue::String(key.to_string()))
+            .get(YamlValue::String(key.to_string()))
             .and_then(YamlValue::as_str)
             .map(str::to_string),
         YamlValue::Sequence(seq) => seq.iter().find_map(|entry| {

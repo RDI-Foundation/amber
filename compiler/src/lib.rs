@@ -9,6 +9,7 @@ use thiserror::Error;
 
 mod binding_query;
 mod binding_validation;
+pub(crate) mod config_scope;
 mod config_template;
 mod config_templates;
 mod environment;

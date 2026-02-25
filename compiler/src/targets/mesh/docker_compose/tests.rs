@@ -971,7 +971,8 @@ fn compose_scopes_root_config_env_and_schema() {
                     "name": { "type": "string" },
                     "log_level": { "type": "string" }
                 }
-            }
+            },
+            "token": { "type": "string" }
         }
     });
 
@@ -995,7 +996,7 @@ fn compose_scopes_root_config_env_and_schema() {
         parent: Some(ComponentId(0)),
         moniker: moniker("/child"),
         digest: digest(1),
-        config: Some(json!({ "app": "${config.app}" })),
+        config: Some(json!({ "app": "${config.app}", "token": "${config.token}" })),
         config_schema: Some(component_schema),
         program: Some(program),
         slots: BTreeMap::new(),
@@ -1045,6 +1046,142 @@ fn compose_scopes_root_config_env_and_schema() {
     assert!(
         root_schema["properties"].get("token").is_none(),
         "pruned schema should not include token"
+    );
+}
+
+#[test]
+fn compose_scopes_root_component_payloads() {
+    let program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["app"],
+        "env": {
+            "APP_NAME": "${config.app.name}"
+        }
+    }))
+    .unwrap();
+
+    let root_schema = json!({
+        "type": "object",
+        "properties": {
+            "app": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "log_level": { "type": "string" }
+                }
+            },
+            "token": { "type": "string", "secret": true }
+        }
+    });
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: Some(root_schema),
+        program: Some(program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root)],
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    };
+
+    let yaml = DockerComposeReporter
+        .emit(&scenario)
+        .expect("compose render ok");
+    let compose = parse_compose(&yaml);
+    let program_service = compose
+        .services
+        .values()
+        .find(|svc| svc.image == "alpine:3.20")
+        .expect("program service missing");
+
+    assert!(
+        env_value(program_service, "AMBER_CONFIG_APP__NAME").is_some(),
+        "missing AMBER_CONFIG_APP__NAME"
+    );
+    assert!(
+        env_value(program_service, "AMBER_CONFIG_APP__LOG_LEVEL").is_none(),
+        "unexpected AMBER_CONFIG_APP__LOG_LEVEL exposure"
+    );
+    assert!(
+        env_value(program_service, "AMBER_CONFIG_TOKEN").is_none(),
+        "unexpected AMBER_CONFIG_TOKEN exposure"
+    );
+
+    let root_schema_b64 =
+        env_value(program_service, "AMBER_ROOT_CONFIG_SCHEMA_B64").expect("root schema env var");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(root_schema_b64.as_bytes())
+        .expect("decode root schema");
+    let root_schema: serde_json::Value =
+        serde_json::from_slice(&decoded).expect("parse root schema");
+    assert!(
+        root_schema["properties"]["app"]["properties"]
+            .get("name")
+            .is_some(),
+        "pruned root schema missing app.name"
+    );
+    assert!(
+        root_schema["properties"]["app"]["properties"]
+            .get("log_level")
+            .is_none(),
+        "pruned root schema should not include app.log_level"
+    );
+    assert!(
+        root_schema["properties"].get("token").is_none(),
+        "pruned root schema should not include token"
+    );
+
+    let component_schema_b64 = env_value(program_service, "AMBER_COMPONENT_CONFIG_SCHEMA_B64")
+        .expect("component schema env var");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(component_schema_b64.as_bytes())
+        .expect("decode component schema");
+    let component_schema: serde_json::Value =
+        serde_json::from_slice(&decoded).expect("parse component schema");
+    assert!(
+        component_schema["properties"]["app"]["properties"]
+            .get("name")
+            .is_some(),
+        "pruned component schema missing app.name"
+    );
+    assert!(
+        component_schema["properties"]["app"]["properties"]
+            .get("log_level")
+            .is_none(),
+        "pruned component schema should not include app.log_level"
+    );
+    assert!(
+        component_schema["properties"].get("token").is_none(),
+        "pruned component schema should not include token"
+    );
+
+    let component_template_b64 = env_value(program_service, "AMBER_COMPONENT_CONFIG_TEMPLATE_B64")
+        .expect("component template env var");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(component_template_b64.as_bytes())
+        .expect("decode component template");
+    let template: serde_json::Value =
+        serde_json::from_slice(&decoded).expect("parse component template");
+    let template_json = template.to_string();
+    assert!(
+        !template_json.contains("log_level"),
+        "pruned component template should not include app.log_level"
+    );
+    assert!(
+        !template_json.contains("token"),
+        "pruned component template should not include token"
     );
 }
 
@@ -1612,11 +1749,11 @@ fn docker_smoke_export_routes_to_host() {
 
     let mut ok = false;
     for _ in 0..30 {
-        if let Ok(response) = http_get(&published_host, published_port) {
-            if response.contains("export-ok") {
-                ok = true;
-                break;
-            }
+        if let Ok(response) = http_get(&published_host, published_port)
+            && response.contains("export-ok")
+        {
+            ok = true;
+            break;
         }
         thread::sleep(Duration::from_secs(1));
     }

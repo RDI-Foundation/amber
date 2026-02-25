@@ -19,10 +19,10 @@ use crate::{
         LOCAL_NETWORK_CIDRS,
         addressing::{Addressing, RouterPortBases, WorkloadId, build_address_plan},
         config::{
-            ProgramImageOrigin, ProgramImagePart, ProgramImagePlan, ProgramPlan,
-            allowed_root_leaf_paths, encode_component_payload, encode_direct_entrypoint_b64,
-            encode_direct_env_b64, encode_helper_payload, encode_mount_spec_b64, encode_schema_b64,
-            mount_specs_need_config, prune_root_schema,
+            ProgramImageOrigin, ProgramImagePart, ProgramImagePlan, ProgramPlan, build_config_plan,
+            encode_component_payload, encode_direct_entrypoint_b64, encode_direct_env_b64,
+            encode_helper_payload, encode_mount_spec_b64, encode_schema_b64,
+            mount_specs_need_config,
         },
         internal_images::resolve_internal_images,
         plan::{MeshOptions, component_label},
@@ -289,7 +289,7 @@ fn render_kubernetes_inner(
         }
     }
 
-    let config_plan = crate::targets::mesh::config::build_config_plan(
+    let config_plan = build_config_plan(
         s,
         program_components,
         &address_plan.slot_values_by_component,
@@ -343,7 +343,6 @@ fn render_kubernetes_inner(
         .map(|leaf| (leaf.path.as_str(), leaf))
         .collect();
     let program_plans = &config_plan.program_plans;
-    let component_templates = &config_plan.component_templates;
 
     let export_ports_by_name = &address_plan.router.export_ports_by_name;
     let router_export_ports = &address_plan.router.export_ports;
@@ -476,8 +475,6 @@ fn render_kubernetes_inner(
     // root config (when runtime config is needed). Pods only reference explicitly
     // granted keys, so unassigned config never becomes visible inside containers.
 
-    let root_schema = config_plan.root_schema.as_ref();
-
     // Deployments
     for id in program_components {
         let c = s.component(*id);
@@ -485,14 +482,14 @@ fn render_kubernetes_inner(
         let labels = component_labels(*id, &cnames.service);
         let program = c.program.as_ref().unwrap();
         let program_plan = program_plans.get(id).unwrap();
-        let component = component_label(s, *id);
+        let label = component_label(s, *id);
         let image_source = output
             .and_then(|output| program_image_source(output, s, *id, program_plan.image_origin()));
         let (program_image, image_source_env_var) = render_kubernetes_image(
             program_plan.image(),
             &root_leaf_by_path,
             &cnames.service,
-            &component,
+            &label,
             image_source.as_ref(),
         )?;
         let mount_specs = config_plan.mount_specs.get(id);
@@ -501,6 +498,13 @@ fn render_kubernetes_inner(
             matches!(program_plan, ProgramPlan::Helper { .. }) || mounts_need_config;
         let needs_helper_for_component =
             matches!(program_plan, ProgramPlan::Helper { .. }) || mount_specs.is_some();
+
+        let runtime_view = needs_config_payload.then(|| {
+            config_plan
+                .runtime_views
+                .get(id)
+                .expect("runtime config view should be computed")
+        });
 
         // Container ports.
         let mut ports: Vec<ContainerPort> = Vec::new();
@@ -555,23 +559,14 @@ fn render_kubernetes_inner(
                 container_env.push(EnvVar::literal("AMBER_DIRECT_ENV_B64", env_b64));
 
                 if needs_config_payload {
-                    let label = component_label(s, *id);
-                    let component_template = component_templates
-                        .get(id)
-                        .expect("component template computed");
-                    // Security: only expose explicitly granted root config leaves to the pod.
-                    let allowed_leaf_paths =
-                        allowed_root_leaf_paths(root_leaves, component_template);
+                    let view = runtime_view.expect("runtime config view should be computed");
                     let mut config_env =
-                        build_component_config_env(root_leaves, &allowed_leaf_paths)?;
+                        build_component_config_env(root_leaves, &view.allowed_root_leaf_paths)?;
                     container_env.append(&mut config_env);
 
-                    let root_schema = root_schema.expect("config payload requires root schema");
-                    let pruned_schema = prune_root_schema(&label, root_schema, &allowed_leaf_paths)
-                        .map_err(|e| ReporterError::new(e.to_string()))?;
                     let root_schema_b64 = encode_schema_b64(
                         &format!("root config definition for {label}"),
-                        &pruned_schema,
+                        &view.pruned_root_schema,
                     )
                     .map_err(|e| ReporterError::new(e.to_string()))?;
                     container_env.push(EnvVar::literal(
@@ -579,13 +574,12 @@ fn render_kubernetes_inner(
                         root_schema_b64,
                     ));
 
-                    let component_schema = c
-                        .config_schema
-                        .as_ref()
-                        .expect("component config schema required");
-                    let payload =
-                        encode_component_payload(&label, component_template, component_schema)
-                            .map_err(|e| ReporterError::new(e.to_string()))?;
+                    let payload = encode_component_payload(
+                        &label,
+                        &view.component_template,
+                        &view.component_schema,
+                    )
+                    .map_err(|e| ReporterError::new(e.to_string()))?;
                     container_env.push(EnvVar::literal(
                         "AMBER_COMPONENT_CONFIG_SCHEMA_B64",
                         &payload.component_schema_b64,
@@ -597,7 +591,6 @@ fn render_kubernetes_inner(
                 }
 
                 if let Some(specs) = mount_specs {
-                    let label = component_label(s, *id);
                     let mount_b64 = encode_mount_spec_b64(&label, specs)
                         .map_err(|e| ReporterError::new(e.to_string()))?;
                     container_env.push(EnvVar::literal("AMBER_MOUNT_SPEC_B64", mount_b64));
@@ -623,34 +616,25 @@ fn render_kubernetes_inner(
 
                 (container, volumes)
             }
-            ProgramPlan::Helper {
-                template_spec,
-                component_template,
-                component_schema,
-                ..
-            } => {
-                let label = component_label(s, *id);
+            ProgramPlan::Helper { template_spec, .. } => {
+                let view = runtime_view.expect("runtime config view should be computed");
                 let payload = encode_helper_payload(
                     &label,
                     template_spec,
-                    component_template,
-                    component_schema,
+                    &view.component_template,
+                    &view.component_schema,
                 )
                 .map_err(|e| ReporterError::new(e.to_string()))?;
 
                 // Helper mode: use helper binary as entrypoint, mount shared volume.
-                // Security: only expose explicitly granted root config leaves to the pod.
-                let allowed_leaf_paths = allowed_root_leaf_paths(root_leaves, component_template);
+                // Security: only expose root config leaves needed for the used component paths.
                 let mut container_env =
-                    build_component_config_env(root_leaves, &allowed_leaf_paths)?;
+                    build_component_config_env(root_leaves, &view.allowed_root_leaf_paths)?;
 
                 // Add helper-specific env vars.
-                let root_schema = root_schema.expect("helper mode requires root schema");
-                let pruned_schema = prune_root_schema(&label, root_schema, &allowed_leaf_paths)
-                    .map_err(|e| ReporterError::new(e.to_string()))?;
                 let root_schema_b64 = encode_schema_b64(
                     &format!("root config definition for {label}"),
-                    &pruned_schema,
+                    &view.pruned_root_schema,
                 )
                 .map_err(|e| ReporterError::new(e.to_string()))?;
                 container_env.push(EnvVar::literal(
