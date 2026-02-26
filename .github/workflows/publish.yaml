@@ -73,6 +73,9 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=tag
+            type=semver,pattern=v{{version}}
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=semver,pattern=v{{major}}
             type=raw,value=${{ github.sha }}
           flavor: |
             suffix=-${{ matrix.arch }}
@@ -138,6 +141,9 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=tag
+            type=semver,pattern=v{{version}}
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=semver,pattern=v{{major}}
             type=raw,value=${{ github.sha }}
       - name: Publish multi-arch manifests
         run: |
@@ -266,7 +272,7 @@ jobs:
   cli-artifacts:
     name: Build amber-cli artifacts (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push'
     permissions:
       contents: read
     env:
@@ -312,3 +318,37 @@ jobs:
           name: amber-cli-${{ matrix.platform }}
           path: amber-cli-${{ matrix.platform }}.tar.gz
           if-no-files-found: error
+
+  github-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [merge-manifests, cli-artifacts]
+    permissions:
+      contents: write
+    steps:
+      - name: Download amber-cli artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: amber-cli-*
+          merge-multiple: true
+          path: dist
+      - name: Generate artifact checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.tar.gz | sort -k2 > SHA256SUMS
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          assets=(dist/*.tar.gz dist/SHA256SUMS)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" --title "$tag" --generate-notes --verify-tag
+          fi
