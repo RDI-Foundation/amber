@@ -14,7 +14,7 @@ hyper-rustls = { version = "0.27.7", default-features = false, features = [
   "tls12",
   "webpki-tokio",
 ] }
-hyper-util = { version = "0.1.10", features = ["client-legacy", "tokio"] }
+hyper-util = { workspace = true }
 rustls = { version = "0.23.36", default-features = false, features = ["aws_lc_rs"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

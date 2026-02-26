@@ -60,11 +60,12 @@ COPY node ./node
 COPY docker/images.json docker/images.json
 
 RUN target=$(cat /tmp/rust-target) && \
-    cargo build -p amber-helper --release --locked --target "${target}" && \
-    install -D -m 0755 /app/target/"${target}"/release/amber-helper /out/amber-helper
+    cargo build -p amber-docker-gateway --release --locked --target "${target}" && \
+    install -D -m 0755 /app/target/"${target}"/release/amber-docker-gateway /out/amber-docker-gateway
 
-FROM scratch
+FROM gcr.io/distroless/static-debian13 AS runtime
 
-COPY --from=builder /out/amber-helper /amber-helper
+COPY --from=builder /out/amber-docker-gateway /amber-docker-gateway
 
-ENTRYPOINT ["/amber-helper"]
+USER 65532:65532
+ENTRYPOINT ["/amber-docker-gateway"]
