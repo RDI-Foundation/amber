@@ -8,8 +8,8 @@ use amber_scenario::{
 use serde_json::json;
 use url::Url;
 
-use super::DcePass;
-use crate::{ComponentProvenance, DigestStore, Provenance, passes::ScenarioPass};
+use super::dce_only;
+use crate::{ComponentProvenance, DigestStore, Provenance};
 
 fn component(id: usize, moniker: &str) -> Component {
     Component {
@@ -258,7 +258,8 @@ fn dce_prunes_unused_transitive_subtree() {
         ],
     };
 
-    let (scenario, _prov) = DcePass.run(scenario, provenance, &store).unwrap();
+    let _provenance = provenance;
+    let scenario = dce_only(scenario);
 
     assert_eq!(scenario.components.iter().flatten().count(), 3);
     assert!(
@@ -483,7 +484,8 @@ fn dce_keeps_dependencies_for_program_slots() {
         ],
     };
 
-    let (scenario, _prov) = DcePass.run(scenario, provenance, &store).unwrap();
+    let _provenance = provenance;
+    let scenario = dce_only(scenario);
 
     assert!(
         scenario
@@ -647,7 +649,8 @@ fn dce_keeps_program_slots_from_env() {
         ],
     };
 
-    let (scenario, _prov) = DcePass.run(scenario, provenance, &store).unwrap();
+    let _provenance = provenance;
+    let scenario = dce_only(scenario);
 
     assert!(
         scenario
@@ -660,6 +663,426 @@ fn dce_keeps_program_slots_from_env() {
         matches!(&edge.from, BindingFrom::Component(from) if from.name == "admin")
             && edge.to.name == "admin"
     }));
+}
+
+#[test]
+fn dce_prunes_unreachable_named_binding_interpolation_subgraph() {
+    let root: Manifest = r##"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            live: "file:///live.json5",
+            dead: "file:///dead.json5",
+            provider: "file:///provider.json5",
+          },
+          exports: { out: "#live.out" },
+        }
+    "##
+    .parse()
+    .unwrap();
+
+    let live: Manifest = r##"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "live",
+            entrypoint: ["live"],
+            network: { endpoints: [{ name: "out", port: 80 }] },
+          },
+          provides: { out: { kind: "http", endpoint: "out" } },
+          exports: { out: "out" },
+        }
+    "##
+    .parse()
+    .unwrap();
+    let out_decl = live
+        .provides()
+        .get("out")
+        .expect("live provides out")
+        .decl
+        .clone();
+
+    let dead: Manifest = r##"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "dead",
+            entrypoint: ["dead"],
+            env: { UPSTREAM_URL: "${bindings.agent.url}" },
+          },
+          slots: { up: { kind: "http" } },
+        }
+    "##
+    .parse()
+    .unwrap();
+
+    let provider: Manifest = r##"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "provider",
+            entrypoint: ["provider"],
+            network: { endpoints: [{ name: "api", port: 81 }] },
+          },
+          provides: { api: { kind: "http", endpoint: "api" } },
+          exports: { api: "api" },
+        }
+    "##
+    .parse()
+    .unwrap();
+
+    let store = DigestStore::new();
+    let root_digest = root.digest();
+    let live_digest = live.digest();
+    let dead_digest = dead.digest();
+    let provider_digest = provider.digest();
+    let mut components = vec![
+        Some(component(0, "/")),
+        Some(component(1, "/live")),
+        Some(component(2, "/dead")),
+        Some(component(3, "/provider")),
+    ];
+    components[0].as_mut().unwrap().digest = root_digest;
+    components[1].as_mut().unwrap().digest = live_digest;
+    components[2].as_mut().unwrap().digest = dead_digest;
+    components[3].as_mut().unwrap().digest = provider_digest;
+
+    components[1].as_mut().unwrap().parent = Some(ComponentId(0));
+    components[2].as_mut().unwrap().parent = Some(ComponentId(0));
+    components[3].as_mut().unwrap().parent = Some(ComponentId(0));
+    apply_manifest(components[0].as_mut().unwrap(), &root);
+    apply_manifest(components[1].as_mut().unwrap(), &live);
+    apply_manifest(components[2].as_mut().unwrap(), &dead);
+    apply_manifest(components[3].as_mut().unwrap(), &provider);
+
+    store.put(root_digest, Arc::new(root));
+    store.put(live_digest, Arc::new(live));
+    store.put(dead_digest, Arc::new(dead));
+    store.put(provider_digest, Arc::new(provider));
+
+    components[0].as_mut().unwrap().children.extend([
+        ComponentId(1),
+        ComponentId(2),
+        ComponentId(3),
+    ]);
+
+    let bindings = vec![BindingEdge {
+        name: Some("agent".to_string()),
+        from: BindingFrom::Component(ProvideRef {
+            component: ComponentId(3),
+            name: "api".to_string(),
+        }),
+        to: SlotRef {
+            component: ComponentId(2),
+            name: "up".to_string(),
+        },
+        weak: false,
+    }];
+
+    let mut scenario = Scenario {
+        root: ComponentId(0),
+        components,
+        bindings,
+        exports: vec![ScenarioExport {
+            name: "out".to_string(),
+            capability: out_decl,
+            from: ProvideRef {
+                component: ComponentId(1),
+                name: "out".to_string(),
+            },
+        }],
+    };
+    scenario.normalize_order();
+
+    let url = Url::parse("file:///root.json5").unwrap();
+    let provenance = Provenance {
+        components: vec![
+            ComponentProvenance {
+                authored_moniker: Moniker::from(Arc::from("/")),
+                declared_ref: ManifestRef::from_url(url.clone()),
+                resolved_url: url.clone(),
+                digest: root_digest,
+                observed_url: None,
+            },
+            ComponentProvenance {
+                authored_moniker: Moniker::from(Arc::from("/live")),
+                declared_ref: ManifestRef::from_url(url.clone()),
+                resolved_url: url.clone(),
+                digest: live_digest,
+                observed_url: None,
+            },
+            ComponentProvenance {
+                authored_moniker: Moniker::from(Arc::from("/dead")),
+                declared_ref: ManifestRef::from_url(url.clone()),
+                resolved_url: url.clone(),
+                digest: dead_digest,
+                observed_url: None,
+            },
+            ComponentProvenance {
+                authored_moniker: Moniker::from(Arc::from("/provider")),
+                declared_ref: ManifestRef::from_url(url.clone()),
+                resolved_url: url,
+                digest: provider_digest,
+                observed_url: None,
+            },
+        ],
+    };
+
+    let _provenance = provenance;
+    let scenario = dce_only(scenario);
+
+    assert!(
+        scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|c| c.moniker.local_name() == Some("live"))
+    );
+    assert!(
+        !scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|c| c.moniker.local_name() == Some("dead"))
+    );
+    assert!(
+        !scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|c| c.moniker.local_name() == Some("provider"))
+    );
+    assert!(scenario.bindings.is_empty());
+}
+
+#[test]
+fn dce_keeps_ancestors_without_marking_ancestor_program_live() {
+    let slot_decl: amber_manifest::SlotDecl =
+        serde_json::from_value(json!({ "kind": "http" })).expect("slot decl");
+    let provide_decl: amber_manifest::ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "up" })).expect("provide decl");
+    let export_provide_decl: amber_manifest::ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "out" }))
+            .expect("export provide decl");
+    let export_capability = export_provide_decl.decl.clone();
+
+    let root_program = serde_json::from_value(json!({
+        "image": "root",
+        "entrypoint": ["root"],
+        "env": { "UP_URL": "${slots.up.url}" },
+        "network": { "endpoints": [{ "name": "root", "port": 9000 }] },
+    }))
+    .expect("root program");
+    let consumer_program = serde_json::from_value(json!({
+        "image": "consumer",
+        "entrypoint": ["consumer"],
+        "network": { "endpoints": [{ "name": "out", "port": 9001 }] },
+    }))
+    .expect("consumer program");
+    let provider_program = serde_json::from_value(json!({
+        "image": "provider",
+        "entrypoint": ["provider"],
+        "network": { "endpoints": [{ "name": "up", "port": 9002 }] },
+    }))
+    .expect("provider program");
+
+    let mut components = vec![
+        Some(component(0, "/")),
+        Some(component(1, "/consumer")),
+        Some(component(2, "/provider")),
+    ];
+    components[1].as_mut().unwrap().parent = Some(ComponentId(0));
+    components[2].as_mut().unwrap().parent = Some(ComponentId(0));
+    components[0]
+        .as_mut()
+        .unwrap()
+        .children
+        .extend([ComponentId(1), ComponentId(2)]);
+
+    components[0].as_mut().unwrap().program = Some(root_program);
+    components[0]
+        .as_mut()
+        .unwrap()
+        .slots
+        .insert("up".to_string(), slot_decl);
+
+    components[1].as_mut().unwrap().program = Some(consumer_program);
+    components[1]
+        .as_mut()
+        .unwrap()
+        .provides
+        .insert("out".to_string(), export_provide_decl);
+
+    components[2].as_mut().unwrap().program = Some(provider_program);
+    components[2]
+        .as_mut()
+        .unwrap()
+        .provides
+        .insert("up".to_string(), provide_decl);
+
+    let bindings = vec![BindingEdge {
+        name: None,
+        from: BindingFrom::Component(ProvideRef {
+            component: ComponentId(2),
+            name: "up".to_string(),
+        }),
+        to: SlotRef {
+            component: ComponentId(0),
+            name: "up".to_string(),
+        },
+        weak: false,
+    }];
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components,
+        bindings,
+        exports: vec![ScenarioExport {
+            name: "out".to_string(),
+            capability: export_capability,
+            from: ProvideRef {
+                component: ComponentId(1),
+                name: "out".to_string(),
+            },
+        }],
+    };
+
+    let scenario = dce_only(scenario);
+    let root = scenario.component(ComponentId(0));
+    assert!(root.program.is_none(), "ancestor program should be pruned");
+    assert!(
+        scenario.components[2].is_none(),
+        "provider should be pruned when only dead ancestor program references its slot"
+    );
+    assert!(
+        scenario.bindings.is_empty(),
+        "binding into pruned ancestor slot should be removed"
+    );
+    assert!(
+        scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|component| component.moniker.local_name() == Some("consumer")),
+        "live exported consumer should remain"
+    );
+}
+
+#[test]
+fn dce_keeps_live_config_binding_slots_without_reviving_scope_program() {
+    let slot_decl: amber_manifest::SlotDecl =
+        serde_json::from_value(json!({ "kind": "http" })).expect("slot decl");
+    let provide_out: amber_manifest::ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "out" })).expect("out decl");
+    let provide_up: amber_manifest::ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "up" })).expect("up decl");
+    let export_capability = provide_out.decl.clone();
+
+    let root_program = serde_json::from_value(json!({
+        "image": "root",
+        "entrypoint": ["root"],
+        "env": { "UP_URL": "${slots.up.url}" },
+        "network": { "endpoints": [{ "name": "root", "port": 9100 }] },
+    }))
+    .expect("root program");
+    let consumer_program = serde_json::from_value(json!({
+        "image": "consumer",
+        "entrypoint": ["consumer"],
+        "network": { "endpoints": [{ "name": "out", "port": 9101 }] },
+    }))
+    .expect("consumer program");
+    let provider_program = serde_json::from_value(json!({
+        "image": "provider",
+        "entrypoint": ["provider"],
+        "network": { "endpoints": [{ "name": "up", "port": 9102 }] },
+    }))
+    .expect("provider program");
+
+    let mut components = vec![
+        Some(component(0, "/")),
+        Some(component(1, "/consumer")),
+        Some(component(2, "/provider")),
+    ];
+    components[1].as_mut().unwrap().parent = Some(ComponentId(0));
+    components[2].as_mut().unwrap().parent = Some(ComponentId(0));
+    components[0]
+        .as_mut()
+        .unwrap()
+        .children
+        .extend([ComponentId(1), ComponentId(2)]);
+
+    components[0].as_mut().unwrap().program = Some(root_program);
+    components[0]
+        .as_mut()
+        .unwrap()
+        .slots
+        .insert("up".to_string(), slot_decl);
+    components[0].as_mut().unwrap().binding_decls.insert(
+        "upstream".to_string(),
+        SlotRef {
+            component: ComponentId(0),
+            name: "up".to_string(),
+        },
+    );
+
+    components[1].as_mut().unwrap().program = Some(consumer_program);
+    components[1].as_mut().unwrap().config = Some(json!({
+        "upstream_url": "${bindings.upstream.url}",
+    }));
+    components[1]
+        .as_mut()
+        .unwrap()
+        .provides
+        .insert("out".to_string(), provide_out);
+
+    components[2].as_mut().unwrap().program = Some(provider_program);
+    components[2]
+        .as_mut()
+        .unwrap()
+        .provides
+        .insert("up".to_string(), provide_up);
+
+    let bindings = vec![BindingEdge {
+        name: None,
+        from: BindingFrom::Component(ProvideRef {
+            component: ComponentId(2),
+            name: "up".to_string(),
+        }),
+        to: SlotRef {
+            component: ComponentId(0),
+            name: "up".to_string(),
+        },
+        weak: false,
+    }];
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components,
+        bindings,
+        exports: vec![ScenarioExport {
+            name: "out".to_string(),
+            capability: export_capability,
+            from: ProvideRef {
+                component: ComponentId(1),
+                name: "out".to_string(),
+            },
+        }],
+    };
+
+    let scenario = dce_only(scenario);
+    assert!(
+        scenario.component(ComponentId(0)).program.is_none(),
+        "scope owner program should be pruned; config binding usage should not revive it"
+    );
+    assert!(
+        scenario.components[2].is_some(),
+        "provider should remain because root-scope config binding usage keeps root slot `up` live"
+    );
+    assert_eq!(
+        scenario.bindings.len(),
+        1,
+        "incoming edge to the live root slot should remain"
+    );
 }
 
 #[test]
@@ -714,7 +1137,6 @@ fn dce_keeps_framework_bound_slots() {
         }],
     };
 
-    let store = DigestStore::new();
     let url = Url::parse("file:///root.json5").unwrap();
     let provenance = Provenance {
         components: scenario
@@ -733,7 +1155,8 @@ fn dce_keeps_framework_bound_slots() {
             .collect(),
     };
 
-    let (scenario, _prov) = DcePass.run(scenario, provenance, &store).unwrap();
+    let _provenance = provenance;
+    let scenario = dce_only(scenario);
     assert_eq!(scenario.components.iter().flatten().count(), 2);
     assert_eq!(scenario.bindings.len(), 1);
     match &scenario.bindings[0].from {
