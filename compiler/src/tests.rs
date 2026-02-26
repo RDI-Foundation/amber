@@ -28,7 +28,9 @@ use crate::{
         BUNDLE_INDEX_NAME, BUNDLE_SCHEMA, BUNDLE_VERSION, BundleBuilder, BundleIndex, BundleLoader,
         BundleRequest,
     },
-    reporter::{Reporter as _, scenario_ir::ScenarioIrReporter},
+    reporter::{
+        Reporter as _, docker_compose::DockerComposeReporter, scenario_ir::ScenarioIrReporter,
+    },
 };
 
 fn error_contains(err: &crate::Error, needle: &str) -> bool {
@@ -999,9 +1001,18 @@ async fn named_binding_resolution_is_stable_across_opt_modes() {
                     env: {
                       UPSTREAM_URL: "${config.url}",
                     },
+                    network: {
+                      endpoints: [{ name: "app", port: 8081 }],
+                    },
                   },
                   slots: {
                     api: { kind: "http" },
+                  },
+                  provides: {
+                    app: { kind: "http", endpoint: "app" },
+                  },
+                  exports: {
+                    app: "app",
                   },
                 }
                 "#,
@@ -1024,6 +1035,9 @@ async fn named_binding_resolution_is_stable_across_opt_modes() {
                       bindings: [
                         {{ name: "upstream", to: "#consumer.api", from: "#provider.api" }},
                       ],
+                      exports: {{
+                        app: "#consumer.app",
+                      }},
                     }}
                     "##,
                     provider = file_url(&provider_path),
@@ -1067,6 +1081,322 @@ async fn named_binding_resolution_is_stable_across_opt_modes() {
             "missing binding resolution in opt mode for {label}: {with_opt_sig:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn non_program_config_binding_resolution_is_stable_across_opt_modes() {
+    let dir = tmp_dir("binding-opt-parity-non-program-config");
+    let root_path = dir.path().join("root.json5");
+    let provider_path = dir.path().join("provider.json5");
+    let realm_path = dir.path().join("realm.json5");
+    let leaf_path = dir.path().join("leaf.json5");
+
+    write_file(
+        &provider_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "provider",
+            entrypoint: ["provider"],
+            network: {
+              endpoints: [{ name: "api", port: 8080 }],
+            },
+          },
+          provides: {
+            api: { kind: "http", endpoint: "api" },
+          },
+          exports: {
+            api: "api",
+          },
+        }
+        "#,
+    );
+
+    write_file(
+        &leaf_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: { upstream_url: { type: "string" } },
+            required: ["upstream_url"],
+            additionalProperties: false,
+          },
+          program: {
+            image: "leaf",
+            entrypoint: ["leaf"],
+            env: {
+              UPSTREAM_URL: "${config.upstream_url}",
+            },
+            network: {
+              endpoints: [{ name: "app", port: 8081 }],
+            },
+          },
+          provides: {
+            app: { kind: "http", endpoint: "app" },
+          },
+          exports: {
+            app: "app",
+          },
+        }
+        "#,
+    );
+
+    write_file(
+        &realm_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              config_schema: {{
+                type: "object",
+                properties: {{ upstream_url: {{ type: "string" }} }},
+                required: ["upstream_url"],
+                additionalProperties: false,
+              }},
+              components: {{
+                leaf: {{
+                  manifest: "{leaf}",
+                  config: {{
+                    upstream_url: "${{config.upstream_url}}",
+                  }},
+                }},
+              }},
+              slots: {{
+                api: {{ kind: "http" }},
+              }},
+              exports: {{
+                app: "#leaf.app",
+              }},
+            }}
+            "##,
+            leaf = file_url(&leaf_path),
+        ),
+    );
+
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              components: {{
+                provider: "{provider}",
+                realm: {{
+                  manifest: "{realm}",
+                  config: {{
+                    upstream_url: "${{bindings.upstream.url}}",
+                  }},
+                }},
+              }},
+              bindings: [
+                {{ name: "upstream", to: "#realm.api", from: "#provider.api" }},
+              ],
+              exports: {{
+                app: "#realm.app",
+              }},
+            }}
+            "##,
+            provider = file_url(&provider_path),
+            realm = file_url(&realm_path),
+        ),
+    );
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+
+    let with_opt = compiler
+        .compile(
+            root_ref.clone(),
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: true },
+            },
+        )
+        .await
+        .expect("compile with optimizations");
+    let without_opt = compiler
+        .compile(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
+            },
+        )
+        .await
+        .expect("compile without optimizations");
+
+    let with_opt_sig = binding_resolution_signature(&with_opt.scenario);
+    let without_opt_sig = binding_resolution_signature(&without_opt.scenario);
+    assert_eq!(
+        with_opt_sig, without_opt_sig,
+        "binding resolution signature changed across opt modes for non-program config holder"
+    );
+    assert!(
+        with_opt_sig.values().all(|value| value != "<missing>"),
+        "missing binding resolution in opt mode for non-program config holder: {with_opt_sig:?}"
+    );
+}
+
+#[tokio::test]
+async fn routing_scope_named_binding_survives_optimization_for_compose_lowering() {
+    let dir = tmp_dir("binding-opt-routing-scope-unnamed-upstream");
+    let root_path = dir.path().join("root.json5");
+    let relay_path = dir.path().join("relay.json5");
+    let leaf_path = dir.path().join("leaf.json5");
+    let provider_path = dir.path().join("provider.json5");
+
+    write_file(
+        &leaf_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: { upstream_url: { type: "string" } },
+            required: ["upstream_url"],
+            additionalProperties: false,
+          },
+          program: {
+            image: "leaf",
+            entrypoint: ["leaf"],
+            env: {
+              UPSTREAM_URL: "${config.upstream_url}",
+            },
+            network: {
+              endpoints: [{ name: "app", port: 8081 }],
+            },
+          },
+          slots: {
+            up: { kind: "http" },
+          },
+          provides: {
+            app: { kind: "http", endpoint: "app" },
+          },
+          exports: {
+            app: "app",
+          },
+        }
+        "#,
+    );
+
+    write_file(
+        &relay_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              components: {{
+                leaf: {{
+                  manifest: "{leaf}",
+                  config: {{
+                    upstream_url: "${{bindings.upstream.url}}",
+                  }},
+                }},
+              }},
+              slots: {{
+                up: {{ kind: "http" }},
+              }},
+              bindings: [
+                {{ name: "upstream", to: "#leaf.up", from: "self.up" }},
+              ],
+              exports: {{
+                app: "#leaf.app",
+              }},
+            }}
+            "##,
+            leaf = file_url(&leaf_path),
+        ),
+    );
+
+    write_file(
+        &provider_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "provider",
+            entrypoint: ["provider"],
+            network: {
+              endpoints: [{ name: "api", port: 8080 }],
+            },
+          },
+          provides: {
+            api: { kind: "http", endpoint: "api" },
+          },
+          exports: {
+            api: "api",
+          },
+        }
+        "#,
+    );
+
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              components: {{
+                relay: "{relay}",
+                provider: "{provider}",
+              }},
+              bindings: [
+                {{ to: "#relay.up", from: "#provider.api" }},
+              ],
+              exports: {{
+                app: "#relay.app",
+              }},
+            }}
+            "##,
+            relay = file_url(&relay_path),
+            provider = file_url(&provider_path),
+        ),
+    );
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+
+    let with_opt = compiler
+        .compile(
+            root_ref.clone(),
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: true },
+            },
+        )
+        .await
+        .expect("compile with optimizations");
+    let without_opt = compiler
+        .compile(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
+            },
+        )
+        .await
+        .expect("compile without optimizations");
+
+    let with_opt_sig = binding_resolution_signature(&with_opt.scenario);
+    let without_opt_sig = binding_resolution_signature(&without_opt.scenario);
+    assert_eq!(
+        with_opt_sig, without_opt_sig,
+        "binding resolution signature changed across opt modes for routing-scope named binding"
+    );
+    assert!(
+        with_opt_sig.values().all(|value| value != "<missing>"),
+        "missing binding resolution in opt mode for routing-scope named binding: {with_opt_sig:?}"
+    );
+
+    DockerComposeReporter
+        .emit(&with_opt.scenario)
+        .expect("compose lowering with optimizations");
+    DockerComposeReporter
+        .emit(&without_opt.scenario)
+        .expect("compose lowering without optimizations");
 }
 
 #[tokio::test]

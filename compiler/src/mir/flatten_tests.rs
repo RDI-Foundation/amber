@@ -7,10 +7,9 @@ use amber_scenario::{
 };
 use url::Url;
 
-use super::FlattenPass;
+use super::flatten_routing_only;
 use crate::{
     CompileOutput, ComponentProvenance, DigestStore, Provenance,
-    passes::ScenarioPass,
     reporter::{Reporter as _, dot::DotReporter},
 };
 
@@ -178,7 +177,7 @@ fn flatten_removes_pure_routing_nodes_and_preserves_debug_data() {
         ],
     };
 
-    let (scenario, provenance) = FlattenPass.run(scenario, provenance, &store).unwrap();
+    let scenario = flatten_routing_only(scenario, &store).unwrap();
 
     assert_eq!(scenario.components.iter().flatten().count(), 2);
     assert_eq!(provenance.components.len(), 3);
@@ -356,7 +355,7 @@ fn flatten_allows_same_name_siblings() {
         ],
     };
 
-    let (scenario, provenance) = FlattenPass.run(scenario, provenance, &store).unwrap();
+    let scenario = flatten_routing_only(scenario, &store).unwrap();
     assert_eq!(scenario.components.len(), 4);
     assert_eq!(provenance.components.len(), 4);
 
