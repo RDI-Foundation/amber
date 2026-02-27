@@ -2,7 +2,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use amber_config as rc;
-use amber_manifest::{InterpolatedPart, InterpolationSource, MountSource};
+use amber_manifest::{InterpolatedPart, InterpolationSource, MountSource, framework_capability};
 use amber_scenario::{ComponentId, Scenario};
 use amber_template::{ProgramTemplateSpec, TemplatePart, TemplateSpec, TemplateString};
 use base64::Engine as _;
@@ -440,6 +440,21 @@ fn build_mount_specs(
         for mount in &program.mounts {
             let query = match &mount.source {
                 MountSource::Config(path) | MountSource::Secret(path) => path,
+                MountSource::Framework(name) => {
+                    if framework_capability(name.as_str()).is_none() {
+                        return Err(MeshError::new(format!(
+                            "unknown framework mount source framework.{} in {}",
+                            name,
+                            component_label(scenario, *id)
+                        )));
+                    }
+                    return Err(MeshError::new(format!(
+                        "framework mount source framework.{} in {} requires runtime framework \
+                         wiring that is not implemented yet",
+                        name,
+                        component_label(scenario, *id)
+                    )));
+                }
                 other => {
                     return Err(MeshError::new(format!(
                         "reserved mount source {other} in {}",

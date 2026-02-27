@@ -23,7 +23,8 @@ use crate::{
         },
         internal_images::resolve_internal_images,
         plan::{
-            MeshOptions, ResolvedBinding, ResolvedExport, ResolvedExternalBinding, component_label,
+            MeshOptions, ResolvedBinding, ResolvedExport, ResolvedExternalBinding,
+            ResolvedFrameworkBinding, component_label,
         },
     },
 };
@@ -489,6 +490,23 @@ impl Addressing for ComposeAddressing<'_> {
         self.record_proxy(binding.consumer, local_port, remote_host, router_port);
 
         Ok(format!("http://127.0.0.1:{local_port}"))
+    }
+
+    fn resolve_framework_binding_url(
+        &mut self,
+        binding: &ResolvedFrameworkBinding,
+    ) -> Result<String, Self::Error> {
+        if binding.capability.as_str() != "docker" {
+            return Err(DockerComposeError::Other(format!(
+                "docker-compose reporter does not support framework capability `framework.{}`",
+                binding.capability
+            )));
+        }
+        Err(DockerComposeError::Other(
+            "docker-compose reporter does not yet support runtime injection for \
+             `framework.docker` (missing docker-gateway wiring)"
+                .to_string(),
+        ))
     }
 
     fn resolve_export_target_url(

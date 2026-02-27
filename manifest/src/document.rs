@@ -140,8 +140,9 @@ fn labels_for_manifest_error(err: &ManifestError, spans: &ManifestSpans) -> Vec<
         ManifestError::UnknownBindingChild { child } => {
             labels_for_unknown_binding_child(spans, child)
         }
-        ManifestError::UnknownFrameworkCapability { capability, .. } => {
-            labels_for_unknown_framework_capability(spans, capability)
+        ManifestError::UnknownFrameworkCapability { capability, .. }
+        | ManifestError::FrameworkCapabilityRequiresFeature { capability, .. } => {
+            labels_for_framework_capability_use(spans, capability)
         }
         ManifestError::DuplicateEndpointName { name } => {
             labels_for_duplicate_endpoint_name(spans, name)
@@ -506,7 +507,7 @@ fn labels_for_binding_target_self(spans: &ManifestSpans, slot: &str) -> Vec<Labe
     )]
 }
 
-fn labels_for_unknown_framework_capability(
+fn labels_for_framework_capability_use(
     spans: &ManifestSpans,
     capability: &str,
 ) -> Vec<LabeledSpan> {
@@ -526,9 +527,25 @@ fn labels_for_unknown_framework_capability(
         }
         None
     });
+    let span = if span == default_span() {
+        spans
+            .program
+            .as_ref()
+            .and_then(|program| {
+                let expected = format!("framework.{capability}");
+                program
+                    .mounts
+                    .iter()
+                    .find(|mount| mount.from_value.as_deref() == Some(expected.as_str()))
+                    .and_then(|mount| mount.from.or(Some(mount.whole)))
+            })
+            .unwrap_or(span)
+    } else {
+        span
+    };
     vec![primary(
         span,
-        Some("unknown framework capability referenced here".to_string()),
+        Some("framework capability referenced here".to_string()),
     )]
 }
 

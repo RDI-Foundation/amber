@@ -534,7 +534,7 @@ fn binding_from_framework_requires_known_capability_explicit_form() {
     match err {
         Error::UnknownFrameworkCapability { capability, help } => {
             assert_eq!(capability, "dynamic_children");
-            assert!(help.contains("framework exposes no capabilities yet"));
+            assert!(help.contains("Known framework capabilities: docker"));
         }
         other => panic!("expected UnknownFrameworkCapability error, got: {other}"),
     }
@@ -560,10 +560,67 @@ fn binding_from_framework_requires_known_capability_dot_form() {
     match err {
         Error::UnknownFrameworkCapability { capability, help } => {
             assert_eq!(capability, "dynamic_children");
-            assert!(help.contains("framework exposes no capabilities yet"));
+            assert!(help.contains("Known framework capabilities: docker"));
         }
         other => panic!("expected UnknownFrameworkCapability error, got: {other}"),
     }
+}
+
+#[test]
+fn binding_from_framework_docker_requires_experimental_feature() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            child: "https://example.com/child",
+          },
+          bindings: [
+            { to: "\#child.worker", from: "framework.docker" },
+          ],
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::FrameworkCapabilityRequiresFeature {
+            capability,
+            feature,
+        } => {
+            assert_eq!(capability, "docker");
+            assert_eq!(feature, "docker");
+        }
+        other => panic!("expected FrameworkCapabilityRequiresFeature error, got: {other}"),
+    }
+}
+
+#[test]
+fn binding_from_framework_docker_is_allowed_with_experimental_feature() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          experimental_features: ["docker"],
+          components: {
+            child: "https://example.com/child",
+          },
+          bindings: [
+            { to: "\#child.worker", from: "framework.docker" },
+          ],
+        }
+        "#,
+    );
+    let manifest = raw.validate().expect("manifest should validate");
+    let target = BindingTarget::ChildSlot {
+        child: ChildName::try_from("child").unwrap(),
+        slot: SlotName::try_from("worker").unwrap(),
+    };
+    let binding = manifest.bindings().get(&target).expect("binding");
+    let BindingSource::Framework(name) = &binding.from else {
+        panic!("expected framework binding source");
+    };
+    assert_eq!(name.as_str(), "docker");
 }
 
 #[test]
@@ -1031,6 +1088,58 @@ fn mounts_parse_config_and_secret_sources() {
 
     let program = m.program.as_ref().expect("program");
     assert_eq!(program.mounts.len(), 2);
+}
+
+#[test]
+fn framework_docker_mount_requires_experimental_feature() {
+    let err = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [
+              { path: "/var/run/docker.sock", from: "framework.docker" },
+            ]
+          }
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    match err {
+        Error::FrameworkCapabilityRequiresFeature {
+            capability,
+            feature,
+        } => {
+            assert_eq!(capability, "docker");
+            assert_eq!(feature, "docker");
+        }
+        other => panic!("expected FrameworkCapabilityRequiresFeature error, got: {other}"),
+    }
+}
+
+#[test]
+fn framework_docker_mount_is_allowed_with_experimental_feature() {
+    let m: Manifest = r#"
+        {
+          manifest_version: "0.1.0",
+          experimental_features: ["docker"],
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [
+              { path: "/var/run/docker.sock", from: "framework.docker" },
+            ]
+          }
+        }
+        "#
+    .parse()
+    .unwrap();
+
+    let program = m.program.as_ref().expect("program");
+    assert_eq!(program.mounts.len(), 1);
+    assert_eq!(program.mounts[0].source.to_string(), "framework.docker");
 }
 
 #[test]

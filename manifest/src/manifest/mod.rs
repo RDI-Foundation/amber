@@ -262,10 +262,28 @@ fn framework_capability_help() -> String {
     format!("Known framework capabilities: {names}")
 }
 
+fn require_framework_capability_feature(
+    capability: &str,
+    required_feature: Option<ExperimentalFeature>,
+    enabled_features: &BTreeSet<ExperimentalFeature>,
+) -> Result<(), Error> {
+    let Some(feature) = required_feature else {
+        return Ok(());
+    };
+    if enabled_features.contains(&feature) {
+        return Ok(());
+    }
+    Err(Error::FrameworkCapabilityRequiresFeature {
+        capability: capability.to_string(),
+        feature: feature.to_string(),
+    })
+}
+
 fn resolve_binding_source(
     ctx: &ValidateCtx<'_>,
     from: BindingSourceRef,
     capability: String,
+    enabled_features: &BTreeSet<ExperimentalFeature>,
 ) -> Result<BindingSource, Error> {
     match from {
         BindingSourceRef::Component(LocalComponentRef::Self_) => {
@@ -295,6 +313,11 @@ fn resolve_binding_source(
                     help: framework_capability_help(),
                 });
             };
+            require_framework_capability_feature(
+                capability.as_str(),
+                spec.required_experimental_feature,
+                enabled_features,
+            )?;
             Ok(BindingSource::Framework(spec.name.clone()))
         }
     }
@@ -303,6 +326,7 @@ fn resolve_binding_source(
 fn build_bindings(
     bindings: BTreeSet<RawBinding>,
     ctx: &ValidateCtx<'_>,
+    enabled_features: &BTreeSet<ExperimentalFeature>,
 ) -> Result<BTreeMap<BindingTarget, Binding>, Error> {
     let mut bindings_out = BTreeMap::new();
     let mut binding_names = BTreeSet::new();
@@ -341,7 +365,7 @@ fn build_bindings(
         };
 
         let target = resolve_binding_target(ctx, to, slot)?;
-        let source = resolve_binding_source(ctx, from, capability)?;
+        let source = resolve_binding_source(ctx, from, capability, enabled_features)?;
 
         if bindings_out.contains_key(&target) {
             let to = match &target {
@@ -455,6 +479,7 @@ fn validate_endpoints(
 fn validate_mounts(
     program: Option<&Program>,
     config_schema: Option<&ConfigSchema>,
+    enabled_features: &BTreeSet<ExperimentalFeature>,
 ) -> Result<(), Error> {
     let Some(program) = program else {
         return Ok(());
@@ -528,7 +553,21 @@ fn validate_mounts(
                     return Err(Error::MountSecretPathIsNotSecret { path: path.clone() });
                 }
             }
-            MountSource::Slot(_) | MountSource::Binding(_) | MountSource::Framework(_) => {
+            MountSource::Framework(name) => {
+                let capability = name.as_str();
+                let Some(spec) = framework_capability(capability) else {
+                    return Err(Error::UnknownFrameworkCapability {
+                        capability: capability.to_string(),
+                        help: framework_capability_help(),
+                    });
+                };
+                require_framework_capability_feature(
+                    capability,
+                    spec.required_experimental_feature,
+                    enabled_features,
+                )?;
+            }
+            MountSource::Slot(_) | MountSource::Binding(_) => {
                 return Err(Error::UnsupportedMountSource {
                     mount: mount.source.to_string(),
                 });
@@ -630,10 +669,14 @@ impl RawManifest {
             provides: &provides,
         };
 
-        let bindings_out = build_bindings(bindings, &ctx)?;
+        let bindings_out = build_bindings(bindings, &ctx, &experimental_features)?;
         let exports_out = build_exports(exports, &ctx)?;
         validate_endpoints(program.as_ref(), &provides)?;
-        validate_mounts(program.as_ref(), config_schema.as_ref())?;
+        validate_mounts(
+            program.as_ref(),
+            config_schema.as_ref(),
+            &experimental_features,
+        )?;
 
         if let Some(program) = program.as_ref()
             && program.args.0.is_empty()

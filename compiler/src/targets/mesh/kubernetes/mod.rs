@@ -114,6 +114,22 @@ impl Addressing for KubernetesAddressing<'_> {
         ))
     }
 
+    fn resolve_framework_binding_url(
+        &mut self,
+        binding: &crate::targets::mesh::plan::ResolvedFrameworkBinding,
+    ) -> Result<String, Self::Error> {
+        if binding.capability.as_str() != "docker" {
+            return Err(Self::Error::new(format!(
+                "kubernetes reporter does not support framework capability `framework.{}`",
+                binding.capability
+            )));
+        }
+        Err(Self::Error::new(
+            "kubernetes reporter does not yet support runtime injection for `framework.docker` \
+             (missing docker-gateway wiring)",
+        ))
+    }
+
     fn resolve_export_target_url(
         &mut self,
         export: &crate::targets::mesh::plan::ResolvedExport,

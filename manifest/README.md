@@ -244,7 +244,8 @@ Reserved (not implemented yet):
 
 * `slots.<name>`
 * `bindings.<name>`
-* `framework.<capability>`
+* `framework.<capability>` except `framework.docker` parsing/validation (requires
+  `experimental_features: ["docker"]`; runtime wiring is backend-dependent).
 
 Mount value formatting:
 
@@ -537,8 +538,12 @@ Rules enforced by this crate:
 * Any `#child` referenced in `to` or `from` must exist in `components`.
 * Slot/capability names must not contain `.`.
 
-Framework capabilities are a fixed compiler-known list. **Today the list is empty**, so any
-`from: "framework"` binding fails validation; this will change as capabilities are added.
+Framework capabilities are a fixed compiler-known list.
+
+Current framework capabilities:
+
+* `docker` (`framework.docker`) — requires `experimental_features: ["docker"]` in the same
+  manifest.
 
 `weak`:
 

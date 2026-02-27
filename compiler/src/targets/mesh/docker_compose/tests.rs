@@ -1899,7 +1899,7 @@ fn errors_on_shared_port_with_different_endpoints() {
 }
 
 #[test]
-fn docker_compose_rejects_framework_bindings() {
+fn docker_compose_rejects_framework_docker_until_gateway_is_injected() {
     let root = Component {
         id: ComponentId(0),
         parent: None,
@@ -1912,19 +1912,114 @@ fn docker_compose_rejects_framework_bindings() {
         provides: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
+        children: vec![ComponentId(1)],
+    };
+
+    let worker = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/worker"),
+        digest: digest(1),
+        config: None,
+        config_schema: None,
+        program: Some(
+            serde_json::from_value(json!({
+                "image": "busybox:1.37",
+                "entrypoint": ["sh", "-lc", "sleep 3600"],
+            }))
+            .unwrap(),
+        ),
+        slots: BTreeMap::from([(
+            "docker".to_string(),
+            serde_json::from_value(json!({
+                "kind": "docker"
+            }))
+            .unwrap(),
+        )]),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
         children: Vec::new(),
     };
 
     let scenario = Scenario {
         root: ComponentId(0),
-        components: vec![Some(root)],
+        components: vec![Some(root), Some(worker)],
+        bindings: vec![BindingEdge {
+            name: Some("docker".to_string()),
+            from: BindingFrom::Framework(FrameworkCapabilityName::try_from("docker").unwrap()),
+            to: SlotRef {
+                component: ComponentId(1),
+                name: "docker".to_string(),
+            },
+            weak: false,
+        }],
+        exports: Vec::new(),
+    };
+
+    let err = DockerComposeReporter.emit(&scenario).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("framework.docker"), "{message}");
+    assert!(
+        message.contains("missing docker-gateway wiring"),
+        "{message}"
+    );
+}
+
+#[test]
+fn docker_compose_rejects_unknown_framework_bindings() {
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: vec![ComponentId(1)],
+    };
+
+    let worker = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/worker"),
+        digest: digest(1),
+        config: None,
+        config_schema: None,
+        program: Some(
+            serde_json::from_value(json!({
+                "image": "busybox:1.37",
+                "entrypoint": ["sh", "-lc", "sleep 3600"],
+            }))
+            .unwrap(),
+        ),
+        slots: BTreeMap::from([(
+            "control".to_string(),
+            serde_json::from_value(json!({
+                "kind": "docker"
+            }))
+            .unwrap(),
+        )]),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(worker)],
         bindings: vec![BindingEdge {
             name: None,
             from: BindingFrom::Framework(
                 FrameworkCapabilityName::try_from("dynamic_children").unwrap(),
             ),
             to: SlotRef {
-                component: ComponentId(0),
+                component: ComponentId(1),
                 name: "control".to_string(),
             },
             weak: false,
@@ -1939,9 +2034,68 @@ fn docker_compose_rejects_framework_bindings() {
         "unexpected error: {message}"
     );
     assert!(
-        message.contains("docker-compose reporter does not support framework binding"),
+        message.contains("unknown framework binding"),
         "unexpected error: {message}"
     );
+}
+
+#[test]
+fn docker_compose_rejects_framework_mounts_until_runtime_wiring_is_implemented() {
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: vec![ComponentId(1)],
+    };
+
+    let worker = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/worker"),
+        digest: digest(1),
+        config: None,
+        config_schema: Some(serde_json::json!({
+            "type": "object",
+        })),
+        program: Some(
+            serde_json::from_value(json!({
+                "image": "busybox:1.37",
+                "entrypoint": ["sh", "-lc", "sleep 3600"],
+                "mounts": [
+                    { "path": "/var/run/docker.sock", "from": "framework.docker" }
+                ],
+            }))
+            .unwrap(),
+        ),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(worker)],
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    };
+
+    let err = DockerComposeReporter.emit(&scenario).unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("framework mount source framework.docker"),
+        "{message}"
+    );
+    assert!(message.contains("not implemented yet"), "{message}");
 }
 
 #[test]

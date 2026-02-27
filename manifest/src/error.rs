@@ -111,6 +111,18 @@ pub enum Error {
     #[diagnostic(code(manifest::unknown_framework_capability), help("{help}"))]
     UnknownFrameworkCapability { capability: String, help: String },
 
+    #[error(
+        "framework capability `framework.{capability}` requires experimental feature `{feature}`"
+    )]
+    #[diagnostic(
+        code(manifest::framework_capability_requires_feature),
+        help(
+            "Add this feature to `experimental_features` in the same manifest, or stop using this \
+             framework capability."
+        )
+    )]
+    FrameworkCapabilityRequiresFeature { capability: String, feature: String },
+
     #[error("duplicate endpoint name `{name}`")]
     #[diagnostic(code(manifest::duplicate_endpoint_name))]
     DuplicateEndpointName { name: String },

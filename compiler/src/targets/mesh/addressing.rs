@@ -7,7 +7,10 @@ use crate::{
     binding_query::BindingObject,
     slot_query::SlotObject,
     targets::mesh::{
-        plan::{MeshError, MeshPlan, ResolvedBinding, ResolvedExport, ResolvedExternalBinding},
+        plan::{
+            MeshError, MeshPlan, ResolvedBinding, ResolvedExport, ResolvedExternalBinding,
+            ResolvedFrameworkBinding,
+        },
         router_config::{
             RouterConfig, RouterExport, RouterExternalSlot, allocate_external_slot_ports,
             build_router_external_slots, encode_router_config_b64,
@@ -88,6 +91,10 @@ pub(crate) trait Addressing {
         binding: &ResolvedExternalBinding,
         router_port: u16,
     ) -> Result<String, Self::Error>;
+    fn resolve_framework_binding_url(
+        &mut self,
+        binding: &ResolvedFrameworkBinding,
+    ) -> Result<String, Self::Error>;
     fn resolve_export_target_url(&mut self, export: &ResolvedExport)
     -> Result<String, Self::Error>;
     fn finalize(self) -> Self::Extra;
@@ -161,6 +168,22 @@ pub(crate) fn build_address_plan<A: Addressing>(
             WorkloadId::Component(binding.consumer),
             router_port,
         );
+    }
+
+    for binding in &mesh_plan.framework_bindings {
+        let url = addressing.resolve_framework_binding_url(binding)?;
+
+        slot_values_by_component
+            .entry(binding.consumer)
+            .or_default()
+            .insert(binding.slot.clone(), SlotObject { url: url.clone() });
+
+        if let Some(name) = binding.binding_name.as_ref() {
+            binding_values_by_component
+                .entry(binding.consumer)
+                .or_default()
+                .insert(name.clone(), BindingObject { url });
+        }
     }
 
     let mut export_ports_by_name: BTreeMap<String, u16> = BTreeMap::new();
