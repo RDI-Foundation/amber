@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 #[derive(Clone, Debug, Default)]
 pub struct ManifestSpans {
     pub manifest_version: Option<SourceSpan>,
+    pub experimental_features: Option<SourceSpan>,
     pub program: Option<ProgramSpans>,
     pub config_schema: Option<SourceSpan>,
     pub components: HashMap<Arc<str>, ComponentDeclSpans>,
@@ -245,6 +246,7 @@ pub(crate) fn parse_manifest_spans(source: &str) -> Option<ManifestSpans> {
     let root = SpanCursor::new(source, (0usize, source.len()).into());
     let mut out = ManifestSpans {
         manifest_version: root.child_span("manifest_version"),
+        experimental_features: root.child_span("experimental_features"),
         config_schema: root.child_span("config_schema"),
         ..ManifestSpans::default()
     };

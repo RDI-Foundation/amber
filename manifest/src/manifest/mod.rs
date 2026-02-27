@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    fmt,
     str::FromStr,
     sync::OnceLock,
 };
@@ -30,6 +31,9 @@ use crate::{
 pub struct RawManifest {
     pub manifest_version: Version,
     #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub experimental_features: BTreeSet<ExperimentalFeature>,
+    #[serde(default)]
     pub program: Option<Program>,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
@@ -55,6 +59,21 @@ pub struct RawManifest {
     pub exports: BTreeMap<String, RawExportTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ExperimentalFeature {
+    Docker,
+}
+
+impl fmt::Display for ExperimentalFeature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExperimentalFeature::Docker => f.write_str("docker"),
+        }
+    }
 }
 
 const SUPPORTED_MANIFEST_VERSION_REQ: &str = "^0.1.0";
@@ -578,6 +597,7 @@ impl RawManifest {
 
         let RawManifest {
             manifest_version,
+            experimental_features,
             program,
             components,
             environments,
@@ -623,6 +643,7 @@ impl RawManifest {
 
         Ok(Manifest {
             manifest_version,
+            experimental_features,
             program,
             components,
             environments,
@@ -641,6 +662,7 @@ impl RawManifest {
 #[serde(into = "RawManifest", try_from = "RawManifest")]
 pub struct Manifest {
     manifest_version: Version,
+    experimental_features: BTreeSet<ExperimentalFeature>,
     program: Option<Program>,
     components: BTreeMap<ChildName, ComponentDecl>,
     environments: BTreeMap<String, EnvironmentDecl>,
@@ -660,6 +682,14 @@ impl Manifest {
 
     pub fn program(&self) -> Option<&Program> {
         self.program.as_ref()
+    }
+
+    pub fn experimental_features(&self) -> &BTreeSet<ExperimentalFeature> {
+        &self.experimental_features
+    }
+
+    pub fn uses_experimental_feature(&self, feature: ExperimentalFeature) -> bool {
+        self.experimental_features.contains(&feature)
     }
 
     pub fn components(&self) -> &BTreeMap<ChildName, ComponentDecl> {
@@ -693,6 +723,7 @@ impl Manifest {
     pub fn empty() -> Self {
         RawManifest {
             manifest_version: Version::new(0, 1, 0),
+            experimental_features: BTreeSet::new(),
             program: None,
             components: BTreeMap::new(),
             environments: BTreeMap::new(),
@@ -721,6 +752,7 @@ impl Manifest {
     #[builder]
     pub fn new(
         #[builder(default = Version::new(0, 1, 0))] manifest_version: Version,
+        #[builder(default)] experimental_features: BTreeSet<ExperimentalFeature>,
         program: Option<Program>,
         #[builder(default)] components: BTreeMap<String, ComponentDecl>,
         #[builder(default)] environments: BTreeMap<String, EnvironmentDecl>,
@@ -735,6 +767,7 @@ impl Manifest {
 
         RawManifest {
             manifest_version,
+            experimental_features,
             program,
             components,
             environments,
@@ -852,6 +885,7 @@ impl From<&Manifest> for RawManifest {
 
         RawManifest {
             manifest_version: manifest.manifest_version.clone(),
+            experimental_features: manifest.experimental_features.clone(),
             program: manifest.program.clone(),
             components,
             environments: manifest.environments.clone(),

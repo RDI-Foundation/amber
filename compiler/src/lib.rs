@@ -1,9 +1,11 @@
+use std::sync::Arc;
+
 #[cfg(test)]
 mod tests;
 
-use amber_manifest::{ManifestRef, lint::lint_manifest};
+use amber_manifest::{ExperimentalFeature, Manifest, ManifestRef, lint::lint_manifest};
 use amber_resolver::Resolver;
-use amber_scenario::Scenario;
+use amber_scenario::{ComponentId, Scenario};
 use miette::{Diagnostic, Report};
 use thiserror::Error;
 
@@ -209,6 +211,22 @@ pub struct CompileOutput {
     pub store: DigestStore,
     pub provenance: Provenance,
     pub diagnostics: Vec<Report>,
+}
+
+impl CompileOutput {
+    pub fn manifest_for_component(&self, id: ComponentId) -> Option<Arc<Manifest>> {
+        let component = self.scenario.components.get(id.0)?.as_ref()?;
+        self.store.get(&component.digest)
+    }
+
+    pub fn component_declares_experimental_feature(
+        &self,
+        id: ComponentId,
+        feature: ExperimentalFeature,
+    ) -> bool {
+        self.manifest_for_component(id)
+            .is_some_and(|manifest| manifest.uses_experimental_feature(feature))
+    }
 }
 
 #[derive(Debug)]

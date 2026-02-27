@@ -5,6 +5,7 @@ use crate::{CapabilityKind, Endpoint, NetworkProtocol};
 fn create_empty_manifest() {
     let manifest = Manifest::empty();
     assert_eq!(manifest.manifest_version, Version::new(0, 1, 0));
+    assert!(manifest.experimental_features.is_empty());
     assert!(manifest.program.is_none());
     assert!(manifest.components.is_empty());
     assert!(manifest.environments.is_empty());
@@ -13,6 +14,61 @@ fn create_empty_manifest() {
     assert!(manifest.provides.is_empty());
     assert!(manifest.bindings.is_empty());
     assert!(manifest.exports.is_empty());
+}
+
+#[test]
+fn experimental_features_parse() {
+    let manifest: Manifest = r#"
+        {
+          manifest_version: "0.1.0",
+          experimental_features: ["docker"],
+        }
+        "#
+    .parse()
+    .unwrap();
+
+    assert!(
+        manifest
+            .experimental_features()
+            .contains(&ExperimentalFeature::Docker)
+    );
+}
+
+#[test]
+fn unknown_experimental_feature_is_rejected() {
+    let err = r#"
+        {
+          manifest_version: "0.1.0",
+          experimental_features: ["not_a_real_feature"],
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    let message = err.to_string();
+    assert!(
+        message.contains("unknown variant `not_a_real_feature`"),
+        "unexpected error message: {message}"
+    );
+}
+
+#[test]
+fn duplicate_experimental_features_are_deduplicated() {
+    let manifest: Manifest = r#"
+        {
+          manifest_version: "0.1.0",
+          experimental_features: ["docker", "docker"],
+        }
+        "#
+    .parse()
+    .unwrap();
+
+    assert_eq!(manifest.experimental_features().len(), 1);
+    assert!(
+        manifest
+            .experimental_features()
+            .contains(&ExperimentalFeature::Docker)
+    );
 }
 
 #[test]
