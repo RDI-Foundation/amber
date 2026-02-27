@@ -79,6 +79,7 @@ jobs:
             type=raw,value=${{ github.sha }}
           flavor: |
             suffix=-${{ matrix.arch }}
+            onlatest=true
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
