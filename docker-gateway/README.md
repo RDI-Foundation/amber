@@ -10,7 +10,8 @@ normal component container, except that it receives a host `docker.sock` mount.
 
 ## What it does
 
-- Authenticates each TCP connection using the peer IP (and optional port) from config.
+- Authenticates each TCP connection using the peer IP (and optional port) resolved from caller
+  host entries in config.
 - Injects ownership labels and `com.docker.compose.project` on create so Compose can clean up
   with `--remove-orphans`.
 - Enforces per-component scoping: only the owning component can inspect, modify, exec, or delete
@@ -36,7 +37,7 @@ Example config:
   "compose_project": "amber-scenario-123",
   "callers": [
     {
-      "ip": "10.5.0.12",
+      "host": "c2-client-net",
       "port": 41732,
       "component": "component-a"
     }
@@ -47,8 +48,10 @@ Example config:
 Notes:
 
 - `compose_project` is required. It is the Docker Compose project name for the scenario.
-- `callers` is required. Each entry maps a peer `ip` (and optional `port`) to a component.
-  If your TCP proxy uses ephemeral source ports, omit `port` and match by IP only.
+- `callers` is required. Each entry maps a peer `host` (and optional `port`) to a component.
+  The gateway resolves caller hosts periodically and authenticates peers by the resolved source
+  IP (plus optional source port).
+- If your TCP proxy uses ephemeral source ports, omit `port` and match by resolved IP only.
 - The ownership label key is fixed to `com.rdi.amber.component`.
 
 ## Labels and scoping
@@ -90,7 +93,7 @@ authorize it.
 ## Running locally (example)
 
 ```sh
-export AMBER_DOCKER_GATEWAY_CONFIG_JSON='{"listen":"0.0.0.0:23750","docker_sock":"/var/run/docker.sock","compose_project":"dev","callers":[{"ip":"127.0.0.1","component":"dev"}]}'
+export AMBER_DOCKER_GATEWAY_CONFIG_JSON='{"listen":"0.0.0.0:23750","docker_sock":"/var/run/docker.sock","compose_project":"dev","callers":[{"host":"localhost","component":"dev"}]}'
 ./target/debug/amber-docker-gateway
 ```
 

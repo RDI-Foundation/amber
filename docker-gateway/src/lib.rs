@@ -4,6 +4,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 use base64::Engine as _;
@@ -25,7 +26,11 @@ use hyper_util::{
 use hyperlocal::{UnixConnector, Uri as HyperlocalUri};
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::net::{TcpListener, UnixStream};
+use tokio::{
+    net::{TcpListener, UnixStream},
+    sync::RwLock,
+    time::sleep,
+};
 use url::form_urlencoded;
 
 const CONFIG_B64_ENV: &str = "AMBER_DOCKER_GATEWAY_CONFIG_B64";
@@ -35,6 +40,7 @@ const COMPOSE_SERVICE_LABEL: &str = "com.docker.compose.service";
 const COMPOSE_NETWORK_LABEL: &str = "com.docker.compose.network";
 const COMPOSE_VOLUME_LABEL: &str = "com.docker.compose.volume";
 const AMBER_COMPONENT_LABEL: &str = "com.rdi.amber.component";
+const CALLER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type ProxyBody = BoxBody<Bytes, BoxError>;
@@ -64,7 +70,7 @@ pub struct DockerGatewayConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct CallerConfig {
-    pub ip: IpAddr,
+    pub host: String,
     #[serde(default)]
     pub port: Option<u16>,
     pub component: String,
@@ -81,6 +87,7 @@ struct State {
     cfg: Arc<DockerGatewayConfig>,
     client: Client<UnixConnector, ProxyBody>,
     exec_map: DashMap<String, String>,
+    callers_by_ip: RwLock<HashMap<IpAddr, Vec<ResolvedCaller>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +99,12 @@ struct OwnerMeta {
 #[derive(Clone, Debug)]
 struct CallerIdentity {
     component: String,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedCaller {
+    component: String,
+    port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,19 +218,19 @@ impl DockerGatewayConfig {
                 "callers must not be empty".to_string(),
             ));
         }
+        for caller in &config.callers {
+            if caller.host.trim().is_empty() {
+                return Err(DockerGatewayError::InvalidConfig(
+                    "caller host must not be empty".to_string(),
+                ));
+            }
+            if caller.component.trim().is_empty() {
+                return Err(DockerGatewayError::InvalidConfig(
+                    "caller component must not be empty".to_string(),
+                ));
+            }
+        }
         Ok(config)
-    }
-}
-
-impl CallerConfig {
-    fn matches(&self, addr: SocketAddr) -> bool {
-        if self.ip != addr.ip() {
-            return false;
-        }
-        match self.port {
-            Some(port) => port == addr.port(),
-            None => true,
-        }
     }
 }
 
@@ -229,22 +242,81 @@ impl State {
             cfg: Arc::new(config),
             client,
             exec_map: DashMap::new(),
+            callers_by_ip: RwLock::new(HashMap::new()),
         }
     }
 
-    fn resolve_identity(&self, peer: SocketAddr) -> Option<CallerIdentity> {
-        self.cfg
-            .callers
-            .iter()
-            .find(|entry| entry.matches(peer))
-            .map(|entry| CallerIdentity {
-                component: entry.component.clone(),
-            })
+    async fn refresh_callers(&self) {
+        let mut callers_by_ip: HashMap<IpAddr, Vec<ResolvedCaller>> = HashMap::new();
+
+        for caller in &self.cfg.callers {
+            match tokio::net::lookup_host((caller.host.as_str(), 0)).await {
+                Ok(addrs) => {
+                    let mut saw_address = false;
+                    for addr in addrs {
+                        saw_address = true;
+                        callers_by_ip
+                            .entry(addr.ip())
+                            .or_default()
+                            .push(ResolvedCaller {
+                                component: caller.component.clone(),
+                                port: caller.port,
+                            });
+                    }
+
+                    if !saw_address {
+                        eprintln!(
+                            "docker gateway caller resolution returned no addresses for host {}",
+                            caller.host
+                        );
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "docker gateway caller resolution failed for host {}: {err}",
+                        caller.host
+                    );
+                }
+            }
+        }
+
+        *self.callers_by_ip.write().await = callers_by_ip;
+    }
+
+    async fn resolve_identity(&self, peer: SocketAddr) -> Option<CallerIdentity> {
+        let callers = self.callers_by_ip.read().await;
+        let matches = callers.get(&peer.ip())?;
+
+        let mut component: Option<&str> = None;
+        for entry in matches {
+            if entry.port.is_some_and(|port| port != peer.port()) {
+                continue;
+            }
+
+            match component {
+                None => component = Some(entry.component.as_str()),
+                Some(current) if current == entry.component.as_str() => {}
+                Some(_) => return None,
+            }
+        }
+
+        component.map(|component| CallerIdentity {
+            component: component.to_string(),
+        })
     }
 }
 
 pub async fn run(config: DockerGatewayConfig) -> Result<(), DockerGatewayError> {
     let state = Arc::new(State::new(config));
+    state.refresh_callers().await;
+
+    let refresh_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            sleep(CALLER_REFRESH_INTERVAL).await;
+            refresh_state.refresh_callers().await;
+        }
+    });
 
     let listener = TcpListener::bind(state.cfg.listen)
         .await
@@ -265,7 +337,7 @@ pub async fn run(config: DockerGatewayConfig) -> Result<(), DockerGatewayError> 
         let conn_state = Arc::new(ConnState {
             state: state.clone(),
             peer,
-            identity: state.resolve_identity(peer),
+            identity: state.resolve_identity(peer).await,
         });
 
         let io = TokioIo::new(stream);
@@ -1909,7 +1981,7 @@ mod tests {
 
     fn default_caller() -> CallerConfig {
         CallerConfig {
-            ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            host: "127.0.0.1".to_string(),
             port: None,
             component: TEST_COMPONENT.to_string(),
         }
@@ -2321,10 +2393,123 @@ mod tests {
         assert!(refs.containers.contains("ipc-target"));
     }
 
+    #[test]
+    fn validate_rejects_empty_caller_host() {
+        let config = DockerGatewayConfig {
+            listen: "127.0.0.1:23750".parse().expect("valid listen addr"),
+            docker_sock: PathBuf::from("/tmp/docker.sock"),
+            compose_project: TEST_PROJECT.to_string(),
+            callers: vec![CallerConfig {
+                host: "   ".to_string(),
+                port: None,
+                component: TEST_COMPONENT.to_string(),
+            }],
+        };
+
+        let err = DockerGatewayConfig::validate(config).expect_err("empty host should fail");
+        assert!(
+            err.to_string().contains("caller host must not be empty"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_caller_component() {
+        let config = DockerGatewayConfig {
+            listen: "127.0.0.1:23750".parse().expect("valid listen addr"),
+            docker_sock: PathBuf::from("/tmp/docker.sock"),
+            compose_project: TEST_PROJECT.to_string(),
+            callers: vec![CallerConfig {
+                host: "localhost".to_string(),
+                port: None,
+                component: "   ".to_string(),
+            }],
+        };
+
+        let err = DockerGatewayConfig::validate(config).expect_err("empty component should fail");
+        assert!(
+            err.to_string()
+                .contains("caller component must not be empty"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_identity_uses_port_and_denies_ambiguous_component_matches() {
+        let state = State::new(DockerGatewayConfig {
+            listen: "127.0.0.1:23750".parse().expect("valid listen addr"),
+            docker_sock: PathBuf::from("/tmp/docker.sock"),
+            compose_project: TEST_PROJECT.to_string(),
+            callers: vec![default_caller()],
+        });
+
+        {
+            let mut callers = state.callers_by_ip.write().await;
+            callers.insert(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                vec![
+                    ResolvedCaller {
+                        component: "component-a".to_string(),
+                        port: Some(30001),
+                    },
+                    ResolvedCaller {
+                        component: "component-b".to_string(),
+                        port: Some(30002),
+                    },
+                ],
+            );
+        }
+
+        let a = state
+            .resolve_identity("127.0.0.1:30001".parse().expect("valid addr"))
+            .await
+            .expect("caller a should match");
+        assert_eq!(a.component, "component-a");
+
+        let b = state
+            .resolve_identity("127.0.0.1:30002".parse().expect("valid addr"))
+            .await
+            .expect("caller b should match");
+        assert_eq!(b.component, "component-b");
+
+        let unmatched = state
+            .resolve_identity("127.0.0.1:30003".parse().expect("valid addr"))
+            .await;
+        assert!(
+            unmatched.is_none(),
+            "unexpected identity for unmatched port"
+        );
+
+        {
+            let mut callers = state.callers_by_ip.write().await;
+            callers.insert(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                vec![
+                    ResolvedCaller {
+                        component: "component-a".to_string(),
+                        port: None,
+                    },
+                    ResolvedCaller {
+                        component: "component-b".to_string(),
+                        port: None,
+                    },
+                ],
+            );
+        }
+
+        let ambiguous = state
+            .resolve_identity("127.0.0.1:30010".parse().expect("valid addr"))
+            .await;
+        assert!(
+            ambiguous.is_none(),
+            "ambiguous peer mapping should fail closed"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn rejects_unauthorized_peer_before_proxying() {
         let gateway = GatewayHarness::start(vec![CallerConfig {
-            ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            host: "127.0.0.2".to_string(),
             port: None,
             component: TEST_COMPONENT.to_string(),
         }])
@@ -2343,7 +2528,7 @@ mod tests {
         assert_ne!(allowed_port, denied_port);
 
         let gateway = GatewayHarness::start(vec![CallerConfig {
-            ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            host: "127.0.0.1".to_string(),
             port: Some(allowed_port),
             component: TEST_COMPONENT.to_string(),
         }])
@@ -2878,7 +3063,7 @@ mod tests {
             docker_sock: docker_sock.clone(),
             compose_project: compose_project.clone(),
             callers: vec![CallerConfig {
-                ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                host: "127.0.0.1".to_string(),
                 port: None,
                 component: component.clone(),
             }],
@@ -3165,12 +3350,12 @@ mod tests {
             compose_project: compose_project.clone(),
             callers: vec![
                 CallerConfig {
-                    ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    host: "127.0.0.1".to_string(),
                     port: Some(caller_a_port),
                     component: component_a.clone(),
                 },
                 CallerConfig {
-                    ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    host: "127.0.0.1".to_string(),
                     port: Some(caller_b_port),
                     component: component_b.clone(),
                 },
