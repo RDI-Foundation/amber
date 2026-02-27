@@ -14,12 +14,20 @@ const TEMPLATE_SPEC_ENV: &str = "AMBER_TEMPLATE_SPEC_B64";
 const DIRECT_ENTRYPOINT_ENV: &str = "AMBER_DIRECT_ENTRYPOINT_B64";
 const DIRECT_ENV_ENV: &str = "AMBER_DIRECT_ENV_B64";
 const MOUNT_SPEC_ENV: &str = "AMBER_MOUNT_SPEC_B64";
+const DOCKER_MOUNT_PROXY_SPEC_ENV: &str = "AMBER_DOCKER_MOUNT_PROXY_SPEC_B64";
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 enum MountSpec {
     Literal { path: String, content: String },
     Config { path: String, config: String },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct DockerMountProxySpec {
+    path: String,
+    tcp_host: String,
+    tcp_port: u16,
 }
 
 #[derive(Debug, Error)]
@@ -68,6 +76,7 @@ impl From<ConfigError> for HelperError {
 pub struct RunPlan {
     pub entrypoint: Vec<String>,
     pub env: BTreeMap<OsString, OsString>,
+    pub docker_mount_proxies: Vec<(String, String, u16)>,
 }
 
 pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Result<RunPlan> {
@@ -80,6 +89,7 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
     let mut direct_entrypoint_b64 = None;
     let mut direct_env_b64 = None;
     let mut mount_spec_b64 = None;
+    let mut docker_mount_proxy_spec_b64 = None;
 
     for (key, value) in env {
         let Some(key_str) = key.to_str() else {
@@ -130,6 +140,12 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
                     .map_err(|_| HelperError::Msg(format!("{MOUNT_SPEC_ENV} is required")))?;
                 mount_spec_b64 = Some(value);
             }
+            DOCKER_MOUNT_PROXY_SPEC_ENV => {
+                let value = value.into_string().map_err(|_| {
+                    HelperError::Msg(format!("{DOCKER_MOUNT_PROXY_SPEC_ENV} is required"))
+                })?;
+                docker_mount_proxy_spec_b64 = Some(value);
+            }
             _ if key_str.starts_with(CONFIG_ENV_PREFIX) => {
                 if let Ok(value) = value.into_string() {
                     config_env.insert(key_str.to_string(), value);
@@ -143,6 +159,11 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
 
     let mounts = if let Some(raw) = mount_spec_b64.as_deref() {
         decode_b64_json_t::<Vec<MountSpec>>(MOUNT_SPEC_ENV, raw)?
+    } else {
+        Vec::new()
+    };
+    let docker_mount_proxies = if let Some(raw) = docker_mount_proxy_spec_b64.as_deref() {
+        decode_b64_json_t::<Vec<DockerMountProxySpec>>(DOCKER_MOUNT_PROXY_SPEC_ENV, raw)?
     } else {
         Vec::new()
     };
@@ -285,6 +306,10 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
     Ok(RunPlan {
         entrypoint,
         env: env_out,
+        docker_mount_proxies: docker_mount_proxies
+            .into_iter()
+            .map(|spec| (spec.path, spec.tcp_host, spec.tcp_port))
+            .collect(),
     })
 }
 
@@ -545,5 +570,47 @@ mod tests {
 
         let contents = std::fs::read_to_string(&mount_path).expect("mount written");
         assert_eq!(contents, "hello");
+    }
+
+    #[test]
+    fn direct_mode_decodes_docker_mount_proxy_specs() {
+        use base64::engine::general_purpose::STANDARD;
+
+        let entrypoint = vec!["/bin/echo".to_string(), "ok".to_string()];
+        let env = BTreeMap::from([("HELLO".to_string(), "world".to_string())]);
+        let proxies = vec![DockerMountProxySpec {
+            path: "/var/run/docker.sock".to_string(),
+            tcp_host: "127.0.0.1".to_string(),
+            tcp_port: 23000,
+        }];
+
+        let envs = BTreeMap::from([
+            (
+                DIRECT_ENTRYPOINT_ENV.to_string(),
+                STANDARD.encode(serde_json::to_vec(&entrypoint).unwrap()),
+            ),
+            (
+                DIRECT_ENV_ENV.to_string(),
+                STANDARD.encode(serde_json::to_vec(&env).unwrap()),
+            ),
+            (
+                DOCKER_MOUNT_PROXY_SPEC_ENV.to_string(),
+                STANDARD.encode(serde_json::to_vec(&proxies).unwrap()),
+            ),
+        ]);
+
+        let os_env = envs
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let plan = build_run_plan(os_env).expect("build run plan");
+
+        assert_eq!(
+            plan.docker_mount_proxies,
+            vec![(
+                "/var/run/docker.sock".to_string(),
+                "127.0.0.1".to_string(),
+                23000
+            )]
+        );
     }
 }

@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     env,
+    hash::Hash,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
@@ -24,12 +25,12 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
 };
 use hyperlocal::{UnixConnector, Uri as HyperlocalUri};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, UnixStream},
     sync::RwLock,
-    time::sleep,
+    time::{sleep, timeout},
 };
 use url::form_urlencoded;
 
@@ -37,10 +38,12 @@ const CONFIG_B64_ENV: &str = "AMBER_DOCKER_GATEWAY_CONFIG_B64";
 const CONFIG_JSON_ENV: &str = "AMBER_DOCKER_GATEWAY_CONFIG_JSON";
 const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
 const COMPOSE_SERVICE_LABEL: &str = "com.docker.compose.service";
+const COMPOSE_CONFIG_HASH_LABEL: &str = "com.docker.compose.config-hash";
 const COMPOSE_NETWORK_LABEL: &str = "com.docker.compose.network";
 const COMPOSE_VOLUME_LABEL: &str = "com.docker.compose.volume";
 const AMBER_COMPONENT_LABEL: &str = "com.rdi.amber.component";
 const CALLER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const SHUTDOWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type ProxyBody = BoxBody<Bytes, BoxError>;
@@ -74,6 +77,7 @@ pub struct CallerConfig {
     #[serde(default)]
     pub port: Option<u16>,
     pub component: String,
+    pub compose_service: String,
 }
 
 #[derive(Clone)]
@@ -87,6 +91,7 @@ struct State {
     cfg: Arc<DockerGatewayConfig>,
     client: Client<UnixConnector, ProxyBody>,
     exec_map: DashMap<String, String>,
+    compose_config_hashes: DashMap<String, String>,
     callers_by_ip: RwLock<HashMap<IpAddr, Vec<ResolvedCaller>>>,
 }
 
@@ -99,11 +104,13 @@ struct OwnerMeta {
 #[derive(Clone, Debug)]
 struct CallerIdentity {
     component: String,
+    compose_service: String,
 }
 
 #[derive(Clone, Debug)]
 struct ResolvedCaller {
     component: String,
+    compose_service: String,
     port: Option<u16>,
 }
 
@@ -138,6 +145,32 @@ struct ExecInspectResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct ContainerSummaryResponse {
+    #[serde(rename = "Id", default)]
+    id: Option<String>,
+    #[serde(rename = "Labels")]
+    labels: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NetworkSummaryResponse {
+    #[serde(rename = "Id", default)]
+    id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VolumeListResponse {
+    #[serde(rename = "Volumes", default)]
+    volumes: Option<Vec<VolumeSummaryResponse>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VolumeSummaryResponse {
+    #[serde(rename = "Name", default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ContainerCreateRequest {
     #[serde(default)]
@@ -151,13 +184,13 @@ struct ContainerCreateRequest {
 struct HostConfigRequest {
     #[serde(default)]
     network_mode: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     binds: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     mounts: Vec<MountRequest>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     volumes_from: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     links: Vec<String>,
     #[serde(default)]
     pid_mode: Option<String>,
@@ -177,8 +210,25 @@ struct MountRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct NetworkingConfigRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_map_or_default")]
     endpoints_config: HashMap<String, serde_json::Value>,
+}
+
+fn deserialize_vec_or_default<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_map_or_default<'de, D, K, V>(deserializer: D) -> Result<HashMap<K, V>, D::Error>
+where
+    D: Deserializer<'de>,
+    K: Deserialize<'de> + Eq + Hash,
+    V: Deserialize<'de>,
+{
+    Ok(Option::<HashMap<K, V>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl DockerGatewayConfig {
@@ -229,6 +279,11 @@ impl DockerGatewayConfig {
                     "caller component must not be empty".to_string(),
                 ));
             }
+            if caller.compose_service.trim().is_empty() {
+                return Err(DockerGatewayError::InvalidConfig(
+                    "caller compose_service must not be empty".to_string(),
+                ));
+            }
         }
         Ok(config)
     }
@@ -242,6 +297,7 @@ impl State {
             cfg: Arc::new(config),
             client,
             exec_map: DashMap::new(),
+            compose_config_hashes: DashMap::new(),
             callers_by_ip: RwLock::new(HashMap::new()),
         }
     }
@@ -260,6 +316,7 @@ impl State {
                             .or_default()
                             .push(ResolvedCaller {
                                 component: caller.component.clone(),
+                                compose_service: caller.compose_service.clone(),
                                 port: caller.port,
                             });
                     }
@@ -287,22 +344,187 @@ impl State {
         let callers = self.callers_by_ip.read().await;
         let matches = callers.get(&peer.ip())?;
 
-        let mut component: Option<&str> = None;
+        let mut identity: Option<(&str, &str)> = None;
         for entry in matches {
             if entry.port.is_some_and(|port| port != peer.port()) {
                 continue;
             }
 
-            match component {
-                None => component = Some(entry.component.as_str()),
-                Some(current) if current == entry.component.as_str() => {}
+            match identity {
+                None => identity = Some((entry.component.as_str(), entry.compose_service.as_str())),
+                Some((component, compose_service))
+                    if component == entry.component.as_str()
+                        && compose_service == entry.compose_service.as_str() => {}
                 Some(_) => return None,
             }
         }
 
-        component.map(|component| CallerIdentity {
+        identity.map(|(component, compose_service)| CallerIdentity {
             component: component.to_string(),
+            compose_service: compose_service.to_string(),
         })
+    }
+
+    async fn cleanup_created_resources(&self) {
+        if timeout(
+            SHUTDOWN_CLEANUP_TIMEOUT,
+            self.cleanup_created_resources_inner(),
+        )
+        .await
+        .is_err()
+        {
+            eprintln!(
+                "docker gateway shutdown cleanup timed out after {:?}",
+                SHUTDOWN_CLEANUP_TIMEOUT
+            );
+        }
+    }
+
+    async fn cleanup_created_resources_inner(&self) {
+        let required_labels = vec![
+            format!("{COMPOSE_PROJECT_LABEL}={}", self.cfg.compose_project),
+            AMBER_COMPONENT_LABEL.to_string(),
+        ];
+
+        let container_query = match build_label_filter_query(&required_labels, true) {
+            Some(value) => value,
+            None => return,
+        };
+        let network_query = match build_label_filter_query(&required_labels, false) {
+            Some(value) => value,
+            None => return,
+        };
+
+        self.cleanup_containers(&container_query).await;
+        self.cleanup_networks(&network_query).await;
+        self.cleanup_volumes(&network_query).await;
+    }
+
+    async fn cleanup_containers(&self, query: &str) {
+        let path = format!("/containers/json?{query}");
+        let response = match docker_get(self, &path).await {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        if response.status != StatusCode::OK {
+            return;
+        }
+
+        let containers =
+            match serde_json::from_slice::<Vec<ContainerSummaryResponse>>(&response.body) {
+                Ok(value) => value,
+                Err(err) => {
+                    eprintln!("docker gateway cleanup failed to parse containers list: {err}");
+                    return;
+                }
+            };
+
+        for container in containers {
+            let Some(id) = container.id.as_deref().map(str::trim) else {
+                continue;
+            };
+            if id.is_empty() {
+                continue;
+            }
+
+            let path = format!("/containers/{id}?force=1&v=1");
+            let Ok(delete_response) = docker_delete(self, &path).await else {
+                continue;
+            };
+            if !(delete_response.status.is_success()
+                || delete_response.status == StatusCode::NOT_FOUND
+                || delete_response.status == StatusCode::CONFLICT)
+            {
+                eprintln!(
+                    "docker gateway cleanup failed to delete container {id}: {}",
+                    delete_response.status
+                );
+            }
+        }
+    }
+
+    async fn cleanup_networks(&self, query: &str) {
+        let path = format!("/networks?{query}");
+        let response = match docker_get(self, &path).await {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        if response.status != StatusCode::OK {
+            return;
+        }
+
+        let networks = match serde_json::from_slice::<Vec<NetworkSummaryResponse>>(&response.body) {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!("docker gateway cleanup failed to parse networks list: {err}");
+                return;
+            }
+        };
+
+        for network in networks {
+            let Some(id) = network.id.as_deref().map(str::trim) else {
+                continue;
+            };
+            if id.is_empty() {
+                continue;
+            }
+
+            let path = format!("/networks/{id}");
+            let Ok(delete_response) = docker_delete(self, &path).await else {
+                continue;
+            };
+            if !(delete_response.status.is_success()
+                || delete_response.status == StatusCode::NOT_FOUND
+                || delete_response.status == StatusCode::CONFLICT)
+            {
+                eprintln!(
+                    "docker gateway cleanup failed to delete network {id}: {}",
+                    delete_response.status
+                );
+            }
+        }
+    }
+
+    async fn cleanup_volumes(&self, query: &str) {
+        let path = format!("/volumes?{query}");
+        let response = match docker_get(self, &path).await {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        if response.status != StatusCode::OK {
+            return;
+        }
+
+        let volumes = match serde_json::from_slice::<VolumeListResponse>(&response.body) {
+            Ok(value) => value.volumes.unwrap_or_default(),
+            Err(err) => {
+                eprintln!("docker gateway cleanup failed to parse volumes list: {err}");
+                return;
+            }
+        };
+
+        for volume in volumes {
+            let Some(name) = volume.name.as_deref().map(str::trim) else {
+                continue;
+            };
+            if name.is_empty() {
+                continue;
+            }
+
+            let path = format!("/volumes/{name}?force=1");
+            let Ok(delete_response) = docker_delete(self, &path).await else {
+                continue;
+            };
+            if !(delete_response.status.is_success()
+                || delete_response.status == StatusCode::NOT_FOUND
+                || delete_response.status == StatusCode::CONFLICT)
+            {
+                eprintln!(
+                    "docker gateway cleanup failed to delete volume {name}: {}",
+                    delete_response.status
+                );
+            }
+        }
     }
 }
 
@@ -311,7 +533,7 @@ pub async fn run(config: DockerGatewayConfig) -> Result<(), DockerGatewayError> 
     state.refresh_callers().await;
 
     let refresh_state = state.clone();
-    tokio::spawn(async move {
+    let refresh_task = tokio::spawn(async move {
         loop {
             sleep(CALLER_REFRESH_INTERVAL).await;
             refresh_state.refresh_callers().await;
@@ -325,41 +547,53 @@ pub async fn run(config: DockerGatewayConfig) -> Result<(), DockerGatewayError> 
             source,
         })?;
 
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
     loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(value) => value,
-            Err(err) => {
-                eprintln!("docker gateway accept failed: {err}");
-                continue;
+        tokio::select! {
+            _ = &mut shutdown => {
+                refresh_task.abort();
+                state.cleanup_created_resources().await;
+                return Ok(());
             }
-        };
+            accepted = listener.accept() => {
+                let (stream, peer) = match accepted {
+                    Ok(value) => value,
+                    Err(err) => {
+                        eprintln!("docker gateway accept failed: {err}");
+                        continue;
+                    }
+                };
 
-        let conn_state = Arc::new(ConnState {
-            state: state.clone(),
-            peer,
-            identity: state.resolve_identity(peer).await,
-        });
+                let conn_state = Arc::new(ConnState {
+                    state: state.clone(),
+                    peer,
+                    identity: state.resolve_identity(peer).await,
+                });
 
-        let io = TokioIo::new(stream);
-        let svc = service_fn(move |req: Request<Incoming>| {
-            let conn_state = conn_state.clone();
-            async move {
-                let req = req.map(box_body_from_incoming);
-                Ok::<_, std::convert::Infallible>(handle(req, conn_state).await)
+                let io = TokioIo::new(stream);
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let conn_state = conn_state.clone();
+                    async move {
+                        let req = req.map(box_body_from_incoming);
+                        Ok::<_, std::convert::Infallible>(handle(req, conn_state).await)
+                    }
+                });
+
+                tokio::spawn(async move {
+                    if let Err(err) = http1::Builder::new()
+                        .preserve_header_case(true)
+                        .title_case_headers(true)
+                        .serve_connection(io, svc)
+                        .with_upgrades()
+                        .await
+                    {
+                        eprintln!("docker gateway connection failed: {err}");
+                    }
+                });
             }
-        });
-
-        tokio::spawn(async move {
-            if let Err(err) = http1::Builder::new()
-                .preserve_header_case(true)
-                .title_case_headers(true)
-                .serve_connection(io, svc)
-                .with_upgrades()
-                .await
-            {
-                eprintln!("docker gateway connection failed: {err}");
-            }
-        });
+        }
     }
 }
 
@@ -479,7 +713,15 @@ async fn handle(mut req: Request<ProxyBody>, conn: Arc<ConnState>) -> Response<P
         }
 
         let mut to_set = owner_label_pairs(&conn.state, &id);
-        to_set.push((COMPOSE_SERVICE_LABEL.to_string(), id.component.clone()));
+        to_set.push((
+            COMPOSE_SERVICE_LABEL.to_string(),
+            id.compose_service.clone(),
+        ));
+        if let Some(config_hash) =
+            resolve_compose_service_config_hash(conn.state.clone(), &version_prefix, &id).await
+        {
+            to_set.push((COMPOSE_CONFIG_HASH_LABEL.to_string(), config_hash));
+        }
 
         let new_body = match inject_labels_into_create_body(raw, &to_set) {
             Ok(body) => body,
@@ -709,6 +951,114 @@ fn required_label_filters(state: &State, id: &CallerIdentity) -> Vec<String> {
         .collect()
 }
 
+fn build_label_filter_query(required_labels: &[String], include_all: bool) -> Option<String> {
+    let filters = serde_json::json!({
+        "label": required_labels
+    });
+    let encoded_filters = serde_json::to_string(&filters).ok()?;
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    if include_all {
+        serializer.append_pair("all", "1");
+    }
+    serializer.append_pair("filters", &encoded_filters);
+    Some(serializer.finish())
+}
+
+async fn resolve_compose_service_config_hash(
+    state: Arc<State>,
+    version_prefix: &str,
+    id: &CallerIdentity,
+) -> Option<String> {
+    if let Some(existing) = state.compose_config_hashes.get(&id.compose_service) {
+        return Some(existing.value().clone());
+    }
+
+    let filters = serde_json::json!({
+        "label": [
+            format!("{COMPOSE_PROJECT_LABEL}={}", state.cfg.compose_project),
+            format!("{COMPOSE_SERVICE_LABEL}={}", id.compose_service),
+        ]
+    });
+    let encoded_filters = match serde_json::to_string(&filters) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!(
+                "docker gateway failed to encode compose label filters for service {}: {err}",
+                id.compose_service
+            );
+            return None;
+        }
+    };
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair("all", "1")
+        .append_pair("filters", &encoded_filters)
+        .finish();
+    let path = with_version(version_prefix, "/containers/json");
+    let response_path = format!("{path}?{query}");
+    let response = match docker_get(&state, &response_path).await {
+        Ok(value) => value,
+        Err(_) => return None,
+    };
+    if response.status != StatusCode::OK {
+        return None;
+    }
+
+    let containers = match serde_json::from_slice::<Vec<ContainerSummaryResponse>>(&response.body) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!(
+                "docker gateway failed to decode container list while resolving compose \
+                 config-hash for service {}: {err}",
+                id.compose_service
+            );
+            return None;
+        }
+    };
+
+    let config_hash = containers.into_iter().find_map(|entry| {
+        entry
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(COMPOSE_CONFIG_HASH_LABEL))
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    });
+
+    if let Some(config_hash) = config_hash {
+        state
+            .compose_config_hashes
+            .insert(id.compose_service.clone(), config_hash.clone());
+        Some(config_hash)
+    } else {
+        None
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 async fn forward(mut req: Request<ProxyBody>, state: Arc<State>) -> Response<ProxyBody> {
     if let Err(resp) = rewrite_to_docker_uri(&mut req, &state.cfg.docker_sock) {
         return *resp;
@@ -834,8 +1184,15 @@ async fn authorize_container_create_references(
 }
 
 fn parse_container_create_references(body: &[u8]) -> GatewayResult<ContainerCreateRefs> {
-    let request: ContainerCreateRequest = serde_json::from_slice(body)
-        .map_err(|_| boxed_response(docker_error(StatusCode::BAD_REQUEST, "invalid JSON body")))?;
+    let request: ContainerCreateRequest = serde_json::from_slice(body).map_err(|err| {
+        boxed_response(docker_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid JSON body: {err}; body prefix: {:?}",
+                String::from_utf8_lossy(&body[..body.len().min(256)])
+            ),
+        ))
+    })?;
 
     let mut refs = ContainerCreateRefs::default();
 
@@ -1144,9 +1501,21 @@ struct DockerGetResponse {
 }
 
 async fn docker_get(state: &State, path: &str) -> GatewayResult<DockerGetResponse> {
+    docker_request(state, Method::GET, path).await
+}
+
+async fn docker_delete(state: &State, path: &str) -> GatewayResult<DockerGetResponse> {
+    docker_request(state, Method::DELETE, path).await
+}
+
+async fn docker_request(
+    state: &State,
+    method: Method,
+    path: &str,
+) -> GatewayResult<DockerGetResponse> {
     let uri: Uri = HyperlocalUri::new(&state.cfg.docker_sock, path).into();
     let mut req = Request::builder()
-        .method(Method::GET)
+        .method(method)
         .uri(uri)
         .body(box_body_from_bytes(Bytes::new()))
         .expect("request build");
@@ -1410,8 +1779,15 @@ fn inject_labels_into_create_body(
     body: Bytes,
     to_set: &[(String, String)],
 ) -> GatewayResult<Bytes> {
-    let mut value: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|_| boxed_response(docker_error(StatusCode::BAD_REQUEST, "invalid JSON body")))?;
+    let mut value: serde_json::Value = serde_json::from_slice(&body).map_err(|err| {
+        boxed_response(docker_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid JSON body: {err}; body prefix: {:?}",
+                String::from_utf8_lossy(&body[..body.len().min(256)])
+            ),
+        ))
+    })?;
 
     let obj = value.as_object_mut().ok_or_else(|| {
         boxed_response(docker_error(
@@ -1984,6 +2360,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: None,
             component: TEST_COMPONENT.to_string(),
+            compose_service: TEST_COMPONENT.to_string(),
         }
     }
 
@@ -2403,6 +2780,7 @@ mod tests {
                 host: "   ".to_string(),
                 port: None,
                 component: TEST_COMPONENT.to_string(),
+                compose_service: TEST_COMPONENT.to_string(),
             }],
         };
 
@@ -2423,6 +2801,7 @@ mod tests {
                 host: "localhost".to_string(),
                 port: None,
                 component: "   ".to_string(),
+                compose_service: TEST_COMPONENT.to_string(),
             }],
         };
 
@@ -2450,10 +2829,12 @@ mod tests {
                 vec![
                     ResolvedCaller {
                         component: "component-a".to_string(),
+                        compose_service: "service-a".to_string(),
                         port: Some(30001),
                     },
                     ResolvedCaller {
                         component: "component-b".to_string(),
+                        compose_service: "service-b".to_string(),
                         port: Some(30002),
                     },
                 ],
@@ -2465,12 +2846,14 @@ mod tests {
             .await
             .expect("caller a should match");
         assert_eq!(a.component, "component-a");
+        assert_eq!(a.compose_service, "service-a");
 
         let b = state
             .resolve_identity("127.0.0.1:30002".parse().expect("valid addr"))
             .await
             .expect("caller b should match");
         assert_eq!(b.component, "component-b");
+        assert_eq!(b.compose_service, "service-b");
 
         let unmatched = state
             .resolve_identity("127.0.0.1:30003".parse().expect("valid addr"))
@@ -2487,10 +2870,12 @@ mod tests {
                 vec![
                     ResolvedCaller {
                         component: "component-a".to_string(),
+                        compose_service: "service-a".to_string(),
                         port: None,
                     },
                     ResolvedCaller {
                         component: "component-b".to_string(),
+                        compose_service: "service-b".to_string(),
                         port: None,
                     },
                 ],
@@ -2512,6 +2897,7 @@ mod tests {
             host: "127.0.0.2".to_string(),
             port: None,
             component: TEST_COMPONENT.to_string(),
+            compose_service: TEST_COMPONENT.to_string(),
         }])
         .await;
 
@@ -2531,6 +2917,7 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: Some(allowed_port),
             component: TEST_COMPONENT.to_string(),
+            compose_service: TEST_COMPONENT.to_string(),
         }])
         .await;
         gateway.enqueue_json(
@@ -2610,6 +2997,18 @@ mod tests {
     async fn create_injects_and_overwrites_security_labels() {
         let gateway = GatewayHarness::start(vec![default_caller()]).await;
         gateway.enqueue_json(
+            Method::GET,
+            "/containers/json",
+            StatusCode::OK,
+            serde_json::json!([
+                {
+                    "Labels": {
+                        COMPOSE_CONFIG_HASH_LABEL: "cfg-hash-1",
+                    }
+                }
+            ]),
+        );
+        gateway.enqueue_json(
             Method::POST,
             "/containers/create",
             StatusCode::CREATED,
@@ -2660,9 +3059,24 @@ mod tests {
             Some(TEST_COMPONENT)
         );
         assert_eq!(
+            labels
+                .get(COMPOSE_CONFIG_HASH_LABEL)
+                .and_then(|v| v.as_str()),
+            Some("cfg-hash-1")
+        );
+        assert_eq!(
             labels.get("user.label").and_then(|v| v.as_str()),
             Some("kept")
         );
+
+        let list_req = requests
+            .iter()
+            .find(|req| req.method == Method::GET && req.path == "/containers/json")
+            .expect("container list should be queried for compose config hash");
+        let list_filters = decode_filters(list_req);
+        let list_labels = labels_as_set(&list_filters);
+        assert!(list_labels.contains(&format!("{COMPOSE_PROJECT_LABEL}={TEST_PROJECT}")));
+        assert!(list_labels.contains(&format!("{COMPOSE_SERVICE_LABEL}={TEST_COMPONENT}")));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2859,6 +3273,115 @@ mod tests {
         assert!(prune_labels.contains("existing=label"));
         assert!(prune_labels.contains(&format!("{AMBER_COMPONENT_LABEL}={TEST_COMPONENT}")));
         assert!(prune_labels.contains(&format!("{COMPOSE_PROJECT_LABEL}={TEST_PROJECT}")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_cleanup_removes_owned_resources() {
+        let docker = MockDocker::start().await;
+        let state = State::new(DockerGatewayConfig {
+            listen: "127.0.0.1:23750".parse().expect("valid listen addr"),
+            docker_sock: docker.socket_path.clone(),
+            compose_project: TEST_PROJECT.to_string(),
+            callers: vec![default_caller()],
+        });
+
+        docker.enqueue_json(
+            Method::GET,
+            "/containers/json",
+            StatusCode::OK,
+            serde_json::json!([
+                {"Id":"container-a"},
+                {"Id":"container-b"},
+            ]),
+        );
+        docker.enqueue_empty(
+            Method::DELETE,
+            "/containers/container-a",
+            StatusCode::NO_CONTENT,
+        );
+        docker.enqueue_empty(
+            Method::DELETE,
+            "/containers/container-b",
+            StatusCode::NO_CONTENT,
+        );
+        docker.enqueue_json(
+            Method::GET,
+            "/networks",
+            StatusCode::OK,
+            serde_json::json!([
+                {"Id":"network-a"},
+            ]),
+        );
+        docker.enqueue_empty(
+            Method::DELETE,
+            "/networks/network-a",
+            StatusCode::NO_CONTENT,
+        );
+        docker.enqueue_json(
+            Method::GET,
+            "/volumes",
+            StatusCode::OK,
+            serde_json::json!({
+                "Volumes": [
+                    {"Name":"volume-a"},
+                ]
+            }),
+        );
+        docker.enqueue_empty(Method::DELETE, "/volumes/volume-a", StatusCode::NO_CONTENT);
+
+        state.cleanup_created_resources_inner().await;
+
+        let requests = docker.requests();
+
+        let container_list = requests
+            .iter()
+            .find(|req| req.method == Method::GET && req.path == "/containers/json")
+            .expect("containers list request");
+        assert!(
+            container_list.path_and_query.contains("all=1"),
+            "containers cleanup should request all containers"
+        );
+        let container_filters = decode_filters(container_list);
+        let container_labels = labels_as_set(&container_filters);
+        assert!(container_labels.contains(AMBER_COMPONENT_LABEL));
+        assert!(container_labels.contains(&format!("{COMPOSE_PROJECT_LABEL}={TEST_PROJECT}")));
+
+        let network_list = requests
+            .iter()
+            .find(|req| req.method == Method::GET && req.path == "/networks")
+            .expect("networks list request");
+        let network_filters = decode_filters(network_list);
+        let network_labels = labels_as_set(&network_filters);
+        assert!(network_labels.contains(AMBER_COMPONENT_LABEL));
+        assert!(network_labels.contains(&format!("{COMPOSE_PROJECT_LABEL}={TEST_PROJECT}")));
+
+        let volume_list = requests
+            .iter()
+            .find(|req| req.method == Method::GET && req.path == "/volumes")
+            .expect("volumes list request");
+        let volume_filters = decode_filters(volume_list);
+        let volume_labels = labels_as_set(&volume_filters);
+        assert!(volume_labels.contains(AMBER_COMPONENT_LABEL));
+        assert!(volume_labels.contains(&format!("{COMPOSE_PROJECT_LABEL}={TEST_PROJECT}")));
+
+        let deleted_containers: HashSet<&str> = requests
+            .iter()
+            .filter(|req| req.method == Method::DELETE && req.path.starts_with("/containers/"))
+            .map(|req| req.path.as_str())
+            .collect();
+        assert!(deleted_containers.contains("/containers/container-a"));
+        assert!(deleted_containers.contains("/containers/container-b"));
+
+        assert!(
+            requests
+                .iter()
+                .any(|req| req.method == Method::DELETE && req.path == "/networks/network-a")
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|req| req.method == Method::DELETE && req.path == "/volumes/volume-a")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3066,6 +3589,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: None,
                 component: component.clone(),
+                compose_service: component.clone(),
             }],
         };
 
@@ -3353,11 +3877,13 @@ mod tests {
                     host: "127.0.0.1".to_string(),
                     port: Some(caller_a_port),
                     component: component_a.clone(),
+                    compose_service: component_a.clone(),
                 },
                 CallerConfig {
                     host: "127.0.0.1".to_string(),
                     port: Some(caller_b_port),
                     component: component_b.clone(),
+                    compose_service: component_b.clone(),
                 },
             ],
         };

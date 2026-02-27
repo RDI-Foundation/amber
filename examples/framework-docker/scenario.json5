@@ -1,0 +1,18 @@
+{
+  manifest_version: "0.1.0",
+  experimental_features: ["docker"],
+  components: {
+    worker: {
+      manifest: "./worker.json5",
+      config: {
+        container_name: "amber-framework-docker-demo",
+      },
+    },
+  },
+  bindings: [
+    { to: "#worker.docker", from: "framework.docker" },
+  ],
+  exports: {
+    status: "#worker.status",
+  },
+}

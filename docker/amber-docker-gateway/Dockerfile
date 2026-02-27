@@ -67,5 +67,4 @@ FROM gcr.io/distroless/static-debian13 AS runtime
 
 COPY --from=builder /out/amber-docker-gateway /amber-docker-gateway
 
-USER 65532:65532
 ENTRYPOINT ["/amber-docker-gateway"]

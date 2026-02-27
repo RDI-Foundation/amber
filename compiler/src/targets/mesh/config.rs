@@ -421,20 +421,31 @@ fn build_mount_specs(
             continue;
         }
 
-        if component.config_schema.is_none() {
+        let has_config_or_secret_mount = program.mounts.iter().any(|mount| {
+            matches!(
+                mount.source,
+                MountSource::Config(_) | MountSource::Secret(_)
+            )
+        });
+
+        if has_config_or_secret_mount && component.config_schema.is_none() {
             return Err(MeshError::new(format!(
                 "component {} requires config_schema when using program.mounts",
                 component_label(scenario, *id)
             )));
         }
 
-        let template = resolved_templates.get(id).ok_or_else(|| {
-            MeshError::new(format!(
-                "no config template for component {}",
-                component_label(scenario, *id)
-            ))
-        })?;
-        let template_opt = template.node();
+        let template_opt = if has_config_or_secret_mount {
+            let template = resolved_templates.get(id).ok_or_else(|| {
+                MeshError::new(format!(
+                    "no config template for component {}",
+                    component_label(scenario, *id)
+                ))
+            })?;
+            Some(template.node())
+        } else {
+            None
+        };
 
         let mut specs = Vec::new();
         for mount in &program.mounts {
@@ -448,12 +459,9 @@ fn build_mount_specs(
                             component_label(scenario, *id)
                         )));
                     }
-                    return Err(MeshError::new(format!(
-                        "framework mount source framework.{} in {} requires runtime framework \
-                         wiring that is not implemented yet",
-                        name,
-                        component_label(scenario, *id)
-                    )));
+                    // Handled by target-specific runtime wiring. Config mount specs only cover
+                    // config/secret file materialization.
+                    continue;
                 }
                 other => {
                     return Err(MeshError::new(format!(
@@ -463,6 +471,7 @@ fn build_mount_specs(
                 }
             };
 
+            let template_opt = template_opt.expect("config/secret mounts require template");
             match resolve_config_query_for_mount(template_opt, query)? {
                 MountResolution::Static(value) => {
                     let content = rc::stringify_for_mount(&value)
@@ -481,7 +490,9 @@ fn build_mount_specs(
             }
         }
 
-        out.insert(*id, specs);
+        if !specs.is_empty() {
+            out.insert(*id, specs);
+        }
     }
 
     Ok(out)

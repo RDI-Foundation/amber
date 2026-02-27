@@ -239,13 +239,14 @@ Supported `from` sources (current):
 
 * `config` or `config.<path>`: mount the component config (whole object or a path).
 * `secret.<path>`: mount a config value marked `secret: true` in the component’s config schema.
+* `framework.docker`: requires `experimental_features: ["docker"]`. In Docker Compose output, this
+  injects a Docker socket mount backed by the framework docker gateway.
 
 Reserved (not implemented yet):
 
 * `slots.<name>`
 * `bindings.<name>`
-* `framework.<capability>` except `framework.docker` parsing/validation (requires
-  `experimental_features: ["docker"]`; runtime wiring is backend-dependent).
+* `framework.<capability>` other than `framework.docker`
 
 Mount value formatting:
 

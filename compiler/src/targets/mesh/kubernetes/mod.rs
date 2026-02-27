@@ -6,7 +6,7 @@ use std::{
 };
 
 use amber_config as rc;
-use amber_manifest::span_for_json_pointer;
+use amber_manifest::{MountSource, span_for_json_pointer};
 use amber_scenario::{ComponentId, Scenario};
 use miette::{LabeledSpan, NamedSource, SourceSpan};
 pub use resources::*;
@@ -228,6 +228,22 @@ fn render_kubernetes_inner(
         },
     )
     .map_err(|e| ReporterError::new(e.to_string()))?;
+    for component_id in &mesh_plan.program_components {
+        let component = s.component(*component_id);
+        let Some(program) = component.program.as_ref() else {
+            continue;
+        };
+        for mount in &program.mounts {
+            if let MountSource::Framework(capability) = &mount.source
+                && capability.as_str() == "docker"
+            {
+                return Err(ReporterError::new(
+                    "kubernetes reporter does not yet support runtime injection for \
+                     `framework.docker` mounts (missing docker-gateway wiring)",
+                ));
+            }
+        }
+    }
     let images = resolve_internal_images().map_err(ReporterError::new)?;
 
     let program_components = mesh_plan.program_components.as_slice();

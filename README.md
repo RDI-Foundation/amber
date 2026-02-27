@@ -155,6 +155,7 @@ If you're working in this repo, these docs go deeper:
 - CLI behavior and outputs: `cli/README.md`
 - Compiler pipeline and reporters: `compiler/README.md`
 - Docker gateway component: `docker-gateway/README.md`
+- Framework docker example: `examples/framework-docker/README.md`
 - Scenario data model: `scenario/README.md`
 - Manifest resolution (file/http) details: `resolver/README.md`
 - Examples: `examples/`

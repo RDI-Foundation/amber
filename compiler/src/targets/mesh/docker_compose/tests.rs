@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use amber_images::{AMBER_HELPER, AMBER_ROUTER, AMBER_SIDECAR};
+use amber_images::{AMBER_DOCKER_GATEWAY, AMBER_HELPER, AMBER_ROUTER, AMBER_SIDECAR};
 use amber_manifest::{FrameworkCapabilityName, ManifestDigest, ManifestRef, ProvideDecl, SlotDecl};
 use amber_resolver::Resolver;
 use amber_scenario::{
@@ -27,6 +27,7 @@ use crate::{CompileOptions, Compiler, DigestStore, OptimizeOptions, reporter::Re
 const SIDECAR_IMAGE: &str = AMBER_SIDECAR.reference;
 const HELPER_IMAGE: &str = AMBER_HELPER.reference;
 const ROUTER_IMAGE: &str = AMBER_ROUTER.reference;
+const DOCKER_GATEWAY_IMAGE: &str = AMBER_DOCKER_GATEWAY.reference;
 
 fn digest(byte: u8) -> ManifestDigest {
     ManifestDigest::new([byte; 32])
@@ -160,6 +161,15 @@ fn build_router_image() -> String {
     build_docker_image(
         ROUTER_IMAGE,
         &root.join("docker/amber-router/Dockerfile"),
+        &root,
+    )
+}
+
+fn build_docker_gateway_image() -> String {
+    let root = workspace_root();
+    build_docker_image(
+        DOCKER_GATEWAY_IMAGE,
+        &root.join("docker/amber-docker-gateway/Dockerfile"),
         &root,
     )
 }
@@ -1899,7 +1909,7 @@ fn errors_on_shared_port_with_different_endpoints() {
 }
 
 #[test]
-fn docker_compose_rejects_framework_docker_until_gateway_is_injected() {
+fn docker_compose_wires_framework_docker_binding_via_gateway() {
     let root = Component {
         id: ComponentId(0),
         parent: None,
@@ -1926,6 +1936,9 @@ fn docker_compose_rejects_framework_docker_until_gateway_is_injected() {
             serde_json::from_value(json!({
                 "image": "busybox:1.37",
                 "entrypoint": ["sh", "-lc", "sleep 3600"],
+                "env": {
+                    "DOCKER_HOST": "${slots.docker.url}"
+                }
             }))
             .unwrap(),
         ),
@@ -1957,12 +1970,28 @@ fn docker_compose_rejects_framework_docker_until_gateway_is_injected() {
         exports: Vec::new(),
     };
 
-    let err = DockerComposeReporter.emit(&scenario).unwrap_err();
-    let message = err.to_string();
-    assert!(message.contains("framework.docker"), "{message}");
+    let yaml = DockerComposeReporter
+        .emit(&scenario)
+        .expect("compose render ok");
+    let compose = parse_compose(&yaml);
+
     assert!(
-        message.contains("missing docker-gateway wiring"),
-        "{message}"
+        compose.services.contains_key("amber-docker-gateway"),
+        "{yaml}"
+    );
+    assert_eq!(
+        service(&compose, "amber-docker-gateway").image,
+        DOCKER_GATEWAY_IMAGE
+    );
+    assert_eq!(
+        env_value(service(&compose, "c1-worker"), "DOCKER_HOST").as_deref(),
+        Some("tcp://127.0.0.1:20000")
+    );
+    let worker_sidecar_script =
+        command_script(service(&compose, "c1-worker-net")).expect("worker sidecar script");
+    assert!(
+        worker_sidecar_script.contains("TCP:amber-docker-gateway:23750"),
+        "{worker_sidecar_script}"
     );
 }
 
@@ -2040,7 +2069,7 @@ fn docker_compose_rejects_unknown_framework_bindings() {
 }
 
 #[test]
-fn docker_compose_rejects_framework_mounts_until_runtime_wiring_is_implemented() {
+fn docker_compose_wires_framework_mounts_via_helper_proxy() {
     let root = Component {
         id: ComponentId(0),
         parent: None,
@@ -2089,13 +2118,39 @@ fn docker_compose_rejects_framework_mounts_until_runtime_wiring_is_implemented()
         exports: Vec::new(),
     };
 
-    let err = DockerComposeReporter.emit(&scenario).unwrap_err();
-    let message = err.to_string();
+    let yaml = DockerComposeReporter
+        .emit(&scenario)
+        .expect("compose render ok");
+    let compose = parse_compose(&yaml);
+
+    assert!(compose.services.contains_key("amber-init"), "{yaml}");
     assert!(
-        message.contains("framework mount source framework.docker"),
-        "{message}"
+        compose.services.contains_key("amber-docker-gateway"),
+        "{yaml}"
     );
-    assert!(message.contains("not implemented yet"), "{message}");
+    let worker = service(&compose, "c1-worker");
+    let proxy_spec_b64 =
+        env_value(worker, "AMBER_DOCKER_MOUNT_PROXY_SPEC_B64").expect("docker mount proxy env var");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(proxy_spec_b64.as_bytes())
+        .expect("decode docker mount proxy env");
+    let specs: serde_json::Value = serde_json::from_slice(&decoded).expect("proxy spec json");
+    assert!(
+        specs
+            .as_array()
+            .expect("proxy specs should be array")
+            .iter()
+            .any(|spec| {
+                spec.get("path").and_then(|value| value.as_str()) == Some("/var/run/docker.sock")
+            }),
+        "{specs}"
+    );
+    let sidecar_script =
+        command_script(service(&compose, "c1-worker-net")).expect("worker sidecar script");
+    assert!(
+        sidecar_script.contains("TCP:amber-docker-gateway:23750"),
+        "{sidecar_script}"
+    );
 }
 
 #[test]
@@ -2452,6 +2507,389 @@ exit 1
     assert!(
         !denied.success(),
         "denied client unexpectedly reached server"
+    );
+}
+
+#[derive(Clone, Copy)]
+enum FrameworkDockerBindingForm {
+    Mount,
+    Url,
+}
+
+impl FrameworkDockerBindingForm {
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Mount => "mount",
+            Self::Url => "url",
+        }
+    }
+
+    fn worker_preflight(self) -> &'static str {
+        match self {
+            Self::Mount => "test -S /var/run/docker.sock;",
+            Self::Url => {
+                "test -n \"$DOCKER_HOST\"; case \"$DOCKER_HOST\" in tcp://127.0.0.1:*) ;; *) echo \
+                 \"unexpected DOCKER_HOST=$DOCKER_HOST\" >&2; exit 1;; esac;"
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FrameworkDockerTeardownMode {
+    ComposeRemoveOrphans,
+    GatewayShutdownCleanup,
+}
+
+impl FrameworkDockerTeardownMode {
+    fn slug(self) -> &'static str {
+        match self {
+            Self::ComposeRemoveOrphans => "remove-orphans",
+            Self::GatewayShutdownCleanup => "gateway-shutdown",
+        }
+    }
+
+    fn down_args(self) -> &'static [&'static str] {
+        match self {
+            Self::ComposeRemoveOrphans => &["down", "-v", "--remove-orphans"],
+            Self::GatewayShutdownCleanup => &["down", "-v"],
+        }
+    }
+}
+
+fn docker_smoke_framework_docker_binding_runs_cli_and_teardown_cleanup(
+    binding_form: FrameworkDockerBindingForm,
+    teardown_mode: FrameworkDockerTeardownMode,
+) {
+    use std::{
+        fs,
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use tempfile::tempdir;
+
+    struct ComposeGuard {
+        project: std::path::PathBuf,
+        compose_project: String,
+        created_container: String,
+    }
+
+    impl ComposeGuard {
+        fn new(
+            project: &std::path::Path,
+            compose_project: String,
+            created_container: String,
+        ) -> Self {
+            Self {
+                project: project.to_path_buf(),
+                compose_project,
+                created_container,
+            }
+        }
+    }
+
+    impl Drop for ComposeGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("docker")
+                .current_dir(&self.project)
+                .env("COMPOSE_PROJECT_NAME", &self.compose_project)
+                .env("AMBER_DOCKER_SOCK", "/var/run/docker.sock")
+                .arg("compose")
+                .args(["down", "-v", "--remove-orphans", "--timeout", "1"])
+                .status();
+            let _ = Command::new("docker")
+                .args(["rm", "-f", &self.created_container])
+                .status();
+        }
+    }
+
+    let project_dir = tempdir().expect("temp dir");
+    let project = project_dir.path();
+    let sidecar_platform = build_sidecar_image();
+    let helper_platform = build_helper_image();
+    let router_platform = build_router_image();
+    let gateway_platform = build_docker_gateway_image();
+    let platform = require_same_platform(&[
+        (SIDECAR_IMAGE, sidecar_platform),
+        (HELPER_IMAGE, helper_platform),
+        (ROUTER_IMAGE, router_platform),
+        (DOCKER_GATEWAY_IMAGE, gateway_platform),
+    ]);
+    ensure_image_platform("docker:27.3.1-cli", &platform);
+
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time after epoch")
+            .as_millis()
+    );
+    let mode = binding_form.slug();
+    let created_container = format!("amber-fw-docker-{mode}-{suffix}");
+    let teardown = teardown_mode.slug();
+    let compose_project = format!("amber-fw-docker-{mode}-{teardown}-test-{suffix}");
+
+    let worker_path = project.join("worker.json5");
+    let root_path = project.join("root.json5");
+    let runner_cmd = format!(
+        "set -eu; {} for i in $(seq 1 30); do if docker version >/dev/null 2>&1; then break; fi; \
+         sleep 1; done; docker version >/dev/null; docker rm -f \"${{config.container_name}}\" \
+         >/dev/null 2>&1 || true; docker create --network none --name \
+         \"${{config.container_name}}\" \"${{config.image_id}}\" true >/tmp/created-id; docker \
+         inspect \"${{config.container_name}}\" >/tmp/inspect.json",
+        binding_form.worker_preflight()
+    );
+    let mut worker_program = json!({
+        "image": "docker:27.3.1-cli",
+        "args": ["sh", "-lc", runner_cmd],
+    });
+    match binding_form {
+        FrameworkDockerBindingForm::Mount => {
+            worker_program["mounts"] = json!([
+                { "path": "/var/run/docker.sock", "from": "framework.docker" }
+            ]);
+        }
+        FrameworkDockerBindingForm::Url => {
+            worker_program["env"] = json!({
+                "DOCKER_HOST": "${slots.docker.url}"
+            });
+        }
+    }
+    let worker_manifest = json!({
+        "manifest_version": "0.1.0",
+        "experimental_features": ["docker"],
+        "config_schema": {
+            "type": "object",
+            "properties": {
+                "container_name": { "type": "string" },
+                "image_id": { "type": "string" },
+            },
+            "required": ["container_name", "image_id"],
+            "additionalProperties": false,
+        },
+        "program": worker_program,
+        "slots": {
+            "docker": { "kind": "docker" }
+        }
+    });
+    fs::write(
+        &worker_path,
+        serde_json::to_vec_pretty(&worker_manifest).expect("serialize worker manifest"),
+    )
+    .expect("write worker manifest");
+
+    let helper_image_id_output = Command::new("docker")
+        .args(["image", "inspect", HELPER_IMAGE, "--format", "{{.Id}}"])
+        .output()
+        .expect("inspect helper image id");
+    assert!(
+        helper_image_id_output.status.success(),
+        "failed to inspect helper image id\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&helper_image_id_output.stdout),
+        String::from_utf8_lossy(&helper_image_id_output.stderr)
+    );
+    let helper_image_id = String::from_utf8_lossy(&helper_image_id_output.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        !helper_image_id.is_empty(),
+        "helper image id should not be empty"
+    );
+
+    let worker_url = Url::from_file_path(&worker_path)
+        .expect("worker file url")
+        .to_string();
+    let root_manifest = json!({
+        "manifest_version": "0.1.0",
+        "experimental_features": ["docker"],
+        "components": {
+            "runner": {
+                "manifest": worker_url,
+                "config": {
+                    "container_name": created_container.clone(),
+                    "image_id": helper_image_id.clone(),
+                }
+            }
+        },
+        "bindings": [
+            { "to": "#runner.docker", "from": "framework.docker" }
+        ]
+    });
+    fs::write(
+        &root_path,
+        serde_json::to_vec_pretty(&root_manifest).expect("serialize root manifest"),
+    )
+    .expect("write root manifest");
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let output = rt
+        .block_on(compiler.compile(
+            ManifestRef::from_url(Url::from_file_path(&root_path).expect("root file url")),
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
+            },
+        ))
+        .expect("compile ok");
+    let yaml = DockerComposeReporter
+        .emit(&output.scenario)
+        .expect("compose render ok");
+    assert!(yaml.contains("amber-docker-gateway"), "{yaml}");
+    fs::write(project.join("docker-compose.yaml"), yaml).expect("write compose yaml");
+    let _guard = ComposeGuard::new(project, compose_project.clone(), created_container.clone());
+
+    let compose = |args: &[&str]| {
+        let mut cmd = Command::new("docker");
+        cmd.current_dir(project)
+            .env("COMPOSE_PROJECT_NAME", &compose_project)
+            .env("AMBER_DOCKER_SOCK", "/var/run/docker.sock")
+            .arg("compose")
+            .args(args);
+        cmd
+    };
+
+    let up = compose(&["up", "-d"]).output().expect("compose up");
+    assert!(
+        up.status.success(),
+        "docker compose up failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&up.stdout),
+        String::from_utf8_lossy(&up.stderr)
+    );
+
+    let runner_container = format!("{compose_project}-c1-runner-1");
+    let wait = Command::new("docker")
+        .args(["wait", &runner_container])
+        .output()
+        .expect("docker wait runner");
+    assert!(
+        wait.status.success(),
+        "docker wait failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&wait.stdout),
+        String::from_utf8_lossy(&wait.stderr)
+    );
+    let exit_code = String::from_utf8_lossy(&wait.stdout).trim().to_string();
+    if exit_code != "0" {
+        let runner_logs = Command::new("docker")
+            .args(["logs", &runner_container])
+            .output()
+            .expect("runner logs");
+        let runner_sidecar = format!("{compose_project}-c1-runner-net-1");
+        let runner_sidecar_logs = Command::new("docker")
+            .args(["logs", &runner_sidecar])
+            .output()
+            .expect("runner sidecar logs");
+        let gateway_container = format!("{compose_project}-amber-docker-gateway-1");
+        let gateway_logs = Command::new("docker")
+            .args(["logs", &gateway_container])
+            .output()
+            .expect("gateway logs");
+        panic!(
+            "runner exited with non-zero status ({exit_code})\nwait stdout:\n{}\nwait \
+             stderr:\n{}\nrunner logs stdout:\n{}\nrunner logs stderr:\n{}\nsidecar logs \
+             stdout:\n{}\nsidecar logs stderr:\n{}\ngateway logs stdout:\n{}\ngateway logs \
+             stderr:\n{}",
+            String::from_utf8_lossy(&wait.stdout),
+            String::from_utf8_lossy(&wait.stderr),
+            String::from_utf8_lossy(&runner_logs.stdout),
+            String::from_utf8_lossy(&runner_logs.stderr),
+            String::from_utf8_lossy(&runner_sidecar_logs.stdout),
+            String::from_utf8_lossy(&runner_sidecar_logs.stderr),
+            String::from_utf8_lossy(&gateway_logs.stdout),
+            String::from_utf8_lossy(&gateway_logs.stderr),
+        );
+    }
+
+    let inspect_labels = Command::new("docker")
+        .args([
+            "inspect",
+            &created_container,
+            "--format",
+            "{{ index .Config.Labels \"com.rdi.amber.component\" }}|{{ index .Config.Labels \
+             \"com.docker.compose.project\" }}|{{ index .Config.Labels \
+             \"com.docker.compose.service\" }}|{{ index .Config.Labels \
+             \"com.docker.compose.config-hash\" }}",
+        ])
+        .output()
+        .expect("inspect created container");
+    assert!(
+        inspect_labels.status.success(),
+        "expected created container to exist\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&inspect_labels.stdout),
+        String::from_utf8_lossy(&inspect_labels.stderr)
+    );
+    let labels = String::from_utf8_lossy(&inspect_labels.stdout);
+    assert!(
+        labels.contains("/runner|"),
+        "unexpected component label: {labels}"
+    );
+    assert!(
+        labels.contains(&compose_project),
+        "unexpected compose project label: {labels}"
+    );
+    let parts: Vec<&str> = labels.trim().split('|').collect();
+    assert_eq!(parts.len(), 4, "unexpected labels format: {labels}");
+    assert_eq!(
+        parts[2], "c1-runner",
+        "unexpected compose service label: {labels}"
+    );
+    assert!(
+        !parts[3].is_empty(),
+        "compose config-hash label should be present: {labels}"
+    );
+
+    let down = compose(teardown_mode.down_args())
+        .output()
+        .expect("compose down");
+    assert!(
+        down.status.success(),
+        "docker compose down failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&down.stdout),
+        String::from_utf8_lossy(&down.stderr)
+    );
+
+    let inspect_after_down = Command::new("docker")
+        .args(["inspect", &created_container])
+        .output()
+        .expect("inspect after down");
+    let cleanup_reason = match teardown_mode {
+        FrameworkDockerTeardownMode::ComposeRemoveOrphans => "docker compose down --remove-orphans",
+        FrameworkDockerTeardownMode::GatewayShutdownCleanup => {
+            "docker gateway shutdown cleanup during docker compose down"
+        }
+    };
+    assert!(
+        !inspect_after_down.status.success(),
+        "container created through framework.docker was not removed by {cleanup_reason}"
+    );
+}
+
+#[test]
+#[ignore = "requires docker + docker compose; run manually"]
+fn docker_smoke_framework_docker_mount_runs_cli_and_remove_orphans() {
+    docker_smoke_framework_docker_binding_runs_cli_and_teardown_cleanup(
+        FrameworkDockerBindingForm::Mount,
+        FrameworkDockerTeardownMode::ComposeRemoveOrphans,
+    );
+}
+
+#[test]
+#[ignore = "requires docker + docker compose; run manually"]
+fn docker_smoke_framework_docker_url_runs_cli_and_remove_orphans() {
+    docker_smoke_framework_docker_binding_runs_cli_and_teardown_cleanup(
+        FrameworkDockerBindingForm::Url,
+        FrameworkDockerTeardownMode::ComposeRemoveOrphans,
+    );
+}
+
+#[test]
+#[ignore = "requires docker + docker compose; run manually"]
+fn docker_smoke_framework_docker_gateway_shutdown_cleans_created_resources() {
+    docker_smoke_framework_docker_binding_runs_cli_and_teardown_cleanup(
+        FrameworkDockerBindingForm::Mount,
+        FrameworkDockerTeardownMode::GatewayShutdownCleanup,
     );
 }
 
