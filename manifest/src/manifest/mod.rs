@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    fmt,
     str::FromStr,
     sync::OnceLock,
 };
@@ -30,6 +31,9 @@ use crate::{
 pub struct RawManifest {
     pub manifest_version: Version,
     #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub experimental_features: BTreeSet<ExperimentalFeature>,
+    #[serde(default)]
     pub program: Option<Program>,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
@@ -55,6 +59,21 @@ pub struct RawManifest {
     pub exports: BTreeMap<String, RawExportTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ExperimentalFeature {
+    Docker,
+}
+
+impl fmt::Display for ExperimentalFeature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExperimentalFeature::Docker => f.write_str("docker"),
+        }
+    }
 }
 
 const SUPPORTED_MANIFEST_VERSION_REQ: &str = "^0.1.0";
@@ -243,10 +262,28 @@ fn framework_capability_help() -> String {
     format!("Known framework capabilities: {names}")
 }
 
+fn require_framework_capability_feature(
+    capability: &str,
+    required_feature: Option<ExperimentalFeature>,
+    enabled_features: &BTreeSet<ExperimentalFeature>,
+) -> Result<(), Error> {
+    let Some(feature) = required_feature else {
+        return Ok(());
+    };
+    if enabled_features.contains(&feature) {
+        return Ok(());
+    }
+    Err(Error::FrameworkCapabilityRequiresFeature {
+        capability: capability.to_string(),
+        feature: feature.to_string(),
+    })
+}
+
 fn resolve_binding_source(
     ctx: &ValidateCtx<'_>,
     from: BindingSourceRef,
     capability: String,
+    enabled_features: &BTreeSet<ExperimentalFeature>,
 ) -> Result<BindingSource, Error> {
     match from {
         BindingSourceRef::Component(LocalComponentRef::Self_) => {
@@ -276,6 +313,11 @@ fn resolve_binding_source(
                     help: framework_capability_help(),
                 });
             };
+            require_framework_capability_feature(
+                capability.as_str(),
+                spec.required_experimental_feature,
+                enabled_features,
+            )?;
             Ok(BindingSource::Framework(spec.name.clone()))
         }
     }
@@ -284,6 +326,7 @@ fn resolve_binding_source(
 fn build_bindings(
     bindings: BTreeSet<RawBinding>,
     ctx: &ValidateCtx<'_>,
+    enabled_features: &BTreeSet<ExperimentalFeature>,
 ) -> Result<BTreeMap<BindingTarget, Binding>, Error> {
     let mut bindings_out = BTreeMap::new();
     let mut binding_names = BTreeSet::new();
@@ -322,7 +365,7 @@ fn build_bindings(
         };
 
         let target = resolve_binding_target(ctx, to, slot)?;
-        let source = resolve_binding_source(ctx, from, capability)?;
+        let source = resolve_binding_source(ctx, from, capability, enabled_features)?;
 
         if bindings_out.contains_key(&target) {
             let to = match &target {
@@ -436,6 +479,7 @@ fn validate_endpoints(
 fn validate_mounts(
     program: Option<&Program>,
     config_schema: Option<&ConfigSchema>,
+    enabled_features: &BTreeSet<ExperimentalFeature>,
 ) -> Result<(), Error> {
     let Some(program) = program else {
         return Ok(());
@@ -509,7 +553,21 @@ fn validate_mounts(
                     return Err(Error::MountSecretPathIsNotSecret { path: path.clone() });
                 }
             }
-            MountSource::Slot(_) | MountSource::Binding(_) | MountSource::Framework(_) => {
+            MountSource::Framework(name) => {
+                let capability = name.as_str();
+                let Some(spec) = framework_capability(capability) else {
+                    return Err(Error::UnknownFrameworkCapability {
+                        capability: capability.to_string(),
+                        help: framework_capability_help(),
+                    });
+                };
+                require_framework_capability_feature(
+                    capability,
+                    spec.required_experimental_feature,
+                    enabled_features,
+                )?;
+            }
+            MountSource::Slot(_) | MountSource::Binding(_) => {
                 return Err(Error::UnsupportedMountSource {
                     mount: mount.source.to_string(),
                 });
@@ -578,6 +636,7 @@ impl RawManifest {
 
         let RawManifest {
             manifest_version,
+            experimental_features,
             program,
             components,
             environments,
@@ -610,10 +669,14 @@ impl RawManifest {
             provides: &provides,
         };
 
-        let bindings_out = build_bindings(bindings, &ctx)?;
+        let bindings_out = build_bindings(bindings, &ctx, &experimental_features)?;
         let exports_out = build_exports(exports, &ctx)?;
         validate_endpoints(program.as_ref(), &provides)?;
-        validate_mounts(program.as_ref(), config_schema.as_ref())?;
+        validate_mounts(
+            program.as_ref(),
+            config_schema.as_ref(),
+            &experimental_features,
+        )?;
 
         if let Some(program) = program.as_ref()
             && program.args.0.is_empty()
@@ -623,6 +686,7 @@ impl RawManifest {
 
         Ok(Manifest {
             manifest_version,
+            experimental_features,
             program,
             components,
             environments,
@@ -641,6 +705,7 @@ impl RawManifest {
 #[serde(into = "RawManifest", try_from = "RawManifest")]
 pub struct Manifest {
     manifest_version: Version,
+    experimental_features: BTreeSet<ExperimentalFeature>,
     program: Option<Program>,
     components: BTreeMap<ChildName, ComponentDecl>,
     environments: BTreeMap<String, EnvironmentDecl>,
@@ -660,6 +725,14 @@ impl Manifest {
 
     pub fn program(&self) -> Option<&Program> {
         self.program.as_ref()
+    }
+
+    pub fn experimental_features(&self) -> &BTreeSet<ExperimentalFeature> {
+        &self.experimental_features
+    }
+
+    pub fn uses_experimental_feature(&self, feature: ExperimentalFeature) -> bool {
+        self.experimental_features.contains(&feature)
     }
 
     pub fn components(&self) -> &BTreeMap<ChildName, ComponentDecl> {
@@ -693,6 +766,7 @@ impl Manifest {
     pub fn empty() -> Self {
         RawManifest {
             manifest_version: Version::new(0, 1, 0),
+            experimental_features: BTreeSet::new(),
             program: None,
             components: BTreeMap::new(),
             environments: BTreeMap::new(),
@@ -721,6 +795,7 @@ impl Manifest {
     #[builder]
     pub fn new(
         #[builder(default = Version::new(0, 1, 0))] manifest_version: Version,
+        #[builder(default)] experimental_features: BTreeSet<ExperimentalFeature>,
         program: Option<Program>,
         #[builder(default)] components: BTreeMap<String, ComponentDecl>,
         #[builder(default)] environments: BTreeMap<String, EnvironmentDecl>,
@@ -735,6 +810,7 @@ impl Manifest {
 
         RawManifest {
             manifest_version,
+            experimental_features,
             program,
             components,
             environments,
@@ -852,6 +928,7 @@ impl From<&Manifest> for RawManifest {
 
         RawManifest {
             manifest_version: manifest.manifest_version.clone(),
+            experimental_features: manifest.experimental_features.clone(),
             program: manifest.program.clone(),
             components,
             environments: manifest.environments.clone(),

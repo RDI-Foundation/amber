@@ -8,8 +8,10 @@ amber-config = { workspace = true }
 base64 = { workspace = true }
 jsonschema = { workspace = true }
 amber-template = { workspace = true }
+libc = "0.2.177"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+signal-hook = "0.3.18"
 thiserror = { workspace = true }
 
 [dev-dependencies]

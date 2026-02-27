@@ -1,0 +1,6 @@
+{
+  manifest_version: "0.1.0",
+  components: {
+    child: "./experimental_feature_not_enabled_parent_child.json5",
+  },
+}

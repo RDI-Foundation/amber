@@ -44,6 +44,7 @@ Minimal leaf component exporting an HTTP API:
 This crate **parses JSON5**, deserializes into Rust types, and validates:
 
 * `manifest_version` must be valid SemVer and **satisfy `^0.1.0`**.
+* `experimental_features` entries must be known feature names.
 * No dots (`.`) in:
 
   * child instance names (`components` keys)
@@ -91,6 +92,8 @@ This crate does **not** fetch child manifests and therefore does not validate cr
 * Whether kinds/profiles match across bindings or forwarded exports.
 * Whether a child has exported the capability you’re trying to bind from.
 * Validation of `components.<name>.config` against `config_schema`.
+* Whether every parent manifest has enabled the experimental features required by each child
+  manifest (`child.experimental_features ⊆ parent.experimental_features`).
 
 If your system resolves manifests, it should enforce those rules at link/resolve time.
 
@@ -103,6 +106,7 @@ Top-level object:
 ```json5
 {
   manifest_version: "0.1.0",   // required
+  experimental_features: ["docker"], // optional; default []
 
   program: { /* ... */ },      // optional
   components: { /* ... */ },   // optional; default {}
@@ -114,6 +118,21 @@ Top-level object:
   metadata: { /* ... */ },      // optional
 }
 ```
+
+### `experimental_features`
+
+`experimental_features` is an opt-in list for unstable manifest behavior.
+
+Current values:
+
+* `"docker"`
+
+Rules:
+
+* Unknown feature names are rejected at parse time.
+* Duplicate entries are ignored during parsing.
+* Parent-child enforcement is done by the resolver/linker: every child manifest feature must also
+  be listed by its parent manifest.
 
 Notes:
 
@@ -220,12 +239,14 @@ Supported `from` sources (current):
 
 * `config` or `config.<path>`: mount the component config (whole object or a path).
 * `secret.<path>`: mount a config value marked `secret: true` in the component’s config schema.
+* `framework.docker`: requires `experimental_features: ["docker"]`. In Docker Compose output, this
+  injects a Docker socket mount backed by the framework docker gateway.
 
 Reserved (not implemented yet):
 
 * `slots.<name>`
 * `bindings.<name>`
-* `framework.<capability>`
+* `framework.<capability>` other than `framework.docker`
 
 Mount value formatting:
 
@@ -368,7 +389,7 @@ config_schema: {
 
 Both slots and provides share:
 
-* `kind`: `"mcp" | "llm" | "http" | "a2a"`
+* `kind`: `"mcp" | "llm" | "http" | "docker" | "a2a"`
 * `profile` (optional): string qualifier (often used for `"mcp"`)
 
 Example:
@@ -518,8 +539,12 @@ Rules enforced by this crate:
 * Any `#child` referenced in `to` or `from` must exist in `components`.
 * Slot/capability names must not contain `.`.
 
-Framework capabilities are a fixed compiler-known list. **Today the list is empty**, so any
-`from: "framework"` binding fails validation; this will change as capabilities are added.
+Framework capabilities are a fixed compiler-known list.
+
+Current framework capabilities:
+
+* `docker` (`framework.docker`) — requires `experimental_features: ["docker"]` in the same
+  manifest.
 
 `weak`:
 

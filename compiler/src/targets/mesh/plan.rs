@@ -3,7 +3,9 @@ use std::{
     fmt,
 };
 
-use amber_manifest::CapabilityDecl;
+use amber_manifest::{
+    CapabilityDecl, FrameworkBindingShape, FrameworkCapabilityName, framework_capability,
+};
 use amber_scenario::{BindingFrom, ComponentId, Scenario};
 
 #[derive(Clone, Debug)]
@@ -16,6 +18,7 @@ pub(crate) struct MeshPlan {
     pub(crate) program_components: Vec<ComponentId>,
     pub(crate) bindings: Vec<ResolvedBinding>,
     pub(crate) external_bindings: Vec<ResolvedExternalBinding>,
+    pub(crate) framework_bindings: Vec<ResolvedFrameworkBinding>,
     pub(crate) exports: Vec<ResolvedExport>,
     pub(crate) strong_deps: HashMap<ComponentId, BTreeSet<ComponentId>>,
 }
@@ -44,6 +47,14 @@ pub(crate) struct ResolvedExternalBinding {
     pub(crate) consumer: ComponentId,
     pub(crate) slot: String,
     pub(crate) external_slot: String,
+    pub(crate) binding_name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedFrameworkBinding {
+    pub(crate) consumer: ComponentId,
+    pub(crate) slot: String,
+    pub(crate) capability: FrameworkCapabilityName,
     pub(crate) binding_name: Option<String>,
 }
 
@@ -84,17 +95,6 @@ pub(crate) fn build_mesh_plan(
     scenario: &Scenario,
     options: MeshOptions,
 ) -> Result<MeshPlan, MeshError> {
-    for binding in &scenario.bindings {
-        if let BindingFrom::Framework(name) = &binding.from {
-            return Err(MeshError::new(format!(
-                "{} does not support framework binding `framework.{name}` (bound to {}.{})",
-                options.backend_label,
-                component_label(scenario, binding.to.component),
-                binding.to.name
-            )));
-        }
-    }
-
     let program_components: Vec<ComponentId> = scenario
         .components_iter()
         .filter_map(|(id, c)| c.program.as_ref().map(|_| id))
@@ -149,6 +149,7 @@ pub(crate) fn build_mesh_plan(
 
     let mut bindings = Vec::new();
     let mut external_bindings = Vec::new();
+    let mut framework_bindings = Vec::new();
     for binding in &scenario.bindings {
         match &binding.from {
             BindingFrom::Component(from) => {
@@ -170,7 +171,32 @@ pub(crate) fn build_mesh_plan(
                     binding_name: binding.name.clone(),
                 });
             }
-            BindingFrom::Framework(_) => {}
+            BindingFrom::Framework(name) => {
+                let Some(spec) = framework_capability(name.as_str()) else {
+                    return Err(MeshError::new(format!(
+                        "{} does not support unknown framework binding `framework.{name}` (bound \
+                         to {}.{})",
+                        options.backend_label,
+                        component_label(scenario, binding.to.component),
+                        binding.to.name
+                    )));
+                };
+                if spec.binding_shape != FrameworkBindingShape::Url {
+                    return Err(MeshError::new(format!(
+                        "{} does not support non-URL framework binding `framework.{name}` (bound \
+                         to {}.{})",
+                        options.backend_label,
+                        component_label(scenario, binding.to.component),
+                        binding.to.name
+                    )));
+                }
+                framework_bindings.push(ResolvedFrameworkBinding {
+                    consumer: binding.to.component,
+                    slot: binding.to.name.clone(),
+                    capability: name.clone(),
+                    binding_name: binding.name.clone(),
+                });
+            }
         }
     }
 
@@ -190,6 +216,7 @@ pub(crate) fn build_mesh_plan(
         program_components,
         bindings,
         external_bindings,
+        framework_bindings,
         exports,
         strong_deps,
     })

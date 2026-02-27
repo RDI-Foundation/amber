@@ -1,0 +1,14 @@
+Error: manifest::framework_capability_requires_feature
+
+  × check failed
+  ╰─▶ framework capability `framework.docker` requires experimental feature
+      `docker`
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/framework_docker_requires_feature.json5:7:34]
+ 6 │   bindings: [
+ 7 │     { to: "#child.worker", from: "framework.docker" },
+   ·                                  ─────────┬────────
+   ·                                           ╰── framework capability referenced here
+ 8 │   ],
+   ╰────
+  help: Add this feature to `experimental_features` in the same manifest, or
+        stop using this framework capability.

@@ -1,0 +1,24 @@
+Error: compiler::experimental_feature_not_enabled
+
+  × check failed
+  ╰─▶ component `#child` requests experimental feature(s) not enabled by its
+      parent: docker
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/experimental_feature_not_enabled_parent.json5:4:12]
+ 3 │   components: {
+ 4 │     child: "./experimental_feature_not_enabled_parent_child.json5",
+   ·            ───────────────────────────┬───────────────────────────
+   ·                                       ╰── child declaration here
+ 5 │   },
+   ╰────
+  help: Enable these features in the parent manifest's `experimental_features`
+        list, or remove them from the child manifest.
+
+Advice: 
+  ☞ component `#child` requests these feature(s) here
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/experimental_feature_not_enabled_parent_child.json5:3:26]
+ 2 │   manifest_version: "0.1.0",
+ 3 │   experimental_features: ["docker"],
+   ·                          ─────┬────
+   ·                               ╰── requested here
+ 4 │ }
+   ╰────

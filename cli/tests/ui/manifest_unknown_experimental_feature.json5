@@ -1,0 +1,4 @@
+{
+  manifest_version: "0.1.0",
+  experimental_features: ["not_a_real_feature"],
+}

@@ -1,6 +1,6 @@
 use std::{collections::HashSet, env};
 
-use amber_images::{AMBER_HELPER, AMBER_ROUTER, AMBER_SIDECAR, ImageRef};
+use amber_images::{AMBER_DOCKER_GATEWAY, AMBER_HELPER, AMBER_ROUTER, AMBER_SIDECAR, ImageRef};
 
 const DEV_IMAGE_TAGS_ENV: &str = "AMBER_DEV_IMAGE_TAGS";
 
@@ -9,6 +9,7 @@ pub(crate) struct InternalImages {
     pub(crate) sidecar: String,
     pub(crate) helper: String,
     pub(crate) router: String,
+    pub(crate) docker_gateway: String,
 }
 
 pub(crate) fn resolve_internal_images() -> Result<InternalImages, String> {
@@ -16,6 +17,7 @@ pub(crate) fn resolve_internal_images() -> Result<InternalImages, String> {
         sidecar: default_reference(&AMBER_SIDECAR),
         helper: default_reference(&AMBER_HELPER),
         router: default_reference(&AMBER_ROUTER),
+        docker_gateway: default_reference(&AMBER_DOCKER_GATEWAY),
     };
 
     let raw = match env::var(DEV_IMAGE_TAGS_ENV) {
@@ -30,7 +32,7 @@ pub(crate) fn resolve_internal_images() -> Result<InternalImages, String> {
     if raw.is_empty() {
         return Err(format!(
             "{DEV_IMAGE_TAGS_ENV} is set but empty; expected format \
-             \"router=<tag>,sidecar=<tag>,helper=<tag>\""
+             \"router=<tag>,sidecar=<tag>,helper=<tag>,docker_gateway=<tag>\""
         ));
     }
 
@@ -40,7 +42,7 @@ pub(crate) fn resolve_internal_images() -> Result<InternalImages, String> {
         if entry.is_empty() {
             return Err(format!(
                 "{DEV_IMAGE_TAGS_ENV} contains an empty entry; expected format \
-                 \"router=<tag>,sidecar=<tag>,helper=<tag>\""
+                 \"router=<tag>,sidecar=<tag>,helper=<tag>,docker_gateway=<tag>\""
             ));
         }
 
@@ -71,10 +73,13 @@ pub(crate) fn resolve_internal_images() -> Result<InternalImages, String> {
             "router" => images.router = override_reference(&AMBER_ROUTER, value),
             "sidecar" => images.sidecar = override_reference(&AMBER_SIDECAR, value),
             "helper" => images.helper = override_reference(&AMBER_HELPER, value),
+            "docker_gateway" => {
+                images.docker_gateway = override_reference(&AMBER_DOCKER_GATEWAY, value)
+            }
             _ => {
                 return Err(format!(
                     "{DEV_IMAGE_TAGS_ENV} contains unknown key \"{key}\"; expected router, \
-                     sidecar, helper"
+                     sidecar, helper, docker_gateway"
                 ));
             }
         }

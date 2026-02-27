@@ -2,14 +2,15 @@
 #![allow(clippy::result_large_err)]
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    fmt,
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
     },
 };
 
-use amber_manifest::{ComponentDecl, Manifest, ManifestDigest, ManifestRef};
+use amber_manifest::{ComponentDecl, ExperimentalFeature, Manifest, ManifestDigest, ManifestRef};
 use amber_resolver::{self as resolver, RemoteResolver, Resolver};
 use futures::stream::StreamExt;
 use miette::{Diagnostic, NamedSource, SourceSpan};
@@ -17,7 +18,37 @@ use thiserror::Error;
 use tokio::sync::{OnceCell, Semaphore};
 use url::Url;
 
-use crate::{DigestStore, ResolverRegistry, store::StoredSource};
+use crate::{
+    DigestStore, ResolverRegistry,
+    store::{StoredSource, display_url},
+};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExperimentalFeatureList(Vec<ExperimentalFeature>);
+
+impl fmt::Display for ExperimentalFeatureList {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (idx, feature) in self.0.iter().enumerate() {
+            if idx > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{feature}")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error, Diagnostic)]
+#[error("{message}")]
+#[diagnostic(severity(Advice))]
+pub struct RelatedManifestSpan {
+    message: String,
+    #[source_code]
+    src: NamedSource<Arc<str>>,
+    #[label(primary, "{label}")]
+    span: SourceSpan,
+    label: String,
+}
 
 #[derive(Clone, Debug)]
 pub struct ResolveOptions {
@@ -72,6 +103,28 @@ pub enum Error {
         src: Option<NamedSource<Arc<str>>>,
         #[label(primary, "unknown resolver")]
         span: Option<SourceSpan>,
+    },
+
+    #[error(
+        "component `#{child}` requests experimental feature(s) not enabled by its parent: \
+         {missing_features}"
+    )]
+    #[diagnostic(
+        code(compiler::experimental_feature_not_enabled),
+        help(
+            "Enable these features in the parent manifest's `experimental_features` list, or \
+             remove them from the child manifest."
+        )
+    )]
+    ExperimentalFeatureNotEnabled {
+        child: Box<str>,
+        missing_features: ExperimentalFeatureList,
+        #[source_code]
+        src: Option<NamedSource<Arc<str>>>,
+        #[label(primary, "child declaration here")]
+        span: Option<SourceSpan>,
+        #[related]
+        related: Vec<RelatedManifestSpan>,
     },
 }
 
@@ -243,6 +296,7 @@ async fn resolve_component(
         .collect();
 
     let realm_url = resolved_url.clone();
+    let parent_features = manifest.experimental_features().clone();
 
     let mut env_cache: HashMap<String, Arc<ResolveEnv>> = HashMap::new();
     for env_name in &referenced_envs {
@@ -256,6 +310,7 @@ async fn resolve_component(
             let child_name = child_name.to_string();
             let (child_ref, child_cfg, child_env_name) = extract_component_decl(decl);
             let svc = Arc::clone(&svc);
+            let parent_features = parent_features.clone();
             let child_stack = stack.clone();
             let child_path_set = path_set.clone();
             let realm_url = realm_url.clone();
@@ -270,14 +325,22 @@ async fn resolve_component(
 
             async move {
                 let child_ctx = ResolveContext {
-                    svc,
+                    svc: Arc::clone(&svc),
                     env: child_env,
-                    base_url: Some(realm_url),
+                    base_url: Some(realm_url.clone()),
                     stack: child_stack,
                     path_set: child_path_set,
                 };
                 let child_node =
                     resolve_component(child_ctx, child_name.clone(), child_ref, child_cfg).await?;
+                validate_child_experimental_features(
+                    &svc,
+                    &realm_url,
+                    child_name.as_str(),
+                    &parent_features,
+                    child_node.digest,
+                    &child_node.resolved_url,
+                )?;
                 Ok::<(String, ResolvedNode), Error>((child_name, child_node))
             }
         })
@@ -319,6 +382,64 @@ fn extract_component_decl(
         ComponentDecl::Object(o) => (o.manifest.clone(), o.config.clone(), o.environment.clone()),
         _ => unreachable!("unsupported component declaration"),
     }
+}
+
+fn validate_child_experimental_features(
+    svc: &ResolveService,
+    realm_url: &Url,
+    child_name: &str,
+    parent_features: &BTreeSet<ExperimentalFeature>,
+    child_digest: ManifestDigest,
+    child_url: &Url,
+) -> Result<(), Error> {
+    let child_manifest = svc
+        .store
+        .get(&child_digest)
+        .expect("child manifest should be in the digest store after resolution");
+
+    let missing_features = child_manifest
+        .experimental_features()
+        .difference(parent_features)
+        .copied()
+        .collect::<Vec<_>>();
+    if missing_features.is_empty() {
+        return Ok(());
+    }
+
+    let (src, span) =
+        svc.store
+            .diagnostic_source(realm_url)
+            .map_or((None, None), |(src, spans)| {
+                let span = spans
+                    .components
+                    .get(child_name)
+                    .and_then(|component| component.manifest.or(Some(component.whole)))
+                    .unwrap_or((0usize, 0usize).into());
+                (Some(src), Some(span))
+            });
+
+    let mut related = Vec::new();
+    if let Some(stored) = svc.store.get_source(child_url) {
+        let span = stored
+            .spans
+            .experimental_features
+            .or(stored.spans.manifest_version)
+            .unwrap_or((0usize, 0usize).into());
+        related.push(RelatedManifestSpan {
+            message: format!("component `#{child_name}` requests these feature(s) here"),
+            src: NamedSource::new(display_url(child_url), stored.source).with_language("json5"),
+            span,
+            label: "requested here".to_string(),
+        });
+    }
+
+    Err(Error::ExperimentalFeatureNotEnabled {
+        child: child_name.into(),
+        missing_features: ExperimentalFeatureList(missing_features),
+        src,
+        span,
+        related,
+    })
 }
 
 fn compute_environment(

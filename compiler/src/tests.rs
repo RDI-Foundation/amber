@@ -2238,6 +2238,190 @@ async fn resolution_environments_allow_parent_to_enable_resolvers_for_children()
 }
 
 #[tokio::test]
+async fn experimental_features_must_be_enabled_by_parent() {
+    let dir = tmp_dir("scenario-experimental-parent");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          experimental_features: ["docker"],
+        }
+        "#,
+    );
+
+    write_file(
+        &root_path,
+        &format!(
+            r#"
+            {{
+              manifest_version: "0.1.0",
+              components: {{
+                child: "{child}",
+              }},
+            }}
+            "#,
+            child = file_url(&child_path)
+        ),
+    );
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+    let err = compiler
+        .compile(root_ref, CompileOptions::default())
+        .await
+        .expect_err("missing parent experimental feature should fail");
+
+    match err {
+        crate::Error::Frontend(crate::frontend::Error::ExperimentalFeatureNotEnabled {
+            child,
+            missing_features,
+            ..
+        }) => {
+            assert_eq!(child.as_ref(), "child");
+            assert_eq!(missing_features.to_string(), "docker");
+        }
+        other => panic!("expected ExperimentalFeatureNotEnabled, got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn experimental_features_are_checked_per_edge() {
+    let dir = tmp_dir("scenario-experimental-per-edge");
+    let root_path = dir.path().join("root.json5");
+    let parent_path = dir.path().join("parent.json5");
+    let child_path = dir.path().join("child.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          experimental_features: ["docker"],
+        }
+        "#,
+    );
+
+    write_file(
+        &parent_path,
+        &format!(
+            r#"
+            {{
+              manifest_version: "0.1.0",
+              components: {{
+                leaf: "{child}",
+              }},
+            }}
+            "#,
+            child = file_url(&child_path)
+        ),
+    );
+
+    write_file(
+        &root_path,
+        &format!(
+            r#"
+            {{
+              manifest_version: "0.1.0",
+              experimental_features: ["docker"],
+              components: {{
+                parent: "{parent}",
+              }},
+            }}
+            "#,
+            parent = file_url(&parent_path)
+        ),
+    );
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+    let err = compiler
+        .compile(root_ref, CompileOptions::default())
+        .await
+        .expect_err("intermediate parent missing feature should fail");
+
+    match err {
+        crate::Error::Frontend(crate::frontend::Error::ExperimentalFeatureNotEnabled {
+            child,
+            missing_features,
+            ..
+        }) => {
+            assert_eq!(child.as_ref(), "leaf");
+            assert_eq!(missing_features.to_string(), "docker");
+        }
+        other => panic!("expected ExperimentalFeatureNotEnabled, got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn experimental_features_succeed_when_enabled_on_every_parent() {
+    let dir = tmp_dir("scenario-experimental-enabled");
+    let root_path = dir.path().join("root.json5");
+    let parent_path = dir.path().join("parent.json5");
+    let child_path = dir.path().join("child.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          experimental_features: ["docker"],
+        }
+        "#,
+    );
+
+    write_file(
+        &parent_path,
+        &format!(
+            r#"
+            {{
+              manifest_version: "0.1.0",
+              experimental_features: ["docker"],
+              components: {{
+                leaf: "{child}",
+              }},
+            }}
+            "#,
+            child = file_url(&child_path)
+        ),
+    );
+
+    write_file(
+        &root_path,
+        &format!(
+            r#"
+            {{
+              manifest_version: "0.1.0",
+              experimental_features: ["docker"],
+              components: {{
+                parent: "{parent}",
+              }},
+            }}
+            "#,
+            parent = file_url(&parent_path)
+        ),
+    );
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let root_ref = ManifestRef::from_url(file_url(&root_path));
+    let output = compiler
+        .compile(
+            root_ref,
+            CompileOptions {
+                resolve: crate::ResolveOptions { max_concurrency: 8 },
+                optimize: OptimizeOptions { dce: false },
+            },
+        )
+        .await
+        .expect("features enabled across all edges should compile");
+
+    assert_eq!(output.scenario.components_iter().count(), 3);
+}
+
+#[tokio::test]
 async fn compile_emits_manifest_lints() {
     let dir = tmp_dir("scenario-manifest-lints");
     let root_path = dir.path().join("root.json5");

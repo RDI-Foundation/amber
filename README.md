@@ -117,6 +117,10 @@ enforce the wiring: `ghcr.io/rdi-foundation/amber-sidecar:main` and
 `ghcr.io/rdi-foundation/amber-helper:v1`. Docker Compose will pull them automatically;
 if you're in a restricted environment, pre-pull them ahead of time.
 
+Some scenarios also use the Docker gateway component to scope Docker Engine API access
+per component. In that case, the compose output will reference
+`ghcr.io/rdi-foundation/amber-docker-gateway:v1`.
+
 If you're working in this repo, the internal image list and tags live in
 `docker/images.json`; CI publishes and verifies those tags on `main`.
 
@@ -150,6 +154,8 @@ If you're working in this repo, these docs go deeper:
 - Manifest format and examples: `manifest/README.md` (or `amber docs manifest`)
 - CLI behavior and outputs: `cli/README.md`
 - Compiler pipeline and reporters: `compiler/README.md`
+- Docker gateway component: `docker-gateway/README.md`
+- Framework docker example: `examples/framework-docker/README.md`
 - Scenario data model: `scenario/README.md`
 - Manifest resolution (file/http) details: `resolver/README.md`
 - Examples: `examples/`

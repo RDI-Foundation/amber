@@ -3,6 +3,7 @@ members = [
   "cli",
   "config",
   "compiler",
+  "docker-gateway",
   "helper",
   "images",
   "json5",
@@ -26,6 +27,7 @@ amber-scenario = { path = "scenario" }
 amber-template = { path = "template" }
 base64 = "0.22.1"
 futures = "0.3.31"
+hyper-util = { version = "0.1.10", features = ["client-legacy", "tokio"] }
 jsonschema = { version = "0.38.1", default-features = false }
 miette = "7.4.0"
 serde = "1.0.217"

@@ -19,7 +19,7 @@ pub use framework::{
     FrameworkBindingShape, FrameworkCapabilitySpec, framework_capabilities, framework_capability,
 };
 pub use interpolation::{InterpolatedPart, InterpolatedString, InterpolationSource, ProgramArgs};
-pub use manifest::{Manifest, RawManifest};
+pub use manifest::{ExperimentalFeature, Manifest, RawManifest};
 pub use names::{
     BindingName, ChildName, ExportName, FrameworkCapabilityName, ProvideName, SlotName,
 };
