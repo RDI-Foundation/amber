@@ -761,8 +761,15 @@ impl<'a> DceSolver<'a> {
                 continue;
             }
             self.live_bindings[edge_idx] = true;
-            if let BindingFrom::Component(from) = &edge.from {
-                self.mark_provide(from.component.0, &from.name);
+            match &edge.from {
+                BindingFrom::Component(from) => {
+                    self.mark_provide(from.component.0, &from.name);
+                }
+                BindingFrom::External(from) => {
+                    // Keep the external root slot declaration when a live binding depends on it.
+                    self.mark_slot(from.component.0, &from.name);
+                }
+                BindingFrom::Framework(_) => {}
             }
         }
     }
@@ -866,14 +873,25 @@ fn dce_with_semantics(scenario: Scenario) -> Scenario {
         |id, component| {
             if !results.live_programs[id.0] {
                 component.program = None;
-                component.slots.clear();
-                component.provides.clear();
+                component
+                    .slots
+                    .retain(|name, _| is_live_capability(&results.live_slots, id.0, name));
+                component
+                    .provides
+                    .retain(|name, _| is_live_capability(&results.live_provides, id.0, name));
             }
         },
         |idx, _binding| results.live_bindings[idx],
     );
     scenario.assert_invariants();
     scenario
+}
+
+fn is_live_capability(live: &HashSet<CapKey>, component: usize, name: &str) -> bool {
+    live.contains(&CapKey {
+        component,
+        name: Arc::from(name),
+    })
 }
 
 fn collect_program_used_slots(component: &amber_scenario::Component) -> Vec<String> {

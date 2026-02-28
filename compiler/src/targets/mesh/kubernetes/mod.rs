@@ -1220,12 +1220,16 @@ fn render_kubernetes_inner(
     }
 
     let mut external_slot_metadata: BTreeMap<String, ExternalSlotMetadata> = BTreeMap::new();
-    for slot_name in address_plan.router.external_slot_ports.keys() {
-        let decl = root_slots
-            .get(slot_name.as_str())
-            .expect("external slot should exist on root");
+    for slot in router_external_slots {
+        let decl = root_slots.get(slot.name.as_str()).ok_or_else(|| {
+            ReporterError::new(format!(
+                "internal error: external slot `{}` is referenced by router metadata but missing \
+                 from root slot declarations",
+                slot.name
+            ))
+        })?;
         external_slot_metadata.insert(
-            slot_name.clone(),
+            slot.name.clone(),
             ExternalSlotMetadata {
                 required: !decl.optional,
                 kind: format!("{}", decl.decl.kind),

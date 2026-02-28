@@ -1167,3 +1167,76 @@ fn dce_keeps_framework_bound_slots() {
         }
     }
 }
+
+#[test]
+fn dce_keeps_live_external_root_slot_when_export_makes_consumer_live() {
+    let root_slot = serde_json::from_value(json!({ "kind": "a2a" })).expect("slot decl");
+    let green_program = serde_json::from_value(json!({
+        "image": "green",
+        "entrypoint": ["green", "--agent", "${slots.white.url}"],
+        "network": {
+            "endpoints": [{ "name": "a2a", "port": 9001 }]
+        }
+    }))
+    .expect("program");
+    let green_provide: amber_manifest::ProvideDecl =
+        serde_json::from_value(json!({ "kind": "a2a", "endpoint": "a2a" })).expect("provide");
+    let export_capability = green_provide.decl.clone();
+
+    let mut root = component(0, "/");
+    root.slots.insert("white".to_string(), root_slot);
+    root.children.push(ComponentId(1));
+
+    let mut green = component(1, "/green");
+    green.parent = Some(ComponentId(0));
+    green.program = Some(green_program);
+    green.slots.insert(
+        "white".to_string(),
+        serde_json::from_value(json!({ "kind": "a2a" })).unwrap(),
+    );
+    green.provides.insert("a2a".to_string(), green_provide);
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(green)],
+        bindings: vec![BindingEdge {
+            name: None,
+            from: BindingFrom::External(SlotRef {
+                component: ComponentId(0),
+                name: "white".to_string(),
+            }),
+            to: SlotRef {
+                component: ComponentId(1),
+                name: "white".to_string(),
+            },
+            weak: true,
+        }],
+        exports: vec![ScenarioExport {
+            name: "green".to_string(),
+            capability: export_capability,
+            from: ProvideRef {
+                component: ComponentId(1),
+                name: "a2a".to_string(),
+            },
+        }],
+    };
+
+    let scenario = dce_only(scenario);
+    let root_after = scenario
+        .components
+        .first()
+        .and_then(|component| component.as_ref())
+        .expect("root should remain");
+    assert!(
+        root_after.slots.contains_key("white"),
+        "live external root slot must not be pruned under DCE"
+    );
+    assert_eq!(scenario.bindings.len(), 1, "external binding should remain");
+    assert!(
+        matches!(
+            &scenario.bindings[0].from,
+            BindingFrom::External(slot) if slot.component == ComponentId(0) && slot.name == "white"
+        ),
+        "expected external binding from root.white to remain"
+    );
+}

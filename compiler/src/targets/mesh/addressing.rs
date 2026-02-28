@@ -57,7 +57,6 @@ impl AllowPlan {
 #[derive(Clone, Debug)]
 pub(crate) struct RouterPlan {
     pub(crate) needs_router: bool,
-    pub(crate) external_slot_ports: BTreeMap<String, u16>,
     pub(crate) export_ports_by_name: BTreeMap<String, u16>,
     pub(crate) export_ports: BTreeSet<u16>,
     pub(crate) router_external_slots: Vec<RouterExternalSlot>,
@@ -207,7 +206,8 @@ pub(crate) fn build_address_plan<A: Addressing>(
     let mut router_config_b64: Option<String> = None;
 
     if needs_router {
-        router_external_slots = build_router_external_slots(root_slots, &external_slot_ports);
+        router_external_slots = build_router_external_slots(root_slots, &external_slot_ports)
+            .map_err(MeshError::new)?;
         router_env_passthrough = router_external_slots
             .iter()
             .map(|slot| slot.url_env.clone())
@@ -242,7 +242,6 @@ pub(crate) fn build_address_plan<A: Addressing>(
 
     let router = RouterPlan {
         needs_router,
-        external_slot_ports,
         export_ports_by_name,
         export_ports,
         router_external_slots,
