@@ -801,6 +801,13 @@ async fn binding_interpolation_error_points_to_config_value() {
             required: ["url"],
             additionalProperties: false,
           },
+          program: {
+            image: "alpine:3.20",
+            entrypoint: ["child"],
+            env: {
+              URL: "${config.url}",
+            },
+          },
         }
         "#,
     );

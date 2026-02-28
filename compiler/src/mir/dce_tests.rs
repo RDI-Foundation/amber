@@ -969,7 +969,132 @@ fn dce_keeps_ancestors_without_marking_ancestor_program_live() {
 }
 
 #[test]
-fn dce_keeps_live_config_binding_slots_without_reviving_scope_program() {
+fn dce_keeps_runtime_visible_config_binding_slots_without_reviving_scope_program() {
+    let slot_decl: amber_manifest::SlotDecl =
+        serde_json::from_value(json!({ "kind": "http" })).expect("slot decl");
+    let provide_out: amber_manifest::ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "out" })).expect("out decl");
+    let provide_up: amber_manifest::ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "up" })).expect("up decl");
+    let consumer_schema = json!({
+        "type": "object",
+        "properties": {
+            "upstream_url": { "type": "string" }
+        }
+    });
+    let export_capability = provide_out.decl.clone();
+
+    let root_program = serde_json::from_value(json!({
+        "image": "root",
+        "entrypoint": ["root"],
+        "env": { "UP_URL": "${slots.up.url}" },
+        "network": { "endpoints": [{ "name": "root", "port": 9100 }] },
+    }))
+    .expect("root program");
+    let consumer_program = serde_json::from_value(json!({
+        "image": "consumer",
+        "entrypoint": ["consumer"],
+        "env": { "UPSTREAM_URL": "${config.upstream_url}" },
+        "network": { "endpoints": [{ "name": "out", "port": 9101 }] },
+    }))
+    .expect("consumer program");
+    let provider_program = serde_json::from_value(json!({
+        "image": "provider",
+        "entrypoint": ["provider"],
+        "network": { "endpoints": [{ "name": "up", "port": 9102 }] },
+    }))
+    .expect("provider program");
+
+    let mut components = vec![
+        Some(component(0, "/")),
+        Some(component(1, "/consumer")),
+        Some(component(2, "/provider")),
+    ];
+    components[1].as_mut().unwrap().parent = Some(ComponentId(0));
+    components[2].as_mut().unwrap().parent = Some(ComponentId(0));
+    components[0]
+        .as_mut()
+        .unwrap()
+        .children
+        .extend([ComponentId(1), ComponentId(2)]);
+
+    components[0].as_mut().unwrap().program = Some(root_program);
+    components[0]
+        .as_mut()
+        .unwrap()
+        .slots
+        .insert("up".to_string(), slot_decl);
+    components[0].as_mut().unwrap().binding_decls.insert(
+        "upstream".to_string(),
+        SlotRef {
+            component: ComponentId(0),
+            name: "up".to_string(),
+        },
+    );
+
+    components[1].as_mut().unwrap().program = Some(consumer_program);
+    components[1].as_mut().unwrap().config = Some(json!({
+        "upstream_url": "${bindings.upstream.url}",
+    }));
+    components[1].as_mut().unwrap().config_schema = Some(consumer_schema);
+    components[1]
+        .as_mut()
+        .unwrap()
+        .provides
+        .insert("out".to_string(), provide_out);
+
+    components[2].as_mut().unwrap().program = Some(provider_program);
+    components[2]
+        .as_mut()
+        .unwrap()
+        .provides
+        .insert("up".to_string(), provide_up);
+
+    let bindings = vec![BindingEdge {
+        name: None,
+        from: BindingFrom::Component(ProvideRef {
+            component: ComponentId(2),
+            name: "up".to_string(),
+        }),
+        to: SlotRef {
+            component: ComponentId(0),
+            name: "up".to_string(),
+        },
+        weak: false,
+    }];
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components,
+        bindings,
+        exports: vec![ScenarioExport {
+            name: "out".to_string(),
+            capability: export_capability,
+            from: ProvideRef {
+                component: ComponentId(1),
+                name: "out".to_string(),
+            },
+        }],
+    };
+
+    let scenario = dce_only(scenario);
+    assert!(
+        scenario.component(ComponentId(0)).program.is_none(),
+        "scope owner program should be pruned; config binding usage should not revive it"
+    );
+    assert!(
+        scenario.components[2].is_some(),
+        "provider should remain because root-scope config binding usage keeps root slot `up` live"
+    );
+    assert_eq!(
+        scenario.bindings.len(),
+        1,
+        "incoming edge to the live root slot should remain"
+    );
+}
+
+#[test]
+fn dce_prunes_non_runtime_visible_config_binding_slots() {
     let slot_decl: amber_manifest::SlotDecl =
         serde_json::from_value(json!({ "kind": "http" })).expect("slot decl");
     let provide_out: amber_manifest::ProvideDecl =
@@ -1072,11 +1197,155 @@ fn dce_keeps_live_config_binding_slots_without_reviving_scope_program() {
     let scenario = dce_only(scenario);
     assert!(
         scenario.component(ComponentId(0)).program.is_none(),
-        "scope owner program should be pruned; config binding usage should not revive it"
+        "scope owner program should still be pruned"
     );
     assert!(
-        scenario.components[2].is_some(),
-        "provider should remain because root-scope config binding usage keeps root slot `up` live"
+        scenario.components[2].is_none(),
+        "provider should be pruned when the config path containing bindings usage is never read \
+         at runtime"
+    );
+    assert!(
+        scenario.bindings.is_empty(),
+        "incoming edge to the root slot should be pruned with the dead provider"
+    );
+}
+
+#[test]
+fn dce_keeps_runtime_visible_transitive_config_binding_slots() {
+    let slot_decl: amber_manifest::SlotDecl =
+        serde_json::from_value(json!({ "kind": "http" })).expect("slot decl");
+    let provide_out: amber_manifest::ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "out" })).expect("out decl");
+    let provide_up: amber_manifest::ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "up" })).expect("up decl");
+    let middle_schema = json!({
+        "type": "object",
+        "properties": {
+            "upstream_url": { "type": "string" }
+        }
+    });
+    let consumer_schema = json!({
+        "type": "object",
+        "properties": {
+            "target": { "type": "string" }
+        }
+    });
+    let export_capability = provide_out.decl.clone();
+
+    let root_program = serde_json::from_value(json!({
+        "image": "root",
+        "entrypoint": ["root"],
+        "env": { "UP_URL": "${slots.up.url}" },
+        "network": { "endpoints": [{ "name": "root", "port": 9100 }] },
+    }))
+    .expect("root program");
+    let consumer_program = serde_json::from_value(json!({
+        "image": "consumer",
+        "entrypoint": ["consumer"],
+        "env": { "UPSTREAM_URL": "${config.target}" },
+        "network": { "endpoints": [{ "name": "out", "port": 9101 }] },
+    }))
+    .expect("consumer program");
+    let provider_program = serde_json::from_value(json!({
+        "image": "provider",
+        "entrypoint": ["provider"],
+        "network": { "endpoints": [{ "name": "up", "port": 9102 }] },
+    }))
+    .expect("provider program");
+
+    let mut components = vec![
+        Some(component(0, "/")),
+        Some(component(1, "/middle")),
+        Some(component(2, "/middle/consumer")),
+        Some(component(3, "/provider")),
+    ];
+    components[1].as_mut().unwrap().parent = Some(ComponentId(0));
+    components[2].as_mut().unwrap().parent = Some(ComponentId(1));
+    components[3].as_mut().unwrap().parent = Some(ComponentId(0));
+    components[0]
+        .as_mut()
+        .unwrap()
+        .children
+        .extend([ComponentId(1), ComponentId(3)]);
+    components[1]
+        .as_mut()
+        .unwrap()
+        .children
+        .push(ComponentId(2));
+
+    components[0].as_mut().unwrap().program = Some(root_program);
+    components[0]
+        .as_mut()
+        .unwrap()
+        .slots
+        .insert("up".to_string(), slot_decl);
+    components[0].as_mut().unwrap().binding_decls.insert(
+        "upstream".to_string(),
+        SlotRef {
+            component: ComponentId(0),
+            name: "up".to_string(),
+        },
+    );
+
+    components[1].as_mut().unwrap().config = Some(json!({
+        "upstream_url": "${bindings.upstream.url}",
+    }));
+    components[1].as_mut().unwrap().config_schema = Some(middle_schema);
+
+    components[2].as_mut().unwrap().program = Some(consumer_program);
+    components[2].as_mut().unwrap().config = Some(json!({
+        "target": "${config.upstream_url}",
+    }));
+    components[2].as_mut().unwrap().config_schema = Some(consumer_schema);
+    components[2]
+        .as_mut()
+        .unwrap()
+        .provides
+        .insert("out".to_string(), provide_out);
+
+    components[3].as_mut().unwrap().program = Some(provider_program);
+    components[3]
+        .as_mut()
+        .unwrap()
+        .provides
+        .insert("up".to_string(), provide_up);
+
+    let bindings = vec![BindingEdge {
+        name: None,
+        from: BindingFrom::Component(ProvideRef {
+            component: ComponentId(3),
+            name: "up".to_string(),
+        }),
+        to: SlotRef {
+            component: ComponentId(0),
+            name: "up".to_string(),
+        },
+        weak: false,
+    }];
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components,
+        bindings,
+        exports: vec![ScenarioExport {
+            name: "out".to_string(),
+            capability: export_capability,
+            from: ProvideRef {
+                component: ComponentId(2),
+                name: "out".to_string(),
+            },
+        }],
+    };
+
+    let scenario = dce_only(scenario);
+    assert!(
+        scenario.component(ComponentId(0)).program.is_none(),
+        "scope owner program should be pruned; transitive config usage should not revive it"
+    );
+    assert!(
+        scenario.components[3].is_some(),
+        "provider should remain because a live program reads config that resolves to \
+         bindings.upstream.url through template composition"
     );
     assert_eq!(
         scenario.bindings.len(),

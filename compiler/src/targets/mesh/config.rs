@@ -124,14 +124,32 @@ pub(crate) fn build_config_plan(
         )));
     }
 
-    let required_bindings_by_scope = collect_required_bindings_by_scope(&composed.templates)?;
+    let mut used_config_paths_by_component: HashMap<ComponentId, BTreeSet<String>> =
+        HashMap::with_capacity(program_components.len());
+    for id in program_components {
+        let component = scenario.component(*id);
+        let Some(program) = component.program.as_ref() else {
+            continue;
+        };
+        let used_paths = program_used_config_paths(program);
+        if !used_paths.is_empty() {
+            used_config_paths_by_component.insert(*id, used_paths);
+        }
+    }
+
+    let required_bindings_by_scope =
+        collect_required_bindings_by_scope(&used_config_paths_by_component, &composed.templates)?;
     let binding_urls_by_scope = binding_urls_by_scope(
         scenario,
         slot_values_by_component,
         &required_bindings_by_scope,
     )?;
-    let resolved_templates =
-        resolve_binding_templates(composed.templates, &binding_urls_by_scope, scenario)?;
+    let resolved_templates = resolve_binding_templates(
+        composed.templates,
+        &binding_urls_by_scope,
+        &used_config_paths_by_component,
+        scenario,
+    )?;
 
     let root_schema = scenario
         .component(scenario.root)
@@ -552,16 +570,91 @@ fn binding_urls_by_scope(
 }
 
 fn collect_required_bindings_by_scope(
+    used_paths_by_component: &HashMap<ComponentId, BTreeSet<String>>,
     templates: &HashMap<ComponentId, rc::RootConfigTemplate>,
 ) -> Result<HashMap<u64, BTreeSet<String>>, MeshError> {
     let mut out: HashMap<u64, BTreeSet<String>> = HashMap::new();
-    for template in templates.values() {
+    for (id, used_paths) in used_paths_by_component {
+        let Some(template) = templates.get(id) else {
+            continue;
+        };
         let Some(node) = template.node() else {
             continue;
         };
-        collect_required_bindings_in_node(node, &mut out)?;
+        collect_required_bindings_in_paths(node, used_paths, &mut out)?;
     }
     Ok(out)
+}
+
+fn program_used_config_paths(program: &amber_manifest::Program) -> BTreeSet<String> {
+    let mut used = BTreeSet::new();
+
+    if let Ok(image) = program.image.parse::<amber_manifest::InterpolatedString>() {
+        collect_program_config_paths(&image.parts, &mut used);
+    }
+    for arg in &program.entrypoint.0 {
+        collect_program_config_paths(&arg.parts, &mut used);
+    }
+    for value in program.env.values() {
+        collect_program_config_paths(&value.parts, &mut used);
+    }
+    for mount in &program.mounts {
+        match &mount.source {
+            MountSource::Config(path) | MountSource::Secret(path) => {
+                used.insert(path.clone());
+            }
+            _ => {}
+        }
+    }
+
+    used
+}
+
+fn collect_program_config_paths(parts: &[InterpolatedPart], out: &mut BTreeSet<String>) {
+    for part in parts {
+        let InterpolatedPart::Interpolation { source, query } = part else {
+            continue;
+        };
+        if *source == InterpolationSource::Config {
+            out.insert(query.clone());
+        }
+    }
+}
+
+fn collect_required_bindings_in_paths(
+    node: &rc::ConfigNode,
+    used_paths: &BTreeSet<String>,
+    out: &mut HashMap<u64, BTreeSet<String>>,
+) -> Result<(), MeshError> {
+    for path in used_paths {
+        let Some(target) = config_node_for_path(node, path) else {
+            continue;
+        };
+        collect_required_bindings_in_node(target, out)?;
+    }
+    Ok(())
+}
+
+fn config_node_for_path<'a>(node: &'a rc::ConfigNode, path: &str) -> Option<&'a rc::ConfigNode> {
+    if path.is_empty() {
+        return Some(node);
+    }
+
+    let mut current = node;
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            return None;
+        }
+        match current {
+            rc::ConfigNode::Object(map) => {
+                current = map.get(segment)?;
+            }
+            rc::ConfigNode::ConfigRef(_) => return None,
+            _ => return None,
+        }
+    }
+
+    Some(current)
 }
 
 fn collect_required_bindings_in_node(
@@ -608,6 +701,7 @@ fn collect_required_bindings_in_node(
 fn resolve_binding_templates(
     templates: HashMap<ComponentId, rc::RootConfigTemplate>,
     bindings_by_scope: &HashMap<u64, BTreeMap<String, BindingObject>>,
+    used_paths_by_component: &HashMap<ComponentId, BTreeSet<String>>,
     scenario: &Scenario,
 ) -> Result<HashMap<ComponentId, rc::RootConfigTemplate>, MeshError> {
     let mut out = HashMap::with_capacity(templates.len());
@@ -615,19 +709,87 @@ fn resolve_binding_templates(
         let resolved = match template {
             rc::RootConfigTemplate::Root => rc::RootConfigTemplate::Root,
             rc::RootConfigTemplate::Node(node) => {
-                let resolved =
-                    resolve_binding_parts_in_config(&node, bindings_by_scope).map_err(|err| {
-                        MeshError::new(format!(
-                            "failed to resolve binding interpolation in config for {}: {err}",
-                            component_label(scenario, id)
-                        ))
-                    })?;
+                let resolved = if let Some(used_paths) = used_paths_by_component.get(&id) {
+                    resolve_binding_parts_in_paths(node, used_paths, bindings_by_scope).map_err(
+                        |err| {
+                            MeshError::new(format!(
+                                "failed to resolve binding interpolation in config for {}: {err}",
+                                component_label(scenario, id)
+                            ))
+                        },
+                    )?
+                } else {
+                    node
+                };
                 rc::RootConfigTemplate::Node(resolved)
             }
         };
         out.insert(id, resolved);
     }
     Ok(out)
+}
+
+fn resolve_binding_parts_in_paths(
+    node: rc::ConfigNode,
+    used_paths: &BTreeSet<String>,
+    bindings_by_scope: &HashMap<u64, BTreeMap<String, BindingObject>>,
+) -> Result<rc::ConfigNode, MeshError> {
+    if used_paths.contains("") {
+        return resolve_binding_parts_in_config(&node, bindings_by_scope);
+    }
+    resolve_binding_parts_in_paths_at(node, "", used_paths, bindings_by_scope)
+}
+
+fn resolve_binding_parts_in_paths_at(
+    node: rc::ConfigNode,
+    path: &str,
+    used_paths: &BTreeSet<String>,
+    bindings_by_scope: &HashMap<u64, BTreeMap<String, BindingObject>>,
+) -> Result<rc::ConfigNode, MeshError> {
+    if used_paths.contains(path) {
+        return resolve_binding_parts_in_config(&node, bindings_by_scope);
+    }
+    if !has_used_descendant(path, used_paths) {
+        return Ok(node);
+    }
+
+    let map = match node {
+        rc::ConfigNode::Object(map) => map,
+        other => return Ok(other),
+    };
+
+    let mut out = BTreeMap::new();
+    for (key, value) in map {
+        let child_path = if path.is_empty() {
+            key.clone()
+        } else {
+            format!("{path}.{key}")
+        };
+        if used_paths.contains(&child_path) || has_used_descendant(&child_path, used_paths) {
+            out.insert(
+                key,
+                resolve_binding_parts_in_paths_at(
+                    value,
+                    &child_path,
+                    used_paths,
+                    bindings_by_scope,
+                )?,
+            );
+        } else {
+            out.insert(key, value);
+        }
+    }
+    Ok(rc::ConfigNode::Object(out))
+}
+
+fn has_used_descendant(path: &str, used_paths: &BTreeSet<String>) -> bool {
+    if path.is_empty() {
+        return !used_paths.is_empty();
+    }
+    let prefix = format!("{path}.");
+    used_paths
+        .iter()
+        .any(|used_path| used_path.starts_with(&prefix))
 }
 
 fn resolve_binding_parts_in_config(
