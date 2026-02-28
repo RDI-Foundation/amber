@@ -17,7 +17,7 @@
   },
   program: {
     image: "busybox:1.36",
-    args: [
+    entrypoint: [
       "sh",
       "-eu",
       "-c",

@@ -594,7 +594,7 @@ mod tests {
                     "config": null,
                     "program": {
                         "image": "example/child",
-                        "args": [],
+                        "entrypoint": [],
                         "env": {},
                         "mounts": [],
                         "network": {

@@ -118,21 +118,21 @@ fn manifest_version_requirement_is_enforced() {
 }
 
 #[test]
-fn program_args_string_sugar_splits() {
+fn program_entrypoint_string_sugar_splits() {
     let m: Manifest = r#"
         {
           manifest_version: "0.1.0",
-          program: { image: "x", args: "--foo ${config.bar} --baz" }
+          program: { image: "x", entrypoint: "--foo ${config.bar} --baz" }
         }
         "#
     .parse()
     .unwrap();
 
-    let args = &m.program.as_ref().unwrap().args.0;
-    assert_eq!(args.len(), 3);
-    assert_eq!(args[0].to_string(), "--foo");
-    assert_eq!(args[1].to_string(), "${config.bar}");
-    assert_eq!(args[2].to_string(), "--baz");
+    let entrypoint = &m.program.as_ref().unwrap().entrypoint.0;
+    assert_eq!(entrypoint.len(), 3);
+    assert_eq!(entrypoint[0].to_string(), "--foo");
+    assert_eq!(entrypoint[1].to_string(), "${config.bar}");
+    assert_eq!(entrypoint[2].to_string(), "--baz");
 }
 
 #[test]

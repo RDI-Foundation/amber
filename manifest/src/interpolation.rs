@@ -172,22 +172,22 @@ impl fmt::Display for InterpolatedString {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
-pub struct ProgramArgs(pub Vec<InterpolatedString>);
+pub struct ProgramEntrypoint(pub Vec<InterpolatedString>);
 
-impl<'de> Deserialize<'de> for ProgramArgs {
+impl<'de> Deserialize<'de> for ProgramEntrypoint {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
         #[serde(untagged)]
-        enum ProgramArgsForm {
+        enum ProgramEntrypointForm {
             String(String),
             List(Vec<InterpolatedString>),
         }
 
-        match ProgramArgsForm::deserialize(deserializer)? {
-            ProgramArgsForm::String(s) => {
+        match ProgramEntrypointForm::deserialize(deserializer)? {
+            ProgramEntrypointForm::String(s) => {
                 let tokens = shlex::split(&s)
                     .ok_or_else(|| serde::de::Error::custom(Error::UnclosedQuote))?;
                 let mut args = Vec::new();
@@ -198,9 +198,9 @@ impl<'de> Deserialize<'de> for ProgramArgs {
                             .map_err(serde::de::Error::custom)?,
                     );
                 }
-                Ok(ProgramArgs(args))
+                Ok(ProgramEntrypoint(args))
             }
-            ProgramArgsForm::List(list) => Ok(ProgramArgs(list)),
+            ProgramEntrypointForm::List(list) => Ok(ProgramEntrypoint(list)),
         }
     }
 }

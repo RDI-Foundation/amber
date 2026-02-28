@@ -63,7 +63,7 @@ fn dce_prunes_unused_transitive_subtree() {
           manifest_version: "0.1.0",
           program: {
             image: "green",
-            args: ["--llm", "${slots.llm.url}"],
+            entrypoint: ["--llm", "${slots.llm.url}"],
             network: { endpoints: [{ name: "tool_proxy", port: 80 }] },
           },
           slots: {
@@ -322,7 +322,7 @@ fn dce_keeps_dependencies_for_program_slots() {
           manifest_version: "0.1.0",
           program: {
             image: "consumer",
-            args: ["--input", "${slots.input.url}", "--llm", "${slots.llm.url}"],
+            entrypoint: ["--input", "${slots.input.url}", "--llm", "${slots.llm.url}"],
             network: { endpoints: [{ name: "out", port: 80 }] },
           },
           slots: {
@@ -1090,7 +1090,7 @@ fn dce_keeps_framework_bound_slots() {
     let control_slot = serde_json::from_value(json!({ "kind": "mcp" })).unwrap();
     let consumer_program = serde_json::from_value(json!({
         "image": "consumer",
-        "args": ["${slots.control.url}"]
+        "entrypoint": ["${slots.control.url}"]
     }))
     .unwrap();
 

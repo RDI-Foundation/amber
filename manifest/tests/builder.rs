@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use amber_manifest::{
     CapabilityDecl, CapabilityKind, ComponentDecl, Endpoint, Error, InterpolatedString, Manifest,
-    ManifestRef, ManifestUrl, Network, Program, ProgramArgs, ProvideDecl,
+    ManifestRef, ManifestUrl, Network, Program, ProgramEntrypoint, ProvideDecl,
 };
 use bon::{map, set};
 use semver::Version;
@@ -12,7 +12,7 @@ use serde_json::json;
 fn manifest_builder_constructs_a_valid_manifest() {
     let program = Program::builder()
         .image("example:latest")
-        .args(ProgramArgs(vec![
+        .entrypoint(ProgramEntrypoint(vec![
             "/bin/true".parse::<InterpolatedString>().unwrap(),
         ]))
         .network(

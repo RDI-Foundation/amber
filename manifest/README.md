@@ -4,7 +4,7 @@ This document defines the **manifest file format** and the **validation/linting 
 
 A manifest describes **one component**. A component may:
 
-* Run a `program` (container image + args/env + optional network endpoints; required when providing capabilities).
+* Run a `program` (container image + entrypoint/env + optional network endpoints; required when providing capabilities).
 * Contain named child `components` (each points at another manifest).
 * Declare required inputs (`slots`) and produced outputs (`provides`).
 * Wire capabilities into slots (`bindings`).
@@ -23,7 +23,7 @@ Minimal leaf component exporting an HTTP API:
   manifest_version: "0.1.0",
   program: {
     image: "ghcr.io/acme/hello:v1",
-    args: "--port 8080",
+    entrypoint: "--port 8080",
     network: {
       endpoints: [{ name: "http", port: 8080 }],
     },
@@ -192,12 +192,12 @@ Example:
 program: {
   image: "ghcr.io/acme/my-component:v1", // required
 
-  // args: optional; default [].
+  // entrypoint: optional; default [].
   // Either:
   // - a list of strings, or
   // - a single string tokenized with shlex rules.
-  args: ["--port", "8080"],
-  // args: "--port 8080",
+  entrypoint: ["--port", "8080"],
+  // entrypoint: "--port 8080",
 
   // env: optional; default {}.
   // Values support interpolation.
@@ -260,9 +260,9 @@ Notes:
 * `secret.<path>` requires the path to be secret in the component’s config schema.
 * `config.<path>` must not reference secret values.
 
-### Interpolation in `image`, `args`, and `env`
+### Interpolation in `image`, `entrypoint`, and `env`
 
-`image`, `args` elements, and `env` values support `${...}` interpolation.
+`image`, `entrypoint` elements, and `env` values support `${...}` interpolation.
 
 Supported sources:
 
@@ -579,7 +579,7 @@ Amber does not interpret the contents. `metadata` is excluded from the manifest 
   manifest_version: "0.1.0",
   program: {
     image: "ghcr.io/acme/hello:v1",
-    args: "--port 8080",
+    entrypoint: "--port 8080",
     network: { endpoints: [{ name: "http", port: 8080 }] },
   },
   provides: {
@@ -605,7 +605,7 @@ Because the component expects its **parent** to supply `llm`, the parent must bi
   },
   program: {
     image: "ghcr.io/acme/evaluator:v1",
-    args: ["--domain", "${config.domain}", "--llm", "${slots.llm.url}"],
+    entrypoint: ["--domain", "${config.domain}", "--llm", "${slots.llm.url}"],
   },
   slots: {
     llm: { kind: "llm" },

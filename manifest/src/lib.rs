@@ -18,7 +18,9 @@ pub use error::Error;
 pub use framework::{
     FrameworkBindingShape, FrameworkCapabilitySpec, framework_capabilities, framework_capability,
 };
-pub use interpolation::{InterpolatedPart, InterpolatedString, InterpolationSource, ProgramArgs};
+pub use interpolation::{
+    InterpolatedPart, InterpolatedString, InterpolationSource, ProgramEntrypoint,
+};
 pub use manifest::{ExperimentalFeature, Manifest, RawManifest};
 pub use names::{
     BindingName, ChildName, ExportName, FrameworkCapabilityName, ProvideName, SlotName,

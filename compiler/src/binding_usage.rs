@@ -79,7 +79,7 @@ pub(crate) fn collect_binding_usage(scenario: &Scenario) -> BindingUsage {
             if let Ok(image) = program.image.parse::<InterpolatedString>() {
                 record_binding_parts(&image.parts, id, BindingUseSource::Program, id, &mut usage);
             }
-            for arg in &program.args.0 {
+            for arg in &program.entrypoint.0 {
                 record_binding_parts(&arg.parts, id, BindingUseSource::Program, id, &mut usage);
             }
             for value in program.env.values() {

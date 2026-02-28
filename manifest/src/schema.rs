@@ -16,7 +16,7 @@ use serde_with::{
 use crate::{
     config_schema_profile,
     error::Error,
-    interpolation::{InterpolatedString, ProgramArgs},
+    interpolation::{InterpolatedString, ProgramEntrypoint},
     names::{
         BindingName, ChildName, ExportName, FrameworkCapabilityName, ProvideName, SlotName,
         ensure_name_no_dot,
@@ -35,9 +35,9 @@ use crate::{
 pub struct Program {
     #[serde(deserialize_with = "deserialize_program_image")]
     pub image: String,
-    #[serde(default, alias = "entrypoint")]
+    #[serde(default)]
     #[builder(default)]
-    pub args: ProgramArgs,
+    pub entrypoint: ProgramEntrypoint,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
     #[builder(default)]

@@ -1000,7 +1000,7 @@ fn validate_config_tree(
         }
 
         // entrypoint / env are structured (InterpolatedString), so we never need to re-parse `${...}`.
-        for (arg_idx, arg) in program.args.0.iter().enumerate() {
+        for (arg_idx, arg) in program.entrypoint.0.iter().enumerate() {
             for part in &arg.parts {
                 let InterpolatedPart::Interpolation { source, query } = part else {
                     continue;
@@ -2036,7 +2036,7 @@ fn collect_program_slot_uses(manifest: &Manifest) -> HashSet<String> {
         }
     }
 
-    for arg in &program.args.0 {
+    for arg in &program.entrypoint.0 {
         used_all = add_program_slot_uses(manifest, &mut uses, arg);
         if used_all {
             return uses;

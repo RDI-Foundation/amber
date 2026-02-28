@@ -679,7 +679,7 @@ impl RawManifest {
         )?;
 
         if let Some(program) = program.as_ref()
-            && program.args.0.is_empty()
+            && program.entrypoint.0.is_empty()
         {
             return Err(Error::EmptyEntrypoint);
         }

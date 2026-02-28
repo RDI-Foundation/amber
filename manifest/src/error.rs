@@ -58,13 +58,13 @@ pub enum Error {
     #[diagnostic(code(manifest::invalid_name))]
     InvalidName { kind: &'static str, name: String },
 
-    #[error("unclosed quote in args string")]
+    #[error("unclosed quote in entrypoint string")]
     #[diagnostic(code(manifest::unclosed_quote))]
     UnclosedQuote,
 
     #[error(
         "program.entrypoint must be non-empty (implicit image entrypoints are unsupported; set \
-         `program.entrypoint`/`program.args` to an explicit command)"
+         `program.entrypoint` to an explicit command)"
     )]
     #[diagnostic(code(manifest::empty_entrypoint))]
     EmptyEntrypoint,
