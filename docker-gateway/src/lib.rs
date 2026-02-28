@@ -37,17 +37,22 @@ use url::form_urlencoded;
 const CONFIG_B64_ENV: &str = "AMBER_DOCKER_GATEWAY_CONFIG_B64";
 const CONFIG_JSON_ENV: &str = "AMBER_DOCKER_GATEWAY_CONFIG_JSON";
 const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
+#[cfg(test)]
 const COMPOSE_SERVICE_LABEL: &str = "com.docker.compose.service";
-const COMPOSE_CONFIG_HASH_LABEL: &str = "com.docker.compose.config-hash";
-const COMPOSE_NETWORK_LABEL: &str = "com.docker.compose.network";
-const COMPOSE_VOLUME_LABEL: &str = "com.docker.compose.volume";
-const AMBER_COMPONENT_LABEL: &str = "com.rdi.amber.component";
+const AMBER_COMPONENT_LABEL: &str = "amber.component";
+const AMBER_PROJECT_LABEL: &str = "amber.project";
 const CALLER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type ProxyBody = BoxBody<Bytes, BoxError>;
 type GatewayResult<T> = Result<T, Box<Response<ProxyBody>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownReason {
+    Interrupt,
+    Terminated,
+}
 
 #[derive(Debug, Error)]
 pub enum DockerGatewayError {
@@ -91,26 +96,23 @@ struct State {
     cfg: Arc<DockerGatewayConfig>,
     client: Client<UnixConnector, ProxyBody>,
     exec_map: DashMap<String, String>,
-    compose_config_hashes: DashMap<String, String>,
     callers_by_ip: RwLock<HashMap<IpAddr, Vec<ResolvedCaller>>>,
 }
 
 #[derive(Clone, Debug)]
 struct OwnerMeta {
     component: Option<String>,
-    compose_project: Option<String>,
+    project: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 struct CallerIdentity {
     component: String,
-    compose_service: String,
 }
 
 #[derive(Clone, Debug)]
 struct ResolvedCaller {
     component: String,
-    compose_service: String,
     port: Option<u16>,
 }
 
@@ -148,8 +150,6 @@ struct ExecInspectResponse {
 struct ContainerSummaryResponse {
     #[serde(rename = "Id", default)]
     id: Option<String>,
-    #[serde(rename = "Labels")]
-    labels: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,7 +297,6 @@ impl State {
             cfg: Arc::new(config),
             client,
             exec_map: DashMap::new(),
-            compose_config_hashes: DashMap::new(),
             callers_by_ip: RwLock::new(HashMap::new()),
         }
     }
@@ -316,7 +315,6 @@ impl State {
                             .or_default()
                             .push(ResolvedCaller {
                                 component: caller.component.clone(),
-                                compose_service: caller.compose_service.clone(),
                                 port: caller.port,
                             });
                     }
@@ -344,24 +342,21 @@ impl State {
         let callers = self.callers_by_ip.read().await;
         let matches = callers.get(&peer.ip())?;
 
-        let mut identity: Option<(&str, &str)> = None;
+        let mut identity: Option<&str> = None;
         for entry in matches {
             if entry.port.is_some_and(|port| port != peer.port()) {
                 continue;
             }
 
             match identity {
-                None => identity = Some((entry.component.as_str(), entry.compose_service.as_str())),
-                Some((component, compose_service))
-                    if component == entry.component.as_str()
-                        && compose_service == entry.compose_service.as_str() => {}
+                None => identity = Some(entry.component.as_str()),
+                Some(component) if component == entry.component.as_str() => {}
                 Some(_) => return None,
             }
         }
 
-        identity.map(|(component, compose_service)| CallerIdentity {
+        identity.map(|component| CallerIdentity {
             component: component.to_string(),
-            compose_service: compose_service.to_string(),
         })
     }
 
@@ -382,7 +377,7 @@ impl State {
 
     async fn cleanup_created_resources_inner(&self) {
         let required_labels = vec![
-            format!("{COMPOSE_PROJECT_LABEL}={}", self.cfg.compose_project),
+            format!("{AMBER_PROJECT_LABEL}={}", self.cfg.compose_project),
             AMBER_COMPONENT_LABEL.to_string(),
         ];
 
@@ -552,9 +547,21 @@ pub async fn run(config: DockerGatewayConfig) -> Result<(), DockerGatewayError> 
 
     loop {
         tokio::select! {
-            _ = &mut shutdown => {
+            reason = &mut shutdown => {
                 refresh_task.abort();
-                state.cleanup_created_resources().await;
+                match reason {
+                    ShutdownReason::Interrupt => {
+                        state.cleanup_created_resources().await;
+                    }
+                    ShutdownReason::Terminated => {
+                        // `docker compose down` sends SIGTERM and also performs its own teardown.
+                        // Skipping gateway cleanup avoids duplicate deletes and "No such container" races.
+                        eprintln!(
+                            "docker gateway received SIGTERM; skipping shutdown cleanup to avoid \
+                             teardown races"
+                        );
+                    }
+                }
                 return Ok(());
             }
             accepted = listener.accept() => {
@@ -612,6 +619,21 @@ async fn handle(mut req: Request<ProxyBody>, conn: Arc<ConnState>) -> Response<P
     let version_prefix = ver_opt.unwrap_or_else(|| "".to_string());
 
     if is_ping(&segs, req.method()) || is_version(&segs, req.method()) {
+        return forward(req, conn.state.clone()).await;
+    }
+
+    if req.method() == Method::GET && segs.len() == 1 && segs[0] == "info" {
+        return forward(req, conn.state.clone()).await;
+    }
+
+    // Compose may inspect image metadata even when builds are disabled (`docker compose up --no-build`).
+    // Image names can include `/` (e.g. `ghcr.io/org/app:tag`), so match `/images/{name}/json`
+    // by prefix/suffix instead of fixed segment length.
+    if req.method() == Method::GET
+        && segs.len() >= 3
+        && segs[0] == "images"
+        && segs[segs.len() - 1] == "json"
+    {
         return forward(req, conn.state.clone()).await;
     }
 
@@ -712,16 +734,7 @@ async fn handle(mut req: Request<ProxyBody>, conn: Arc<ConnState>) -> Response<P
             return *resp;
         }
 
-        let mut to_set = owner_label_pairs(&conn.state, &id);
-        to_set.push((
-            COMPOSE_SERVICE_LABEL.to_string(),
-            id.compose_service.clone(),
-        ));
-        if let Some(config_hash) =
-            resolve_compose_service_config_hash(conn.state.clone(), &version_prefix, &id).await
-        {
-            to_set.push((COMPOSE_CONFIG_HASH_LABEL.to_string(), config_hash));
-        }
+        let to_set = owner_label_pairs(&conn.state, &id);
 
         let new_body = match inject_labels_into_create_body(raw, &to_set) {
             Ok(body) => body,
@@ -747,12 +760,7 @@ async fn handle(mut req: Request<ProxyBody>, conn: Arc<ConnState>) -> Response<P
         };
         let raw = collected.to_bytes();
 
-        let mut to_set = owner_label_pairs(&conn.state, &id);
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw)
-            && let Some(name) = value.get("Name").and_then(|v| v.as_str())
-        {
-            to_set.push((COMPOSE_NETWORK_LABEL.to_string(), name.to_string()));
-        }
+        let to_set = owner_label_pairs(&conn.state, &id);
 
         let new_body = match inject_labels_into_create_body(raw, &to_set) {
             Ok(body) => body,
@@ -778,12 +786,7 @@ async fn handle(mut req: Request<ProxyBody>, conn: Arc<ConnState>) -> Response<P
         };
         let raw = collected.to_bytes();
 
-        let mut to_set = owner_label_pairs(&conn.state, &id);
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw)
-            && let Some(name) = value.get("Name").and_then(|v| v.as_str())
-        {
-            to_set.push((COMPOSE_VOLUME_LABEL.to_string(), name.to_string()));
-        }
+        let to_set = owner_label_pairs(&conn.state, &id);
 
         let new_body = match inject_labels_into_create_body(raw, &to_set) {
             Ok(body) => body,
@@ -938,6 +941,10 @@ fn owner_label_pairs(state: &State, id: &CallerIdentity) -> Vec<(String, String)
     vec![
         (AMBER_COMPONENT_LABEL.to_string(), id.component.clone()),
         (
+            AMBER_PROJECT_LABEL.to_string(),
+            state.cfg.compose_project.clone(),
+        ),
+        (
             COMPOSE_PROJECT_LABEL.to_string(),
             state.cfg.compose_project.clone(),
         ),
@@ -964,78 +971,7 @@ fn build_label_filter_query(required_labels: &[String], include_all: bool) -> Op
     Some(serializer.finish())
 }
 
-async fn resolve_compose_service_config_hash(
-    state: Arc<State>,
-    version_prefix: &str,
-    id: &CallerIdentity,
-) -> Option<String> {
-    if let Some(existing) = state.compose_config_hashes.get(&id.compose_service) {
-        return Some(existing.value().clone());
-    }
-
-    let filters = serde_json::json!({
-        "label": [
-            format!("{COMPOSE_PROJECT_LABEL}={}", state.cfg.compose_project),
-            format!("{COMPOSE_SERVICE_LABEL}={}", id.compose_service),
-        ]
-    });
-    let encoded_filters = match serde_json::to_string(&filters) {
-        Ok(value) => value,
-        Err(err) => {
-            eprintln!(
-                "docker gateway failed to encode compose label filters for service {}: {err}",
-                id.compose_service
-            );
-            return None;
-        }
-    };
-    let query = form_urlencoded::Serializer::new(String::new())
-        .append_pair("all", "1")
-        .append_pair("filters", &encoded_filters)
-        .finish();
-    let path = with_version(version_prefix, "/containers/json");
-    let response_path = format!("{path}?{query}");
-    let response = match docker_get(&state, &response_path).await {
-        Ok(value) => value,
-        Err(_) => return None,
-    };
-    if response.status != StatusCode::OK {
-        return None;
-    }
-
-    let containers = match serde_json::from_slice::<Vec<ContainerSummaryResponse>>(&response.body) {
-        Ok(value) => value,
-        Err(err) => {
-            eprintln!(
-                "docker gateway failed to decode container list while resolving compose \
-                 config-hash for service {}: {err}",
-                id.compose_service
-            );
-            return None;
-        }
-    };
-
-    let config_hash = containers.into_iter().find_map(|entry| {
-        entry
-            .labels
-            .as_ref()
-            .and_then(|labels| labels.get(COMPOSE_CONFIG_HASH_LABEL))
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    });
-
-    if let Some(config_hash) = config_hash {
-        state
-            .compose_config_hashes
-            .insert(id.compose_service.clone(), config_hash.clone());
-        Some(config_hash)
-    } else {
-        None
-    }
-}
-
-async fn shutdown_signal() {
+async fn shutdown_signal() -> ShutdownReason {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -1043,12 +979,13 @@ async fn shutdown_signal() {
         match signal(SignalKind::terminate()) {
             Ok(mut sigterm) => {
                 tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = sigterm.recv() => {}
+                    _ = tokio::signal::ctrl_c() => ShutdownReason::Interrupt,
+                    _ = sigterm.recv() => ShutdownReason::Terminated,
                 }
             }
             Err(_) => {
                 let _ = tokio::signal::ctrl_c().await;
+                ShutdownReason::Interrupt
             }
         }
     }
@@ -1056,6 +993,7 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+        return ShutdownReason::Interrupt;
     }
 }
 
@@ -1310,9 +1248,9 @@ async fn authorize_container(
     container: &str,
     id: &CallerIdentity,
 ) -> GatewayResult<()> {
-    let compose_project = state.cfg.compose_project.clone();
+    let project = state.cfg.compose_project.clone();
     let meta = fetch_container_meta(state.clone(), version_prefix, container).await?;
-    if is_owner(&meta, id, &compose_project) {
+    if is_owner(&meta, id, &project) {
         Ok(())
     } else {
         Err(boxed_response(docker_error(
@@ -1328,9 +1266,9 @@ async fn authorize_network(
     network: &str,
     id: &CallerIdentity,
 ) -> GatewayResult<()> {
-    let compose_project = state.cfg.compose_project.clone();
+    let project = state.cfg.compose_project.clone();
     let meta = fetch_network_meta(state.clone(), version_prefix, network).await?;
-    if is_owner(&meta, id, &compose_project) {
+    if is_owner(&meta, id, &project) {
         Ok(())
     } else {
         Err(boxed_response(docker_error(
@@ -1346,9 +1284,9 @@ async fn authorize_volume(
     volume: &str,
     id: &CallerIdentity,
 ) -> GatewayResult<()> {
-    let compose_project = state.cfg.compose_project.clone();
+    let project = state.cfg.compose_project.clone();
     let meta = fetch_volume_meta(state.clone(), version_prefix, volume).await?;
-    if is_owner(&meta, id, &compose_project) {
+    if is_owner(&meta, id, &project) {
         Ok(())
     } else {
         Err(boxed_response(docker_error(
@@ -1388,7 +1326,7 @@ async fn fetch_container_meta(
 
     let meta = OwnerMeta {
         component: labels.get(AMBER_COMPONENT_LABEL).cloned(),
-        compose_project: labels.get(COMPOSE_PROJECT_LABEL).cloned(),
+        project: labels.get(AMBER_PROJECT_LABEL).cloned(),
     };
 
     Ok(meta)
@@ -1419,7 +1357,7 @@ async fn fetch_network_meta(
     let labels = parsed.labels.unwrap_or_default();
     let meta = OwnerMeta {
         component: labels.get(AMBER_COMPONENT_LABEL).cloned(),
-        compose_project: labels.get(COMPOSE_PROJECT_LABEL).cloned(),
+        project: labels.get(AMBER_PROJECT_LABEL).cloned(),
     };
 
     Ok(meta)
@@ -1450,7 +1388,7 @@ async fn fetch_volume_meta(
     let labels = parsed.labels.unwrap_or_default();
     let meta = OwnerMeta {
         component: labels.get(AMBER_COMPONENT_LABEL).cloned(),
-        compose_project: labels.get(COMPOSE_PROJECT_LABEL).cloned(),
+        project: labels.get(AMBER_PROJECT_LABEL).cloned(),
     };
 
     Ok(meta)
@@ -1489,9 +1427,9 @@ async fn resolve_exec_container_id(
     Ok(parsed.container_id)
 }
 
-fn is_owner(meta: &OwnerMeta, id: &CallerIdentity, compose_project: &str) -> bool {
+fn is_owner(meta: &OwnerMeta, id: &CallerIdentity, project: &str) -> bool {
     meta.component.as_deref() == Some(id.component.as_str())
-        && meta.compose_project.as_deref() == Some(compose_project)
+        && meta.project.as_deref() == Some(project)
 }
 
 struct DockerGetResponse {
@@ -1684,7 +1622,7 @@ fn add_label_filters_to_uri(uri: &Uri, required: &[String]) -> GatewayResult<Uri
     let obj = filters.as_object_mut().unwrap();
     let labels_val = obj
         .entry("label")
-        .or_insert_with(|| serde_json::Value::Array(vec![]));
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
     merge_required_labels(labels_val, required)?;
 
     let new_filters = serde_json::to_string(&filters).map_err(|err| {
@@ -1725,54 +1663,49 @@ fn merge_required_labels(
     labels_val: &mut serde_json::Value,
     required: &[String],
 ) -> GatewayResult<()> {
-    match labels_val {
-        serde_json::Value::Array(arr) => {
-            let mut existing = HashSet::new();
-            for value in arr.iter() {
-                if let Some(label) = value.as_str() {
-                    existing.insert(label.to_string());
-                }
-            }
+    let mut labels_obj = serde_json::Map::new();
 
-            for label in required {
-                if existing.insert(label.clone()) {
-                    arr.push(serde_json::Value::String(label.clone()));
-                }
+    match labels_val {
+        serde_json::Value::Array(values) => {
+            for value in values.iter() {
+                let Some(label) = value.as_str() else {
+                    continue;
+                };
+                labels_obj.insert(label.to_string(), serde_json::Value::Bool(true));
             }
-            Ok(())
         }
-        serde_json::Value::Object(obj) => {
-            for label in required {
-                obj.insert(label.clone(), serde_json::Value::Bool(true));
+        serde_json::Value::Object(values) => {
+            for (label, enabled) in values.iter() {
+                let enabled = enabled.as_bool().unwrap_or(true);
+                labels_obj.insert(label.clone(), serde_json::Value::Bool(enabled));
             }
-            Ok(())
         }
         serde_json::Value::String(existing_label) => {
-            let mut labels = vec![serde_json::Value::String(existing_label.clone())];
-            let mut seen = HashSet::from([existing_label.clone()]);
-            for label in required {
-                if seen.insert(label.clone()) {
-                    labels.push(serde_json::Value::String(label.clone()));
-                }
-            }
-            *labels_val = serde_json::Value::Array(labels);
-            Ok(())
+            labels_obj.insert(existing_label.clone(), serde_json::Value::Bool(true));
         }
-        serde_json::Value::Null => {
-            *labels_val = serde_json::Value::Array(
-                required
-                    .iter()
-                    .cloned()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            );
-            Ok(())
+        serde_json::Value::Null => {}
+        _ => {
+            return Err(boxed_response(docker_error(
+                StatusCode::BAD_REQUEST,
+                "filters.label must be an array, object, string, or null",
+            )));
         }
-        _ => Err(boxed_response(docker_error(
-            StatusCode::BAD_REQUEST,
-            "filters.label must be an array, object, string, or null",
-        ))),
     }
+
+    let normalize_compose_project = required
+        .iter()
+        .any(|label| label.starts_with(&format!("{COMPOSE_PROJECT_LABEL}=")));
+    if normalize_compose_project {
+        labels_obj.retain(|label, _| !label.starts_with(&format!("{COMPOSE_PROJECT_LABEL}=")));
+    }
+
+    for label in required {
+        // Required owner labels must always be enabled.
+        labels_obj.insert(label.clone(), serde_json::Value::Bool(true));
+    }
+
+    *labels_val = serde_json::Value::Object(labels_obj);
+    Ok(())
 }
 
 fn inject_labels_into_create_body(
@@ -2369,7 +2302,7 @@ mod tests {
             "Config": {
                 "Labels": {
                     AMBER_COMPONENT_LABEL: component,
-                    COMPOSE_PROJECT_LABEL: project
+                    AMBER_PROJECT_LABEL: project
                 }
             }
         })
@@ -2379,7 +2312,7 @@ mod tests {
         serde_json::json!({
             "Labels": {
                 AMBER_COMPONENT_LABEL: component,
-                COMPOSE_PROJECT_LABEL: project
+                AMBER_PROJECT_LABEL: project
             }
         })
     }
@@ -2734,8 +2667,84 @@ mod tests {
             .get("label")
             .and_then(|value| value.as_object())
             .expect("labels object");
-        assert_eq!(labels.get("a=b"), Some(&serde_json::Value::Bool(true)));
-        assert_eq!(labels.get("c=d"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(
+            labels.get("a=b").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            labels.get("c=d").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn add_label_filters_to_uri_uses_object_labels_with_name_filter() {
+        let uri: Uri = "/networks?filters=%7B%22name%22%3A%7B%22example_net%22%3Atrue%7D%2C%\
+                        22label%22%3A%7B%22existing%3Dlabel%22%3Atrue%7D%7D"
+            .parse()
+            .expect("uri");
+        let required = vec!["amber.component=/green".to_string()];
+        let out = add_label_filters_to_uri(&uri, &required).expect("filters");
+        let query = out.query().expect("query");
+        let parsed_query: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect();
+        let filters = parsed_query.get("filters").expect("filters");
+        let parsed_filters: serde_json::Value = serde_json::from_str(filters).expect("json");
+
+        assert!(
+            parsed_filters
+                .get("name")
+                .and_then(|value| value.as_object())
+                .is_some()
+        );
+
+        let labels = parsed_filters
+            .get("label")
+            .and_then(|value| value.as_object())
+            .expect("labels object");
+        assert_eq!(
+            labels
+                .get("existing=label")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            labels
+                .get("amber.component=/green")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn add_label_filters_to_uri_rewrites_compose_project_filter() {
+        let uri: Uri = "/containers/json?filters=%7B%22label%22%3A%5B%22com.docker.compose.\
+                        project%3Dinner-project%22%2C%22com.docker.compose.service%3Dlangchain%22%\
+                        5D%7D"
+            .parse()
+            .expect("uri");
+        let required = vec![
+            "amber.component=/green".to_string(),
+            "amber.project=outer-project".to_string(),
+            "com.docker.compose.project=outer-project".to_string(),
+        ];
+
+        let out = add_label_filters_to_uri(&uri, &required).expect("filters");
+        let query = out.query().expect("query");
+        let parsed_query: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect();
+        let filters = parsed_query.get("filters").expect("filters");
+        let parsed_filters: serde_json::Value = serde_json::from_str(filters).expect("json");
+        let labels = parsed_filters
+            .get("label")
+            .and_then(|value| value.as_object())
+            .expect("labels object");
+
+        assert!(labels.contains_key("com.docker.compose.service=langchain"));
+        assert!(labels.contains_key("com.docker.compose.project=outer-project"));
+        assert!(!labels.contains_key("com.docker.compose.project=inner-project"));
     }
 
     #[test]
@@ -2829,12 +2838,10 @@ mod tests {
                 vec![
                     ResolvedCaller {
                         component: "component-a".to_string(),
-                        compose_service: "service-a".to_string(),
                         port: Some(30001),
                     },
                     ResolvedCaller {
                         component: "component-b".to_string(),
-                        compose_service: "service-b".to_string(),
                         port: Some(30002),
                     },
                 ],
@@ -2846,14 +2853,12 @@ mod tests {
             .await
             .expect("caller a should match");
         assert_eq!(a.component, "component-a");
-        assert_eq!(a.compose_service, "service-a");
 
         let b = state
             .resolve_identity("127.0.0.1:30002".parse().expect("valid addr"))
             .await
             .expect("caller b should match");
         assert_eq!(b.component, "component-b");
-        assert_eq!(b.compose_service, "service-b");
 
         let unmatched = state
             .resolve_identity("127.0.0.1:30003".parse().expect("valid addr"))
@@ -2870,12 +2875,10 @@ mod tests {
                 vec![
                     ResolvedCaller {
                         component: "component-a".to_string(),
-                        compose_service: "service-a".to_string(),
                         port: None,
                     },
                     ResolvedCaller {
                         component: "component-b".to_string(),
-                        compose_service: "service-b".to_string(),
                         port: None,
                     },
                 ],
@@ -2967,6 +2970,77 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn allows_image_inspect_endpoint_for_prebuilt_workflows() {
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+        gateway.enqueue_json(
+            Method::GET,
+            "/images/busybox:latest/json",
+            StatusCode::OK,
+            serde_json::json!({"Id":"sha256:abc"}),
+        );
+
+        let response = send_gateway_request(
+            gateway.addr,
+            Method::GET,
+            "/images/busybox:latest/json",
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+
+        let requests = gateway.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, Method::GET);
+        assert_eq!(requests[0].path, "/images/busybox:latest/json");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn allows_image_inspect_endpoint_for_registry_qualified_names() {
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+        gateway.enqueue_json(
+            Method::GET,
+            "/images/ghcr.io/org/app:latest/json",
+            StatusCode::OK,
+            serde_json::json!({"Id":"sha256:def"}),
+        );
+
+        let response = send_gateway_request(
+            gateway.addr,
+            Method::GET,
+            "/images/ghcr.io/org/app:latest/json",
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+
+        let requests = gateway.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, Method::GET);
+        assert_eq!(requests[0].path, "/images/ghcr.io/org/app:latest/json");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn allows_info_endpoint() {
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+        gateway.enqueue_json(
+            Method::GET,
+            "/info",
+            StatusCode::OK,
+            serde_json::json!({"ServerVersion":"27.0"}),
+        );
+
+        let response = send_gateway_request(gateway.addr, Method::GET, "/info", &[], &[]).await;
+        assert_eq!(response.status, StatusCode::OK);
+
+        let requests = gateway.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, Method::GET);
+        assert_eq!(requests[0].path, "/info");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn blocks_network_connect_and_disconnect() {
         let gateway = GatewayHarness::start(vec![default_caller()]).await;
 
@@ -2994,20 +3068,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn create_injects_and_overwrites_security_labels() {
+    async fn create_injects_owner_labels_and_normalizes_compose_project() {
         let gateway = GatewayHarness::start(vec![default_caller()]).await;
-        gateway.enqueue_json(
-            Method::GET,
-            "/containers/json",
-            StatusCode::OK,
-            serde_json::json!([
-                {
-                    "Labels": {
-                        COMPOSE_CONFIG_HASH_LABEL: "cfg-hash-1",
-                    }
-                }
-            ]),
-        );
         gateway.enqueue_json(
             Method::POST,
             "/containers/create",
@@ -3019,7 +3081,8 @@ mod tests {
             "Image": "busybox",
             "Labels": {
                 AMBER_COMPONENT_LABEL: "attacker",
-                COMPOSE_PROJECT_LABEL: "other-project",
+                AMBER_PROJECT_LABEL: "other-project",
+                COMPOSE_PROJECT_LABEL: "compose-project",
                 COMPOSE_SERVICE_LABEL: "other-service",
                 "user.label": "kept"
             }
@@ -3051,32 +3114,28 @@ mod tests {
             Some(TEST_COMPONENT)
         );
         assert_eq!(
-            labels.get(COMPOSE_PROJECT_LABEL).and_then(|v| v.as_str()),
+            labels.get(AMBER_PROJECT_LABEL).and_then(|v| v.as_str()),
             Some(TEST_PROJECT)
         );
         assert_eq!(
             labels.get(COMPOSE_SERVICE_LABEL).and_then(|v| v.as_str()),
-            Some(TEST_COMPONENT)
+            Some("other-service")
         );
         assert_eq!(
-            labels
-                .get(COMPOSE_CONFIG_HASH_LABEL)
-                .and_then(|v| v.as_str()),
-            Some("cfg-hash-1")
+            labels.get(COMPOSE_PROJECT_LABEL).and_then(|v| v.as_str()),
+            Some(TEST_PROJECT)
         );
         assert_eq!(
             labels.get("user.label").and_then(|v| v.as_str()),
             Some("kept")
         );
 
-        let list_req = requests
-            .iter()
-            .find(|req| req.method == Method::GET && req.path == "/containers/json")
-            .expect("container list should be queried for compose config hash");
-        let list_filters = decode_filters(list_req);
-        let list_labels = labels_as_set(&list_filters);
-        assert!(list_labels.contains(&format!("{COMPOSE_PROJECT_LABEL}={TEST_PROJECT}")));
-        assert!(list_labels.contains(&format!("{COMPOSE_SERVICE_LABEL}={TEST_COMPONENT}")));
+        assert!(
+            !requests
+                .iter()
+                .any(|req| req.method == Method::GET && req.path == "/containers/json"),
+            "container create should not query compose config hash"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3262,7 +3321,7 @@ mod tests {
         let container_labels = labels_as_set(&containers_filters);
         assert!(container_labels.contains("existing=label"));
         assert!(container_labels.contains(&format!("{AMBER_COMPONENT_LABEL}={TEST_COMPONENT}")));
-        assert!(container_labels.contains(&format!("{COMPOSE_PROJECT_LABEL}={TEST_PROJECT}")));
+        assert!(container_labels.contains(&format!("{AMBER_PROJECT_LABEL}={TEST_PROJECT}")));
 
         let prune_req = requests
             .iter()
@@ -3272,7 +3331,7 @@ mod tests {
         let prune_labels = labels_as_set(&prune_filters);
         assert!(prune_labels.contains("existing=label"));
         assert!(prune_labels.contains(&format!("{AMBER_COMPONENT_LABEL}={TEST_COMPONENT}")));
-        assert!(prune_labels.contains(&format!("{COMPOSE_PROJECT_LABEL}={TEST_PROJECT}")));
+        assert!(prune_labels.contains(&format!("{AMBER_PROJECT_LABEL}={TEST_PROJECT}")));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3344,7 +3403,7 @@ mod tests {
         let container_filters = decode_filters(container_list);
         let container_labels = labels_as_set(&container_filters);
         assert!(container_labels.contains(AMBER_COMPONENT_LABEL));
-        assert!(container_labels.contains(&format!("{COMPOSE_PROJECT_LABEL}={TEST_PROJECT}")));
+        assert!(container_labels.contains(&format!("{AMBER_PROJECT_LABEL}={TEST_PROJECT}")));
 
         let network_list = requests
             .iter()
@@ -3353,7 +3412,7 @@ mod tests {
         let network_filters = decode_filters(network_list);
         let network_labels = labels_as_set(&network_filters);
         assert!(network_labels.contains(AMBER_COMPONENT_LABEL));
-        assert!(network_labels.contains(&format!("{COMPOSE_PROJECT_LABEL}={TEST_PROJECT}")));
+        assert!(network_labels.contains(&format!("{AMBER_PROJECT_LABEL}={TEST_PROJECT}")));
 
         let volume_list = requests
             .iter()
@@ -3362,7 +3421,7 @@ mod tests {
         let volume_filters = decode_filters(volume_list);
         let volume_labels = labels_as_set(&volume_filters);
         assert!(volume_labels.contains(AMBER_COMPONENT_LABEL));
-        assert!(volume_labels.contains(&format!("{COMPOSE_PROJECT_LABEL}={TEST_PROJECT}")));
+        assert!(volume_labels.contains(&format!("{AMBER_PROJECT_LABEL}={TEST_PROJECT}")));
 
         let deleted_containers: HashSet<&str> = requests
             .iter()
@@ -3607,7 +3666,7 @@ mod tests {
             Some(serde_json::json!({
                 "Name": foreign_network.as_str(),
                 "Labels": {
-                    COMPOSE_PROJECT_LABEL: compose_project.as_str(),
+                    AMBER_PROJECT_LABEL: compose_project.as_str(),
                     AMBER_COMPONENT_LABEL: foreign_component.as_str()
                 }
             })),
@@ -3621,7 +3680,7 @@ mod tests {
             Some(serde_json::json!({
                 "Name": foreign_volume.as_str(),
                 "Labels": {
-                    COMPOSE_PROJECT_LABEL: compose_project.as_str(),
+                    AMBER_PROJECT_LABEL: compose_project.as_str(),
                     AMBER_COMPONENT_LABEL: foreign_component.as_str()
                 }
             })),
@@ -3637,7 +3696,7 @@ mod tests {
                 "Name": owned_network.as_str(),
                 "Labels": {
                     AMBER_COMPONENT_LABEL: "attacker",
-                    COMPOSE_PROJECT_LABEL: "attacker-project",
+                    AMBER_PROJECT_LABEL: "attacker-project",
                     "user.label": "kept"
                 }
             })
@@ -3661,7 +3720,7 @@ mod tests {
                 "Name": owned_volume.as_str(),
                 "Labels": {
                     AMBER_COMPONENT_LABEL: "attacker",
-                    COMPOSE_PROJECT_LABEL: "attacker-project"
+                    AMBER_PROJECT_LABEL: "attacker-project"
                 }
             })
             .to_string()
@@ -3697,15 +3756,9 @@ mod tests {
         );
         assert_eq!(
             owned_network_labels
-                .get(COMPOSE_PROJECT_LABEL)
+                .get(AMBER_PROJECT_LABEL)
                 .and_then(|value| value.as_str()),
             Some(compose_project.as_str())
-        );
-        assert_eq!(
-            owned_network_labels
-                .get(COMPOSE_NETWORK_LABEL)
-                .and_then(|value| value.as_str()),
-            Some(owned_network.as_str())
         );
         assert_eq!(
             owned_network_labels
@@ -3736,15 +3789,9 @@ mod tests {
         );
         assert_eq!(
             owned_volume_labels
-                .get(COMPOSE_PROJECT_LABEL)
+                .get(AMBER_PROJECT_LABEL)
                 .and_then(|value| value.as_str()),
             Some(compose_project.as_str())
-        );
-        assert_eq!(
-            owned_volume_labels
-                .get(COMPOSE_VOLUME_LABEL)
-                .and_then(|value| value.as_str()),
-            Some(owned_volume.as_str())
         );
 
         let deny_network = send_gateway_request(

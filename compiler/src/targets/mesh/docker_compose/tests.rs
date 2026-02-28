@@ -1390,6 +1390,96 @@ fn compose_routes_external_slots_through_router() {
 }
 
 #[test]
+fn compose_external_slots_and_exports_work_together_with_and_without_dce() {
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let root_path = dir.path().join("root.json5");
+    let green_path = dir.path().join("green.json5");
+
+    fs::write(
+        &root_path,
+        r##"
+        {
+          manifest_version: "0.1.0",
+          slots: {
+            agent: { kind: "a2a" },
+          },
+          components: {
+            green: "green.json5",
+          },
+          bindings: [
+            { to: "#green.agent", from: "self.agent", weak: true },
+          ],
+          exports: {
+            green: "#green.a2a",
+          },
+        }
+        "##,
+    )
+    .unwrap();
+
+    fs::write(
+        &green_path,
+        r##"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "alpine:3.20",
+            entrypoint: ["sleep", "infinity"],
+            env: {
+              AGENT_URL: "${slots.agent.url}",
+            },
+            network: {
+              endpoints: [{ name: "a2a", port: 9001 }],
+            },
+          },
+          slots: {
+            agent: { kind: "a2a" },
+          },
+          provides: {
+            a2a: { kind: "a2a", endpoint: "a2a" },
+          },
+          exports: {
+            a2a: "a2a",
+          },
+        }
+        "##,
+    )
+    .unwrap();
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    for dce in [true, false] {
+        let opts = CompileOptions {
+            optimize: OptimizeOptions { dce },
+            ..CompileOptions::default()
+        };
+        let output = rt
+            .block_on(compiler.compile(
+                ManifestRef::from_url(Url::from_file_path(&root_path).unwrap()),
+                opts,
+            ))
+            .expect("compile ok");
+
+        let yaml = DockerComposeReporter
+            .emit(&output.scenario)
+            .expect("compose render ok");
+        let b64 = extract_compose_env_value(&yaml, "AMBER_ROUTER_CONFIG_B64")
+            .expect("router config env var");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64.as_bytes())
+            .expect("decode router config");
+        let config: serde_json::Value =
+            serde_json::from_slice(&decoded).expect("parse router config");
+
+        assert_eq!(config["external_slots"][0]["name"], "agent");
+        assert_eq!(config["exports"][0]["name"], "green");
+    }
+}
+
+#[test]
 #[ignore = "requires docker + docker compose; run manually"]
 fn docker_smoke_external_slot_routes_to_outside_service() {
     use tempfile::tempdir;

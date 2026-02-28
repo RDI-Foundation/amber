@@ -52,28 +52,27 @@ Notes:
   The gateway resolves caller hosts periodically and authenticates peers by the resolved source
   IP (plus optional source port).
 - If your TCP proxy uses ephemeral source ports, omit `port` and match by resolved IP only.
-- The ownership label key is fixed to `com.rdi.amber.component`.
+- Ownership labels are fixed to `amber.component` and `amber.project`.
 
 ## Labels and scoping
 
 On create, the gateway injects these labels:
 
-- Ownership labels: `com.rdi.amber.component`
-- Compose labels: `com.docker.compose.project`, `com.docker.compose.service`
-- Network/volume extras when a name is present: `com.docker.compose.network`,
-  `com.docker.compose.volume`
+- Ownership labels: `amber.component`, `amber.project`
+- Compose project label: `com.docker.compose.project` (normalized to outer scenario project)
 
 These labels are used for two purposes:
 
 1. Compose grouping (`com.docker.compose.project`) so `docker compose --remove-orphans`
    works for resources created through the gateway.
-2. Ownership enforcement so only the owning component can act on the resource.
+2. Ownership enforcement so only the owning component and scenario project can act on the resource.
 
 ## Allowed API surface
 
 The gateway is default-deny. It only allows endpoints that can be scoped safely:
 
 - `/containers/create`, `/networks/create`, `/volumes/create` (labels injected)
+- `/images/{name}/json` (read-only image inspect; required by `docker compose up --no-build`)
 - Container-scoped endpoints (start/stop/logs/inspect/remove/exec/etc) after ownership check
 - Exec endpoints (`/exec/{id}/start`, `/exec/{id}/json`, `/exec/{id}/resize`) after mapping
   exec ID to container ownership

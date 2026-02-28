@@ -55,12 +55,15 @@ pub(crate) fn allocate_external_slot_ports(
 pub(crate) fn build_router_external_slots(
     root_slots: &BTreeMap<String, SlotDecl>,
     external_slot_ports: &BTreeMap<String, u16>,
-) -> Vec<RouterExternalSlot> {
+) -> Result<Vec<RouterExternalSlot>, String> {
     let mut router_external_slots = Vec::with_capacity(external_slot_ports.len());
     for (slot_name, listen_port) in external_slot_ports {
-        let decl = root_slots
-            .get(slot_name.as_str())
-            .expect("external slot should exist on root");
+        let decl = root_slots.get(slot_name.as_str()).ok_or_else(|| {
+            format!(
+                "internal error: external slot `{slot_name}` is referenced by a binding but \
+                 missing from root slot declarations"
+            )
+        })?;
         let url_env = external_slot_env_var(slot_name);
         router_external_slots.push(RouterExternalSlot {
             name: slot_name.clone(),
@@ -70,7 +73,7 @@ pub(crate) fn build_router_external_slots(
         });
     }
 
-    router_external_slots
+    Ok(router_external_slots)
 }
 
 pub(crate) fn encode_router_config_b64(config: &RouterConfig) -> Result<String, serde_json::Error> {
