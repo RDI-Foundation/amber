@@ -4,7 +4,7 @@
     {
       "name": "amber-cli",
       "context": ".",
-      "dockerfile": "Dockerfile"
+      "dockerfile": "docker/amber-cli/Dockerfile"
     },
     {
       "name": "amber-sidecar",

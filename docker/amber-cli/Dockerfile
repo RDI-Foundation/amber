@@ -1,14 +1,17 @@
+# syntax=docker/dockerfile:1.12
+
 FROM rust:1.91-slim-trixie AS base-builder
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     g++ \
     musl-tools \
-    pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+    pkg-config
 
 COPY rust-toolchain.toml .
 RUN rustup show
@@ -39,10 +42,12 @@ COPY scenario/Cargo.toml scenario/
 COPY template/Cargo.toml template/
 COPY node/Cargo.toml node/
 
-RUN mkdir -p cli/src config/src compiler/src docker-gateway/src helper/src images/src json5/src manifest/src router/src resolver/src scenario/src template/src node/src && \
-    touch cli/src/main.rs config/src/lib.rs compiler/src/lib.rs docker-gateway/src/main.rs helper/src/main.rs images/src/lib.rs json5/src/lib.rs manifest/src/lib.rs router/src/main.rs resolver/src/lib.rs scenario/src/lib.rs template/src/lib.rs node/src/main.rs
-RUN cargo fetch --locked
-RUN rm -rf cli/src config/src compiler/src docker-gateway/src helper/src images/src json5/src manifest/src router/src resolver/src scenario/src template/src node/src
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    mkdir -p cli/src config/src compiler/src docker-gateway/src helper/src images/src json5/src manifest/src router/src resolver/src scenario/src template/src node/src && \
+    touch cli/src/main.rs config/src/lib.rs compiler/src/lib.rs docker-gateway/src/main.rs helper/src/main.rs images/src/lib.rs json5/src/lib.rs manifest/src/lib.rs router/src/main.rs resolver/src/lib.rs scenario/src/lib.rs template/src/lib.rs node/src/main.rs && \
+    cargo fetch --locked && \
+    rm -rf cli/src config/src compiler/src docker-gateway/src helper/src images/src json5/src manifest/src router/src resolver/src scenario/src template/src node/src
 
 COPY cli ./cli
 COPY config ./config
@@ -60,12 +65,15 @@ COPY node ./node
 COPY docker/images.json docker/images.json
 
 ARG BUILD_MODE=release
-RUN target=$(cat /tmp/rust-target) && \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/app/target,sharing=locked \
+    target=$(cat /tmp/rust-target) && \
     if [ "$BUILD_MODE" = "release" ]; then \
       cargo build --locked --release -p amber-cli --target "${target}"; \
       build_dir=release; \
     else \
-      cargo build -p amber-cli --target "${target}"; \
+      cargo build --locked -p amber-cli --target "${target}"; \
       build_dir=debug; \
     fi && \
     install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber /out/amber && \
