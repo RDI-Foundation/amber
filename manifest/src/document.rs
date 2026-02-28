@@ -817,7 +817,7 @@ mod tests {
         {
           // { brace in comment should be ignored
           manifest_version: "0.1.0",
-          program: { image: "{not", args: [] }
+          program: { image: "{not", entrypoint: [] }
         "##;
 
         let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();

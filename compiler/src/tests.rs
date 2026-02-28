@@ -876,7 +876,7 @@ async fn named_binding_resolution_is_stable_across_opt_modes() {
                   manifest_version: "0.1.0",
                   program: {
                     image: "alpine:3.20",
-                    args: ["sleep", "infinity"],
+                    entrypoint: ["sleep", "infinity"],
                     env: {
                       AGENT_URL: "${bindings.agent.url}",
                     },
@@ -926,7 +926,7 @@ async fn named_binding_resolution_is_stable_across_opt_modes() {
                   manifest_version: "0.1.0",
                   program: {
                     image: "alpine:3.20",
-                    args: ["sleep", "infinity"],
+                    entrypoint: ["sleep", "infinity"],
                     network: {
                       endpoints: [{ name: "a2a", port: 9000 }],
                     },
@@ -1414,7 +1414,7 @@ async fn renamed_binding_chain_is_stable_across_opt_modes() {
           manifest_version: "0.1.0",
           program: {
             image: "alpine:3.20",
-            args: ["sleep", "infinity"],
+            entrypoint: ["sleep", "infinity"],
             env: {
               AGENT_URL: "${bindings.agent.url}",
             },
@@ -1466,7 +1466,7 @@ async fn renamed_binding_chain_is_stable_across_opt_modes() {
           manifest_version: "0.1.0",
           program: {
             image: "alpine:3.20",
-            args: ["sleep", "infinity"],
+            entrypoint: ["sleep", "infinity"],
             network: {
               endpoints: [{ name: "api", port: 9000 }],
             },

@@ -1082,7 +1082,7 @@ fn build_program_plan(
         ProgramImagePlan::Static(rendered)
     };
 
-    for (idx, arg) in program.args.0.iter().enumerate() {
+    for (idx, arg) in program.entrypoint.0.iter().enumerate() {
         let mut ts: TemplateString = Vec::new();
         for part in &arg.parts {
             match part {

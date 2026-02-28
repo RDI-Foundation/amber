@@ -206,7 +206,7 @@ fn validate_manifest_binding_interpolations(
         validate_interpolated_string(&image, &ctx, location, span, &mut diagnostics);
     }
 
-    for (idx, arg) in program.args.0.iter().enumerate() {
+    for (idx, arg) in program.entrypoint.0.iter().enumerate() {
         let location = ProgramLocation::Entrypoint(idx);
         let span = location.span(source.as_ref(), spans);
         validate_interpolated_string(arg, &ctx, location, span, &mut diagnostics);
@@ -426,17 +426,12 @@ impl ProgramLocation<'_> {
                 .or_else(|| spans.program.as_ref().map(|p| p.whole))
                 .unwrap_or_else(|| (0usize, 0usize).into()),
             ProgramLocation::Entrypoint(idx) => {
-                for key in ["args", "entrypoint"] {
-                    let pointer = format!("/program/{key}/{idx}");
-                    if let Some(span) = span_for_json_pointer(source, root, &pointer) {
-                        return span;
-                    }
+                let pointer = format!("/program/entrypoint/{idx}");
+                if let Some(span) = span_for_json_pointer(source, root, &pointer) {
+                    return span;
                 }
-                for key in ["args", "entrypoint"] {
-                    let pointer = format!("/program/{key}");
-                    if let Some(span) = span_for_json_pointer(source, root, &pointer) {
-                        return span;
-                    }
+                if let Some(span) = span_for_json_pointer(source, root, "/program/entrypoint") {
+                    return span;
                 }
                 spans
                     .program

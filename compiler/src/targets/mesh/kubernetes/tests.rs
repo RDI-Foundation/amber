@@ -1299,7 +1299,7 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
           manifest_version: "0.1.0",
           program: {
             image: "busybox:1.36.1",
-            args: ["sh", "-lc", "sleep 3600"],
+            entrypoint: ["sh", "-lc", "sleep 3600"],
             env: { API_URL: "${slots.api.url}" }
           },
           slots: { api: { kind: "http" } }
@@ -1578,7 +1578,7 @@ fn kubernetes_smoke_export_routes_to_host() {
           manifest_version: "0.1.0",
           program: {
             image: "busybox:1.36.1",
-            args: ["sh", "-lc", "mkdir -p /www && echo export-ok > /www/index.html && httpd -f -p 8080 -h /www"],
+            entrypoint: ["sh", "-lc", "mkdir -p /www && echo export-ok > /www/index.html && httpd -f -p 8080 -h /www"],
             network: { endpoints: [ { name: "api", port: 8080, protocol: "http" } ] }
           },
           provides: { api: { kind: "http", endpoint: "api" } }

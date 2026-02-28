@@ -2,7 +2,7 @@
   manifest_version: "0.1.0",
   program: {
     image: "busybox:1.36",
-    args: [
+    entrypoint: [
       "sh",
       "-eu",
       "-c",

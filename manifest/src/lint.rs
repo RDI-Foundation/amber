@@ -179,7 +179,7 @@ fn collect_config_uses(manifest: &Manifest) -> ConfigUses {
         if let Ok(image) = program.image.parse::<InterpolatedString>() {
             collect_config_uses_from_interpolated(&image, &mut uses);
         }
-        for arg in &program.args.0 {
+        for arg in &program.entrypoint.0 {
             collect_config_uses_from_interpolated(arg, &mut uses);
         }
         for value in program.env.values() {
@@ -267,7 +267,7 @@ pub fn lint_manifest(
             used_all = add_program_slot_uses(manifest, &mut program_used_slots, &image);
         }
         if !used_all {
-            for arg in &program.args.0 {
+            for arg in &program.entrypoint.0 {
                 used_all = add_program_slot_uses(manifest, &mut program_used_slots, arg);
                 if used_all {
                     break;
@@ -472,7 +472,7 @@ mod tests {
           },
           program: {
             image: "x",
-            args: ["--domain", "${config.domain}"],
+            entrypoint: ["--domain", "${config.domain}"],
           },
         }
         "#;
@@ -539,14 +539,14 @@ mod tests {
     }
 
     #[test]
-    fn slot_used_in_program_args_is_not_linted() {
+    fn slot_used_in_program_entrypoint_is_not_linted() {
         let input = r#"
         {
           manifest_version: "0.1.0",
           slots: { llm: { kind: "llm" } },
           program: {
             image: "x",
-            args: ["--llm", "${slots.llm.url}"],
+            entrypoint: ["--llm", "${slots.llm.url}"],
           },
         }
         "#;

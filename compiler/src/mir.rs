@@ -893,7 +893,7 @@ fn collect_program_used_slots(component: &amber_scenario::Component) -> Vec<Stri
         return all_slots();
     }
 
-    for arg in &program.args.0 {
+    for arg in &program.entrypoint.0 {
         if arg.visit_slot_uses(|slot| mark_slot(slot, &mut used)) {
             return all_slots();
         }

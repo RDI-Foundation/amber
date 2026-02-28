@@ -381,7 +381,7 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
 fn compose_escapes_entrypoint_dollars() {
     let program = serde_json::from_value(json!({
         "image": "alpine:3.20",
-        "args": ["sh", "-lc", "echo $API_URL"]
+        "entrypoint": ["sh", "-lc", "echo $API_URL"]
     }))
     .unwrap();
 
@@ -1483,7 +1483,7 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
 
     let client_program = serde_json::from_value(json!({
         "image": "alpine:3.20",
-        "args": ["sh", "-lc", "sleep infinity"],
+        "entrypoint": ["sh", "-lc", "sleep infinity"],
         "env": {
             "API_URL": "${slots.api.url}"
         }
@@ -1672,7 +1672,7 @@ fn docker_smoke_export_routes_to_host() {
 
     let server_program = serde_json::from_value(json!({
         "image": "busybox:1.36.1",
-        "args": ["sh", "-lc", "mkdir -p /www && echo export-ok > /www/index.html && httpd -f -p 8080 -h /www"],
+        "entrypoint": ["sh", "-lc", "mkdir -p /www && echo export-ok > /www/index.html && httpd -f -p 8080 -h /www"],
         "network": { "endpoints": [ { "name": "api", "port": 8080, "protocol": "http" } ] }
     }))
     .unwrap();
@@ -2207,7 +2207,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
     // Scenario definition
     let server_program = serde_json::from_value(json!({
         "image": "busybox:1.36.1",
-        "args": ["sh", "-lc", "mkdir -p /www && echo hello > /www/index.html && httpd -f -p 8080 -h /www"],
+        "entrypoint": ["sh", "-lc", "mkdir -p /www && echo hello > /www/index.html && httpd -f -p 8080 -h /www"],
         "network": { "endpoints": [ { "name": "api", "port": 8080, "protocol": "http" } ] }
     }))
     .unwrap();
@@ -2215,7 +2215,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
     let sleeper_program = |env: serde_json::Value| {
         serde_json::from_value(json!({
             "image": "alpine:3.20",
-            "args": ["sh", "-lc", "sleep infinity"],
+            "entrypoint": ["sh", "-lc", "sleep infinity"],
             "env": env
         }))
         .unwrap()
@@ -2952,7 +2952,7 @@ fn docker_compose_flattens_routing_components_with_and_without_dce() {
           manifest_version: "0.1.0",
           program: {
             image: "alpine:3.20",
-            args: ["sleep", "infinity"],
+            entrypoint: ["sleep", "infinity"],
             env: {
               AGENT_URL: "${bindings.agent.url}",
             },
@@ -2981,7 +2981,7 @@ fn docker_compose_flattens_routing_components_with_and_without_dce() {
           manifest_version: "0.1.0",
           program: {
             image: "alpine:3.20",
-            args: ["sleep", "infinity"],
+            entrypoint: ["sleep", "infinity"],
             network: {
               endpoints: [{ name: "a2a", port: 9000 }],
             },
