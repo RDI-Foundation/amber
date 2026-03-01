@@ -1,0 +1,19 @@
+{
+  manifest_version: "0.1.0",
+  components: {
+    app: {
+      manifest: "./lint_unused_config_binding_interpolation_child.json5",
+      config: {
+        required_value: "hello",
+        ignored_value: "${bindings.upstream.url}",
+      },
+    },
+    backend: "./lint_unused_config_binding_interpolation_backend.json5",
+  },
+  bindings: [
+    { name: "upstream", to: "#app.backend", from: "#backend.api" },
+  ],
+  exports: {
+    out: "#app.out",
+  },
+}

@@ -1480,6 +1480,124 @@ fn compose_external_slots_and_exports_work_together_with_and_without_dce() {
 }
 
 #[test]
+fn compose_ignores_unused_config_binding_paths_under_dce() {
+    let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
+    let provide_out: ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "out" })).unwrap();
+    let provide_up: ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "up" })).unwrap();
+    let consumer_program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["consumer"],
+        "network": {
+            "endpoints": [{ "name": "out", "port": 9001, "protocol": "http" }]
+        }
+    }))
+    .unwrap();
+    let provider_program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["provider"],
+        "network": {
+            "endpoints": [{ "name": "up", "port": 9002, "protocol": "http" }]
+        }
+    }))
+    .unwrap();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: None,
+        slots: BTreeMap::from([("up".to_string(), slot_http)]),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::from([(
+            "upstream".to_string(),
+            SlotRef {
+                component: ComponentId(0),
+                name: "up".to_string(),
+            },
+        )]),
+        metadata: None,
+        children: vec![ComponentId(1), ComponentId(2)],
+    };
+
+    let consumer = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/consumer"),
+        digest: digest(1),
+        config: Some(json!({
+            "upstream_url": "${bindings.upstream.url}"
+        })),
+        config_schema: None,
+        program: Some(consumer_program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::from([("out".to_string(), provide_out.clone())]),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let provider = Component {
+        id: ComponentId(2),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/provider"),
+        digest: digest(2),
+        config: None,
+        config_schema: None,
+        program: Some(provider_program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::from([("up".to_string(), provide_up)]),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(consumer), Some(provider)],
+        bindings: vec![BindingEdge {
+            name: None,
+            from: BindingFrom::Component(ProvideRef {
+                component: ComponentId(2),
+                name: "up".to_string(),
+            }),
+            to: SlotRef {
+                component: ComponentId(0),
+                name: "up".to_string(),
+            },
+            weak: false,
+        }],
+        exports: vec![ScenarioExport {
+            name: "out".to_string(),
+            capability: provide_out.decl.clone(),
+            from: ProvideRef {
+                component: ComponentId(1),
+                name: "out".to_string(),
+            },
+        }],
+    };
+
+    let scenario = crate::mir::dce_only(scenario);
+    assert!(
+        scenario.components[2].is_none(),
+        "provider should be pruned because bindings usage lives under a config path that is never \
+         read by runtime"
+    );
+
+    let yaml = DockerComposeReporter
+        .emit(&scenario)
+        .expect("compose render should not require pruned bindings");
+    assert!(
+        !yaml.trim().is_empty(),
+        "compose render should produce non-empty output"
+    );
+}
+
+#[test]
 #[ignore = "requires docker + docker compose; run manually"]
 fn docker_smoke_external_slot_routes_to_outside_service() {
     use tempfile::tempdir;

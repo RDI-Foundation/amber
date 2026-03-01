@@ -1,10 +1,11 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use amber_manifest::{InterpolatedPart, InterpolatedString, InterpolationSource};
+use amber_config::ConfigNode;
+use amber_manifest::{InterpolatedPart, InterpolatedString, InterpolationSource, MountSource};
 use amber_scenario::{ComponentId, Scenario};
-use serde_json::Value;
+use amber_template::TemplatePart;
 
-use crate::binding_query::parse_binding_query;
+use crate::{binding_query::parse_binding_query, config_templates};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct BindingUsage {
@@ -73,6 +74,9 @@ impl BindingUsage {
 
 pub(crate) fn collect_binding_usage(scenario: &Scenario) -> BindingUsage {
     let mut usage = BindingUsage::default();
+    let templates =
+        config_templates::compose_root_config_templates(scenario.root, &scenario.components)
+            .templates;
 
     for (id, component) in scenario.components_iter() {
         if let Some(program) = component.program.as_ref() {
@@ -85,17 +89,19 @@ pub(crate) fn collect_binding_usage(scenario: &Scenario) -> BindingUsage {
             for value in program.env.values() {
                 record_binding_parts(&value.parts, id, BindingUseSource::Program, id, &mut usage);
             }
-        }
 
-        let scope = component.parent.unwrap_or(id);
-        if let Some(config) = component.config.as_ref() {
-            record_binding_uses_in_config_value(
-                config,
-                id,
-                BindingUseSource::Config,
-                scope,
-                &mut usage,
-            );
+            let used_paths = collect_program_used_config_paths(program);
+            if !used_paths.is_empty()
+                && let Some(template) = templates.get(&id).and_then(|template| template.node())
+            {
+                record_binding_uses_in_runtime_config_paths(
+                    template,
+                    &used_paths,
+                    id,
+                    BindingUseSource::Config,
+                    &mut usage,
+                );
+            }
         }
     }
 
@@ -122,27 +128,107 @@ fn record_binding_parts(
     }
 }
 
-fn record_binding_uses_in_config_value(
-    value: &Value,
+fn collect_program_used_config_paths(program: &amber_manifest::Program) -> BTreeSet<String> {
+    let mut used = BTreeSet::new();
+
+    if let Ok(image) = program.image.parse::<InterpolatedString>() {
+        record_program_config_parts(&image.parts, &mut used);
+    }
+    for arg in &program.entrypoint.0 {
+        record_program_config_parts(&arg.parts, &mut used);
+    }
+    for value in program.env.values() {
+        record_program_config_parts(&value.parts, &mut used);
+    }
+    for mount in &program.mounts {
+        match &mount.source {
+            MountSource::Config(path) | MountSource::Secret(path) => {
+                used.insert(path.clone());
+            }
+            _ => {}
+        }
+    }
+
+    used
+}
+
+fn record_program_config_parts(parts: &[InterpolatedPart], used: &mut BTreeSet<String>) {
+    for part in parts {
+        let InterpolatedPart::Interpolation { source, query } = part else {
+            continue;
+        };
+        if *source == InterpolationSource::Config {
+            used.insert(query.clone());
+        }
+    }
+}
+
+fn record_binding_uses_in_runtime_config_paths(
+    template: &ConfigNode,
+    used_paths: &BTreeSet<String>,
     component: ComponentId,
     usage_source: BindingUseSource,
-    scope: ComponentId,
+    usage: &mut BindingUsage,
+) {
+    for path in used_paths {
+        let Some(node) = config_node_for_path(template, path) else {
+            continue;
+        };
+        record_binding_uses_in_config_node(node, component, usage_source, usage);
+    }
+}
+
+fn config_node_for_path<'a>(template: &'a ConfigNode, path: &str) -> Option<&'a ConfigNode> {
+    if path.is_empty() {
+        return Some(template);
+    }
+
+    let mut current = template;
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            return None;
+        }
+        match current {
+            ConfigNode::Object(map) => {
+                current = map.get(segment)?;
+            }
+            ConfigNode::ConfigRef(_) => return None,
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
+fn record_binding_uses_in_config_node(
+    value: &ConfigNode,
+    component: ComponentId,
+    usage_source: BindingUseSource,
     usage: &mut BindingUsage,
 ) {
     match value {
-        Value::String(s) => {
-            if let Ok(parsed) = s.parse::<InterpolatedString>() {
-                record_binding_parts(&parsed.parts, component, usage_source, scope, usage);
+        ConfigNode::StringTemplate(parts) => {
+            for part in parts {
+                let TemplatePart::Binding { binding, scope } = part else {
+                    continue;
+                };
+                if let Ok(parsed) = parse_binding_query(binding) {
+                    usage.record(
+                        component,
+                        usage_source,
+                        ComponentId(*scope as usize),
+                        parsed.name,
+                    );
+                }
             }
         }
-        Value::Array(values) => {
+        ConfigNode::Array(values) => {
             for value in values {
-                record_binding_uses_in_config_value(value, component, usage_source, scope, usage);
+                record_binding_uses_in_config_node(value, component, usage_source, usage);
             }
         }
-        Value::Object(map) => {
+        ConfigNode::Object(map) => {
             for value in map.values() {
-                record_binding_uses_in_config_value(value, component, usage_source, scope, usage);
+                record_binding_uses_in_config_node(value, component, usage_source, usage);
             }
         }
         _ => {}

@@ -654,7 +654,6 @@ struct CapKey {
 
 #[derive(Clone, Debug)]
 enum DceWorkItem {
-    KeepComponent(usize),
     LiveProgram(usize),
     Slot(CapKey),
     Provide(CapKey),
@@ -674,7 +673,6 @@ struct DceSolver<'a> {
     usage: binding_usage::BindingUsage,
     targets_by_name: HashMap<(ComponentId, String), Vec<SlotRef>>,
     keep_components: Vec<bool>,
-    processed_kept_components: Vec<bool>,
     live_programs: Vec<bool>,
     live_slots: HashSet<CapKey>,
     live_provides: HashSet<CapKey>,
@@ -700,7 +698,6 @@ impl<'a> DceSolver<'a> {
             usage: binding_usage::collect_binding_usage(scenario),
             targets_by_name: binding_targets_by_name(scenario),
             keep_components: vec![false; n],
-            processed_kept_components: vec![false; n],
             live_programs: vec![false; n],
             live_slots: HashSet::new(),
             live_provides: HashSet::new(),
@@ -716,7 +713,6 @@ impl<'a> DceSolver<'a> {
 
         while let Some(item) = self.work.pop_front() {
             match item {
-                DceWorkItem::KeepComponent(component) => self.apply_keep_component(component),
                 DceWorkItem::LiveProgram(component) => self.apply_live_program(component),
                 DceWorkItem::Slot(key) => self.apply_slot(key),
                 DceWorkItem::Provide(key) => self.apply_provide(key),
@@ -732,21 +728,11 @@ impl<'a> DceSolver<'a> {
         }
     }
 
-    fn apply_keep_component(&mut self, component: usize) {
-        if self.processed_kept_components[component] {
-            return;
-        }
-        self.processed_kept_components[component] = true;
-        self.mark_binding_targets(
-            ComponentId(component),
-            binding_usage::BindingUseSource::Config,
-        );
-    }
-
     fn apply_live_program(&mut self, component: usize) {
         let component_id = ComponentId(component);
         self.mark_program_used_slots(component_id);
         self.mark_binding_targets(component_id, binding_usage::BindingUseSource::Program);
+        self.mark_binding_targets(component_id, binding_usage::BindingUseSource::Config);
     }
 
     fn apply_slot(&mut self, key: CapKey) {
@@ -786,7 +772,6 @@ impl<'a> DceSolver<'a> {
                 break;
             }
             self.keep_components[id.0] = true;
-            self.work.push_back(DceWorkItem::KeepComponent(id.0));
             cur = self.scenario.component(id).parent;
         }
     }

@@ -1,0 +1,15 @@
+compiler::unused_config_binding_interpolation
+
+  x component /app never reads `config.ignored_value`
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/lint_unused_config_binding_interpolation_child.json5:7:7]
+ 6 |       required_value: { type: "string" },
+ 7 |       ignored_value: { type: "string" },
+   :       ^^^^^^^^^^^^^^^^|^^^^^^^^^^^^^^^^
+   :                       `-- unused config item `config.ignored_value`
+ 8 |     },
+   `----
+  help: warning treated as error because it was denied via `-D warnings`
+        Remove this config item from /app, or make /app read `config.ignored_value` at runtime (for example by using `${config.ignored_value}` in its program or by mounting it as a config/secret
+        file).
+        Configured by parent / at `components.app.config.ignored_value`.
+Error:   × check failed

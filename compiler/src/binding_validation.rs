@@ -5,10 +5,11 @@ use std::{
     sync::Arc,
 };
 
+use amber_json5::spans::span_for_object_key;
 use amber_manifest::{
     BindingSource, BindingTarget, ComponentDecl, FrameworkBindingShape, InterpolatedPart,
-    InterpolatedString, InterpolationSource, Manifest, ManifestSpans, framework_capability,
-    span_for_json_pointer,
+    InterpolatedString, InterpolationSource, Manifest, ManifestSpans, MountSource,
+    framework_capability, span_for_json_pointer,
 };
 use miette::{Diagnostic, NamedSource, Report, SourceSpan};
 use serde_json::Value;
@@ -35,11 +36,85 @@ struct InvalidBindingsInterpolation {
     label: String,
 }
 
+#[derive(Debug, Error, Diagnostic)]
+#[error("component {component_path} never reads `{config_item}`")]
+#[diagnostic(
+    code(compiler::unused_config_binding_interpolation),
+    severity(Warning),
+    help("{help}\nConfigured by parent {parent_component_path} at `{parent_location}`.")
+)]
+struct UnusedConfigBindingInterpolation {
+    component_path: String,
+    config_item: String,
+    parent_component_path: String,
+    parent_location: String,
+    help: String,
+    #[source_code]
+    src: NamedSource<Arc<str>>,
+    #[label(primary, "{label}")]
+    span: SourceSpan,
+    label: String,
+}
+
 #[derive(Default)]
 struct BindingLookup {
     named: BTreeSet<String>,
     named_url_unsupported: BTreeMap<String, String>,
     has_unnamed: bool,
+}
+
+#[derive(Default)]
+struct ConfigUses {
+    prefixes: BTreeSet<String>,
+    uses_all: bool,
+}
+
+impl ConfigUses {
+    fn add_query(&mut self, query: &str) {
+        if self.uses_all {
+            return;
+        }
+        if query.is_empty() {
+            self.uses_all = true;
+            self.prefixes.clear();
+            return;
+        }
+        if query.split('.').any(|seg| seg.is_empty()) {
+            return;
+        }
+        self.prefixes.insert(query.to_string());
+    }
+
+    fn is_used(&self, path: &str) -> bool {
+        if self.uses_all {
+            return true;
+        }
+        self.prefixes.iter().any(|prefix| {
+            path == prefix
+                || path
+                    .strip_prefix(prefix.as_str())
+                    .is_some_and(|rest| rest.starts_with('.'))
+        })
+    }
+}
+
+struct ChildConfigLintLabel {
+    source: Arc<str>,
+    src_name: String,
+}
+
+struct ChildConfigLintTarget {
+    uses: ConfigUses,
+    component_path: String,
+    label: Option<ChildConfigLintLabel>,
+}
+
+pub(crate) type SuppressedUnusedConfigLints = BTreeMap<String, BTreeSet<String>>;
+
+#[derive(Default)]
+pub(crate) struct BindingInterpolationDiagnostics {
+    pub(crate) diagnostics: Vec<Report>,
+    pub(crate) suppressed_unused_config_lints: SuppressedUnusedConfigLints,
 }
 
 enum BindingTargetSelector<'a> {
@@ -92,6 +167,75 @@ fn collect_bindings_in_manifest(manifest: &Manifest) -> BindingLookup {
     out
 }
 
+fn collect_config_uses(manifest: &Manifest) -> ConfigUses {
+    let mut uses = ConfigUses::default();
+
+    if let Some(program) = manifest.program() {
+        if let Ok(image) = program.image.parse::<InterpolatedString>() {
+            collect_config_uses_from_interpolated(&image, &mut uses);
+        }
+        for arg in &program.entrypoint.0 {
+            collect_config_uses_from_interpolated(arg, &mut uses);
+        }
+        for value in program.env.values() {
+            collect_config_uses_from_interpolated(value, &mut uses);
+        }
+        for mount in &program.mounts {
+            match &mount.source {
+                MountSource::Config(path) | MountSource::Secret(path) => uses.add_query(path),
+                MountSource::Slot(_) | MountSource::Binding(_) | MountSource::Framework(_) => {}
+                _ => {}
+            }
+        }
+    }
+
+    for decl in manifest.components().values() {
+        let ComponentDecl::Object(obj) = decl else {
+            continue;
+        };
+        let Some(config) = obj.config.as_ref() else {
+            continue;
+        };
+        collect_config_uses_from_value(config, &mut uses);
+    }
+
+    uses
+}
+
+fn collect_config_uses_from_interpolated(value: &InterpolatedString, uses: &mut ConfigUses) {
+    for part in &value.parts {
+        let InterpolatedPart::Interpolation { source, query } = part else {
+            continue;
+        };
+        if *source != InterpolationSource::Config {
+            continue;
+        }
+        uses.add_query(query);
+    }
+}
+
+fn collect_config_uses_from_value(value: &Value, uses: &mut ConfigUses) {
+    match value {
+        Value::String(s) => {
+            let Ok(parsed) = s.parse::<InterpolatedString>() else {
+                return;
+            };
+            collect_config_uses_from_interpolated(&parsed, uses);
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_config_uses_from_value(value, uses);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                collect_config_uses_from_value(value, uses);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn binding_url_unsupported(binding: &amber_manifest::Binding) -> Option<String> {
     let BindingSource::Framework(name) = &binding.from else {
         return None;
@@ -107,10 +251,10 @@ fn binding_url_unsupported(binding: &amber_manifest::Binding) -> Option<String> 
 pub(crate) fn collect_binding_interpolation_diagnostics_from_tree(
     tree: &ResolvedTree,
     store: &DigestStore,
-) -> Vec<Report> {
-    let mut diagnostics = Vec::new();
+) -> BindingInterpolationDiagnostics {
+    let mut out = BindingInterpolationDiagnostics::default();
     let Some(root_manifest) = store.get(&tree.root.digest) else {
-        return diagnostics;
+        return out;
     };
     let root_bindings =
         collect_bindings_for_target(root_manifest.as_ref(), BindingTargetSelector::Self_);
@@ -119,9 +263,10 @@ pub(crate) fn collect_binding_interpolation_diagnostics_from_tree(
         "/",
         store,
         root_bindings,
-        &mut diagnostics,
+        &mut out.diagnostics,
+        &mut out.suppressed_unused_config_lints,
     );
-    diagnostics
+    out
 }
 
 fn collect_binding_interpolation_diagnostics(
@@ -130,6 +275,7 @@ fn collect_binding_interpolation_diagnostics(
     store: &DigestStore,
     bindings: BindingLookup,
     diagnostics: &mut Vec<Report>,
+    suppressed_unused_config_lints: &mut SuppressedUnusedConfigLints,
 ) {
     let Some(manifest) = store.get(&node.digest) else {
         return;
@@ -150,14 +296,44 @@ fn collect_binding_interpolation_diagnostics(
         spans,
         &src_name,
     ));
+    let mut child_targets: BTreeMap<String, ChildConfigLintTarget> = BTreeMap::new();
+    for (child_name, child) in &node.children {
+        let Some(child_manifest) = store.get(&child.digest) else {
+            continue;
+        };
+        let child_component_path = if component_path == "/" {
+            format!("/{child_name}")
+        } else {
+            format!("{component_path}/{child_name}")
+        };
+        let label = store
+            .get_source(&child.resolved_url)
+            .map(|stored| ChildConfigLintLabel {
+                source: Arc::clone(&stored.source),
+                src_name: display_url(&child.resolved_url),
+            });
+        child_targets.insert(
+            child_name.to_string(),
+            ChildConfigLintTarget {
+                uses: collect_config_uses(child_manifest.as_ref()),
+                component_path: child_component_path,
+                label,
+            },
+        );
+    }
     let config_bindings = collect_bindings_in_manifest(manifest.as_ref());
-    diagnostics.extend(validate_manifest_config_binding_interpolations(
-        manifest.as_ref(),
+    let manifest_ctx = ManifestConfigValidationContext {
         component_path,
-        config_bindings,
+        bindings: config_bindings,
         source,
         spans,
-        &src_name,
+        src_name: &src_name,
+        child_targets: &child_targets,
+    };
+    diagnostics.extend(validate_manifest_config_binding_interpolations(
+        manifest.as_ref(),
+        manifest_ctx,
+        suppressed_unused_config_lints,
     ));
 
     for (child_name, child) in &node.children {
@@ -176,6 +352,7 @@ fn collect_binding_interpolation_diagnostics(
             store,
             child_bindings,
             diagnostics,
+            suppressed_unused_config_lints,
         );
     }
 }
@@ -224,26 +401,29 @@ fn validate_manifest_binding_interpolations(
 struct ConfigBindingValidationContext<'a> {
     component_path: &'a str,
     bindings: &'a BindingLookup,
+    child_target: Option<&'a ChildConfigLintTarget>,
+    root_span: SourceSpan,
+    config_span: Option<SourceSpan>,
     source: &'a Arc<str>,
     src_name: &'a str,
 }
 
-fn validate_manifest_config_binding_interpolations(
-    manifest: &Manifest,
-    component_path: &str,
+struct ManifestConfigValidationContext<'a> {
+    component_path: &'a str,
     bindings: BindingLookup,
     source: Arc<str>,
-    spans: &ManifestSpans,
-    src_name: &str,
+    spans: &'a ManifestSpans,
+    src_name: &'a str,
+    child_targets: &'a BTreeMap<String, ChildConfigLintTarget>,
+}
+
+fn validate_manifest_config_binding_interpolations(
+    manifest: &Manifest,
+    manifest_ctx: ManifestConfigValidationContext<'_>,
+    suppressed_unused_config_lints: &mut SuppressedUnusedConfigLints,
 ) -> Vec<Report> {
     let mut diagnostics = Vec::new();
-    let ctx = ConfigBindingValidationContext {
-        component_path,
-        bindings: &bindings,
-        source: &source,
-        src_name,
-    };
-    let root_span = (0usize, source.len()).into();
+    let root_span = (0usize, manifest_ctx.source.len()).into();
 
     for (child_name, decl) in manifest.components() {
         let ComponentDecl::Object(obj) = decl else {
@@ -258,19 +438,29 @@ fn validate_manifest_config_binding_interpolations(
         pointer.push_str("/config");
 
         let location = format!("components.{child_name}.config");
-        let config_span = spans
+        let config_span = manifest_ctx
+            .spans
             .components
             .get(child_name.as_str())
             .and_then(|spans| spans.config);
+        let ctx = ConfigBindingValidationContext {
+            component_path: manifest_ctx.component_path,
+            bindings: &manifest_ctx.bindings,
+            child_target: manifest_ctx.child_targets.get(child_name.as_str()),
+            root_span,
+            config_span,
+            source: &manifest_ctx.source,
+            src_name: manifest_ctx.src_name,
+        };
 
         validate_config_value(
             config,
             &ctx,
-            root_span,
             &pointer,
             &location,
-            config_span,
+            "",
             &mut diagnostics,
+            suppressed_unused_config_lints,
         );
     }
 
@@ -280,21 +470,29 @@ fn validate_manifest_config_binding_interpolations(
 fn validate_config_value(
     value: &Value,
     ctx: &ConfigBindingValidationContext<'_>,
-    root_span: SourceSpan,
     pointer: &str,
     location: &str,
-    config_span: Option<SourceSpan>,
+    config_path: &str,
     diagnostics: &mut Vec<Report>,
+    suppressed_unused_config_lints: &mut SuppressedUnusedConfigLints,
 ) {
     match value {
         Value::String(s) => {
             let Ok(parsed) = s.parse::<InterpolatedString>() else {
                 return;
             };
-            let span = span_for_json_pointer(ctx.source.as_ref(), root_span, pointer)
-                .or(config_span)
+            let span = span_for_json_pointer(ctx.source.as_ref(), ctx.root_span, pointer)
+                .or(ctx.config_span)
                 .unwrap_or_else(|| (0usize, 0usize).into());
-            validate_interpolated_config_string(&parsed, ctx, location, span, diagnostics);
+            validate_interpolated_config_string(
+                &parsed,
+                ctx,
+                location,
+                config_path,
+                span,
+                diagnostics,
+                suppressed_unused_config_lints,
+            );
         }
         Value::Array(values) => {
             for (idx, value) in values.iter().enumerate() {
@@ -305,11 +503,11 @@ fn validate_config_value(
                 validate_config_value(
                     value,
                     ctx,
-                    root_span,
                     &next_pointer,
                     &next_location,
-                    config_span,
+                    config_path,
                     diagnostics,
+                    suppressed_unused_config_lints,
                 );
             }
         }
@@ -319,14 +517,19 @@ fn validate_config_value(
                 next_pointer.push('/');
                 push_json_pointer_segment(&mut next_pointer, key);
                 let next_location = format!("{location}.{key}");
+                let next_path = if config_path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{config_path}.{key}")
+                };
                 validate_config_value(
                     value,
                     ctx,
-                    root_span,
                     &next_pointer,
                     &next_location,
-                    config_span,
+                    &next_path,
                     diagnostics,
+                    suppressed_unused_config_lints,
                 );
             }
         }
@@ -338,9 +541,20 @@ fn validate_interpolated_config_string(
     value: &InterpolatedString,
     ctx: &ConfigBindingValidationContext<'_>,
     location: &str,
+    config_path: &str,
     span: SourceSpan,
     diagnostics: &mut Vec<Report>,
+    suppressed_unused_config_lints: &mut SuppressedUnusedConfigLints,
 ) {
+    let path_label = if config_path.is_empty() {
+        "config".to_string()
+    } else {
+        format!("config.{config_path}")
+    };
+    let path_runtime_visible = ctx
+        .child_target
+        .is_none_or(|child_target| child_target.uses.is_used(config_path));
+
     for part in &value.parts {
         let InterpolatedPart::Interpolation {
             source: kind,
@@ -350,6 +564,44 @@ fn validate_interpolated_config_string(
             continue;
         };
         if *kind != InterpolationSource::Bindings {
+            continue;
+        }
+
+        if !path_runtime_visible {
+            let Some(child_target) = ctx.child_target else {
+                continue;
+            };
+            let Some(label) = child_target.label.as_ref() else {
+                continue;
+            };
+            let Some(schema_span) = config_schema_property_span(label, config_path) else {
+                continue;
+            };
+            if !config_path.is_empty() {
+                suppressed_unused_config_lints
+                    .entry(child_target.component_path.clone())
+                    .or_default()
+                    .insert(config_path.to_string());
+            }
+            diagnostics.push(Report::new(UnusedConfigBindingInterpolation {
+                component_path: child_target.component_path.clone(),
+                config_item: path_label.clone(),
+                parent_component_path: ctx.component_path.to_string(),
+                parent_location: location.to_string(),
+                help: format!(
+                    "Remove this config item from {}, or make {} read `{}` at runtime (for \
+                     example by using `${{{}}}` in its program or by mounting it as a \
+                     config/secret file).",
+                    child_target.component_path,
+                    child_target.component_path,
+                    path_label,
+                    path_label
+                ),
+                src: NamedSource::new(&label.src_name, Arc::clone(&label.source))
+                    .with_language("json5"),
+                span: schema_span,
+                label: format!("unused config item `{path_label}`"),
+            }));
             continue;
         }
 
@@ -595,6 +847,43 @@ fn non_url_binding_help(binding: &str, capability: &str) -> String {
         "Binding `{binding}` targets framework.{capability}, which does not expose a URL. Remove \
          the interpolation or use a URL-shaped binding."
     )
+}
+
+fn config_schema_property_span(
+    label: &ChildConfigLintLabel,
+    config_path: &str,
+) -> Option<SourceSpan> {
+    if config_path.is_empty() {
+        return None;
+    }
+    if config_path.split('.').any(|seg| seg.is_empty()) {
+        return None;
+    }
+
+    let root = (0usize, label.source.len()).into();
+    let segments = config_path.split('.').collect::<Vec<_>>();
+    let (last, parents) = segments.split_last()?;
+
+    let mut parent_properties_pointer = "/config_schema/properties".to_string();
+    for segment in parents {
+        parent_properties_pointer.push('/');
+        push_json_pointer_segment(&mut parent_properties_pointer, segment);
+        parent_properties_pointer.push_str("/properties");
+    }
+
+    let parent_properties_span =
+        span_for_json_pointer(label.source.as_ref(), root, &parent_properties_pointer)?;
+
+    let key_span = span_for_object_key(label.source.as_ref(), parent_properties_span, last)?;
+
+    let mut value_pointer = parent_properties_pointer;
+    value_pointer.push('/');
+    push_json_pointer_segment(&mut value_pointer, last);
+    let value_span = span_for_json_pointer(label.source.as_ref(), root, &value_pointer)?;
+
+    let start = key_span.offset();
+    let end = value_span.offset().saturating_add(value_span.len());
+    Some((start, end.saturating_sub(start)).into())
 }
 
 fn push_json_pointer_segment(out: &mut String, segment: &str) {

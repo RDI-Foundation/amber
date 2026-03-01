@@ -75,6 +75,7 @@ version = "0.1.0"
 dependencies = [
  "amber-config",
  "amber-images",
+ "amber-json5",
  "amber-manifest",
  "amber-resolver",
  "amber-scenario",
