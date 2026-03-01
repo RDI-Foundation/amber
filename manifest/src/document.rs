@@ -217,6 +217,59 @@ fn default_span() -> SourceSpan {
     (0usize, 0usize).into()
 }
 
+fn labels_for_mount(
+    spans: &ManifestSpans,
+    label: &str,
+    matches: impl Fn(&crate::spans::ProgramMountSpans) -> bool,
+    span: impl Fn(&crate::spans::ProgramMountSpans) -> Option<SourceSpan>,
+) -> Vec<LabeledSpan> {
+    let Some(program) = spans.program.as_ref() else {
+        return Vec::new();
+    };
+    program
+        .mounts
+        .iter()
+        .filter(|mount| matches(mount))
+        .map(|mount| {
+            primary(
+                span_or_default(span(mount).or(Some(mount.whole))),
+                Some(label.to_string()),
+            )
+        })
+        .collect()
+}
+
+fn labels_for_duplicate_values(
+    matches: &[SourceSpan],
+    empty_label: Option<&str>,
+    single_label: &str,
+    second_label: &str,
+    first_label: Option<&str>,
+    dedupe_rest_against_second: bool,
+) -> Vec<LabeledSpan> {
+    match matches {
+        [] => empty_label.map_or_else(Vec::new, |label| {
+            vec![primary(default_span(), Some(label.to_string()))]
+        }),
+        [only] => vec![primary(*only, Some(single_label.to_string()))],
+        [first, second, rest @ ..] => {
+            let mut labels = Vec::new();
+            labels.push(primary(*second, Some(second_label.to_string())));
+            labels.push(LabeledSpan::new_with_span(
+                first_label.map(str::to_string),
+                *first,
+            ));
+            for span in rest {
+                if dedupe_rest_against_second && *span == *second {
+                    continue;
+                }
+                labels.push(LabeledSpan::new_with_span(None, *span));
+            }
+            labels
+        }
+    }
+}
+
 fn labels_for_invalid_name(
     spans: &ManifestSpans,
     kind: &'static str,
@@ -247,54 +300,30 @@ fn labels_for_invalid_name(
 }
 
 fn labels_for_mount_name(spans: &ManifestSpans, name: &str, label: &str) -> Vec<LabeledSpan> {
-    let Some(program) = spans.program.as_ref() else {
-        return Vec::new();
-    };
-    program
-        .mounts
-        .iter()
-        .filter(|mount| mount.name_value.as_deref() == Some(name))
-        .map(|mount| {
-            primary(
-                span_or_default(mount.name.or(Some(mount.whole))),
-                Some(label.to_string()),
-            )
-        })
-        .collect()
+    labels_for_mount(
+        spans,
+        label,
+        |mount| mount.name_value.as_deref() == Some(name),
+        |mount| mount.name,
+    )
 }
 
 fn labels_for_mount_path(spans: &ManifestSpans, path: &str, label: &str) -> Vec<LabeledSpan> {
-    let Some(program) = spans.program.as_ref() else {
-        return Vec::new();
-    };
-    program
-        .mounts
-        .iter()
-        .filter(|mount| mount.path_value.as_deref() == Some(path))
-        .map(|mount| {
-            primary(
-                span_or_default(mount.path.or(Some(mount.whole))),
-                Some(label.to_string()),
-            )
-        })
-        .collect()
+    labels_for_mount(
+        spans,
+        label,
+        |mount| mount.path_value.as_deref() == Some(path),
+        |mount| mount.path,
+    )
 }
 
 fn labels_for_mount_source(spans: &ManifestSpans, source: &str, label: &str) -> Vec<LabeledSpan> {
-    let Some(program) = spans.program.as_ref() else {
-        return Vec::new();
-    };
-    program
-        .mounts
-        .iter()
-        .filter(|mount| mount.from_value.as_deref() == Some(source))
-        .map(|mount| {
-            primary(
-                span_or_default(mount.from.or(Some(mount.whole))),
-                Some(label.to_string()),
-            )
-        })
-        .collect()
+    labels_for_mount(
+        spans,
+        label,
+        |mount| mount.from_value.as_deref() == Some(source),
+        |mount| mount.from,
+    )
 }
 
 fn labels_for_mixed_binding_form(spans: &ManifestSpans, to: &str, from: &str) -> Vec<LabeledSpan> {
@@ -397,25 +426,14 @@ fn labels_for_duplicate_binding_target(
         }
     }
 
-    match matches.as_slice() {
-        [] => vec![primary(
-            default_span(),
-            Some("duplicate binding target".to_string()),
-        )],
-        [only] => vec![primary(*only, Some("duplicate binding target".to_string()))],
-        [first, second, rest @ ..] => {
-            let mut labels = Vec::new();
-            labels.push(primary(*second, Some("second binding here".to_string())));
-            labels.push(LabeledSpan::new_with_span(
-                Some("first binding here".to_string()),
-                *first,
-            ));
-            for span in rest {
-                labels.push(LabeledSpan::new_with_span(None, *span));
-            }
-            labels
-        }
-    }
+    labels_for_duplicate_values(
+        &matches,
+        Some("duplicate binding target"),
+        "duplicate binding target",
+        "second binding here",
+        Some("first binding here"),
+        false,
+    )
 }
 
 fn labels_for_duplicate_binding_name(spans: &ManifestSpans, name: &str) -> Vec<LabeledSpan> {
@@ -428,28 +446,14 @@ fn labels_for_duplicate_binding_name(spans: &ManifestSpans, name: &str) -> Vec<L
         })
         .collect();
 
-    match matches.as_slice() {
-        [] => vec![primary(
-            default_span(),
-            Some("duplicate binding name".to_string()),
-        )],
-        [only] => vec![primary(*only, Some("duplicate binding name".to_string()))],
-        [first, second, rest @ ..] => {
-            let mut labels = Vec::new();
-            labels.push(primary(
-                *second,
-                Some("second binding name here".to_string()),
-            ));
-            labels.push(LabeledSpan::new_with_span(
-                Some("first binding name here".to_string()),
-                *first,
-            ));
-            for span in rest {
-                labels.push(LabeledSpan::new_with_span(None, *span));
-            }
-            labels
-        }
-    }
+    labels_for_duplicate_values(
+        &matches,
+        Some("duplicate binding name"),
+        "duplicate binding name",
+        "second binding name here",
+        Some("first binding name here"),
+        false,
+    )
 }
 
 fn binding_span_or_default(
@@ -588,25 +592,14 @@ fn labels_for_duplicate_endpoint_name(spans: &ManifestSpans, name: &str) -> Vec<
         .filter_map(|endpoint| (endpoint.name.as_ref() == name).then_some(endpoint.name_span))
         .collect();
 
-    match matches.as_slice() {
-        [] => Vec::new(),
-        [only] => vec![primary(*only, Some("duplicate endpoint name".to_string()))],
-        [first, second, rest @ ..] => {
-            let mut labels = Vec::new();
-            labels.push(primary(
-                *second,
-                Some("duplicate endpoint name".to_string()),
-            ));
-            labels.push(LabeledSpan::new_with_span(None, *first));
-            for span in rest {
-                if *span == *second {
-                    continue;
-                }
-                labels.push(LabeledSpan::new_with_span(None, *span));
-            }
-            labels
-        }
-    }
+    labels_for_duplicate_values(
+        &matches,
+        None,
+        "duplicate endpoint name",
+        "duplicate endpoint name",
+        None,
+        true,
+    )
 }
 
 fn labels_for_unknown_endpoint(spans: &ManifestSpans, name: &str) -> Vec<LabeledSpan> {
