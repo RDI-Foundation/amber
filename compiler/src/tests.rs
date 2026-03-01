@@ -2560,6 +2560,152 @@ async fn bundle_loader_auto_detects_dir_and_index() {
     );
 }
 
+#[test]
+fn bundle_loader_from_path_rejects_unsupported_schema() {
+    let dir = tmp_dir("bundle-invalid-schema");
+    let index_path = dir.path().join(BUNDLE_INDEX_NAME);
+    let index = serde_json::json!({
+        "schema": "other.bundle",
+        "version": BUNDLE_VERSION,
+        "root_url": "file:///bundle/root.json5",
+        "requests": []
+    });
+    fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+
+    let err = match BundleLoader::from_path(&index_path) {
+        Ok(_) => panic!("unsupported schema should fail"),
+        Err(err) => err,
+    };
+    match err {
+        crate::bundle::Error::InvalidSchema { schema, expected } => {
+            assert_eq!(schema, "other.bundle");
+            assert_eq!(expected, BUNDLE_SCHEMA);
+        }
+        other => panic!("expected InvalidSchema, got {other:?}"),
+    }
+}
+
+#[test]
+fn bundle_loader_from_path_rejects_unsupported_version() {
+    let dir = tmp_dir("bundle-invalid-version");
+    let index_path = dir.path().join(BUNDLE_INDEX_NAME);
+    let index = serde_json::json!({
+        "schema": BUNDLE_SCHEMA,
+        "version": BUNDLE_VERSION + 1,
+        "root_url": "file:///bundle/root.json5",
+        "requests": []
+    });
+    fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+
+    let err = match BundleLoader::from_path(&index_path) {
+        Ok(_) => panic!("unsupported version should fail"),
+        Err(err) => err,
+    };
+    match err {
+        crate::bundle::Error::InvalidVersion { version, expected } => {
+            assert_eq!(version, BUNDLE_VERSION + 1);
+            assert_eq!(expected, BUNDLE_VERSION);
+        }
+        other => panic!("expected InvalidVersion, got {other:?}"),
+    }
+}
+
+#[test]
+fn compile_from_tree_handles_malformed_program_image_from_builder() {
+    let manifest = Manifest::builder()
+        .program(
+            amber_manifest::Program::builder()
+                .image("${config.image")
+                .entrypoint(amber_manifest::ProgramEntrypoint(vec![
+                    "run".parse().unwrap(),
+                ]))
+                .build(),
+        )
+        .build()
+        .unwrap();
+    let digest = manifest.digest();
+    let url = Url::parse("file:///virtual/root.json5").unwrap();
+    let root_ref = ManifestRef::from_url(url.clone());
+    let store = DigestStore::default();
+    store.put(digest, Arc::new(manifest));
+
+    let tree = ResolvedTree {
+        root: ResolvedNode {
+            name: String::new(),
+            declared_ref: root_ref,
+            digest,
+            resolved_url: url,
+            observed_url: None,
+            config: None,
+            children: BTreeMap::new(),
+        },
+    };
+
+    let compiler = Compiler::new(Resolver::new(), store);
+    let out = compiler
+        .compile_from_tree(tree, standard_compile_options().optimize)
+        .expect("builder-provided malformed program.image should remain recoverable");
+    assert_eq!(out.scenario.components.len(), 1);
+}
+
+#[test]
+fn check_from_tree_handles_malformed_program_image_from_builder_with_source() {
+    let manifest = Manifest::builder()
+        .program(
+            amber_manifest::Program::builder()
+                .image("${config.image")
+                .entrypoint(amber_manifest::ProgramEntrypoint(vec![
+                    "run".parse().unwrap(),
+                ]))
+                .build(),
+        )
+        .build()
+        .unwrap();
+    let digest = manifest.digest();
+    let url = Url::parse("file:///virtual/root.json5").unwrap();
+    let root_ref = ManifestRef::from_url(url.clone());
+    let store = DigestStore::default();
+    store.put(digest, Arc::new(manifest));
+
+    let source: Arc<str> = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "${config.image",
+            entrypoint: ["run"],
+          },
+        }
+        "#
+    .into();
+    let spans = Arc::new(amber_manifest::ManifestSpans::parse(&source));
+    store.put_source(
+        url.clone(),
+        crate::store::StoredSource {
+            digest,
+            source,
+            spans,
+        },
+    );
+
+    let tree = ResolvedTree {
+        root: ResolvedNode {
+            name: String::new(),
+            declared_ref: root_ref,
+            digest,
+            resolved_url: url,
+            observed_url: None,
+            config: None,
+            children: BTreeMap::new(),
+        },
+    };
+
+    let compiler = Compiler::new(Resolver::new(), store);
+    let out = compiler
+        .check_from_tree(tree)
+        .expect("builder-provided malformed program.image should remain recoverable");
+    assert!(!out.has_errors);
+}
+
 #[tokio::test]
 async fn bundle_builder_reserializes_when_source_missing() {
     let dir = tmp_dir("bundle-reserialize");

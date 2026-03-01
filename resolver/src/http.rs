@@ -80,7 +80,7 @@ impl HttpResolver {
             let content_type = content_type
                 .split(';')
                 .next()
-                .unwrap_or_default()
+                .expect("split on ';' always yields at least one segment")
                 .trim()
                 .to_ascii_lowercase();
             if !is_allowed_content_type(&content_type) {

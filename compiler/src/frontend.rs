@@ -320,7 +320,7 @@ async fn resolve_component(
                 Some(env_name) => env_cache
                     .get(&env_name)
                     .cloned()
-                    .unwrap_or_else(|| Arc::clone(&env)),
+                    .expect("referenced environment should be precomputed"),
             };
 
             async move {
