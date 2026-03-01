@@ -43,6 +43,16 @@ pub struct CompileOptions {
     pub optimize: OptimizeOptions,
 }
 
+impl CompileOptions {
+    #[cfg(test)]
+    pub(crate) fn testing(dce: bool) -> Self {
+        Self {
+            resolve: ResolveOptions { max_concurrency: 8 },
+            optimize: OptimizeOptions { dce },
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OptimizeOptions {
     pub dce: bool,

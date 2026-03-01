@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::{
     BindingSource, ComponentDecl, ExportTarget, InterpolatedPart, InterpolatedString,
-    InterpolationSource, Manifest, ManifestSpans, MountSource, SlotName,
+    InterpolationSource, Manifest, ManifestSpans, MountSource, Program, SlotName,
 };
 
 #[allow(unused_assignments)]
@@ -137,6 +137,28 @@ fn add_program_slot_uses<'a>(
     used_all
 }
 
+fn visit_program_interpolated(
+    program: &Program,
+    mut visit: impl FnMut(&InterpolatedString) -> bool,
+) -> bool {
+    if let Ok(image) = program.image.parse::<InterpolatedString>()
+        && visit(&image)
+    {
+        return true;
+    }
+    for arg in &program.entrypoint.0 {
+        if visit(arg) {
+            return true;
+        }
+    }
+    for value in program.env.values() {
+        if visit(value) {
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Default)]
 struct ConfigUses {
     prefixes: BTreeSet<String>,
@@ -176,15 +198,10 @@ fn collect_config_uses(manifest: &Manifest) -> ConfigUses {
     let mut uses = ConfigUses::default();
 
     if let Some(program) = manifest.program() {
-        if let Ok(image) = program.image.parse::<InterpolatedString>() {
-            collect_config_uses_from_interpolated(&image, &mut uses);
-        }
-        for arg in &program.entrypoint.0 {
-            collect_config_uses_from_interpolated(arg, &mut uses);
-        }
-        for value in program.env.values() {
+        let _ = visit_program_interpolated(program, |value| {
             collect_config_uses_from_interpolated(value, &mut uses);
-        }
+            false
+        });
         for mount in &program.mounts {
             match &mount.source {
                 MountSource::Config(path) | MountSource::Secret(path) => uses.add_query(path),
@@ -262,26 +279,9 @@ pub fn lint_manifest(
 
     let mut program_used_slots = BTreeSet::new();
     if let Some(program) = manifest.program() {
-        let mut used_all = false;
-        if let Ok(image) = program.image.parse::<InterpolatedString>() {
-            used_all = add_program_slot_uses(manifest, &mut program_used_slots, &image);
-        }
-        if !used_all {
-            for arg in &program.entrypoint.0 {
-                used_all = add_program_slot_uses(manifest, &mut program_used_slots, arg);
-                if used_all {
-                    break;
-                }
-            }
-        }
-        if !used_all {
-            for value in program.env.values() {
-                used_all = add_program_slot_uses(manifest, &mut program_used_slots, value);
-                if used_all {
-                    break;
-                }
-            }
-        }
+        let _ = visit_program_interpolated(program, |value| {
+            add_program_slot_uses(manifest, &mut program_used_slots, value)
+        });
     }
 
     let mut exported_provides = BTreeSet::new();

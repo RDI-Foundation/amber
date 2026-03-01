@@ -1139,6 +1139,74 @@ fn extend_image_parts(parts: &mut Vec<ProgramImagePart>, extra: Vec<ProgramImage
 }
 
 #[allow(clippy::too_many_arguments)]
+fn resolve_program_template_string(
+    scenario: &Scenario,
+    id: ComponentId,
+    location: &str,
+    value: &amber_manifest::InterpolatedString,
+    slots: &BTreeMap<String, SlotObject>,
+    bindings: &BTreeMap<String, BindingObject>,
+    template_opt: Option<&rc::ConfigNode>,
+    needs_helper_for_program_templates: &mut bool,
+    require_non_empty: bool,
+) -> Result<TemplateString, MeshError> {
+    let mut ts: TemplateString = Vec::new();
+    for part in &value.parts {
+        match part {
+            InterpolatedPart::Literal(lit) => ts.push(TemplatePart::lit(lit)),
+            InterpolatedPart::Interpolation { source, query } => match source {
+                InterpolationSource::Slots => {
+                    let value = resolve_slot_query(slots, query).map_err(|e| {
+                        MeshError::new(format!(
+                            "failed to resolve slot query in {}: {e}",
+                            component_label(scenario, id)
+                        ))
+                    })?;
+                    ts.push(TemplatePart::lit(value));
+                }
+                InterpolationSource::Bindings => {
+                    let value = resolve_binding_query(bindings, query).map_err(|e| {
+                        MeshError::new(format!(
+                            "failed to resolve binding query in {}: {e}",
+                            component_label(scenario, id)
+                        ))
+                    })?;
+                    ts.push(TemplatePart::lit(value));
+                }
+                InterpolationSource::Config => {
+                    match resolve_config_query_for_program(template_opt, query)? {
+                        ConfigResolution::Static(value) => ts.push(TemplatePart::lit(value)),
+                        ConfigResolution::Runtime => {
+                            ts.push(TemplatePart::config(query.clone()));
+                            *needs_helper_for_program_templates = true;
+                        }
+                    }
+                }
+                other => {
+                    return Err(MeshError::new(format!(
+                        "unsupported interpolation source {other} in {} {location}",
+                        component_label(scenario, id)
+                    )));
+                }
+            },
+            _ => {
+                return Err(MeshError::new(format!(
+                    "unsupported interpolation part in {} {location}",
+                    component_label(scenario, id)
+                )));
+            }
+        }
+    }
+    if require_non_empty && ts.is_empty() {
+        return Err(MeshError::new(format!(
+            "internal error: produced empty template for {} {location}",
+            component_label(scenario, id)
+        )));
+    }
+    Ok(ts)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_program_plan(
     scenario: &Scenario,
     id: ComponentId,
@@ -1245,112 +1313,35 @@ fn build_program_plan(
     };
 
     for (idx, arg) in program.entrypoint.0.iter().enumerate() {
-        let mut ts: TemplateString = Vec::new();
-        for part in &arg.parts {
-            match part {
-                InterpolatedPart::Literal(lit) => ts.push(TemplatePart::lit(lit)),
-                InterpolatedPart::Interpolation { source, query } => match source {
-                    InterpolationSource::Slots => {
-                        let v = resolve_slot_query(slots, query).map_err(|e| {
-                            MeshError::new(format!(
-                                "failed to resolve slot query in {}: {e}",
-                                component_label(scenario, id)
-                            ))
-                        })?;
-                        ts.push(TemplatePart::lit(v));
-                    }
-                    InterpolationSource::Bindings => {
-                        let v = resolve_binding_query(bindings, query).map_err(|e| {
-                            MeshError::new(format!(
-                                "failed to resolve binding query in {}: {e}",
-                                component_label(scenario, id)
-                            ))
-                        })?;
-                        ts.push(TemplatePart::lit(v));
-                    }
-                    InterpolationSource::Config => {
-                        match resolve_config_query_for_program(template_opt, query)? {
-                            ConfigResolution::Static(v) => ts.push(TemplatePart::lit(v)),
-                            ConfigResolution::Runtime => {
-                                ts.push(TemplatePart::config(query.clone()));
-                                needs_helper_for_program_templates = true;
-                            }
-                        }
-                    }
-                    other => {
-                        return Err(MeshError::new(format!(
-                            "unsupported interpolation source {other} in {} \
-                             program.entrypoint[{idx}]",
-                            component_label(scenario, id)
-                        )));
-                    }
-                },
-                _ => {
-                    return Err(MeshError::new(format!(
-                        "unsupported interpolation part in {} program.entrypoint[{idx}]",
-                        component_label(scenario, id)
-                    )));
-                }
-            }
-        }
-        if ts.is_empty() {
-            return Err(MeshError::new(format!(
-                "internal error: produced empty template for {} program.entrypoint[{idx}]",
-                component_label(scenario, id)
-            )));
-        }
+        let location = format!("program.entrypoint[{idx}]");
+        let ts = resolve_program_template_string(
+            scenario,
+            id,
+            &location,
+            arg,
+            slots,
+            bindings,
+            template_opt,
+            &mut needs_helper_for_program_templates,
+            true,
+        )?;
         entrypoint_ts.push(ts);
     }
 
     let mut env_ts: BTreeMap<String, TemplateString> = BTreeMap::new();
     for (k, v) in &program.env {
-        let mut ts: TemplateString = Vec::new();
-        for part in &v.parts {
-            match part {
-                InterpolatedPart::Literal(lit) => ts.push(TemplatePart::lit(lit)),
-                InterpolatedPart::Interpolation { source, query } => match source {
-                    InterpolationSource::Slots => {
-                        let vv = resolve_slot_query(slots, query).map_err(|e| {
-                            MeshError::new(format!(
-                                "failed to resolve slot query in {}: {e}",
-                                component_label(scenario, id)
-                            ))
-                        })?;
-                        ts.push(TemplatePart::lit(vv));
-                    }
-                    InterpolationSource::Bindings => {
-                        let vv = resolve_binding_query(bindings, query).map_err(|e| {
-                            MeshError::new(format!(
-                                "failed to resolve binding query in {}: {e}",
-                                component_label(scenario, id)
-                            ))
-                        })?;
-                        ts.push(TemplatePart::lit(vv));
-                    }
-                    InterpolationSource::Config => {
-                        match resolve_config_query_for_program(template_opt, query)? {
-                            ConfigResolution::Static(vv) => ts.push(TemplatePart::lit(vv)),
-                            ConfigResolution::Runtime => {
-                                ts.push(TemplatePart::config(query.clone()));
-                                needs_helper_for_program_templates = true;
-                            }
-                        }
-                    }
-                    other => {
-                        return Err(MeshError::new(format!(
-                            "unsupported interpolation source {other} in {} program.env.{k}",
-                            component_label(scenario, id)
-                        )));
-                    }
-                },
-                _ => {
-                    return Err(MeshError::new(format!(
-                        "unsupported interpolation part in {} program.env.{k}",
-                        component_label(scenario, id)
-                    )));
-                }
-            }
-        }
+        let location = format!("program.env.{k}");
+        let ts = resolve_program_template_string(
+            scenario,
+            id,
+            &location,
+            v,
+            slots,
+            bindings,
+            template_opt,
+            &mut needs_helper_for_program_templates,
+            false,
+        )?;
         env_ts.insert(k.clone(), ts);
     }
 
