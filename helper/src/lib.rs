@@ -147,9 +147,10 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
                 docker_mount_proxy_spec_b64 = Some(value);
             }
             _ if key_str.starts_with(CONFIG_ENV_PREFIX) => {
-                if let Ok(value) = value.into_string() {
-                    config_env.insert(key_str.to_string(), value);
-                }
+                let value = value
+                    .into_string()
+                    .map_err(|_| HelperError::Msg(format!("{key_str} must be valid UTF-8")))?;
+                config_env.insert(key_str.to_string(), value);
             }
             _ => {
                 passthrough_env.insert(key, value);
@@ -611,6 +612,22 @@ mod tests {
                 "127.0.0.1".to_string(),
                 23000
             )]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_env_values_must_be_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let env = vec![(
+            OsString::from("AMBER_CONFIG_INVALID"),
+            OsString::from_vec(vec![0xff, 0xfe]),
+        )];
+        let err = build_run_plan(env).expect_err("invalid utf-8 env value should fail");
+        assert!(
+            err.to_string()
+                .contains("AMBER_CONFIG_INVALID must be valid UTF-8")
         );
     }
 }

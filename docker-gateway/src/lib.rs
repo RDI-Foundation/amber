@@ -430,14 +430,8 @@ impl State {
             AMBER_COMPONENT_LABEL.to_string(),
         ];
 
-        let container_query = match build_label_filter_query(&required_labels, true) {
-            Some(value) => value,
-            None => return,
-        };
-        let network_query = match build_label_filter_query(&required_labels, false) {
-            Some(value) => value,
-            None => return,
-        };
+        let container_query = build_label_filter_query(&required_labels, true);
+        let network_query = build_label_filter_query(&required_labels, false);
 
         self.cleanup_containers(&container_query).await;
         self.cleanup_networks(&network_query).await;
@@ -888,17 +882,18 @@ fn required_label_filters(state: &State, id: &CallerIdentity) -> Vec<String> {
         .collect()
 }
 
-fn build_label_filter_query(required_labels: &[String], include_all: bool) -> Option<String> {
+fn build_label_filter_query(required_labels: &[String], include_all: bool) -> String {
     let filters = serde_json::json!({
         "label": required_labels
     });
-    let encoded_filters = serde_json::to_string(&filters).ok()?;
+    let encoded_filters = serde_json::to_string(&filters)
+        .expect("serializing static label filter JSON should succeed");
     let mut serializer = form_urlencoded::Serializer::new(String::new());
     if include_all {
         serializer.append_pair("all", "1");
     }
     serializer.append_pair("filters", &encoded_filters);
-    Some(serializer.finish())
+    serializer.finish()
 }
 
 async fn shutdown_signal() -> ShutdownReason {
@@ -1537,16 +1532,23 @@ fn add_label_filters_to_uri(uri: &Uri, required: &[String]) -> GatewayResult<Uri
         })
         .unwrap_or_default();
 
-    let mut filters: serde_json::Value = serde_json::Value::Object(Default::default());
-    if let Some(idx) = pairs.iter().position(|(key, _)| key == "filters") {
+    let mut filters = if let Some(idx) = pairs.iter().position(|(key, _)| key == "filters") {
         let raw = &pairs[idx].1;
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
-            filters = value;
-        }
-    }
+        serde_json::from_str::<serde_json::Value>(raw).map_err(|err| {
+            boxed_response(docker_error(
+                StatusCode::BAD_REQUEST,
+                format!("filters must be valid JSON: {err}"),
+            ))
+        })?
+    } else {
+        serde_json::Value::Object(Default::default())
+    };
 
     if !filters.is_object() {
-        filters = serde_json::Value::Object(Default::default());
+        return Err(boxed_response(docker_error(
+            StatusCode::BAD_REQUEST,
+            "filters must be a JSON object",
+        )));
     }
 
     let obj = filters.as_object_mut().unwrap();
@@ -1606,7 +1608,12 @@ fn merge_required_labels(
         }
         serde_json::Value::Object(values) => {
             for (label, enabled) in values.iter() {
-                let enabled = enabled.as_bool().unwrap_or(true);
+                let Some(enabled) = enabled.as_bool() else {
+                    return Err(boxed_response(docker_error(
+                        StatusCode::BAD_REQUEST,
+                        format!("filters.label[{label:?}] must be a boolean"),
+                    )));
+                };
                 labels_obj.insert(label.clone(), serde_json::Value::Bool(enabled));
             }
         }
@@ -2678,6 +2685,34 @@ mod tests {
     }
 
     #[test]
+    fn add_label_filters_to_uri_rejects_invalid_filters_json() {
+        let uri: Uri = "/containers/json?filters=%7Bnot-json".parse().expect("uri");
+        let required = vec!["amber.component=/green".to_string()];
+        let err = add_label_filters_to_uri(&uri, &required).expect_err("expected invalid filters");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn add_label_filters_to_uri_rejects_non_object_filters() {
+        let uri: Uri = "/containers/json?filters=%5B%22a%3Db%22%5D"
+            .parse()
+            .expect("uri");
+        let required = vec!["amber.component=/green".to_string()];
+        let err = add_label_filters_to_uri(&uri, &required).expect_err("expected invalid filters");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn add_label_filters_to_uri_rejects_non_boolean_label_values() {
+        let uri: Uri = "/containers/json?filters=%7B%22label%22%3A%7B%22a%3Db%22%3A%22yes%22%7D%7D"
+            .parse()
+            .expect("uri");
+        let required = vec!["amber.component=/green".to_string()];
+        let err = add_label_filters_to_uri(&uri, &required).expect_err("expected invalid labels");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn parse_container_create_references_extracts_resources() {
         let body = br#"{
             "HostConfig": {
@@ -3583,14 +3618,11 @@ mod tests {
                 "com.docker.compose.oneoff=False".to_string(),
             ],
             true,
-        )
-        .expect("container filters query");
+        );
         let network_query =
-            build_label_filter_query(&[format!("{COMPOSE_PROJECT_LABEL}={inner_project}")], false)
-                .expect("network filters query");
+            build_label_filter_query(&[format!("{COMPOSE_PROJECT_LABEL}={inner_project}")], false);
         let volume_query =
-            build_label_filter_query(&[format!("{COMPOSE_PROJECT_LABEL}={inner_project}")], false)
-                .expect("volume filters query");
+            build_label_filter_query(&[format!("{COMPOSE_PROJECT_LABEL}={inner_project}")], false);
 
         let list_containers = send_gateway_request(
             gateway.addr,

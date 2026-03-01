@@ -539,6 +539,23 @@ mod tests {
     }
 
     #[test]
+    fn lint_manifest_handles_malformed_program_image_from_builder() {
+        let program = crate::Program::builder()
+            .image("${config.image")
+            .entrypoint(crate::ProgramEntrypoint(vec!["run".parse().unwrap()]))
+            .build();
+        let manifest = Manifest::builder().program(program).build().unwrap();
+
+        let input = r#"{ manifest_version: "0.1.0" }"#;
+        let lints = lint_for(input, &manifest);
+        assert!(
+            lints
+                .iter()
+                .any(|lint| matches!(lint, crate::lint::ManifestLint::UnusedProgram { .. }))
+        );
+    }
+
+    #[test]
     fn slot_used_in_program_entrypoint_is_not_linted() {
         let input = r#"
         {

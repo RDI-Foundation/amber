@@ -63,7 +63,9 @@ pub(crate) fn parse_slot_query(query: &str) -> Result<SlotQuery<'_>, SlotQueryEr
     }
 
     let mut segments = query.split('.');
-    let slot = segments.next().unwrap_or_default();
+    let slot = segments
+        .next()
+        .expect("split on '.' always yields at least one segment");
     if slot.is_empty() {
         return Err(SlotQueryError::MissingSlotName);
     }

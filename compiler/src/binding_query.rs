@@ -49,7 +49,9 @@ pub(crate) fn parse_binding_query(query: &str) -> Result<BindingQuery<'_>, Bindi
     }
 
     let mut segments = query.split('.');
-    let name = segments.next().unwrap_or_default();
+    let name = segments
+        .next()
+        .expect("split on '.' always yields at least one segment");
     if name.is_empty() {
         return Err(BindingQueryError::MissingBindingName);
     }

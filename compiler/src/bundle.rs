@@ -115,14 +115,37 @@ impl BundleIndex {
         let Some(obj) = value.as_object() else {
             return Ok(None);
         };
-        let Some(schema) = obj.get("schema").and_then(|v| v.as_str()) else {
+        let Some(schema_value) = obj.get("schema") else {
             return Ok(None);
         };
-        let Some(version) = obj.get("version").and_then(|v| v.as_u64()) else {
+        let Some(version_value) = obj.get("version") else {
             return Ok(None);
         };
-        if schema != BUNDLE_SCHEMA || version != BUNDLE_VERSION as u64 {
-            return Ok(None);
+
+        let Some(schema) = schema_value.as_str() else {
+            let index: BundleIndex = serde_json::from_value(value)?;
+            index.ensure_supported()?;
+            return Ok(Some(index));
+        };
+        let Some(version_u64) = version_value.as_u64() else {
+            let index: BundleIndex = serde_json::from_value(value)?;
+            index.ensure_supported()?;
+            return Ok(Some(index));
+        };
+
+        if schema != BUNDLE_SCHEMA {
+            return Err(Error::InvalidSchema {
+                schema: schema.to_string(),
+                expected: BUNDLE_SCHEMA,
+            });
+        }
+
+        let version = u32::try_from(version_u64).unwrap_or(u32::MAX);
+        if version != BUNDLE_VERSION {
+            return Err(Error::InvalidVersion {
+                version,
+                expected: BUNDLE_VERSION,
+            });
         }
 
         let index: BundleIndex = serde_json::from_value(value)?;
