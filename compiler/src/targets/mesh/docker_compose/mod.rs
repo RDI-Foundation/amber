@@ -251,6 +251,10 @@ impl From<crate::targets::mesh::plan::MeshError> for DockerComposeError {
     }
 }
 
+fn dc_other(err: impl ToString) -> DockerComposeError {
+    DockerComposeError::Other(err.to_string())
+}
+
 impl DockerComposeError {
     fn into_reporter_error(self, scenario: &Scenario) -> ReporterError {
         match self {
@@ -591,7 +595,7 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
             backend_label: "docker-compose reporter",
         },
     )
-    .map_err(|e| DockerComposeError::Other(e.to_string()))?;
+    .map_err(dc_other)?;
     let images = resolve_internal_images().map_err(DockerComposeError::Other)?;
 
     let program_components = mesh_plan.program_components.as_slice();
@@ -733,7 +737,7 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
         &address_plan.slot_values_by_component,
         &address_plan.binding_values_by_component,
     )
-    .map_err(|e| DockerComposeError::Other(e.to_string()))?;
+    .map_err(dc_other)?;
 
     let root_leaves = &config_plan.root_leaves;
     let root_leaf_by_path: BTreeMap<&str, &rc::SchemaLeaf> = root_leaves
@@ -938,7 +942,7 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
                 &format!("root config definition for {label}"),
                 &view.pruned_root_schema,
             )
-            .map_err(|e| DockerComposeError::Other(e.to_string()))?;
+            .map_err(dc_other)?;
             let root_env_entries =
                 build_root_env_entries(root_leaves, &view.allowed_root_leaf_paths)?;
             env_entries.extend(root_env_entries);
@@ -955,8 +959,7 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
         let append_mount_and_proxy_env =
             |env_entries: &mut Vec<String>| -> Result<(), DockerComposeError> {
                 if let Some(specs) = mount_specs {
-                    let mount_b64 = encode_mount_spec_b64(&label, specs)
-                        .map_err(|e| DockerComposeError::Other(e.to_string()))?;
+                    let mount_b64 = encode_mount_spec_b64(&label, specs).map_err(dc_other)?;
                     env_entries.push(format!("AMBER_MOUNT_SPEC_B64={mount_b64}"));
                 }
                 if let (Some(paths), Some(port)) = (docker_mount_paths, docker_mount_proxy_port) {
@@ -988,10 +991,8 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
             ProgramPlan::Direct {
                 entrypoint, env, ..
             } => {
-                let entrypoint_b64 = encode_direct_entrypoint_b64(entrypoint)
-                    .map_err(|e| DockerComposeError::Other(e.to_string()))?;
-                let env_b64 = encode_direct_env_b64(env)
-                    .map_err(|e| DockerComposeError::Other(e.to_string()))?;
+                let entrypoint_b64 = encode_direct_entrypoint_b64(entrypoint).map_err(dc_other)?;
+                let env_b64 = encode_direct_env_b64(env).map_err(dc_other)?;
 
                 configure_helper_runner_service(&mut program_service);
 
@@ -1006,7 +1007,7 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
                         &view.component_template,
                         &view.component_schema,
                     )
-                    .map_err(|e| DockerComposeError::Other(e.to_string()))?;
+                    .map_err(dc_other)?;
                     append_runtime_config_env(
                         &mut env_entries,
                         &payload.component_schema_b64,
@@ -1026,7 +1027,7 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
                     &view.component_template,
                     &view.component_schema,
                 )
-                .map_err(|e| DockerComposeError::Other(e.to_string()))?;
+                .map_err(dc_other)?;
 
                 configure_helper_runner_service(&mut program_service);
 

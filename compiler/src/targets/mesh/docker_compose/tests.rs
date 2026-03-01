@@ -22,7 +22,7 @@ use serde_json::json;
 use url::Url;
 
 use super::DockerComposeReporter;
-use crate::{CompileOptions, Compiler, DigestStore, OptimizeOptions, reporter::Reporter as _};
+use crate::{CompileOptions, Compiler, DigestStore, reporter::Reporter as _};
 
 const SIDECAR_IMAGE: &str = AMBER_SIDECAR.reference;
 const HELPER_IMAGE: &str = AMBER_HELPER.reference;
@@ -191,6 +191,48 @@ fn parse_compose(yaml: &str) -> super::DockerComposeFile {
     serde_yaml::from_str(yaml).expect("compose yaml should parse")
 }
 
+fn emit_yaml(scenario: &Scenario) -> String {
+    DockerComposeReporter
+        .emit(scenario)
+        .expect("compose render ok")
+}
+
+fn emit_compose(scenario: &Scenario) -> (String, super::DockerComposeFile) {
+    let yaml = emit_yaml(scenario);
+    let compose = parse_compose(&yaml);
+    (yaml, compose)
+}
+
+fn component(id: u8, parent: Option<u8>, path: &str) -> Component {
+    Component {
+        id: ComponentId(id as usize),
+        parent: parent.map(|pid| ComponentId(pid as usize)),
+        moniker: moniker(path),
+        digest: digest(id),
+        config: None,
+        config_schema: None,
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    }
+}
+
+fn scenario(
+    components: Vec<Component>,
+    bindings: Vec<BindingEdge>,
+    exports: Vec<ScenarioExport>,
+) -> Scenario {
+    Scenario {
+        root: ComponentId(0),
+        components: components.into_iter().map(Some).collect(),
+        bindings,
+        exports,
+    }
+}
+
 fn service<'a>(compose: &'a super::DockerComposeFile, name: &str) -> &'a super::Service {
     compose
         .services
@@ -301,10 +343,7 @@ impl Drop for ComposeDownGuard {
 }
 
 fn standard_compile_options() -> CompileOptions {
-    CompileOptions {
-        resolve: crate::ResolveOptions { max_concurrency: 8 },
-        optimize: crate::OptimizeOptions { dce: false },
-    }
+    CompileOptions::testing(false)
 }
 
 #[test]
@@ -335,54 +374,23 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         serde_json::from_value(json!({ "kind": "http", "endpoint": "api" })).unwrap();
 
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
         children: vec![ComponentId(2), ComponentId(1)],
+        ..component(0, None, "/")
     };
-
     let server = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/server"),
-        digest: digest(1),
-        config: None,
-        config_schema: None,
         program: Some(server_program),
-        slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(1, Some(0), "/server")
     };
-
     let client = Component {
-        id: ComponentId(2),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/client"),
-        digest: digest(2),
-        config: None,
-        config_schema: None,
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(2, Some(0), "/client")
     };
 
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root), Some(server), Some(client)],
-        bindings: vec![BindingEdge {
+    let scenario = scenario(
+        vec![root, server, client],
+        vec![BindingEdge {
             name: None,
             from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(1),
@@ -394,13 +402,10 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
             },
             weak: false,
         }],
-        exports: vec![],
-    };
+        vec![],
+    );
 
-    let yaml = DockerComposeReporter
-        .emit(&scenario)
-        .expect("compose render ok");
-    let compose = parse_compose(&yaml);
+    let (yaml, compose) = emit_compose(&scenario);
 
     // Service names should be injective and include sidecars.
     assert!(compose.services.contains_key("c1-server-net"), "{yaml}");
@@ -451,31 +456,12 @@ fn compose_escapes_entrypoint_dollars() {
     .unwrap();
 
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
         program: Some(program),
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(0, None, "/")
     };
+    let scenario = scenario(vec![root], vec![], vec![]);
 
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root)],
-        bindings: vec![],
-        exports: vec![],
-    };
-
-    let yaml = DockerComposeReporter
-        .emit(&scenario)
-        .expect("compose render ok");
-    let compose = parse_compose(&yaml);
+    let (_yaml, compose) = emit_compose(&scenario);
 
     let service = compose
         .services
@@ -506,31 +492,13 @@ fn compose_renders_runtime_program_image_from_root_config() {
     .unwrap();
 
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
         config_schema: Some(schema),
         program: Some(program),
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(0, None, "/")
     };
+    let scenario = scenario(vec![root], vec![], vec![]);
 
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root)],
-        bindings: vec![],
-        exports: vec![],
-    };
-
-    let yaml = DockerComposeReporter
-        .emit(&scenario)
-        .expect("compose render ok");
-    let compose = parse_compose(&yaml);
+    let (yaml, compose) = emit_compose(&scenario);
 
     let service = compose
         .services
@@ -578,15 +546,6 @@ fn compose_resolves_binding_urls_in_child_config() {
         serde_json::from_value(json!({ "kind": "http", "endpoint": "api" })).unwrap();
 
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
         binding_decls: BTreeMap::from([(
             "bind".to_string(),
             SlotRef {
@@ -594,45 +553,20 @@ fn compose_resolves_binding_urls_in_child_config() {
                 name: "api".to_string(),
             },
         )]),
-        metadata: None,
         children: vec![ComponentId(3), ComponentId(2), ComponentId(1)],
+        ..component(0, None, "/")
     };
-
     let server = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/server"),
-        digest: digest(1),
-        config: None,
-        config_schema: None,
         program: Some(server_program),
-        slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(1, Some(0), "/server")
     };
-
     let client = Component {
-        id: ComponentId(2),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/client"),
-        digest: digest(2),
-        config: None,
-        config_schema: None,
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(2, Some(0), "/client")
     };
-
     let observer = Component {
-        id: ComponentId(3),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/observer"),
-        digest: digest(3),
         config: Some(json!({
             "upstream_url": "${bindings.bind.url}"
         })),
@@ -645,17 +579,12 @@ fn compose_resolves_binding_urls_in_child_config() {
             "additionalProperties": false
         })),
         program: Some(observer_program),
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(3, Some(0), "/observer")
     };
 
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root), Some(server), Some(client), Some(observer)],
-        bindings: vec![BindingEdge {
+    let scenario = scenario(
+        vec![root, server, client, observer],
+        vec![BindingEdge {
             name: Some("bind".to_string()),
             from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(1),
@@ -667,13 +596,10 @@ fn compose_resolves_binding_urls_in_child_config() {
             },
             weak: false,
         }],
-        exports: vec![],
-    };
+        vec![],
+    );
 
-    let yaml = DockerComposeReporter
-        .emit(&scenario)
-        .expect("compose render ok");
-    let compose = parse_compose(&yaml);
+    let (yaml, compose) = emit_compose(&scenario);
 
     assert!(
         compose
@@ -725,15 +651,6 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         serde_json::from_value(json!({ "kind": "http", "endpoint": "api" })).unwrap();
 
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
         binding_decls: BTreeMap::from([(
             "bind".to_string(),
             SlotRef {
@@ -741,38 +658,18 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
                 name: "api".to_string(),
             },
         )]),
-        metadata: None,
         children: vec![ComponentId(3), ComponentId(2), ComponentId(1)],
+        ..component(0, None, "/")
     };
-
     let server = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/server"),
-        digest: digest(1),
-        config: None,
-        config_schema: None,
         program: Some(server_program),
-        slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(1, Some(0), "/server")
     };
-
     let client = Component {
-        id: ComponentId(2),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/client"),
-        digest: digest(2),
-        config: None,
-        config_schema: None,
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(2, Some(0), "/client")
     };
 
     let upstream_schema = json!({
@@ -785,67 +682,33 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
     });
 
     let grandparent = Component {
-        id: ComponentId(3),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/grandparent"),
-        digest: digest(3),
         config: Some(json!({
             "upstream_url": "${bindings.bind.url}"
         })),
         config_schema: Some(upstream_schema.clone()),
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
         children: vec![ComponentId(4)],
+        ..component(3, Some(0), "/grandparent")
     };
-
     let parent = Component {
-        id: ComponentId(4),
-        parent: Some(ComponentId(3)),
-        moniker: moniker("/grandparent/parent"),
-        digest: digest(4),
         config: Some(json!({
             "upstream_url": "${config.upstream_url}"
         })),
         config_schema: Some(upstream_schema.clone()),
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
         children: vec![ComponentId(5)],
+        ..component(4, Some(3), "/grandparent/parent")
     };
-
     let child = Component {
-        id: ComponentId(5),
-        parent: Some(ComponentId(4)),
-        moniker: moniker("/grandparent/parent/child"),
-        digest: digest(5),
         config: Some(json!({
             "upstream_url": "${config.upstream_url}"
         })),
         config_schema: Some(upstream_schema.clone()),
         program: Some(child_program),
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(5, Some(4), "/grandparent/parent/child")
     };
 
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![
-            Some(root),
-            Some(server),
-            Some(client),
-            Some(grandparent),
-            Some(parent),
-            Some(child),
-        ],
-        bindings: vec![BindingEdge {
+    let scenario = scenario(
+        vec![root, server, client, grandparent, parent, child],
+        vec![BindingEdge {
             name: Some("bind".to_string()),
             from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(1),
@@ -857,13 +720,10 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
             },
             weak: false,
         }],
-        exports: vec![],
-    };
+        vec![],
+    );
 
-    let yaml = DockerComposeReporter
-        .emit(&scenario)
-        .expect("compose render ok");
-    let compose = parse_compose(&yaml);
+    let (yaml, compose) = emit_compose(&scenario);
 
     assert!(compose.services.values().any(|svc| {
         env_value(svc, "UPSTREAM_URL").as_deref() == Some("http://127.0.0.1:20000")
@@ -894,46 +754,18 @@ fn compose_mounts_use_helper_direct_mode() {
     });
 
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
         children: vec![ComponentId(1)],
+        ..component(0, None, "/")
     };
-
     let child = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/child"),
-        digest: digest(1),
         config: Some(json!({ "app": "static" })),
         config_schema: Some(config_schema),
         program: Some(program),
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(1, Some(0), "/child")
     };
+    let scenario = scenario(vec![root, child], Vec::new(), Vec::new());
 
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root), Some(child)],
-        bindings: Vec::new(),
-        exports: Vec::new(),
-    };
-
-    let yaml = DockerComposeReporter
-        .emit(&scenario)
-        .expect("compose render ok");
-    let compose = parse_compose(&yaml);
+    let (yaml, compose) = emit_compose(&scenario);
 
     assert!(
         compose.services.contains_key("amber-init"),
@@ -964,45 +796,19 @@ fn compose_runtime_mount_requires_config_payload() {
     });
 
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
         config_schema: Some(config_schema.clone()),
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
         children: vec![ComponentId(1)],
+        ..component(0, None, "/")
     };
-
     let child = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/child"),
-        digest: digest(1),
         config: Some(json!({ "app": "${config.app}" })),
         config_schema: Some(config_schema),
         program: Some(program),
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(1, Some(0), "/child")
     };
+    let scenario = scenario(vec![root, child], Vec::new(), Vec::new());
 
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root), Some(child)],
-        bindings: Vec::new(),
-        exports: Vec::new(),
-    };
-
-    let yaml = DockerComposeReporter
-        .emit(&scenario)
-        .expect("compose render ok");
+    let yaml = emit_yaml(&scenario);
 
     assert!(yaml.contains("AMBER_DIRECT_ENTRYPOINT_B64"), "{yaml}");
     assert!(yaml.contains("AMBER_MOUNT_SPEC_B64"), "{yaml}");
@@ -1053,46 +859,19 @@ fn compose_scopes_root_config_env_and_schema() {
     });
 
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
         config_schema: Some(root_schema),
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
         children: vec![ComponentId(1)],
+        ..component(0, None, "/")
     };
-
     let child = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/child"),
-        digest: digest(1),
         config: Some(json!({ "app": "${config.app}", "token": "${config.token}" })),
         config_schema: Some(component_schema),
         program: Some(program),
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(1, Some(0), "/child")
     };
+    let scenario = scenario(vec![root, child], Vec::new(), Vec::new());
 
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root), Some(child)],
-        bindings: Vec::new(),
-        exports: Vec::new(),
-    };
-
-    let yaml = DockerComposeReporter
-        .emit(&scenario)
-        .expect("compose render ok");
-    let compose = parse_compose(&yaml);
+    let (_yaml, compose) = emit_compose(&scenario);
     let child_service = service(&compose, "c1-child");
 
     assert!(
@@ -1151,31 +930,13 @@ fn compose_scopes_root_component_payloads() {
     });
 
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
         config_schema: Some(root_schema),
         program: Some(program),
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(0, None, "/")
     };
+    let scenario = scenario(vec![root], Vec::new(), Vec::new());
 
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root)],
-        bindings: Vec::new(),
-        exports: Vec::new(),
-    };
-
-    let yaml = DockerComposeReporter
-        .emit(&scenario)
-        .expect("compose render ok");
-    let compose = parse_compose(&yaml);
+    let (_yaml, compose) = emit_compose(&scenario);
     let program_service = compose
         .services
         .values()
@@ -1280,40 +1041,19 @@ fn compose_emits_export_metadata_and_labels() {
     let provide_decl = provide_http.decl.clone();
 
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
         children: vec![ComponentId(1)],
+        ..component(0, None, "/")
     };
-
     let server = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/server"),
-        digest: digest(1),
-        config: None,
-        config_schema: None,
         program: Some(server_program),
-        slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(1, Some(0), "/server")
     };
 
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root), Some(server)],
-        bindings: vec![],
-        exports: vec![ScenarioExport {
+    let scenario = scenario(
+        vec![root, server],
+        vec![],
+        vec![ScenarioExport {
             name: "public".to_string(),
             capability: provide_decl,
             from: ProvideRef {
@@ -1321,12 +1061,9 @@ fn compose_emits_export_metadata_and_labels() {
                 name: "api".to_string(),
             },
         }],
-    };
+    );
 
-    let yaml = DockerComposeReporter
-        .emit(&scenario)
-        .expect("compose render ok");
-    let compose = parse_compose(&yaml);
+    let (_yaml, compose) = emit_compose(&scenario);
 
     let exports = compose
         .x_amber
@@ -1372,39 +1109,19 @@ fn compose_routes_external_slots_through_router() {
     let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
 
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: None,
         slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
         children: vec![ComponentId(1)],
+        ..component(0, None, "/")
     };
-
     let client = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/client"),
-        digest: digest(1),
-        config: None,
-        config_schema: None,
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(1, Some(0), "/client")
     };
 
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root), Some(client)],
-        bindings: vec![BindingEdge {
+    let scenario = scenario(
+        vec![root, client],
+        vec![BindingEdge {
             name: None,
             from: BindingFrom::External(SlotRef {
                 component: ComponentId(0),
@@ -1416,13 +1133,10 @@ fn compose_routes_external_slots_through_router() {
             },
             weak: true,
         }],
-        exports: Vec::new(),
-    };
+        Vec::new(),
+    );
 
-    let yaml = DockerComposeReporter
-        .emit(&scenario)
-        .expect("compose render ok");
-    let compose = parse_compose(&yaml);
+    let (yaml, compose) = emit_compose(&scenario);
 
     assert!(compose.services.contains_key("amber-router-net"));
     assert!(
@@ -1517,10 +1231,7 @@ fn compose_external_slots_and_exports_work_together_with_and_without_dce() {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     for dce in [true, false] {
-        let opts = CompileOptions {
-            optimize: OptimizeOptions { dce },
-            ..CompileOptions::default()
-        };
+        let opts = CompileOptions::testing(dce);
         let output = rt
             .block_on(compiler.compile(
                 ManifestRef::from_url(Url::from_file_path(&root_path).unwrap()),
@@ -1528,9 +1239,7 @@ fn compose_external_slots_and_exports_work_together_with_and_without_dce() {
             ))
             .expect("compile ok");
 
-        let yaml = DockerComposeReporter
-            .emit(&output.scenario)
-            .expect("compose render ok");
+        let yaml = emit_yaml(&output.scenario);
         let b64 = extract_compose_env_value(&yaml, "AMBER_ROUTER_CONFIG_B64")
             .expect("router config env var");
         let decoded = base64::engine::general_purpose::STANDARD
@@ -1569,15 +1278,7 @@ fn compose_ignores_unused_config_binding_paths_under_dce() {
     .unwrap();
 
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: None,
         slots: BTreeMap::from([("up".to_string(), slot_http)]),
-        provides: BTreeMap::new(),
         binding_decls: BTreeMap::from([(
             "upstream".to_string(),
             SlotRef {
@@ -1585,46 +1286,26 @@ fn compose_ignores_unused_config_binding_paths_under_dce() {
                 name: "up".to_string(),
             },
         )]),
-        metadata: None,
         children: vec![ComponentId(1), ComponentId(2)],
+        ..component(0, None, "/")
     };
-
     let consumer = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/consumer"),
-        digest: digest(1),
         config: Some(json!({
             "upstream_url": "${bindings.upstream.url}"
         })),
-        config_schema: None,
         program: Some(consumer_program),
-        slots: BTreeMap::new(),
         provides: BTreeMap::from([("out".to_string(), provide_out.clone())]),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(1, Some(0), "/consumer")
     };
-
     let provider = Component {
-        id: ComponentId(2),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/provider"),
-        digest: digest(2),
-        config: None,
-        config_schema: None,
         program: Some(provider_program),
-        slots: BTreeMap::new(),
         provides: BTreeMap::from([("up".to_string(), provide_up)]),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(2, Some(0), "/provider")
     };
 
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root), Some(consumer), Some(provider)],
-        bindings: vec![BindingEdge {
+    let scenario = scenario(
+        vec![root, consumer, provider],
+        vec![BindingEdge {
             name: None,
             from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(2),
@@ -1636,7 +1317,7 @@ fn compose_ignores_unused_config_binding_paths_under_dce() {
             },
             weak: false,
         }],
-        exports: vec![ScenarioExport {
+        vec![ScenarioExport {
             name: "out".to_string(),
             capability: provide_out.decl.clone(),
             from: ProvideRef {
@@ -1644,7 +1325,7 @@ fn compose_ignores_unused_config_binding_paths_under_dce() {
                 name: "out".to_string(),
             },
         }],
-    };
+    );
 
     let scenario = crate::mir::dce_only(scenario);
     assert!(
@@ -1730,39 +1411,19 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
     let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
 
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: None,
         slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
         children: vec![ComponentId(1)],
+        ..component(0, None, "/")
     };
-
     let client = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/client"),
-        digest: digest(1),
-        config: None,
-        config_schema: None,
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(1, Some(0), "/client")
     };
 
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root), Some(client)],
-        bindings: vec![BindingEdge {
+    let scenario = scenario(
+        vec![root, client],
+        vec![BindingEdge {
             name: None,
             from: BindingFrom::External(SlotRef {
                 component: ComponentId(0),
@@ -1774,12 +1435,10 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
             },
             weak: true,
         }],
-        exports: Vec::new(),
-    };
+        Vec::new(),
+    );
 
-    let yaml = DockerComposeReporter
-        .emit(&scenario)
-        .expect("compose render ok");
+    let yaml = emit_yaml(&scenario);
     fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
 
     let project_name = format!("amber-ext-slot-{}", std::process::id());
@@ -1892,40 +1551,19 @@ fn docker_smoke_export_routes_to_host() {
     let export_capability = provide_http.decl.clone();
 
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
         children: vec![ComponentId(1)],
+        ..component(0, None, "/")
     };
-
     let server = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/server"),
-        digest: digest(1),
-        config: None,
-        config_schema: None,
         program: Some(server_program),
-        slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(1, Some(0), "/server")
     };
 
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root), Some(server)],
-        bindings: vec![],
-        exports: vec![ScenarioExport {
+    let scenario = scenario(
+        vec![root, server],
+        vec![],
+        vec![ScenarioExport {
             name: "public".to_string(),
             capability: export_capability,
             from: ProvideRef {
@@ -1933,12 +1571,9 @@ fn docker_smoke_export_routes_to_host() {
                 name: "api".to_string(),
             },
         }],
-    };
+    );
 
-    let yaml = DockerComposeReporter
-        .emit(&scenario)
-        .expect("compose render ok");
-    let compose = parse_compose(&yaml);
+    let (yaml, compose) = emit_compose(&scenario);
 
     let export = compose
         .x_amber
@@ -2021,60 +1656,29 @@ fn errors_on_shared_port_with_different_endpoints() {
     let provide_admin = serde_json::from_value(json!({ "kind": "http", "endpoint": "b" })).unwrap();
 
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
         children: vec![ComponentId(2), ComponentId(1)],
+        ..component(0, None, "/")
     };
-
     let server = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/server"),
-        digest: digest(1),
-        config: None,
-        config_schema: None,
         program: Some(server_program),
-        slots: BTreeMap::new(),
         provides: BTreeMap::from([
             ("v1".to_string(), provide_v1),
             ("admin".to_string(), provide_admin),
         ]),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(1, Some(0), "/server")
     };
-
     let client = Component {
-        id: ComponentId(2),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/client"),
-        digest: digest(2),
-        config: None,
-        config_schema: None,
         program: Some(client_program),
         slots: BTreeMap::from([
             ("v1".to_string(), slot_http.clone()),
             ("admin".to_string(), slot_http),
         ]),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(2, Some(0), "/client")
     };
 
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root), Some(server), Some(client)],
-        bindings: vec![
+    let scenario = scenario(
+        vec![root, server, client],
+        vec![
             BindingEdge {
                 name: None,
                 from: BindingFrom::Component(ProvideRef {
@@ -2100,8 +1704,8 @@ fn errors_on_shared_port_with_different_endpoints() {
                 weak: false,
             },
         ],
-        exports: vec![],
-    };
+        vec![],
+    );
 
     let err = DockerComposeReporter.emit(&scenario).unwrap_err();
     assert!(
@@ -2118,27 +1722,10 @@ fn errors_on_shared_port_with_different_endpoints() {
 #[test]
 fn docker_compose_wires_framework_docker_binding_via_gateway() {
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
         children: vec![ComponentId(1)],
+        ..component(0, None, "/")
     };
-
     let worker = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/worker"),
-        digest: digest(1),
-        config: None,
-        config_schema: None,
         program: Some(
             serde_json::from_value(json!({
                 "image": "busybox:1.37",
@@ -2156,16 +1743,12 @@ fn docker_compose_wires_framework_docker_binding_via_gateway() {
             }))
             .unwrap(),
         )]),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(1, Some(0), "/worker")
     };
 
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root), Some(worker)],
-        bindings: vec![BindingEdge {
+    let scenario = scenario(
+        vec![root, worker],
+        vec![BindingEdge {
             name: Some("docker".to_string()),
             from: BindingFrom::Framework(FrameworkCapabilityName::try_from("docker").unwrap()),
             to: SlotRef {
@@ -2174,13 +1757,10 @@ fn docker_compose_wires_framework_docker_binding_via_gateway() {
             },
             weak: false,
         }],
-        exports: Vec::new(),
-    };
+        Vec::new(),
+    );
 
-    let yaml = DockerComposeReporter
-        .emit(&scenario)
-        .expect("compose render ok");
-    let compose = parse_compose(&yaml);
+    let (yaml, compose) = emit_compose(&scenario);
 
     assert!(
         compose.services.contains_key("amber-docker-gateway"),
@@ -2205,27 +1785,10 @@ fn docker_compose_wires_framework_docker_binding_via_gateway() {
 #[test]
 fn docker_compose_rejects_unknown_framework_bindings() {
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
         children: vec![ComponentId(1)],
+        ..component(0, None, "/")
     };
-
     let worker = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/worker"),
-        digest: digest(1),
-        config: None,
-        config_schema: None,
         program: Some(
             serde_json::from_value(json!({
                 "image": "busybox:1.37",
@@ -2240,16 +1803,12 @@ fn docker_compose_rejects_unknown_framework_bindings() {
             }))
             .unwrap(),
         )]),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(1, Some(0), "/worker")
     };
 
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root), Some(worker)],
-        bindings: vec![BindingEdge {
+    let scenario = scenario(
+        vec![root, worker],
+        vec![BindingEdge {
             name: None,
             from: BindingFrom::Framework(
                 FrameworkCapabilityName::try_from("dynamic_children").unwrap(),
@@ -2260,8 +1819,8 @@ fn docker_compose_rejects_unknown_framework_bindings() {
             },
             weak: false,
         }],
-        exports: Vec::new(),
-    };
+        Vec::new(),
+    );
 
     let err = DockerComposeReporter.emit(&scenario).unwrap_err();
     let message = err.to_string();
@@ -2278,26 +1837,10 @@ fn docker_compose_rejects_unknown_framework_bindings() {
 #[test]
 fn docker_compose_wires_framework_mounts_via_helper_proxy() {
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
         children: vec![ComponentId(1)],
+        ..component(0, None, "/")
     };
-
     let worker = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/worker"),
-        digest: digest(1),
-        config: None,
         config_schema: Some(serde_json::json!({
             "type": "object",
         })),
@@ -2311,24 +1854,11 @@ fn docker_compose_wires_framework_mounts_via_helper_proxy() {
             }))
             .unwrap(),
         ),
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(1, Some(0), "/worker")
     };
+    let scenario = scenario(vec![root, worker], Vec::new(), Vec::new());
 
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root), Some(worker)],
-        bindings: Vec::new(),
-        exports: Vec::new(),
-    };
-
-    let yaml = DockerComposeReporter
-        .emit(&scenario)
-        .expect("compose render ok");
-    let compose = parse_compose(&yaml);
+    let (yaml, compose) = emit_compose(&scenario);
 
     assert!(compose.services.contains_key("amber-init"), "{yaml}");
     assert!(
@@ -2403,69 +1933,27 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         serde_json::from_value(json!({ "kind": "http", "endpoint": "api" })).unwrap();
 
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
         children: vec![ComponentId(2), ComponentId(3), ComponentId(1)],
+        ..component(0, None, "/")
     };
-
     let server = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/server"),
-        digest: digest(1),
-        config: None,
-        config_schema: None,
         program: Some(server_program),
-        slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(1, Some(0), "/server")
     };
-
     let allowed = Component {
-        id: ComponentId(2),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/allowed"),
-        digest: digest(2),
-        config: None,
-        config_schema: None,
         program: Some(sleeper_program(json!({ "URL": "${slots.api.url}" }))),
         slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(2, Some(0), "/allowed")
     };
-
     let denied = Component {
-        id: ComponentId(3),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/denied"),
-        digest: digest(3),
-        config: None,
-        config_schema: None,
         program: Some(sleeper_program(json!({}))),
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component(3, Some(0), "/denied")
     };
 
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root), Some(server), Some(allowed), Some(denied)],
-        bindings: vec![BindingEdge {
+    let scenario = scenario(
+        vec![root, server, allowed, denied],
+        vec![BindingEdge {
             name: None,
             from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(1),
@@ -2477,12 +1965,10 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
             },
             weak: false,
         }],
-        exports: vec![],
-    };
+        vec![],
+    );
 
-    let yaml = DockerComposeReporter
-        .emit(&scenario)
-        .expect("compose render ok");
+    let yaml = emit_yaml(&scenario);
     fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
 
     let compose = |args: &[&str]| {
@@ -2873,9 +2359,7 @@ fn docker_smoke_framework_docker_binding_runs_cli_and_teardown_cleanup(
             standard_compile_options(),
         ))
         .expect("compile ok");
-    let yaml = DockerComposeReporter
-        .emit(&output.scenario)
-        .expect("compose render ok");
+    let yaml = emit_yaml(&output.scenario);
     assert!(yaml.contains("amber-docker-gateway"), "{yaml}");
     fs::write(project.join("docker-compose.yaml"), yaml).expect("write compose yaml");
     let guard_envs = [
@@ -3150,10 +2634,7 @@ fn docker_compose_flattens_routing_components_with_and_without_dce() {
 
     let mut agent_urls = Vec::new();
     for dce in [true, false] {
-        let opts = CompileOptions {
-            optimize: OptimizeOptions { dce },
-            ..CompileOptions::default()
-        };
+        let opts = CompileOptions::testing(dce);
         let output = rt
             .block_on(compiler.compile(
                 ManifestRef::from_url(Url::from_file_path(&root_path).unwrap()),
@@ -3161,10 +2642,7 @@ fn docker_compose_flattens_routing_components_with_and_without_dce() {
             ))
             .expect("compile ok");
 
-        let yaml = DockerComposeReporter
-            .emit(&output.scenario)
-            .expect("compose render ok");
-        let compose = parse_compose(&yaml);
+        let (_yaml, compose) = emit_compose(&output.scenario);
         let agent_url = compose
             .services
             .values()
@@ -3318,9 +2796,7 @@ fn docker_smoke_config_forwarding_runtime_validation() {
         ))
         .expect("compile ok");
 
-    let yaml = DockerComposeReporter
-        .emit(&output.scenario)
-        .expect("compose render ok");
+    let yaml = emit_yaml(&output.scenario);
     fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
 
     let valid_env = [
