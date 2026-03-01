@@ -194,6 +194,13 @@ fn build_helper_image() {
     checked_status(&mut cmd, "docker build amber-helper image");
 }
 
+fn standard_compile_options() -> CompileOptions {
+    CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..CompileOptions::default()
+    }
+}
+
 struct KindClusterGuard {
     name: String,
 }
@@ -398,10 +405,7 @@ fn kubernetes_emits_router_for_external_slots() {
     .expect("write client manifest");
 
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let opts = CompileOptions {
-        optimize: OptimizeOptions { dce: false },
-        ..CompileOptions::default()
-    };
+    let opts = standard_compile_options();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let output = rt
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
@@ -524,10 +528,7 @@ fn kubernetes_renders_static_program_image_from_static_component_config() {
     .expect("write child manifest");
 
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let opts = CompileOptions {
-        optimize: OptimizeOptions { dce: false },
-        ..Default::default()
-    };
+    let opts = standard_compile_options();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let output = rt
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
@@ -613,10 +614,7 @@ fn kubernetes_supports_runtime_program_image_when_whole_image_is_config_leaf() {
     .expect("write child manifest");
 
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let opts = CompileOptions {
-        optimize: OptimizeOptions { dce: false },
-        ..Default::default()
-    };
+    let opts = standard_compile_options();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let output = rt
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
@@ -718,10 +716,7 @@ fn kubernetes_rejects_runtime_program_image_templates() {
     .expect("write child manifest");
 
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let opts = CompileOptions {
-        optimize: OptimizeOptions { dce: false },
-        ..Default::default()
-    };
+    let opts = standard_compile_options();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let output = rt
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
@@ -1309,10 +1304,7 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
     .expect("write client manifest");
 
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let opts = CompileOptions {
-        optimize: OptimizeOptions { dce: false },
-        ..CompileOptions::default()
-    };
+    let opts = standard_compile_options();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let output = rt
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
@@ -1588,10 +1580,7 @@ fn kubernetes_smoke_export_routes_to_host() {
     .expect("write server manifest");
 
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let opts = CompileOptions {
-        optimize: OptimizeOptions { dce: false },
-        ..CompileOptions::default()
-    };
+    let opts = standard_compile_options();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let output = rt
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))

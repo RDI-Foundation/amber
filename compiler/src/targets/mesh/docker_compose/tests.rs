@@ -242,6 +242,71 @@ fn extract_compose_env_value(yaml: &str, key: &str) -> Option<String> {
         .find_map(|svc| env_value(svc, key))
 }
 
+const COMPOSE_DOWN_RMI_LOCAL_ARGS: &[&str] = &[
+    "down",
+    "-v",
+    "--remove-orphans",
+    "--rmi",
+    "local",
+    "--timeout",
+    "1",
+];
+
+const COMPOSE_DOWN_REMOVE_ORPHANS_TIMEOUT_ARGS: &[&str] =
+    &["down", "-v", "--remove-orphans", "--timeout", "1"];
+
+struct ComposeDownGuard {
+    project: PathBuf,
+    args: Vec<String>,
+    envs: Vec<(String, String)>,
+    container_to_remove: Option<String>,
+}
+
+impl ComposeDownGuard {
+    fn new(project: &Path, args: &[&str], envs: &[(&str, &str)]) -> Self {
+        Self {
+            project: project.to_path_buf(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            envs: envs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            container_to_remove: None,
+        }
+    }
+
+    fn with_container_cleanup(mut self, container_name: impl Into<String>) -> Self {
+        self.container_to_remove = Some(container_name.into());
+        self
+    }
+}
+
+impl Drop for ComposeDownGuard {
+    fn drop(&mut self) {
+        let mut cmd = Command::new("docker");
+        cmd.current_dir(&self.project)
+            .arg("compose")
+            .args(&self.args);
+        for (k, v) in &self.envs {
+            cmd.env(k, v);
+        }
+        let _ = cmd.status();
+
+        if let Some(container_name) = &self.container_to_remove {
+            let _ = Command::new("docker")
+                .args(["rm", "-f", container_name])
+                .status();
+        }
+    }
+}
+
+fn standard_compile_options() -> CompileOptions {
+    CompileOptions {
+        resolve: crate::ResolveOptions { max_concurrency: 8 },
+        optimize: crate::OptimizeOptions { dce: false },
+    }
+}
+
 #[test]
 fn compose_emits_sidecars_and_programs_and_slot_urls() {
     let server_program = serde_json::from_value(json!({
@@ -1602,42 +1667,6 @@ fn compose_ignores_unused_config_binding_paths_under_dce() {
 fn docker_smoke_external_slot_routes_to_outside_service() {
     use tempfile::tempdir;
 
-    struct ComposeGuard {
-        project: PathBuf,
-        envs: Vec<(String, String)>,
-    }
-
-    impl ComposeGuard {
-        fn new(project: &Path, envs: &[(&str, &str)]) -> Self {
-            Self {
-                project: project.to_path_buf(),
-                envs: envs
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect(),
-            }
-        }
-    }
-
-    impl Drop for ComposeGuard {
-        fn drop(&mut self) {
-            let mut cmd = Command::new("docker");
-            cmd.current_dir(&self.project).arg("compose").args([
-                "down",
-                "-v",
-                "--remove-orphans",
-                "--rmi",
-                "local",
-                "--timeout",
-                "1",
-            ]);
-            for (k, v) in &self.envs {
-                cmd.env(k, v);
-            }
-            let _ = cmd.status();
-        }
-    }
-
     struct ExternalContainerGuard {
         name: String,
     }
@@ -1761,7 +1790,7 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
         ("AMBER_EXTERNAL_SLOT_API_URL", external_url.as_str()),
     ];
 
-    let _compose_guard = ComposeGuard::new(project, &envs);
+    let _compose_guard = ComposeDownGuard::new(project, COMPOSE_DOWN_RMI_LOCAL_ARGS, &envs);
 
     let compose = |args: &[&str]| {
         let mut cmd = Command::new("docker");
@@ -1837,36 +1866,6 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
 #[ignore = "requires docker + docker compose; run manually"]
 fn docker_smoke_export_routes_to_host() {
     use tempfile::tempdir;
-
-    struct ComposeGuard {
-        project: PathBuf,
-    }
-
-    impl ComposeGuard {
-        fn new(project: &Path) -> Self {
-            Self {
-                project: project.to_path_buf(),
-            }
-        }
-    }
-
-    impl Drop for ComposeGuard {
-        fn drop(&mut self) {
-            let _ = Command::new("docker")
-                .current_dir(&self.project)
-                .arg("compose")
-                .args([
-                    "down",
-                    "-v",
-                    "--remove-orphans",
-                    "--rmi",
-                    "local",
-                    "--timeout",
-                    "1",
-                ])
-                .status();
-        }
-    }
 
     let dir = tempdir().unwrap();
     let project = dir.path();
@@ -1957,7 +1956,7 @@ fn docker_smoke_export_routes_to_host() {
 
     fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
 
-    let _compose_guard = ComposeGuard::new(project);
+    let _compose_guard = ComposeDownGuard::new(project, COMPOSE_DOWN_RMI_LOCAL_ARGS, &[]);
     let status = Command::new("docker")
         .current_dir(project)
         .arg("compose")
@@ -2368,36 +2367,6 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
 
     use tempfile::tempdir;
 
-    struct ComposeGuard {
-        project: std::path::PathBuf,
-    }
-
-    impl ComposeGuard {
-        fn new(project: &std::path::Path) -> Self {
-            Self {
-                project: project.to_path_buf(),
-            }
-        }
-    }
-
-    impl Drop for ComposeGuard {
-        fn drop(&mut self) {
-            let _ = Command::new("docker")
-                .current_dir(&self.project)
-                .arg("compose")
-                .args([
-                    "down",
-                    "-v",
-                    "--remove-orphans",
-                    "--rmi",
-                    "local",
-                    "--timeout",
-                    "1",
-                ])
-                .status();
-        }
-    }
-
     // Build a tiny scenario:
     // - server runs busybox httpd on 8080
     // - allowed client has a binding and uses ${slots.api.url}
@@ -2409,7 +2378,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
     let platform = build_sidecar_image();
     ensure_image_platform("busybox:1.36.1", &platform);
     ensure_image_platform("alpine:3.20", &platform);
-    let _compose_guard = ComposeGuard::new(project);
+    let _compose_guard = ComposeDownGuard::new(project, COMPOSE_DOWN_RMI_LOCAL_ARGS, &[]);
     let server_host = "c1-server-net";
 
     // Scenario definition
@@ -2777,41 +2746,6 @@ fn docker_smoke_framework_docker_binding_runs_cli_and_teardown_cleanup(
 
     use tempfile::tempdir;
 
-    struct ComposeGuard {
-        project: std::path::PathBuf,
-        compose_project: String,
-        created_container: String,
-    }
-
-    impl ComposeGuard {
-        fn new(
-            project: &std::path::Path,
-            compose_project: String,
-            created_container: String,
-        ) -> Self {
-            Self {
-                project: project.to_path_buf(),
-                compose_project,
-                created_container,
-            }
-        }
-    }
-
-    impl Drop for ComposeGuard {
-        fn drop(&mut self) {
-            let _ = Command::new("docker")
-                .current_dir(&self.project)
-                .env("COMPOSE_PROJECT_NAME", &self.compose_project)
-                .env("AMBER_DOCKER_SOCK", "/var/run/docker.sock")
-                .arg("compose")
-                .args(["down", "-v", "--remove-orphans", "--timeout", "1"])
-                .status();
-            let _ = Command::new("docker")
-                .args(["rm", "-f", &self.created_container])
-                .status();
-        }
-    }
-
     let project_dir = tempdir().expect("temp dir");
     let project = project_dir.path();
     let sidecar_platform = build_sidecar_image();
@@ -2936,10 +2870,7 @@ fn docker_smoke_framework_docker_binding_runs_cli_and_teardown_cleanup(
     let output = rt
         .block_on(compiler.compile(
             ManifestRef::from_url(Url::from_file_path(&root_path).expect("root file url")),
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
+            standard_compile_options(),
         ))
         .expect("compile ok");
     let yaml = DockerComposeReporter
@@ -2947,7 +2878,16 @@ fn docker_smoke_framework_docker_binding_runs_cli_and_teardown_cleanup(
         .expect("compose render ok");
     assert!(yaml.contains("amber-docker-gateway"), "{yaml}");
     fs::write(project.join("docker-compose.yaml"), yaml).expect("write compose yaml");
-    let _guard = ComposeGuard::new(project, compose_project.clone(), created_container.clone());
+    let guard_envs = [
+        ("COMPOSE_PROJECT_NAME", compose_project.as_str()),
+        ("AMBER_DOCKER_SOCK", "/var/run/docker.sock"),
+    ];
+    let _guard = ComposeDownGuard::new(
+        project,
+        COMPOSE_DOWN_REMOVE_ORPHANS_TIMEOUT_ARGS,
+        &guard_envs,
+    )
+    .with_container_cleanup(created_container.clone());
 
     let compose = |args: &[&str]| {
         let mut cmd = Command::new("docker");
@@ -3357,10 +3297,7 @@ fn docker_smoke_config_forwarding_runtime_validation() {
     .unwrap();
 
     let compiler = crate::Compiler::new(Resolver::new(), crate::DigestStore::default());
-    let opts = crate::CompileOptions {
-        resolve: crate::ResolveOptions { max_concurrency: 8 },
-        optimize: crate::OptimizeOptions { dce: false },
-    };
+    let opts = standard_compile_options();
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     let err = rt
@@ -3386,47 +3323,11 @@ fn docker_smoke_config_forwarding_runtime_validation() {
         .expect("compose render ok");
     fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
 
-    struct ComposeGuard {
-        project: std::path::PathBuf,
-        envs: Vec<(String, String)>,
-    }
-
-    impl ComposeGuard {
-        fn new(project: &std::path::Path, envs: &[(&str, &str)]) -> Self {
-            Self {
-                project: project.to_path_buf(),
-                envs: envs
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect(),
-            }
-        }
-    }
-
-    impl Drop for ComposeGuard {
-        fn drop(&mut self) {
-            let mut cmd = Command::new("docker");
-            cmd.current_dir(&self.project).arg("compose").args([
-                "down",
-                "-v",
-                "--remove-orphans",
-                "--rmi",
-                "local",
-                "--timeout",
-                "1",
-            ]);
-            for (k, v) in &self.envs {
-                cmd.env(k, v);
-            }
-            let _ = cmd.status();
-        }
-    }
-
     let valid_env = [
         ("AMBER_CONFIG_API_KEY", "ABC"),
         ("AMBER_CONFIG_SYSTEM_PROMPT", "OVERRIDE"),
     ];
-    let _compose_guard = ComposeGuard::new(project, &valid_env);
+    let _compose_guard = ComposeDownGuard::new(project, COMPOSE_DOWN_RMI_LOCAL_ARGS, &valid_env);
 
     let compose = |envs: &[(&str, &str)], args: &[&str]| {
         let mut cmd = Command::new("docker");

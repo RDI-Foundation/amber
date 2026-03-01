@@ -55,6 +55,21 @@ fn file_url(path: &Path) -> Url {
     Url::from_file_path(path).unwrap()
 }
 
+fn compile_options(dce: bool) -> CompileOptions {
+    CompileOptions {
+        resolve: crate::ResolveOptions { max_concurrency: 8 },
+        optimize: OptimizeOptions { dce },
+    }
+}
+
+fn standard_compile_options() -> CompileOptions {
+    compile_options(false)
+}
+
+fn optimized_compile_options() -> CompileOptions {
+    compile_options(true)
+}
+
 fn component_moniker(scenario: &amber_scenario::Scenario, id: ComponentId) -> String {
     scenario
         .components
@@ -329,13 +344,7 @@ async fn compile_twice_unpinned_fails_when_sources_removed() {
     let root_ref = ManifestRef::from_url(file_url(&root_path));
 
     let compilation = compiler
-        .compile(
-            root_ref.clone(),
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref.clone(), standard_compile_options())
         .await
         .unwrap();
 
@@ -346,13 +355,7 @@ async fn compile_twice_unpinned_fails_when_sources_removed() {
     fs::remove_file(&b_path).unwrap();
 
     let err = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .unwrap_err();
 
@@ -420,13 +423,7 @@ async fn compile_twice_with_digest_pins_succeeds_when_sources_removed() {
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
 
     let compilation = compiler
-        .compile(
-            root_ref.clone(),
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref.clone(), standard_compile_options())
         .await
         .unwrap();
 
@@ -437,13 +434,7 @@ async fn compile_twice_with_digest_pins_succeeds_when_sources_removed() {
     fs::remove_file(&b_path).unwrap();
 
     let compilation2 = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .unwrap();
 
@@ -463,13 +454,7 @@ async fn provenance_records_redirect_when_fetched() {
     let root_ref = ManifestRef::new(url.clone(), Some(digest));
 
     let compilation = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .unwrap();
 
@@ -505,13 +490,7 @@ async fn relative_manifest_refs_resolve_against_parent() {
     let root_ref = ManifestRef::from_url(file_url(&root_path));
 
     let compilation = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .unwrap();
 
@@ -555,13 +534,7 @@ async fn relative_manifest_refs_require_file_base() {
     let root_ref = ManifestRef::from_url("test://root".parse().unwrap());
 
     let err = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .unwrap_err();
 
@@ -578,13 +551,7 @@ async fn cycle_is_detected_across_url_aliases_with_same_digest() {
     let root_ref = ManifestRef::from_url(url);
 
     let err = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .unwrap_err();
 
@@ -620,13 +587,7 @@ async fn delegated_export_requires_child_export() {
     let root_ref = ManifestRef::from_url(file_url(&root_path));
 
     let err = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .unwrap_err();
 
@@ -683,13 +644,7 @@ async fn binding_rejects_missing_child_slot() {
     let root_ref = ManifestRef::from_url(file_url(&root_path));
 
     let err = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .unwrap_err();
 
@@ -746,13 +701,7 @@ async fn config_validation_error_points_to_invalid_value() {
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
     let root_ref = ManifestRef::from_url(file_url(&root_path));
     let output = compiler
-        .check(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .check(root_ref, standard_compile_options())
         .await
         .unwrap();
 
@@ -831,13 +780,7 @@ async fn binding_interpolation_error_points_to_config_value() {
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
     let root_ref = ManifestRef::from_url(file_url(&root_path));
     let output = compiler
-        .check(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .check(root_ref, standard_compile_options())
         .await
         .unwrap();
 
@@ -1057,23 +1000,11 @@ async fn named_binding_resolution_is_stable_across_opt_modes() {
         let root_ref = ManifestRef::from_url(file_url(&root_path));
 
         let with_opt = compiler
-            .compile(
-                root_ref.clone(),
-                CompileOptions {
-                    resolve: crate::ResolveOptions { max_concurrency: 8 },
-                    optimize: OptimizeOptions { dce: true },
-                },
-            )
+            .compile(root_ref.clone(), optimized_compile_options())
             .await
             .expect("compile with optimizations");
         let without_opt = compiler
-            .compile(
-                root_ref,
-                CompileOptions {
-                    resolve: crate::ResolveOptions { max_concurrency: 8 },
-                    optimize: OptimizeOptions { dce: false },
-                },
-            )
+            .compile(root_ref, standard_compile_options())
             .await
             .expect("compile without optimizations");
 
@@ -1215,23 +1146,11 @@ async fn non_program_config_binding_resolution_is_stable_across_opt_modes() {
     let root_ref = ManifestRef::from_url(file_url(&root_path));
 
     let with_opt = compiler
-        .compile(
-            root_ref.clone(),
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: true },
-            },
-        )
+        .compile(root_ref.clone(), optimized_compile_options())
         .await
         .expect("compile with optimizations");
     let without_opt = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .expect("compile without optimizations");
 
@@ -1367,23 +1286,11 @@ async fn routing_scope_named_binding_survives_optimization_for_compose_lowering(
     let root_ref = ManifestRef::from_url(file_url(&root_path));
 
     let with_opt = compiler
-        .compile(
-            root_ref.clone(),
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: true },
-            },
-        )
+        .compile(root_ref.clone(), optimized_compile_options())
         .await
         .expect("compile with optimizations");
     let without_opt = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .expect("compile without optimizations");
 
@@ -1515,23 +1422,11 @@ async fn renamed_binding_chain_is_stable_across_opt_modes() {
     let root_ref = ManifestRef::from_url(file_url(&root_path));
 
     let with_opt = compiler
-        .compile(
-            root_ref.clone(),
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: true },
-            },
-        )
+        .compile(root_ref.clone(), optimized_compile_options())
         .await
         .expect("compile with optimizations");
     let without_opt = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .expect("compile without optimizations");
 
@@ -1627,13 +1522,7 @@ async fn type_mismatch_reports_expected_and_got() {
     let root_ref = ManifestRef::from_url(file_url(&root_path));
 
     let err = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .unwrap_err();
 
@@ -1717,13 +1606,7 @@ async fn slot_forwarding_and_export_chain_resolve_to_provider() {
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
     let root_ref = ManifestRef::from_url(file_url(&root_path));
     let output = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .unwrap();
 
@@ -1803,13 +1686,7 @@ async fn slot_cycle_reports_error() {
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
     let root_ref = ManifestRef::from_url(file_url(&root_path));
     let err = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .unwrap_err();
 
@@ -1856,13 +1733,7 @@ async fn external_root_slot_with_weak_binding_is_allowed() {
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
     let root_ref = ManifestRef::from_url(file_url(&root_path));
     let output = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .unwrap();
 
@@ -1930,13 +1801,7 @@ async fn external_root_slot_requires_weak_binding() {
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
     let root_ref = ManifestRef::from_url(file_url(&root_path));
     let err = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .unwrap_err();
 
@@ -1965,13 +1830,7 @@ async fn exporting_unbound_optional_slot_errors() {
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
     let root_ref = ManifestRef::from_url(file_url(&root_path));
     let err = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .unwrap_err();
 
@@ -2052,13 +1911,7 @@ async fn delegated_export_chain_resolves_binding_source() {
     let root_ref = ManifestRef::from_url(file_url(&root_path));
 
     let compilation = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .unwrap();
 
@@ -2185,13 +2038,7 @@ async fn resolution_deduplicates_inflight_requests() {
     let root_ref = ManifestRef::from_url(file_url(&root_path));
 
     let compilation = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .unwrap();
 
@@ -2230,13 +2077,7 @@ async fn resolution_environments_allow_parent_to_enable_resolvers_for_children()
     let root_ref = ManifestRef::from_url(file_url(&root_path));
 
     let compilation = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .unwrap();
 
@@ -2415,13 +2256,7 @@ async fn experimental_features_succeed_when_enabled_on_every_parent() {
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
     let root_ref = ManifestRef::from_url(file_url(&root_path));
     let output = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .expect("features enabled across all edges should compile");
 
@@ -2452,13 +2287,7 @@ async fn compile_emits_manifest_lints() {
     let root_ref = ManifestRef::from_url(file_url(&root_path));
 
     let output = compiler
-        .compile(
-            root_ref,
-            CompileOptions {
-                resolve: crate::ResolveOptions { max_concurrency: 8 },
-                optimize: OptimizeOptions { dce: false },
-            },
-        )
+        .compile(root_ref, standard_compile_options())
         .await
         .unwrap();
 
