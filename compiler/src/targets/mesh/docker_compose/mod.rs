@@ -929,6 +929,43 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
         }
         program_service.depends_on = build_depends_on(any_helper, deps);
 
+        let append_runtime_config_env = |env_entries: &mut Vec<String>,
+                                         component_schema_b64: &str,
+                                         component_template_b64: &str|
+         -> Result<(), DockerComposeError> {
+            let view = runtime_view.expect("runtime config view should be computed");
+            let root_schema_b64 = encode_schema_b64(
+                &format!("root config definition for {label}"),
+                &view.pruned_root_schema,
+            )
+            .map_err(|e| DockerComposeError::Other(e.to_string()))?;
+            let root_env_entries =
+                build_root_env_entries(root_leaves, &view.allowed_root_leaf_paths)?;
+            env_entries.extend(root_env_entries);
+            env_entries.push(format!("AMBER_ROOT_CONFIG_SCHEMA_B64={root_schema_b64}"));
+            env_entries.push(format!(
+                "AMBER_COMPONENT_CONFIG_SCHEMA_B64={component_schema_b64}"
+            ));
+            env_entries.push(format!(
+                "AMBER_COMPONENT_CONFIG_TEMPLATE_B64={component_template_b64}"
+            ));
+            Ok(())
+        };
+
+        let append_mount_and_proxy_env =
+            |env_entries: &mut Vec<String>| -> Result<(), DockerComposeError> {
+                if let Some(specs) = mount_specs {
+                    let mount_b64 = encode_mount_spec_b64(&label, specs)
+                        .map_err(|e| DockerComposeError::Other(e.to_string()))?;
+                    env_entries.push(format!("AMBER_MOUNT_SPEC_B64={mount_b64}"));
+                }
+                if let (Some(paths), Some(port)) = (docker_mount_paths, docker_mount_proxy_port) {
+                    let spec_b64 = encode_docker_mount_proxy_spec_b64(paths, port)?;
+                    env_entries.push(format!("{DOCKER_MOUNT_PROXY_SPEC_ENV}={spec_b64}"));
+                }
+                Ok(())
+            };
+
         match program_plan {
             ProgramPlan::Direct {
                 entrypoint, env, ..
@@ -956,11 +993,7 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
                 let env_b64 = encode_direct_env_b64(env)
                     .map_err(|e| DockerComposeError::Other(e.to_string()))?;
 
-                program_service
-                    .volumes
-                    .push(format!("{HELPER_VOLUME_NAME}:{HELPER_BIN_DIR}:ro"));
-                program_service.entrypoint =
-                    Some(vec![HELPER_BIN_PATH.to_string(), "run".to_string()]);
+                configure_helper_runner_service(&mut program_service);
 
                 let mut env_entries = Vec::new();
                 env_entries.push(format!("AMBER_DIRECT_ENTRYPOINT_B64={entrypoint_b64}"));
@@ -968,41 +1001,20 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
 
                 if needs_config_payload {
                     let view = runtime_view.expect("runtime config view should be computed");
-                    let root_schema_b64 = encode_schema_b64(
-                        &format!("root config definition for {label}"),
-                        &view.pruned_root_schema,
-                    )
-                    .map_err(|e| DockerComposeError::Other(e.to_string()))?;
-                    let root_env_entries =
-                        build_root_env_entries(root_leaves, &view.allowed_root_leaf_paths)?;
-                    env_entries.extend(root_env_entries);
-                    env_entries.push(format!("AMBER_ROOT_CONFIG_SCHEMA_B64={root_schema_b64}"));
-
                     let payload = encode_component_payload(
                         &label,
                         &view.component_template,
                         &view.component_schema,
                     )
                     .map_err(|e| DockerComposeError::Other(e.to_string()))?;
-                    env_entries.push(format!(
-                        "AMBER_COMPONENT_CONFIG_SCHEMA_B64={}",
-                        payload.component_schema_b64
-                    ));
-                    env_entries.push(format!(
-                        "AMBER_COMPONENT_CONFIG_TEMPLATE_B64={}",
-                        payload.component_cfg_template_b64
-                    ));
+                    append_runtime_config_env(
+                        &mut env_entries,
+                        &payload.component_schema_b64,
+                        &payload.component_cfg_template_b64,
+                    )?;
                 }
 
-                if let Some(specs) = mount_specs {
-                    let mount_b64 = encode_mount_spec_b64(&label, specs)
-                        .map_err(|e| DockerComposeError::Other(e.to_string()))?;
-                    env_entries.push(format!("AMBER_MOUNT_SPEC_B64={mount_b64}"));
-                }
-                if let (Some(paths), Some(port)) = (docker_mount_paths, docker_mount_proxy_port) {
-                    let spec_b64 = encode_docker_mount_proxy_spec_b64(paths, port)?;
-                    env_entries.push(format!("{DOCKER_MOUNT_PROXY_SPEC_ENV}={spec_b64}"));
-                }
+                append_mount_and_proxy_env(&mut env_entries)?;
 
                 program_service.environment = Some(Environment::List(env_entries));
             }
@@ -1016,43 +1028,20 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
                 )
                 .map_err(|e| DockerComposeError::Other(e.to_string()))?;
 
-                // Mount helper binary and run it as PID1; it execs the program entrypoint.
-                program_service
-                    .volumes
-                    .push(format!("{HELPER_VOLUME_NAME}:{HELPER_BIN_DIR}:ro"));
-                program_service.entrypoint =
-                    Some(vec![HELPER_BIN_PATH.to_string(), "run".to_string()]);
+                configure_helper_runner_service(&mut program_service);
 
                 // Security: only expose root config leaves needed for the used component paths.
-                let root_schema_b64 = encode_schema_b64(
-                    &format!("root config definition for {label}"),
-                    &view.pruned_root_schema,
-                )
-                .map_err(|e| DockerComposeError::Other(e.to_string()))?;
-                let mut env_entries =
-                    build_root_env_entries(root_leaves, &view.allowed_root_leaf_paths)?;
-                env_entries.push(format!("AMBER_ROOT_CONFIG_SCHEMA_B64={root_schema_b64}"));
-                env_entries.push(format!(
-                    "AMBER_COMPONENT_CONFIG_SCHEMA_B64={}",
-                    payload.component_schema_b64
-                ));
-                env_entries.push(format!(
-                    "AMBER_COMPONENT_CONFIG_TEMPLATE_B64={}",
-                    payload.component_cfg_template_b64
-                ));
+                let mut env_entries = Vec::new();
+                append_runtime_config_env(
+                    &mut env_entries,
+                    &payload.component_schema_b64,
+                    &payload.component_cfg_template_b64,
+                )?;
                 env_entries.push(format!(
                     "AMBER_TEMPLATE_SPEC_B64={}",
                     payload.template_spec_b64
                 ));
-                if let Some(specs) = mount_specs {
-                    let mount_b64 = encode_mount_spec_b64(&label, specs)
-                        .map_err(|e| DockerComposeError::Other(e.to_string()))?;
-                    env_entries.push(format!("AMBER_MOUNT_SPEC_B64={mount_b64}"));
-                }
-                if let (Some(paths), Some(port)) = (docker_mount_paths, docker_mount_proxy_port) {
-                    let spec_b64 = encode_docker_mount_proxy_spec_b64(paths, port)?;
-                    env_entries.push(format!("{DOCKER_MOUNT_PROXY_SPEC_ENV}={spec_b64}"));
-                }
+                append_mount_and_proxy_env(&mut env_entries)?;
                 program_service.environment = Some(Environment::List(env_entries));
             }
         }
@@ -1085,6 +1074,13 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
 }
 
 // ---- helpers ----
+
+fn configure_helper_runner_service(service: &mut Service) {
+    service
+        .volumes
+        .push(format!("{HELPER_VOLUME_NAME}:{HELPER_BIN_DIR}:ro"));
+    service.entrypoint = Some(vec![HELPER_BIN_PATH.to_string(), "run".to_string()]);
+}
 
 fn collect_framework_docker_mount_paths(
     scenario: &Scenario,

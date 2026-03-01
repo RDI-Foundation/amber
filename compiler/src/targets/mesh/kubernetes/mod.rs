@@ -550,6 +550,44 @@ fn render_kubernetes_inner(
             }
         }
 
+        let append_runtime_config_env = |container_env: &mut Vec<EnvVar>,
+                                         component_schema_b64: &str,
+                                         component_template_b64: &str|
+         -> Result<(), ReporterError> {
+            let view = runtime_view.expect("runtime config view should be computed");
+            let mut config_env =
+                build_component_config_env(root_leaves, &view.allowed_root_leaf_paths)?;
+            container_env.append(&mut config_env);
+
+            let root_schema_b64 = encode_schema_b64(
+                &format!("root config definition for {label}"),
+                &view.pruned_root_schema,
+            )
+            .map_err(|e| ReporterError::new(e.to_string()))?;
+            container_env.push(EnvVar::literal(
+                "AMBER_ROOT_CONFIG_SCHEMA_B64",
+                root_schema_b64,
+            ));
+            container_env.push(EnvVar::literal(
+                "AMBER_COMPONENT_CONFIG_SCHEMA_B64",
+                component_schema_b64,
+            ));
+            container_env.push(EnvVar::literal(
+                "AMBER_COMPONENT_CONFIG_TEMPLATE_B64",
+                component_template_b64,
+            ));
+            Ok(())
+        };
+
+        let append_mount_spec_env = |container_env: &mut Vec<EnvVar>| -> Result<(), ReporterError> {
+            if let Some(specs) = mount_specs {
+                let mount_b64 = encode_mount_spec_b64(&label, specs)
+                    .map_err(|e| ReporterError::new(e.to_string()))?;
+                container_env.push(EnvVar::literal("AMBER_MOUNT_SPEC_B64", mount_b64));
+            }
+            Ok(())
+        };
+
         // Build container based on program mode.
         let (container, volumes) = match program_plan {
             ProgramPlan::Direct {
@@ -592,61 +630,21 @@ fn render_kubernetes_inner(
 
                 if needs_config_payload {
                     let view = runtime_view.expect("runtime config view should be computed");
-                    let mut config_env =
-                        build_component_config_env(root_leaves, &view.allowed_root_leaf_paths)?;
-                    container_env.append(&mut config_env);
-
-                    let root_schema_b64 = encode_schema_b64(
-                        &format!("root config definition for {label}"),
-                        &view.pruned_root_schema,
-                    )
-                    .map_err(|e| ReporterError::new(e.to_string()))?;
-                    container_env.push(EnvVar::literal(
-                        "AMBER_ROOT_CONFIG_SCHEMA_B64",
-                        root_schema_b64,
-                    ));
-
                     let payload = encode_component_payload(
                         &label,
                         &view.component_template,
                         &view.component_schema,
                     )
                     .map_err(|e| ReporterError::new(e.to_string()))?;
-                    container_env.push(EnvVar::literal(
-                        "AMBER_COMPONENT_CONFIG_SCHEMA_B64",
+                    append_runtime_config_env(
+                        &mut container_env,
                         &payload.component_schema_b64,
-                    ));
-                    container_env.push(EnvVar::literal(
-                        "AMBER_COMPONENT_CONFIG_TEMPLATE_B64",
                         &payload.component_cfg_template_b64,
-                    ));
+                    )?;
                 }
 
-                if let Some(specs) = mount_specs {
-                    let mount_b64 = encode_mount_spec_b64(&label, specs)
-                        .map_err(|e| ReporterError::new(e.to_string()))?;
-                    container_env.push(EnvVar::literal("AMBER_MOUNT_SPEC_B64", mount_b64));
-                }
-
-                let container = Container {
-                    name: "main".to_string(),
-                    image: program_image.clone(),
-                    command: vec![HELPER_BIN_PATH.to_string(), "run".to_string()],
-                    args: Vec::new(),
-                    env: container_env,
-                    env_from: Vec::new(),
-                    ports,
-                    readiness_probe: None,
-                    volume_mounts: vec![VolumeMount {
-                        name: HELPER_VOLUME_NAME.to_string(),
-                        mount_path: HELPER_BIN_DIR.to_string(),
-                        read_only: Some(true),
-                    }],
-                };
-
-                let volumes = vec![Volume::empty_dir(HELPER_VOLUME_NAME)];
-
-                (container, volumes)
+                append_mount_spec_env(&mut container_env)?;
+                build_helper_runner_container(program_image.clone(), ports, container_env)
             }
             ProgramPlan::Helper { template_spec, .. } => {
                 let view = runtime_view.expect("runtime config view should be computed");
@@ -658,58 +656,18 @@ fn render_kubernetes_inner(
                 )
                 .map_err(|e| ReporterError::new(e.to_string()))?;
 
-                // Helper mode: use helper binary as entrypoint, mount shared volume.
-                // Security: only expose root config leaves needed for the used component paths.
-                let mut container_env =
-                    build_component_config_env(root_leaves, &view.allowed_root_leaf_paths)?;
-
-                // Add helper-specific env vars.
-                let root_schema_b64 = encode_schema_b64(
-                    &format!("root config definition for {label}"),
-                    &view.pruned_root_schema,
-                )
-                .map_err(|e| ReporterError::new(e.to_string()))?;
-                container_env.push(EnvVar::literal(
-                    "AMBER_ROOT_CONFIG_SCHEMA_B64",
-                    root_schema_b64,
-                ));
-                container_env.push(EnvVar::literal(
-                    "AMBER_COMPONENT_CONFIG_SCHEMA_B64",
+                let mut container_env = Vec::new();
+                append_runtime_config_env(
+                    &mut container_env,
                     &payload.component_schema_b64,
-                ));
-                container_env.push(EnvVar::literal(
-                    "AMBER_COMPONENT_CONFIG_TEMPLATE_B64",
                     &payload.component_cfg_template_b64,
-                ));
+                )?;
                 container_env.push(EnvVar::literal(
                     "AMBER_TEMPLATE_SPEC_B64",
                     &payload.template_spec_b64,
                 ));
-                if let Some(specs) = mount_specs {
-                    let mount_b64 = encode_mount_spec_b64(&label, specs)
-                        .map_err(|e| ReporterError::new(e.to_string()))?;
-                    container_env.push(EnvVar::literal("AMBER_MOUNT_SPEC_B64", mount_b64));
-                }
-
-                let container = Container {
-                    name: "main".to_string(),
-                    image: program_image.clone(),
-                    command: vec![HELPER_BIN_PATH.to_string(), "run".to_string()],
-                    args: Vec::new(),
-                    env: container_env,
-                    env_from: Vec::new(),
-                    ports,
-                    readiness_probe: None,
-                    volume_mounts: vec![VolumeMount {
-                        name: HELPER_VOLUME_NAME.to_string(),
-                        mount_path: HELPER_BIN_DIR.to_string(),
-                        read_only: Some(true),
-                    }],
-                };
-
-                let volumes = vec![Volume::empty_dir(HELPER_VOLUME_NAME)];
-
-                (container, volumes)
+                append_mount_spec_env(&mut container_env)?;
+                build_helper_runner_container(program_image.clone(), ports, container_env)
             }
         };
 
@@ -1537,6 +1495,30 @@ fn build_component_config_env(
     }
 
     Ok(env)
+}
+
+fn build_helper_runner_container(
+    program_image: String,
+    ports: Vec<ContainerPort>,
+    env: Vec<EnvVar>,
+) -> (Container, Vec<Volume>) {
+    let container = Container {
+        name: "main".to_string(),
+        image: program_image,
+        command: vec![HELPER_BIN_PATH.to_string(), "run".to_string()],
+        args: Vec::new(),
+        env,
+        env_from: Vec::new(),
+        ports,
+        readiness_probe: None,
+        volume_mounts: vec![VolumeMount {
+            name: HELPER_VOLUME_NAME.to_string(),
+            mount_path: HELPER_BIN_DIR.to_string(),
+            read_only: Some(true),
+        }],
+    };
+    let volumes = vec![Volume::empty_dir(HELPER_VOLUME_NAME)];
+    (container, volumes)
 }
 
 // ---- Runtime config / helper mode support ----
