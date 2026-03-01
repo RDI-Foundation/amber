@@ -605,53 +605,17 @@ fn validate_interpolated_config_string(
             continue;
         }
 
-        match parse_binding_query(query) {
-            Ok(parsed) => {
-                if !ctx.bindings.named.contains(parsed.name) {
-                    let help = unknown_binding_help_for_config(ctx.component_path, ctx.bindings);
-                    diagnostics.push(Report::new(InvalidBindingsInterpolation {
-                        component_path: ctx.component_path.to_string(),
-                        location: location.to_string(),
-                        message: format!("unknown binding name `{}`", parsed.name),
-                        help,
-                        src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source))
-                            .with_language("json5"),
-                        span,
-                        label: "binding interpolation here".to_string(),
-                    }));
-                } else if let Some(capability) = ctx.bindings.named_url_unsupported.get(parsed.name)
-                {
-                    let help = non_url_binding_help(parsed.name, capability);
-                    diagnostics.push(Report::new(InvalidBindingsInterpolation {
-                        component_path: ctx.component_path.to_string(),
-                        location: location.to_string(),
-                        message: format!(
-                            "binding `{}` does not expose a url (framework capability \
-                             `framework.{capability}` is not URL-shaped)",
-                            parsed.name
-                        ),
-                        help,
-                        src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source))
-                            .with_language("json5"),
-                        span,
-                        label: "binding interpolation here".to_string(),
-                    }));
-                }
-            }
-            Err(err) => {
-                let help = binding_query_help(&err);
-                diagnostics.push(Report::new(InvalidBindingsInterpolation {
-                    component_path: ctx.component_path.to_string(),
-                    location: location.to_string(),
-                    message: err.to_string(),
-                    help,
-                    src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source))
-                        .with_language("json5"),
-                    span,
-                    label: "binding interpolation here".to_string(),
-                }));
-            }
-        }
+        validate_binding_query_interpolation(
+            ctx.component_path,
+            ctx.bindings,
+            ctx.source,
+            ctx.src_name,
+            location,
+            span,
+            query,
+            unknown_binding_help_for_config,
+            diagnostics,
+        );
     }
 }
 
@@ -713,6 +677,63 @@ struct BindingValidationContext<'a> {
     src_name: &'a str,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_binding_query_interpolation(
+    component_path: &str,
+    bindings: &BindingLookup,
+    source: &Arc<str>,
+    src_name: &str,
+    location: &str,
+    span: SourceSpan,
+    query: &str,
+    unknown_binding_help_fn: fn(&str, &BindingLookup) -> String,
+    diagnostics: &mut Vec<Report>,
+) {
+    match parse_binding_query(query) {
+        Ok(parsed) => {
+            if !bindings.named.contains(parsed.name) {
+                let help = unknown_binding_help_fn(component_path, bindings);
+                diagnostics.push(Report::new(InvalidBindingsInterpolation {
+                    component_path: component_path.to_string(),
+                    location: location.to_string(),
+                    message: format!("unknown binding name `{}`", parsed.name),
+                    help,
+                    src: NamedSource::new(src_name, Arc::clone(source)).with_language("json5"),
+                    span,
+                    label: "binding interpolation here".to_string(),
+                }));
+            } else if let Some(capability) = bindings.named_url_unsupported.get(parsed.name) {
+                let help = non_url_binding_help(parsed.name, capability);
+                diagnostics.push(Report::new(InvalidBindingsInterpolation {
+                    component_path: component_path.to_string(),
+                    location: location.to_string(),
+                    message: format!(
+                        "binding `{}` does not expose a url (framework capability \
+                         `framework.{capability}` is not URL-shaped)",
+                        parsed.name
+                    ),
+                    help,
+                    src: NamedSource::new(src_name, Arc::clone(source)).with_language("json5"),
+                    span,
+                    label: "binding interpolation here".to_string(),
+                }));
+            }
+        }
+        Err(err) => {
+            let help = binding_query_help(&err);
+            diagnostics.push(Report::new(InvalidBindingsInterpolation {
+                component_path: component_path.to_string(),
+                location: location.to_string(),
+                message: err.to_string(),
+                help,
+                src: NamedSource::new(src_name, Arc::clone(source)).with_language("json5"),
+                span,
+                label: "binding interpolation here".to_string(),
+            }));
+        }
+    }
+}
+
 fn validate_interpolated_string(
     value: &InterpolatedString,
     ctx: &BindingValidationContext<'_>,
@@ -732,53 +753,18 @@ fn validate_interpolated_string(
             continue;
         }
 
-        match parse_binding_query(query) {
-            Ok(parsed) => {
-                if !ctx.bindings.named.contains(parsed.name) {
-                    let help = unknown_binding_help(ctx.component_path, ctx.bindings);
-                    diagnostics.push(Report::new(InvalidBindingsInterpolation {
-                        component_path: ctx.component_path.to_string(),
-                        location: location.label(),
-                        message: format!("unknown binding name `{}`", parsed.name),
-                        help,
-                        src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source))
-                            .with_language("json5"),
-                        span,
-                        label: "binding interpolation here".to_string(),
-                    }));
-                } else if let Some(capability) = ctx.bindings.named_url_unsupported.get(parsed.name)
-                {
-                    let help = non_url_binding_help(parsed.name, capability);
-                    diagnostics.push(Report::new(InvalidBindingsInterpolation {
-                        component_path: ctx.component_path.to_string(),
-                        location: location.label(),
-                        message: format!(
-                            "binding `{}` does not expose a url (framework capability \
-                             `framework.{capability}` is not URL-shaped)",
-                            parsed.name
-                        ),
-                        help,
-                        src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source))
-                            .with_language("json5"),
-                        span,
-                        label: "binding interpolation here".to_string(),
-                    }));
-                }
-            }
-            Err(err) => {
-                let help = binding_query_help(&err);
-                diagnostics.push(Report::new(InvalidBindingsInterpolation {
-                    component_path: ctx.component_path.to_string(),
-                    location: location.label(),
-                    message: err.to_string(),
-                    help,
-                    src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source))
-                        .with_language("json5"),
-                    span,
-                    label: "binding interpolation here".to_string(),
-                }));
-            }
-        }
+        let location = location.label();
+        validate_binding_query_interpolation(
+            ctx.component_path,
+            ctx.bindings,
+            ctx.source,
+            ctx.src_name,
+            &location,
+            span,
+            query,
+            unknown_binding_help,
+            diagnostics,
+        );
     }
 }
 

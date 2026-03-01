@@ -912,6 +912,23 @@ fn validate_config_tree(
     schema_cache: &mut HashMap<ManifestDigest, Arc<Validator>>,
     errors: &mut Vec<Error>,
 ) {
+    fn invalid_config_error(
+        component_path: String,
+        site: &ConfigSite,
+        message: impl Into<String>,
+        label: Option<String>,
+        related: Vec<RelatedSpan>,
+    ) -> Error {
+        Error::InvalidConfig {
+            component_path,
+            message: message.into(),
+            src: site.src.clone(),
+            span: site.span,
+            label: label.unwrap_or_else(|| site.label.clone()),
+            related,
+        }
+    }
+
     // 1) Validate Amber-specific schema constraints for every declared config_schema.
     for id in (0..components.len()).map(ComponentId) {
         let m = manifests[id.0].as_ref().expect("manifest should exist");
@@ -921,14 +938,13 @@ fn validate_config_tree(
         if let Err(err) = rc::validate_config_schema(&schema_decl.0) {
             let component_path = component_path_for(components, id);
             let site = ConfigErrorSite::new(components, provenance, store, id).config_site();
-            errors.push(Error::InvalidConfig {
+            errors.push(invalid_config_error(
                 component_path,
-                message: format!("invalid config definition: {err}"),
-                src: site.src,
-                span: site.span,
-                label: site.label,
-                related: Vec::new(),
-            });
+                &site,
+                format!("invalid config definition: {err}"),
+                None,
+                Vec::new(),
+            ));
         }
     }
 
@@ -958,32 +974,28 @@ fn validate_config_tree(
                 format!(".{query}")
             };
             let Some(schema) = schema else {
-                errors.push(Error::InvalidConfig {
-                    component_path: component_path.clone(),
-                    message: format!(
+                errors.push(invalid_config_error(
+                    component_path.clone(),
+                    &site,
+                    format!(
                         "{location} references ${{config{interp_suffix}}}, but this component \
                          does not declare `config_schema`"
                     ),
-                    src: site.src.clone(),
-                    span: site.span,
-                    label: "config definition required".to_string(),
-                    related: Vec::new(),
-                });
+                    Some("config definition required".to_string()),
+                    Vec::new(),
+                ));
                 return;
             };
             match rc::schema_lookup(schema, query) {
                 Ok(rc::SchemaLookup::Found) | Ok(rc::SchemaLookup::Unknown) => {}
                 Err(e) => {
-                    errors.push(Error::InvalidConfig {
-                        component_path: component_path.clone(),
-                        message: format!(
-                            "invalid ${{config{interp_suffix}}} reference in {location}: {e}"
-                        ),
-                        src: site.src.clone(),
-                        span: site.span,
-                        label: "invalid config reference".to_string(),
-                        related: Vec::new(),
-                    });
+                    errors.push(invalid_config_error(
+                        component_path.clone(),
+                        &site,
+                        format!("invalid ${{config{interp_suffix}}} reference in {location}: {e}"),
+                        Some("invalid config reference".to_string()),
+                        Vec::new(),
+                    ));
                 }
             }
         };
@@ -1146,29 +1158,27 @@ fn validate_config_tree(
                 Arc::clone(v)
             } else {
                 let v = Arc::new(jsonschema::validator_for(schema_value).map_err(|e| {
-                    Error::InvalidConfig {
-                        component_path: component_path.clone(),
-                        message: format!("{context}: failed to compile schema: {e}"),
-                        src: site.src.clone(),
-                        span: site.span,
-                        label: site.label.clone(),
-                        related: Vec::new(),
-                    }
+                    invalid_config_error(
+                        component_path.clone(),
+                        &site,
+                        format!("{context}: failed to compile schema: {e}"),
+                        None,
+                        Vec::new(),
+                    )
                 })?);
                 schema_cache.insert(c.digest, Arc::clone(&v));
                 v
             }
         } else {
-            Arc::new(
-                jsonschema::validator_for(schema_value).map_err(|e| Error::InvalidConfig {
-                    component_path: component_path.clone(),
-                    message: format!("{context}: failed to compile projected schema: {e}"),
-                    src: site.src.clone(),
-                    span: site.span,
-                    label: site.label.clone(),
-                    related: Vec::new(),
-                })?,
-            )
+            Arc::new(jsonschema::validator_for(schema_value).map_err(|e| {
+                invalid_config_error(
+                    component_path.clone(),
+                    &site,
+                    format!("{context}: failed to compile projected schema: {e}"),
+                    None,
+                    Vec::new(),
+                )
+            })?)
         };
 
         let mut errs = validator.iter_errors(instance);
@@ -1181,14 +1191,13 @@ fn validate_config_tree(
         if let Some(value_site) = error_site.invalid_value_site(&instance_path) {
             site = value_site;
         }
-        Err(Error::InvalidConfig {
+        Err(invalid_config_error(
             component_path,
-            message: format!("{context}: {}", msgs.join("; ")),
-            src: site.src,
-            span: site.span,
-            label: site.label,
+            &site,
+            format!("{context}: {}", msgs.join("; ")),
+            None,
             related,
-        })
+        ))
     }
 
     for id in (0..components.len()).map(ComponentId) {
@@ -1202,14 +1211,13 @@ fn validate_config_tree(
     for err in &composed.errors {
         let component_path = component_path_for(components, err.component);
         let site = ConfigErrorSite::new(components, provenance, store, err.component).config_site();
-        errors.push(Error::InvalidConfig {
+        errors.push(invalid_config_error(
             component_path,
-            message: err.message.clone(),
-            src: site.src,
-            span: site.span,
-            label: site.label,
-            related: Vec::new(),
-        });
+            &site,
+            err.message.clone(),
+            None,
+            Vec::new(),
+        ));
     }
 
     for id in (0..components.len()).map(ComponentId) {
@@ -1222,16 +1230,13 @@ fn validate_config_tree(
 
         let Some(schema) = schema else {
             if c.config.is_some() {
-                errors.push(Error::InvalidConfig {
-                    component_path: component_path.clone(),
-                    message: "config was provided for a component that does not declare \
-                              `config_schema`"
-                        .to_string(),
-                    src: site.src.clone(),
-                    span: site.span,
-                    label: site.label.clone(),
-                    related: Vec::new(),
-                });
+                errors.push(invalid_config_error(
+                    component_path.clone(),
+                    &site,
+                    "config was provided for a component that does not declare `config_schema`",
+                    None,
+                    Vec::new(),
+                ));
             }
             continue;
         };
@@ -1243,28 +1248,24 @@ fn validate_config_tree(
         };
 
         if !composed.is_object() {
-            errors.push(Error::InvalidConfig {
-                component_path: component_path.clone(),
-                message: "component config must be an object (non-object config templates are \
-                          unsupported)"
-                    .to_string(),
-                src: site.src.clone(),
-                span: site.span,
-                label: site.label.clone(),
-                related: Vec::new(),
-            });
+            errors.push(invalid_config_error(
+                component_path.clone(),
+                &site,
+                "component config must be an object (non-object config templates are unsupported)",
+                None,
+                Vec::new(),
+            ));
             continue;
         }
 
         if let Err(msg) = ensure_required_keys_present(schema, composed, "") {
-            errors.push(Error::InvalidConfig {
-                component_path: component_path.clone(),
-                message: msg,
-                src: site.src.clone(),
-                span: site.span,
-                label: site.label.clone(),
-                related: Vec::new(),
-            });
+            errors.push(invalid_config_error(
+                component_path.clone(),
+                &site,
+                msg,
+                None,
+                Vec::new(),
+            ));
         }
 
         // Validate static values at compile time.
@@ -1285,14 +1286,13 @@ fn validate_config_tree(
                         errors.push(e);
                     }
                 }
-                Err(err) => errors.push(Error::InvalidConfig {
-                    component_path: component_path.clone(),
-                    message: err.to_string(),
-                    src: site.src.clone(),
-                    span: site.span,
-                    label: site.label.clone(),
-                    related: Vec::new(),
-                }),
+                Err(err) => errors.push(invalid_config_error(
+                    component_path.clone(),
+                    &site,
+                    err.to_string(),
+                    None,
+                    Vec::new(),
+                )),
             }
         } else if let Some(partial) = composed.static_subset() {
             let projected = project_schema_for_partial(schema, &partial);
