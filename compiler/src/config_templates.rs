@@ -22,9 +22,16 @@ pub fn compose_root_config_templates(
     root: ComponentId,
     components: &[Option<Component>],
 ) -> ComposedTemplates {
-    let root_schema = components[root.0]
-        .as_ref()
-        .and_then(|component| component.config_schema.as_ref());
+    let Some(root_component) = components.get(root.0).and_then(Option::as_ref) else {
+        return ComposedTemplates {
+            templates: HashMap::new(),
+            errors: vec![TemplateError {
+                component: root,
+                message: format!("root component id {} does not exist", root.0),
+            }],
+        };
+    };
+    let root_schema = root_component.config_schema.as_ref();
 
     let root_template = if root_schema.is_some() {
         rc::RootConfigTemplate::Root
@@ -46,7 +53,13 @@ pub fn compose_root_config_templates(
         templates: &mut HashMap<ComponentId, rc::RootConfigTemplate>,
         errors: &mut Vec<TemplateError>,
     ) {
-        let c = components[id.0].as_ref().expect("component should exist");
+        let Some(c) = components.get(id.0).and_then(Option::as_ref) else {
+            errors.push(TemplateError {
+                component: id,
+                message: format!("component id {} does not exist", id.0),
+            });
+            return;
+        };
         let schema = c.config_schema.as_ref();
 
         let this_template = if id == root {

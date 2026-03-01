@@ -75,16 +75,12 @@ pub struct Scenario {
 }
 
 impl Scenario {
-    pub fn component(&self, id: ComponentId) -> &Component {
-        self.components[id.0]
-            .as_ref()
-            .expect("component should exist")
+    pub fn component(&self, id: ComponentId) -> Option<&Component> {
+        self.components.get(id.0).and_then(Option::as_ref)
     }
 
-    pub fn component_mut(&mut self, id: ComponentId) -> &mut Component {
-        self.components[id.0]
-            .as_mut()
-            .expect("component should exist")
+    pub fn component_mut(&mut self, id: ComponentId) -> Option<&mut Component> {
+        self.components.get_mut(id.0).and_then(Option::as_mut)
     }
 
     pub fn components_iter(&self) -> impl Iterator<Item = (ComponentId, &Component)> {
@@ -114,13 +110,15 @@ impl Scenario {
 
         for component in self.components.iter_mut().flatten() {
             component.children.sort_by(|a, b| {
-                let left = monikers[a.0]
-                    .as_ref()
-                    .expect("child component should exist");
-                let right = monikers[b.0]
-                    .as_ref()
-                    .expect("child component should exist");
-                left.cmp(right)
+                match (
+                    monikers.get(a.0).and_then(Option::as_ref),
+                    monikers.get(b.0).and_then(Option::as_ref),
+                ) {
+                    (Some(left), Some(right)) => left.cmp(right),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.0.cmp(&b.0),
+                }
             });
         }
     }
@@ -136,11 +134,15 @@ impl Scenario {
             return;
         }
 
-        let _ = self.component(self.root);
+        let _ = self
+            .component(self.root)
+            .expect("root component should exist");
 
         for (id, component) in self.components_iter() {
             if let Some(parent) = component.parent {
-                let parent_component = self.component(parent);
+                let parent_component = self
+                    .component(parent)
+                    .expect("parent component should exist");
                 debug_assert!(
                     parent_component.children.contains(&id),
                     "parent missing child edge"
@@ -151,7 +153,7 @@ impl Scenario {
             let mut last_moniker: Option<&Moniker> = None;
             for &child in &component.children {
                 debug_assert!(seen.insert(child), "duplicate child edge");
-                let child_component = self.component(child);
+                let child_component = self.component(child).expect("child component should exist");
                 debug_assert_eq!(
                     child_component.parent,
                     Some(id),
@@ -170,14 +172,20 @@ impl Scenario {
         for binding in &self.bindings {
             match &binding.from {
                 BindingFrom::Component(provide) => {
-                    let _ = self.component(provide.component);
+                    let _ = self
+                        .component(provide.component)
+                        .expect("binding source component should exist");
                 }
                 BindingFrom::External(slot) => {
-                    let _ = self.component(slot.component);
+                    let _ = self
+                        .component(slot.component)
+                        .expect("external slot component should exist");
                 }
                 BindingFrom::Framework(_) => {}
             }
-            let _ = self.component(binding.to.component);
+            let _ = self
+                .component(binding.to.component)
+                .expect("binding target component should exist");
         }
 
         let mut export_names = HashSet::new();
@@ -186,7 +194,9 @@ impl Scenario {
                 export_names.insert(&export.name),
                 "duplicate scenario export name"
             );
-            let _ = self.component(export.from.component);
+            let _ = self
+                .component(export.from.component)
+                .expect("export source component should exist");
         }
     }
 }

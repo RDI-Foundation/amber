@@ -101,16 +101,28 @@ pub(crate) fn build_mesh_plan(
         .collect();
 
     for binding in &scenario.bindings {
-        if let BindingFrom::Component(from) = &binding.from
-            && scenario.component(from.component).program.is_none()
-        {
-            return Err(MeshError::new(format!(
-                "binding source {}.{} is not runnable (component has no program)",
-                component_label(scenario, from.component),
-                from.name
-            )));
+        if let BindingFrom::Component(from) = &binding.from {
+            let Some(source_component) = scenario.component(from.component) else {
+                return Err(MeshError::new(format!(
+                    "binding source references missing component id {}",
+                    from.component.0
+                )));
+            };
+            if source_component.program.is_none() {
+                return Err(MeshError::new(format!(
+                    "binding source {}.{} is not runnable (component has no program)",
+                    component_label(scenario, from.component),
+                    from.name
+                )));
+            }
         }
-        if scenario.component(binding.to.component).program.is_none() {
+        let Some(target_component) = scenario.component(binding.to.component) else {
+            return Err(MeshError::new(format!(
+                "binding target references missing component id {}",
+                binding.to.component.0
+            )));
+        };
+        if target_component.program.is_none() {
             return Err(MeshError::new(format!(
                 "binding target {}.{} is not runnable (component has no program)",
                 component_label(scenario, binding.to.component),
@@ -119,7 +131,13 @@ pub(crate) fn build_mesh_plan(
         }
     }
     for ex in &scenario.exports {
-        if scenario.component(ex.from.component).program.is_none() {
+        let Some(export_component) = scenario.component(ex.from.component) else {
+            return Err(MeshError::new(format!(
+                "scenario export '{}' references missing component id {}",
+                ex.name, ex.from.component.0
+            )));
+        };
+        if export_component.program.is_none() {
             return Err(MeshError::new(format!(
                 "scenario export '{}' points at {}.{} which is not runnable (component has no \
                  program)",
@@ -223,14 +241,22 @@ pub(crate) fn build_mesh_plan(
 }
 
 pub(crate) fn component_label(scenario: &Scenario, id: ComponentId) -> String {
-    scenario.component(id).moniker.as_str().to_string()
+    scenario
+        .component(id)
+        .map(|component| component.moniker.as_str().to_string())
+        .unwrap_or_else(|| format!("<missing-component-{}>", id.0))
 }
 fn resolve_provide_endpoint(
     scenario: &Scenario,
     component_id: ComponentId,
     provide_name: &str,
 ) -> Result<EndpointInfo, MeshError> {
-    let component = scenario.component(component_id);
+    let component = scenario.component(component_id).ok_or_else(|| {
+        MeshError::new(format!(
+            "component id {} referenced for provide {} but does not exist",
+            component_id.0, provide_name
+        ))
+    })?;
 
     let provide = component.provides.get(provide_name).ok_or_else(|| {
         MeshError::new(format!(

@@ -185,6 +185,7 @@ fn flatten_removes_pure_routing_nodes_and_preserves_debug_data() {
     assert_eq!(
         provenance
             .for_component(ComponentId(2))
+            .expect("provenance for component 2")
             .authored_moniker
             .as_str(),
         "/parent/child"

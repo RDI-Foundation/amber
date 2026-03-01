@@ -346,6 +346,94 @@ fn standard_compile_options() -> CompileOptions {
     CompileOptions::testing(false)
 }
 
+fn manifest_ref(path: &Path) -> ManifestRef {
+    ManifestRef::from_url(Url::from_file_path(path).expect("manifest file url"))
+}
+
+fn compile_manifest(
+    path: &Path,
+    opts: CompileOptions,
+) -> Result<crate::CompileOutput, Box<crate::Error>> {
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime
+        .block_on(compiler.compile(manifest_ref(path), opts))
+        .map_err(Box::new)
+}
+
+fn slot_ref(component: u8, name: &str) -> SlotRef {
+    SlotRef {
+        component: ComponentId(component as usize),
+        name: name.to_string(),
+    }
+}
+
+fn provide_ref(component: u8, name: &str) -> ProvideRef {
+    ProvideRef {
+        component: ComponentId(component as usize),
+        name: name.to_string(),
+    }
+}
+
+fn component_binding(
+    from_component: u8,
+    from_name: &str,
+    to_component: u8,
+    to_name: &str,
+) -> BindingEdge {
+    BindingEdge {
+        name: None,
+        from: BindingFrom::Component(provide_ref(from_component, from_name)),
+        to: slot_ref(to_component, to_name),
+        weak: false,
+    }
+}
+
+fn named_component_binding(
+    binding_name: &str,
+    from_component: u8,
+    from_name: &str,
+    to_component: u8,
+    to_name: &str,
+) -> BindingEdge {
+    BindingEdge {
+        name: Some(binding_name.to_string()),
+        from: BindingFrom::Component(provide_ref(from_component, from_name)),
+        to: slot_ref(to_component, to_name),
+        weak: false,
+    }
+}
+
+fn external_binding(
+    from_component: u8,
+    from_name: &str,
+    to_component: u8,
+    to_name: &str,
+) -> BindingEdge {
+    BindingEdge {
+        name: None,
+        from: BindingFrom::External(slot_ref(from_component, from_name)),
+        to: slot_ref(to_component, to_name),
+        weak: true,
+    }
+}
+
+fn framework_binding(
+    framework_capability: &str,
+    binding_name: Option<&str>,
+    to_component: u8,
+    to_name: &str,
+) -> BindingEdge {
+    BindingEdge {
+        name: binding_name.map(str::to_string),
+        from: BindingFrom::Framework(
+            FrameworkCapabilityName::try_from(framework_capability).expect("framework capability"),
+        ),
+        to: slot_ref(to_component, to_name),
+        weak: false,
+    }
+}
+
 #[test]
 fn compose_emits_sidecars_and_programs_and_slot_urls() {
     let server_program = serde_json::from_value(json!({
@@ -390,18 +478,7 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
 
     let scenario = scenario(
         vec![root, server, client],
-        vec![BindingEdge {
-            name: None,
-            from: BindingFrom::Component(ProvideRef {
-                component: ComponentId(1),
-                name: "api".to_string(),
-            }),
-            to: SlotRef {
-                component: ComponentId(2),
-                name: "api".to_string(),
-            },
-            weak: false,
-        }],
+        vec![component_binding(1, "api", 2, "api")],
         vec![],
     );
 
@@ -584,18 +661,7 @@ fn compose_resolves_binding_urls_in_child_config() {
 
     let scenario = scenario(
         vec![root, server, client, observer],
-        vec![BindingEdge {
-            name: Some("bind".to_string()),
-            from: BindingFrom::Component(ProvideRef {
-                component: ComponentId(1),
-                name: "api".to_string(),
-            }),
-            to: SlotRef {
-                component: ComponentId(2),
-                name: "api".to_string(),
-            },
-            weak: false,
-        }],
+        vec![named_component_binding("bind", 1, "api", 2, "api")],
         vec![],
     );
 
@@ -708,18 +774,7 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
 
     let scenario = scenario(
         vec![root, server, client, grandparent, parent, child],
-        vec![BindingEdge {
-            name: Some("bind".to_string()),
-            from: BindingFrom::Component(ProvideRef {
-                component: ComponentId(1),
-                name: "api".to_string(),
-            }),
-            to: SlotRef {
-                component: ComponentId(2),
-                name: "api".to_string(),
-            },
-            weak: false,
-        }],
+        vec![named_component_binding("bind", 1, "api", 2, "api")],
         vec![],
     );
 
@@ -1121,18 +1176,7 @@ fn compose_routes_external_slots_through_router() {
 
     let scenario = scenario(
         vec![root, client],
-        vec![BindingEdge {
-            name: None,
-            from: BindingFrom::External(SlotRef {
-                component: ComponentId(0),
-                name: "api".to_string(),
-            }),
-            to: SlotRef {
-                component: ComponentId(1),
-                name: "api".to_string(),
-            },
-            weak: true,
-        }],
+        vec![external_binding(0, "api", 1, "api")],
         Vec::new(),
     );
 
@@ -1227,17 +1271,9 @@ fn compose_external_slots_and_exports_work_together_with_and_without_dce() {
     )
     .unwrap();
 
-    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let rt = tokio::runtime::Runtime::new().unwrap();
-
     for dce in [true, false] {
-        let opts = CompileOptions::testing(dce);
-        let output = rt
-            .block_on(compiler.compile(
-                ManifestRef::from_url(Url::from_file_path(&root_path).unwrap()),
-                opts,
-            ))
-            .expect("compile ok");
+        let output =
+            compile_manifest(&root_path, CompileOptions::testing(dce)).expect("compile ok");
 
         let yaml = emit_yaml(&output.scenario);
         let b64 = extract_compose_env_value(&yaml, "AMBER_ROUTER_CONFIG_B64")
@@ -1305,25 +1341,11 @@ fn compose_ignores_unused_config_binding_paths_under_dce() {
 
     let scenario = scenario(
         vec![root, consumer, provider],
-        vec![BindingEdge {
-            name: None,
-            from: BindingFrom::Component(ProvideRef {
-                component: ComponentId(2),
-                name: "up".to_string(),
-            }),
-            to: SlotRef {
-                component: ComponentId(0),
-                name: "up".to_string(),
-            },
-            weak: false,
-        }],
+        vec![component_binding(2, "up", 0, "up")],
         vec![ScenarioExport {
             name: "out".to_string(),
             capability: provide_out.decl.clone(),
-            from: ProvideRef {
-                component: ComponentId(1),
-                name: "out".to_string(),
-            },
+            from: provide_ref(1, "out"),
         }],
     );
 
@@ -1423,18 +1445,7 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
 
     let scenario = scenario(
         vec![root, client],
-        vec![BindingEdge {
-            name: None,
-            from: BindingFrom::External(SlotRef {
-                component: ComponentId(0),
-                name: "api".to_string(),
-            }),
-            to: SlotRef {
-                component: ComponentId(1),
-                name: "api".to_string(),
-            },
-            weak: true,
-        }],
+        vec![external_binding(0, "api", 1, "api")],
         Vec::new(),
     );
 
@@ -1679,30 +1690,8 @@ fn errors_on_shared_port_with_different_endpoints() {
     let scenario = scenario(
         vec![root, server, client],
         vec![
-            BindingEdge {
-                name: None,
-                from: BindingFrom::Component(ProvideRef {
-                    component: ComponentId(1),
-                    name: "v1".to_string(),
-                }),
-                to: SlotRef {
-                    component: ComponentId(2),
-                    name: "v1".to_string(),
-                },
-                weak: false,
-            },
-            BindingEdge {
-                name: None,
-                from: BindingFrom::Component(ProvideRef {
-                    component: ComponentId(1),
-                    name: "admin".to_string(),
-                }),
-                to: SlotRef {
-                    component: ComponentId(2),
-                    name: "admin".to_string(),
-                },
-                weak: false,
-            },
+            component_binding(1, "v1", 2, "v1"),
+            component_binding(1, "admin", 2, "admin"),
         ],
         vec![],
     );
@@ -1748,15 +1737,7 @@ fn docker_compose_wires_framework_docker_binding_via_gateway() {
 
     let scenario = scenario(
         vec![root, worker],
-        vec![BindingEdge {
-            name: Some("docker".to_string()),
-            from: BindingFrom::Framework(FrameworkCapabilityName::try_from("docker").unwrap()),
-            to: SlotRef {
-                component: ComponentId(1),
-                name: "docker".to_string(),
-            },
-            weak: false,
-        }],
+        vec![framework_binding("docker", Some("docker"), 1, "docker")],
         Vec::new(),
     );
 
@@ -1808,17 +1789,7 @@ fn docker_compose_rejects_unknown_framework_bindings() {
 
     let scenario = scenario(
         vec![root, worker],
-        vec![BindingEdge {
-            name: None,
-            from: BindingFrom::Framework(
-                FrameworkCapabilityName::try_from("dynamic_children").unwrap(),
-            ),
-            to: SlotRef {
-                component: ComponentId(1),
-                name: "control".to_string(),
-            },
-            weak: false,
-        }],
+        vec![framework_binding("dynamic_children", None, 1, "control")],
         Vec::new(),
     );
 
@@ -1953,18 +1924,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
 
     let scenario = scenario(
         vec![root, server, allowed, denied],
-        vec![BindingEdge {
-            name: None,
-            from: BindingFrom::Component(ProvideRef {
-                component: ComponentId(1),
-                name: "api".to_string(),
-            }),
-            to: SlotRef {
-                component: ComponentId(2),
-                name: "api".to_string(),
-            },
-            weak: false,
-        }],
+        vec![component_binding(1, "api", 2, "api")],
         vec![],
     );
 
@@ -2351,14 +2311,7 @@ fn docker_smoke_framework_docker_binding_runs_cli_and_teardown_cleanup(
     )
     .expect("write root manifest");
 
-    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let rt = tokio::runtime::Runtime::new().expect("runtime");
-    let output = rt
-        .block_on(compiler.compile(
-            ManifestRef::from_url(Url::from_file_path(&root_path).expect("root file url")),
-            standard_compile_options(),
-        ))
-        .expect("compile ok");
+    let output = compile_manifest(&root_path, standard_compile_options()).expect("compile ok");
     let yaml = emit_yaml(&output.scenario);
     assert!(yaml.contains("amber-docker-gateway"), "{yaml}");
     fs::write(project.join("docker-compose.yaml"), yaml).expect("write compose yaml");
@@ -2629,18 +2582,10 @@ fn docker_compose_flattens_routing_components_with_and_without_dce() {
     )
     .unwrap();
 
-    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let rt = tokio::runtime::Runtime::new().unwrap();
-
     let mut agent_urls = Vec::new();
     for dce in [true, false] {
-        let opts = CompileOptions::testing(dce);
-        let output = rt
-            .block_on(compiler.compile(
-                ManifestRef::from_url(Url::from_file_path(&root_path).unwrap()),
-                opts,
-            ))
-            .expect("compile ok");
+        let output =
+            compile_manifest(&root_path, CompileOptions::testing(dce)).expect("compile ok");
 
         let (_yaml, compose) = emit_compose(&output.scenario);
         let agent_url = compose
@@ -2665,7 +2610,6 @@ fn docker_compose_flattens_routing_components_with_and_without_dce() {
 fn docker_smoke_config_forwarding_runtime_validation() {
     use std::{fs, process::Command, thread, time::Duration};
 
-    use amber_resolver::Resolver;
     use tempfile::tempdir;
 
     let dir = tempdir().unwrap();
@@ -2774,27 +2718,14 @@ fn docker_smoke_config_forwarding_runtime_validation() {
     )
     .unwrap();
 
-    let compiler = crate::Compiler::new(Resolver::new(), crate::DigestStore::default());
     let opts = standard_compile_options();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-
-    let err = rt
-        .block_on(compiler.compile(
-            ManifestRef::from_url(Url::from_file_path(&root_invalid_path).unwrap()),
-            opts.clone(),
-        ))
-        .unwrap_err();
+    let err = *compile_manifest(&root_invalid_path, opts.clone()).unwrap_err();
     assert!(
         error_contains(&err, "missing required field config.system_prompt"),
         "unexpected compile error: {err}"
     );
 
-    let output = rt
-        .block_on(compiler.compile(
-            ManifestRef::from_url(Url::from_file_path(&root_valid_path).unwrap()),
-            opts,
-        ))
-        .expect("compile ok");
+    let output = compile_manifest(&root_valid_path, opts).expect("compile ok");
 
     let yaml = emit_yaml(&output.scenario);
     fs::write(project.join("docker-compose.yaml"), yaml).unwrap();

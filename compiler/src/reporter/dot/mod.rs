@@ -35,7 +35,7 @@ fn render_dot_with_exports(s: &Scenario) -> String {
         let kind = export.capability.kind;
         exports.push(ExportEdge {
             endpoint_label: endpoint_label_for_provide(
-                s.component(from),
+                s.component(from).expect("component should exist"),
                 export.from.name.as_str(),
             ),
             from,
@@ -48,7 +48,11 @@ fn render_dot_with_exports(s: &Scenario) -> String {
 
 fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
     let root = s.root;
-    let root_has_program = s.component(root).program.is_some();
+    let root_has_program = s
+        .component(root)
+        .expect("component should exist")
+        .program
+        .is_some();
     let root_has_binding = s.bindings.iter().any(|b| {
         matches!(&b.from, BindingFrom::Component(from) if from.component == root)
             || b.to.component == root
@@ -173,7 +177,7 @@ fn endpoint_label_for_provide(component: &Component, provide_name: &str) -> Stri
 
 fn render_root(s: &Scenario, render_root_node: bool, indent: usize, out: &mut String) {
     let root = s.root;
-    let c = s.component(root);
+    let c = s.component(root).expect("component should exist");
 
     write_indent(out, indent);
     let _ = writeln!(out, "subgraph cluster_{} {{", root.0);
@@ -199,7 +203,7 @@ fn render_root(s: &Scenario, render_root_node: bool, indent: usize, out: &mut St
 }
 
 fn render_component(s: &Scenario, id: ComponentId, indent: usize, out: &mut String) {
-    let c = s.component(id);
+    let c = s.component(id).expect("component should exist");
 
     if c.children.is_empty() {
         render_node(s, id, indent, out);
@@ -228,7 +232,12 @@ fn render_component(s: &Scenario, id: ComponentId, indent: usize, out: &mut Stri
 }
 
 fn render_node(s: &Scenario, id: ComponentId, indent: usize, out: &mut String) {
-    let label = s.component(id).moniker.as_str().to_string();
+    let label = s
+        .component(id)
+        .expect("component should exist")
+        .moniker
+        .as_str()
+        .to_string();
     render_node_with_label(id, label.as_str(), indent, out);
 }
 

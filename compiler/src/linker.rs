@@ -98,7 +98,7 @@ fn source_for_component(
     store: &DigestStore,
     id: ComponentId,
 ) -> Option<(NamedSource<Arc<str>>, Arc<amber_manifest::ManifestSpans>)> {
-    let url = &provenance.for_component(id).resolved_url;
+    let url = &provenance.for_component(id)?.resolved_url;
     store.diagnostic_source(url)
 }
 
@@ -218,7 +218,7 @@ impl<'a> ConfigErrorSite<'a> {
         let component = self.component();
         let parent = component.parent?;
         component.config.as_ref()?;
-        let parent_prov = self.provenance.for_component(parent);
+        let parent_prov = self.provenance.for_component(parent)?;
         let stored = self.store.get_source(&parent_prov.resolved_url)?;
         let component_spans = stored
             .spans

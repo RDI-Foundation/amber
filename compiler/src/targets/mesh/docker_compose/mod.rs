@@ -268,7 +268,11 @@ impl DockerComposeError {
                     provide,
                     endpoint,
                 } = *conflict;
-                let component_moniker = scenario.component(component).moniker.as_str();
+                let component_moniker = scenario
+                    .component(component)
+                    .expect("component should exist")
+                    .moniker
+                    .as_str();
                 let message = format!(
                     "docker-compose output cannot enforce separate capabilities for provides \
                      `{first_provide}` and `{provide}` in component `{component_moniker}`: both \
@@ -298,7 +302,12 @@ fn port_conflict_report(output: &CompileOutput, conflict: &PortConflict) -> Repo
         provide,
         endpoint,
     } = conflict;
-    let component_moniker = output.scenario.component(*component).moniker.as_str();
+    let component_moniker = output
+        .scenario
+        .component(*component)
+        .expect("component should exist")
+        .moniker
+        .as_str();
     let message = format!(
         "docker-compose output cannot enforce separate capabilities for provides \
          `{first_provide}` and `{provide}` in component `{component_moniker}`: both route to port \
@@ -307,7 +316,9 @@ fn port_conflict_report(output: &CompileOutput, conflict: &PortConflict) -> Repo
     let help = "Expose each capability on its own port, or add an explicit L7 proxy component \
                 that maps each capability to a separate port.";
 
-    let prov = output.provenance.for_component(*component);
+    let Some(prov) = output.provenance.for_component(*component) else {
+        return ReporterError::new(message).with_help(help);
+    };
     let Some((src, spans)) = output.store.diagnostic_source(&prov.resolved_url) else {
         return ReporterError::new(message).with_help(help);
     };
@@ -392,7 +403,7 @@ pub fn validate_docker_compose(output: &CompileOutput) -> Result<(), ReporterErr
 
     let mut names: HashMap<ComponentId, ServiceNames> = HashMap::new();
     for id in program_components {
-        let c = s.component(*id);
+        let c = s.component(*id).expect("component should exist");
         let base = service_base_name(*id, c.moniker.local_name().unwrap_or("component"));
         let sidecar = format!("{base}-net");
         names.insert(
@@ -408,7 +419,10 @@ pub fn validate_docker_compose(output: &CompileOutput) -> Result<(), ReporterErr
         sidecar: format!("{ROUTER_SERVICE_NAME}-net"),
     };
 
-    let root_slots = &s.component(s.root).slots;
+    let root_slots = &s
+        .component(s.root)
+        .expect("root component should exist")
+        .slots;
     let addressing = ComposeAddressing::new(s, program_components, &names, router_names)
         .map_err(|err| err.into_reporter_error_with_spans(output))?;
     build_address_plan(
@@ -603,7 +617,7 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
     // Precompute service names (injective & stable).
     let mut names: HashMap<ComponentId, ServiceNames> = HashMap::new();
     for id in program_components {
-        let c = s.component(*id);
+        let c = s.component(*id).expect("component should exist");
         let base = service_base_name(*id, c.moniker.local_name().unwrap_or("component"));
         let sidecar = format!("{base}-net");
         names.insert(
@@ -619,7 +633,10 @@ fn render_docker_compose_inner(s: &Scenario) -> DcResult<String> {
         sidecar: format!("{ROUTER_SERVICE_NAME}-net"),
     };
 
-    let root_slots = &s.component(s.root).slots;
+    let root_slots = &s
+        .component(s.root)
+        .expect("root component should exist")
+        .slots;
 
     let addressing = ComposeAddressing::new(s, program_components, &names, router_names.clone())?;
     let address_plan = build_address_plan(
@@ -1089,7 +1106,10 @@ fn collect_framework_docker_mount_paths(
 ) -> HashMap<ComponentId, Vec<String>> {
     let mut out = HashMap::new();
     for component in program_components {
-        let Some(program) = scenario.component(*component).program.as_ref() else {
+        let Some(program) = scenario
+            .component(*component)
+            .and_then(|component| component.program.as_ref())
+        else {
             continue;
         };
         let paths: Vec<String> = program
@@ -1116,7 +1136,9 @@ fn allocate_docker_mount_proxy_ports(
 ) -> Result<HashMap<ComponentId, u16>, String> {
     let mut out = HashMap::new();
     for component in program_components {
-        let c = scenario.component(*component);
+        let c = scenario
+            .component(*component)
+            .expect("component should exist");
         let program = c
             .program
             .as_ref()
@@ -1402,7 +1424,7 @@ fn allocate_local_proxy_ports(
     let mut out: HashMap<ComponentId, BTreeMap<String, u16>> = HashMap::new();
 
     for id in program_components {
-        let c = s.component(*id);
+        let c = s.component(*id).expect("component should exist");
         let program = c.program.as_ref().unwrap();
 
         // Reserved: any ports the program listens on itself.

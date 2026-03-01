@@ -9,8 +9,8 @@ pub struct Provenance {
 }
 
 impl Provenance {
-    pub fn for_component(&self, id: ComponentId) -> &ComponentProvenance {
-        &self.components[id.0]
+    pub fn for_component(&self, id: ComponentId) -> Option<&ComponentProvenance> {
+        self.components.get(id.0)
     }
 }
 

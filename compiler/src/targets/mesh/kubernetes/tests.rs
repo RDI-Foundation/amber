@@ -18,7 +18,7 @@ use tempfile::tempdir;
 use url::Url;
 
 use super::{KubernetesReporter, KubernetesReporterConfig};
-use crate::{CompileOptions, Compiler, DigestStore, OptimizeOptions, reporter::Reporter as _};
+use crate::{CompileOptions, Compiler, DigestStore, reporter::Reporter as _};
 
 const HELPER_IMAGE: &str = AMBER_HELPER.reference;
 const ROUTER_IMAGE: &str = AMBER_ROUTER.reference;
@@ -195,9 +195,67 @@ fn build_helper_image() {
 }
 
 fn standard_compile_options() -> CompileOptions {
-    CompileOptions {
-        optimize: OptimizeOptions { dce: false },
-        ..CompileOptions::default()
+    CompileOptions::testing(false)
+}
+
+fn default_compiler() -> Compiler {
+    Compiler::new(Resolver::new(), DigestStore::default())
+}
+
+fn compile_scenario(root_path: &Path, opts: CompileOptions) -> crate::CompileOutput {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(default_compiler().compile(ManifestRef::from_url(file_url(root_path)), opts))
+        .expect("compile scenario")
+}
+
+fn test_reporter() -> KubernetesReporter {
+    KubernetesReporter {
+        config: KubernetesReporterConfig {
+            // kind's default CNI doesn't enforce NetworkPolicy, so the netpol
+            // check would keep pods in init forever in tests.
+            disable_networkpolicy_check: true,
+        },
+    }
+}
+
+fn render_kubernetes(scenario: &Scenario) -> super::KubernetesArtifact {
+    test_reporter()
+        .emit(scenario)
+        .expect("render kubernetes output")
+}
+
+fn compile_and_render(root_path: &Path, opts: CompileOptions) -> super::KubernetesArtifact {
+    let output = compile_scenario(root_path, opts);
+    render_kubernetes(&output.scenario)
+}
+
+fn compile_and_render_standard(root_path: &Path) -> super::KubernetesArtifact {
+    compile_and_render(root_path, standard_compile_options())
+}
+
+fn component_fixture(id: u8, parent: Option<u8>, path: &str) -> Component {
+    Component {
+        id: ComponentId(id as usize),
+        parent: parent.map(|pid| ComponentId(pid as usize)),
+        moniker: moniker(path),
+        digest: digest(id),
+        config: None,
+        config_schema: None,
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    }
+}
+
+fn scenario_with_components(components: Vec<Component>) -> Scenario {
+    Scenario {
+        root: ComponentId(0),
+        components: components.into_iter().map(Some).collect(),
+        bindings: Vec::new(),
+        exports: Vec::new(),
     }
 }
 
@@ -404,23 +462,7 @@ fn kubernetes_emits_router_for_external_slots() {
     )
     .expect("write client manifest");
 
-    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let opts = standard_compile_options();
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let output = rt
-        .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
-        .expect("compile scenario");
-
-    let reporter = KubernetesReporter {
-        config: KubernetesReporterConfig {
-            // kind's default CNI doesn't enforce NetworkPolicy, so the netpol
-            // check would keep pods in init forever in this test.
-            disable_networkpolicy_check: true,
-        },
-    };
-    let artifact = reporter
-        .emit(&output.scenario)
-        .expect("render kubernetes output");
+    let artifact = compile_and_render_standard(&root_path);
 
     let router_deploy = artifact
         .files
@@ -527,21 +569,7 @@ fn kubernetes_renders_static_program_image_from_static_component_config() {
     )
     .expect("write child manifest");
 
-    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let opts = standard_compile_options();
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let output = rt
-        .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
-        .expect("compile scenario");
-
-    let reporter = KubernetesReporter {
-        config: KubernetesReporterConfig {
-            disable_networkpolicy_check: true,
-        },
-    };
-    let artifact = reporter
-        .emit(&output.scenario)
-        .expect("render kubernetes output");
+    let artifact = compile_and_render_standard(&root_path);
 
     let child_deploy = artifact
         .files
@@ -613,21 +641,7 @@ fn kubernetes_supports_runtime_program_image_when_whole_image_is_config_leaf() {
     )
     .expect("write child manifest");
 
-    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let opts = standard_compile_options();
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let output = rt
-        .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
-        .expect("compile scenario");
-
-    let reporter = KubernetesReporter {
-        config: KubernetesReporterConfig {
-            disable_networkpolicy_check: true,
-        },
-    };
-    let artifact = reporter
-        .emit(&output.scenario)
-        .expect("render kubernetes output");
+    let artifact = compile_and_render_standard(&root_path);
 
     let child_deploy = artifact
         .files
@@ -715,19 +729,8 @@ fn kubernetes_rejects_runtime_program_image_templates() {
     )
     .expect("write child manifest");
 
-    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let opts = standard_compile_options();
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let output = rt
-        .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
-        .expect("compile scenario");
-
-    let reporter = KubernetesReporter {
-        config: KubernetesReporterConfig {
-            disable_networkpolicy_check: true,
-        },
-    };
-    let err = reporter
+    let output = compile_scenario(&root_path, standard_compile_options());
+    let err = test_reporter()
         .emit(&output.scenario)
         .expect_err("mixed runtime image should fail");
     let msg = err.to_string();
@@ -759,48 +762,17 @@ fn kubernetes_mounts_use_helper_direct_mode() {
     });
 
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
         children: vec![ComponentId(1)],
+        ..component_fixture(0, None, "/")
     };
-
     let child = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/child"),
-        digest: digest(1),
         config: Some(json!({ "app": "static" })),
         config_schema: Some(config_schema),
         program: Some(program),
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component_fixture(1, Some(0), "/child")
     };
-
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root), Some(child)],
-        bindings: Vec::new(),
-        exports: Vec::new(),
-    };
-
-    let reporter = KubernetesReporter {
-        config: KubernetesReporterConfig {
-            disable_networkpolicy_check: true,
-        },
-    };
-    let artifact = reporter.emit(&scenario).expect("render kubernetes output");
+    let scenario = scenario_with_components(vec![root, child]);
+    let artifact = render_kubernetes(&scenario);
 
     let any_direct = artifact
         .files
@@ -842,48 +814,18 @@ fn kubernetes_runtime_mount_requires_config_payload() {
     });
 
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
         config_schema: Some(config_schema.clone()),
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
         children: vec![ComponentId(1)],
+        ..component_fixture(0, None, "/")
     };
-
     let child = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/child"),
-        digest: digest(1),
         config: Some(json!({ "app": "${config.app}" })),
         config_schema: Some(config_schema),
         program: Some(program),
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component_fixture(1, Some(0), "/child")
     };
-
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root), Some(child)],
-        bindings: Vec::new(),
-        exports: Vec::new(),
-    };
-
-    let reporter = KubernetesReporter {
-        config: KubernetesReporterConfig {
-            disable_networkpolicy_check: true,
-        },
-    };
-    let artifact = reporter.emit(&scenario).expect("render kubernetes output");
+    let scenario = scenario_with_components(vec![root, child]);
+    let artifact = render_kubernetes(&scenario);
 
     let any_direct = artifact
         .files
@@ -950,48 +892,18 @@ fn kubernetes_mount_includes_object_config_leaves() {
     });
 
     let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
         config_schema: Some(root_schema.clone()),
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
         children: vec![ComponentId(1)],
+        ..component_fixture(0, None, "/")
     };
-
     let child = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/child"),
-        digest: digest(1),
         config: Some(json!({ "app": "${config.app}", "token": "${config.token}" })),
         config_schema: Some(component_schema),
         program: Some(program),
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
+        ..component_fixture(1, Some(0), "/child")
     };
-
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root), Some(child)],
-        bindings: Vec::new(),
-        exports: Vec::new(),
-    };
-
-    let reporter = KubernetesReporter {
-        config: KubernetesReporterConfig {
-            disable_networkpolicy_check: true,
-        },
-    };
-    let artifact = reporter.emit(&scenario).expect("render kubernetes output");
+    let scenario = scenario_with_components(vec![root, child]);
+    let artifact = render_kubernetes(&scenario);
 
     let deploy_doc = artifact
         .files
@@ -1111,23 +1023,8 @@ fn kubernetes_smoke_config_roundtrip() {
     let workspace = workspace_root();
     let scenario_path = workspace.join("test-scenarios/kubernetes-basic/scenario.json5");
 
-    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let opts = CompileOptions::default();
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let output = rt
-        .block_on(compiler.compile(ManifestRef::from_url(file_url(&scenario_path)), opts))
-        .expect("compile kubernetes scenario");
-
-    let reporter = KubernetesReporter {
-        config: KubernetesReporterConfig {
-            // kind's default CNI doesn't enforce NetworkPolicy, so the netpol
-            // check would keep pods in init forever in this test.
-            disable_networkpolicy_check: true,
-        },
-    };
-    let artifact = reporter
-        .emit(&output.scenario)
-        .expect("render kubernetes output");
+    let output = compile_scenario(&scenario_path, CompileOptions::default());
+    let artifact = render_kubernetes(&output.scenario);
 
     let dir = tempdir().expect("create temp dir");
     let output_dir = dir.path().join("kubernetes");
@@ -1303,23 +1200,7 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
     )
     .expect("write client manifest");
 
-    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let opts = standard_compile_options();
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let output = rt
-        .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
-        .expect("compile scenario");
-
-    let reporter = KubernetesReporter {
-        config: KubernetesReporterConfig {
-            // kind's default CNI doesn't enforce NetworkPolicy, so the netpol
-            // check would keep pods in init forever in this test.
-            disable_networkpolicy_check: true,
-        },
-    };
-    let artifact = reporter
-        .emit(&output.scenario)
-        .expect("render kubernetes output");
+    let artifact = compile_and_render_standard(&root_path);
 
     let output_dir = dir.path().join("kubernetes");
     write_kubernetes_output(&output_dir, &artifact);
@@ -1579,21 +1460,7 @@ fn kubernetes_smoke_export_routes_to_host() {
     )
     .expect("write server manifest");
 
-    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let opts = standard_compile_options();
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let output = rt
-        .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
-        .expect("compile scenario");
-
-    let reporter = KubernetesReporter {
-        config: KubernetesReporterConfig {
-            disable_networkpolicy_check: true,
-        },
-    };
-    let artifact = reporter
-        .emit(&output.scenario)
-        .expect("render kubernetes output");
+    let artifact = compile_and_render_standard(&root_path);
 
     let router_deploy = artifact
         .files

@@ -30,7 +30,7 @@ fn collect_metadata(s: &Scenario) -> BTreeMap<String, Value> {
     let mut stack = vec![s.root];
 
     while let Some(id) = stack.pop() {
-        let component = s.component(id);
+        let component = s.component(id).expect("component should exist");
         if let Some(metadata) = component.metadata.clone() {
             out.insert(component.moniker.as_str().to_string(), metadata);
         }

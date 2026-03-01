@@ -1,15 +1,13 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use amber_manifest::{FrameworkCapabilityName, Manifest, ManifestRef};
+use amber_manifest::{FrameworkCapabilityName, Manifest};
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
     ScenarioExport, SlotRef,
 };
 use serde_json::json;
-use url::Url;
 
 use super::dce_only;
-use crate::{ComponentProvenance, DigestStore, Provenance};
 
 fn component(id: usize, moniker: &str) -> Component {
     Component {
@@ -41,6 +39,107 @@ fn apply_manifest(component: &mut Component, manifest: &Manifest) {
         .iter()
         .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
         .collect();
+}
+
+fn component_mut(components: &mut [Option<Component>], id: usize) -> &mut Component {
+    components[id]
+        .as_mut()
+        .unwrap_or_else(|| panic!("component {id} missing"))
+}
+
+fn connect_parent_child(components: &mut [Option<Component>], parent: usize, child: usize) {
+    component_mut(components, child).parent = Some(ComponentId(parent));
+    component_mut(components, parent)
+        .children
+        .push(ComponentId(child));
+}
+
+fn apply_component_manifest(components: &mut [Option<Component>], id: usize, manifest: &Manifest) {
+    let component = component_mut(components, id);
+    component.digest = manifest.digest();
+    apply_manifest(component, manifest);
+}
+
+fn slot(component: usize, name: &str) -> SlotRef {
+    SlotRef {
+        component: ComponentId(component),
+        name: name.to_string(),
+    }
+}
+
+fn provide(component: usize, name: &str) -> ProvideRef {
+    ProvideRef {
+        component: ComponentId(component),
+        name: name.to_string(),
+    }
+}
+
+fn component_binding(
+    from_component: usize,
+    from_name: &str,
+    to_component: usize,
+    to_name: &str,
+) -> BindingEdge {
+    BindingEdge {
+        name: None,
+        from: BindingFrom::Component(provide(from_component, from_name)),
+        to: slot(to_component, to_name),
+        weak: false,
+    }
+}
+
+fn named_component_binding(
+    binding_name: &str,
+    from_component: usize,
+    from_name: &str,
+    to_component: usize,
+    to_name: &str,
+) -> BindingEdge {
+    BindingEdge {
+        name: Some(binding_name.to_string()),
+        from: BindingFrom::Component(provide(from_component, from_name)),
+        to: slot(to_component, to_name),
+        weak: false,
+    }
+}
+
+fn framework_binding(capability: &str, to_component: usize, to_name: &str) -> BindingEdge {
+    BindingEdge {
+        name: None,
+        from: BindingFrom::Framework(
+            FrameworkCapabilityName::try_from(capability).expect("framework capability"),
+        ),
+        to: slot(to_component, to_name),
+        weak: false,
+    }
+}
+
+fn external_binding(
+    from_component: usize,
+    from_name: &str,
+    to_component: usize,
+    to_name: &str,
+    weak: bool,
+) -> BindingEdge {
+    BindingEdge {
+        name: None,
+        from: BindingFrom::External(slot(from_component, from_name)),
+        to: slot(to_component, to_name),
+        weak,
+    }
+}
+
+fn scenario_export(
+    name: &str,
+    capability: amber_manifest::CapabilityDecl,
+    from_component: usize,
+    from_name: &str,
+) -> ScenarioExport {
+    ScenarioExport {
+        name: name.to_string(),
+        capability,
+        from: provide(from_component, from_name),
+    }
 }
 
 #[test]
@@ -127,138 +226,42 @@ fn dce_prunes_unused_transitive_subtree() {
     .parse()
     .unwrap();
 
-    let store = DigestStore::new();
-    let root_digest = root.digest();
-    let green_digest = green.digest();
-    let router_digest = router.digest();
-    let wrapper_digest = wrapper.digest();
     let mut components = vec![
         Some(component(0, "/")),
         Some(component(1, "/router")),
         Some(component(2, "/green")),
         Some(component(3, "/router/wrapper")),
     ];
-    components[0].as_mut().unwrap().digest = root_digest;
-    components[1].as_mut().unwrap().digest = router_digest;
-    components[2].as_mut().unwrap().digest = green_digest;
-    components[3].as_mut().unwrap().digest = wrapper_digest;
-
-    components[1].as_mut().unwrap().parent = Some(ComponentId(0));
-    components[2].as_mut().unwrap().parent = Some(ComponentId(0));
-    components[3].as_mut().unwrap().parent = Some(ComponentId(1));
-    apply_manifest(components[0].as_mut().unwrap(), &root);
-    apply_manifest(components[1].as_mut().unwrap(), &router);
-    apply_manifest(components[2].as_mut().unwrap(), &green);
-    apply_manifest(components[3].as_mut().unwrap(), &wrapper);
-
-    store.put(root_digest, Arc::new(root));
-    store.put(green_digest, Arc::new(green));
-    store.put(router_digest, Arc::new(router));
-    store.put(wrapper_digest, Arc::new(wrapper));
-
-    components[0]
-        .as_mut()
-        .unwrap()
-        .children
-        .extend([ComponentId(1), ComponentId(2)]);
-    components[1]
-        .as_mut()
-        .unwrap()
-        .children
-        .push(ComponentId(3));
+    apply_component_manifest(&mut components, 0, &root);
+    apply_component_manifest(&mut components, 1, &router);
+    apply_component_manifest(&mut components, 2, &green);
+    apply_component_manifest(&mut components, 3, &wrapper);
+    connect_parent_child(&mut components, 0, 1);
+    connect_parent_child(&mut components, 0, 2);
+    connect_parent_child(&mut components, 1, 3);
 
     let bindings = vec![
         // Root wiring: green.llm <- router.llm
-        BindingEdge {
-            name: None,
-            from: BindingFrom::Component(ProvideRef {
-                component: ComponentId(1),
-                name: "llm".to_string(),
-            }),
-            to: SlotRef {
-                component: ComponentId(2),
-                name: "llm".to_string(),
-            },
-            weak: false,
-        },
+        component_binding(1, "llm", 2, "llm"),
         // Root wiring: green.admin_api <- router.admin_api (resolved to wrapper.admin_api)
-        BindingEdge {
-            name: None,
-            from: BindingFrom::Component(ProvideRef {
-                component: ComponentId(3),
-                name: "admin_api".to_string(),
-            }),
-            to: SlotRef {
-                component: ComponentId(2),
-                name: "admin_api".to_string(),
-            },
-            weak: false,
-        },
+        component_binding(3, "admin_api", 2, "admin_api"),
         // Router internal wiring: wrapper.litellm <- router.admin_api
-        BindingEdge {
-            name: None,
-            from: BindingFrom::Component(ProvideRef {
-                component: ComponentId(1),
-                name: "admin_api".to_string(),
-            }),
-            to: SlotRef {
-                component: ComponentId(3),
-                name: "litellm".to_string(),
-            },
-            weak: false,
-        },
+        component_binding(1, "admin_api", 3, "litellm"),
     ];
 
     let mut scenario = Scenario {
         root: ComponentId(0),
         components,
         bindings,
-        exports: vec![ScenarioExport {
-            name: "tool_proxy".to_string(),
-            capability: tool_proxy_decl,
-            from: ProvideRef {
-                component: ComponentId(2),
-                name: "tool_proxy".to_string(),
-            },
-        }],
+        exports: vec![scenario_export(
+            "tool_proxy",
+            tool_proxy_decl,
+            2,
+            "tool_proxy",
+        )],
     };
     scenario.normalize_order();
 
-    let url = Url::parse("file:///root.json5").unwrap();
-    let provenance = Provenance {
-        components: vec![
-            ComponentProvenance {
-                authored_moniker: Moniker::from(Arc::from("/")),
-                declared_ref: ManifestRef::from_url(url.clone()),
-                resolved_url: url.clone(),
-                digest: root_digest,
-                observed_url: None,
-            },
-            ComponentProvenance {
-                authored_moniker: Moniker::from(Arc::from("/router")),
-                declared_ref: ManifestRef::from_url(url.clone()),
-                resolved_url: url.clone(),
-                digest: router_digest,
-                observed_url: None,
-            },
-            ComponentProvenance {
-                authored_moniker: Moniker::from(Arc::from("/green")),
-                declared_ref: ManifestRef::from_url(url.clone()),
-                resolved_url: url.clone(),
-                digest: green_digest,
-                observed_url: None,
-            },
-            ComponentProvenance {
-                authored_moniker: Moniker::from(Arc::from("/router/wrapper")),
-                declared_ref: ManifestRef::from_url(url.clone()),
-                resolved_url: url,
-                digest: wrapper_digest,
-                observed_url: None,
-            },
-        ],
-    };
-
-    let _provenance = provenance;
     let scenario = dce_only(scenario);
 
     assert_eq!(scenario.components.iter().flatten().count(), 3);
@@ -373,118 +376,33 @@ fn dce_keeps_dependencies_for_program_slots() {
     .parse()
     .unwrap();
 
-    let store = DigestStore::new();
-    let root_digest = root.digest();
-    let consumer_digest = consumer.digest();
-    let input_digest = input.digest();
-    let llm_digest = llm.digest();
     let mut components = vec![
         Some(component(0, "/")),
         Some(component(1, "/consumer")),
         Some(component(2, "/input")),
         Some(component(3, "/llm")),
     ];
-    components[0].as_mut().unwrap().digest = root_digest;
-    components[1].as_mut().unwrap().digest = consumer_digest;
-    components[2].as_mut().unwrap().digest = input_digest;
-    components[3].as_mut().unwrap().digest = llm_digest;
-
-    components[1].as_mut().unwrap().parent = Some(ComponentId(0));
-    components[2].as_mut().unwrap().parent = Some(ComponentId(0));
-    components[3].as_mut().unwrap().parent = Some(ComponentId(0));
-    apply_manifest(components[0].as_mut().unwrap(), &root);
-    apply_manifest(components[1].as_mut().unwrap(), &consumer);
-    apply_manifest(components[2].as_mut().unwrap(), &input);
-    apply_manifest(components[3].as_mut().unwrap(), &llm);
-
-    store.put(root_digest, Arc::new(root));
-    store.put(consumer_digest, Arc::new(consumer));
-    store.put(input_digest, Arc::new(input));
-    store.put(llm_digest, Arc::new(llm));
-
-    components[0].as_mut().unwrap().children.extend([
-        ComponentId(1),
-        ComponentId(2),
-        ComponentId(3),
-    ]);
+    apply_component_manifest(&mut components, 0, &root);
+    apply_component_manifest(&mut components, 1, &consumer);
+    apply_component_manifest(&mut components, 2, &input);
+    apply_component_manifest(&mut components, 3, &llm);
+    connect_parent_child(&mut components, 0, 1);
+    connect_parent_child(&mut components, 0, 2);
+    connect_parent_child(&mut components, 0, 3);
 
     let bindings = vec![
-        BindingEdge {
-            name: None,
-            from: BindingFrom::Component(ProvideRef {
-                component: ComponentId(2),
-                name: "input".to_string(),
-            }),
-            to: SlotRef {
-                component: ComponentId(1),
-                name: "input".to_string(),
-            },
-            weak: false,
-        },
-        BindingEdge {
-            name: None,
-            from: BindingFrom::Component(ProvideRef {
-                component: ComponentId(3),
-                name: "llm".to_string(),
-            }),
-            to: SlotRef {
-                component: ComponentId(1),
-                name: "llm".to_string(),
-            },
-            weak: false,
-        },
+        component_binding(2, "input", 1, "input"),
+        component_binding(3, "llm", 1, "llm"),
     ];
 
     let mut scenario = Scenario {
         root: ComponentId(0),
         components,
         bindings,
-        exports: vec![ScenarioExport {
-            name: "out".to_string(),
-            capability: out_decl,
-            from: ProvideRef {
-                component: ComponentId(1),
-                name: "out".to_string(),
-            },
-        }],
+        exports: vec![scenario_export("out", out_decl, 1, "out")],
     };
     scenario.normalize_order();
 
-    let url = Url::parse("file:///root.json5").unwrap();
-    let provenance = Provenance {
-        components: vec![
-            ComponentProvenance {
-                authored_moniker: Moniker::from(Arc::from("/")),
-                declared_ref: ManifestRef::from_url(url.clone()),
-                resolved_url: url.clone(),
-                digest: root_digest,
-                observed_url: None,
-            },
-            ComponentProvenance {
-                authored_moniker: Moniker::from(Arc::from("/consumer")),
-                declared_ref: ManifestRef::from_url(url.clone()),
-                resolved_url: url.clone(),
-                digest: consumer_digest,
-                observed_url: None,
-            },
-            ComponentProvenance {
-                authored_moniker: Moniker::from(Arc::from("/input")),
-                declared_ref: ManifestRef::from_url(url.clone()),
-                resolved_url: url.clone(),
-                digest: input_digest,
-                observed_url: None,
-            },
-            ComponentProvenance {
-                authored_moniker: Moniker::from(Arc::from("/llm")),
-                declared_ref: ManifestRef::from_url(url.clone()),
-                resolved_url: url,
-                digest: llm_digest,
-                observed_url: None,
-            },
-        ],
-    };
-
-    let _provenance = provenance;
     let scenario = dce_only(scenario);
 
     assert!(
@@ -565,91 +483,27 @@ fn dce_keeps_program_slots_from_env() {
     .parse()
     .unwrap();
 
-    let store = DigestStore::new();
-    let root_digest = root.digest();
-    let app_digest = app.digest();
-    let admin_digest = admin.digest();
     let mut components = vec![
         Some(component(0, "/")),
         Some(component(1, "/app")),
         Some(component(2, "/admin")),
     ];
-    components[0].as_mut().unwrap().digest = root_digest;
-    components[1].as_mut().unwrap().digest = app_digest;
-    components[2].as_mut().unwrap().digest = admin_digest;
+    apply_component_manifest(&mut components, 0, &root);
+    apply_component_manifest(&mut components, 1, &app);
+    apply_component_manifest(&mut components, 2, &admin);
+    connect_parent_child(&mut components, 0, 1);
+    connect_parent_child(&mut components, 0, 2);
 
-    components[1].as_mut().unwrap().parent = Some(ComponentId(0));
-    components[2].as_mut().unwrap().parent = Some(ComponentId(0));
-    apply_manifest(components[0].as_mut().unwrap(), &root);
-    apply_manifest(components[1].as_mut().unwrap(), &app);
-    apply_manifest(components[2].as_mut().unwrap(), &admin);
-
-    store.put(root_digest, Arc::new(root));
-    store.put(app_digest, Arc::new(app));
-    store.put(admin_digest, Arc::new(admin));
-
-    components[0]
-        .as_mut()
-        .unwrap()
-        .children
-        .extend([ComponentId(1), ComponentId(2)]);
-
-    let bindings = vec![BindingEdge {
-        name: None,
-        from: BindingFrom::Component(ProvideRef {
-            component: ComponentId(2),
-            name: "admin".to_string(),
-        }),
-        to: SlotRef {
-            component: ComponentId(1),
-            name: "admin".to_string(),
-        },
-        weak: false,
-    }];
+    let bindings = vec![component_binding(2, "admin", 1, "admin")];
 
     let mut scenario = Scenario {
         root: ComponentId(0),
         components,
         bindings,
-        exports: vec![ScenarioExport {
-            name: "out".to_string(),
-            capability: out_decl,
-            from: ProvideRef {
-                component: ComponentId(1),
-                name: "out".to_string(),
-            },
-        }],
+        exports: vec![scenario_export("out", out_decl, 1, "out")],
     };
     scenario.normalize_order();
 
-    let url = Url::parse("file:///root.json5").unwrap();
-    let provenance = Provenance {
-        components: vec![
-            ComponentProvenance {
-                authored_moniker: Moniker::from(Arc::from("/")),
-                declared_ref: ManifestRef::from_url(url.clone()),
-                resolved_url: url.clone(),
-                digest: root_digest,
-                observed_url: None,
-            },
-            ComponentProvenance {
-                authored_moniker: Moniker::from(Arc::from("/app")),
-                declared_ref: ManifestRef::from_url(url.clone()),
-                resolved_url: url.clone(),
-                digest: app_digest,
-                observed_url: None,
-            },
-            ComponentProvenance {
-                authored_moniker: Moniker::from(Arc::from("/admin")),
-                declared_ref: ManifestRef::from_url(url.clone()),
-                resolved_url: url,
-                digest: admin_digest,
-                observed_url: None,
-            },
-        ],
-    };
-
-    let _provenance = provenance;
     let scenario = dce_only(scenario);
 
     assert!(
@@ -731,104 +585,30 @@ fn dce_prunes_unreachable_named_binding_interpolation_subgraph() {
     .parse()
     .unwrap();
 
-    let store = DigestStore::new();
-    let root_digest = root.digest();
-    let live_digest = live.digest();
-    let dead_digest = dead.digest();
-    let provider_digest = provider.digest();
     let mut components = vec![
         Some(component(0, "/")),
         Some(component(1, "/live")),
         Some(component(2, "/dead")),
         Some(component(3, "/provider")),
     ];
-    components[0].as_mut().unwrap().digest = root_digest;
-    components[1].as_mut().unwrap().digest = live_digest;
-    components[2].as_mut().unwrap().digest = dead_digest;
-    components[3].as_mut().unwrap().digest = provider_digest;
+    apply_component_manifest(&mut components, 0, &root);
+    apply_component_manifest(&mut components, 1, &live);
+    apply_component_manifest(&mut components, 2, &dead);
+    apply_component_manifest(&mut components, 3, &provider);
+    connect_parent_child(&mut components, 0, 1);
+    connect_parent_child(&mut components, 0, 2);
+    connect_parent_child(&mut components, 0, 3);
 
-    components[1].as_mut().unwrap().parent = Some(ComponentId(0));
-    components[2].as_mut().unwrap().parent = Some(ComponentId(0));
-    components[3].as_mut().unwrap().parent = Some(ComponentId(0));
-    apply_manifest(components[0].as_mut().unwrap(), &root);
-    apply_manifest(components[1].as_mut().unwrap(), &live);
-    apply_manifest(components[2].as_mut().unwrap(), &dead);
-    apply_manifest(components[3].as_mut().unwrap(), &provider);
-
-    store.put(root_digest, Arc::new(root));
-    store.put(live_digest, Arc::new(live));
-    store.put(dead_digest, Arc::new(dead));
-    store.put(provider_digest, Arc::new(provider));
-
-    components[0].as_mut().unwrap().children.extend([
-        ComponentId(1),
-        ComponentId(2),
-        ComponentId(3),
-    ]);
-
-    let bindings = vec![BindingEdge {
-        name: Some("agent".to_string()),
-        from: BindingFrom::Component(ProvideRef {
-            component: ComponentId(3),
-            name: "api".to_string(),
-        }),
-        to: SlotRef {
-            component: ComponentId(2),
-            name: "up".to_string(),
-        },
-        weak: false,
-    }];
+    let bindings = vec![named_component_binding("agent", 3, "api", 2, "up")];
 
     let mut scenario = Scenario {
         root: ComponentId(0),
         components,
         bindings,
-        exports: vec![ScenarioExport {
-            name: "out".to_string(),
-            capability: out_decl,
-            from: ProvideRef {
-                component: ComponentId(1),
-                name: "out".to_string(),
-            },
-        }],
+        exports: vec![scenario_export("out", out_decl, 1, "out")],
     };
     scenario.normalize_order();
 
-    let url = Url::parse("file:///root.json5").unwrap();
-    let provenance = Provenance {
-        components: vec![
-            ComponentProvenance {
-                authored_moniker: Moniker::from(Arc::from("/")),
-                declared_ref: ManifestRef::from_url(url.clone()),
-                resolved_url: url.clone(),
-                digest: root_digest,
-                observed_url: None,
-            },
-            ComponentProvenance {
-                authored_moniker: Moniker::from(Arc::from("/live")),
-                declared_ref: ManifestRef::from_url(url.clone()),
-                resolved_url: url.clone(),
-                digest: live_digest,
-                observed_url: None,
-            },
-            ComponentProvenance {
-                authored_moniker: Moniker::from(Arc::from("/dead")),
-                declared_ref: ManifestRef::from_url(url.clone()),
-                resolved_url: url.clone(),
-                digest: dead_digest,
-                observed_url: None,
-            },
-            ComponentProvenance {
-                authored_moniker: Moniker::from(Arc::from("/provider")),
-                declared_ref: ManifestRef::from_url(url.clone()),
-                resolved_url: url,
-                digest: provider_digest,
-                observed_url: None,
-            },
-        ],
-    };
-
-    let _provenance = provenance;
     let scenario = dce_only(scenario);
 
     assert!(
@@ -891,64 +671,37 @@ fn dce_keeps_ancestors_without_marking_ancestor_program_live() {
         Some(component(1, "/consumer")),
         Some(component(2, "/provider")),
     ];
-    components[1].as_mut().unwrap().parent = Some(ComponentId(0));
-    components[2].as_mut().unwrap().parent = Some(ComponentId(0));
-    components[0]
-        .as_mut()
-        .unwrap()
-        .children
-        .extend([ComponentId(1), ComponentId(2)]);
+    connect_parent_child(&mut components, 0, 1);
+    connect_parent_child(&mut components, 0, 2);
 
-    components[0].as_mut().unwrap().program = Some(root_program);
-    components[0]
-        .as_mut()
-        .unwrap()
+    component_mut(&mut components, 0).program = Some(root_program);
+    component_mut(&mut components, 0)
         .slots
         .insert("up".to_string(), slot_decl);
 
-    components[1].as_mut().unwrap().program = Some(consumer_program);
-    components[1]
-        .as_mut()
-        .unwrap()
+    component_mut(&mut components, 1).program = Some(consumer_program);
+    component_mut(&mut components, 1)
         .provides
         .insert("out".to_string(), export_provide_decl);
 
-    components[2].as_mut().unwrap().program = Some(provider_program);
-    components[2]
-        .as_mut()
-        .unwrap()
+    component_mut(&mut components, 2).program = Some(provider_program);
+    component_mut(&mut components, 2)
         .provides
         .insert("up".to_string(), provide_decl);
 
-    let bindings = vec![BindingEdge {
-        name: None,
-        from: BindingFrom::Component(ProvideRef {
-            component: ComponentId(2),
-            name: "up".to_string(),
-        }),
-        to: SlotRef {
-            component: ComponentId(0),
-            name: "up".to_string(),
-        },
-        weak: false,
-    }];
+    let bindings = vec![component_binding(2, "up", 0, "up")];
 
     let scenario = Scenario {
         root: ComponentId(0),
         components,
         bindings,
-        exports: vec![ScenarioExport {
-            name: "out".to_string(),
-            capability: export_capability,
-            from: ProvideRef {
-                component: ComponentId(1),
-                name: "out".to_string(),
-            },
-        }],
+        exports: vec![scenario_export("out", export_capability, 1, "out")],
     };
 
     let scenario = dce_only(scenario);
-    let root = scenario.component(ComponentId(0));
+    let root = scenario
+        .component(ComponentId(0))
+        .expect("root component should exist");
     assert!(root.program.is_none(), "ancestor program should be pruned");
     assert!(
         scenario.components[2].is_none(),
@@ -1010,76 +763,47 @@ fn dce_keeps_runtime_visible_config_binding_slots_without_reviving_scope_program
         Some(component(1, "/consumer")),
         Some(component(2, "/provider")),
     ];
-    components[1].as_mut().unwrap().parent = Some(ComponentId(0));
-    components[2].as_mut().unwrap().parent = Some(ComponentId(0));
-    components[0]
-        .as_mut()
-        .unwrap()
-        .children
-        .extend([ComponentId(1), ComponentId(2)]);
+    connect_parent_child(&mut components, 0, 1);
+    connect_parent_child(&mut components, 0, 2);
 
-    components[0].as_mut().unwrap().program = Some(root_program);
-    components[0]
-        .as_mut()
-        .unwrap()
+    component_mut(&mut components, 0).program = Some(root_program);
+    component_mut(&mut components, 0)
         .slots
         .insert("up".to_string(), slot_decl);
-    components[0].as_mut().unwrap().binding_decls.insert(
-        "upstream".to_string(),
-        SlotRef {
-            component: ComponentId(0),
-            name: "up".to_string(),
-        },
-    );
+    component_mut(&mut components, 0)
+        .binding_decls
+        .insert("upstream".to_string(), slot(0, "up"));
 
-    components[1].as_mut().unwrap().program = Some(consumer_program);
-    components[1].as_mut().unwrap().config = Some(json!({
+    component_mut(&mut components, 1).program = Some(consumer_program);
+    component_mut(&mut components, 1).config = Some(json!({
         "upstream_url": "${bindings.upstream.url}",
     }));
-    components[1].as_mut().unwrap().config_schema = Some(consumer_schema);
-    components[1]
-        .as_mut()
-        .unwrap()
+    component_mut(&mut components, 1).config_schema = Some(consumer_schema);
+    component_mut(&mut components, 1)
         .provides
         .insert("out".to_string(), provide_out);
 
-    components[2].as_mut().unwrap().program = Some(provider_program);
-    components[2]
-        .as_mut()
-        .unwrap()
+    component_mut(&mut components, 2).program = Some(provider_program);
+    component_mut(&mut components, 2)
         .provides
         .insert("up".to_string(), provide_up);
 
-    let bindings = vec![BindingEdge {
-        name: None,
-        from: BindingFrom::Component(ProvideRef {
-            component: ComponentId(2),
-            name: "up".to_string(),
-        }),
-        to: SlotRef {
-            component: ComponentId(0),
-            name: "up".to_string(),
-        },
-        weak: false,
-    }];
+    let bindings = vec![component_binding(2, "up", 0, "up")];
 
     let scenario = Scenario {
         root: ComponentId(0),
         components,
         bindings,
-        exports: vec![ScenarioExport {
-            name: "out".to_string(),
-            capability: export_capability,
-            from: ProvideRef {
-                component: ComponentId(1),
-                name: "out".to_string(),
-            },
-        }],
+        exports: vec![scenario_export("out", export_capability, 1, "out")],
     };
 
     let scenario = dce_only(scenario);
     assert!(
-        scenario.component(ComponentId(0)).program.is_none(),
+        scenario
+            .component(ComponentId(0))
+            .expect("root component should exist")
+            .program
+            .is_none(),
         "scope owner program should be pruned; config binding usage should not revive it"
     );
     assert!(
@@ -1128,75 +852,46 @@ fn dce_prunes_non_runtime_visible_config_binding_slots() {
         Some(component(1, "/consumer")),
         Some(component(2, "/provider")),
     ];
-    components[1].as_mut().unwrap().parent = Some(ComponentId(0));
-    components[2].as_mut().unwrap().parent = Some(ComponentId(0));
-    components[0]
-        .as_mut()
-        .unwrap()
-        .children
-        .extend([ComponentId(1), ComponentId(2)]);
+    connect_parent_child(&mut components, 0, 1);
+    connect_parent_child(&mut components, 0, 2);
 
-    components[0].as_mut().unwrap().program = Some(root_program);
-    components[0]
-        .as_mut()
-        .unwrap()
+    component_mut(&mut components, 0).program = Some(root_program);
+    component_mut(&mut components, 0)
         .slots
         .insert("up".to_string(), slot_decl);
-    components[0].as_mut().unwrap().binding_decls.insert(
-        "upstream".to_string(),
-        SlotRef {
-            component: ComponentId(0),
-            name: "up".to_string(),
-        },
-    );
+    component_mut(&mut components, 0)
+        .binding_decls
+        .insert("upstream".to_string(), slot(0, "up"));
 
-    components[1].as_mut().unwrap().program = Some(consumer_program);
-    components[1].as_mut().unwrap().config = Some(json!({
+    component_mut(&mut components, 1).program = Some(consumer_program);
+    component_mut(&mut components, 1).config = Some(json!({
         "upstream_url": "${bindings.upstream.url}",
     }));
-    components[1]
-        .as_mut()
-        .unwrap()
+    component_mut(&mut components, 1)
         .provides
         .insert("out".to_string(), provide_out);
 
-    components[2].as_mut().unwrap().program = Some(provider_program);
-    components[2]
-        .as_mut()
-        .unwrap()
+    component_mut(&mut components, 2).program = Some(provider_program);
+    component_mut(&mut components, 2)
         .provides
         .insert("up".to_string(), provide_up);
 
-    let bindings = vec![BindingEdge {
-        name: None,
-        from: BindingFrom::Component(ProvideRef {
-            component: ComponentId(2),
-            name: "up".to_string(),
-        }),
-        to: SlotRef {
-            component: ComponentId(0),
-            name: "up".to_string(),
-        },
-        weak: false,
-    }];
+    let bindings = vec![component_binding(2, "up", 0, "up")];
 
     let scenario = Scenario {
         root: ComponentId(0),
         components,
         bindings,
-        exports: vec![ScenarioExport {
-            name: "out".to_string(),
-            capability: export_capability,
-            from: ProvideRef {
-                component: ComponentId(1),
-                name: "out".to_string(),
-            },
-        }],
+        exports: vec![scenario_export("out", export_capability, 1, "out")],
     };
 
     let scenario = dce_only(scenario);
     assert!(
-        scenario.component(ComponentId(0)).program.is_none(),
+        scenario
+            .component(ComponentId(0))
+            .expect("root component should exist")
+            .program
+            .is_none(),
         "scope owner program should still be pruned"
     );
     assert!(
@@ -1259,87 +954,53 @@ fn dce_keeps_runtime_visible_transitive_config_binding_slots() {
         Some(component(2, "/middle/consumer")),
         Some(component(3, "/provider")),
     ];
-    components[1].as_mut().unwrap().parent = Some(ComponentId(0));
-    components[2].as_mut().unwrap().parent = Some(ComponentId(1));
-    components[3].as_mut().unwrap().parent = Some(ComponentId(0));
-    components[0]
-        .as_mut()
-        .unwrap()
-        .children
-        .extend([ComponentId(1), ComponentId(3)]);
-    components[1]
-        .as_mut()
-        .unwrap()
-        .children
-        .push(ComponentId(2));
+    connect_parent_child(&mut components, 0, 1);
+    connect_parent_child(&mut components, 1, 2);
+    connect_parent_child(&mut components, 0, 3);
 
-    components[0].as_mut().unwrap().program = Some(root_program);
-    components[0]
-        .as_mut()
-        .unwrap()
+    component_mut(&mut components, 0).program = Some(root_program);
+    component_mut(&mut components, 0)
         .slots
         .insert("up".to_string(), slot_decl);
-    components[0].as_mut().unwrap().binding_decls.insert(
-        "upstream".to_string(),
-        SlotRef {
-            component: ComponentId(0),
-            name: "up".to_string(),
-        },
-    );
+    component_mut(&mut components, 0)
+        .binding_decls
+        .insert("upstream".to_string(), slot(0, "up"));
 
-    components[1].as_mut().unwrap().config = Some(json!({
+    component_mut(&mut components, 1).config = Some(json!({
         "upstream_url": "${bindings.upstream.url}",
     }));
-    components[1].as_mut().unwrap().config_schema = Some(middle_schema);
+    component_mut(&mut components, 1).config_schema = Some(middle_schema);
 
-    components[2].as_mut().unwrap().program = Some(consumer_program);
-    components[2].as_mut().unwrap().config = Some(json!({
+    component_mut(&mut components, 2).program = Some(consumer_program);
+    component_mut(&mut components, 2).config = Some(json!({
         "target": "${config.upstream_url}",
     }));
-    components[2].as_mut().unwrap().config_schema = Some(consumer_schema);
-    components[2]
-        .as_mut()
-        .unwrap()
+    component_mut(&mut components, 2).config_schema = Some(consumer_schema);
+    component_mut(&mut components, 2)
         .provides
         .insert("out".to_string(), provide_out);
 
-    components[3].as_mut().unwrap().program = Some(provider_program);
-    components[3]
-        .as_mut()
-        .unwrap()
+    component_mut(&mut components, 3).program = Some(provider_program);
+    component_mut(&mut components, 3)
         .provides
         .insert("up".to_string(), provide_up);
 
-    let bindings = vec![BindingEdge {
-        name: None,
-        from: BindingFrom::Component(ProvideRef {
-            component: ComponentId(3),
-            name: "up".to_string(),
-        }),
-        to: SlotRef {
-            component: ComponentId(0),
-            name: "up".to_string(),
-        },
-        weak: false,
-    }];
+    let bindings = vec![component_binding(3, "up", 0, "up")];
 
     let scenario = Scenario {
         root: ComponentId(0),
         components,
         bindings,
-        exports: vec![ScenarioExport {
-            name: "out".to_string(),
-            capability: export_capability,
-            from: ProvideRef {
-                component: ComponentId(2),
-                name: "out".to_string(),
-            },
-        }],
+        exports: vec![scenario_export("out", export_capability, 2, "out")],
     };
 
     let scenario = dce_only(scenario);
     assert!(
-        scenario.component(ComponentId(0)).program.is_none(),
+        scenario
+            .component(ComponentId(0))
+            .expect("root component should exist")
+            .program
+            .is_none(),
         "scope owner program should be pruned; transitive config usage should not revive it"
     );
     assert!(
@@ -1364,30 +1025,13 @@ fn dce_keeps_framework_bound_slots() {
     .unwrap();
 
     let mut components = vec![Some(component(0, "/")), Some(component(1, "/consumer"))];
-    components[1].as_mut().unwrap().parent = Some(ComponentId(0));
-    components[0]
-        .as_mut()
-        .unwrap()
-        .children
-        .push(ComponentId(1));
-    components[1].as_mut().unwrap().program = Some(consumer_program);
-    components[1]
-        .as_mut()
-        .unwrap()
+    connect_parent_child(&mut components, 0, 1);
+    component_mut(&mut components, 1).program = Some(consumer_program);
+    component_mut(&mut components, 1)
         .slots
         .insert("control".to_string(), control_slot);
 
-    let bindings = vec![BindingEdge {
-        name: None,
-        from: BindingFrom::Framework(
-            FrameworkCapabilityName::try_from("dynamic_children").unwrap(),
-        ),
-        to: SlotRef {
-            component: ComponentId(1),
-            name: "control".to_string(),
-        },
-        weak: false,
-    }];
+    let bindings = vec![framework_binding("dynamic_children", 1, "control")];
 
     let export_capability =
         serde_json::from_value(json!({ "kind": "http" })).expect("capability decl");
@@ -1396,35 +1040,9 @@ fn dce_keeps_framework_bound_slots() {
         root: ComponentId(0),
         components,
         bindings,
-        exports: vec![ScenarioExport {
-            name: "out".to_string(),
-            capability: export_capability,
-            from: ProvideRef {
-                component: ComponentId(1),
-                name: "out".to_string(),
-            },
-        }],
+        exports: vec![scenario_export("out", export_capability, 1, "out")],
     };
 
-    let url = Url::parse("file:///root.json5").unwrap();
-    let provenance = Provenance {
-        components: scenario
-            .components
-            .iter()
-            .map(|component| {
-                let component = component.as_ref().expect("test component should exist");
-                ComponentProvenance {
-                    authored_moniker: component.moniker.clone(),
-                    declared_ref: ManifestRef::from_url(url.clone()),
-                    resolved_url: url.clone(),
-                    digest: component.digest,
-                    observed_url: None,
-                }
-            })
-            .collect(),
-    };
-
-    let _provenance = provenance;
     let scenario = dce_only(scenario);
     assert_eq!(scenario.components.iter().flatten().count(), 2);
     assert_eq!(scenario.bindings.len(), 1);
@@ -1468,26 +1086,8 @@ fn dce_keeps_live_external_root_slot_when_export_makes_consumer_live() {
     let scenario = Scenario {
         root: ComponentId(0),
         components: vec![Some(root), Some(green)],
-        bindings: vec![BindingEdge {
-            name: None,
-            from: BindingFrom::External(SlotRef {
-                component: ComponentId(0),
-                name: "white".to_string(),
-            }),
-            to: SlotRef {
-                component: ComponentId(1),
-                name: "white".to_string(),
-            },
-            weak: true,
-        }],
-        exports: vec![ScenarioExport {
-            name: "green".to_string(),
-            capability: export_capability,
-            from: ProvideRef {
-                component: ComponentId(1),
-                name: "a2a".to_string(),
-            },
-        }],
+        bindings: vec![external_binding(0, "white", 1, "white", true)],
+        exports: vec![scenario_export("green", export_capability, 1, "a2a")],
     };
 
     let scenario = dce_only(scenario);
