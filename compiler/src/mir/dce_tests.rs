@@ -699,9 +699,7 @@ fn dce_keeps_ancestors_without_marking_ancestor_program_live() {
     };
 
     let scenario = dce_only(scenario);
-    let root = scenario
-        .component(ComponentId(0))
-        .expect("root component should exist");
+    let root = scenario.component(ComponentId(0));
     assert!(root.program.is_none(), "ancestor program should be pruned");
     assert!(
         scenario.components[2].is_none(),
@@ -799,11 +797,7 @@ fn dce_keeps_runtime_visible_config_binding_slots_without_reviving_scope_program
 
     let scenario = dce_only(scenario);
     assert!(
-        scenario
-            .component(ComponentId(0))
-            .expect("root component should exist")
-            .program
-            .is_none(),
+        scenario.component(ComponentId(0)).program.is_none(),
         "scope owner program should be pruned; config binding usage should not revive it"
     );
     assert!(
@@ -887,11 +881,7 @@ fn dce_prunes_non_runtime_visible_config_binding_slots() {
 
     let scenario = dce_only(scenario);
     assert!(
-        scenario
-            .component(ComponentId(0))
-            .expect("root component should exist")
-            .program
-            .is_none(),
+        scenario.component(ComponentId(0)).program.is_none(),
         "scope owner program should still be pruned"
     );
     assert!(
@@ -996,11 +986,7 @@ fn dce_keeps_runtime_visible_transitive_config_binding_slots() {
 
     let scenario = dce_only(scenario);
     assert!(
-        scenario
-            .component(ComponentId(0))
-            .expect("root component should exist")
-            .program
-            .is_none(),
+        scenario.component(ComponentId(0)).program.is_none(),
         "scope owner program should be pruned; transitive config usage should not revive it"
     );
     assert!(

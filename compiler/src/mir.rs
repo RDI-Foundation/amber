@@ -311,9 +311,7 @@ fn resolve_forward_targets(
         }];
     }
 
-    let component = scenario
-        .component(start.component)
-        .expect("component should exist");
+    let component = scenario.component(start.component);
     if component.program.is_some() {
         stack.remove(&key);
         return vec![ResolvedTarget {
@@ -686,13 +684,9 @@ impl<'a> DceSolver<'a> {
     fn new(scenario: &'a Scenario) -> Self {
         let mut incoming = vec![Vec::new(); scenario.components.len()];
         for (idx, binding) in scenario.bindings.iter().enumerate() {
-            let _ = scenario
-                .component(binding.to.component)
-                .expect("binding target component should exist");
+            let _ = scenario.component(binding.to.component);
             if let BindingFrom::Component(from) = &binding.from {
-                let _ = scenario
-                    .component(from.component)
-                    .expect("binding source component should exist");
+                let _ = scenario.component(from.component);
             }
             incoming[binding.to.component.0].push(idx);
         }
@@ -778,11 +772,7 @@ impl<'a> DceSolver<'a> {
                 break;
             }
             self.keep_components[id.0] = true;
-            cur = self
-                .scenario
-                .component(id)
-                .expect("component should exist")
-                .parent;
+            cur = self.scenario.component(id).parent;
         }
     }
 
@@ -791,7 +781,6 @@ impl<'a> DceSolver<'a> {
             || self
                 .scenario
                 .component(ComponentId(component))
-                .expect("component should exist")
                 .program
                 .is_none()
         {
@@ -844,11 +833,7 @@ impl<'a> DceSolver<'a> {
     }
 
     fn mark_program_used_slots(&mut self, component: ComponentId) {
-        for slot in collect_program_used_slots(
-            self.scenario
-                .component(component)
-                .expect("component should exist"),
-        ) {
+        for slot in collect_program_used_slots(self.scenario.component(component)) {
             self.mark_slot(component.0, &slot);
         }
     }
@@ -950,19 +935,13 @@ fn compute_keep_set(
         if !keep[idx] {
             continue;
         }
-        let mut cur = scenario
-            .component(ComponentId(idx))
-            .expect("component should exist")
-            .parent;
+        let mut cur = scenario.component(ComponentId(idx)).parent;
         while let Some(parent) = cur {
             if keep[parent.0] {
                 break;
             }
             keep[parent.0] = true;
-            cur = scenario
-                .component(parent)
-                .expect("component should exist")
-                .parent;
+            cur = scenario.component(parent).parent;
         }
     }
 

@@ -678,9 +678,7 @@ mod tests {
 
         let ir: ScenarioIr = serde_json::from_value(payload).expect("deserialize scenario IR");
         let scenario: Scenario = ir.try_into().expect("convert scenario IR");
-        let root = scenario
-            .component(ComponentId(0))
-            .expect("root component should exist");
+        let root = scenario.component(ComponentId(0));
 
         assert!(root.program.is_none());
         assert!(root.slots.is_empty());

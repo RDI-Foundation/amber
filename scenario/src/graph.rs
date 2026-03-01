@@ -21,10 +21,8 @@ pub fn topo_order(s: &Scenario) -> Result<Vec<ComponentId>, CycleError> {
     let mut live = vec![false; n];
     let mut live_count = 0usize;
     for (id, _) in s.components_iter() {
-        if let Some(is_live) = live.get_mut(id.0) {
-            *is_live = true;
-            live_count += 1;
-        }
+        live[id.0] = true;
+        live_count += 1;
     }
     let mut indeg = vec![0usize; n];
     let mut out: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -38,24 +36,17 @@ pub fn topo_order(s: &Scenario) -> Result<Vec<ComponentId>, CycleError> {
         };
         let u = from.component.0;
         let v = b.to.component.0;
-        if u >= n || v >= n {
-            continue;
-        }
         if u == v {
             continue;
         }
-        if let Some(outgoing) = out.get_mut(u) {
-            outgoing.push(v);
-        }
+        out[u].push(v);
     }
 
     for out in &mut out {
         out.sort_unstable();
         out.dedup();
         for &v in out.iter() {
-            if let Some(indegree) = indeg.get_mut(v) {
-                *indegree += 1;
-            }
+            indeg[v] += 1;
         }
     }
 
@@ -72,14 +63,10 @@ pub fn topo_order(s: &Scenario) -> Result<Vec<ComponentId>, CycleError> {
     let mut order = Vec::with_capacity(n);
     while let Some(u) = q.pop_front() {
         order.push(ComponentId(u));
-        if let Some(outgoing) = out.get(u) {
-            for &v in outgoing {
-                if let Some(indegree) = indeg.get_mut(v) {
-                    *indegree -= 1;
-                    if *indegree == 0 {
-                        q.push_back(v);
-                    }
-                }
+        for &v in &out[u] {
+            indeg[v] -= 1;
+            if indeg[v] == 0 {
+                q.push_back(v);
             }
         }
     }
@@ -99,11 +86,11 @@ pub fn component_path(s: &Scenario, id: ComponentId) -> String {
 
 /// Convenience: compute a stable "path" name for a component like `/a/b`.
 pub fn component_path_for(components: &[Option<Component>], id: ComponentId) -> String {
-    components
-        .get(id.0)
-        .and_then(Option::as_ref)
-        .map(|component| component.moniker.to_string())
-        .unwrap_or_else(|| format!("<missing-component-{}>", id.0))
+    components[id.0]
+        .as_ref()
+        .expect("component should exist")
+        .moniker
+        .to_string()
 }
 
 /// Convenience: list direct dependencies (providers) of a component, by id.

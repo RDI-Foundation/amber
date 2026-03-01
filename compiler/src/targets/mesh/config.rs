@@ -127,7 +127,7 @@ pub(crate) fn build_config_plan(
     let mut used_config_paths_by_component: HashMap<ComponentId, BTreeSet<String>> =
         HashMap::with_capacity(program_components.len());
     for id in program_components {
-        let component = scenario.component(*id).expect("component should exist");
+        let component = scenario.component(*id);
         let Some(program) = component.program.as_ref() else {
             continue;
         };
@@ -153,7 +153,6 @@ pub(crate) fn build_config_plan(
 
     let root_schema = scenario
         .component(scenario.root)
-        .expect("root component should exist")
         .config_schema
         .as_ref()
         .cloned();
@@ -175,7 +174,7 @@ pub(crate) fn build_config_plan(
     let mut needs_runtime_config = false;
 
     for id in program_components {
-        let c = scenario.component(*id).expect("component should exist");
+        let c = scenario.component(*id);
         let program = c.program.as_ref().expect("program component has program");
 
         let slots = slot_values_by_component.get(id).ok_or_else(|| {
@@ -199,12 +198,7 @@ pub(crate) fn build_config_plan(
         })?;
         let template_opt = component_template.node();
 
-        let component_schema = scenario
-            .component(*id)
-            .expect("component should exist")
-            .config_schema
-            .as_ref()
-            .cloned();
+        let component_schema = scenario.component(*id).config_schema.as_ref().cloned();
 
         let plan = build_program_plan(
             scenario,
@@ -273,7 +267,6 @@ pub(crate) fn build_config_plan(
 
             let component_schema = scenario
                 .component(*id)
-                .expect("component should exist")
                 .config_schema
                 .as_ref()
                 .expect("component config schema required");
@@ -437,7 +430,7 @@ fn build_mount_specs(
     let mut out = HashMap::new();
 
     for id in program_components {
-        let component = scenario.component(*id).expect("component should exist");
+        let component = scenario.component(*id);
         let program = component
             .program
             .as_ref()

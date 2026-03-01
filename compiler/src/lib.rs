@@ -269,9 +269,7 @@ fn collect_manifest_diagnostics(
         let manifest = store
             .get(&component.digest)
             .expect("manifest was resolved during linking");
-        let Some(prov) = provenance.for_component(component.id) else {
-            continue;
-        };
+        let prov = provenance.for_component(component.id);
         let url = &prov.resolved_url;
         let component_path = prov.authored_moniker.as_str();
 

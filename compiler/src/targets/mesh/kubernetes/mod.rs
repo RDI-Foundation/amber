@@ -229,7 +229,7 @@ fn render_kubernetes_inner(
     )
     .map_err(|e| ReporterError::new(e.to_string()))?;
     for component_id in &mesh_plan.program_components {
-        let component = s.component(*component_id).expect("component should exist");
+        let component = s.component(*component_id);
         let Some(program) = component.program.as_ref() else {
             continue;
         };
@@ -253,7 +253,7 @@ fn render_kubernetes_inner(
     // Generate component names.
     let mut names: HashMap<ComponentId, ComponentNames> = HashMap::new();
     for id in program_components {
-        let c = s.component(*id).expect("component should exist");
+        let c = s.component(*id);
         let base = service_name(*id, c.moniker.local_name().unwrap_or("component"));
         names.insert(
             *id,
@@ -263,10 +263,7 @@ fn render_kubernetes_inner(
             },
         );
     }
-    let root_slots = &s
-        .component(s.root)
-        .expect("root component should exist")
-        .slots;
+    let root_slots = &s.component(s.root).slots;
 
     let addressing = KubernetesAddressing {
         scenario: s,
@@ -512,7 +509,7 @@ fn render_kubernetes_inner(
 
     // Deployments
     for id in program_components {
-        let c = s.component(*id).expect("component should exist");
+        let c = s.component(*id);
         let cnames = names.get(id).unwrap();
         let labels = component_labels(*id, &cnames.service);
         let program = c.program.as_ref().unwrap();
@@ -867,7 +864,7 @@ fn render_kubernetes_inner(
 
     // Services (only for components with provides)
     for id in program_components {
-        let c = s.component(*id).expect("component should exist");
+        let c = s.component(*id);
         if c.provides.is_empty() {
             continue;
         }
@@ -1160,12 +1157,7 @@ fn render_kubernetes_inner(
         export_metadata.insert(
             ex.name.clone(),
             ExportMetadata {
-                component: s
-                    .component(provider)
-                    .expect("component should exist")
-                    .moniker
-                    .as_str()
-                    .to_string(),
+                component: s.component(provider).moniker.as_str().to_string(),
                 provide: ex.provide.clone(),
                 service,
                 port,
@@ -1205,11 +1197,7 @@ fn render_kubernetes_inner(
 
     let scenario_metadata = ScenarioMetadata {
         version: "1",
-        digest: s
-            .component(s.root)
-            .expect("root component should exist")
-            .digest
-            .to_string(),
+        digest: s.component(s.root).digest.to_string(),
         exports: export_metadata,
         inputs: input_metadata,
         external_slots: external_slot_metadata,
@@ -1331,13 +1319,11 @@ fn component_config_image_source(
     component: ComponentId,
     path: &str,
 ) -> Option<ProgramImageSource> {
-    let component = scenario
-        .component(component)
-        .expect("component should exist");
+    let component = scenario.component(component);
     let parent = component.parent?;
     let child_name = component.moniker.local_name()?;
 
-    let provenance = output.provenance.for_component(parent)?;
+    let provenance = output.provenance.for_component(parent);
     let url = &provenance.resolved_url;
     let stored = output.store.get_source(url)?;
     let root_span: SourceSpan = (0usize, stored.source.len()).into();
@@ -1361,7 +1347,7 @@ fn component_program_image_source(
     output: &CompileOutput,
     component: ComponentId,
 ) -> Option<ProgramImageSource> {
-    let provenance = output.provenance.for_component(component)?;
+    let provenance = output.provenance.for_component(component);
     let url = &provenance.resolved_url;
     let stored = output.store.get_source(url)?;
     let program = stored.spans.program.as_ref()?;
@@ -1399,7 +1385,7 @@ fn program_image_error(
 }
 
 fn generate_namespace_name(s: &Scenario) -> String {
-    let root = s.component(s.root).expect("root component should exist");
+    let root = s.component(s.root);
     let short_name = root
         .moniker
         .local_name()
