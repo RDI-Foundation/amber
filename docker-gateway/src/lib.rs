@@ -170,6 +170,55 @@ struct VolumeSummaryResponse {
     name: Option<String>,
 }
 
+fn cleanup_target_name(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_cleanup_container_ids(body: &[u8]) -> Result<Vec<String>, serde_json::Error> {
+    let containers = serde_json::from_slice::<Vec<ContainerSummaryResponse>>(body)?;
+    Ok(containers
+        .into_iter()
+        .filter_map(|container| cleanup_target_name(container.id.as_deref()))
+        .collect())
+}
+
+fn parse_cleanup_network_ids(body: &[u8]) -> Result<Vec<String>, serde_json::Error> {
+    let networks = serde_json::from_slice::<Vec<NetworkSummaryResponse>>(body)?;
+    Ok(networks
+        .into_iter()
+        .filter_map(|network| cleanup_target_name(network.id.as_deref()))
+        .collect())
+}
+
+fn parse_cleanup_volume_names(body: &[u8]) -> Result<Vec<String>, serde_json::Error> {
+    let volumes = serde_json::from_slice::<VolumeListResponse>(body)?
+        .volumes
+        .unwrap_or_default();
+    Ok(volumes
+        .into_iter()
+        .filter_map(|volume| cleanup_target_name(volume.name.as_deref()))
+        .collect())
+}
+
+fn cleanup_delete_container_path(id: &str) -> String {
+    format!("/containers/{id}?force=1&v=1")
+}
+
+fn cleanup_delete_network_path(id: &str) -> String {
+    format!("/networks/{id}")
+}
+
+fn cleanup_delete_volume_path(name: &str) -> String {
+    format!("/volumes/{name}?force=1")
+}
+
+fn is_allowed_cleanup_delete_status(status: StatusCode) -> bool {
+    status.is_success() || status == StatusCode::NOT_FOUND || status == StatusCode::CONFLICT
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ContainerCreateRequest {
@@ -396,93 +445,47 @@ impl State {
     }
 
     async fn cleanup_containers(&self, query: &str) {
-        let path = format!("/containers/json?{query}");
-        let response = match docker_get(self, &path).await {
-            Ok(value) => value,
-            Err(_) => return,
-        };
-        if response.status != StatusCode::OK {
-            return;
-        }
-
-        let containers =
-            match serde_json::from_slice::<Vec<ContainerSummaryResponse>>(&response.body) {
-                Ok(value) => value,
-                Err(err) => {
-                    eprintln!("docker gateway cleanup failed to parse containers list: {err}");
-                    return;
-                }
-            };
-
-        for container in containers {
-            let Some(id) = container.id.as_deref().map(str::trim) else {
-                continue;
-            };
-            if id.is_empty() {
-                continue;
-            }
-
-            let path = format!("/containers/{id}?force=1&v=1");
-            let Ok(delete_response) = docker_delete(self, &path).await else {
-                continue;
-            };
-            if !(delete_response.status.is_success()
-                || delete_response.status == StatusCode::NOT_FOUND
-                || delete_response.status == StatusCode::CONFLICT)
-            {
-                eprintln!(
-                    "docker gateway cleanup failed to delete container {id}: {}",
-                    delete_response.status
-                );
-            }
-        }
+        self.cleanup_resources(
+            format!("/containers/json?{query}"),
+            parse_cleanup_container_ids,
+            cleanup_delete_container_path,
+            "containers",
+            "container",
+        )
+        .await;
     }
 
     async fn cleanup_networks(&self, query: &str) {
-        let path = format!("/networks?{query}");
-        let response = match docker_get(self, &path).await {
-            Ok(value) => value,
-            Err(_) => return,
-        };
-        if response.status != StatusCode::OK {
-            return;
-        }
-
-        let networks = match serde_json::from_slice::<Vec<NetworkSummaryResponse>>(&response.body) {
-            Ok(value) => value,
-            Err(err) => {
-                eprintln!("docker gateway cleanup failed to parse networks list: {err}");
-                return;
-            }
-        };
-
-        for network in networks {
-            let Some(id) = network.id.as_deref().map(str::trim) else {
-                continue;
-            };
-            if id.is_empty() {
-                continue;
-            }
-
-            let path = format!("/networks/{id}");
-            let Ok(delete_response) = docker_delete(self, &path).await else {
-                continue;
-            };
-            if !(delete_response.status.is_success()
-                || delete_response.status == StatusCode::NOT_FOUND
-                || delete_response.status == StatusCode::CONFLICT)
-            {
-                eprintln!(
-                    "docker gateway cleanup failed to delete network {id}: {}",
-                    delete_response.status
-                );
-            }
-        }
+        self.cleanup_resources(
+            format!("/networks?{query}"),
+            parse_cleanup_network_ids,
+            cleanup_delete_network_path,
+            "networks",
+            "network",
+        )
+        .await;
     }
 
     async fn cleanup_volumes(&self, query: &str) {
-        let path = format!("/volumes?{query}");
-        let response = match docker_get(self, &path).await {
+        self.cleanup_resources(
+            format!("/volumes?{query}"),
+            parse_cleanup_volume_names,
+            cleanup_delete_volume_path,
+            "volumes",
+            "volume",
+        )
+        .await;
+    }
+
+    async fn cleanup_resources(
+        &self,
+        list_path: String,
+        parse_targets: fn(&[u8]) -> Result<Vec<String>, serde_json::Error>,
+        delete_path: fn(&str) -> String,
+        list_name: &str,
+        item_name: &str,
+    ) {
+        let response = match docker_get(self, &list_path).await {
             Ok(value) => value,
             Err(_) => return,
         };
@@ -490,32 +493,22 @@ impl State {
             return;
         }
 
-        let volumes = match serde_json::from_slice::<VolumeListResponse>(&response.body) {
-            Ok(value) => value.volumes.unwrap_or_default(),
+        let targets = match parse_targets(&response.body) {
+            Ok(value) => value,
             Err(err) => {
-                eprintln!("docker gateway cleanup failed to parse volumes list: {err}");
+                eprintln!("docker gateway cleanup failed to parse {list_name} list: {err}");
                 return;
             }
         };
 
-        for volume in volumes {
-            let Some(name) = volume.name.as_deref().map(str::trim) else {
-                continue;
-            };
-            if name.is_empty() {
-                continue;
-            }
-
-            let path = format!("/volumes/{name}?force=1");
+        for target in targets {
+            let path = delete_path(&target);
             let Ok(delete_response) = docker_delete(self, &path).await else {
                 continue;
             };
-            if !(delete_response.status.is_success()
-                || delete_response.status == StatusCode::NOT_FOUND
-                || delete_response.status == StatusCode::CONFLICT)
-            {
+            if !is_allowed_cleanup_delete_status(delete_response.status) {
                 eprintln!(
-                    "docker gateway cleanup failed to delete volume {name}: {}",
+                    "docker gateway cleanup failed to delete {item_name} {target}: {}",
                     delete_response.status
                 );
             }
@@ -637,164 +630,41 @@ async fn handle(mut req: Request<ProxyBody>, conn: Arc<ConnState>) -> Response<P
         return forward(req, conn.state.clone()).await;
     }
 
-    if req.method() == Method::GET
-        && segs.len() == 2
-        && segs[0] == "containers"
-        && segs[1] == "json"
-    {
-        let required = required_label_filters(&conn.state, &id);
-        match add_label_filters_to_uri(req.uri(), &required) {
-            Ok(new_uri) => *req.uri_mut() = new_uri,
-            Err(resp) => return *resp,
-        }
-        return forward(req, conn.state.clone()).await;
-    }
-
-    if req.method() == Method::GET && segs.len() == 1 && segs[0] == "events" {
-        let required = required_label_filters(&conn.state, &id);
-        match add_label_filters_to_uri(req.uri(), &required) {
-            Ok(new_uri) => *req.uri_mut() = new_uri,
-            Err(resp) => return *resp,
-        }
-        return forward(req, conn.state.clone()).await;
-    }
-
-    if req.method() == Method::POST
-        && segs.len() == 2
-        && segs[0] == "containers"
-        && segs[1] == "prune"
-    {
-        let required = required_label_filters(&conn.state, &id);
-        match add_label_filters_to_uri(req.uri(), &required) {
-            Ok(new_uri) => *req.uri_mut() = new_uri,
-            Err(resp) => return *resp,
-        }
-        return forward(req, conn.state.clone()).await;
-    }
-
-    if req.method() == Method::GET && segs.len() == 1 && segs[0] == "networks" {
-        let required = required_label_filters(&conn.state, &id);
-        match add_label_filters_to_uri(req.uri(), &required) {
-            Ok(new_uri) => *req.uri_mut() = new_uri,
-            Err(resp) => return *resp,
-        }
-        return forward(req, conn.state.clone()).await;
-    }
-
-    if req.method() == Method::POST
-        && segs.len() == 2
-        && segs[0] == "networks"
-        && segs[1] == "prune"
-    {
-        let required = required_label_filters(&conn.state, &id);
-        match add_label_filters_to_uri(req.uri(), &required) {
-            Ok(new_uri) => *req.uri_mut() = new_uri,
-            Err(resp) => return *resp,
-        }
-        return forward(req, conn.state.clone()).await;
-    }
-
-    if req.method() == Method::GET && segs.len() == 1 && segs[0] == "volumes" {
-        let required = required_label_filters(&conn.state, &id);
-        match add_label_filters_to_uri(req.uri(), &required) {
-            Ok(new_uri) => *req.uri_mut() = new_uri,
-            Err(resp) => return *resp,
-        }
-        return forward(req, conn.state.clone()).await;
-    }
-
-    if req.method() == Method::POST && segs.len() == 2 && segs[0] == "volumes" && segs[1] == "prune"
-    {
-        let required = required_label_filters(&conn.state, &id);
-        match add_label_filters_to_uri(req.uri(), &required) {
-            Ok(new_uri) => *req.uri_mut() = new_uri,
-            Err(resp) => return *resp,
-        }
-        return forward(req, conn.state.clone()).await;
-    }
-
-    if req.method() == Method::POST
-        && segs.len() == 2
-        && segs[0] == "containers"
-        && segs[1] == "create"
-    {
-        let (parts, body) = req.into_parts();
-        let collected = match body.collect().await {
-            Ok(c) => c,
-            Err(err) => {
-                return docker_error(StatusCode::BAD_REQUEST, format!("read body failed: {err}"));
-            }
-        };
-        let raw = collected.to_bytes();
-
-        if let Err(resp) =
-            authorize_container_create_references(conn.state.clone(), &version_prefix, &raw, &id)
-                .await
-        {
+    if requires_owner_label_filters(req.method(), &segs) {
+        if let Err(resp) = apply_required_label_filters(&mut req, &conn.state, &id) {
             return *resp;
         }
-
-        let to_set = owner_label_pairs(&conn.state, &id);
-
-        let new_body = match inject_labels_into_create_body(raw, &to_set) {
-            Ok(body) => body,
-            Err(resp) => return *resp,
-        };
-
-        let mut req = Request::from_parts(parts, box_body_from_bytes(new_body.clone()));
-        set_content_length(&mut req, new_body.len());
         return forward(req, conn.state.clone()).await;
     }
 
-    if req.method() == Method::POST
-        && segs.len() == 2
-        && segs[0] == "networks"
-        && segs[1] == "create"
-    {
-        let (parts, body) = req.into_parts();
-        let collected = match body.collect().await {
-            Ok(c) => c,
-            Err(err) => {
-                return docker_error(StatusCode::BAD_REQUEST, format!("read body failed: {err}"));
-            }
+    if req.method() == Method::POST && is_create_endpoint(&segs, "containers") {
+        let req = match prepare_labeled_create_request(
+            req,
+            conn.state.clone(),
+            &id,
+            Some(&version_prefix),
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(resp) => return resp,
         };
-        let raw = collected.to_bytes();
-
-        let to_set = owner_label_pairs(&conn.state, &id);
-
-        let new_body = match inject_labels_into_create_body(raw, &to_set) {
-            Ok(body) => body,
-            Err(resp) => return *resp,
-        };
-
-        let mut req = Request::from_parts(parts, box_body_from_bytes(new_body.clone()));
-        set_content_length(&mut req, new_body.len());
         return forward(req, conn.state.clone()).await;
     }
 
-    if req.method() == Method::POST
-        && segs.len() == 2
-        && segs[0] == "volumes"
-        && segs[1] == "create"
-    {
-        let (parts, body) = req.into_parts();
-        let collected = match body.collect().await {
-            Ok(c) => c,
-            Err(err) => {
-                return docker_error(StatusCode::BAD_REQUEST, format!("read body failed: {err}"));
-            }
+    if req.method() == Method::POST && is_create_endpoint(&segs, "networks") {
+        let req = match prepare_labeled_create_request(req, conn.state.clone(), &id, None).await {
+            Ok(value) => value,
+            Err(resp) => return resp,
         };
-        let raw = collected.to_bytes();
+        return forward(req, conn.state.clone()).await;
+    }
 
-        let to_set = owner_label_pairs(&conn.state, &id);
-
-        let new_body = match inject_labels_into_create_body(raw, &to_set) {
-            Ok(body) => body,
-            Err(resp) => return *resp,
+    if req.method() == Method::POST && is_create_endpoint(&segs, "volumes") {
+        let req = match prepare_labeled_create_request(req, conn.state.clone(), &id, None).await {
+            Ok(value) => value,
+            Err(resp) => return resp,
         };
-
-        let mut req = Request::from_parts(parts, box_body_from_bytes(new_body.clone()));
-        set_content_length(&mut req, new_body.len());
         return forward(req, conn.state.clone()).await;
     }
 
@@ -935,6 +805,66 @@ fn is_ping(segs: &[String], method: &Method) -> bool {
 
 fn is_version(segs: &[String], method: &Method) -> bool {
     method == Method::GET && segs.len() == 1 && segs[0] == "version"
+}
+
+fn requires_owner_label_filters(method: &Method, segs: &[String]) -> bool {
+    match *method {
+        Method::GET => {
+            matches!(segs, [resource, op] if resource == "containers" && op == "json")
+                || matches!(segs, [resource] if resource == "events")
+                || matches!(segs, [resource] if resource == "networks")
+                || matches!(segs, [resource] if resource == "volumes")
+        }
+        Method::POST => {
+            matches!(segs, [resource, op] if resource == "containers" && op == "prune")
+                || matches!(segs, [resource, op] if resource == "networks" && op == "prune")
+                || matches!(segs, [resource, op] if resource == "volumes" && op == "prune")
+        }
+        _ => false,
+    }
+}
+
+fn is_create_endpoint(segs: &[String], resource: &str) -> bool {
+    matches!(segs, [first, second] if first == resource && second == "create")
+}
+
+fn apply_required_label_filters(
+    req: &mut Request<ProxyBody>,
+    state: &State,
+    id: &CallerIdentity,
+) -> GatewayResult<()> {
+    let required = required_label_filters(state, id);
+    let new_uri = add_label_filters_to_uri(req.uri(), &required)?;
+    *req.uri_mut() = new_uri;
+    Ok(())
+}
+
+async fn prepare_labeled_create_request(
+    req: Request<ProxyBody>,
+    state: Arc<State>,
+    id: &CallerIdentity,
+    authorize_container_refs_version_prefix: Option<&str>,
+) -> Result<Request<ProxyBody>, Response<ProxyBody>> {
+    let (parts, body) = req.into_parts();
+    let collected = body
+        .collect()
+        .await
+        .map_err(|err| docker_error(StatusCode::BAD_REQUEST, format!("read body failed: {err}")))?;
+    let raw = collected.to_bytes();
+
+    if let Some(version_prefix) = authorize_container_refs_version_prefix
+        && let Err(resp) =
+            authorize_container_create_references(state.clone(), version_prefix, &raw, id).await
+    {
+        return Err(*resp);
+    }
+
+    let to_set = owner_label_pairs(&state, id);
+    let new_body = inject_labels_into_create_body(raw, &to_set).map_err(|resp| *resp)?;
+
+    let mut req = Request::from_parts(parts, box_body_from_bytes(new_body.clone()));
+    set_content_length(&mut req, new_body.len());
+    Ok(req)
 }
 
 fn owner_label_pairs(state: &State, id: &CallerIdentity) -> Vec<(String, String)> {
