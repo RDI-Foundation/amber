@@ -9,7 +9,7 @@ use amber_manifest::{
 };
 use amber_scenario::{BindingFrom, ComponentId, Scenario};
 
-use crate::{DigestStore, manifest_table};
+use crate::DigestStore;
 
 #[derive(Clone, Debug)]
 pub(crate) struct MeshOptions {
@@ -18,7 +18,7 @@ pub(crate) struct MeshOptions {
 
 #[derive(Clone, Debug)]
 pub(crate) struct MeshPlan {
-    pub(crate) manifests: Vec<Option<Arc<Manifest>>>,
+    pub(crate) root_manifest: Arc<Manifest>,
     pub(crate) program_components: Vec<ComponentId>,
     pub(crate) bindings: Vec<ResolvedBinding>,
     pub(crate) external_bindings: Vec<ResolvedExternalBinding>,
@@ -99,14 +99,14 @@ pub(crate) fn build_mesh_plan(
     store: &DigestStore,
     options: MeshOptions,
 ) -> Result<MeshPlan, MeshError> {
-    let manifests =
-        manifest_table::build_manifest_table(&scenario.components, store).map_err(|e| {
-            MeshError::new(format!(
-                "internal error: missing manifest content for {} (digest {})",
-                component_label(scenario, e.component),
-                e.digest
-            ))
-        })?;
+    let root_component = scenario.component(scenario.root);
+    let root_manifest = store.get(&root_component.digest).ok_or_else(|| {
+        MeshError::new(format!(
+            "internal error: missing manifest content for {} (digest {})",
+            component_label(scenario, scenario.root),
+            root_component.digest
+        ))
+    })?;
     let program_components: Vec<ComponentId> = scenario
         .components_iter()
         .filter_map(|(id, c)| c.program.as_ref().map(|_| id))
@@ -224,7 +224,7 @@ pub(crate) fn build_mesh_plan(
     }
 
     Ok(MeshPlan {
-        manifests,
+        root_manifest,
         program_components,
         bindings,
         external_bindings,

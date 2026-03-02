@@ -287,6 +287,18 @@ fn env_value(service: &super::Service, key: &str) -> Option<String> {
     }
 }
 
+fn injected_docker_gateway_service(compose: &super::DockerComposeFile) -> (&str, &super::Service) {
+    compose
+        .services
+        .iter()
+        .find_map(|(name, svc)| {
+            env_value(svc, super::DOCKER_GATEWAY_CONFIG_ENV)
+                .is_some()
+                .then_some((name.as_str(), svc))
+        })
+        .expect("injected docker gateway service missing")
+}
+
 fn assert_depends_on(service: &super::Service, name: &str, condition: &str) {
     let depends_on = service
         .depends_on
@@ -444,9 +456,25 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
         .emit(&output)
         .expect("compose render should succeed");
     let compose = parse_compose(&yaml);
+    assert!(
+        !compose.services.contains_key("amber-router"),
+        "framework-only scenarios should not emit a scenario router service"
+    );
+    assert!(
+        !compose.services.contains_key("amber-docker-router"),
+        "framework routing should not emit a bespoke docker router service"
+    );
+    assert!(
+        !compose.services.contains_key("amber-docker-gateway"),
+        "framework routing should not emit a bespoke docker gateway service"
+    );
 
-    let gateway = service(&compose, super::DOCKER_GATEWAY_SERVICE_NAME);
-    assert_depends_on(gateway, "amber-router", "service_started");
+    let (gateway_name, gateway) = injected_docker_gateway_service(&compose);
+    let expected_network_mode = format!("service:{gateway_name}-net");
+    assert_eq!(
+        gateway.network_mode.as_deref(),
+        Some(expected_network_mode.as_str()),
+    );
 
     let gateway_config = env_value(gateway, super::DOCKER_GATEWAY_CONFIG_ENV)
         .expect("gateway config env should be present");
@@ -456,16 +484,18 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
         .as_array()
         .expect("callers should be an array");
     assert_eq!(callers.len(), 1);
-    assert_eq!(callers[0]["host"], "amber-router");
-    assert_eq!(callers[0]["component"], "/router");
-    assert_eq!(callers[0]["compose_service"], "amber-router");
+    assert_eq!(callers[0]["host"], "127.0.0.1");
+    let gateway_component = callers[0]["component"]
+        .as_str()
+        .expect("gateway caller component should be a string");
+    assert!(
+        gateway_component.starts_with("/__amber_internal_framework_docker_gateway"),
+        "unexpected injected gateway component moniker: {gateway_component}"
+    );
+    assert_eq!(callers[0]["compose_service"], gateway_name);
 
     let program_service = service(&compose, "c0-component");
-    assert_depends_on(
-        program_service,
-        super::DOCKER_GATEWAY_SERVICE_NAME,
-        "service_started",
-    );
+    assert_depends_on(program_service, gateway_name, "service_started");
     assert_eq!(
         env_value(program_service, "DOCKER_HOST").as_deref(),
         Some("tcp://127.0.0.1:20000"),
@@ -509,9 +539,25 @@ fn docker_compose_emits_framework_docker_mount_proxy_wiring() {
         .emit(&output)
         .expect("compose render should succeed");
     let compose = parse_compose(&yaml);
+    assert!(
+        !compose.services.contains_key("amber-router"),
+        "framework-only scenarios should not emit a scenario router service"
+    );
+    assert!(
+        !compose.services.contains_key("amber-docker-router"),
+        "framework routing should not emit a bespoke docker router service"
+    );
+    assert!(
+        !compose.services.contains_key("amber-docker-gateway"),
+        "framework routing should not emit a bespoke docker gateway service"
+    );
 
-    let gateway = service(&compose, super::DOCKER_GATEWAY_SERVICE_NAME);
-    assert_depends_on(gateway, "amber-router", "service_started");
+    let (gateway_name, gateway) = injected_docker_gateway_service(&compose);
+    let expected_network_mode = format!("service:{gateway_name}-net");
+    assert_eq!(
+        gateway.network_mode.as_deref(),
+        Some(expected_network_mode.as_str()),
+    );
 
     let program_service = service(&compose, "c0-component");
     let entrypoint = program_service
@@ -527,11 +573,7 @@ fn docker_compose_emits_framework_docker_mount_proxy_wiring() {
         super::HELPER_INIT_SERVICE,
         "service_completed_successfully",
     );
-    assert_depends_on(
-        program_service,
-        super::DOCKER_GATEWAY_SERVICE_NAME,
-        "service_started",
-    );
+    assert_depends_on(program_service, gateway_name, "service_started");
 
     let mount_proxy_b64 = env_value(program_service, super::DOCKER_MOUNT_PROXY_SPEC_ENV)
         .expect("docker mount proxy env should be present");

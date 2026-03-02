@@ -1,15 +1,21 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
 };
 
 use amber_config as rc;
-use amber_manifest::{FrameworkCapabilityName, MountSource};
+use amber_manifest::MountSource;
 use amber_mesh::{MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProvisionOutput};
 use amber_scenario::{ComponentId, Scenario};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+
+mod framework_docker_injection;
+
+use framework_docker_injection::{
+    FRAMEWORK_DOCKER_GATEWAY_PORT, rewrite_framework_docker_as_injected_component,
+};
 
 use crate::{
     CompileOutput,
@@ -25,13 +31,10 @@ use crate::{
         },
         internal_images::resolve_internal_images,
         mesh_config::{
-            FRAMEWORK_DOCKER_URL_ENV, INTERNAL_FRAMEWORK_DOCKER_SLOT, MeshServiceName, ROUTER_ID,
-            RouterPorts, ServiceMeshAddressing, build_mesh_config_plan, scenario_ir_digest,
+            MeshServiceName, RouterPorts, ServiceMeshAddressing, build_mesh_config_plan,
+            scenario_ir_digest,
         },
-        plan::{
-            MeshOptions, MeshPlan, ResolvedFrameworkBinding, component_label,
-            map_program_components,
-        },
+        plan::{MeshOptions, component_label, map_program_components},
         ports::{allocate_mesh_ports, allocate_slot_ports},
         provision::build_mesh_provision_plan,
         proxy_metadata::{ProxyMetadata, RouterMetadata, build_proxy_metadata},
@@ -41,7 +44,6 @@ use crate::{
 const MESH_NETWORK_NAME: &str = "amber_mesh";
 
 const ROUTER_SERVICE_NAME: &str = "amber-router";
-const DOCKER_GATEWAY_SERVICE_NAME: &str = "amber-docker-gateway";
 const PROVISIONER_SERVICE_NAME: &str = "amber-provisioner";
 const HELPER_VOLUME_NAME: &str = "amber-helper-bin";
 const HELPER_INIT_SERVICE: &str = "amber-init";
@@ -51,7 +53,6 @@ const DOCKER_MOUNT_PROXY_SPEC_ENV: &str = "AMBER_DOCKER_MOUNT_PROXY_SPEC_B64";
 const DOCKER_GATEWAY_CONFIG_ENV: &str = "AMBER_DOCKER_GATEWAY_CONFIG_JSON";
 const DOCKER_GATEWAY_HOST_SOCK_ENV: &str = "AMBER_DOCKER_SOCK";
 const DOCKER_GATEWAY_CONTAINER_SOCK: &str = "/var/run/docker.sock";
-const DOCKER_GATEWAY_PORT: u16 = 23750;
 const MESH_CONFIG_DIR: &str = "/amber/mesh";
 const PROVISIONER_CONFIG_ROOT: &str = "/amber/provision";
 const PROVISIONER_PLAN_CONFIG_NAME: &str = "amber-mesh-provision-plan";
@@ -67,7 +68,6 @@ const COMPOSE_PROJECT_NAME_ENV: &str = "COMPOSE_PROJECT_NAME";
 const COMPONENT_MESH_PORT_BASE: u16 = 23000;
 const ROUTER_MESH_PORT_BASE: u16 = 24000;
 const ROUTER_CONTROL_PORT_BASE: u16 = 24100;
-const LOCAL_SLOT_PORT_BASE: u16 = 20000;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DockerComposeReporter;
@@ -252,9 +252,11 @@ fn render_docker_compose(output: &CompileOutput) -> Result<String, ReporterError
 }
 
 fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
-    let s = &output.scenario;
+    let transformed =
+        rewrite_framework_docker_as_injected_component(&output.scenario).map_err(dc_other)?;
+    let s = &transformed.scenario;
 
-    let mut mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
+    let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
         s,
         &output.store,
         MeshOptions {
@@ -265,7 +267,6 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     let images = resolve_internal_images().map_err(DockerComposeError::Other)?;
     let docker_mount_paths_by_component =
         collect_framework_docker_mount_paths(s, mesh_plan.program_components.as_slice());
-    add_mount_only_framework_docker_bindings(&mut mesh_plan, &docker_mount_paths_by_component);
     let program_components = mesh_plan.program_components.as_slice();
 
     // Precompute service names (injective & stable).
@@ -277,36 +278,24 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 sidecar: format!("{base}-net"),
             }
         });
-    let docker_binding_components: BTreeSet<ComponentId> = mesh_plan
-        .framework_bindings
-        .iter()
-        .filter(|binding| binding.capability.as_str() == "docker")
-        .map(|binding| binding.consumer)
-        .collect();
     let docker_mount_components: BTreeSet<ComponentId> =
         docker_mount_paths_by_component.keys().copied().collect();
-    let docker_access_components: BTreeSet<ComponentId> = docker_binding_components
-        .union(&docker_mount_components)
-        .copied()
-        .collect();
-    let needs_docker_gateway = !docker_access_components.is_empty();
-    let root_manifest = mesh_plan.manifests[s.root.0]
-        .as_ref()
-        .expect("root manifest should exist");
-    let needs_router = !mesh_plan.external_bindings.is_empty()
-        || !mesh_plan.exports.is_empty()
-        || !mesh_plan.framework_bindings.is_empty();
+    let docker_gateway_component = transformed.gateway_component;
+    let root_manifest = mesh_plan.root_manifest.as_ref();
+    let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
 
-    let mut slot_ports_by_component = allocate_slot_ports(s, program_components)?;
-    ensure_internal_framework_slot_ports(s, &mut slot_ports_by_component, &mesh_plan)?;
+    let slot_ports_by_component = allocate_slot_ports(s, program_components)?;
     let mesh_ports_by_component = allocate_mesh_ports(
         s,
         program_components,
         COMPONENT_MESH_PORT_BASE,
         &slot_ports_by_component,
     )?;
-    let docker_proxy_ports_by_component =
-        docker_proxy_ports_by_component(s, &slot_ports_by_component, &mesh_plan)?;
+    let docker_proxy_ports_by_component = docker_proxy_ports_by_component(
+        s,
+        &slot_ports_by_component,
+        &transformed.proxy_slot_by_component,
+    )?;
     let router_ports = needs_router.then_some(RouterPorts {
         mesh: ROUTER_MESH_PORT_BASE,
         control: ROUTER_CONTROL_PORT_BASE,
@@ -433,18 +422,6 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
             .insert(HELPER_INIT_SERVICE.to_string(), helper_init);
     }
 
-    if needs_docker_gateway {
-        let gateway_deps = docker_gateway_depends_on(needs_router);
-        let gateway_service = docker_gateway_service(
-            &images.docker_gateway,
-            build_docker_gateway_config_json()?,
-            gateway_deps,
-        );
-        compose
-            .services
-            .insert(DOCKER_GATEWAY_SERVICE_NAME.to_string(), gateway_service);
-    }
-
     if needs_provisioner {
         let plan_json = serde_json::to_string(&mesh_provision_plan).map_err(|err| {
             DockerComposeError::Other(format!("failed to serialize mesh provision plan: {err}"))
@@ -484,12 +461,6 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
 
     if needs_router {
         let mut env_entries = mesh_config_plan.router_env_passthrough.clone();
-        if needs_docker_gateway {
-            env_entries.push(format!(
-                "{FRAMEWORK_DOCKER_URL_ENV}=tcp://{DOCKER_GATEWAY_SERVICE_NAME}:\
-                 {DOCKER_GATEWAY_PORT}"
-            ));
-        }
         env_entries.push(format!("AMBER_ROUTER_CONFIG_PATH={}", mesh_config_path()));
         env_entries.push(format!(
             "AMBER_ROUTER_IDENTITY_PATH={}",
@@ -577,8 +548,12 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
 
         // depends_on: own sidecar + strong deps provider programs (+ amber-init for helper-backed services)
         let program_plan = program_plans.get(id).expect("program plan computed");
-        let image = render_compose_image(program_plan.image(), &root_leaf_by_path)
-            .map_err(DockerComposeError::Other)?;
+        let image = if Some(*id) == docker_gateway_component {
+            images.docker_gateway.clone()
+        } else {
+            render_compose_image(program_plan.image(), &root_leaf_by_path)
+                .map_err(DockerComposeError::Other)?
+        };
         let mut program_service = Service::new(image);
         program_service.network_mode = Some(format!("service:{}", svc.sidecar));
         let label = component_label(s, *id);
@@ -613,9 +588,6 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                     .into());
                 }
             }
-        }
-        if docker_access_components.contains(id) {
-            deps.push((DOCKER_GATEWAY_SERVICE_NAME.to_string(), "service_started"));
         }
         program_service.depends_on = build_depends_on(any_helper, deps);
 
@@ -693,6 +665,9 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 program_service.environment = Some(Environment::List(env_entries));
             }
         }
+        if Some(*id) == docker_gateway_component {
+            configure_injected_docker_gateway_service(&mut program_service, s, *id, svc)?;
+        }
 
         compose
             .services
@@ -750,118 +725,61 @@ fn collect_framework_docker_mount_paths(
     out
 }
 
-fn add_mount_only_framework_docker_bindings(
-    mesh_plan: &mut MeshPlan,
-    docker_mount_paths_by_component: &HashMap<ComponentId, Vec<String>>,
-) {
-    let already_bound: BTreeSet<ComponentId> = mesh_plan
-        .framework_bindings
-        .iter()
-        .filter(|binding| binding.capability.as_str() == "docker")
-        .map(|binding| binding.consumer)
-        .collect();
-    let docker_capability = FrameworkCapabilityName::try_from("docker")
-        .expect("framework capability names are static and valid");
-
-    let mut mount_components: Vec<ComponentId> =
-        docker_mount_paths_by_component.keys().copied().collect();
-    mount_components.sort_by_key(|component| component.0);
-    for component in mount_components {
-        if already_bound.contains(&component) {
-            continue;
-        }
-        mesh_plan.framework_bindings.push(ResolvedFrameworkBinding {
-            consumer: component,
-            slot: INTERNAL_FRAMEWORK_DOCKER_SLOT.to_string(),
-            capability: docker_capability.clone(),
-            binding_name: None,
-        });
-    }
-}
-
-fn ensure_internal_framework_slot_ports(
+fn configure_injected_docker_gateway_service(
+    service: &mut Service,
     scenario: &Scenario,
-    slot_ports_by_component: &mut HashMap<ComponentId, BTreeMap<String, u16>>,
-    mesh_plan: &MeshPlan,
+    id: ComponentId,
+    names: &ServiceNames,
 ) -> DcResult<()> {
-    let mut components = BTreeSet::new();
-    for binding in &mesh_plan.framework_bindings {
-        if binding.capability.as_str() == "docker" && binding.slot == INTERNAL_FRAMEWORK_DOCKER_SLOT
-        {
-            components.insert(binding.consumer);
+    let config_json =
+        build_docker_gateway_config_json(scenario.component(id).moniker.as_str(), &names.program)?;
+    match service.environment.take() {
+        Some(Environment::Map(mut env)) => {
+            env.insert(DOCKER_GATEWAY_CONFIG_ENV.to_string(), config_json);
+            service.environment = Some(Environment::Map(env));
+        }
+        Some(Environment::List(_)) => {
+            return Err(DockerComposeError::Other(
+                "internal error: injected docker gateway should not use list-style environment"
+                    .to_string(),
+            ));
+        }
+        None => {
+            service.environment = Some(Environment::Map(BTreeMap::from([(
+                DOCKER_GATEWAY_CONFIG_ENV.to_string(),
+                config_json,
+            )])));
         }
     }
-
-    for component in components {
-        let slot_ports = slot_ports_by_component.get_mut(&component).ok_or_else(|| {
-            DockerComposeError::Other(format!(
-                "internal error: missing local slot map for {}",
-                component_label(scenario, component)
-            ))
-        })?;
-        if slot_ports.contains_key(INTERNAL_FRAMEWORK_DOCKER_SLOT) {
-            continue;
-        }
-
-        let mut reserved: HashSet<u16> = HashSet::new();
-        let program = scenario
-            .component(component)
-            .program
-            .as_ref()
-            .expect("program component has program");
-        if let Some(network) = program.network.as_ref() {
-            for endpoint in &network.endpoints {
-                reserved.insert(endpoint.port);
-            }
-        }
-        for port in slot_ports.values() {
-            reserved.insert(*port);
-        }
-
-        let mut next = LOCAL_SLOT_PORT_BASE;
-        while reserved.contains(&next) {
-            next = next.checked_add(1).ok_or_else(|| {
-                DockerComposeError::Other(format!(
-                    "ran out of local slot ports allocating for {}",
-                    component_label(scenario, component)
-                ))
-            })?;
-        }
-        slot_ports.insert(INTERNAL_FRAMEWORK_DOCKER_SLOT.to_string(), next);
-    }
-
+    service.volumes.push(format!(
+        "${{{DOCKER_GATEWAY_HOST_SOCK_ENV}:-{}}}:{DOCKER_GATEWAY_CONTAINER_SOCK}",
+        detect_default_host_docker_sock().display()
+    ));
     Ok(())
 }
 
 fn docker_proxy_ports_by_component(
     scenario: &Scenario,
     slot_ports_by_component: &HashMap<ComponentId, BTreeMap<String, u16>>,
-    mesh_plan: &MeshPlan,
+    proxy_slot_by_component: &HashMap<ComponentId, String>,
 ) -> DcResult<HashMap<ComponentId, u16>> {
     let mut ports = HashMap::new();
-    for binding in &mesh_plan.framework_bindings {
-        if binding.capability.as_str() != "docker" {
-            continue;
-        }
-        if ports.contains_key(&binding.consumer) {
-            continue;
-        }
-        let slot_ports = slot_ports_by_component
-            .get(&binding.consumer)
-            .ok_or_else(|| {
-                DockerComposeError::Other(format!(
-                    "internal error: missing local slot map for {}",
-                    component_label(scenario, binding.consumer)
-                ))
-            })?;
-        let listen_port = *slot_ports.get(&binding.slot).ok_or_else(|| {
+    for (component, slot_name) in proxy_slot_by_component {
+        let slot_ports = slot_ports_by_component.get(component).ok_or_else(|| {
             DockerComposeError::Other(format!(
                 "internal error: missing local slot port for {}.{}",
-                component_label(scenario, binding.consumer),
-                binding.slot
+                component_label(scenario, *component),
+                slot_name
             ))
         })?;
-        ports.insert(binding.consumer, listen_port);
+        let listen_port = *slot_ports.get(slot_name).ok_or_else(|| {
+            DockerComposeError::Other(format!(
+                "internal error: missing local slot port for {}.{}",
+                component_label(scenario, *component),
+                slot_name
+            ))
+        })?;
+        ports.insert(*component, listen_port);
     }
     Ok(ports)
 }
@@ -887,45 +805,19 @@ fn encode_docker_mount_proxy_spec_b64(
     Ok(base64::engine::general_purpose::STANDARD.encode(payload))
 }
 
-fn docker_gateway_depends_on(needs_router: bool) -> Vec<(String, &'static str)> {
-    if needs_router {
-        vec![(ROUTER_SERVICE_NAME.to_string(), "service_started")]
-    } else {
-        Vec::new()
-    }
-}
-
-fn docker_gateway_service(
-    image: &str,
-    config_json: String,
-    deps: Vec<(String, &'static str)>,
-) -> Service {
-    let mut service = Service::new(image);
-    service
-        .networks
-        .insert(MESH_NETWORK_NAME.to_string(), EmptyMap::default());
-    service.environment = Some(Environment::Map(BTreeMap::from([(
-        DOCKER_GATEWAY_CONFIG_ENV.to_string(),
-        config_json,
-    )])));
-    service.depends_on = build_depends_on(false, deps);
-    service.volumes.push(format!(
-        "${{{DOCKER_GATEWAY_HOST_SOCK_ENV}:-{}}}:{DOCKER_GATEWAY_CONTAINER_SOCK}",
-        detect_default_host_docker_sock().display()
-    ));
-    service
-}
-
-fn build_docker_gateway_config_json() -> DcResult<String> {
+fn build_docker_gateway_config_json(
+    caller_component: &str,
+    caller_compose_service: &str,
+) -> DcResult<String> {
     let callers = vec![DockerGatewayCallerConfig {
-        host: ROUTER_SERVICE_NAME.to_string(),
+        host: "127.0.0.1".to_string(),
         port: None,
-        component: ROUTER_ID.to_string(),
-        compose_service: ROUTER_SERVICE_NAME.to_string(),
+        component: caller_component.to_string(),
+        compose_service: caller_compose_service.to_string(),
     }];
 
     let config = DockerGatewayConfig {
-        listen: format!("0.0.0.0:{DOCKER_GATEWAY_PORT}"),
+        listen: format!("0.0.0.0:{FRAMEWORK_DOCKER_GATEWAY_PORT}"),
         docker_sock: DOCKER_GATEWAY_CONTAINER_SOCK.to_string(),
         compose_project: "${COMPOSE_PROJECT_NAME}".to_string(),
         callers,

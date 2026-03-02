@@ -15,9 +15,6 @@ use super::{
 };
 
 pub(crate) const ROUTER_ID: &str = "/router";
-pub(crate) const INTERNAL_FRAMEWORK_DOCKER_SLOT: &str = "__amber_internal_framework_docker";
-pub(crate) const FRAMEWORK_DOCKER_CAPABILITY: &str = "framework.docker";
-pub(crate) const FRAMEWORK_DOCKER_URL_ENV: &str = "AMBER_FRAMEWORK_DOCKER_URL";
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RouterPorts {
@@ -102,9 +99,7 @@ pub(crate) fn build_mesh_config_plan(
     router_ports: Option<RouterPorts>,
     addressing: &impl MeshAddressing,
 ) -> Result<MeshConfigPlan, MeshError> {
-    let needs_router = !mesh_plan.external_bindings.is_empty()
-        || !mesh_plan.exports.is_empty()
-        || !mesh_plan.framework_bindings.is_empty();
+    let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
     if needs_router && router_ports.is_none() {
         return Err(MeshError::new("router ports missing"));
     }
@@ -281,44 +276,6 @@ pub(crate) fn build_mesh_config_plan(
             });
         }
 
-        for binding in &mesh_plan.framework_bindings {
-            if binding.consumer != *id {
-                continue;
-            }
-            let spec = framework_route_spec(binding.capability.as_str()).ok_or_else(|| {
-                MeshError::new(format!(
-                    "unsupported framework capability for mesh routing: framework.{}",
-                    binding.capability
-                ))
-            })?;
-            let slot_ports = slot_ports_by_component.get(id).ok_or_else(|| {
-                MeshError::new(format!(
-                    "slot ports missing for {}",
-                    component_label(scenario, *id)
-                ))
-            })?;
-            let listen_port = *slot_ports.get(&binding.slot).ok_or_else(|| {
-                MeshError::new(format!(
-                    "slot port missing for {}.{}",
-                    component_label(scenario, *id),
-                    binding.slot
-                ))
-            })?;
-            let router_identity = router_identity
-                .as_ref()
-                .ok_or_else(|| MeshError::new("framework bindings require router identity"))?;
-            let router_addr = addressing.mesh_addr_for_router()?;
-            outbound.push(OutboundRoute {
-                slot: binding.slot.clone(),
-                listen_port,
-                listen_addr: None,
-                protocol: spec.protocol,
-                peer_addr: router_addr,
-                peer_id: router_identity.id.clone(),
-                capability: spec.capability.to_string(),
-            });
-        }
-
         let mesh_listen = format!("0.0.0.0:{mesh_port}").parse().expect("mesh listen");
         let config_peers = required_peers(&identity.id, &inbound, &outbound);
 
@@ -366,48 +323,6 @@ pub(crate) fn build_mesh_config_plan(
                 target: InboundTarget::External {
                     url_env: slot.url_env.clone(),
                     optional: slot.optional,
-                },
-                allowed_issuers: issuers.into_iter().collect(),
-            });
-        }
-
-        let mut framework_consumers: BTreeMap<String, BTreeSet<ComponentId>> = BTreeMap::new();
-        for binding in &mesh_plan.framework_bindings {
-            framework_consumers
-                .entry(binding.capability.as_str().to_string())
-                .or_default()
-                .insert(binding.consumer);
-        }
-        for (framework_capability, consumers) in framework_consumers {
-            let spec = framework_route_spec(&framework_capability).ok_or_else(|| {
-                MeshError::new(format!(
-                    "unsupported framework capability for mesh routing: \
-                     framework.{framework_capability}"
-                ))
-            })?;
-            if spec.url_env_passthrough {
-                router_env_passthrough.push(spec.url_env.to_string());
-            }
-
-            let mut issuers = BTreeSet::new();
-            for consumer in consumers {
-                let consumer_id = identities_by_component
-                    .get(&consumer)
-                    .expect("consumer identity missing")
-                    .id
-                    .clone();
-                issuers.insert(consumer_id);
-            }
-            if issuers.is_empty() {
-                continue;
-            }
-
-            inbound.push(InboundRoute {
-                capability: spec.capability.to_string(),
-                protocol: spec.protocol,
-                target: InboundTarget::External {
-                    url_env: spec.url_env.to_string(),
-                    optional: false,
                 },
                 allowed_issuers: issuers.into_iter().collect(),
             });
@@ -506,26 +421,6 @@ fn required_peers(
         .into_iter()
         .map(|id| MeshPeerTemplate { id })
         .collect()
-}
-
-#[derive(Clone, Copy)]
-struct FrameworkRouteSpec {
-    capability: &'static str,
-    protocol: MeshProtocol,
-    url_env: &'static str,
-    url_env_passthrough: bool,
-}
-
-fn framework_route_spec(capability: &str) -> Option<FrameworkRouteSpec> {
-    match capability {
-        "docker" => Some(FrameworkRouteSpec {
-            capability: FRAMEWORK_DOCKER_CAPABILITY,
-            protocol: MeshProtocol::Tcp,
-            url_env: FRAMEWORK_DOCKER_URL_ENV,
-            url_env_passthrough: false,
-        }),
-        _ => None,
-    }
 }
 
 struct RouterExternalSlot {

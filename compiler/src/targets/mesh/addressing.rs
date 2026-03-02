@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use amber_manifest::NetworkProtocol;
 use amber_scenario::{ComponentId, Scenario};
 
 use crate::{
@@ -125,7 +126,11 @@ impl Addressing for LocalAddressing<'_> {
 
     fn resolve_binding_url(&mut self, binding: &ResolvedBinding) -> Result<String, Self::Error> {
         let local_port = self.local_slot_port(binding.consumer, &binding.slot)?;
-        Ok(format!("http://127.0.0.1:{local_port}"))
+        let scheme = match binding.endpoint.protocol {
+            NetworkProtocol::Tcp => "tcp",
+            _ => "http",
+        };
+        Ok(format!("{scheme}://127.0.0.1:{local_port}"))
     }
 
     fn resolve_external_binding_url(

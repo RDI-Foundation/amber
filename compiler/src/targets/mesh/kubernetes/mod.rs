@@ -178,8 +178,6 @@ fn render_kubernetes(
     let images = resolve_internal_images().map_err(ReporterError::new)?;
 
     let program_components = mesh_plan.program_components.as_slice();
-    let manifests = &mesh_plan.manifests;
-
     // Generate namespace name.
     let namespace = generate_namespace_name(s, &scenario_digest);
 
@@ -192,9 +190,7 @@ fn render_kubernetes(
                 netpol: format!("{base}-netpol"),
             }
         });
-    let root_manifest = manifests[s.root.0]
-        .as_ref()
-        .expect("root manifest should exist");
+    let root_manifest = mesh_plan.root_manifest.as_ref();
 
     let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
 

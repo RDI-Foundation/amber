@@ -31,6 +31,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, duplex, split},
     net::TcpListener,
     sync::{Mutex, RwLock},
+    task::JoinSet,
 };
 use url::Url;
 
@@ -200,41 +201,29 @@ pub async fn run(config: MeshConfig) -> Result<(), RouterError> {
     let config = Arc::new(config);
     let external_overrides = Arc::new(RwLock::new(HashMap::new()));
 
-    let mut handles = Vec::new();
+    let mut listeners = JoinSet::new();
 
-    let mesh_handle = {
+    {
         let config = config.clone();
         let trust = trust.clone();
         let inbound_routes = inbound_routes.clone();
         let dynamic_issuers = dynamic_issuers.clone();
         let external_overrides = external_overrides.clone();
         let client = Arc::new(build_client());
-        tokio::spawn(async move {
-            if let Err(err) = run_mesh_listener(
-                config,
-                trust,
-                inbound_routes,
-                dynamic_issuers,
-                external_overrides,
-                client,
-            )
-            .await
-            {
-                eprintln!("mesh listener failed: {err}");
-            }
-        })
-    };
-    handles.push(mesh_handle);
+        listeners.spawn(run_mesh_listener(
+            config,
+            trust,
+            inbound_routes,
+            dynamic_issuers,
+            external_overrides,
+            client,
+        ));
+    }
 
     for route in config.outbound.clone() {
         let config = config.clone();
         let trust = trust.clone();
-        let handle = tokio::spawn(async move {
-            if let Err(err) = run_outbound_listener(route, config, trust).await {
-                eprintln!("outbound listener failed: {err}");
-            }
-        });
-        handles.push(handle);
+        listeners.spawn(run_outbound_listener(route, config, trust));
     }
 
     let control_socket_path = env::var(CONTROL_SOCKET_PATH_ENV)
@@ -250,21 +239,14 @@ pub async fn run(config: MeshConfig) -> Result<(), RouterError> {
             let inbound_routes = inbound_routes.clone();
             let dynamic_issuers = dynamic_issuers.clone();
             let identity_public = identity_public.clone();
-            let handle = tokio::spawn(async move {
-                if let Err(err) = run_control_server_unix(
-                    path,
-                    external_overrides,
-                    trust,
-                    inbound_routes,
-                    dynamic_issuers,
-                    identity_public,
-                )
-                .await
-                {
-                    eprintln!("control unix listener failed: {err}");
-                }
-            });
-            handles.push(handle);
+            listeners.spawn(run_control_server_unix(
+                path,
+                external_overrides,
+                trust,
+                inbound_routes,
+                dynamic_issuers,
+                identity_public,
+            ));
         }
         #[cfg(not(unix))]
         {
@@ -283,29 +265,33 @@ pub async fn run(config: MeshConfig) -> Result<(), RouterError> {
         let inbound_routes = inbound_routes.clone();
         let dynamic_issuers = dynamic_issuers.clone();
         let identity_public = identity_public.clone();
-        let handle = tokio::spawn(async move {
-            if let Err(err) = run_control_server(
-                addr,
-                external_overrides,
-                control_allow,
-                trust,
-                inbound_routes,
-                dynamic_issuers,
-                identity_public,
-            )
-            .await
-            {
-                eprintln!("control listener failed: {err}");
-            }
-        });
-        handles.push(handle);
+        listeners.spawn(run_control_server(
+            addr,
+            external_overrides,
+            control_allow,
+            trust,
+            inbound_routes,
+            dynamic_issuers,
+            identity_public,
+        ));
     }
 
-    for handle in handles {
-        let _ = handle.await;
-    }
+    let Some(listener) = listeners.join_next().await else {
+        return Err(RouterError::Transport(
+            "no listener tasks were started".to_string(),
+        ));
+    };
 
-    Ok(())
+    listeners.abort_all();
+    match listener {
+        Ok(Ok(())) => Err(RouterError::Transport(
+            "listener task exited unexpectedly".to_string(),
+        )),
+        Ok(Err(err)) => Err(err),
+        Err(err) => Err(RouterError::Transport(format!(
+            "listener task panicked: {err}"
+        ))),
+    }
 }
 
 fn validate_config(config: &MeshConfig) -> Result<(), RouterError> {
@@ -1696,6 +1682,8 @@ fn insert_peer(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn test_mesh_config() -> MeshConfig {
@@ -1806,6 +1794,37 @@ mod tests {
                 assert!(message.contains("peer key already registered for first-peer"));
             }
             other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_surfaces_outbound_listener_bind_failure() {
+        let occupied = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind occupied listener");
+        let occupied_addr = occupied
+            .local_addr()
+            .expect("read occupied listener address");
+
+        let mut config = test_mesh_config();
+        config.outbound.push(amber_mesh::OutboundRoute {
+            slot: "test-outbound".to_string(),
+            listen_port: occupied_addr.port(),
+            listen_addr: Some("127.0.0.1".to_string()),
+            protocol: MeshProtocol::Tcp,
+            peer_addr: "127.0.0.1:65535".to_string(),
+            peer_id: "peer".to_string(),
+            capability: "capability".to_string(),
+        });
+
+        let err = tokio::time::timeout(Duration::from_secs(2), run(config))
+            .await
+            .expect("run should return when a listener fails to bind")
+            .expect_err("run should fail when outbound listener port is occupied");
+
+        match err {
+            RouterError::BindFailed { addr, .. } => assert_eq!(addr, occupied_addr),
+            other => panic!("expected bind failure, got {other}"),
         }
     }
 }
