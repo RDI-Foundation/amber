@@ -12,6 +12,7 @@ use amber_mesh::{
     MeshProvisionPlan, MeshProvisionTarget, MeshProvisionTargetKind,
 };
 use amber_scenario::{ComponentId, Scenario};
+use base64::Engine as _;
 use miette::{LabeledSpan, NamedSource, SourceSpan};
 pub use resources::*;
 use serde::Serialize;
@@ -28,7 +29,7 @@ use crate::{
             mount_specs_need_config,
         },
         internal_images::resolve_internal_images,
-        mesh_config::{MeshAddressing, RouterPorts, build_mesh_config_plan},
+        mesh_config::{MeshAddressing, RouterPorts, build_mesh_config_plan, scenario_ir_digest},
         plan::{MeshError, MeshOptions, component_label},
         ports::{allocate_mesh_ports, allocate_slot_ports},
         proxy_metadata::{
@@ -197,6 +198,8 @@ fn render_kubernetes(
     config: &KubernetesReporterConfig,
 ) -> KubernetesResult<KubernetesArtifact> {
     let s = &output.scenario;
+    let scenario_digest =
+        scenario_ir_digest(s).map_err(|err| ReporterError::new(err.to_string()))?;
     let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
         s,
         &output.store,
@@ -227,7 +230,7 @@ fn render_kubernetes(
     let manifests = &mesh_plan.manifests;
 
     // Generate namespace name.
-    let namespace = generate_namespace_name(s);
+    let namespace = generate_namespace_name(s, &scenario_digest);
 
     // Generate component names.
     let mut names: HashMap<ComponentId, ComponentNames> = HashMap::new();
@@ -1201,7 +1204,7 @@ fn render_kubernetes(
 
     let scenario_metadata = ScenarioMetadata {
         version: "1",
-        digest: s.component(s.root).digest.to_string(),
+        digest: encode_scenario_digest(&scenario_digest),
         exports: export_metadata.clone(),
         inputs: input_metadata,
         external_slots: external_slot_metadata.clone(),
@@ -1582,7 +1585,12 @@ fn mesh_secret_name(service: &str) -> String {
     format!("{service}-mesh")
 }
 
-fn generate_namespace_name(s: &Scenario) -> String {
+fn encode_scenario_digest(digest: &[u8; 32]) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(digest);
+    format!("sha256:{encoded}")
+}
+
+fn generate_namespace_name(s: &Scenario, scenario_digest: &[u8; 32]) -> String {
     let root = s.component(s.root);
     let short_name = root
         .moniker
@@ -1590,8 +1598,7 @@ fn generate_namespace_name(s: &Scenario) -> String {
         .unwrap_or("scenario")
         .to_lowercase();
     // Get digest bytes and encode as hex (DNS-safe)
-    let digest_bytes = root.digest.bytes();
-    let digest_hex: String = digest_bytes[..4]
+    let digest_hex: String = scenario_digest[..4]
         .iter()
         .map(|b| format!("{:02x}", b))
         .collect();

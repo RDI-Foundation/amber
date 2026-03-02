@@ -402,6 +402,103 @@ fn fetch(
 }
 
 #[test]
+fn kubernetes_namespace_and_metadata_digest_follow_scenario_ir() {
+    let dir = tempdir().expect("temp dir");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+    fs::write(
+        &root_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          components: { child: "./child.json5" }
+        }
+        "#,
+    )
+    .expect("write root manifest");
+
+    let compile_namespace_and_digest = |child_contents: &str| {
+        fs::write(&child_path, child_contents).expect("write child manifest");
+        let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+        let opts = CompileOptions {
+            optimize: OptimizeOptions { dce: false },
+            ..Default::default()
+        };
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let output = rt
+            .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
+            .expect("compile scenario");
+
+        let reporter = KubernetesReporter {
+            config: KubernetesReporterConfig {
+                disable_networkpolicy_check: true,
+            },
+        };
+        let artifact = reporter.emit(&output).expect("render kubernetes output");
+
+        let kustomization = artifact
+            .files
+            .get(&PathBuf::from("kustomization.yaml"))
+            .expect("kustomization");
+        let kust_doc: serde_yaml::Value =
+            serde_yaml::from_str(kustomization).expect("parse kustomization");
+        let namespace = kust_doc["namespace"]
+            .as_str()
+            .expect("kustomization namespace")
+            .to_string();
+
+        let metadata_yaml = artifact
+            .files
+            .get(&PathBuf::from("01-configmaps/amber-metadata.yaml"))
+            .expect("metadata configmap");
+        let meta_doc: serde_yaml::Value =
+            serde_yaml::from_str(metadata_yaml).expect("parse metadata yaml");
+        let scenario_json = meta_doc["data"]["scenario.json"]
+            .as_str()
+            .expect("scenario.json in metadata");
+        let scenario_json: serde_json::Value =
+            serde_json::from_str(scenario_json).expect("parse scenario.json");
+        let digest = scenario_json["digest"]
+            .as_str()
+            .expect("scenario digest")
+            .to_string();
+
+        (namespace, digest)
+    };
+
+    let child_a = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "busybox:1.36.1",
+            entrypoint: ["sh", "-lc", "sleep 3600"]
+          }
+        }
+        "#;
+    let child_b = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "busybox:1.36.1",
+            entrypoint: ["sh", "-lc", "sleep 1200"]
+          }
+        }
+        "#;
+
+    let (namespace_a, digest_a) = compile_namespace_and_digest(child_a);
+    let (namespace_b, digest_b) = compile_namespace_and_digest(child_b);
+
+    assert_ne!(
+        namespace_a, namespace_b,
+        "namespace should change when scenario IR changes"
+    );
+    assert_ne!(
+        digest_a, digest_b,
+        "metadata digest should change when scenario IR changes"
+    );
+}
+
+#[test]
 fn kubernetes_emits_router_for_external_slots() {
     let dir = tempdir().expect("temp dir");
     let root_path = dir.path().join("root.json5");

@@ -123,6 +123,10 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn use_prebuilt_images() -> bool {
+    std::env::var("AMBER_TEST_USE_PREBUILT_IMAGES").is_ok()
+}
+
 fn image_platform_opt(tag: &str) -> Option<String> {
     let output = std::process::Command::new("docker")
         .arg("image")
@@ -176,6 +180,17 @@ fn ensure_image_platform(tag: &str, platform: &str) {
 }
 
 fn build_docker_image(tag: &str, dockerfile: &Path, context: &Path) -> String {
+    // The CI "prebuilt images" smoke job pulls and retags these images ahead of tests.
+    // Respecting this flag here avoids rebuilding the same images in every smoke test run.
+    if use_prebuilt_images() {
+        return image_platform_opt(tag).unwrap_or_else(|| {
+            panic!(
+                "AMBER_TEST_USE_PREBUILT_IMAGES is set but {tag} is not available locally. Ensure \
+                 images are pulled and retagged before running tests."
+            )
+        });
+    }
+
     let status = std::process::Command::new("docker")
         .arg("buildx")
         .arg("build")
