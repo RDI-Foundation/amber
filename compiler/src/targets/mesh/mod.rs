@@ -8,3 +8,4 @@ pub(crate) mod internal_images;
 pub(crate) mod mesh_config;
 pub(crate) mod plan;
 pub(crate) mod ports;
+pub(crate) mod provision;

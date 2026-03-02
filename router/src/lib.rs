@@ -102,6 +102,15 @@ type ExternalOverrides = Arc<RwLock<HashMap<String, String>>>;
 type ControlAllowlist = Arc<HashSet<IpAddr>>;
 type DynamicIssuers = Arc<RwLock<HashMap<String, HashSet<String>>>>;
 
+#[derive(Clone)]
+struct ControlServiceState {
+    external_overrides: ExternalOverrides,
+    trust: Arc<TrustBundle>,
+    inbound_routes: Arc<HashMap<String, InboundRoute>>,
+    dynamic_issuers: DynamicIssuers,
+    identity: MeshIdentityPublic,
+}
+
 #[derive(Debug, Deserialize)]
 struct ControlExternalSlot {
     url: String,
@@ -412,80 +421,59 @@ async fn handle_inbound(
                 (!trimmed.is_empty()).then_some(trimmed)
             });
             if let Some(override_url) = override_url {
-                if override_url.starts_with("mesh://") {
-                    let mesh = parse_mesh_external(&override_url)?;
-                    let outbound = connect_noise_with_key(
-                        &mesh.peer_addr,
-                        &mesh.peer_id,
-                        mesh.peer_key,
-                        &config,
-                    )
-                    .await?;
-                    let open = OpenFrame {
-                        capability: route.capability.clone(),
-                        protocol: route.protocol,
-                    };
-                    outbound.send_open(&open).await?;
-                    proxy_noise_to_noise(&mut session, outbound).await?;
+                if maybe_proxy_mesh_external(
+                    &mut session,
+                    &route.capability,
+                    route.protocol,
+                    &override_url,
+                    &config,
+                )
+                .await?
+                {
                     return Ok(());
                 }
 
-                let target = ExternalTarget {
-                    name: route.capability.clone(),
-                    url_env,
-                    optional,
-                    url_override: Some(override_url),
-                };
-                match route.protocol {
-                    MeshProtocol::Http => {
-                        proxy_noise_to_external(&mut session, target, client).await?
-                    }
-                    MeshProtocol::Tcp => proxy_noise_to_external_tcp(&mut session, target).await?,
-                    MeshProtocol::Udp => {
-                        return Err(RouterError::InvalidConfig(
-                            "external targets do not support udp protocol".to_string(),
-                        ));
-                    }
-                }
-                return Ok(());
+                return proxy_by_external_protocol(
+                    &mut session,
+                    route.protocol,
+                    ExternalTarget {
+                        name: route.capability.clone(),
+                        url_env,
+                        optional,
+                        url_override: Some(override_url),
+                    },
+                    client.clone(),
+                )
+                .await;
             }
 
             if let Ok(raw) = env::var(&url_env) {
                 let trimmed = raw.trim();
-                if trimmed.starts_with("mesh://") {
-                    let mesh = parse_mesh_external(trimmed)?;
-                    let outbound = connect_noise_with_key(
-                        &mesh.peer_addr,
-                        &mesh.peer_id,
-                        mesh.peer_key,
-                        &config,
-                    )
-                    .await?;
-                    let open = OpenFrame {
-                        capability: route.capability.clone(),
-                        protocol: route.protocol,
-                    };
-                    outbound.send_open(&open).await?;
-                    proxy_noise_to_noise(&mut session, outbound).await?;
+                if maybe_proxy_mesh_external(
+                    &mut session,
+                    &route.capability,
+                    route.protocol,
+                    trimmed,
+                    &config,
+                )
+                .await?
+                {
                     return Ok(());
                 }
             }
 
-            let target = ExternalTarget {
-                name: route.capability.clone(),
-                url_env,
-                optional,
-                url_override: None,
-            };
-            match route.protocol {
-                MeshProtocol::Http => proxy_noise_to_external(&mut session, target, client).await?,
-                MeshProtocol::Tcp => proxy_noise_to_external_tcp(&mut session, target).await?,
-                MeshProtocol::Udp => {
-                    return Err(RouterError::InvalidConfig(
-                        "external targets do not support udp protocol".to_string(),
-                    ));
-                }
-            }
+            proxy_by_external_protocol(
+                &mut session,
+                route.protocol,
+                ExternalTarget {
+                    name: route.capability.clone(),
+                    url_env,
+                    optional,
+                    url_override: None,
+                },
+                client.clone(),
+            )
+            .await?;
         }
         InboundTarget::MeshForward {
             peer_addr,
@@ -503,6 +491,43 @@ async fn handle_inbound(
     }
 
     Ok(())
+}
+
+async fn maybe_proxy_mesh_external(
+    session: &mut NoiseSession,
+    capability: &str,
+    protocol: MeshProtocol,
+    url: &str,
+    config: &MeshConfig,
+) -> Result<bool, RouterError> {
+    if !url.starts_with("mesh://") {
+        return Ok(false);
+    }
+    let mesh = parse_mesh_external(url)?;
+    let outbound =
+        connect_noise_with_key(&mesh.peer_addr, &mesh.peer_id, mesh.peer_key, config).await?;
+    let open = OpenFrame {
+        capability: capability.to_string(),
+        protocol,
+    };
+    outbound.send_open(&open).await?;
+    proxy_noise_to_noise(session, outbound).await?;
+    Ok(true)
+}
+
+async fn proxy_by_external_protocol(
+    session: &mut NoiseSession,
+    protocol: MeshProtocol,
+    target: ExternalTarget,
+    client: Arc<HttpClient>,
+) -> Result<(), RouterError> {
+    match protocol {
+        MeshProtocol::Http => proxy_noise_to_external(session, target, client).await,
+        MeshProtocol::Tcp => proxy_noise_to_external_tcp(session, target).await,
+        MeshProtocol::Udp => Err(RouterError::InvalidConfig(
+            "external targets do not support udp protocol".to_string(),
+        )),
+    }
 }
 
 async fn run_outbound_listener(
@@ -568,49 +593,23 @@ async fn run_control_server(
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|source| RouterError::BindFailed { addr, source })?;
+    let state = ControlServiceState {
+        external_overrides,
+        trust,
+        inbound_routes,
+        dynamic_issuers,
+        identity,
+    };
 
     loop {
         let (stream, peer) = listener.accept().await?;
-        let external_overrides = external_overrides.clone();
         let control_allow = control_allow.clone();
-        let trust = trust.clone();
-        let inbound_routes = inbound_routes.clone();
-        let dynamic_issuers = dynamic_issuers.clone();
-        let identity = identity.clone();
+        let state = state.clone();
         tokio::spawn(async move {
-            let allowed = match control_allow.as_ref() {
-                Some(allow) => allow.contains(&peer.ip()),
-                None => true,
-            };
-            let service = service_fn(move |req| {
-                let external_overrides = external_overrides.clone();
-                let trust = trust.clone();
-                let inbound_routes = inbound_routes.clone();
-                let dynamic_issuers = dynamic_issuers.clone();
-                let identity = identity.clone();
-                async move {
-                    if allowed {
-                        control_service(
-                            req,
-                            external_overrides,
-                            trust,
-                            inbound_routes,
-                            dynamic_issuers,
-                            identity,
-                        )
-                        .await
-                    } else {
-                        Ok(error_response(
-                            StatusCode::FORBIDDEN,
-                            "control access denied",
-                        ))
-                    }
-                }
-            });
-            if let Err(err) = http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), service)
-                .await
-            {
+            let allowed = control_allow
+                .as_ref()
+                .is_none_or(|allow| allow.contains(&peer.ip()));
+            if let Err(err) = serve_control_connection(stream, state, allowed).await {
                 eprintln!("control connection failed: {err}");
             }
         });
@@ -650,41 +649,63 @@ async fn run_control_server_unix(
             path: path.clone(),
             source,
         })?;
+    let state = ControlServiceState {
+        external_overrides,
+        trust,
+        inbound_routes,
+        dynamic_issuers,
+        identity,
+    };
 
     loop {
         let (stream, _) = listener.accept().await?;
-        let external_overrides = external_overrides.clone();
-        let trust = trust.clone();
-        let inbound_routes = inbound_routes.clone();
-        let dynamic_issuers = dynamic_issuers.clone();
-        let identity = identity.clone();
+        let state = state.clone();
         tokio::spawn(async move {
-            let service = service_fn(move |req| {
-                let external_overrides = external_overrides.clone();
-                let trust = trust.clone();
-                let inbound_routes = inbound_routes.clone();
-                let dynamic_issuers = dynamic_issuers.clone();
-                let identity = identity.clone();
-                async move {
-                    control_service(
-                        req,
-                        external_overrides,
-                        trust,
-                        inbound_routes,
-                        dynamic_issuers,
-                        identity,
-                    )
-                    .await
-                }
-            });
-            if let Err(err) = http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), service)
-                .await
-            {
+            if let Err(err) = serve_control_connection(stream, state, true).await {
                 eprintln!("control unix connection failed: {err}");
             }
         });
     }
+}
+
+async fn serve_control_connection<IO>(
+    stream: IO,
+    state: ControlServiceState,
+    allowed: bool,
+) -> Result<(), hyper::Error>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let service = service_fn(move |req| {
+        let state = state.clone();
+        async move {
+            if !allowed {
+                return Ok(error_response(
+                    StatusCode::FORBIDDEN,
+                    "control access denied",
+                ));
+            }
+            let ControlServiceState {
+                external_overrides,
+                trust,
+                inbound_routes,
+                dynamic_issuers,
+                identity,
+            } = state;
+            control_service(
+                req,
+                external_overrides,
+                trust,
+                inbound_routes,
+                dynamic_issuers,
+                identity,
+            )
+            .await
+        }
+    });
+    http1::Builder::new()
+        .serve_connection(TokioIo::new(stream), service)
+        .await
 }
 
 async fn resolve_control_allowlist(entries: &[String]) -> Result<ControlAllowlist, RouterError> {
@@ -1090,30 +1111,11 @@ async fn connect_noise(
     config: &MeshConfig,
     trust: &TrustBundle,
 ) -> Result<NoiseSession, RouterError> {
-    let noise_keys = noise_keys_for_identity(&config.identity)?;
     let remote = trust
         .noise_key(peer_id)
         .await
         .ok_or_else(|| RouterError::Auth(format!("unknown peer {peer_id}")))?;
-    let stream = tokio::net::TcpStream::connect(peer_addr).await?;
-    let (mut reader, mut writer) = stream.into_split();
-
-    let mut builder = snow::Builder::new(NOISE_PATTERN.parse().unwrap());
-    builder = builder
-        .local_private_key(&noise_keys.private)
-        .remote_public_key(&remote);
-    let handshake = builder
-        .build_initiator()
-        .map_err(|err| RouterError::Handshake(err.to_string()))?;
-
-    let handshake = perform_handshake(handshake, &mut reader, &mut writer).await?;
-
-    Ok(NoiseSession {
-        state: Arc::new(Mutex::new(handshake.transport)),
-        reader: Arc::new(Mutex::new(reader)),
-        writer: Arc::new(Mutex::new(writer)),
-        remote_id: Some(peer_id.to_string()),
-    })
+    connect_noise_with_remote_key(peer_addr, peer_id, remote, config).await
 }
 
 async fn connect_noise_with_key(
@@ -1122,8 +1124,17 @@ async fn connect_noise_with_key(
     peer_key: [u8; 32],
     config: &MeshConfig,
 ) -> Result<NoiseSession, RouterError> {
-    let noise_keys = noise_keys_for_identity(&config.identity)?;
     let remote = ed25519_public_to_x25519(peer_key)?;
+    connect_noise_with_remote_key(peer_addr, peer_id, remote, config).await
+}
+
+async fn connect_noise_with_remote_key(
+    peer_addr: &str,
+    peer_id: &str,
+    remote: [u8; 32],
+    config: &MeshConfig,
+) -> Result<NoiseSession, RouterError> {
+    let noise_keys = noise_keys_for_identity(&config.identity)?;
     let stream = tokio::net::TcpStream::connect(peer_addr).await?;
     let (mut reader, mut writer) = stream.into_split();
 
@@ -1516,13 +1527,7 @@ fn parse_mesh_external(value: &str) -> Result<MeshExternalTarget, RouterError> {
         .ok_or_else(|| RouterError::InvalidConfig("mesh url missing peer_id".to_string()))?;
     let peer_key = peer_key
         .ok_or_else(|| RouterError::InvalidConfig("mesh url missing peer_key".to_string()))?;
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(peer_key.as_bytes())
-        .map_err(|err| RouterError::InvalidConfig(format!("invalid peer_key: {err}")))?;
-    let peer_key: [u8; 32] = decoded
-        .as_slice()
-        .try_into()
-        .map_err(|_| RouterError::InvalidConfig("invalid peer_key length".to_string()))?;
+    let peer_key = decode_peer_key(&peer_key).map_err(RouterError::InvalidConfig)?;
 
     Ok(MeshExternalTarget {
         peer_addr: format!("{host}:{port}"),

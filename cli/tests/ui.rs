@@ -134,12 +134,6 @@ fn normalize_paths(text: &str) -> String {
         .to_string_lossy();
     let mut out = text.replace(manifest_dir, "<CARGO_MANIFEST_DIR>");
     out = out.replace(workspace_root.as_ref(), "<WORKSPACE_ROOT>");
-    if cfg!(windows) {
-        let manifest_dir = manifest_dir.replace('\\', "/");
-        let workspace_root = workspace_root.replace('\\', "/");
-        out = out.replace(&manifest_dir, "<CARGO_MANIFEST_DIR>");
-        out = out.replace(&workspace_root, "<WORKSPACE_ROOT>");
-    }
     out
 }
 

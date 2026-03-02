@@ -6,10 +6,7 @@ use std::{
 
 use amber_config as rc;
 use amber_manifest::{FrameworkCapabilityName, MountSource};
-use amber_mesh::{
-    MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MESH_PROVISION_PLAN_VERSION, MeshProvisionOutput,
-    MeshProvisionPlan, MeshProvisionTarget, MeshProvisionTargetKind,
-};
+use amber_mesh::{MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProvisionOutput};
 use amber_scenario::{ComponentId, Scenario};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -18,23 +15,25 @@ use crate::{
     CompileOutput,
     reporter::{Reporter, ReporterError},
     targets::mesh::{
-        addressing::{Addressing, build_address_plan},
+        addressing::{
+            DockerFrameworkBindingPolicy, LocalAddressing, LocalAddressingOptions,
+            build_address_plan,
+        },
         config::{
-            ProgramImagePart, ProgramImagePlan, ProgramPlan, build_config_plan,
-            encode_component_payload, encode_direct_entrypoint_b64, encode_direct_env_b64,
-            encode_helper_payload, encode_mount_spec_b64, encode_schema_b64,
-            mount_specs_need_config,
+            ComponentExecutionPlan, ProgramImagePart, ProgramImagePlan,
+            build_component_runtime_plan, build_config_plan,
         },
         internal_images::resolve_internal_images,
         mesh_config::{
-            FRAMEWORK_DOCKER_URL_ENV, INTERNAL_FRAMEWORK_DOCKER_SLOT, MeshAddressing,
-            MeshConfigPlan, ROUTER_ID, RouterPorts, build_mesh_config_plan, scenario_ir_digest,
+            FRAMEWORK_DOCKER_URL_ENV, INTERNAL_FRAMEWORK_DOCKER_SLOT, MeshServiceName, ROUTER_ID,
+            RouterPorts, ServiceMeshAddressing, build_mesh_config_plan, scenario_ir_digest,
         },
         plan::{
-            MeshError, MeshOptions, MeshPlan, ResolvedBinding, ResolvedExternalBinding,
-            ResolvedFrameworkBinding, component_label,
+            MeshOptions, MeshPlan, ResolvedFrameworkBinding, component_label,
+            map_program_components,
         },
         ports::{allocate_mesh_ports, allocate_slot_ports},
+        provision::build_mesh_provision_plan,
         proxy_metadata::{ProxyMetadata, RouterMetadata, build_proxy_metadata},
     },
 };
@@ -187,9 +186,10 @@ struct ServiceNames {
     sidecar: String,
 }
 
-struct ComposeAddressing<'a> {
-    scenario: &'a Scenario,
-    slot_ports_by_component: HashMap<ComponentId, BTreeMap<String, u16>>,
+impl MeshServiceName for ServiceNames {
+    fn mesh_service_name(&self) -> &str {
+        &self.sidecar
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -247,68 +247,6 @@ impl DockerComposeError {
 
 type DcResult<T> = Result<T, DockerComposeError>;
 
-impl<'a> ComposeAddressing<'a> {
-    fn new(
-        scenario: &'a Scenario,
-        slot_ports_by_component: HashMap<ComponentId, BTreeMap<String, u16>>,
-    ) -> Result<Self, DockerComposeError> {
-        Ok(Self {
-            scenario,
-            slot_ports_by_component,
-        })
-    }
-
-    fn local_proxy_port(
-        &self,
-        component: ComponentId,
-        slot: &str,
-    ) -> Result<u16, DockerComposeError> {
-        self.slot_ports_by_component
-            .get(&component)
-            .and_then(|ports| ports.get(slot))
-            .copied()
-            .ok_or_else(|| {
-                DockerComposeError::Other(format!(
-                    "internal error: missing local port allocation for {}.{}",
-                    component_label(self.scenario, component),
-                    slot
-                ))
-            })
-    }
-}
-
-impl Addressing for ComposeAddressing<'_> {
-    type Error = DockerComposeError;
-
-    fn resolve_binding_url(&mut self, binding: &ResolvedBinding) -> Result<String, Self::Error> {
-        let local_port = self.local_proxy_port(binding.consumer, &binding.slot)?;
-
-        Ok(format!("http://127.0.0.1:{local_port}"))
-    }
-
-    fn resolve_external_binding_url(
-        &mut self,
-        binding: &ResolvedExternalBinding,
-    ) -> Result<String, Self::Error> {
-        let local_port = self.local_proxy_port(binding.consumer, &binding.slot)?;
-
-        Ok(format!("http://127.0.0.1:{local_port}"))
-    }
-    fn resolve_framework_binding_url(
-        &mut self,
-        binding: &ResolvedFrameworkBinding,
-    ) -> Result<String, Self::Error> {
-        if binding.capability.as_str() != "docker" {
-            return Err(DockerComposeError::Other(format!(
-                "docker-compose reporter does not support framework capability `framework.{}`",
-                binding.capability
-            )));
-        }
-        let local_port = self.local_proxy_port(binding.consumer, &binding.slot)?;
-        Ok(format!("tcp://127.0.0.1:{local_port}"))
-    }
-}
-
 fn render_docker_compose(output: &CompileOutput) -> Result<String, ReporterError> {
     render_docker_compose_inner(output).map_err(|err| err.into_reporter_error(output))
 }
@@ -331,19 +269,14 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     let program_components = mesh_plan.program_components.as_slice();
 
     // Precompute service names (injective & stable).
-    let mut names: HashMap<ComponentId, ServiceNames> = HashMap::new();
-    for id in program_components {
-        let c = s.component(*id);
-        let base = service_base_name(*id, c.moniker.local_name().unwrap_or("component"));
-        let sidecar = format!("{base}-net");
-        names.insert(
-            *id,
+    let names: HashMap<ComponentId, ServiceNames> =
+        map_program_components(s, program_components, |id, local_name| {
+            let base = service_base_name(id, local_name);
             ServiceNames {
-                program: base,
-                sidecar,
-            },
-        );
-    }
+                program: base.clone(),
+                sidecar: format!("{base}-net"),
+            }
+        });
     let docker_binding_components: BTreeSet<ComponentId> = mesh_plan
         .framework_bindings
         .iter()
@@ -379,41 +312,27 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         control: ROUTER_CONTROL_PORT_BASE,
     });
 
-    let addressing = ComposeAddressing::new(s, slot_ports_by_component.clone())?;
-    let address_plan = build_address_plan(&mesh_plan, addressing)?;
-
-    struct ComposeMeshAddressing<'a> {
-        names: &'a HashMap<ComponentId, ServiceNames>,
-        mesh_ports_by_component: &'a HashMap<ComponentId, u16>,
-        router_mesh_port: u16,
-    }
-
-    impl MeshAddressing for ComposeMeshAddressing<'_> {
-        fn mesh_addr_for_component(&self, id: ComponentId) -> Result<String, MeshError> {
-            let svc = self.names.get(&id).ok_or_else(|| {
-                MeshError::new(format!("missing service name for component {id:?}"))
-            })?;
-            let port = *self
-                .mesh_ports_by_component
-                .get(&id)
-                .ok_or_else(|| MeshError::new(format!("missing mesh port for component {id:?}")))?;
-            Ok(format!("{}:{}", svc.sidecar, port))
-        }
-
-        fn mesh_addr_for_router(&self) -> Result<String, MeshError> {
-            Ok(format!("{ROUTER_SERVICE_NAME}:{}", self.router_mesh_port))
-        }
-    }
+    let addressing = LocalAddressing::new(
+        s,
+        &slot_ports_by_component,
+        LocalAddressingOptions {
+            backend_label: "docker-compose reporter",
+            docker_binding: DockerFrameworkBindingPolicy::LoopbackTcp,
+        },
+    );
+    let address_plan = build_address_plan(&mesh_plan, addressing).map_err(dc_other)?;
 
     let router_mesh_port = router_ports
         .as_ref()
         .map(|ports| ports.mesh)
         .unwrap_or(ROUTER_MESH_PORT_BASE);
-    let mesh_addressing = ComposeMeshAddressing {
-        names: &names,
-        mesh_ports_by_component: &mesh_ports_by_component,
+    let mesh_addressing = ServiceMeshAddressing::new(
+        &names,
+        None,
+        &mesh_ports_by_component,
+        ROUTER_SERVICE_NAME,
         router_mesh_port,
-    };
+    );
     let mesh_config_plan = build_mesh_config_plan(
         s,
         &mesh_plan,
@@ -444,8 +363,22 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         .as_ref()
         .map(|meta| meta.exports.clone())
         .unwrap_or_default();
-    let mesh_provision_plan = build_provision_plan(&mesh_config_plan, program_components, &names)
-        .map_err(|err| DockerComposeError::Other(err.to_string()))?;
+    let mesh_provision_plan = build_mesh_provision_plan(
+        &mesh_config_plan,
+        program_components,
+        &names,
+        |svc: &ServiceNames| MeshProvisionOutput::Filesystem {
+            dir: provisioner_mount_dir(&svc.sidecar),
+        },
+        || MeshProvisionOutput::Filesystem {
+            dir: provisioner_mount_dir(ROUTER_SERVICE_NAME),
+        },
+        |router_config| {
+            router_config.control_listen = None;
+            router_config.control_allow = None;
+        },
+    )
+    .map_err(dc_other)?;
     let mut provisioner_mounts = Vec::new();
     for id in program_components {
         let svc = names.get(id).expect("service name missing");
@@ -649,23 +582,19 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         let mut program_service = Service::new(image);
         program_service.network_mode = Some(format!("service:{}", svc.sidecar));
         let label = component_label(s, *id);
-        let mount_specs = config_plan.mount_specs.get(id);
+        let mount_specs = config_plan.mount_specs.get(id).map(Vec::as_slice);
         let docker_mount_paths = docker_mount_paths_by_component.get(id);
         let has_docker_mount = docker_mount_paths.is_some_and(|paths| !paths.is_empty());
-        let mounts_need_config = mount_specs.is_some_and(|specs| mount_specs_need_config(specs));
-        let needs_config_payload =
-            matches!(program_plan, ProgramPlan::Helper { .. }) || mounts_need_config;
-        let needs_helper_for_component = matches!(program_plan, ProgramPlan::Helper { .. })
-            || mount_specs.is_some()
-            || has_docker_mount;
-        let runtime_view = needs_config_payload.then(|| {
-            config_plan
-                .runtime_views
-                .get(id)
-                .expect("runtime config view should be computed")
-        });
+        let runtime_plan = build_component_runtime_plan(
+            &label,
+            program_plan,
+            mount_specs,
+            config_plan.runtime_views.get(id),
+            has_docker_mount,
+        )
+        .map_err(dc_other)?;
         let mut deps: Vec<(String, &'static str)> = Vec::new();
-        if any_helper && needs_helper_for_component {
+        if any_helper && runtime_plan.needs_helper {
             deps.push((
                 HELPER_INIT_SERVICE.to_string(),
                 "service_completed_successfully",
@@ -690,54 +619,8 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         }
         program_service.depends_on = build_depends_on(any_helper, deps);
 
-        let append_runtime_config_env = |env_entries: &mut Vec<String>,
-                                         component_schema_b64: &str,
-                                         component_template_b64: &str|
-         -> Result<(), DockerComposeError> {
-            let view = runtime_view.expect("runtime config view should be computed");
-            let root_schema_b64 = encode_schema_b64(
-                &format!("root config definition for {label}"),
-                &view.pruned_root_schema,
-            )
-            .map_err(dc_other)?;
-            let root_env_entries =
-                build_root_env_entries(root_leaves, &view.allowed_root_leaf_paths)?;
-            env_entries.extend(root_env_entries);
-            env_entries.push(format!("AMBER_ROOT_CONFIG_SCHEMA_B64={root_schema_b64}"));
-            env_entries.push(format!(
-                "AMBER_COMPONENT_CONFIG_SCHEMA_B64={component_schema_b64}"
-            ));
-            env_entries.push(format!(
-                "AMBER_COMPONENT_CONFIG_TEMPLATE_B64={component_template_b64}"
-            ));
-            Ok(())
-        };
-
-        let append_mount_and_proxy_env =
-            |env_entries: &mut Vec<String>| -> Result<(), DockerComposeError> {
-                if let Some(specs) = mount_specs {
-                    let mount_b64 = encode_mount_spec_b64(&label, specs).map_err(dc_other)?;
-                    env_entries.push(format!("AMBER_MOUNT_SPEC_B64={mount_b64}"));
-                }
-                if let Some(paths) = docker_mount_paths {
-                    let local_proxy_port =
-                        *docker_proxy_ports_by_component.get(id).ok_or_else(|| {
-                            DockerComposeError::Other(format!(
-                                "internal error: missing framework.docker proxy port for {}",
-                                component_label(s, *id)
-                            ))
-                        })?;
-                    let spec_b64 =
-                        encode_docker_mount_proxy_spec_b64(paths, "127.0.0.1", local_proxy_port)?;
-                    env_entries.push(format!("{DOCKER_MOUNT_PROXY_SPEC_ENV}={spec_b64}"));
-                }
-                Ok(())
-            };
-
-        match program_plan {
-            ProgramPlan::Direct {
-                entrypoint, env, ..
-            } if !needs_helper_for_component => {
+        match runtime_plan.execution {
+            ComponentExecutionPlan::Direct { entrypoint, env } => {
                 // Use entrypoint so image entrypoints are ignored.
                 let entrypoint = entrypoint
                     .iter()
@@ -753,61 +636,60 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                     program_service.environment = Some(Environment::Map(env_map));
                 }
             }
-            ProgramPlan::Direct {
-                entrypoint, env, ..
+            ComponentExecutionPlan::HelperRunner {
+                direct_entrypoint_b64,
+                direct_env_b64,
+                template_spec_b64,
+                runtime_config,
+                mount_spec_b64,
             } => {
-                let entrypoint_b64 = encode_direct_entrypoint_b64(entrypoint).map_err(dc_other)?;
-                let env_b64 = encode_direct_env_b64(env).map_err(dc_other)?;
-
                 configure_helper_runner_service(&mut program_service);
 
                 let mut env_entries = Vec::new();
-                env_entries.push(format!("AMBER_DIRECT_ENTRYPOINT_B64={entrypoint_b64}"));
-                env_entries.push(format!("AMBER_DIRECT_ENV_B64={env_b64}"));
-
-                if needs_config_payload {
-                    let view = runtime_view.expect("runtime config view should be computed");
-                    let payload = encode_component_payload(
-                        &label,
-                        &view.component_template,
-                        &view.component_schema,
-                    )
-                    .map_err(dc_other)?;
-                    append_runtime_config_env(
-                        &mut env_entries,
-                        &payload.component_schema_b64,
-                        &payload.component_cfg_template_b64,
-                    )?;
+                if let Some(entrypoint_b64) = direct_entrypoint_b64 {
+                    env_entries.push(format!("AMBER_DIRECT_ENTRYPOINT_B64={entrypoint_b64}"));
                 }
-
-                append_mount_and_proxy_env(&mut env_entries)?;
-
-                program_service.environment = Some(Environment::List(env_entries));
-            }
-            ProgramPlan::Helper { template_spec, .. } => {
-                let view = runtime_view.expect("runtime config view should be computed");
-                let payload = encode_helper_payload(
-                    &label,
-                    template_spec,
-                    &view.component_template,
-                    &view.component_schema,
-                )
-                .map_err(dc_other)?;
-
-                configure_helper_runner_service(&mut program_service);
-
-                // Security: only expose root config leaves needed for the used component paths.
-                let mut env_entries = Vec::new();
-                append_runtime_config_env(
-                    &mut env_entries,
-                    &payload.component_schema_b64,
-                    &payload.component_cfg_template_b64,
-                )?;
-                env_entries.push(format!(
-                    "AMBER_TEMPLATE_SPEC_B64={}",
-                    payload.template_spec_b64
-                ));
-                append_mount_and_proxy_env(&mut env_entries)?;
+                if let Some(env_b64) = direct_env_b64 {
+                    env_entries.push(format!("AMBER_DIRECT_ENV_B64={env_b64}"));
+                }
+                if let Some(runtime_config) = runtime_config {
+                    // Security: only expose root config leaves needed for used component paths.
+                    let root_env_entries = build_root_env_entries(
+                        root_leaves,
+                        runtime_config.allowed_root_leaf_paths,
+                    )?;
+                    env_entries.extend(root_env_entries);
+                    env_entries.push(format!(
+                        "AMBER_ROOT_CONFIG_SCHEMA_B64={}",
+                        runtime_config.root_schema_b64
+                    ));
+                    env_entries.push(format!(
+                        "AMBER_COMPONENT_CONFIG_SCHEMA_B64={}",
+                        runtime_config.component_schema_b64
+                    ));
+                    env_entries.push(format!(
+                        "AMBER_COMPONENT_CONFIG_TEMPLATE_B64={}",
+                        runtime_config.component_cfg_template_b64
+                    ));
+                }
+                if let Some(template_spec_b64) = template_spec_b64 {
+                    env_entries.push(format!("AMBER_TEMPLATE_SPEC_B64={template_spec_b64}"));
+                }
+                if let Some(mount_spec_b64) = mount_spec_b64 {
+                    env_entries.push(format!("AMBER_MOUNT_SPEC_B64={mount_spec_b64}"));
+                }
+                if let Some(paths) = docker_mount_paths {
+                    let local_proxy_port =
+                        *docker_proxy_ports_by_component.get(id).ok_or_else(|| {
+                            DockerComposeError::Other(format!(
+                                "internal error: missing framework.docker proxy port for {}",
+                                component_label(s, *id)
+                            ))
+                        })?;
+                    let spec_b64 =
+                        encode_docker_mount_proxy_spec_b64(paths, "127.0.0.1", local_proxy_port)?;
+                    env_entries.push(format!("{DOCKER_MOUNT_PROXY_SPEC_ENV}={spec_b64}"));
+                }
                 program_service.environment = Some(Environment::List(env_entries));
             }
         }
@@ -1121,47 +1003,6 @@ fn mesh_identity_path() -> String {
 
 fn provisioner_mount_dir(service: &str) -> String {
     format!("{PROVISIONER_CONFIG_ROOT}/{service}")
-}
-
-fn build_provision_plan(
-    mesh_config_plan: &MeshConfigPlan,
-    program_components: &[ComponentId],
-    names: &HashMap<ComponentId, ServiceNames>,
-) -> Result<MeshProvisionPlan, String> {
-    let mut targets = Vec::new();
-    for id in program_components {
-        let svc = names
-            .get(id)
-            .ok_or_else(|| format!("missing service name for component {id:?}"))?;
-        let template = mesh_config_plan
-            .component_configs
-            .get(id)
-            .ok_or_else(|| format!("missing config template for component {id:?}"))?
-            .clone();
-        targets.push(MeshProvisionTarget {
-            kind: MeshProvisionTargetKind::Component,
-            config: template,
-            output: MeshProvisionOutput::Filesystem {
-                dir: provisioner_mount_dir(&svc.sidecar),
-            },
-        });
-    }
-    if let Some(router_template) = mesh_config_plan.router_config.as_ref() {
-        let mut router_template = router_template.clone();
-        router_template.control_listen = None;
-        router_template.control_allow = None;
-        targets.push(MeshProvisionTarget {
-            kind: MeshProvisionTargetKind::Router,
-            config: router_template,
-            output: MeshProvisionOutput::Filesystem {
-                dir: provisioner_mount_dir(ROUTER_SERVICE_NAME),
-            },
-        });
-    }
-    Ok(MeshProvisionPlan {
-        version: MESH_PROVISION_PLAN_VERSION.to_string(),
-        targets,
-    })
 }
 
 fn build_depends_on(any_helper: bool, deps: Vec<(String, &'static str)>) -> Option<DependsOn> {

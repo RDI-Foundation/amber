@@ -1024,13 +1024,7 @@ async fn try_fetch_router_identity(
     let request = "GET /identity HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     let response = send_control_request(endpoint, request).await?;
     let (code, body) = parse_http_response(&response).ok_or(ControlUpdateError::Retryable)?;
-    if !(200..300).contains(&code) {
-        return Err(if code >= 500 {
-            ControlUpdateError::Retryable
-        } else {
-            ControlUpdateError::Fatal(format!("router control returned HTTP {code}"))
-        });
-    }
+    control_status(code)?;
     let identity: MeshIdentityPublic = serde_json::from_str(body.trim()).map_err(|err| {
         ControlUpdateError::Fatal(format!("invalid router identity payload: {err}"))
     })?;
@@ -1042,27 +1036,12 @@ async fn try_send_control_update(
     slot: &str,
     url: &str,
 ) -> Result<(), ControlUpdateError> {
-    let payload = serde_json::json!({ "url": url }).to_string();
-    let request = format!(
-        "PUT /external-slots/{slot} HTTP/1.1\r\nHost: localhost\r\nContent-Type: \
-         application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
-        payload.len()
-    );
-    let response = send_control_request(endpoint, &request).await?;
-    let status_line = response.lines().next().unwrap_or("");
-    let code = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|value| value.parse::<u16>().ok())
-        .ok_or(ControlUpdateError::Retryable)?;
-    if !(200..300).contains(&code) {
-        return Err(if code >= 500 {
-            ControlUpdateError::Retryable
-        } else {
-            ControlUpdateError::Fatal(format!("router control returned HTTP {code}"))
-        });
-    }
-    Ok(())
+    send_control_put_json(
+        endpoint,
+        &format!("/external-slots/{slot}"),
+        &serde_json::json!({ "url": url }),
+    )
+    .await
 }
 
 async fn try_send_export_update(
@@ -1070,27 +1049,43 @@ async fn try_send_export_update(
     export: &str,
     payload: &ControlExportPayload,
 ) -> Result<(), ControlUpdateError> {
-    let payload = serde_json::json!({
-        "peer_id": payload.peer_id,
-        "peer_key": payload.peer_key,
-        "protocol": payload.protocol,
+    send_control_put_json(
+        endpoint,
+        &format!("/exports/{export}"),
+        &serde_json::json!({
+            "peer_id": payload.peer_id,
+            "peer_key": payload.peer_key,
+            "protocol": payload.protocol,
+        }),
+    )
+    .await
+}
+
+fn control_status(code: u16) -> Result<(), ControlUpdateError> {
+    if (200..300).contains(&code) {
+        return Ok(());
+    }
+    Err(if code >= 500 {
+        ControlUpdateError::Retryable
+    } else {
+        ControlUpdateError::Fatal(format!("router control returned HTTP {code}"))
     })
-    .to_string();
+}
+
+async fn send_control_put_json(
+    endpoint: &ControlEndpoint,
+    path: &str,
+    payload: &serde_json::Value,
+) -> Result<(), ControlUpdateError> {
+    let payload = payload.to_string();
     let request = format!(
-        "PUT /exports/{export} HTTP/1.1\r\nHost: localhost\r\nContent-Type: \
+        "PUT {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: \
          application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
         payload.len()
     );
     let response = send_control_request(endpoint, &request).await?;
     let (code, _) = parse_http_response(&response).ok_or(ControlUpdateError::Retryable)?;
-    if !(200..300).contains(&code) {
-        return Err(if code >= 500 {
-            ControlUpdateError::Retryable
-        } else {
-            ControlUpdateError::Fatal(format!("router control returned HTTP {code}"))
-        });
-    }
-    Ok(())
+    control_status(code)
 }
 
 fn parse_http_response(response: &str) -> Option<(u16, &str)> {
@@ -1426,25 +1421,12 @@ impl Diagnostic for DeniedDiagnostic<'_> {
 
 fn parse_manifest_ref(input: &str) -> Result<ManifestRef> {
     if let Ok(r) = input.parse::<ManifestRef>()
-        && let Some(url) = r.url.as_url()
+        && r.url.as_url().is_some()
     {
-        let is_windows_drive_path = !input.contains("://")
-            && url.scheme().len() == 1
-            && input.as_bytes().get(1) == Some(&b':');
-        if !is_windows_drive_path {
-            return Ok(r);
-        }
+        return Ok(r);
     }
 
-    let path = Path::new(input);
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().into_diagnostic()?.join(path)
-    };
-    let abs = abs.canonicalize().map_err(|e| {
-        miette::miette!("failed to resolve manifest path `{}`: {}", abs.display(), e)
-    })?;
+    let abs = canonicalize_user_path(Path::new(input), "manifest path")?;
     let url = url::Url::from_file_path(&abs)
         .map_err(|_| miette::miette!("could not convert `{}` into a file URL", abs.display()))?;
 
@@ -1486,33 +1468,16 @@ fn local_input_path(input: &str) -> Result<Option<PathBuf>> {
             if !path.exists() {
                 return Ok(None);
             }
-            let path = path.canonicalize().map_err(|e| {
-                miette::miette!("failed to resolve input path `{}`: {}", path.display(), e)
-            })?;
-            return Ok(Some(path));
+            return canonicalize_user_path(&path, "input path").map(Some);
         }
-
-        let is_windows_drive_path = !input.contains("://")
-            && url.scheme().len() == 1
-            && input.as_bytes().get(1) == Some(&b':');
-        if !is_windows_drive_path {
-            return Ok(None);
-        }
+        return Ok(None);
     }
 
     let path = Path::new(input);
     if !path.exists() {
         return Ok(None);
     }
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().into_diagnostic()?.join(path)
-    };
-    let abs = abs
-        .canonicalize()
-        .map_err(|e| miette::miette!("failed to resolve input path `{}`: {}", abs.display(), e))?;
-    Ok(Some(abs))
+    canonicalize_user_path(path, "input path").map(Some)
 }
 
 enum ArtifactOutput {
@@ -1553,64 +1518,29 @@ fn resolve_output_paths(args: &CompileArgs) -> Result<OutputPaths> {
     let metadata = resolve_optional_output(&args.metadata);
     let kubernetes = args.kubernetes.clone();
 
-    if let (Some(primary_path), Some(ArtifactOutput::File(dot_path))) =
-        (primary.as_ref(), dot.as_ref())
-        && dot_path == primary_path
-    {
-        return Err(miette::miette!(
-            "dot output path `{}` must not match the primary output path",
-            dot_path.display()
-        ));
-    }
-
-    if let (Some(primary_path), Some(ArtifactOutput::File(compose_path))) =
-        (primary.as_ref(), docker_compose.as_ref())
-        && compose_path == primary_path
-    {
-        return Err(miette::miette!(
-            "docker compose output path `{}` must not match the primary output path",
-            compose_path.display()
-        ));
-    }
-
-    if let (Some(primary_path), Some(ArtifactOutput::File(metadata_path))) =
-        (primary.as_ref(), metadata.as_ref())
-        && metadata_path == primary_path
-    {
-        return Err(miette::miette!(
-            "metadata output path `{}` must not match the primary output path",
-            metadata_path.display()
-        ));
-    }
-
-    if let (Some(ArtifactOutput::File(dot_path)), Some(ArtifactOutput::File(compose_path))) =
-        (dot.as_ref(), docker_compose.as_ref())
-        && dot_path == compose_path
-    {
-        return Err(miette::miette!(
-            "dot output path `{}` must not match docker compose output path",
-            dot_path.display()
-        ));
-    }
-
-    if let (Some(ArtifactOutput::File(dot_path)), Some(ArtifactOutput::File(metadata_path))) =
-        (dot.as_ref(), metadata.as_ref())
-        && dot_path == metadata_path
-    {
-        return Err(miette::miette!(
-            "dot output path `{}` must not match metadata output path",
-            dot_path.display()
-        ));
-    }
-
-    if let (Some(ArtifactOutput::File(compose_path)), Some(ArtifactOutput::File(metadata_path))) =
-        (docker_compose.as_ref(), metadata.as_ref())
-        && compose_path == metadata_path
-    {
-        return Err(miette::miette!(
-            "docker compose output path `{}` must not match metadata output path",
-            compose_path.display()
-        ));
+    let outputs = [
+        ("primary output", primary.as_deref()),
+        ("dot output", artifact_file_path(dot.as_ref())),
+        (
+            "docker compose output",
+            artifact_file_path(docker_compose.as_ref()),
+        ),
+        ("metadata output", artifact_file_path(metadata.as_ref())),
+    ];
+    for (index, (left_name, left_path)) in outputs.iter().enumerate() {
+        let Some(left_path) = left_path else {
+            continue;
+        };
+        for (right_name, right_path) in outputs.iter().skip(index + 1) {
+            if right_path.is_some_and(|right_path| right_path == *left_path) {
+                return Err(miette::miette!(
+                    "{} path `{}` must not match {} path",
+                    left_name,
+                    left_path.display(),
+                    right_name
+                ));
+            }
+        }
     }
 
     Ok(OutputPaths {
@@ -1630,6 +1560,23 @@ fn resolve_optional_output(request: &Option<PathBuf>) -> Option<ArtifactOutput> 
             ArtifactOutput::File(path.clone())
         }
     })
+}
+
+fn artifact_file_path(output: Option<&ArtifactOutput>) -> Option<&Path> {
+    match output {
+        Some(ArtifactOutput::File(path)) => Some(path.as_path()),
+        _ => None,
+    }
+}
+
+fn canonicalize_user_path(path: &Path, context: &str) -> Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().into_diagnostic()?.join(path)
+    };
+    path.canonicalize()
+        .map_err(|err| miette::miette!("failed to resolve {context} `{}`: {err}", path.display()))
 }
 
 fn resolve_bundle_root(args: &CompileArgs) -> Result<Option<PathBuf>> {

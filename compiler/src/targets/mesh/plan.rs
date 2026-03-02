@@ -237,6 +237,24 @@ pub(crate) fn build_mesh_plan(
 pub(crate) fn component_label(scenario: &Scenario, id: ComponentId) -> String {
     scenario.component(id).moniker.as_str().to_string()
 }
+
+pub(crate) fn map_program_components<T>(
+    scenario: &Scenario,
+    program_components: &[ComponentId],
+    mut map: impl FnMut(ComponentId, &str) -> T,
+) -> HashMap<ComponentId, T> {
+    let mut out = HashMap::with_capacity(program_components.len());
+    for id in program_components {
+        let local_name = scenario
+            .component(*id)
+            .moniker
+            .local_name()
+            .unwrap_or("component");
+        out.insert(*id, map(*id, local_name));
+    }
+    out
+}
+
 fn resolve_provide_endpoint(
     scenario: &Scenario,
     component_id: ComponentId,

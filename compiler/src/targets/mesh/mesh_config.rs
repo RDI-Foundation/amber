@@ -37,6 +37,62 @@ pub(crate) trait MeshAddressing {
     fn mesh_addr_for_router(&self) -> Result<String, MeshError>;
 }
 
+pub(crate) trait MeshServiceName {
+    fn mesh_service_name(&self) -> &str;
+}
+
+pub(crate) struct ServiceMeshAddressing<'a, Names> {
+    names: &'a HashMap<ComponentId, Names>,
+    namespace: Option<&'a str>,
+    mesh_ports_by_component: &'a HashMap<ComponentId, u16>,
+    router_service_name: &'a str,
+    router_mesh_port: u16,
+}
+
+impl<'a, Names: MeshServiceName> ServiceMeshAddressing<'a, Names> {
+    pub(crate) fn new(
+        names: &'a HashMap<ComponentId, Names>,
+        namespace: Option<&'a str>,
+        mesh_ports_by_component: &'a HashMap<ComponentId, u16>,
+        router_service_name: &'a str,
+        router_mesh_port: u16,
+    ) -> Self {
+        Self {
+            names,
+            namespace,
+            mesh_ports_by_component,
+            router_service_name,
+            router_mesh_port,
+        }
+    }
+
+    fn format_addr(&self, service: &str, port: u16) -> String {
+        match self.namespace {
+            Some(namespace) => format!("{service}.{namespace}.svc.cluster.local:{port}"),
+            None => format!("{service}:{port}"),
+        }
+    }
+}
+
+impl<Names: MeshServiceName> MeshAddressing for ServiceMeshAddressing<'_, Names> {
+    fn mesh_addr_for_component(&self, id: ComponentId) -> Result<String, MeshError> {
+        let service_name = self
+            .names
+            .get(&id)
+            .ok_or_else(|| MeshError::new(format!("missing mesh service name for {id:?}")))?
+            .mesh_service_name();
+        let port = *self
+            .mesh_ports_by_component
+            .get(&id)
+            .ok_or_else(|| MeshError::new(format!("missing mesh port for component {id:?}")))?;
+        Ok(self.format_addr(service_name, port))
+    }
+
+    fn mesh_addr_for_router(&self) -> Result<String, MeshError> {
+        Ok(self.format_addr(self.router_service_name, self.router_mesh_port))
+    }
+}
+
 pub(crate) fn build_mesh_config_plan(
     scenario: &Scenario,
     mesh_plan: &MeshPlan,
