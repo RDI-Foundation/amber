@@ -496,9 +496,11 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     }
 
     if needs_docker_gateway {
+        let gateway_deps = docker_gateway_depends_on(s, &docker_access_components, &names)?;
         let gateway_service = docker_gateway_service(
             &images.docker_gateway,
             build_docker_gateway_config_json(s, &docker_access_components, &names)?,
+            gateway_deps,
         );
         compose
             .services
@@ -864,7 +866,29 @@ fn encode_docker_mount_proxy_spec_b64(paths: &[String]) -> DcResult<String> {
     Ok(base64::engine::general_purpose::STANDARD.encode(payload))
 }
 
-fn docker_gateway_service(image: &str, config_json: String) -> Service {
+fn docker_gateway_depends_on(
+    scenario: &Scenario,
+    docker_access_components: &BTreeSet<ComponentId>,
+    names: &HashMap<ComponentId, ServiceNames>,
+) -> DcResult<Vec<(String, &'static str)>> {
+    let mut deps = Vec::with_capacity(docker_access_components.len());
+    for component in docker_access_components {
+        let service_names = names.get(component).ok_or_else(|| {
+            DockerComposeError::Other(format!(
+                "internal error: missing service names for {}",
+                component_label(scenario, *component)
+            ))
+        })?;
+        deps.push((service_names.sidecar.clone(), "service_started"));
+    }
+    Ok(deps)
+}
+
+fn docker_gateway_service(
+    image: &str,
+    config_json: String,
+    deps: Vec<(String, &'static str)>,
+) -> Service {
     let mut service = Service::new(image);
     service
         .networks
@@ -873,6 +897,7 @@ fn docker_gateway_service(image: &str, config_json: String) -> Service {
         DOCKER_GATEWAY_CONFIG_ENV.to_string(),
         config_json,
     )])));
+    service.depends_on = build_depends_on(false, deps);
     service.volumes.push(format!(
         "${{{DOCKER_GATEWAY_HOST_SOCK_ENV}:-{}}}:{DOCKER_GATEWAY_CONTAINER_SOCK}",
         detect_default_host_docker_sock().display()

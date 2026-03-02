@@ -510,6 +510,16 @@ impl State {
     }
 }
 
+async fn resolve_connection_identity(state: &State, peer: SocketAddr) -> Option<CallerIdentity> {
+    if let Some(identity) = state.resolve_identity(peer).await {
+        return Some(identity);
+    }
+    // Newly started compose networks can make caller hostnames resolvable a moment after startup.
+    // Refresh once on a miss so first requests do not fail with a transient unauthorized error.
+    state.refresh_callers().await;
+    state.resolve_identity(peer).await
+}
+
 pub async fn run(config: DockerGatewayConfig) -> Result<(), DockerGatewayError> {
     let state = Arc::new(State::new(config));
     state.refresh_callers().await;
@@ -563,7 +573,7 @@ pub async fn run(config: DockerGatewayConfig) -> Result<(), DockerGatewayError> 
                 let conn_state = Arc::new(ConnState {
                     state: state.clone(),
                     peer,
-                    identity: state.resolve_identity(peer).await,
+                    identity: resolve_connection_identity(state.as_ref(), peer).await,
                 });
 
                 let io = TokioIo::new(stream);

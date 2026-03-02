@@ -16,6 +16,7 @@ use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
     ScenarioExport, SlotRef,
 };
+use base64::Engine as _;
 use serde_json::{Map, Value, json};
 use url::Url;
 
@@ -104,6 +105,15 @@ fn compile_output_with_manifest_overrides(
 
 fn compile_output(scenario: Scenario) -> crate::CompileOutput {
     compile_output_with_manifest_overrides(scenario, BTreeMap::new())
+}
+
+fn compile_output_with_docker_feature(scenario: Scenario) -> crate::CompileOutput {
+    let mut overrides = BTreeMap::new();
+    overrides.insert(
+        scenario.root,
+        Map::from_iter([("experimental_features".to_string(), json!(["docker"]))]),
+    );
+    compile_output_with_manifest_overrides(scenario, overrides)
 }
 
 fn error_contains(err: &crate::Error, needle: &str) -> bool {
@@ -277,6 +287,31 @@ fn env_value(service: &super::Service, key: &str) -> Option<String> {
     }
 }
 
+fn assert_depends_on(service: &super::Service, name: &str, condition: &str) {
+    let depends_on = service
+        .depends_on
+        .as_ref()
+        .unwrap_or_else(|| panic!("depends_on missing for dependency {name}"));
+    match depends_on {
+        super::DependsOn::List(deps) => {
+            assert_eq!(
+                condition, "service_started",
+                "list-style depends_on only supports service_started"
+            );
+            assert!(
+                deps.iter().any(|dep| dep == name),
+                "dependency {name} missing from depends_on list"
+            );
+        }
+        super::DependsOn::Conditions(deps) => {
+            let actual = deps
+                .get(name)
+                .unwrap_or_else(|| panic!("dependency {name} missing from depends_on map"));
+            assert_eq!(actual.condition, condition);
+        }
+    }
+}
+
 fn provision_plan(compose: &super::DockerComposeFile) -> MeshProvisionPlan {
     let raw = &compose
         .configs
@@ -361,6 +396,157 @@ fn control_socket_token_depends_on_whole_scenario_ir() {
         token_a, token_b,
         "control socket token should change when scenario IR changes"
     );
+}
+
+#[test]
+fn docker_compose_emits_gateway_for_framework_docker_binding() {
+    let program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["sh", "-lc", "sleep infinity"],
+        "env": {
+            "DOCKER_HOST": "${slots.docker.url}",
+        },
+    }))
+    .unwrap();
+    let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: Some(program),
+        slots: BTreeMap::from([("docker".to_string(), slot_http)]),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root)],
+        bindings: vec![BindingEdge {
+            name: None,
+            from: BindingFrom::Framework(FrameworkCapabilityName::try_from("docker").unwrap()),
+            to: SlotRef {
+                component: ComponentId(0),
+                name: "docker".to_string(),
+            },
+            weak: false,
+        }],
+        exports: Vec::new(),
+    };
+
+    let output = compile_output_with_docker_feature(scenario);
+    let yaml = DockerComposeReporter
+        .emit(&output)
+        .expect("compose render should succeed");
+    let compose = parse_compose(&yaml);
+
+    let gateway = service(&compose, super::DOCKER_GATEWAY_SERVICE_NAME);
+    assert_depends_on(gateway, "c0-component-net", "service_started");
+
+    let gateway_config = env_value(gateway, super::DOCKER_GATEWAY_CONFIG_ENV)
+        .expect("gateway config env should be present");
+    let gateway_config_json: Value =
+        serde_json::from_str(&gateway_config).expect("gateway config should parse");
+    let callers = gateway_config_json["callers"]
+        .as_array()
+        .expect("callers should be an array");
+    assert_eq!(callers.len(), 1);
+    assert_eq!(callers[0]["host"], "c0-component-net");
+    assert_eq!(callers[0]["component"], "/");
+    assert_eq!(callers[0]["compose_service"], "c0-component");
+
+    let program_service = service(&compose, "c0-component");
+    assert_depends_on(
+        program_service,
+        super::DOCKER_GATEWAY_SERVICE_NAME,
+        "service_started",
+    );
+    assert_eq!(
+        env_value(program_service, "DOCKER_HOST").as_deref(),
+        Some("tcp://amber-docker-gateway:23750"),
+    );
+}
+
+#[test]
+fn docker_compose_emits_framework_docker_mount_proxy_wiring() {
+    let program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["sh", "-lc", "sleep infinity"],
+        "mounts": [
+            { "path": "/var/run/docker.sock", "from": "framework.docker" },
+        ],
+    }))
+    .unwrap();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: Some(program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root)],
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    };
+
+    let output = compile_output_with_docker_feature(scenario);
+    let yaml = DockerComposeReporter
+        .emit(&output)
+        .expect("compose render should succeed");
+    let compose = parse_compose(&yaml);
+
+    let gateway = service(&compose, super::DOCKER_GATEWAY_SERVICE_NAME);
+    assert_depends_on(gateway, "c0-component-net", "service_started");
+
+    let program_service = service(&compose, "c0-component");
+    let entrypoint = program_service
+        .entrypoint
+        .as_ref()
+        .expect("framework mount should force helper entrypoint");
+    assert_eq!(
+        entrypoint,
+        &vec![super::HELPER_BIN_PATH.to_string(), "run".to_string()]
+    );
+    assert_depends_on(
+        program_service,
+        super::HELPER_INIT_SERVICE,
+        "service_completed_successfully",
+    );
+    assert_depends_on(
+        program_service,
+        super::DOCKER_GATEWAY_SERVICE_NAME,
+        "service_started",
+    );
+
+    let mount_proxy_b64 = env_value(program_service, super::DOCKER_MOUNT_PROXY_SPEC_ENV)
+        .expect("docker mount proxy env should be present");
+    let mount_proxy_json = base64::engine::general_purpose::STANDARD
+        .decode(mount_proxy_b64.as_bytes())
+        .expect("mount proxy env should be valid base64");
+    let mount_specs: Value =
+        serde_json::from_slice(&mount_proxy_json).expect("mount proxy payload should be JSON");
+    let mount_specs = mount_specs
+        .as_array()
+        .expect("mount proxy payload should be an array");
+    assert_eq!(mount_specs.len(), 1);
+    assert_eq!(mount_specs[0]["path"], "/var/run/docker.sock");
+    assert_eq!(mount_specs[0]["tcp_host"], "amber-docker-gateway");
+    assert_eq!(mount_specs[0]["tcp_port"], super::DOCKER_GATEWAY_PORT);
 }
 
 #[test]
