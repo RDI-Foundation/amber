@@ -1,11 +1,11 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::PathBuf,
 };
 
 use amber_config as rc;
-use amber_manifest::MountSource;
+use amber_manifest::{FrameworkCapabilityName, MountSource};
 use amber_mesh::{
     MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MESH_PROVISION_PLAN_VERSION, MeshProvisionOutput,
     MeshProvisionPlan, MeshProvisionTarget, MeshProvisionTargetKind,
@@ -27,10 +27,11 @@ use crate::{
         },
         internal_images::resolve_internal_images,
         mesh_config::{
-            MeshAddressing, MeshConfigPlan, RouterPorts, build_mesh_config_plan, scenario_ir_digest,
+            FRAMEWORK_DOCKER_URL_ENV, INTERNAL_FRAMEWORK_DOCKER_SLOT, MeshAddressing,
+            MeshConfigPlan, ROUTER_ID, RouterPorts, build_mesh_config_plan, scenario_ir_digest,
         },
         plan::{
-            MeshError, MeshOptions, ResolvedBinding, ResolvedExternalBinding,
+            MeshError, MeshOptions, MeshPlan, ResolvedBinding, ResolvedExternalBinding,
             ResolvedFrameworkBinding, component_label,
         },
         ports::{allocate_mesh_ports, allocate_slot_ports},
@@ -67,6 +68,7 @@ const COMPOSE_PROJECT_NAME_ENV: &str = "COMPOSE_PROJECT_NAME";
 const COMPONENT_MESH_PORT_BASE: u16 = 23000;
 const ROUTER_MESH_PORT_BASE: u16 = 24000;
 const ROUTER_CONTROL_PORT_BASE: u16 = 24100;
+const LOCAL_SLOT_PORT_BASE: u16 = 20000;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DockerComposeReporter;
@@ -302,9 +304,8 @@ impl Addressing for ComposeAddressing<'_> {
                 binding.capability
             )));
         }
-        Ok(format!(
-            "tcp://{DOCKER_GATEWAY_SERVICE_NAME}:{DOCKER_GATEWAY_PORT}"
-        ))
+        let local_port = self.local_proxy_port(binding.consumer, &binding.slot)?;
+        Ok(format!("tcp://127.0.0.1:{local_port}"))
     }
 }
 
@@ -315,7 +316,7 @@ fn render_docker_compose(output: &CompileOutput) -> Result<String, ReporterError
 fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     let s = &output.scenario;
 
-    let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
+    let mut mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
         s,
         &output.store,
         MeshOptions {
@@ -324,7 +325,9 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     )
     .map_err(dc_other)?;
     let images = resolve_internal_images().map_err(DockerComposeError::Other)?;
-
+    let docker_mount_paths_by_component =
+        collect_framework_docker_mount_paths(s, mesh_plan.program_components.as_slice());
+    add_mount_only_framework_docker_bindings(&mut mesh_plan, &docker_mount_paths_by_component);
     let program_components = mesh_plan.program_components.as_slice();
 
     // Precompute service names (injective & stable).
@@ -341,21 +344,6 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
             },
         );
     }
-    let root_manifest = mesh_plan.manifests[s.root.0]
-        .as_ref()
-        .expect("root manifest should exist");
-
-    let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
-
-    let slot_ports_by_component = allocate_slot_ports(s, program_components)?;
-    let mesh_ports_by_component = allocate_mesh_ports(
-        s,
-        program_components,
-        COMPONENT_MESH_PORT_BASE,
-        &slot_ports_by_component,
-    )?;
-    let docker_mount_paths_by_component =
-        collect_framework_docker_mount_paths(s, program_components);
     let docker_binding_components: BTreeSet<ComponentId> = mesh_plan
         .framework_bindings
         .iter()
@@ -369,6 +357,23 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         .copied()
         .collect();
     let needs_docker_gateway = !docker_access_components.is_empty();
+    let root_manifest = mesh_plan.manifests[s.root.0]
+        .as_ref()
+        .expect("root manifest should exist");
+    let needs_router = !mesh_plan.external_bindings.is_empty()
+        || !mesh_plan.exports.is_empty()
+        || !mesh_plan.framework_bindings.is_empty();
+
+    let mut slot_ports_by_component = allocate_slot_ports(s, program_components)?;
+    ensure_internal_framework_slot_ports(s, &mut slot_ports_by_component, &mesh_plan)?;
+    let mesh_ports_by_component = allocate_mesh_ports(
+        s,
+        program_components,
+        COMPONENT_MESH_PORT_BASE,
+        &slot_ports_by_component,
+    )?;
+    let docker_proxy_ports_by_component =
+        docker_proxy_ports_by_component(s, &slot_ports_by_component, &mesh_plan)?;
     let router_ports = needs_router.then_some(RouterPorts {
         mesh: ROUTER_MESH_PORT_BASE,
         control: ROUTER_CONTROL_PORT_BASE,
@@ -496,10 +501,10 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     }
 
     if needs_docker_gateway {
-        let gateway_deps = docker_gateway_depends_on(s, &docker_access_components, &names)?;
+        let gateway_deps = docker_gateway_depends_on(needs_router);
         let gateway_service = docker_gateway_service(
             &images.docker_gateway,
-            build_docker_gateway_config_json(s, &docker_access_components, &names)?,
+            build_docker_gateway_config_json()?,
             gateway_deps,
         );
         compose
@@ -546,6 +551,12 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
 
     if needs_router {
         let mut env_entries = mesh_config_plan.router_env_passthrough.clone();
+        if needs_docker_gateway {
+            env_entries.push(format!(
+                "{FRAMEWORK_DOCKER_URL_ENV}=tcp://{DOCKER_GATEWAY_SERVICE_NAME}:\
+                 {DOCKER_GATEWAY_PORT}"
+            ));
+        }
         env_entries.push(format!("AMBER_ROUTER_CONFIG_PATH={}", mesh_config_path()));
         env_entries.push(format!(
             "AMBER_ROUTER_IDENTITY_PATH={}",
@@ -709,7 +720,15 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                     env_entries.push(format!("AMBER_MOUNT_SPEC_B64={mount_b64}"));
                 }
                 if let Some(paths) = docker_mount_paths {
-                    let spec_b64 = encode_docker_mount_proxy_spec_b64(paths)?;
+                    let local_proxy_port =
+                        *docker_proxy_ports_by_component.get(id).ok_or_else(|| {
+                            DockerComposeError::Other(format!(
+                                "internal error: missing framework.docker proxy port for {}",
+                                component_label(s, *id)
+                            ))
+                        })?;
+                    let spec_b64 =
+                        encode_docker_mount_proxy_spec_b64(paths, "127.0.0.1", local_proxy_port)?;
                     env_entries.push(format!("{DOCKER_MOUNT_PROXY_SPEC_ENV}={spec_b64}"));
                 }
                 Ok(())
@@ -849,13 +868,133 @@ fn collect_framework_docker_mount_paths(
     out
 }
 
-fn encode_docker_mount_proxy_spec_b64(paths: &[String]) -> DcResult<String> {
+fn add_mount_only_framework_docker_bindings(
+    mesh_plan: &mut MeshPlan,
+    docker_mount_paths_by_component: &HashMap<ComponentId, Vec<String>>,
+) {
+    let already_bound: BTreeSet<ComponentId> = mesh_plan
+        .framework_bindings
+        .iter()
+        .filter(|binding| binding.capability.as_str() == "docker")
+        .map(|binding| binding.consumer)
+        .collect();
+    let docker_capability = FrameworkCapabilityName::try_from("docker")
+        .expect("framework capability names are static and valid");
+
+    let mut mount_components: Vec<ComponentId> =
+        docker_mount_paths_by_component.keys().copied().collect();
+    mount_components.sort_by_key(|component| component.0);
+    for component in mount_components {
+        if already_bound.contains(&component) {
+            continue;
+        }
+        mesh_plan.framework_bindings.push(ResolvedFrameworkBinding {
+            consumer: component,
+            slot: INTERNAL_FRAMEWORK_DOCKER_SLOT.to_string(),
+            capability: docker_capability.clone(),
+            binding_name: None,
+        });
+    }
+}
+
+fn ensure_internal_framework_slot_ports(
+    scenario: &Scenario,
+    slot_ports_by_component: &mut HashMap<ComponentId, BTreeMap<String, u16>>,
+    mesh_plan: &MeshPlan,
+) -> DcResult<()> {
+    let mut components = BTreeSet::new();
+    for binding in &mesh_plan.framework_bindings {
+        if binding.capability.as_str() == "docker" && binding.slot == INTERNAL_FRAMEWORK_DOCKER_SLOT
+        {
+            components.insert(binding.consumer);
+        }
+    }
+
+    for component in components {
+        let slot_ports = slot_ports_by_component.get_mut(&component).ok_or_else(|| {
+            DockerComposeError::Other(format!(
+                "internal error: missing local slot map for {}",
+                component_label(scenario, component)
+            ))
+        })?;
+        if slot_ports.contains_key(INTERNAL_FRAMEWORK_DOCKER_SLOT) {
+            continue;
+        }
+
+        let mut reserved: HashSet<u16> = HashSet::new();
+        let program = scenario
+            .component(component)
+            .program
+            .as_ref()
+            .expect("program component has program");
+        if let Some(network) = program.network.as_ref() {
+            for endpoint in &network.endpoints {
+                reserved.insert(endpoint.port);
+            }
+        }
+        for port in slot_ports.values() {
+            reserved.insert(*port);
+        }
+
+        let mut next = LOCAL_SLOT_PORT_BASE;
+        while reserved.contains(&next) {
+            next = next.checked_add(1).ok_or_else(|| {
+                DockerComposeError::Other(format!(
+                    "ran out of local slot ports allocating for {}",
+                    component_label(scenario, component)
+                ))
+            })?;
+        }
+        slot_ports.insert(INTERNAL_FRAMEWORK_DOCKER_SLOT.to_string(), next);
+    }
+
+    Ok(())
+}
+
+fn docker_proxy_ports_by_component(
+    scenario: &Scenario,
+    slot_ports_by_component: &HashMap<ComponentId, BTreeMap<String, u16>>,
+    mesh_plan: &MeshPlan,
+) -> DcResult<HashMap<ComponentId, u16>> {
+    let mut ports = HashMap::new();
+    for binding in &mesh_plan.framework_bindings {
+        if binding.capability.as_str() != "docker" {
+            continue;
+        }
+        if ports.contains_key(&binding.consumer) {
+            continue;
+        }
+        let slot_ports = slot_ports_by_component
+            .get(&binding.consumer)
+            .ok_or_else(|| {
+                DockerComposeError::Other(format!(
+                    "internal error: missing local slot map for {}",
+                    component_label(scenario, binding.consumer)
+                ))
+            })?;
+        let listen_port = *slot_ports.get(&binding.slot).ok_or_else(|| {
+            DockerComposeError::Other(format!(
+                "internal error: missing local slot port for {}.{}",
+                component_label(scenario, binding.consumer),
+                binding.slot
+            ))
+        })?;
+        ports.insert(binding.consumer, listen_port);
+    }
+    Ok(ports)
+}
+
+fn encode_docker_mount_proxy_spec_b64(
+    paths: &[String],
+    tcp_host: &str,
+    tcp_port: u16,
+) -> DcResult<String> {
     let specs: Vec<DockerMountProxySpec> = paths
         .iter()
         .map(|path| DockerMountProxySpec {
             path: path.clone(),
-            tcp_host: DOCKER_GATEWAY_SERVICE_NAME.to_string(),
-            tcp_port: DOCKER_GATEWAY_PORT,
+            tcp_host: tcp_host.to_string(),
+            tcp_port,
         })
         .collect();
     let payload = serde_json::to_vec(&specs).map_err(|err| {
@@ -866,22 +1005,12 @@ fn encode_docker_mount_proxy_spec_b64(paths: &[String]) -> DcResult<String> {
     Ok(base64::engine::general_purpose::STANDARD.encode(payload))
 }
 
-fn docker_gateway_depends_on(
-    scenario: &Scenario,
-    docker_access_components: &BTreeSet<ComponentId>,
-    names: &HashMap<ComponentId, ServiceNames>,
-) -> DcResult<Vec<(String, &'static str)>> {
-    let mut deps = Vec::with_capacity(docker_access_components.len());
-    for component in docker_access_components {
-        let service_names = names.get(component).ok_or_else(|| {
-            DockerComposeError::Other(format!(
-                "internal error: missing service names for {}",
-                component_label(scenario, *component)
-            ))
-        })?;
-        deps.push((service_names.sidecar.clone(), "service_started"));
+fn docker_gateway_depends_on(needs_router: bool) -> Vec<(String, &'static str)> {
+    if needs_router {
+        vec![(ROUTER_SERVICE_NAME.to_string(), "service_started")]
+    } else {
+        Vec::new()
     }
-    Ok(deps)
 }
 
 fn docker_gateway_service(
@@ -905,28 +1034,13 @@ fn docker_gateway_service(
     service
 }
 
-fn build_docker_gateway_config_json(
-    scenario: &Scenario,
-    docker_access_components: &BTreeSet<ComponentId>,
-    names: &HashMap<ComponentId, ServiceNames>,
-) -> DcResult<String> {
-    let callers = docker_access_components
-        .iter()
-        .map(|component| {
-            let service_names = names.get(component).ok_or_else(|| {
-                DockerComposeError::Other(format!(
-                    "internal error: missing service names for {}",
-                    component_label(scenario, *component)
-                ))
-            })?;
-            Ok(DockerGatewayCallerConfig {
-                host: service_names.sidecar.clone(),
-                port: None,
-                component: component_label(scenario, *component),
-                compose_service: service_names.program.clone(),
-            })
-        })
-        .collect::<DcResult<Vec<_>>>()?;
+fn build_docker_gateway_config_json() -> DcResult<String> {
+    let callers = vec![DockerGatewayCallerConfig {
+        host: ROUTER_SERVICE_NAME.to_string(),
+        port: None,
+        component: ROUTER_ID.to_string(),
+        compose_service: ROUTER_SERVICE_NAME.to_string(),
+    }];
 
     let config = DockerGatewayConfig {
         listen: format!("0.0.0.0:{DOCKER_GATEWAY_PORT}"),

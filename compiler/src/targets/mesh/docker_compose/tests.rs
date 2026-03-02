@@ -446,7 +446,7 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
     let compose = parse_compose(&yaml);
 
     let gateway = service(&compose, super::DOCKER_GATEWAY_SERVICE_NAME);
-    assert_depends_on(gateway, "c0-component-net", "service_started");
+    assert_depends_on(gateway, "amber-router", "service_started");
 
     let gateway_config = env_value(gateway, super::DOCKER_GATEWAY_CONFIG_ENV)
         .expect("gateway config env should be present");
@@ -456,9 +456,9 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
         .as_array()
         .expect("callers should be an array");
     assert_eq!(callers.len(), 1);
-    assert_eq!(callers[0]["host"], "c0-component-net");
-    assert_eq!(callers[0]["component"], "/");
-    assert_eq!(callers[0]["compose_service"], "c0-component");
+    assert_eq!(callers[0]["host"], "amber-router");
+    assert_eq!(callers[0]["component"], "/router");
+    assert_eq!(callers[0]["compose_service"], "amber-router");
 
     let program_service = service(&compose, "c0-component");
     assert_depends_on(
@@ -468,7 +468,7 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
     );
     assert_eq!(
         env_value(program_service, "DOCKER_HOST").as_deref(),
-        Some("tcp://amber-docker-gateway:23750"),
+        Some("tcp://127.0.0.1:20000"),
     );
 }
 
@@ -511,7 +511,7 @@ fn docker_compose_emits_framework_docker_mount_proxy_wiring() {
     let compose = parse_compose(&yaml);
 
     let gateway = service(&compose, super::DOCKER_GATEWAY_SERVICE_NAME);
-    assert_depends_on(gateway, "c0-component-net", "service_started");
+    assert_depends_on(gateway, "amber-router", "service_started");
 
     let program_service = service(&compose, "c0-component");
     let entrypoint = program_service
@@ -545,8 +545,8 @@ fn docker_compose_emits_framework_docker_mount_proxy_wiring() {
         .expect("mount proxy payload should be an array");
     assert_eq!(mount_specs.len(), 1);
     assert_eq!(mount_specs[0]["path"], "/var/run/docker.sock");
-    assert_eq!(mount_specs[0]["tcp_host"], "amber-docker-gateway");
-    assert_eq!(mount_specs[0]["tcp_port"], super::DOCKER_GATEWAY_PORT);
+    assert_eq!(mount_specs[0]["tcp_host"], "127.0.0.1");
+    assert_eq!(mount_specs[0]["tcp_port"], 20000);
 }
 
 #[test]

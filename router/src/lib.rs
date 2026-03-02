@@ -430,18 +430,23 @@ async fn handle_inbound(
                     return Ok(());
                 }
 
-                if route.protocol != MeshProtocol::Http {
-                    return Err(RouterError::InvalidConfig(
-                        "external targets require http protocol".to_string(),
-                    ));
-                }
                 let target = ExternalTarget {
                     name: route.capability.clone(),
                     url_env,
                     optional,
                     url_override: Some(override_url),
                 };
-                proxy_noise_to_external(&mut session, target, client).await?;
+                match route.protocol {
+                    MeshProtocol::Http => {
+                        proxy_noise_to_external(&mut session, target, client).await?
+                    }
+                    MeshProtocol::Tcp => proxy_noise_to_external_tcp(&mut session, target).await?,
+                    MeshProtocol::Udp => {
+                        return Err(RouterError::InvalidConfig(
+                            "external targets do not support udp protocol".to_string(),
+                        ));
+                    }
+                }
                 return Ok(());
             }
 
@@ -466,18 +471,21 @@ async fn handle_inbound(
                 }
             }
 
-            if route.protocol != MeshProtocol::Http {
-                return Err(RouterError::InvalidConfig(
-                    "external targets require http protocol".to_string(),
-                ));
-            }
             let target = ExternalTarget {
                 name: route.capability.clone(),
                 url_env,
                 optional,
                 url_override: None,
             };
-            proxy_noise_to_external(&mut session, target, client).await?;
+            match route.protocol {
+                MeshProtocol::Http => proxy_noise_to_external(&mut session, target, client).await?,
+                MeshProtocol::Tcp => proxy_noise_to_external_tcp(&mut session, target).await?,
+                MeshProtocol::Udp => {
+                    return Err(RouterError::InvalidConfig(
+                        "external targets do not support udp protocol".to_string(),
+                    ));
+                }
+            }
         }
         InboundTarget::MeshForward {
             peer_addr,
@@ -1321,6 +1329,15 @@ async fn proxy_noise_to_external(
     Ok(())
 }
 
+async fn proxy_noise_to_external_tcp(
+    session: &mut NoiseSession,
+    target: ExternalTarget,
+) -> Result<(), RouterError> {
+    let (host, port) = resolve_tcp_target(&target)?;
+    let upstream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+    proxy_noise_to_plain(session, upstream).await
+}
+
 async fn proxy_http_request(state: HttpProxyState, req: Request<Incoming>) -> Response<BoxBody> {
     let target_url = match resolve_target_url(&state.target, &req) {
         Ok(url) => url,
@@ -1396,6 +1413,43 @@ fn resolve_target_url(
     }
 
     Ok(join_url(&base, req.uri()))
+}
+
+fn resolve_tcp_target(target: &ExternalTarget) -> Result<(String, u16), RouterError> {
+    let url = match target.url_override.as_ref() {
+        Some(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => match env::var(&target.url_env) {
+            Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+            _ => {
+                let message = if target.optional {
+                    format!(
+                        "external slot {} is optional and not configured",
+                        target.name
+                    )
+                } else {
+                    format!("external slot {} is not configured", target.name)
+                };
+                return Err(RouterError::InvalidConfig(message));
+            }
+        },
+    };
+
+    let parsed = Url::parse(&url).map_err(|err| {
+        RouterError::InvalidConfig(format!("external slot url is invalid: {err}"))
+    })?;
+    if parsed.scheme() != "tcp" {
+        return Err(RouterError::InvalidConfig(
+            "external tcp target url must use tcp://".to_string(),
+        ));
+    }
+    let host = parsed.host_str().ok_or_else(|| {
+        RouterError::InvalidConfig("external tcp target url missing host".to_string())
+    })?;
+    let port = parsed.port().ok_or_else(|| {
+        RouterError::InvalidConfig("external tcp target url missing port".to_string())
+    })?;
+
+    Ok((host.to_string(), port))
 }
 
 fn join_url(base: &Url, uri: &Uri) -> Url {
