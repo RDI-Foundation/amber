@@ -8,6 +8,7 @@ amber-config = { workspace = true }
 amber-images = { workspace = true }
 amber-json5 = { workspace = true }
 amber-manifest = { workspace = true }
+amber-mesh = { workspace = true }
 amber-resolver = { workspace = true }
 amber-scenario = { workspace = true }
 amber-template = { workspace = true }
@@ -19,10 +20,12 @@ miette = { workspace = true, features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+sha2 = "0.10.9"
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "rt", "sync"] }
 url = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
+amber-router = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = { workspace = true }

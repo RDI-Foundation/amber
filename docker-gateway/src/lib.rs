@@ -25,7 +25,7 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
 };
 use hyperlocal::{UnixConnector, Uri as HyperlocalUri};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, UnixStream},
@@ -177,20 +177,27 @@ fn cleanup_target_name(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+fn parse_cleanup_ids<T>(
+    body: &[u8],
+    id_of: impl Fn(T) -> Option<String>,
+) -> Result<Vec<String>, serde_json::Error>
+where
+    T: DeserializeOwned,
+{
+    let resources = serde_json::from_slice::<Vec<T>>(body)?;
+    Ok(resources.into_iter().filter_map(id_of).collect())
+}
+
 fn parse_cleanup_container_ids(body: &[u8]) -> Result<Vec<String>, serde_json::Error> {
-    let containers = serde_json::from_slice::<Vec<ContainerSummaryResponse>>(body)?;
-    Ok(containers
-        .into_iter()
-        .filter_map(|container| cleanup_target_name(container.id.as_deref()))
-        .collect())
+    parse_cleanup_ids::<ContainerSummaryResponse>(body, |container| {
+        cleanup_target_name(container.id.as_deref())
+    })
 }
 
 fn parse_cleanup_network_ids(body: &[u8]) -> Result<Vec<String>, serde_json::Error> {
-    let networks = serde_json::from_slice::<Vec<NetworkSummaryResponse>>(body)?;
-    Ok(networks
-        .into_iter()
-        .filter_map(|network| cleanup_target_name(network.id.as_deref()))
-        .collect())
+    parse_cleanup_ids::<NetworkSummaryResponse>(body, |network| {
+        cleanup_target_name(network.id.as_deref())
+    })
 }
 
 fn parse_cleanup_volume_names(body: &[u8]) -> Result<Vec<String>, serde_json::Error> {
@@ -433,36 +440,24 @@ impl State {
         let container_query = build_label_filter_query(&required_labels, true);
         let network_query = build_label_filter_query(&required_labels, false);
 
-        self.cleanup_containers(&container_query).await;
-        self.cleanup_networks(&network_query).await;
-        self.cleanup_volumes(&network_query).await;
-    }
-
-    async fn cleanup_containers(&self, query: &str) {
         self.cleanup_resources(
-            format!("/containers/json?{query}"),
+            format!("/containers/json?{container_query}"),
             parse_cleanup_container_ids,
             cleanup_delete_container_path,
             "containers",
             "container",
         )
         .await;
-    }
-
-    async fn cleanup_networks(&self, query: &str) {
         self.cleanup_resources(
-            format!("/networks?{query}"),
+            format!("/networks?{network_query}"),
             parse_cleanup_network_ids,
             cleanup_delete_network_path,
             "networks",
             "network",
         )
         .await;
-    }
-
-    async fn cleanup_volumes(&self, query: &str) {
         self.cleanup_resources(
-            format!("/volumes?{query}"),
+            format!("/volumes?{network_query}"),
             parse_cleanup_volume_names,
             cleanup_delete_volume_path,
             "volumes",
@@ -508,6 +503,16 @@ impl State {
             }
         }
     }
+}
+
+async fn resolve_connection_identity(state: &State, peer: SocketAddr) -> Option<CallerIdentity> {
+    if let Some(identity) = state.resolve_identity(peer).await {
+        return Some(identity);
+    }
+    // Newly started compose networks can make caller hostnames resolvable a moment after startup.
+    // Refresh once on a miss so first requests do not fail with a transient unauthorized error.
+    state.refresh_callers().await;
+    state.resolve_identity(peer).await
 }
 
 pub async fn run(config: DockerGatewayConfig) -> Result<(), DockerGatewayError> {
@@ -563,7 +568,7 @@ pub async fn run(config: DockerGatewayConfig) -> Result<(), DockerGatewayError> 
                 let conn_state = Arc::new(ConnState {
                     state: state.clone(),
                     peer,
-                    identity: state.resolve_identity(peer).await,
+                    identity: resolve_connection_identity(state.as_ref(), peer).await,
                 });
 
                 let io = TokioIo::new(stream);
@@ -1085,23 +1090,23 @@ fn parse_container_create_references(body: &[u8]) -> GatewayResult<ContainerCrea
             }
         }
 
-        for value in host_config.volumes_from {
+        for value in host_config
+            .volumes_from
+            .into_iter()
+            .chain(host_config.links)
+        {
             if let Some(container) = container_ref_from_qualified_value(&value) {
                 refs.containers.insert(container.to_string());
             }
         }
 
-        for value in host_config.links {
-            if let Some(container) = container_ref_from_qualified_value(&value) {
+        for mode in [
+            host_config.pid_mode.as_deref(),
+            host_config.ipc_mode.as_deref(),
+        ] {
+            if let Some(container) = container_ref_from_mode(mode) {
                 refs.containers.insert(container.to_string());
             }
-        }
-
-        if let Some(container) = container_ref_from_mode(host_config.pid_mode.as_deref()) {
-            refs.containers.insert(container.to_string());
-        }
-        if let Some(container) = container_ref_from_mode(host_config.ipc_mode.as_deref()) {
-            refs.containers.insert(container.to_string());
         }
     }
 
@@ -1173,16 +1178,8 @@ async fn authorize_container(
     container: &str,
     id: &CallerIdentity,
 ) -> GatewayResult<()> {
-    let project = state.cfg.compose_project.clone();
     let meta = fetch_container_meta(state.clone(), version_prefix, container).await?;
-    if is_owner(&meta, id, &project) {
-        Ok(())
-    } else {
-        Err(boxed_response(docker_error(
-            StatusCode::FORBIDDEN,
-            "not authorized for this container",
-        )))
-    }
+    authorize_owned_resource(&state, meta, id, "not authorized for this container")
 }
 
 async fn authorize_network(
@@ -1191,16 +1188,8 @@ async fn authorize_network(
     network: &str,
     id: &CallerIdentity,
 ) -> GatewayResult<()> {
-    let project = state.cfg.compose_project.clone();
     let meta = fetch_network_meta(state.clone(), version_prefix, network).await?;
-    if is_owner(&meta, id, &project) {
-        Ok(())
-    } else {
-        Err(boxed_response(docker_error(
-            StatusCode::FORBIDDEN,
-            "not authorized for this network",
-        )))
-    }
+    authorize_owned_resource(&state, meta, id, "not authorized for this network")
 }
 
 async fn authorize_volume(
@@ -1209,16 +1198,54 @@ async fn authorize_volume(
     volume: &str,
     id: &CallerIdentity,
 ) -> GatewayResult<()> {
-    let project = state.cfg.compose_project.clone();
     let meta = fetch_volume_meta(state.clone(), version_prefix, volume).await?;
-    if is_owner(&meta, id, &project) {
+    authorize_owned_resource(&state, meta, id, "not authorized for this volume")
+}
+
+fn authorize_owned_resource(
+    state: &State,
+    meta: OwnerMeta,
+    id: &CallerIdentity,
+    denied_message: &'static str,
+) -> GatewayResult<()> {
+    if is_owner(&meta, id, &state.cfg.compose_project) {
         Ok(())
     } else {
         Err(boxed_response(docker_error(
             StatusCode::FORBIDDEN,
-            "not authorized for this volume",
+            denied_message,
         )))
     }
+}
+
+fn owner_meta_from_labels(labels: HashMap<String, String>) -> OwnerMeta {
+    OwnerMeta {
+        component: labels.get(AMBER_COMPONENT_LABEL).cloned(),
+        project: labels.get(AMBER_PROJECT_LABEL).cloned(),
+    }
+}
+
+async fn fetch_owner_meta<T>(
+    state: Arc<State>,
+    path: String,
+    parse_error: &'static str,
+    labels: impl FnOnce(T) -> Option<HashMap<String, String>>,
+) -> GatewayResult<OwnerMeta>
+where
+    T: DeserializeOwned,
+{
+    let response = docker_get(&state, &path).await?;
+    if response.status != StatusCode::OK {
+        return Err(boxed_response(response_from_upstream(
+            response.status,
+            response.headers,
+            response.body,
+        )));
+    }
+
+    let parsed: T = serde_json::from_slice(&response.body)
+        .map_err(|_| boxed_response(docker_error(StatusCode::BAD_GATEWAY, parse_error)))?;
+    Ok(owner_meta_from_labels(labels(parsed).unwrap_or_default()))
 }
 
 async fn fetch_container_meta(
@@ -1227,34 +1254,13 @@ async fn fetch_container_meta(
     container: &str,
 ) -> GatewayResult<OwnerMeta> {
     let path = with_version(version_prefix, &format!("/containers/{container}/json"));
-    let response = docker_get(&state, &path).await?;
-    if response.status != StatusCode::OK {
-        return Err(boxed_response(response_from_upstream(
-            response.status,
-            response.headers,
-            response.body,
-        )));
-    }
-
-    let parsed: ContainerInspectResponse =
-        serde_json::from_slice(&response.body).map_err(|_| {
-            boxed_response(docker_error(
-                StatusCode::BAD_GATEWAY,
-                "unexpected inspect JSON",
-            ))
-        })?;
-
-    let labels = parsed
-        .config
-        .and_then(|config| config.labels)
-        .unwrap_or_default();
-
-    let meta = OwnerMeta {
-        component: labels.get(AMBER_COMPONENT_LABEL).cloned(),
-        project: labels.get(AMBER_PROJECT_LABEL).cloned(),
-    };
-
-    Ok(meta)
+    fetch_owner_meta(
+        state,
+        path,
+        "unexpected inspect JSON",
+        |parsed: ContainerInspectResponse| parsed.config.and_then(|config| config.labels),
+    )
+    .await
 }
 
 async fn fetch_network_meta(
@@ -1263,29 +1269,13 @@ async fn fetch_network_meta(
     network: &str,
 ) -> GatewayResult<OwnerMeta> {
     let path = with_version(version_prefix, &format!("/networks/{network}"));
-    let response = docker_get(&state, &path).await?;
-    if response.status != StatusCode::OK {
-        return Err(boxed_response(response_from_upstream(
-            response.status,
-            response.headers,
-            response.body,
-        )));
-    }
-
-    let parsed: NetworkInspectResponse = serde_json::from_slice(&response.body).map_err(|_| {
-        boxed_response(docker_error(
-            StatusCode::BAD_GATEWAY,
-            "unexpected network inspect JSON",
-        ))
-    })?;
-
-    let labels = parsed.labels.unwrap_or_default();
-    let meta = OwnerMeta {
-        component: labels.get(AMBER_COMPONENT_LABEL).cloned(),
-        project: labels.get(AMBER_PROJECT_LABEL).cloned(),
-    };
-
-    Ok(meta)
+    fetch_owner_meta(
+        state,
+        path,
+        "unexpected network inspect JSON",
+        |parsed: NetworkInspectResponse| parsed.labels,
+    )
+    .await
 }
 
 async fn fetch_volume_meta(
@@ -1294,29 +1284,13 @@ async fn fetch_volume_meta(
     volume: &str,
 ) -> GatewayResult<OwnerMeta> {
     let path = with_version(version_prefix, &format!("/volumes/{volume}"));
-    let response = docker_get(&state, &path).await?;
-    if response.status != StatusCode::OK {
-        return Err(boxed_response(response_from_upstream(
-            response.status,
-            response.headers,
-            response.body,
-        )));
-    }
-
-    let parsed: VolumeInspectResponse = serde_json::from_slice(&response.body).map_err(|_| {
-        boxed_response(docker_error(
-            StatusCode::BAD_GATEWAY,
-            "unexpected volume inspect JSON",
-        ))
-    })?;
-
-    let labels = parsed.labels.unwrap_or_default();
-    let meta = OwnerMeta {
-        component: labels.get(AMBER_COMPONENT_LABEL).cloned(),
-        project: labels.get(AMBER_PROJECT_LABEL).cloned(),
-    };
-
-    Ok(meta)
+    fetch_owner_meta(
+        state,
+        path,
+        "unexpected volume inspect JSON",
+        |parsed: VolumeInspectResponse| parsed.labels,
+    )
+    .await
 }
 
 async fn resolve_exec_container_id(

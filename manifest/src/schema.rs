@@ -233,7 +233,6 @@ pub enum NetworkProtocol {
     Http,
     Https,
     Tcp,
-    Udp,
 }
 
 impl fmt::Display for NetworkProtocol {
@@ -242,7 +241,6 @@ impl fmt::Display for NetworkProtocol {
             NetworkProtocol::Http => "http",
             NetworkProtocol::Https => "https",
             NetworkProtocol::Tcp => "tcp",
-            NetworkProtocol::Udp => "udp",
         };
         f.write_str(s)
     }

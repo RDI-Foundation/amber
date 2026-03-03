@@ -87,19 +87,39 @@ impl ProgramPlan {
             Self::Helper { image_origin, .. } => image_origin,
         }
     }
+
+    pub(crate) fn is_helper(&self) -> bool {
+        matches!(self, Self::Helper { .. })
+    }
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct HelperPayload {
-    pub(crate) template_spec_b64: String,
+pub(crate) struct RuntimeConfigPayload<'a> {
+    pub(crate) root_schema_b64: String,
     pub(crate) component_cfg_template_b64: String,
     pub(crate) component_schema_b64: String,
+    pub(crate) allowed_root_leaf_paths: &'a BTreeSet<String>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ComponentConfigPayload {
-    pub(crate) component_cfg_template_b64: String,
-    pub(crate) component_schema_b64: String,
+pub(crate) enum ComponentExecutionPlan<'a> {
+    Direct {
+        entrypoint: &'a [String],
+        env: &'a BTreeMap<String, String>,
+    },
+    HelperRunner {
+        direct_entrypoint_b64: Option<String>,
+        direct_env_b64: Option<String>,
+        template_spec_b64: Option<String>,
+        runtime_config: Option<RuntimeConfigPayload<'a>>,
+        mount_spec_b64: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ComponentRuntimePlan<'a> {
+    pub(crate) needs_helper: bool,
+    pub(crate) execution: ComponentExecutionPlan<'a>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -299,65 +319,6 @@ pub(crate) fn build_config_plan(
     })
 }
 
-pub(crate) fn encode_helper_payload(
-    component_label: &str,
-    template_spec: &TemplateSpec,
-    component_template: &rc::RootConfigTemplate,
-    component_schema: &Value,
-) -> Result<HelperPayload, MeshError> {
-    let b64 = base64::engine::general_purpose::STANDARD;
-
-    let spec_json = serde_json::to_vec(template_spec).map_err(|e| {
-        MeshError::new(format!(
-            "failed to serialize template spec for {component_label}: {e}"
-        ))
-    })?;
-    let spec_b64 = b64.encode(spec_json);
-
-    let component_payload =
-        encode_component_payload(component_label, component_template, component_schema)?;
-
-    Ok(HelperPayload {
-        template_spec_b64: spec_b64,
-        component_cfg_template_b64: component_payload.component_cfg_template_b64,
-        component_schema_b64: component_payload.component_schema_b64,
-    })
-}
-
-pub(crate) fn encode_component_payload(
-    component_label: &str,
-    component_template: &rc::RootConfigTemplate,
-    component_schema: &Value,
-) -> Result<ComponentConfigPayload, MeshError> {
-    let b64 = base64::engine::general_purpose::STANDARD;
-
-    let template_json = serde_json::to_vec(&component_template.to_json_ir()).map_err(|e| {
-        MeshError::new(format!(
-            "failed to serialize component config template for {component_label}: {e}"
-        ))
-    })?;
-    let template_b64 = b64.encode(template_json);
-
-    let schema_json = serde_json::to_vec(&rc::canonical_json(component_schema)).map_err(|e| {
-        MeshError::new(format!(
-            "failed to serialize component config definition for {component_label}: {e}"
-        ))
-    })?;
-    let schema_b64 = b64.encode(schema_json);
-
-    Ok(ComponentConfigPayload {
-        component_cfg_template_b64: template_b64,
-        component_schema_b64: schema_b64,
-    })
-}
-
-pub(crate) fn encode_schema_b64(label: &str, schema: &Value) -> Result<String, MeshError> {
-    let b64 = base64::engine::general_purpose::STANDARD;
-    let schema_json = serde_json::to_vec(&rc::canonical_json(schema))
-        .map_err(|e| MeshError::new(format!("failed to serialize {label}: {e}")))?;
-    Ok(b64.encode(schema_json))
-}
-
 // Security: only expose runtime config needed by program templates and mounts.
 fn used_component_paths(
     program_plan: &ProgramPlan,
@@ -380,29 +341,131 @@ fn used_component_paths(
     used
 }
 
-pub(crate) fn encode_mount_spec_b64(label: &str, specs: &[MountSpec]) -> Result<String, MeshError> {
-    let b64 = base64::engine::general_purpose::STANDARD;
-    let spec_json =
-        serde_json::to_vec(specs).map_err(|e| MeshError::new(format!("{label}: {e}")))?;
-    Ok(b64.encode(spec_json))
-}
-
-pub(crate) fn encode_direct_entrypoint_b64(entrypoint: &[String]) -> Result<String, MeshError> {
-    let b64 = base64::engine::general_purpose::STANDARD;
-    let payload = serde_json::to_vec(entrypoint).map_err(|e| MeshError::new(format!("{e}")))?;
-    Ok(b64.encode(payload))
-}
-
-pub(crate) fn encode_direct_env_b64(env: &BTreeMap<String, String>) -> Result<String, MeshError> {
-    let b64 = base64::engine::general_purpose::STANDARD;
-    let payload = serde_json::to_vec(env).map_err(|e| MeshError::new(format!("{e}")))?;
-    Ok(b64.encode(payload))
+fn encode_json_b64(value: &(impl Serialize + ?Sized)) -> Result<String, serde_json::Error> {
+    let bytes = serde_json::to_vec(value)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 pub(crate) fn mount_specs_need_config(specs: &[MountSpec]) -> bool {
     specs
         .iter()
         .any(|spec| matches!(spec, MountSpec::Config { .. }))
+}
+
+pub(crate) fn build_component_runtime_plan<'a>(
+    component_label: &str,
+    program_plan: &'a ProgramPlan,
+    mount_specs: Option<&'a [MountSpec]>,
+    runtime_view: Option<&'a RuntimeConfigView>,
+    extra_helper_requirement: bool,
+) -> Result<ComponentRuntimePlan<'a>, MeshError> {
+    let needs_config_payload =
+        program_plan.is_helper() || mount_specs.is_some_and(mount_specs_need_config);
+    let needs_helper =
+        program_plan.is_helper() || mount_specs.is_some() || extra_helper_requirement;
+
+    let mount_spec_b64 = mount_specs
+        .map(|specs| {
+            encode_json_b64(specs).map_err(|e| MeshError::new(format!("{component_label}: {e}")))
+        })
+        .transpose()?;
+
+    let encode_component_payload = |component_template: &rc::RootConfigTemplate,
+                                    component_schema: &Value|
+     -> Result<(String, String), MeshError> {
+        let component_cfg_template_b64 = encode_json_b64(&component_template.to_json_ir())
+            .map_err(|e| {
+                MeshError::new(format!(
+                    "failed to serialize component config template for {component_label}: {e}"
+                ))
+            })?;
+        let component_schema_b64 =
+            encode_json_b64(&rc::canonical_json(component_schema)).map_err(|e| {
+                MeshError::new(format!(
+                    "failed to serialize component config definition for {component_label}: {e}"
+                ))
+            })?;
+        Ok((component_schema_b64, component_cfg_template_b64))
+    };
+
+    let build_runtime_payload = |component_schema_b64: String,
+                                 component_cfg_template_b64: String|
+     -> Result<RuntimeConfigPayload<'a>, MeshError> {
+        let view = runtime_view.expect("runtime config view should be computed");
+        let root_schema_b64 = encode_json_b64(&rc::canonical_json(&view.pruned_root_schema))
+            .map_err(|e| {
+                MeshError::new(format!(
+                    "failed to serialize root config definition for {component_label}: {e}"
+                ))
+            })?;
+
+        Ok(RuntimeConfigPayload {
+            root_schema_b64,
+            component_cfg_template_b64,
+            component_schema_b64,
+            allowed_root_leaf_paths: &view.allowed_root_leaf_paths,
+        })
+    };
+
+    let execution = match program_plan {
+        ProgramPlan::Direct {
+            entrypoint, env, ..
+        } if !needs_helper => ComponentExecutionPlan::Direct { entrypoint, env },
+        ProgramPlan::Direct {
+            entrypoint, env, ..
+        } => {
+            let direct_entrypoint_b64 =
+                Some(encode_json_b64(entrypoint).map_err(|e| MeshError::new(e.to_string()))?);
+            let direct_env_b64 =
+                Some(encode_json_b64(env).map_err(|e| MeshError::new(e.to_string()))?);
+            let runtime_config = if needs_config_payload {
+                let view = runtime_view.expect("runtime config view should be computed");
+                let (component_schema_b64, component_cfg_template_b64) =
+                    encode_component_payload(&view.component_template, &view.component_schema)?;
+                Some(build_runtime_payload(
+                    component_schema_b64,
+                    component_cfg_template_b64,
+                )?)
+            } else {
+                None
+            };
+
+            ComponentExecutionPlan::HelperRunner {
+                direct_entrypoint_b64,
+                direct_env_b64,
+                template_spec_b64: None,
+                runtime_config,
+                mount_spec_b64,
+            }
+        }
+        ProgramPlan::Helper { template_spec, .. } => {
+            let view = runtime_view.expect("runtime config view should be computed");
+            let template_spec_b64 = encode_json_b64(template_spec).map_err(|e| {
+                MeshError::new(format!(
+                    "failed to serialize template spec for {component_label}: {e}"
+                ))
+            })?;
+            let (component_schema_b64, component_cfg_template_b64) =
+                encode_component_payload(&view.component_template, &view.component_schema)?;
+            let runtime_config = Some(build_runtime_payload(
+                component_schema_b64,
+                component_cfg_template_b64,
+            )?);
+
+            ComponentExecutionPlan::HelperRunner {
+                direct_entrypoint_b64: None,
+                direct_env_b64: None,
+                template_spec_b64: Some(template_spec_b64),
+                runtime_config,
+                mount_spec_b64,
+            }
+        }
+    };
+
+    Ok(ComponentRuntimePlan {
+        needs_helper,
+        execution,
+    })
 }
 
 fn collect_used_paths_from_template_spec(spec: &TemplateSpec, out: &mut BTreeSet<String>) {
@@ -853,6 +916,65 @@ enum MountResolution {
     Runtime,
 }
 
+enum QueryResolution<'a> {
+    Node(&'a rc::ConfigNode),
+    RuntimePath(String),
+}
+
+fn parse_query_segments(query: &str) -> Result<Vec<&str>, MeshError> {
+    query
+        .split('.')
+        .map(|seg| {
+            if seg.is_empty() {
+                Err(MeshError::new(format!(
+                    "invalid config path {query:?}: empty segment"
+                )))
+            } else {
+                Ok(seg)
+            }
+        })
+        .collect()
+}
+
+fn resolve_config_query_node<'a>(
+    template: &'a rc::ConfigNode,
+    query: &str,
+) -> Result<QueryResolution<'a>, MeshError> {
+    if query.is_empty() {
+        return Ok(QueryResolution::Node(template));
+    }
+
+    let segments = parse_query_segments(query)?;
+    let mut current = template;
+    for (idx, seg) in segments.iter().enumerate() {
+        match current {
+            rc::ConfigNode::Object(map) => {
+                let Some(next) = map.get(*seg) else {
+                    return Err(MeshError::new(format!(
+                        "config.{query} not found (missing key {seg:?})"
+                    )));
+                };
+                current = next;
+            }
+            rc::ConfigNode::ConfigRef(path) => {
+                let suffix = segments[idx..].join(".");
+                let full = if path.is_empty() {
+                    suffix
+                } else {
+                    format!("{path}.{suffix}")
+                };
+                return Ok(QueryResolution::RuntimePath(full));
+            }
+            _ => {
+                return Err(MeshError::new(format!(
+                    "config.{query} not found (encountered non-object before segment {seg:?})"
+                )));
+            }
+        }
+    }
+    Ok(QueryResolution::Node(current))
+}
+
 fn resolve_config_query_for_program(
     template: Option<&rc::ConfigNode>,
     query: &str,
@@ -861,34 +983,9 @@ fn resolve_config_query_for_program(
         return Ok(ConfigResolution::Runtime);
     };
 
-    let cur = if query.is_empty() {
-        template
-    } else {
-        let mut current = template;
-        for seg in query.split('.') {
-            if seg.is_empty() {
-                return Err(MeshError::new(format!(
-                    "invalid config path {query:?}: empty segment"
-                )));
-            }
-            match current {
-                rc::ConfigNode::Object(map) => {
-                    let Some(next) = map.get(seg) else {
-                        return Err(MeshError::new(format!(
-                            "config.{query} not found (missing key {seg:?})"
-                        )));
-                    };
-                    current = next;
-                }
-                rc::ConfigNode::ConfigRef(_) => return Ok(ConfigResolution::Runtime),
-                _ => {
-                    return Err(MeshError::new(format!(
-                        "config.{query} not found (encountered non-object before segment {seg:?})"
-                    )));
-                }
-            }
-        }
-        current
+    let cur = match resolve_config_query_node(template, query)? {
+        QueryResolution::Node(cur) => cur,
+        QueryResolution::RuntimePath(_) => return Ok(ConfigResolution::Runtime),
     };
 
     if !cur.contains_runtime() {
@@ -969,79 +1066,29 @@ fn resolve_config_query_for_program_image(
                  string leaf like ${config.image}",
             ));
         }
-        for seg in query.split('.') {
-            if seg.is_empty() {
-                return Err(MeshError::new(format!(
-                    "invalid config path {query:?}: empty segment"
-                )));
-            }
-        }
+        parse_query_segments(query)?;
         return Ok(ImageConfigResolution::RuntimeTemplate(vec![
             ProgramImagePart::RootConfigPath(query.to_string()),
         ]));
     };
 
-    if query.is_empty() {
-        return if !template.contains_runtime() {
-            let v = template
-                .evaluate_static()
-                .map_err(|e| MeshError::new(e.to_string()))?;
-            Ok(ImageConfigResolution::Static(
-                rc::stringify_for_interpolation(&v).map_err(|e| MeshError::new(e.to_string()))?,
-            ))
-        } else {
-            resolve_program_image_runtime_node(template)
-        };
-    }
-
-    let segments = query.split('.').collect::<Vec<_>>();
-    for seg in &segments {
-        if seg.is_empty() {
-            return Err(MeshError::new(format!(
-                "invalid config path {query:?}: empty segment"
-            )));
-        }
-    }
-
-    let mut cur = template;
-    for (idx, seg) in segments.iter().enumerate() {
-        match cur {
-            rc::ConfigNode::Object(map) => {
-                let Some(next) = map.get(*seg) else {
-                    return Err(MeshError::new(format!(
-                        "config.{query} not found (missing key {seg:?})"
-                    )));
-                };
-                cur = next;
-            }
-            rc::ConfigNode::ConfigRef(path) => {
-                let suffix = segments[idx..].join(".");
-                let full = if path.is_empty() {
-                    suffix
-                } else {
-                    format!("{path}.{suffix}")
-                };
-                return Ok(ImageConfigResolution::RuntimeTemplate(vec![
-                    ProgramImagePart::RootConfigPath(full),
-                ]));
-            }
-            _ => {
-                return Err(MeshError::new(format!(
-                    "config.{query} not found (encountered non-object before segment {seg:?})"
-                )));
+    match resolve_config_query_node(template, query)? {
+        QueryResolution::RuntimePath(path) => Ok(ImageConfigResolution::RuntimeTemplate(vec![
+            ProgramImagePart::RootConfigPath(path),
+        ])),
+        QueryResolution::Node(cur) => {
+            if !cur.contains_runtime() {
+                let v = cur
+                    .evaluate_static()
+                    .map_err(|e| MeshError::new(e.to_string()))?;
+                Ok(ImageConfigResolution::Static(
+                    rc::stringify_for_interpolation(&v)
+                        .map_err(|e| MeshError::new(e.to_string()))?,
+                ))
+            } else {
+                resolve_program_image_runtime_node(cur)
             }
         }
-    }
-
-    if !cur.contains_runtime() {
-        let v = cur
-            .evaluate_static()
-            .map_err(|e| MeshError::new(e.to_string()))?;
-        Ok(ImageConfigResolution::Static(
-            rc::stringify_for_interpolation(&v).map_err(|e| MeshError::new(e.to_string()))?,
-        ))
-    } else {
-        resolve_program_image_runtime_node(cur)
     }
 }
 
@@ -1053,49 +1100,17 @@ fn resolve_config_query_for_mount(
         return Ok(MountResolution::Runtime);
     };
 
-    if query.is_empty() {
-        return if !template.contains_runtime() {
-            let v = template
-                .evaluate_static()
-                .map_err(|e| MeshError::new(e.to_string()))?;
-            Ok(MountResolution::Static(v))
-        } else {
-            Ok(MountResolution::Runtime)
-        };
-    }
+    let cur = match resolve_config_query_node(template, query)? {
+        QueryResolution::Node(cur) => cur,
+        QueryResolution::RuntimePath(_) => return Ok(MountResolution::Runtime),
+    };
 
-    let mut cur = template;
-    for seg in query.split('.') {
-        if seg.is_empty() {
-            return Err(MeshError::new(format!(
-                "invalid config path {query:?}: empty segment"
-            )));
-        }
-        match cur {
-            rc::ConfigNode::Object(map) => {
-                let Some(next) = map.get(seg) else {
-                    return Err(MeshError::new(format!(
-                        "config.{query} not found (missing key {seg:?})"
-                    )));
-                };
-                cur = next;
-            }
-            rc::ConfigNode::ConfigRef(_) => return Ok(MountResolution::Runtime),
-            _ => {
-                return Err(MeshError::new(format!(
-                    "config.{query} not found (encountered non-object before segment {seg:?})"
-                )));
-            }
-        }
-    }
-
-    if !cur.contains_runtime() {
-        let v = cur
-            .evaluate_static()
-            .map_err(|e| MeshError::new(e.to_string()))?;
-        Ok(MountResolution::Static(v))
-    } else {
+    if cur.contains_runtime() {
         Ok(MountResolution::Runtime)
+    } else {
+        cur.evaluate_static()
+            .map(MountResolution::Static)
+            .map_err(|e| MeshError::new(e.to_string()))
     }
 }
 
@@ -1138,6 +1153,36 @@ fn extend_image_parts(parts: &mut Vec<ProgramImagePart>, extra: Vec<ProgramImage
     }
 }
 
+fn resolve_slot_or_binding_interpolation(
+    scenario: &Scenario,
+    id: ComponentId,
+    location: &str,
+    source: &InterpolationSource,
+    query: &str,
+    slots: &BTreeMap<String, SlotObject>,
+    bindings: &BTreeMap<String, BindingObject>,
+) -> Result<Option<String>, MeshError> {
+    let component = component_label(scenario, id);
+    match source {
+        InterpolationSource::Slots => resolve_slot_query(slots, query).map(Some).map_err(|e| {
+            MeshError::new(format!("failed to resolve slot query in {component}: {e}"))
+        }),
+        InterpolationSource::Bindings => {
+            resolve_binding_query(bindings, query)
+                .map(Some)
+                .map_err(|e| {
+                    MeshError::new(format!(
+                        "failed to resolve binding query in {component}: {e}"
+                    ))
+                })
+        }
+        InterpolationSource::Config => Ok(None),
+        other => Err(MeshError::new(format!(
+            "unsupported interpolation source {other} in {component} {location}",
+        ))),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_program_template_string(
     scenario: &Scenario,
@@ -1150,57 +1195,36 @@ fn resolve_program_template_string(
     needs_helper_for_program_templates: &mut bool,
     require_non_empty: bool,
 ) -> Result<TemplateString, MeshError> {
+    let component = component_label(scenario, id);
     let mut ts: TemplateString = Vec::new();
     for part in &value.parts {
         match part {
             InterpolatedPart::Literal(lit) => ts.push(TemplatePart::lit(lit)),
-            InterpolatedPart::Interpolation { source, query } => match source {
-                InterpolationSource::Slots => {
-                    let value = resolve_slot_query(slots, query).map_err(|e| {
-                        MeshError::new(format!(
-                            "failed to resolve slot query in {}: {e}",
-                            component_label(scenario, id)
-                        ))
-                    })?;
+            InterpolatedPart::Interpolation { source, query } => {
+                if let Some(value) = resolve_slot_or_binding_interpolation(
+                    scenario, id, location, source, query, slots, bindings,
+                )? {
                     ts.push(TemplatePart::lit(value));
+                    continue;
                 }
-                InterpolationSource::Bindings => {
-                    let value = resolve_binding_query(bindings, query).map_err(|e| {
-                        MeshError::new(format!(
-                            "failed to resolve binding query in {}: {e}",
-                            component_label(scenario, id)
-                        ))
-                    })?;
-                    ts.push(TemplatePart::lit(value));
-                }
-                InterpolationSource::Config => {
-                    match resolve_config_query_for_program(template_opt, query)? {
-                        ConfigResolution::Static(value) => ts.push(TemplatePart::lit(value)),
-                        ConfigResolution::Runtime => {
-                            ts.push(TemplatePart::config(query.clone()));
-                            *needs_helper_for_program_templates = true;
-                        }
+                match resolve_config_query_for_program(template_opt, query)? {
+                    ConfigResolution::Static(value) => ts.push(TemplatePart::lit(value)),
+                    ConfigResolution::Runtime => {
+                        ts.push(TemplatePart::config(query.clone()));
+                        *needs_helper_for_program_templates = true;
                     }
                 }
-                other => {
-                    return Err(MeshError::new(format!(
-                        "unsupported interpolation source {other} in {} {location}",
-                        component_label(scenario, id)
-                    )));
-                }
-            },
+            }
             _ => {
                 return Err(MeshError::new(format!(
-                    "unsupported interpolation part in {} {location}",
-                    component_label(scenario, id)
+                    "unsupported interpolation part in {component} {location}",
                 )));
             }
         }
     }
     if require_non_empty && ts.is_empty() {
         return Err(MeshError::new(format!(
-            "internal error: produced empty template for {} {location}",
-            component_label(scenario, id)
+            "internal error: produced empty template for {component} {location}",
         )));
     }
     Ok(ts)
@@ -1216,6 +1240,7 @@ fn build_program_plan(
     template_opt: Option<&rc::ConfigNode>,
     component_schema: Option<&Value>,
 ) -> Result<ProgramPlan, MeshError> {
+    let component = component_label(scenario, id);
     let mut entrypoint_ts: Vec<TemplateString> = Vec::new();
     // Helper mode is required only for runtime config interpolation in
     // program.entrypoint/program.env (not for program.image runtime interpolation).
@@ -1226,8 +1251,7 @@ fn build_program_plan(
         .parse::<amber_manifest::InterpolatedString>()
         .map_err(|err| {
             MeshError::new(format!(
-                "failed to parse program.image interpolation in {}: {err}",
-                component_label(scenario, id)
+                "failed to parse program.image interpolation in {component}: {err}",
             ))
         })?;
     // If program.image is exactly one `${config...}` interpolation, image diagnostics should
@@ -1246,54 +1270,38 @@ fn build_program_plan(
     for part in &image.parts {
         match part {
             InterpolatedPart::Literal(lit) => push_image_literal(&mut image_parts, lit.clone()),
-            InterpolatedPart::Interpolation { source, query } => match source {
-                InterpolationSource::Slots => {
-                    let value = resolve_slot_query(slots, query).map_err(|e| {
-                        MeshError::new(format!(
-                            "failed to resolve slot query in {}: {e}",
-                            component_label(scenario, id)
-                        ))
-                    })?;
+            InterpolatedPart::Interpolation { source, query } => {
+                if let Some(value) = resolve_slot_or_binding_interpolation(
+                    scenario,
+                    id,
+                    "program.image",
+                    source,
+                    query,
+                    slots,
+                    bindings,
+                )? {
                     push_image_literal(&mut image_parts, value);
+                    continue;
                 }
-                InterpolationSource::Bindings => {
-                    let value = resolve_binding_query(bindings, query).map_err(|e| {
-                        MeshError::new(format!(
-                            "failed to resolve binding query in {}: {e}",
-                            component_label(scenario, id)
-                        ))
-                    })?;
-                    push_image_literal(&mut image_parts, value);
-                }
-                InterpolationSource::Config => {
-                    match resolve_config_query_for_program_image(template_opt, query)? {
-                        ImageConfigResolution::Static(value) => {
-                            push_image_literal(&mut image_parts, value);
-                        }
-                        ImageConfigResolution::RuntimeTemplate(parts) => {
-                            extend_image_parts(&mut image_parts, parts);
-                        }
+                match resolve_config_query_for_program_image(template_opt, query)? {
+                    ImageConfigResolution::Static(value) => {
+                        push_image_literal(&mut image_parts, value);
+                    }
+                    ImageConfigResolution::RuntimeTemplate(parts) => {
+                        extend_image_parts(&mut image_parts, parts);
                     }
                 }
-                other => {
-                    return Err(MeshError::new(format!(
-                        "unsupported interpolation source {other} in {} program.image",
-                        component_label(scenario, id)
-                    )));
-                }
-            },
+            }
             _ => {
                 return Err(MeshError::new(format!(
-                    "unsupported interpolation part in {} program.image",
-                    component_label(scenario, id)
+                    "unsupported interpolation part in {component} program.image",
                 )));
             }
         }
     }
     if image_parts.is_empty() {
         return Err(MeshError::new(format!(
-            "internal error: produced empty image template for {} program.image",
-            component_label(scenario, id)
+            "internal error: produced empty image template for {component} program.image",
         )));
     }
     let image = if image_parts
@@ -1349,7 +1357,7 @@ fn build_program_plan(
         component_schema.ok_or_else(|| {
             MeshError::new(format!(
                 "component {} requires config_schema when using runtime config interpolation",
-                component_label(scenario, id)
+                component
             ))
         })?;
 
@@ -1366,15 +1374,14 @@ fn build_program_plan(
             template_spec: spec,
         })
     } else {
-        let mut rendered_entrypoint: Vec<String> = Vec::new();
-        for ts in entrypoint_ts {
-            rendered_entrypoint.push(render_template_string_static(&ts)?);
-        }
-
-        let mut rendered_env: BTreeMap<String, String> = BTreeMap::new();
-        for (k, ts) in env_ts {
-            rendered_env.insert(k, render_template_string_static(&ts)?);
-        }
+        let rendered_entrypoint = entrypoint_ts
+            .into_iter()
+            .map(|ts| render_template_string_static(&ts))
+            .collect::<Result<Vec<_>, _>>()?;
+        let rendered_env = env_ts
+            .into_iter()
+            .map(|(k, ts)| render_template_string_static(&ts).map(|rendered| (k, rendered)))
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
 
         Ok(ProgramPlan::Direct {
             image,

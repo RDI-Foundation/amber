@@ -314,22 +314,34 @@ fn slots_section_site(
     })
 }
 
-fn unknown_slot_help(component_label: &str, manifest: &Manifest) -> String {
-    let mut names: Vec<_> = manifest
-        .slots()
-        .keys()
-        .map(|name| name.to_string())
-        .collect();
+fn declared_items_help(
+    component_label: &str,
+    item_kind: &str,
+    names: impl Iterator<Item = String>,
+    empty_help: impl FnOnce() -> String,
+) -> String {
+    let mut names: Vec<_> = names.collect();
     if names.is_empty() {
-        return format!(
-            "No slots are declared on {component_label}. Declare slots in a `slots: {{ ... }}` \
-             block, or fix the binding target."
-        );
+        return empty_help();
     }
     names.sort();
     format!(
-        "Valid slots on {component_label}: {}",
+        "Valid {item_kind} on {component_label}: {}",
         names.into_iter().take(20).collect::<Vec<_>>().join(", ")
+    )
+}
+
+fn unknown_slot_help(component_label: &str, manifest: &Manifest) -> String {
+    declared_items_help(
+        component_label,
+        "slots",
+        manifest.slots().keys().map(|name| name.to_string()),
+        || {
+            format!(
+                "No slots are declared on {component_label}. Declare slots in a `slots: {{ ... \
+                 }}` block, or fix the binding target."
+            )
+        },
     )
 }
 
@@ -371,22 +383,45 @@ impl BindingErrorSite<'_> {
 
 fn not_exported_help(component_path: &str, manifest: &Manifest) -> String {
     let component_label = describe_component_path(component_path);
-    let mut names: Vec<_> = manifest
-        .exports()
-        .keys()
-        .map(|name| name.to_string())
-        .collect();
-    if names.is_empty() {
-        return format!(
-            "No exports are declared by {component_label}. Add an `exports: {{ ... }}` entry, or \
-             fix the reference."
-        );
-    }
-    names.sort();
-    format!(
-        "Valid exports on {component_label}: {}",
-        names.into_iter().take(20).collect::<Vec<_>>().join(", ")
+    declared_items_help(
+        &component_label,
+        "exports",
+        manifest.exports().keys().map(|name| name.to_string()),
+        || {
+            format!(
+                "No exports are declared by {component_label}. Add an `exports: {{ ... }}` entry, \
+                 or fix the reference."
+            )
+        },
     )
+}
+
+fn slot_decl_related_span(
+    components: &[Option<Component>],
+    provenance: &Provenance,
+    store: &DigestStore,
+    slot_ref: &SlotRef,
+    message_prefix: &str,
+    label: &str,
+    use_kind_span: bool,
+) -> Option<RelatedSpan> {
+    let (src, slot_spans) = source_for_component(provenance, store, slot_ref.component)?;
+    let spans = slot_spans.slots.get(slot_ref.name.as_str())?;
+    let span = if use_kind_span {
+        spans.kind.unwrap_or(spans.whole)
+    } else {
+        spans.name
+    };
+    Some(RelatedSpan {
+        message: format!(
+            "{message_prefix} `{}` declared on {}",
+            slot_ref.name,
+            component_path_for(components, slot_ref.component)
+        ),
+        src,
+        span,
+        label: label.to_string(),
+    })
 }
 
 #[allow(unused_assignments)]
@@ -748,22 +783,17 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
                     },
                     None => {
                         let (src, span) = export_site(&provenance, store, root, export_name);
-                        let mut related = Vec::new();
-                        if let Some((slot_src, slot_spans)) =
-                            source_for_component(&provenance, store, slot.component)
-                            && let Some(s) = slot_spans.slots.get(slot.name.as_str())
-                        {
-                            related.push(RelatedSpan {
-                                message: format!(
-                                    "slot `{}` declared on {}",
-                                    slot.name,
-                                    component_path_for(&components, slot.component)
-                                ),
-                                src: slot_src,
-                                span: s.name,
-                                label: "slot declared here".to_string(),
-                            });
-                        }
+                        let related = slot_decl_related_span(
+                            &components,
+                            &provenance,
+                            store,
+                            &slot,
+                            "slot",
+                            "slot declared here",
+                            false,
+                        )
+                        .into_iter()
+                        .collect();
                         errors.push(Error::ExportUnboundSlot {
                             component_path: describe_component_path(&component_path_for(
                                 &components,
@@ -1586,21 +1616,16 @@ fn type_mismatch_error(
     let mut related = Vec::new();
 
     let to_id = slot_ref.component;
-    let slot_name = slot_ref.name.as_str();
-    if let Some((slot_src, slot_spans)) = source_for_component(provenance, store, to_id)
-        && let Some(slot_decl_spans) = slot_spans.slots.get(slot_name)
-    {
-        let span = slot_decl_spans.kind.unwrap_or(slot_decl_spans.whole);
-        related.push(RelatedSpan {
-            message: format!(
-                "slot `{}` declared on {}",
-                slot_name,
-                component_path_for(components, to_id)
-            ),
-            src: slot_src,
-            span,
-            label: "slot type declared here".to_string(),
-        });
+    if let Some(site) = slot_decl_related_span(
+        components,
+        provenance,
+        store,
+        &slot_ref,
+        "slot",
+        "slot type declared here",
+        true,
+    ) {
+        related.push(site);
     }
 
     match &source {
@@ -1624,22 +1649,16 @@ fn type_mismatch_error(
             }
         }
         CapabilitySource::Slot(slot_ref) => {
-            if let Some((slot_src, slot_spans)) =
-                source_for_component(provenance, store, slot_ref.component)
-            {
-                let slot_name = slot_ref.name.as_str();
-                if let Some(s) = slot_spans.slots.get(slot_name) {
-                    let span = s.kind.unwrap_or(s.whole);
-                    related.push(RelatedSpan {
-                        message: format!(
-                            "slot `{slot_name}` declared on {}",
-                            component_path_for(components, slot_ref.component)
-                        ),
-                        src: slot_src,
-                        span,
-                        label: "slot type declared here".to_string(),
-                    });
-                }
+            if let Some(site) = slot_decl_related_span(
+                components,
+                provenance,
+                store,
+                slot_ref,
+                "slot",
+                "slot type declared here",
+                true,
+            ) {
+                related.push(site);
             }
         }
         CapabilitySource::Framework(_) => {}
@@ -1954,21 +1973,16 @@ impl<'a> SlotResolver<'a> {
 
             let mut related = Vec::new();
             for slot_ref in &cycle_slots {
-                if let Some((slot_src, slot_spans)) =
-                    source_for_component(self.provenance, self.store, slot_ref.component)
-                    && let Some(s) = slot_spans.slots.get(slot_ref.name.as_str())
-                {
-                    let span = s.name;
-                    related.push(RelatedSpan {
-                        message: format!(
-                            "slot `{}` declared on {}",
-                            slot_ref.name,
-                            component_path_for(self.components, slot_ref.component)
-                        ),
-                        src: slot_src,
-                        span,
-                        label: "slot declared here".to_string(),
-                    });
+                if let Some(site) = slot_decl_related_span(
+                    self.components,
+                    self.provenance,
+                    self.store,
+                    slot_ref,
+                    "slot",
+                    "slot declared here",
+                    false,
+                ) {
+                    related.push(site);
                 }
             }
 
@@ -2192,22 +2206,17 @@ fn resolve_binding_edges(
             )
             .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
 
-            let mut related = Vec::new();
-            if let Some((slot_src, slot_spans)) =
-                source_for_component(resolver.provenance, resolver.store, slot_ref.component)
-                && let Some(s) = slot_spans.slots.get(slot_ref.name.as_str())
-            {
-                related.push(RelatedSpan {
-                    message: format!(
-                        "external slot `{}` declared on {}",
-                        slot_ref.name,
-                        component_path_for(resolver.components, slot_ref.component)
-                    ),
-                    src: slot_src,
-                    span: s.name,
-                    label: "slot declared here".to_string(),
-                });
-            }
+            let related = slot_decl_related_span(
+                resolver.components,
+                resolver.provenance,
+                resolver.store,
+                slot_ref,
+                "external slot",
+                "slot declared here",
+                false,
+            )
+            .into_iter()
+            .collect();
 
             errors.push(Error::ExternalSlotRequiresWeakBinding {
                 component_path: describe_component_path(&component_path_for(

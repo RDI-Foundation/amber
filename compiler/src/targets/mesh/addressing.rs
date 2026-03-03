@@ -1,20 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use amber_manifest::SlotDecl;
-use amber_scenario::ComponentId;
+use amber_manifest::NetworkProtocol;
+use amber_scenario::{ComponentId, Scenario};
 
 use crate::{
     binding_query::BindingObject,
     slot_query::SlotObject,
-    targets::mesh::{
-        plan::{
-            MeshError, MeshPlan, ResolvedBinding, ResolvedExport, ResolvedExternalBinding,
-            ResolvedFrameworkBinding,
-        },
-        router_config::{
-            RouterConfig, RouterExport, RouterExternalSlot, allocate_external_slot_ports,
-            build_router_external_slots, encode_router_config_b64,
-        },
+    targets::mesh::plan::{
+        MeshError, MeshPlan, ResolvedBinding, ResolvedExternalBinding, ResolvedFrameworkBinding,
+        component_label,
     },
 };
 
@@ -55,56 +49,123 @@ impl AllowPlan {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RouterPlan {
-    pub(crate) needs_router: bool,
-    pub(crate) export_ports_by_name: BTreeMap<String, u16>,
-    pub(crate) export_ports: BTreeSet<u16>,
-    pub(crate) router_external_slots: Vec<RouterExternalSlot>,
-    pub(crate) router_exports: Vec<RouterExport>,
-    pub(crate) router_env_passthrough: Vec<String>,
-    pub(crate) router_config_b64: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct MeshAddressPlan<E> {
+pub(crate) struct MeshAddressPlan {
     pub(crate) slot_values_by_component: HashMap<ComponentId, BTreeMap<String, SlotObject>>,
     pub(crate) binding_values_by_component: HashMap<ComponentId, BTreeMap<String, BindingObject>>,
-    pub(crate) allow: AllowPlan,
-    pub(crate) router: RouterPlan,
-    pub(crate) extra: E,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RouterPortBases {
-    pub(crate) external: u16,
-    pub(crate) export: u16,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DockerFrameworkBindingPolicy {
+    LoopbackTcp,
+    Unsupported { reason: &'static str },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LocalAddressingOptions {
+    pub(crate) backend_label: &'static str,
+    pub(crate) docker_binding: DockerFrameworkBindingPolicy,
+}
+
+pub(crate) struct LocalAddressing<'a> {
+    scenario: &'a Scenario,
+    slot_ports_by_component: &'a HashMap<ComponentId, BTreeMap<String, u16>>,
+    options: LocalAddressingOptions,
+}
+
+impl<'a> LocalAddressing<'a> {
+    pub(crate) fn new(
+        scenario: &'a Scenario,
+        slot_ports_by_component: &'a HashMap<ComponentId, BTreeMap<String, u16>>,
+        options: LocalAddressingOptions,
+    ) -> Self {
+        Self {
+            scenario,
+            slot_ports_by_component,
+            options,
+        }
+    }
+
+    fn local_slot_port(&self, component: ComponentId, slot: &str) -> Result<u16, MeshError> {
+        self.slot_ports_by_component
+            .get(&component)
+            .and_then(|ports| ports.get(slot))
+            .copied()
+            .ok_or_else(|| {
+                MeshError::new(format!(
+                    "internal error: missing local port allocation for {}.{}",
+                    component_label(self.scenario, component),
+                    slot
+                ))
+            })
+    }
+
+    fn unsupported_framework_error(&self, capability: &str) -> MeshError {
+        MeshError::new(format!(
+            "{} does not support framework capability `framework.{capability}`",
+            self.options.backend_label
+        ))
+    }
 }
 
 pub(crate) trait Addressing {
-    type Extra;
     type Error: From<MeshError>;
 
     fn resolve_binding_url(&mut self, binding: &ResolvedBinding) -> Result<String, Self::Error>;
     fn resolve_external_binding_url(
         &mut self,
         binding: &ResolvedExternalBinding,
-        router_port: u16,
     ) -> Result<String, Self::Error>;
     fn resolve_framework_binding_url(
         &mut self,
         binding: &ResolvedFrameworkBinding,
     ) -> Result<String, Self::Error>;
-    fn resolve_export_target_url(&mut self, export: &ResolvedExport)
-    -> Result<String, Self::Error>;
-    fn finalize(self) -> Self::Extra;
+}
+
+impl Addressing for LocalAddressing<'_> {
+    type Error = MeshError;
+
+    fn resolve_binding_url(&mut self, binding: &ResolvedBinding) -> Result<String, Self::Error> {
+        let local_port = self.local_slot_port(binding.consumer, &binding.slot)?;
+        let scheme = match binding.endpoint.protocol {
+            NetworkProtocol::Tcp => "tcp",
+            _ => "http",
+        };
+        Ok(format!("{scheme}://127.0.0.1:{local_port}"))
+    }
+
+    fn resolve_external_binding_url(
+        &mut self,
+        binding: &ResolvedExternalBinding,
+    ) -> Result<String, Self::Error> {
+        let local_port = self.local_slot_port(binding.consumer, &binding.slot)?;
+        Ok(format!("http://127.0.0.1:{local_port}"))
+    }
+
+    fn resolve_framework_binding_url(
+        &mut self,
+        binding: &ResolvedFrameworkBinding,
+    ) -> Result<String, Self::Error> {
+        if binding.capability.as_str() != "docker" {
+            return Err(self.unsupported_framework_error(binding.capability.as_str()));
+        }
+
+        match self.options.docker_binding {
+            DockerFrameworkBindingPolicy::LoopbackTcp => {
+                let local_port = self.local_slot_port(binding.consumer, &binding.slot)?;
+                Ok(format!("tcp://127.0.0.1:{local_port}"))
+            }
+            DockerFrameworkBindingPolicy::Unsupported { reason } => Err(MeshError::new(format!(
+                "{} {reason}",
+                self.options.backend_label
+            ))),
+        }
+    }
 }
 
 pub(crate) fn build_address_plan<A: Addressing>(
     mesh_plan: &MeshPlan,
-    root_slots: &BTreeMap<String, SlotDecl>,
-    router_ports: RouterPortBases,
     mut addressing: A,
-) -> Result<MeshAddressPlan<A::Extra>, A::Error> {
+) -> Result<MeshAddressPlan, A::Error> {
     let mut slot_values_by_component: HashMap<ComponentId, BTreeMap<String, SlotObject>> =
         HashMap::new();
     let mut binding_values_by_component: HashMap<ComponentId, BTreeMap<String, BindingObject>> =
@@ -114,147 +175,150 @@ pub(crate) fn build_address_plan<A: Addressing>(
         binding_values_by_component.insert(*id, BTreeMap::new());
     }
 
-    let mut allow = AllowPlan::default();
+    let mut insert_url =
+        |consumer: ComponentId, slot: &str, binding_name: Option<&str>, url: String| {
+            slot_values_by_component
+                .entry(consumer)
+                .or_default()
+                .insert(slot.to_string(), SlotObject { url: url.clone() });
+
+            if let Some(name) = binding_name {
+                binding_values_by_component
+                    .entry(consumer)
+                    .or_default()
+                    .insert(name.to_string(), BindingObject { url });
+            }
+        };
 
     for binding in &mesh_plan.bindings {
         let url = addressing.resolve_binding_url(binding)?;
-
-        slot_values_by_component
-            .entry(binding.consumer)
-            .or_default()
-            .insert(binding.slot.clone(), SlotObject { url: url.clone() });
-
-        if let Some(name) = binding.binding_name.as_ref() {
-            binding_values_by_component
-                .entry(binding.consumer)
-                .or_default()
-                .insert(name.clone(), BindingObject { url });
-        }
-
-        allow.allow(
-            WorkloadId::Component(binding.provider),
-            WorkloadId::Component(binding.consumer),
-            binding.endpoint.port,
+        insert_url(
+            binding.consumer,
+            &binding.slot,
+            binding.binding_name.as_deref(),
+            url,
         );
     }
 
-    let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
-
-    let external_slot_ports =
-        allocate_external_slot_ports(&mesh_plan.external_bindings, router_ports.external)
-            .map_err(MeshError::new)?;
-
     for binding in &mesh_plan.external_bindings {
-        let router_port = *external_slot_ports
-            .get(&binding.external_slot)
-            .expect("external slot port missing");
-        let url = addressing.resolve_external_binding_url(binding, router_port)?;
-
-        slot_values_by_component
-            .entry(binding.consumer)
-            .or_default()
-            .insert(binding.slot.clone(), SlotObject { url: url.clone() });
-
-        if let Some(name) = binding.binding_name.as_ref() {
-            binding_values_by_component
-                .entry(binding.consumer)
-                .or_default()
-                .insert(name.clone(), BindingObject { url });
-        }
-
-        allow.allow(
-            WorkloadId::Router,
-            WorkloadId::Component(binding.consumer),
-            router_port,
+        let url = addressing.resolve_external_binding_url(binding)?;
+        insert_url(
+            binding.consumer,
+            &binding.slot,
+            binding.binding_name.as_deref(),
+            url,
         );
     }
 
     for binding in &mesh_plan.framework_bindings {
         let url = addressing.resolve_framework_binding_url(binding)?;
-
-        slot_values_by_component
-            .entry(binding.consumer)
-            .or_default()
-            .insert(binding.slot.clone(), SlotObject { url: url.clone() });
-
-        if let Some(name) = binding.binding_name.as_ref() {
-            binding_values_by_component
-                .entry(binding.consumer)
-                .or_default()
-                .insert(name.clone(), BindingObject { url });
-        }
+        insert_url(
+            binding.consumer,
+            &binding.slot,
+            binding.binding_name.as_deref(),
+            url,
+        );
     }
-
-    let mut export_ports_by_name: BTreeMap<String, u16> = BTreeMap::new();
-    let mut export_ports: BTreeSet<u16> = BTreeSet::new();
-
-    if !mesh_plan.exports.is_empty() {
-        let mut next_port = router_ports.export;
-        for ex in &mesh_plan.exports {
-            let listen_port = next_port;
-            next_port = next_port
-                .checked_add(1)
-                .ok_or_else(|| MeshError::new("ran out of router export ports".to_string()))?;
-            export_ports_by_name.insert(ex.name.clone(), listen_port);
-            export_ports.insert(listen_port);
-        }
-    }
-
-    let mut router_external_slots: Vec<RouterExternalSlot> = Vec::new();
-    let mut router_exports: Vec<RouterExport> = Vec::new();
-    let mut router_env_passthrough: Vec<String> = Vec::new();
-    let mut router_config_b64: Option<String> = None;
-
-    if needs_router {
-        router_external_slots = build_router_external_slots(root_slots, &external_slot_ports)
-            .map_err(MeshError::new)?;
-        router_env_passthrough = router_external_slots
-            .iter()
-            .map(|slot| slot.url_env.clone())
-            .collect();
-
-        for ex in &mesh_plan.exports {
-            let listen_port = *export_ports_by_name
-                .get(&ex.name)
-                .expect("missing router port for export");
-            let target_url = addressing.resolve_export_target_url(ex)?;
-            router_exports.push(RouterExport {
-                name: ex.name.clone(),
-                listen_port,
-                target_url,
-            });
-
-            allow.allow(
-                WorkloadId::Component(ex.provider),
-                WorkloadId::Router,
-                ex.endpoint.port,
-            );
-        }
-
-        let router_config = RouterConfig {
-            external_slots: router_external_slots.clone(),
-            exports: router_exports.clone(),
-        };
-        let b64 = encode_router_config_b64(&router_config)
-            .map_err(|err| MeshError::new(format!("failed to serialize router config: {err}")))?;
-        router_config_b64 = Some(b64);
-    }
-
-    let router = RouterPlan {
-        needs_router,
-        export_ports_by_name,
-        export_ports,
-        router_external_slots,
-        router_exports,
-        router_env_passthrough,
-        router_config_b64,
-    };
 
     Ok(MeshAddressPlan {
         slot_values_by_component,
         binding_values_by_component,
-        allow,
-        router,
-        extra: addressing.finalize(),
     })
+}
+
+pub(crate) type ComponentEgressAllow = HashMap<ComponentId, BTreeMap<ComponentId, BTreeSet<u16>>>;
+pub(crate) type RouterEgressAllow = HashMap<ComponentId, BTreeSet<u16>>;
+
+pub(crate) fn build_component_egress_allow(
+    allow_plan: &AllowPlan,
+) -> (ComponentEgressAllow, RouterEgressAllow) {
+    let mut egress_allow: ComponentEgressAllow = HashMap::new();
+    let mut egress_router_allow: RouterEgressAllow = HashMap::new();
+
+    for (provider, by_port) in &allow_plan.by_provider {
+        match provider {
+            WorkloadId::Component(provider_id) => {
+                for (port, consumers) in by_port {
+                    for consumer in consumers {
+                        if let WorkloadId::Component(consumer_id) = consumer {
+                            egress_allow
+                                .entry(*consumer_id)
+                                .or_default()
+                                .entry(*provider_id)
+                                .or_default()
+                                .insert(*port);
+                        }
+                    }
+                }
+            }
+            WorkloadId::Router => {
+                for (port, consumers) in by_port {
+                    for consumer in consumers {
+                        if let WorkloadId::Component(consumer_id) = consumer {
+                            egress_router_allow
+                                .entry(*consumer_id)
+                                .or_default()
+                                .insert(*port);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (egress_allow, egress_router_allow)
+}
+
+pub(crate) fn build_allow_plan(
+    mesh_plan: &MeshPlan,
+    mesh_ports_by_component: &HashMap<ComponentId, u16>,
+    router_mesh_port: Option<u16>,
+) -> Result<AllowPlan, MeshError> {
+    let mut allow = AllowPlan::default();
+
+    for binding in &mesh_plan.bindings {
+        let port = *mesh_ports_by_component
+            .get(&binding.provider)
+            .ok_or_else(|| {
+                MeshError::new(format!(
+                    "mesh port missing for provider {}",
+                    binding.provider.0
+                ))
+            })?;
+        allow.allow(
+            WorkloadId::Component(binding.provider),
+            WorkloadId::Component(binding.consumer),
+            port,
+        );
+    }
+
+    if !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty() {
+        let router_port =
+            router_mesh_port.ok_or_else(|| MeshError::new("router mesh port missing"))?;
+        for binding in &mesh_plan.external_bindings {
+            allow.allow(
+                WorkloadId::Router,
+                WorkloadId::Component(binding.consumer),
+                router_port,
+            );
+        }
+        for export in &mesh_plan.exports {
+            let provider_port =
+                *mesh_ports_by_component
+                    .get(&export.provider)
+                    .ok_or_else(|| {
+                        MeshError::new(format!(
+                            "mesh port missing for export provider {}",
+                            export.provider.0
+                        ))
+                    })?;
+            allow.allow(
+                WorkloadId::Component(export.provider),
+                WorkloadId::Router,
+                provider_port,
+            );
+        }
+    }
+
+    Ok(allow)
 }

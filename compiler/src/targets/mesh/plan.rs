@@ -1,12 +1,15 @@
 use std::{
     collections::{BTreeSet, HashMap},
     fmt,
+    sync::Arc,
 };
 
 use amber_manifest::{
-    CapabilityDecl, FrameworkBindingShape, FrameworkCapabilityName, framework_capability,
+    FrameworkBindingShape, FrameworkCapabilityName, Manifest, NetworkProtocol, framework_capability,
 };
 use amber_scenario::{BindingFrom, ComponentId, Scenario};
+
+use crate::DigestStore;
 
 #[derive(Clone, Debug)]
 pub(crate) struct MeshOptions {
@@ -15,6 +18,7 @@ pub(crate) struct MeshOptions {
 
 #[derive(Clone, Debug)]
 pub(crate) struct MeshPlan {
+    pub(crate) root_manifest: Arc<Manifest>,
     pub(crate) program_components: Vec<ComponentId>,
     pub(crate) bindings: Vec<ResolvedBinding>,
     pub(crate) external_bindings: Vec<ResolvedExternalBinding>,
@@ -39,7 +43,6 @@ pub(crate) struct ResolvedExport {
     pub(crate) provider: ComponentId,
     pub(crate) provide: String,
     pub(crate) endpoint: EndpointInfo,
-    pub(crate) capability: CapabilityDecl,
 }
 
 #[derive(Clone, Debug)]
@@ -60,8 +63,8 @@ pub(crate) struct ResolvedFrameworkBinding {
 
 #[derive(Clone, Debug)]
 pub(crate) struct EndpointInfo {
-    pub(crate) name: String,
     pub(crate) port: u16,
+    pub(crate) protocol: NetworkProtocol,
 }
 
 #[derive(Debug)]
@@ -93,8 +96,17 @@ impl From<String> for MeshError {
 
 pub(crate) fn build_mesh_plan(
     scenario: &Scenario,
+    store: &DigestStore,
     options: MeshOptions,
 ) -> Result<MeshPlan, MeshError> {
+    let root_component = scenario.component(scenario.root);
+    let root_manifest = store.get(&root_component.digest).ok_or_else(|| {
+        MeshError::new(format!(
+            "internal error: missing manifest content for {} (digest {})",
+            component_label(scenario, scenario.root),
+            root_component.digest
+        ))
+    })?;
     let program_components: Vec<ComponentId> = scenario
         .components_iter()
         .filter_map(|(id, c)| c.program.as_ref().map(|_| id))
@@ -208,11 +220,11 @@ pub(crate) fn build_mesh_plan(
             provider: ex.from.component,
             provide: ex.from.name.clone(),
             endpoint,
-            capability: ex.capability.clone(),
         });
     }
 
     Ok(MeshPlan {
+        root_manifest,
         program_components,
         bindings,
         external_bindings,
@@ -225,6 +237,24 @@ pub(crate) fn build_mesh_plan(
 pub(crate) fn component_label(scenario: &Scenario, id: ComponentId) -> String {
     scenario.component(id).moniker.as_str().to_string()
 }
+
+pub(crate) fn map_program_components<T>(
+    scenario: &Scenario,
+    program_components: &[ComponentId],
+    mut map: impl FnMut(ComponentId, &str) -> T,
+) -> HashMap<ComponentId, T> {
+    let mut out = HashMap::with_capacity(program_components.len());
+    for id in program_components {
+        let local_name = scenario
+            .component(*id)
+            .moniker
+            .local_name()
+            .unwrap_or("component");
+        out.insert(*id, map(*id, local_name));
+    }
+    out
+}
+
 fn resolve_provide_endpoint(
     scenario: &Scenario,
     component_id: ComponentId,
@@ -278,7 +308,7 @@ fn resolve_provide_endpoint(
         })?;
 
     Ok(EndpointInfo {
-        name: endpoint.name.clone(),
         port: endpoint.port,
+        protocol: endpoint.protocol,
     })
 }
