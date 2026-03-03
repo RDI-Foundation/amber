@@ -5,7 +5,11 @@ edition = "2024"
 publish = false
 
 [dependencies]
+semver = "1.0.27"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 
 [build-dependencies]
+semver = "1.0.27"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

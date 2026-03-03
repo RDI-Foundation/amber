@@ -8,6 +8,9 @@ use std::{
 
 use serde::Deserialize;
 
+#[path = "src/versioning.rs"]
+mod versioning;
+
 #[derive(Debug, Deserialize)]
 struct Manifest {
     registry: String,
@@ -18,7 +21,7 @@ struct Manifest {
 struct ImageSpec {
     name: String,
     #[serde(default)]
-    code_tag: Option<String>,
+    version: Option<String>,
 }
 
 fn main() {
@@ -35,12 +38,17 @@ fn main() {
     let mut code_images = Vec::new();
 
     for image in manifest.images {
-        let Some(tag) = image.code_tag else {
+        let Some(version) = image.version else {
             continue;
         };
-        if tag.trim().is_empty() {
-            panic!("image {} has an empty code_tag", image.name);
-        }
+        let version = version.trim();
+        let parsed = versioning::parse_manifest_version(version).unwrap_or_else(|reason| {
+            panic!(
+                "image {} has invalid version {}: {reason}",
+                image.name, version
+            )
+        });
+        let tag = versioning::runtime_tag(&parsed);
         let const_name = const_name(&image.name);
         if const_name.is_empty() {
             panic!("image {} produced an empty constant name", image.name);
