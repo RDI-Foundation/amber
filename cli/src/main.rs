@@ -1678,7 +1678,6 @@ fn write_kubernetes_output(
     root: &Path,
     artifact: &amber_compiler::reporter::kubernetes::KubernetesArtifact,
 ) -> Result<()> {
-    // Clean and recreate the output directory.
     if root.exists() {
         if root.is_dir() {
             std::fs::remove_dir_all(root)
@@ -1706,7 +1705,6 @@ fn write_kubernetes_output(
             )
         })?;
 
-    // Write each file.
     for (rel_path, content) in &artifact.files {
         let full_path = root.join(rel_path);
         if let Some(parent) = full_path.parent() {
