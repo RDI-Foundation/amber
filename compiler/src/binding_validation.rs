@@ -11,6 +11,7 @@ use amber_manifest::{
     InterpolatedString, InterpolationSource, Manifest, ManifestSpans, MountSource,
     framework_capability, span_for_json_pointer,
 };
+use jsonptr::PointerBuf;
 use miette::{Diagnostic, NamedSource, Report, SourceSpan};
 use serde_json::Value;
 use thiserror::Error;
@@ -433,9 +434,7 @@ fn validate_manifest_config_binding_interpolations(
             continue;
         };
 
-        let mut pointer = "/components/".to_string();
-        push_json_pointer_segment(&mut pointer, child_name.as_str());
-        pointer.push_str("/config");
+        let pointer = PointerBuf::from_tokens(["components", child_name.as_str(), "config"]);
 
         let location = format!("components.{child_name}.config");
         let config_span = manifest_ctx
@@ -470,7 +469,7 @@ fn validate_manifest_config_binding_interpolations(
 fn validate_config_value(
     value: &Value,
     ctx: &ConfigBindingValidationContext<'_>,
-    pointer: &str,
+    pointer: &PointerBuf,
     location: &str,
     config_path: &str,
     diagnostics: &mut Vec<Report>,
@@ -481,7 +480,8 @@ fn validate_config_value(
             let Ok(parsed) = s.parse::<InterpolatedString>() else {
                 return;
             };
-            let span = span_for_json_pointer(ctx.source.as_ref(), ctx.root_span, pointer)
+            let pointer = pointer.to_string();
+            let span = span_for_json_pointer(ctx.source.as_ref(), ctx.root_span, &pointer)
                 .or(ctx.config_span)
                 .unwrap_or_else(|| (0usize, 0usize).into());
             validate_interpolated_config_string(
@@ -496,9 +496,8 @@ fn validate_config_value(
         }
         Value::Array(values) => {
             for (idx, value) in values.iter().enumerate() {
-                let mut next_pointer = pointer.to_string();
-                next_pointer.push('/');
-                next_pointer.push_str(&idx.to_string());
+                let mut next_pointer = pointer.clone();
+                next_pointer.push_back(idx.to_string());
                 let next_location = format!("{location}[{idx}]");
                 validate_config_value(
                     value,
@@ -513,9 +512,8 @@ fn validate_config_value(
         }
         Value::Object(map) => {
             for (key, value) in map {
-                let mut next_pointer = pointer.to_string();
-                next_pointer.push('/');
-                push_json_pointer_segment(&mut next_pointer, key);
+                let mut next_pointer = pointer.clone();
+                next_pointer.push_back(key.as_str());
                 let next_location = format!("{location}.{key}");
                 let next_path = if config_path.is_empty() {
                     key.clone()
@@ -656,8 +654,7 @@ impl ProgramLocation<'_> {
                     .unwrap_or_else(|| (0usize, 0usize).into())
             }
             ProgramLocation::Env(key) => {
-                let mut pointer = "/program/env/".to_string();
-                push_json_pointer_segment(&mut pointer, key);
+                let pointer = PointerBuf::from_tokens(["program", "env", key]).to_string();
                 if let Some(span) = span_for_json_pointer(source, root, &pointer) {
                     return span;
                 }
@@ -850,36 +847,26 @@ fn config_schema_property_span(
     let segments = config_path.split('.').collect::<Vec<_>>();
     let (last, parents) = segments.split_last()?;
 
-    let mut parent_properties_pointer = "/config_schema/properties".to_string();
+    let mut parent_properties_pointer = PointerBuf::from_tokens(["config_schema", "properties"]);
     for segment in parents {
-        parent_properties_pointer.push('/');
-        push_json_pointer_segment(&mut parent_properties_pointer, segment);
-        parent_properties_pointer.push_str("/properties");
+        parent_properties_pointer.push_back(*segment);
+        parent_properties_pointer.push_back("properties");
     }
+    let parent_properties_pointer_str = parent_properties_pointer.to_string();
 
     let parent_properties_span =
-        span_for_json_pointer(label.source.as_ref(), root, &parent_properties_pointer)?;
+        span_for_json_pointer(label.source.as_ref(), root, &parent_properties_pointer_str)?;
 
     let key_span = span_for_object_key(label.source.as_ref(), parent_properties_span, last)?;
 
     let mut value_pointer = parent_properties_pointer;
-    value_pointer.push('/');
-    push_json_pointer_segment(&mut value_pointer, last);
+    value_pointer.push_back(*last);
+    let value_pointer = value_pointer.to_string();
     let value_span = span_for_json_pointer(label.source.as_ref(), root, &value_pointer)?;
 
     let start = key_span.offset();
     let end = value_span.offset().saturating_add(value_span.len());
     Some((start, end.saturating_sub(start)).into())
-}
-
-fn push_json_pointer_segment(out: &mut String, segment: &str) {
-    for ch in segment.chars() {
-        match ch {
-            '~' => out.push_str("~0"),
-            '/' => out.push_str("~1"),
-            other => out.push(other),
-        }
-    }
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ use amber_manifest::{
     InterpolatedPart, InterpolatedString, InterpolationSource, Manifest, ManifestSpans, SlotDecl,
     SlotName, span_for_json_pointer,
 };
+use jsonptr::PointerBuf;
 use miette::{Diagnostic, NamedSource, Report, SourceSpan};
 use thiserror::Error;
 
@@ -152,8 +153,7 @@ impl SlotLocation<'_> {
                     .unwrap_or_else(|| (0usize, 0usize).into())
             }
             SlotLocation::Env(key) => {
-                let mut pointer = "/program/env/".to_string();
-                push_json_pointer_segment(&mut pointer, key);
+                let pointer = PointerBuf::from_tokens(["program", "env", key]).to_string();
                 if let Some(span) = span_for_json_pointer(source, root, &pointer) {
                     return span;
                 }
@@ -255,14 +255,4 @@ fn unknown_slot_help(component_path: &str, slots: &BTreeMap<SlotName, SlotDecl>)
         "Valid slots on component {component_path}: {}",
         names.into_iter().take(20).collect::<Vec<_>>().join(", ")
     )
-}
-
-fn push_json_pointer_segment(out: &mut String, segment: &str) {
-    for ch in segment.chars() {
-        match ch {
-            '~' => out.push_str("~0"),
-            '/' => out.push_str("~1"),
-            other => out.push(other),
-        }
-    }
 }

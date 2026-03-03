@@ -2234,9 +2234,8 @@ mod tests {
             .path_and_query
             .split_once('?')
             .expect("request should include query");
-        let query_map: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
-            .into_owned()
-            .collect();
+        let query_map: HashMap<String, String> =
+            serde_urlencoded::from_str(query).expect("query should decode");
         let filters = query_map.get("filters").expect("filters query param");
         serde_json::from_str(filters).expect("filters should be valid json")
     }
@@ -2570,9 +2569,8 @@ mod tests {
         let required = vec!["c=d".to_string()];
         let out = add_label_filters_to_uri(&uri, &required).expect("filters");
         let query = out.query().expect("query");
-        let parsed_query: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
-            .into_owned()
-            .collect();
+        let parsed_query: HashMap<String, String> =
+            serde_urlencoded::from_str(query).expect("query should decode");
         let filters = parsed_query.get("filters").expect("filters");
         let parsed_filters: serde_json::Value = serde_json::from_str(filters).expect("json");
         let labels = parsed_filters
@@ -2598,9 +2596,8 @@ mod tests {
         let required = vec!["amber.component=/green".to_string()];
         let out = add_label_filters_to_uri(&uri, &required).expect("filters");
         let query = out.query().expect("query");
-        let parsed_query: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
-            .into_owned()
-            .collect();
+        let parsed_query: HashMap<String, String> =
+            serde_urlencoded::from_str(query).expect("query should decode");
         let filters = parsed_query.get("filters").expect("filters");
         let parsed_filters: serde_json::Value = serde_json::from_str(filters).expect("json");
 
@@ -2644,9 +2641,8 @@ mod tests {
 
         let out = add_label_filters_to_uri(&uri, &required).expect("filters");
         let query = out.query().expect("query");
-        let parsed_query: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
-            .into_owned()
-            .collect();
+        let parsed_query: HashMap<String, String> =
+            serde_urlencoded::from_str(query).expect("query should decode");
         let filters = parsed_query.get("filters").expect("filters");
         let parsed_filters: serde_json::Value = serde_json::from_str(filters).expect("json");
         let labels = parsed_filters
