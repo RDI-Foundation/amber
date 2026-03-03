@@ -330,7 +330,7 @@ async fn run_mesh_listener(
             )
             .await
             {
-                eprintln!("mesh connection failed: {err}");
+                tracing::warn!("mesh connection failed: {err}");
             }
         });
     }
@@ -508,7 +508,7 @@ async fn run_outbound_listener(
         let trust = trust.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_outbound(stream, route, config, trust).await {
-                eprintln!("outbound connection failed: {err}");
+                tracing::warn!("outbound connection failed: {err}");
             }
         });
     }
@@ -562,7 +562,7 @@ async fn run_control_server(
                 .as_ref()
                 .is_none_or(|allow| allow.contains(&peer.ip()));
             if let Err(err) = serve_control_connection(stream, state, allowed).await {
-                eprintln!("control connection failed: {err}");
+                tracing::warn!("control connection failed: {err}");
             }
         });
     }
@@ -614,7 +614,7 @@ async fn run_control_server_unix(
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(err) = serve_control_connection(stream, state, true).await {
-                eprintln!("control unix connection failed: {err}");
+                tracing::warn!("control unix connection failed: {err}");
             }
         });
     }
@@ -1375,7 +1375,7 @@ async fn proxy_http_request(state: HttpProxyState, req: Request<Incoming>) -> Re
     let response = match state.client.request(proxied).await {
         Ok(resp) => resp,
         Err(err) => {
-            eprintln!("router request failed: {err}");
+            tracing::warn!("router request failed: {err}");
             return error_response(StatusCode::BAD_GATEWAY, "upstream request failed");
         }
     };

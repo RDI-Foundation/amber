@@ -19,9 +19,9 @@ miette = { workspace = true, features = ["fancy"] }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tracing = "0.1.44"
+tracing = { workspace = true }
 tracing-error = "0.2.1"
-tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+tracing-subscriber = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]

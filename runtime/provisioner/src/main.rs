@@ -13,6 +13,7 @@ use base64::Engine as _;
 use reqwest::{Certificate, Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Error)]
 enum ProvisionerError {
@@ -37,10 +38,21 @@ type Result<T> = std::result::Result<T, ProvisionerError>;
 
 #[tokio::main]
 async fn main() {
+    init_tracing();
+
     if let Err(err) = run().await {
-        eprintln!("amber provisioner failed: {err}");
+        tracing::error!("amber provisioner failed: {err}");
         std::process::exit(1);
     }
+}
+
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .without_time()
+        .init();
 }
 
 async fn run() -> Result<()> {

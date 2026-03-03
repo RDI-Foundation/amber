@@ -18,6 +18,8 @@ serde_urlencoded = "0.7.1"
 serde_with = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]

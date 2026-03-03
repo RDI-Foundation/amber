@@ -494,7 +494,7 @@ async fn proxy(args: ProxyArgs) -> Result<()> {
                     println!("registered slot {slot} via router control ({control_endpoint})");
                 }
                 Err(ControlUpdateError::Retryable) => {
-                    eprintln!("waiting for router control at {control_endpoint}...");
+                    tracing::warn!("waiting for router control at {control_endpoint}...");
                     let control_endpoint = control_endpoint.clone();
                     let slot = slot.to_string();
                     let mesh_url = mesh_url.clone();
@@ -505,7 +505,7 @@ async fn proxy(args: ProxyArgs) -> Result<()> {
                     });
                 }
                 Err(ControlUpdateError::Fatal(err)) => {
-                    eprintln!(
+                    tracing::error!(
                         "failed to register slot via router control ({}): {err}\nfallback: set \
                          {env_var}={mesh_url} before starting the scenario",
                         control_endpoint
@@ -557,7 +557,7 @@ async fn resolve_router_identity(
                     ));
                 }
                 if !warned {
-                    eprintln!("waiting for router control at {control_endpoint}...");
+                    tracing::warn!("waiting for router control at {control_endpoint}...");
                     warned = true;
                 }
                 sleep(CONTROL_UPDATE_RETRY_INTERVAL).await;
@@ -985,7 +985,7 @@ async fn register_control_with_retry(
                 sleep(CONTROL_UPDATE_RETRY_INTERVAL).await;
             }
             Err(ControlUpdateError::Fatal(err)) => {
-                eprintln!(
+                tracing::error!(
                     "failed to register slot via router control ({}): {err}\nfallback: set \
                      {env_var}={url} before starting the scenario",
                     endpoint
@@ -1014,7 +1014,7 @@ async fn register_export_with_retry(
                     return Err(ExportRegistrationError::Timeout(timeout));
                 }
                 if !warned {
-                    eprintln!("waiting for router control at {endpoint}...");
+                    tracing::warn!("waiting for router control at {endpoint}...");
                     warned = true;
                 }
                 sleep(CONTROL_UPDATE_RETRY_INTERVAL).await;
