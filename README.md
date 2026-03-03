@@ -124,6 +124,19 @@ per component. In that case, the compose output will reference
 
 If you're working in this repo, the internal image list and tags live in
 `docker/images.json`; CI publishes and verifies those tags on `main`.
+Image publishing is fully manifest-driven. Git tags are not used to publish images.
+
+Tag behavior is defined per image in `docker/images.json`:
+
+- `version`: current immutable semver release tag for that image
+  (for example `v1.2.3` or `v1.2.3-alpha.1`). CI creates this tag once if it does not exist.
+  Amber-generated configs and tests use a semver-derived runtime compatibility tag.
+
+Every push to `main` publishes `:main` and `:<git-sha>` for each image, creates any missing
+`version`, and derives floating semver tags from `version`.
+- Stable example: `v1.2.3` also updates `v1.2` and `v1`.
+- Prerelease example: `v1.2.3-alpha.1` also updates `v1.2-alpha.1`, `v1-alpha.1`, and `v1-alpha`.
+- Runtime tag example: `version: v1.2.3` bakes `v1`; `version: v1.2.3-alpha.1` bakes `v1-alpha`.
 
 ## Common workflows
 

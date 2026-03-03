@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - main
-    tags:
-      - "v*"
 
 jobs:
   image-matrix:
@@ -57,6 +55,7 @@ jobs:
             echo "docker/images.json registry is missing" >&2
             exit 1
           fi
+          image_registry="${image_registry%/}"
           echo "image_registry=${image_registry}" >> "$GITHUB_OUTPUT"
           echo "IMAGE_REGISTRY=${image_registry}" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@v3
@@ -65,21 +64,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Configure tags
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ steps.registry.outputs.image_registry }}/${{ matrix.image }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=semver,pattern=v{{version}}
-            type=semver,pattern=v{{major}}.{{minor}}
-            type=semver,pattern=v{{major}}
-            type=raw,value=${{ github.sha }}
-          flavor: |
-            suffix=-${{ matrix.arch }}
-            onlatest=true
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
@@ -89,12 +73,11 @@ jobs:
             BUILD_MODE=release
           platforms: linux/${{ matrix.arch }}
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: |
-            type=gha,scope=refs/heads/main-${{ matrix.image }}-${{ matrix.arch }}
-            type=gha,scope=${{ github.ref }}-${{ matrix.image }}-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ github.ref }}-${{ matrix.image }}-${{ matrix.arch }}
+          tags: |
+            ${{ steps.registry.outputs.image_registry }}/${{ matrix.image }}:main-${{ matrix.arch }}
+            ${{ steps.registry.outputs.image_registry }}/${{ matrix.image }}:${{ github.sha }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=refs/heads/main-${{ matrix.image }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=refs/heads/main-${{ matrix.image }}-${{ matrix.arch }}
 
   merge-manifests:
     name: Create Multi-Arch Manifests
@@ -105,6 +88,7 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
       - name: Read image registry
         id: registry
         shell: bash
@@ -115,6 +99,7 @@ jobs:
             echo "docker/images.json registry is missing" >&2
             exit 1
           fi
+          image_registry="${image_registry%/}"
           echo "image_registry=${image_registry}" >> "$GITHUB_OUTPUT"
           echo "IMAGE_REGISTRY=${image_registry}" >> "$GITHUB_ENV"
       - name: List images
@@ -134,53 +119,93 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Configure tags
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ steps.images.outputs.images }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=semver,pattern=v{{version}}
-            type=semver,pattern=v{{major}}.{{minor}}
-            type=semver,pattern=v{{major}}
-            type=raw,value=${{ github.sha }}
-      - name: Publish multi-arch manifests
+      - name: Compute semver tag metadata
+        id: version_tags
+        shell: bash
         run: |
           set -euo pipefail
-          tags="${{ steps.meta.outputs.tags }}"
-          while read -r tag; do
-            [ -z "$tag" ] && continue
-            docker buildx imagetools create -t "$tag" "${tag}-amd64" "${tag}-arm64"
-          done <<< "$tags"
-      - name: Publish floating tags
-        if: github.ref == 'refs/heads/main'
+          json="$(cargo run -q -p amber-images --bin version_tags -- docker/images.json)"
+          {
+            echo "json<<EOF"
+            echo "$json"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Publish base multi-arch tags (main + sha)
+        shell: bash
         run: |
           set -euo pipefail
-          floating=$(jq -c '.images[] | {name, tags: ([.code_tag] + (.floating_tags // [])) | map(select(. != null)) | unique} | select(.tags | length > 0)' docker/images.json)
+          images="${{ steps.images.outputs.images }}"
+          while IFS= read -r image; do
+            [ -z "$image" ] && continue
+            docker buildx imagetools create \
+              -t "${image}:main" \
+              "${image}:main-amd64" \
+              "${image}:main-arm64"
+            docker buildx imagetools create \
+              -t "${image}:${GITHUB_SHA}" \
+              "${image}:${GITHUB_SHA}-amd64" \
+              "${image}:${GITHUB_SHA}-arm64"
+          done <<< "$images"
+      - name: Publish release versions and semver channels
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest_signature() {
+            local ref="$1"
+            docker buildx imagetools inspect --raw "$ref" | jq -cS '
+              if has("manifests") then
+                .manifests |= sort_by(
+                  .platform.os // "",
+                  .platform.architecture // "",
+                  .platform.variant // "",
+                  .digest
+                )
+              else
+                .
+              end
+            '
+          }
+
+          version_tags_json='${{ steps.version_tags.outputs.json }}'
           while IFS= read -r entry; do
-            name=$(jq -r '.name' <<< "$entry")
-            for tag in $(jq -r '.tags[]' <<< "$entry"); do
-              if [ "$tag" = "main" ]; then
-                continue
+            [ -z "$entry" ] && continue
+            name="$(jq -r '.name' <<< "$entry")"
+            version="$(jq -r '.version' <<< "$entry")"
+            release_ref="${IMAGE_REGISTRY}/${name}:${version}"
+            sha_ref="${IMAGE_REGISTRY}/${name}:${GITHUB_SHA}"
+
+            if docker buildx imagetools inspect "$release_ref" >/dev/null 2>&1; then
+              release_sig="$(manifest_signature "$release_ref")"
+              sha_sig="$(manifest_signature "$sha_ref")"
+              if [ "$release_sig" != "$sha_sig" ]; then
+                echo "::error::Release tag ${release_ref} already exists but does not match ${sha_ref}. Bump docker/images.json version for ${name} when image contents change."
+                exit 1
               fi
+              echo "release tag already exists and matches current sha: $release_ref"
+            else
+              docker buildx imagetools create \
+                -t "$release_ref" \
+                "$sha_ref"
+            fi
+
+            while IFS= read -r tag; do
+              [ -z "$tag" ] && continue
               docker buildx imagetools create \
                 -t "${IMAGE_REGISTRY}/${name}:${tag}" \
-                "${IMAGE_REGISTRY}/${name}:main"
-            done
-          done <<< "$floating"
+                "$release_ref"
+            done < <(jq -r '.floating_tags[]' <<< "$entry")
+          done < <(jq -c '.images[]' <<< "$version_tags_json")
 
   verify-image-tags:
     name: Verify Internal Image Tags
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
     needs: merge-manifests
     permissions:
       contents: read
       packages: read
     steps:
       - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
       - name: Read image registry
         id: registry
         shell: bash
@@ -191,7 +216,19 @@ jobs:
             echo "docker/images.json registry is missing" >&2
             exit 1
           fi
+          image_registry="${image_registry%/}"
           echo "IMAGE_REGISTRY=${image_registry}" >> "$GITHUB_ENV"
+      - name: Compute semver tag metadata
+        id: version_tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          json="$(cargo run -q -p amber-images --bin version_tags -- docker/images.json)"
+          {
+            echo "json<<EOF"
+            echo "$json"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -202,22 +239,38 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tags=$(jq -r '.images[] | .name as $name | ([.code_tag] + (.floating_tags // [])) | map(select(. != null)) | unique | .[] | "\($name):\(.)"' docker/images.json)
+          version_tags_json='${{ steps.version_tags.outputs.json }}'
+          expected_file="$(mktemp)"
+
+          while IFS= read -r entry; do
+            [ -z "$entry" ] && continue
+            name="$(jq -r '.name' <<< "$entry")"
+            version="$(jq -r '.version // ""' <<< "$entry")"
+            [ -z "$version" ] && continue
+
+            echo "${name}:${version}" >> "$expected_file"
+            while IFS= read -r tag; do
+              [ -z "$tag" ] && continue
+              echo "${name}:${tag}" >> "$expected_file"
+            done < <(jq -r '.floating_tags[]' <<< "$entry")
+          done < <(jq -c '.images[]' <<< "$version_tags_json")
+
           missing=0
-          while read -r spec; do
+          while IFS= read -r spec; do
             [ -z "$spec" ] && continue
             image="${IMAGE_REGISTRY}/${spec}"
             if ! docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
               echo "::error::Missing image tag ${image}"
               missing=1
             fi
-          done <<< "$tags"
+          done < <(sort -u "$expected_file")
+
+          rm -f "$expected_file"
           exit "$missing"
 
   docker-tests:
     name: Docker Smoke Tests (prebuilt images)
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
     needs: merge-manifests
     permissions:
       contents: read
@@ -247,20 +300,37 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute semver tag metadata
+        id: version_tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          json="$(cargo run -q -p amber-images --bin version_tags -- docker/images.json)"
+          {
+            echo "json<<EOF"
+            echo "$json"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
       - name: Pull and retag images for tests
         shell: bash
         run: |
           set -euo pipefail
-          jq -c '.images[] | select(.code_tag != null) | {name, code_tag}' docker/images.json | while read -r spec; do
+          version_tags_json='${{ steps.version_tags.outputs.json }}'
+          while IFS= read -r spec; do
+            [ -z "$spec" ] && continue
             name="$(jq -r '.name' <<< "$spec")"
-            code_tag="$(jq -r '.code_tag' <<< "$spec")"
+            version="$(jq -r '.version' <<< "$spec")"
+            runtime_tag="$(jq -r '.runtime_tag' <<< "$spec")"
             src="${IMAGE_REGISTRY}/${name}:${GITHUB_SHA}"
             docker pull "$src"
-            docker tag "$src" "${IMAGE_REGISTRY}/${name}:${code_tag}"
+            docker tag "$src" "${IMAGE_REGISTRY}/${name}:${version}"
+            if [ "$runtime_tag" != "$version" ]; then
+              docker tag "$src" "${IMAGE_REGISTRY}/${name}:${runtime_tag}"
+            fi
             if [ "$name" = "amber-helper" ]; then
               docker tag "$src" "amber-helper:e2e"
             fi
-          done
+          done < <(jq -c '.images[]' <<< "$version_tags_json")
       - name: Run docker compose smoke tests
         run: |
           cargo test -p amber-compiler --all-features docker_smoke_ocap_blocks_unbound_callers -- --ignored --test-threads=1
@@ -272,7 +342,6 @@ jobs:
   cli-artifacts:
     name: Build amber-cli artifacts (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
-    if: github.event_name == 'push'
     permissions:
       contents: read
     env:
@@ -318,37 +387,3 @@ jobs:
           name: amber-cli-${{ matrix.platform }}
           path: amber-cli-${{ matrix.platform }}.tar.gz
           if-no-files-found: error
-
-  github-release:
-    name: Publish GitHub Release
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [merge-manifests, cli-artifacts]
-    permissions:
-      contents: write
-    steps:
-      - name: Download amber-cli artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: amber-cli-*
-          merge-multiple: true
-          path: dist
-      - name: Generate artifact checksums
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd dist
-          sha256sum *.tar.gz | sort -k2 > SHA256SUMS
-      - name: Create or update release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          assets=(dist/*.tar.gz dist/SHA256SUMS)
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "${assets[@]}" --clobber
-          else
-            gh release create "$tag" "${assets[@]}" --title "$tag" --generate-notes --verify-tag
-          fi

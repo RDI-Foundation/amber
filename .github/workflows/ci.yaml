@@ -218,6 +218,17 @@ jobs:
           code_registry="${code_registry%/}"
           echo "CI_IMAGE_REGISTRY=${ci_registry}" >> "$GITHUB_ENV"
           echo "CODE_IMAGE_REGISTRY=${code_registry}" >> "$GITHUB_ENV"
+      - name: Compute semver tag metadata
+        id: version_tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          json="$(cargo run -q -p amber-images --bin version_tags -- docker/images.json)"
+          {
+            echo "json<<EOF"
+            echo "$json"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -227,16 +238,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          jq -c '.images[] | select(.code_tag != null) | {name, code_tag}' docker/images.json | while read -r spec; do
+          version_tags_json='${{ steps.version_tags.outputs.json }}'
+          while IFS= read -r spec; do
+            [ -z "$spec" ] && continue
             name="$(jq -r '.name' <<< "$spec")"
-            code_tag="$(jq -r '.code_tag' <<< "$spec")"
+            version="$(jq -r '.version' <<< "$spec")"
+            runtime_tag="$(jq -r '.runtime_tag' <<< "$spec")"
             src="${CI_IMAGE_REGISTRY}/${name}:${GITHUB_SHA}"
             docker pull "$src"
-            docker tag "$src" "${CODE_IMAGE_REGISTRY}/${name}:${code_tag}"
+            docker tag "$src" "${CODE_IMAGE_REGISTRY}/${name}:${version}"
+            if [ "$runtime_tag" != "$version" ]; then
+              docker tag "$src" "${CODE_IMAGE_REGISTRY}/${name}:${runtime_tag}"
+            fi
             if [ "$name" = "amber-helper" ]; then
               docker tag "$src" "amber-helper:e2e"
             fi
-          done
+          done < <(jq -c '.images[]' <<< "$version_tags_json")
       - name: Run docker compose smoke tests
         run: |
           cargo test -p amber-compiler --all-features docker_smoke_ocap_blocks_unbound_callers -- --ignored --test-threads=1
