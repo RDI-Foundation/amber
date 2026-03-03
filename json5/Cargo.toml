@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 json5 = "1.3.0"
+jsonptr = { workspace = true }
 miette = { workspace = true }
 pest = "2.8.4"
 pest_derive = "2.8.4"

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use jsonptr::PointerBuf;
 use serde_json::{Map, Value};
 
 use crate::{ConfigError, Result};
@@ -86,6 +87,12 @@ fn resolve_local_ref<'a>(root: &'a Value, reference: &str) -> Result<(&'a Value,
         )));
     };
     let pointer = format!("/{pointer}");
+    let pointer = PointerBuf::parse(pointer).map_err(|_| {
+        ConfigError::schema(format!(
+            "invalid $ref pointer {reference:?}: non-RFC6901 escape sequence"
+        ))
+    })?;
+    let pointer = pointer.to_string();
     let target = root
         .pointer(&pointer)
         .ok_or_else(|| ConfigError::schema(format!("unresolvable $ref pointer {reference:?}")))?;
@@ -409,13 +416,18 @@ fn schema_secret_flag(schema: &Value) -> bool {
         .unwrap_or(false)
 }
 
-fn push_pointer(base: &str, segment: &str) -> String {
-    let escaped = segment.replace('~', "~0").replace('/', "~1");
-    if base.is_empty() {
-        format!("/{escaped}")
+fn push_pointer(base: &str, segment: &str) -> Result<String> {
+    let mut pointer = if base.is_empty() {
+        PointerBuf::new()
     } else {
-        format!("{base}/{escaped}")
-    }
+        PointerBuf::parse(base.to_string()).map_err(|_| {
+            ConfigError::schema(format!(
+                "internal error: invalid schema pointer during leaf walk: {base:?}"
+            ))
+        })?
+    };
+    pointer.push_back(segment);
+    Ok(pointer.to_string())
 }
 
 #[derive(Clone, Debug)]
@@ -653,7 +665,7 @@ fn walk_leaf_paths<'a>(
                 format!("{prefix}.{k}")
             };
 
-            let pointer = push_pointer(&push_pointer(&cursor.pointer, "properties"), k.as_str());
+            let pointer = push_pointer(&push_pointer(&cursor.pointer, "properties")?, k.as_str())?;
 
             did_traverse = true;
             let _ = walk_leaf_paths(
@@ -672,7 +684,7 @@ fn walk_leaf_paths<'a>(
 
     if let Some(all_of) = cursor.schema.get("allOf").and_then(|v| v.as_array()) {
         for (idx, subschema) in all_of.iter().enumerate() {
-            let pointer = push_pointer(&push_pointer(&cursor.pointer, "allOf"), &idx.to_string());
+            let pointer = push_pointer(&push_pointer(&cursor.pointer, "allOf")?, &idx.to_string())?;
             did_traverse = true;
             let _ = walk_leaf_paths(
                 SchemaCursor {
@@ -737,22 +749,10 @@ fn ensure_leaf_schema_supported(schema: &Map<String, Value>) -> Result<()> {
 }
 
 pub fn canonical_json(v: &Value) -> Value {
-    match v {
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            let mut out = Map::new();
-            for k in keys {
-                out.insert(
-                    k.clone(),
-                    canonical_json(map.get(k.as_str()).expect("key exists")),
-                );
-            }
-            Value::Object(out)
-        }
-        Value::Array(arr) => Value::Array(arr.iter().map(canonical_json).collect()),
-        other => other.clone(),
-    }
+    let canonical_bytes =
+        serde_jcs::to_vec(v).expect("serializing config schema to canonical JSON should succeed");
+    serde_json::from_slice(&canonical_bytes)
+        .expect("canonical JSON bytes should deserialize back into JSON value")
 }
 
 // Produce a minimized schema that only includes explicitly allowed leaf paths.

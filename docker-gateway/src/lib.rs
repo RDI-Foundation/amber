@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     env,
-    hash::Hash,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
@@ -10,7 +9,6 @@ use std::{
 
 use base64::Engine as _;
 use bytes::Bytes;
-use dashmap::DashMap;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::{
     Method, Request, Response, StatusCode, Uri,
@@ -25,14 +23,15 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
 };
 use hyperlocal::{UnixConnector, Uri as HyperlocalUri};
-use serde::{Deserialize, Deserializer, de::DeserializeOwned};
+use moka::sync::Cache;
+use serde::{Deserialize, de::DeserializeOwned};
+use serde_with::{DefaultOnNull, serde_as};
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, UnixStream},
     sync::RwLock,
     time::{sleep, timeout},
 };
-use url::form_urlencoded;
 
 const CONFIG_B64_ENV: &str = "AMBER_DOCKER_GATEWAY_CONFIG_B64";
 const CONFIG_JSON_ENV: &str = "AMBER_DOCKER_GATEWAY_CONFIG_JSON";
@@ -43,6 +42,8 @@ const AMBER_COMPONENT_LABEL: &str = "amber.component";
 const AMBER_PROJECT_LABEL: &str = "amber.project";
 const CALLER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(8);
+const EXEC_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const EXEC_CACHE_MAX_ENTRIES: u64 = 8_192;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type ProxyBody = BoxBody<Bytes, BoxError>;
@@ -95,7 +96,7 @@ struct ConnState {
 struct State {
     cfg: Arc<DockerGatewayConfig>,
     client: Client<UnixConnector, ProxyBody>,
-    exec_map: DashMap<String, String>,
+    exec_map: Cache<String, String>,
     callers_by_ip: RwLock<HashMap<IpAddr, Vec<ResolvedCaller>>>,
 }
 
@@ -235,18 +236,23 @@ struct ContainerCreateRequest {
     networking_config: Option<NetworkingConfigRequest>,
 }
 
+#[serde_as]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct HostConfigRequest {
     #[serde(default)]
     network_mode: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
+    #[serde(default)]
+    #[serde_as(deserialize_as = "DefaultOnNull")]
     binds: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
+    #[serde(default)]
+    #[serde_as(deserialize_as = "DefaultOnNull")]
     mounts: Vec<MountRequest>,
-    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
+    #[serde(default)]
+    #[serde_as(deserialize_as = "DefaultOnNull")]
     volumes_from: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
+    #[serde(default)]
+    #[serde_as(deserialize_as = "DefaultOnNull")]
     links: Vec<String>,
     #[serde(default)]
     pid_mode: Option<String>,
@@ -263,28 +269,13 @@ struct MountRequest {
     source: Option<String>,
 }
 
+#[serde_as]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct NetworkingConfigRequest {
-    #[serde(default, deserialize_with = "deserialize_map_or_default")]
+    #[serde(default)]
+    #[serde_as(deserialize_as = "DefaultOnNull")]
     endpoints_config: HashMap<String, serde_json::Value>,
-}
-
-fn deserialize_vec_or_default<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
-}
-
-fn deserialize_map_or_default<'de, D, K, V>(deserializer: D) -> Result<HashMap<K, V>, D::Error>
-where
-    D: Deserializer<'de>,
-    K: Deserialize<'de> + Eq + Hash,
-    V: Deserialize<'de>,
-{
-    Ok(Option::<HashMap<K, V>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl DockerGatewayConfig {
@@ -352,7 +343,10 @@ impl State {
         Self {
             cfg: Arc::new(config),
             client,
-            exec_map: DashMap::new(),
+            exec_map: Cache::builder()
+                .time_to_live(EXEC_CACHE_TTL)
+                .max_capacity(EXEC_CACHE_MAX_ENTRIES)
+                .build(),
             callers_by_ip: RwLock::new(HashMap::new()),
         }
     }
@@ -893,12 +887,15 @@ fn build_label_filter_query(required_labels: &[String], include_all: bool) -> St
     });
     let encoded_filters = serde_json::to_string(&filters)
         .expect("serializing static label filter JSON should succeed");
-    let mut serializer = form_urlencoded::Serializer::new(String::new());
+
+    let mut query_pairs = Vec::new();
     if include_all {
-        serializer.append_pair("all", "1");
+        query_pairs.push(("all".to_string(), "1".to_string()));
     }
-    serializer.append_pair("filters", &encoded_filters);
-    serializer.finish()
+    query_pairs.push(("filters".to_string(), encoded_filters));
+
+    serde_urlencoded::to_string(query_pairs)
+        .expect("serializing static label query params should succeed")
 }
 
 async fn shutdown_signal() -> ShutdownReason {
@@ -1298,8 +1295,8 @@ async fn resolve_exec_container_id(
     version_prefix: &str,
     exec_id: &str,
 ) -> GatewayResult<String> {
-    if let Some(entry) = state.exec_map.get(exec_id) {
-        return Ok(entry.value().clone());
+    if let Some(container_id) = state.exec_map.get(exec_id) {
+        return Ok(container_id);
     }
 
     let path = with_version(version_prefix, &format!("/exec/{exec_id}/json"));
@@ -1497,14 +1494,15 @@ fn ensure_host(req: &mut Request<ProxyBody>) {
 
 fn add_label_filters_to_uri(uri: &Uri, required: &[String]) -> GatewayResult<Uri> {
     let path = uri.path().to_string();
-    let mut pairs: Vec<(String, String)> = uri
-        .query()
-        .map(|query| {
-            form_urlencoded::parse(query.as_bytes())
-                .into_owned()
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut pairs: Vec<(String, String)> = match uri.query() {
+        Some(query) => serde_urlencoded::from_str(query).map_err(|err| {
+            boxed_response(docker_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid query parameters: {err}"),
+            ))
+        })?,
+        None => Vec::new(),
+    };
 
     let mut filters = if let Some(idx) = pairs.iter().position(|(key, _)| key == "filters") {
         let raw = &pairs[idx].1;
@@ -1544,9 +1542,12 @@ fn add_label_filters_to_uri(uri: &Uri, required: &[String]) -> GatewayResult<Uri
         pairs.push(("filters".to_string(), new_filters));
     }
 
-    let new_query = form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(pairs)
-        .finish();
+    let new_query = serde_urlencoded::to_string(&pairs).map_err(|err| {
+        boxed_response(docker_error(
+            StatusCode::BAD_REQUEST,
+            format!("query parameter serialization error: {err}"),
+        ))
+    })?;
 
     let path_and_query = if new_query.is_empty() {
         path
@@ -2233,9 +2234,8 @@ mod tests {
             .path_and_query
             .split_once('?')
             .expect("request should include query");
-        let query_map: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
-            .into_owned()
-            .collect();
+        let query_map: HashMap<String, String> =
+            serde_urlencoded::from_str(query).expect("query should decode");
         let filters = query_map.get("filters").expect("filters query param");
         serde_json::from_str(filters).expect("filters should be valid json")
     }
@@ -2569,9 +2569,8 @@ mod tests {
         let required = vec!["c=d".to_string()];
         let out = add_label_filters_to_uri(&uri, &required).expect("filters");
         let query = out.query().expect("query");
-        let parsed_query: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
-            .into_owned()
-            .collect();
+        let parsed_query: HashMap<String, String> =
+            serde_urlencoded::from_str(query).expect("query should decode");
         let filters = parsed_query.get("filters").expect("filters");
         let parsed_filters: serde_json::Value = serde_json::from_str(filters).expect("json");
         let labels = parsed_filters
@@ -2597,9 +2596,8 @@ mod tests {
         let required = vec!["amber.component=/green".to_string()];
         let out = add_label_filters_to_uri(&uri, &required).expect("filters");
         let query = out.query().expect("query");
-        let parsed_query: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
-            .into_owned()
-            .collect();
+        let parsed_query: HashMap<String, String> =
+            serde_urlencoded::from_str(query).expect("query should decode");
         let filters = parsed_query.get("filters").expect("filters");
         let parsed_filters: serde_json::Value = serde_json::from_str(filters).expect("json");
 
@@ -2643,9 +2641,8 @@ mod tests {
 
         let out = add_label_filters_to_uri(&uri, &required).expect("filters");
         let query = out.query().expect("query");
-        let parsed_query: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
-            .into_owned()
-            .collect();
+        let parsed_query: HashMap<String, String> =
+            serde_urlencoded::from_str(query).expect("query should decode");
         let filters = parsed_query.get("filters").expect("filters");
         let parsed_filters: serde_json::Value = serde_json::from_str(filters).expect("json");
         let labels = parsed_filters
