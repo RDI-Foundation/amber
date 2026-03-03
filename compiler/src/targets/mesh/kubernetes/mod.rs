@@ -65,7 +65,6 @@ const COMPONENT_MESH_PORT_BASE: u16 = 23000;
 const ROUTER_MESH_PORT_BASE: u16 = 24000;
 const ROUTER_CONTROL_PORT_BASE: u16 = 24100;
 
-// Root config Secret/ConfigMap names.
 const ROOT_CONFIG_SECRET_NAME: &str = "amber-root-config-secret";
 const ROOT_CONFIG_CONFIGMAP_NAME: &str = "amber-root-config";
 
@@ -179,10 +178,8 @@ fn render_kubernetes(
     let images = resolve_internal_images().map_err(ReporterError::new)?;
 
     let program_components = mesh_plan.program_components.as_slice();
-    // Generate namespace name.
     let namespace = generate_namespace_name(s, &scenario_digest);
 
-    // Generate component names.
     let names: HashMap<ComponentId, ComponentNames> =
         map_program_components(s, program_components, |id, local_name| {
             let base = service_name(id, local_name);
@@ -282,7 +279,6 @@ fn render_kubernetes(
         &address_plan.binding_values_by_component,
     )
     .map_err(|e| ReporterError::new(e.to_string()))?;
-    // Standard labels for all resources.
     let scenario_labels = |extra: &[(&str, &str)]| -> BTreeMap<String, String> {
         let mut labels = BTreeMap::new();
         labels.insert(
@@ -319,7 +315,6 @@ fn render_kubernetes(
 
     let mut files: BTreeMap<PathBuf, String> = BTreeMap::new();
 
-    // Namespace
     let ns = Namespace::new(&namespace, scenario_labels(&[]));
     files.insert(PathBuf::from("00-namespace.yaml"), to_yaml(&ns)?);
 
@@ -365,7 +360,6 @@ fn render_kubernetes(
         let (secret_leaves, config_leaves): (Vec<_>, Vec<_>) =
             root_leaves.iter().partition(|l| l.secret);
 
-        // Add secretGenerator for secret config values.
         if !secret_leaves.is_empty() {
             kustomization.secret_generator.push(SecretGenerator {
                 name: ROOT_CONFIG_SECRET_NAME.to_string(),
@@ -377,7 +371,6 @@ fn render_kubernetes(
                 }),
             });
 
-            // Generate template .env file for secrets.
             let mut env_content = String::new();
             env_content.push_str("# Root config secrets - fill in values before deploying\n");
             for leaf in &secret_leaves {
@@ -388,7 +381,6 @@ fn render_kubernetes(
             files.insert(PathBuf::from("root-config-secret.env"), env_content);
         }
 
-        // Add configMapGenerator for non-secret config values.
         if !config_leaves.is_empty() {
             kustomization.config_map_generator.push(ConfigMapGenerator {
                 name: ROOT_CONFIG_CONFIGMAP_NAME.to_string(),
@@ -400,7 +392,6 @@ fn render_kubernetes(
                 }),
             });
 
-            // Generate template .env file for config.
             let mut env_content = String::new();
             env_content.push_str("# Root config values - fill in values before deploying\n");
             for leaf in &config_leaves {
@@ -473,7 +464,6 @@ fn render_kubernetes(
         .map_err(|e| ReporterError::new(e.to_string()))?;
         let needs_helper_for_component = runtime_plan.needs_helper;
 
-        // Container ports.
         let mut ports: Vec<ContainerPort> = Vec::new();
         if let Some(network) = &program.network {
             for ep in &network.endpoints {
@@ -485,7 +475,6 @@ fn render_kubernetes(
             }
         }
 
-        // Build container based on program mode.
         let (container, mut volumes) = match runtime_plan.execution {
             ComponentExecutionPlan::Direct { entrypoint, env } => {
                 // Direct mode: use resolved entrypoint and env directly.
@@ -610,10 +599,8 @@ fn render_kubernetes(
             });
         }
 
-        // Add init containers.
         let mut init_containers = Vec::new();
 
-        // For helper mode, add init container to install the helper binary.
         if needs_helper_for_component {
             init_containers.push(Container {
                 name: "install-helper".to_string(),
@@ -636,7 +623,6 @@ fn render_kubernetes(
             });
         }
 
-        // Add init container to wait for NetworkPolicy enforcement check.
         if !config.disable_networkpolicy_check {
             init_containers.push(Container {
                 name: "wait-for-netpol-check".to_string(),
@@ -835,7 +821,6 @@ fn render_kubernetes(
 
         let mut netpol = NetworkPolicy::new(&cnames.netpol, &namespace, labels, pod_selector);
 
-        // Add ingress rules for bound consumers + router exports.
         if let Some(allowed) = allow_plan.for_component(*id) {
             for (port, consumers) in allowed {
                 let from: Vec<NetworkPolicyPeer> = consumers
@@ -1032,7 +1017,6 @@ fn render_kubernetes(
         );
     }
 
-    // NetworkPolicy enforcement check (unless disabled).
     if !config.disable_networkpolicy_check {
         let enforcement_resources =
             generate_netpol_enforcement_check(&namespace, &scenario_labels(&[]));
@@ -1044,7 +1028,6 @@ fn render_kubernetes(
         }
     }
 
-    // Metadata ConfigMap
     let export_metadata = collect_exports_metadata(s, &mesh_plan, router_mesh_port);
 
     let mut input_metadata: BTreeMap<String, InputMetadata> = BTreeMap::new();
@@ -1225,11 +1208,9 @@ fn render_kubernetes(
         files.insert(PathBuf::from(PROXY_METADATA_FILENAME), proxy_json);
     }
 
-    // Build and insert kustomization with actual file paths.
     // Always generate kustomization.yaml for consistency, even if not using helper mode.
     let mut kust_resources = Vec::new();
 
-    // Collect all YAML files, excluding non-resource files
     for path in files.keys() {
         if path == &PathBuf::from("root-config.env")
             || path == &PathBuf::from("root-config-secret.env")
@@ -1242,7 +1223,6 @@ fn render_kubernetes(
     }
     kust_resources.sort();
 
-    // Set the resources list and insert the kustomization
     kustomization.resources = kust_resources;
     files.insert(
         PathBuf::from("kustomization.yaml"),
@@ -1568,7 +1548,6 @@ fn generate_netpol_enforcement_check(
         l
     };
 
-    // Create a single server deployment that listens on two ports
     let server_deployment = Deployment {
         api_version: "apps/v1",
         kind: "Deployment",
@@ -1631,7 +1610,6 @@ fn generate_netpol_enforcement_check(
         },
     };
 
-    // Service for allowed port (8080) - no NetworkPolicy blocks this
     let allowed_service = Service::new(
         "amber-netpol-allowed",
         namespace,
@@ -1652,7 +1630,6 @@ fn generate_netpol_enforcement_check(
         }],
     );
 
-    // Service for blocked port (8081) - NetworkPolicy will block this
     let blocked_service = Service::new(
         "amber-netpol-blocked",
         namespace,
@@ -1673,7 +1650,6 @@ fn generate_netpol_enforcement_check(
         }],
     );
 
-    // NetworkPolicy - deny ingress to port 8081 only
     let deny_policy = NetworkPolicy {
         api_version: "networking.k8s.io/v1",
         kind: "NetworkPolicy",
@@ -1695,16 +1671,13 @@ fn generate_netpol_enforcement_check(
                 },
             },
             policy_types: vec!["Ingress"],
-            ingress: vec![
-                // Allow ingress on port 8080 only
-                NetworkPolicyIngressRule {
-                    ports: vec![NetworkPolicyPort {
-                        port: 8080,
-                        protocol: "TCP",
-                    }],
-                    from: Vec::new(), // from anywhere
-                },
-            ],
+            ingress: vec![NetworkPolicyIngressRule {
+                ports: vec![NetworkPolicyPort {
+                    port: 8080,
+                    protocol: "TCP",
+                }],
+                from: Vec::new(), // from anywhere
+            }],
             egress: Vec::new(),
         },
     };
@@ -1821,7 +1794,6 @@ while true; do echo "ready" | nc -l -p 8080 >/dev/null; done
         },
     };
 
-    // Client service - allows scenario pods to check if enforcement check passed
     let client_service = Service::new(
         "amber-netpol-client",
         namespace,

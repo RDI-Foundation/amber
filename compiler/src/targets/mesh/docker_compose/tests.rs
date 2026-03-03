@@ -2301,7 +2301,6 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
     let _compose_guard = ComposeGuard::new(project);
     let server_host = "c1-server-net";
 
-    // Scenario definition
     let server_program = serde_json::from_value(json!({
         "image": "busybox:1.36.1",
         "entrypoint": ["sh", "-lc", "mkdir -p /www && echo hello > /www/index.html && httpd -f -p 8080 -h /www"],
@@ -2412,7 +2411,6 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         cmd
     };
 
-    // Up
     let status = compose(&["up", "-d"]).status().unwrap();
     assert!(status.success(), "docker compose up failed");
 

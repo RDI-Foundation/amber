@@ -1017,9 +1017,6 @@ fn sanitize_service_suffix(s: &str) -> String {
     }
 }
 
-// NOTE: template interpolation is now handled structurally via `amber_manifest::InterpolatedString`
-// parts and the runtime helper payload IR. The old string re-parser has been removed.
-
 fn escape_compose_interpolation<'a>(line: &'a str) -> Cow<'a, str> {
     if line.contains('$') {
         Cow::Owned(line.replace('$', "$$"))
