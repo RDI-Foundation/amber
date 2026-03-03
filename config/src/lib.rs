@@ -222,6 +222,31 @@ mod tests {
     }
 
     #[test]
+    fn collect_leaf_paths_invalid_ref_encoding_is_schema_error() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "api": { "$ref": "#/$defs/a~2b" },
+            },
+            "$defs": {
+                "a~2b": {
+                    "type": "object",
+                    "properties": {
+                        "token": { "type": "string" },
+                    }
+                },
+            }
+        });
+
+        let err = collect_leaf_paths(&schema).expect_err("invalid ref encoding should error");
+        let message = err.to_string();
+        assert!(
+            message.contains("invalid $ref pointer"),
+            "unexpected error message: {message}"
+        );
+    }
+
+    #[test]
     fn collect_leaf_paths_tracks_secrets_through_allof() {
         let schema = json!({
             "type": "object",

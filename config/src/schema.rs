@@ -87,6 +87,12 @@ fn resolve_local_ref<'a>(root: &'a Value, reference: &str) -> Result<(&'a Value,
         )));
     };
     let pointer = format!("/{pointer}");
+    let pointer = PointerBuf::parse(pointer).map_err(|_| {
+        ConfigError::schema(format!(
+            "invalid $ref pointer {reference:?}: non-RFC6901 escape sequence"
+        ))
+    })?;
+    let pointer = pointer.to_string();
     let target = root
         .pointer(&pointer)
         .ok_or_else(|| ConfigError::schema(format!("unresolvable $ref pointer {reference:?}")))?;
@@ -740,22 +746,10 @@ fn ensure_leaf_schema_supported(schema: &Map<String, Value>) -> Result<()> {
 }
 
 pub fn canonical_json(v: &Value) -> Value {
-    match v {
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            let mut out = Map::new();
-            for k in keys {
-                out.insert(
-                    k.clone(),
-                    canonical_json(map.get(k.as_str()).expect("key exists")),
-                );
-            }
-            Value::Object(out)
-        }
-        Value::Array(arr) => Value::Array(arr.iter().map(canonical_json).collect()),
-        other => other.clone(),
-    }
+    let canonical_bytes =
+        serde_jcs::to_vec(v).expect("serializing config schema to canonical JSON should succeed");
+    serde_json::from_slice(&canonical_bytes)
+        .expect("canonical JSON bytes should deserialize back into JSON value")
 }
 
 // Produce a minimized schema that only includes explicitly allowed leaf paths.

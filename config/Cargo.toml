@@ -8,3 +8,4 @@ amber-template = { workspace = true }
 jsonptr = { workspace = true }
 jsonschema = { workspace = true }
 serde_json = { workspace = true }
+serde_jcs = "0.1.0"
