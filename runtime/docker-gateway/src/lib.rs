@@ -370,14 +370,14 @@ impl State {
                     }
 
                     if !saw_address {
-                        eprintln!(
+                        tracing::warn!(
                             "docker gateway caller resolution returned no addresses for host {}",
                             caller.host
                         );
                     }
                 }
                 Err(err) => {
-                    eprintln!(
+                    tracing::warn!(
                         "docker gateway caller resolution failed for host {}: {err}",
                         caller.host
                     );
@@ -418,7 +418,7 @@ impl State {
         .await
         .is_err()
         {
-            eprintln!(
+            tracing::warn!(
                 "docker gateway shutdown cleanup timed out after {:?}",
                 SHUTDOWN_CLEANUP_TIMEOUT
             );
@@ -479,7 +479,7 @@ impl State {
         let targets = match parse_targets(&response.body) {
             Ok(value) => value,
             Err(err) => {
-                eprintln!("docker gateway cleanup failed to parse {list_name} list: {err}");
+                tracing::warn!("docker gateway cleanup failed to parse {list_name} list: {err}");
                 return;
             }
         };
@@ -490,7 +490,7 @@ impl State {
                 continue;
             };
             if !is_allowed_cleanup_delete_status(delete_response.status) {
-                eprintln!(
+                tracing::warn!(
                     "docker gateway cleanup failed to delete {item_name} {target}: {}",
                     delete_response.status
                 );
@@ -542,7 +542,7 @@ pub async fn run(config: DockerGatewayConfig) -> Result<(), DockerGatewayError> 
                     ShutdownReason::Terminated => {
                         // `docker compose down` sends SIGTERM and also performs its own teardown.
                         // Skipping gateway cleanup avoids duplicate deletes and "No such container" races.
-                        eprintln!(
+                        tracing::warn!(
                             "docker gateway received SIGTERM; skipping shutdown cleanup to avoid \
                              teardown races"
                         );
@@ -554,7 +554,7 @@ pub async fn run(config: DockerGatewayConfig) -> Result<(), DockerGatewayError> 
                 let (stream, peer) = match accepted {
                     Ok(value) => value,
                     Err(err) => {
-                        eprintln!("docker gateway accept failed: {err}");
+                        tracing::warn!("docker gateway accept failed: {err}");
                         continue;
                     }
                 };
@@ -582,7 +582,7 @@ pub async fn run(config: DockerGatewayConfig) -> Result<(), DockerGatewayError> 
                         .with_upgrades()
                         .await
                     {
-                        eprintln!("docker gateway connection failed: {err}");
+                        tracing::warn!("docker gateway connection failed: {err}");
                     }
                 });
             }
@@ -973,7 +973,7 @@ async fn forward_with_upgrade(
 
     tokio::spawn(async move {
         if let Err(err) = conn.with_upgrades().await {
-            eprintln!("docker upgrade connection failed: {err}");
+            tracing::warn!("docker upgrade connection failed: {err}");
         }
     });
 
@@ -998,11 +998,11 @@ async fn forward_with_upgrade(
 
     tokio::spawn(async move {
         let Ok(down) = on_client.await else {
-            eprintln!("downstream upgrade failed");
+            tracing::warn!("downstream upgrade failed");
             return;
         };
         let Ok(up) = on_upstream.await else {
-            eprintln!("upstream upgrade failed");
+            tracing::warn!("upstream upgrade failed");
             return;
         };
 
@@ -1010,7 +1010,7 @@ async fn forward_with_upgrade(
         let mut up = TokioIo::new(up);
 
         if let Err(err) = tokio::io::copy_bidirectional(&mut down, &mut up).await {
-            eprintln!("upgrade tunnel error: {err}");
+            tracing::warn!("upgrade tunnel error: {err}");
         }
     });
 

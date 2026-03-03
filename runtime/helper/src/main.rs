@@ -16,6 +16,7 @@ use std::{
 use amber_helper::{HelperError, RunPlan, build_run_plan};
 #[cfg(unix)]
 use signal_hook::{consts::signal, iterator::Signals};
+use tracing_subscriber::EnvFilter;
 
 #[cfg(unix)]
 const FORWARDED_SIGNALS: &[i32] = &[
@@ -26,13 +27,24 @@ const FORWARDED_SIGNALS: &[i32] = &[
 ];
 
 fn main() -> ExitCode {
+    init_tracing();
+
     match run_main() {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("{err}");
+            tracing::error!("{err}");
             ExitCode::from(1)
         }
     }
+}
+
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .without_time()
+        .init();
 }
 
 fn run_main() -> Result<ExitCode, HelperError> {
@@ -172,7 +184,7 @@ fn run_child_with_signal_forwarding(cmd: &mut Command) -> Result<ExitStatus, Hel
             }
             let err = io::Error::last_os_error();
             if err.raw_os_error() != Some(libc::ESRCH) {
-                eprintln!(
+                tracing::warn!(
                     "failed to forward signal {sig} to workload process group {child_pgid}: {err}"
                 );
             }

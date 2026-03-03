@@ -5,6 +5,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use tracing_subscriber::EnvFilter;
 
 #[path = "../versioning.rs"]
 mod versioning;
@@ -35,6 +36,8 @@ struct ImageVersionTags {
 }
 
 fn main() {
+    init_tracing();
+
     let manifest_path = match env::args().nth(1) {
         Some(path) => PathBuf::from(path),
         None => default_manifest_path(),
@@ -43,7 +46,7 @@ fn main() {
     let manifest = match read_manifest(&manifest_path) {
         Ok(manifest) => manifest,
         Err(err) => {
-            eprintln!("{err}");
+            tracing::error!("{err}");
             process::exit(1);
         }
     };
@@ -55,16 +58,17 @@ fn main() {
         };
         let version = version.trim();
         if version.is_empty() {
-            eprintln!("image {} has an empty version", image.name);
+            tracing::error!("image {} has an empty version", image.name);
             process::exit(1);
         }
 
         let parsed = match versioning::parse_manifest_version(version) {
             Ok(parsed) => parsed,
             Err(err) => {
-                eprintln!(
+                tracing::error!(
                     "image {} has invalid version {}: {err}",
-                    image.name, version
+                    image.name,
+                    version
                 );
                 process::exit(1);
             }
@@ -82,10 +86,19 @@ fn main() {
     match serde_json::to_string(&out) {
         Ok(json) => println!("{json}"),
         Err(err) => {
-            eprintln!("failed to serialize version tag metadata: {err}");
+            tracing::error!("failed to serialize version tag metadata: {err}");
             process::exit(1);
         }
     }
+}
+
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .without_time()
+        .init();
 }
 
 fn default_manifest_path() -> PathBuf {
