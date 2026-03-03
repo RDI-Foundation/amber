@@ -416,15 +416,18 @@ fn schema_secret_flag(schema: &Value) -> bool {
         .unwrap_or(false)
 }
 
-fn push_pointer(base: &str, segment: &str) -> String {
+fn push_pointer(base: &str, segment: &str) -> Result<String> {
     let mut pointer = if base.is_empty() {
         PointerBuf::new()
     } else {
-        PointerBuf::parse(base.to_string())
-            .expect("schema walker pointers are always internally-constructed")
+        PointerBuf::parse(base.to_string()).map_err(|_| {
+            ConfigError::schema(format!(
+                "internal error: invalid schema pointer during leaf walk: {base:?}"
+            ))
+        })?
     };
     pointer.push_back(segment);
-    pointer.to_string()
+    Ok(pointer.to_string())
 }
 
 #[derive(Clone, Debug)]
@@ -662,7 +665,7 @@ fn walk_leaf_paths<'a>(
                 format!("{prefix}.{k}")
             };
 
-            let pointer = push_pointer(&push_pointer(&cursor.pointer, "properties"), k.as_str());
+            let pointer = push_pointer(&push_pointer(&cursor.pointer, "properties")?, k.as_str())?;
 
             did_traverse = true;
             let _ = walk_leaf_paths(
@@ -681,7 +684,7 @@ fn walk_leaf_paths<'a>(
 
     if let Some(all_of) = cursor.schema.get("allOf").and_then(|v| v.as_array()) {
         for (idx, subschema) in all_of.iter().enumerate() {
-            let pointer = push_pointer(&push_pointer(&cursor.pointer, "allOf"), &idx.to_string());
+            let pointer = push_pointer(&push_pointer(&cursor.pointer, "allOf")?, &idx.to_string())?;
             did_traverse = true;
             let _ = walk_leaf_paths(
                 SchemaCursor {
