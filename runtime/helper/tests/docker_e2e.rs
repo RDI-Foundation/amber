@@ -28,7 +28,8 @@ fn encode_spec_b64(spec: &TemplateSpec) -> String {
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("helper crate should live under the workspace root")
+        .and_then(Path::parent)
+        .expect("helper crate should live under runtime/ in the workspace root")
         .to_path_buf()
 }
 

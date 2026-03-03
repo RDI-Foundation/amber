@@ -132,6 +132,142 @@ fn file_url(path: &Path) -> Url {
     Url::from_file_path(path).expect("path should be valid file URL")
 }
 
+fn write_kubernetes_smoke_fixture(root: &Path) -> PathBuf {
+    let scenario_dir = root.join("kubernetes-basic");
+    fs::create_dir_all(&scenario_dir).expect("create kubernetes smoke fixture directory");
+
+    fs::write(
+        scenario_dir.join("client.json5"),
+        r##"{
+  manifest_version: "0.1.0",
+  program: {
+    image: "busybox:1.36",
+    entrypoint: [
+      "sh",
+      "-eu",
+      "-c",
+      "\
+        mkdir content\n\
+        cd content\n\
+        wget '${slots.server.url}/runtime_secret.txt'\n\
+        wget '${slots.server.url}/runtime_config.txt'\n\
+        wget '${slots.server.url}/static_secret.txt'\n\
+        wget '${slots.server.url}/static_config.txt'\n\
+        httpd -f -p 8080\n\
+      ",
+    ],
+    network: {
+      endpoints: [{ name: "http", port: 8080 }],
+    },
+  },
+  slots: {
+    server: { kind: "http" },
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" },
+  },
+  exports: {
+    http: "http",
+  },
+}
+"##,
+    )
+    .expect("write kubernetes smoke client manifest");
+
+    fs::write(
+        scenario_dir.join("server.json5"),
+        r##"{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      runtime_secret: { type: "string", secret: true },
+      runtime_config: { type: "string", },
+      static_secret: { type: "string", secret: true },
+      static_config: { type: "string", },
+    },
+    required: [
+      "runtime_secret",
+      "runtime_config",
+      "static_secret",
+      "static_config",
+    ],
+  },
+  program: {
+    image: "busybox:1.36",
+    entrypoint: [
+      "sh",
+      "-eu",
+      "-c",
+      "\
+        mkdir content\n\
+        cd content\n\
+        printf '%s\n' \"$RUNTIME_SECRET\" >runtime_secret.txt\n\
+        printf '%s\n' '${config.runtime_config}' >runtime_config.txt\n\
+        printf '%s\n' \"$STATIC_SECRET\" >static_secret.txt\n\
+        printf '%s\n' '${config.static_config}' >static_config.txt\n\
+        httpd -f -p 8080\n\
+      ",
+    ],
+    env: {
+      RUNTIME_SECRET: "${config.runtime_secret}",
+      STATIC_SECRET: "${config.static_secret}",
+    },
+    network: {
+      endpoints: [{ name: "http", port: 8080 }],
+    },
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" },
+  },
+  exports: {
+    http: "http",
+  },
+}
+"##,
+    )
+    .expect("write kubernetes smoke server manifest");
+
+    let scenario_path = scenario_dir.join("scenario.json5");
+    fs::write(
+        &scenario_path,
+        r##"{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      server_runtime_secret: { type: "string", secret: true },
+      server_runtime_config: { type: "string" },
+    },
+    required: ["server_runtime_secret", "server_runtime_config"],
+  },
+  components: {
+    server: {
+      manifest: "./server.json5",
+      config: {
+        runtime_secret: "${config.server_runtime_secret}",
+        runtime_config: "${config.server_runtime_config}",
+        static_secret: "hardcode-this-secret",
+        static_config: "hardcode-this-config",
+      },
+    },
+    client: "./client.json5",
+  },
+  bindings: [
+    { to: "#client.server", from: "#server.http" },
+  ],
+  exports: {
+    server_http: "#server.http",
+    client_http: "#client.http",
+  },
+}
+"##,
+    )
+    .expect("write kubernetes smoke root scenario");
+
+    scenario_path
+}
+
 fn write_kubernetes_output(root: &Path, artifact: &super::KubernetesArtifact) {
     if root.exists() {
         fs::remove_dir_all(root).expect("remove kubernetes output directory");
@@ -675,8 +811,8 @@ fn kubernetes_smoke_config_roundtrip() {
         return;
     }
 
-    let workspace = workspace_root();
-    let scenario_path = workspace.join("test-scenarios/kubernetes-basic/scenario.json5");
+    let fixture_dir = tempdir().expect("create fixture temp dir");
+    let scenario_path = write_kubernetes_smoke_fixture(fixture_dir.path());
 
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
     let opts = CompileOptions::default();

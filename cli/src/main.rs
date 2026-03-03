@@ -356,7 +356,7 @@ fn docs(args: DocsArgs) -> Result<()> {
         DocsCommand::Manifest => {
             const MANIFEST_DOCS: &str = include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/../manifest/README.md"
+                "/../compiler/manifest/README.md"
             ));
             print!("{MANIFEST_DOCS}");
             Ok(())

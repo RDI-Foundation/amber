@@ -27,7 +27,7 @@ environments like Docker Compose and Kubernetes.
 - **Scenario:** the fully linked, validated graph produced by the compiler.
 
 If you want the full schema and examples, run `amber docs manifest`. If you have the repo checked
-out, the same content lives in `manifest/README.md`.
+out, the same content lives in `compiler/manifest/README.md`.
 
 ## Getting started
 
@@ -165,13 +165,13 @@ amber compile path/to/root.json5 --bundle /tmp/amber-bundle
 
 If you're working in this repo, these docs go deeper:
 
-- Manifest format and examples: `manifest/README.md` (or `amber docs manifest`)
+- Manifest format and examples: `compiler/manifest/README.md` (or `amber docs manifest`)
 - CLI behavior and outputs: `cli/README.md`
 - Compiler pipeline and reporters: `compiler/README.md`
-- Docker gateway component: `docker-gateway/README.md`
+- Docker gateway component: `runtime/docker-gateway/README.md`
 - Framework docker example: `examples/framework-docker/README.md`
-- Scenario data model: `scenario/README.md`
-- Manifest resolution (file/http) details: `resolver/README.md`
+- Scenario data model: `compiler/scenario/README.md`
+- Manifest resolution (file/http) details: `compiler/resolver/README.md`
 - Examples: `examples/`
 
 ---
