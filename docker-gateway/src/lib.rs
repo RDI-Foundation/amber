@@ -9,7 +9,6 @@ use std::{
 
 use base64::Engine as _;
 use bytes::Bytes;
-use dashmap::DashMap;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::{
     Method, Request, Response, StatusCode, Uri,
@@ -24,6 +23,7 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
 };
 use hyperlocal::{UnixConnector, Uri as HyperlocalUri};
+use moka::sync::Cache;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_with::{DefaultOnNull, serde_as};
 use thiserror::Error;
@@ -43,6 +43,8 @@ const AMBER_COMPONENT_LABEL: &str = "amber.component";
 const AMBER_PROJECT_LABEL: &str = "amber.project";
 const CALLER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_CLEANUP_TIMEOUT: Duration = Duration::from_secs(8);
+const EXEC_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const EXEC_CACHE_MAX_ENTRIES: u64 = 8_192;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type ProxyBody = BoxBody<Bytes, BoxError>;
@@ -95,7 +97,7 @@ struct ConnState {
 struct State {
     cfg: Arc<DockerGatewayConfig>,
     client: Client<UnixConnector, ProxyBody>,
-    exec_map: DashMap<String, String>,
+    exec_map: Cache<String, String>,
     callers_by_ip: RwLock<HashMap<IpAddr, Vec<ResolvedCaller>>>,
 }
 
@@ -342,7 +344,10 @@ impl State {
         Self {
             cfg: Arc::new(config),
             client,
-            exec_map: DashMap::new(),
+            exec_map: Cache::builder()
+                .time_to_live(EXEC_CACHE_TTL)
+                .max_capacity(EXEC_CACHE_MAX_ENTRIES)
+                .build(),
             callers_by_ip: RwLock::new(HashMap::new()),
         }
     }
@@ -1288,8 +1293,8 @@ async fn resolve_exec_container_id(
     version_prefix: &str,
     exec_id: &str,
 ) -> GatewayResult<String> {
-    if let Some(entry) = state.exec_map.get(exec_id) {
-        return Ok(entry.value().clone());
+    if let Some(container_id) = state.exec_map.get(exec_id) {
+        return Ok(container_id);
     }
 
     let path = with_version(version_prefix, &format!("/exec/{exec_id}/json"));
