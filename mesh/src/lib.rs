@@ -206,6 +206,7 @@ pub enum MeshProvisionOutput {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct InboundRoute {
+    pub route_id: String,
     pub capability: String,
     pub protocol: MeshProtocol,
     pub target: InboundTarget,
@@ -215,6 +216,7 @@ pub struct InboundRoute {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct OutboundRoute {
+    pub route_id: String,
     pub slot: String,
     pub listen_port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -239,6 +241,7 @@ pub enum InboundTarget {
     MeshForward {
         peer_addr: String,
         peer_id: String,
+        route_id: String,
         capability: String,
     },
 }
@@ -255,6 +258,28 @@ fn default_transport() -> TransportConfig {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+pub fn component_route_id(identity_id: &str, capability: &str, protocol: MeshProtocol) -> String {
+    format!(
+        "component:{identity_id}:{capability}:{}",
+        protocol_label(protocol)
+    )
+}
+
+pub fn router_external_route_id(slot: &str) -> String {
+    format!("router:external:{slot}:http")
+}
+
+pub fn router_export_route_id(export: &str, protocol: MeshProtocol) -> String {
+    format!("router:export:{export}:{}", protocol_label(protocol))
+}
+
+fn protocol_label(protocol: MeshProtocol) -> &'static str {
+    match protocol {
+        MeshProtocol::Http => "http",
+        MeshProtocol::Tcp => "tcp",
+    }
 }
 
 pub fn encode_config_b64(config: &MeshConfig) -> Result<String, serde_json::Error> {

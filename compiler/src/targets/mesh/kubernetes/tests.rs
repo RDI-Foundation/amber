@@ -11,7 +11,7 @@ use amber_images::{AMBER_HELPER, AMBER_PROVISIONER, AMBER_ROUTER};
 use amber_manifest::ManifestRef;
 use amber_mesh::{
     MeshConfig, MeshConfigPublic, MeshIdentity, MeshIdentityPublic, MeshIdentitySecret, MeshPeer,
-    MeshProtocol, OutboundRoute, TransportConfig,
+    MeshProtocol, OutboundRoute, TransportConfig, router_export_route_id,
 };
 use amber_resolver::Resolver;
 use amber_router as router;
@@ -1379,6 +1379,7 @@ fn kubernetes_smoke_export_routes_to_host() {
         peers: vec![router_peer],
         inbound: Vec::new(),
         outbound: vec![OutboundRoute {
+            route_id: router_export_route_id(export_name, MeshProtocol::Http),
             slot: export_name.to_string(),
             listen_port: proxy_listen.port(),
             listen_addr: Some(proxy_listen.ip().to_string()),

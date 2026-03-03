@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use amber_manifest::{Manifest, NetworkProtocol};
 use amber_mesh::{
     InboundRoute, InboundTarget, MeshConfigTemplate, MeshIdentityTemplate, MeshPeerTemplate,
-    MeshProtocol, OutboundRoute,
+    MeshProtocol, OutboundRoute, component_route_id, router_export_route_id,
+    router_external_route_id,
 };
 use amber_scenario::{ComponentId, Scenario};
 use base64::Engine as _;
@@ -197,9 +198,11 @@ pub(crate) fn build_mesh_config_plan(
                 continue;
             }
 
+            let protocol = mesh_protocol(endpoint.protocol)?;
             inbound.push(InboundRoute {
+                route_id: component_route_id(&identity.id, provide_name, protocol),
                 capability: provide_name.clone(),
-                protocol: mesh_protocol(endpoint.protocol)?,
+                protocol,
                 target: InboundTarget::Local {
                     port: endpoint.port,
                 },
@@ -233,6 +236,7 @@ pub(crate) fn build_mesh_config_plan(
                 .clone();
             let protocol = mesh_protocol(binding.endpoint.protocol)?;
             outbound.push(OutboundRoute {
+                route_id: component_route_id(&peer_id, &binding.provide, protocol),
                 slot: binding.slot.clone(),
                 listen_port,
                 listen_addr: None,
@@ -266,6 +270,7 @@ pub(crate) fn build_mesh_config_plan(
             let router_addr = addressing.mesh_addr_for_router()?;
             let protocol = MeshProtocol::Http;
             outbound.push(OutboundRoute {
+                route_id: router_external_route_id(&binding.external_slot),
                 slot: binding.slot.clone(),
                 listen_port,
                 listen_addr: None,
@@ -318,6 +323,7 @@ pub(crate) fn build_mesh_config_plan(
                 continue;
             }
             inbound.push(InboundRoute {
+                route_id: router_external_route_id(&slot.name),
                 capability: slot.name.clone(),
                 protocol: MeshProtocol::Http,
                 target: InboundTarget::External {
@@ -336,12 +342,15 @@ pub(crate) fn build_mesh_config_plan(
                 .id
                 .clone();
             let protocol = mesh_protocol(export.endpoint.protocol)?;
+            let provider_route_id = component_route_id(&peer_id, &export.provide, protocol);
             inbound.push(InboundRoute {
+                route_id: router_export_route_id(&export.name, protocol),
                 capability: export.name.clone(),
                 protocol,
                 target: InboundTarget::MeshForward {
                     peer_addr,
                     peer_id,
+                    route_id: provider_route_id,
                     capability: export.provide.clone(),
                 },
                 allowed_issuers: vec![router_identity.id.clone()],

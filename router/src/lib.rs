@@ -8,7 +8,7 @@ use std::{
 
 use amber_mesh::{
     InboundRoute, InboundTarget, MeshConfig, MeshConfigPublic, MeshIdentity, MeshIdentityPublic,
-    MeshIdentitySecret, MeshPeer, MeshProtocol,
+    MeshIdentitySecret, MeshPeer, MeshProtocol, component_route_id,
 };
 use base64::Engine as _;
 use bytes::Bytes;
@@ -72,6 +72,7 @@ pub enum RouterError {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct OpenFrame {
+    route_id: String,
     capability: String,
     protocol: MeshProtocol,
 }
@@ -102,12 +103,13 @@ struct MeshExternalTarget {
 type ExternalOverrides = Arc<RwLock<HashMap<String, String>>>;
 type ControlAllowlist = Arc<HashSet<IpAddr>>;
 type DynamicIssuers = Arc<RwLock<HashMap<String, HashSet<String>>>>;
+type InboundRoutes = HashMap<String, InboundRoute>;
 
 #[derive(Clone)]
 struct ControlServiceState {
     external_overrides: ExternalOverrides,
     trust: Arc<TrustBundle>,
-    inbound_routes: Arc<HashMap<String, InboundRoute>>,
+    inbound_routes: Arc<InboundRoutes>,
     dynamic_issuers: DynamicIssuers,
     identity: MeshIdentityPublic,
 }
@@ -190,7 +192,7 @@ fn parse_identity_json(raw: &str) -> Result<MeshIdentitySecret, RouterError> {
 
 pub async fn run(config: MeshConfig) -> Result<(), RouterError> {
     let trust = Arc::new(TrustBundle::new(&config)?);
-    let inbound_routes = Arc::new(build_inbound_routes(&config));
+    let inbound_routes = Arc::new(build_inbound_routes(&config)?);
     let dynamic_issuers = Arc::new(RwLock::new(HashMap::new()));
     let identity_public = MeshIdentityPublic::from_identity(&config.identity);
     let control_allow = match config.control_allow.as_ref() {
@@ -296,7 +298,7 @@ pub async fn run(config: MeshConfig) -> Result<(), RouterError> {
 async fn run_mesh_listener(
     config: Arc<MeshConfig>,
     trust: Arc<TrustBundle>,
-    inbound_routes: Arc<HashMap<String, InboundRoute>>,
+    inbound_routes: Arc<InboundRoutes>,
     dynamic_issuers: DynamicIssuers,
     external_overrides: ExternalOverrides,
     client: Arc<HttpClient>,
@@ -338,38 +340,22 @@ async fn handle_inbound(
     stream: tokio::net::TcpStream,
     config: Arc<MeshConfig>,
     trust: Arc<TrustBundle>,
-    inbound_routes: Arc<HashMap<String, InboundRoute>>,
+    inbound_routes: Arc<InboundRoutes>,
     dynamic_issuers: DynamicIssuers,
     external_overrides: ExternalOverrides,
     client: Arc<HttpClient>,
 ) -> Result<(), RouterError> {
     let noise_keys = noise_keys_for_identity(&config.identity)?;
     let mut session = accept_noise(stream, &noise_keys, &trust).await?;
-    let open = session.recv_open().await?;
-    let key = inbound_key(&open.capability, open.protocol);
-    let route = inbound_routes
-        .get(&key)
-        .ok_or_else(|| RouterError::Auth("unknown capability".to_string()))?
-        .clone();
-
-    if open.capability != route.capability || open.protocol != route.protocol {
-        return Err(RouterError::Auth("open frame mismatch".to_string()));
-    }
-
     let remote_id = session
         .remote_id
         .clone()
         .ok_or_else(|| RouterError::Auth("unknown peer".to_string()))?;
-    let mut allowed = route.allowed_issuers.contains(&remote_id);
-    if !allowed {
+    let open = session.recv_open().await?;
+    let route = {
         let issuers = dynamic_issuers.read().await;
-        if let Some(dynamic) = issuers.get(&key) {
-            allowed = dynamic.contains(&remote_id);
-        }
-    }
-    if !allowed {
-        return Err(RouterError::Auth("peer not allowed".to_string()));
-    }
+        resolve_inbound_route(inbound_routes.as_ref(), &open, &remote_id, &issuers)?.clone()
+    };
 
     match route.target {
         InboundTarget::Local { port } => {
@@ -443,10 +429,12 @@ async fn handle_inbound(
         InboundTarget::MeshForward {
             peer_addr,
             peer_id,
+            route_id,
             capability,
         } => {
             let outbound = connect_noise(&peer_addr, &peer_id, &config, &trust).await?;
             let open = OpenFrame {
+                route_id,
                 capability,
                 protocol: route.protocol,
             };
@@ -472,6 +460,7 @@ async fn maybe_proxy_mesh_external(
     let outbound =
         connect_noise_with_key(&mesh.peer_addr, &mesh.peer_id, mesh.peer_key, config).await?;
     let open = OpenFrame {
+        route_id: component_route_id(&mesh.peer_id, capability, protocol),
         capability: capability.to_string(),
         protocol,
     };
@@ -534,6 +523,7 @@ async fn handle_outbound(
     let mut outbound = connect_noise(&route.peer_addr, &route.peer_id, &config, &trust).await?;
 
     let open = OpenFrame {
+        route_id: route.route_id,
         capability: route.capability,
         protocol: route.protocol,
     };
@@ -548,7 +538,7 @@ async fn run_control_server(
     external_overrides: ExternalOverrides,
     control_allow: Option<ControlAllowlist>,
     trust: Arc<TrustBundle>,
-    inbound_routes: Arc<HashMap<String, InboundRoute>>,
+    inbound_routes: Arc<InboundRoutes>,
     dynamic_issuers: DynamicIssuers,
     identity: MeshIdentityPublic,
 ) -> Result<(), RouterError> {
@@ -583,7 +573,7 @@ async fn run_control_server_unix(
     path: String,
     external_overrides: ExternalOverrides,
     trust: Arc<TrustBundle>,
-    inbound_routes: Arc<HashMap<String, InboundRoute>>,
+    inbound_routes: Arc<InboundRoutes>,
     dynamic_issuers: DynamicIssuers,
     identity: MeshIdentityPublic,
 ) -> Result<(), RouterError> {
@@ -712,7 +702,7 @@ async fn control_service(
     req: Request<Incoming>,
     external_overrides: ExternalOverrides,
     trust: Arc<TrustBundle>,
-    inbound_routes: Arc<HashMap<String, InboundRoute>>,
+    inbound_routes: Arc<InboundRoutes>,
     dynamic_issuers: DynamicIssuers,
     identity: MeshIdentityPublic,
 ) -> Result<Response<BoxBody>, hyper::Error> {
@@ -897,7 +887,7 @@ async fn register_export_peer(
     export: &str,
     payload: ControlExportPeer,
     trust: &TrustBundle,
-    inbound_routes: &HashMap<String, InboundRoute>,
+    inbound_routes: &InboundRoutes,
     dynamic_issuers: &DynamicIssuers,
     router_id: &str,
 ) -> Result<(), String> {
@@ -910,16 +900,20 @@ async fn register_export_peer(
     }
     let peer_key = decode_peer_key(&payload.peer_key)?;
     let protocol = control_protocol(payload.protocol.trim())?;
-    let key = inbound_key(export, protocol);
-    let route = inbound_routes.get(&key).ok_or_else(|| {
-        format!(
-            "unknown export {} for protocol {}",
+    let mut export_routes = inbound_routes.values().filter(|route| {
+        route.capability == export
+            && route.protocol == protocol
+            && matches!(route.target, InboundTarget::MeshForward { .. })
+    });
+    let Some(route) = export_routes.next() else {
+        return Err(format!("capability {} is not an export", export));
+    };
+    if export_routes.next().is_some() {
+        return Err(format!(
+            "ambiguous export {} for protocol {}",
             export,
             protocol_string(protocol)
-        )
-    })?;
-    if !matches!(route.target, InboundTarget::MeshForward { .. }) {
-        return Err(format!("capability {} is not an export", export));
+        ));
     }
 
     let peer = MeshPeer {
@@ -932,7 +926,10 @@ async fn register_export_peer(
         .map_err(|err| format!("invalid peer: {err}"))?;
 
     let mut issuers = dynamic_issuers.write().await;
-    issuers.entry(key).or_default().insert(peer.id.clone());
+    issuers
+        .entry(route.route_id.clone())
+        .or_default()
+        .insert(peer.id.clone());
     Ok(())
 }
 
@@ -955,17 +952,58 @@ fn control_protocol(value: &str) -> Result<MeshProtocol, String> {
     }
 }
 
-fn build_inbound_routes(config: &MeshConfig) -> HashMap<String, InboundRoute> {
+fn build_inbound_routes(config: &MeshConfig) -> Result<InboundRoutes, RouterError> {
     let mut map = HashMap::new();
     for route in &config.inbound {
-        let key = inbound_key(&route.capability, route.protocol);
-        map.insert(key, route.clone());
+        if map.insert(route.route_id.clone(), route.clone()).is_some() {
+            return Err(RouterError::InvalidConfig(format!(
+                "duplicate inbound route_id {}",
+                route.route_id
+            )));
+        }
     }
-    map
+    Ok(map)
 }
 
-fn inbound_key(capability: &str, protocol: MeshProtocol) -> String {
-    format!("{capability}::{}", protocol_string(protocol))
+fn resolve_inbound_route<'a>(
+    inbound_routes: &'a InboundRoutes,
+    open: &OpenFrame,
+    remote_id: &str,
+    dynamic_issuers: &HashMap<String, HashSet<String>>,
+) -> Result<&'a InboundRoute, RouterError> {
+    let route = inbound_routes
+        .get(&open.route_id)
+        .ok_or_else(|| RouterError::Auth("unknown route".to_string()))?;
+
+    if open.capability != route.capability || open.protocol != route.protocol {
+        return Err(RouterError::Auth("open frame mismatch".to_string()));
+    }
+
+    if !route_allowed(route, remote_id, dynamic_issuers.get(&route.route_id)) {
+        return Err(RouterError::Auth("peer not allowed".to_string()));
+    }
+
+    Ok(route)
+}
+
+fn route_allowed(
+    route: &InboundRoute,
+    remote_id: &str,
+    dynamic_issuers_for_key: Option<&HashSet<String>>,
+) -> bool {
+    if route
+        .allowed_issuers
+        .iter()
+        .any(|issuer| issuer == remote_id)
+    {
+        return true;
+    }
+    if !matches!(route.target, InboundTarget::MeshForward { .. }) {
+        return false;
+    }
+    dynamic_issuers_for_key
+        .map(|issuers| issuers.contains(remote_id))
+        .unwrap_or(false)
 }
 
 fn protocol_string(protocol: MeshProtocol) -> String {
@@ -1658,6 +1696,8 @@ fn insert_peer(
 mod tests {
     use std::time::Duration;
 
+    use base64::Engine as _;
+
     use super::*;
 
     fn test_mesh_config() -> MeshConfig {
@@ -1678,6 +1718,53 @@ mod tests {
         MeshPeer {
             id: id.to_string(),
             public_key: identity.public_key,
+        }
+    }
+
+    fn inbound_route(
+        route_id: &str,
+        capability: &str,
+        protocol: MeshProtocol,
+        target: InboundTarget,
+        allowed_issuers: &[&str],
+    ) -> InboundRoute {
+        InboundRoute {
+            route_id: route_id.to_string(),
+            capability: capability.to_string(),
+            protocol,
+            target,
+            allowed_issuers: allowed_issuers.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn build_inbound_routes_rejects_duplicate_route_id() {
+        let config = MeshConfig {
+            inbound: vec![
+                inbound_route(
+                    "dup",
+                    "shared-a",
+                    MeshProtocol::Http,
+                    InboundTarget::Local { port: 7001 },
+                    &["peer-a"],
+                ),
+                inbound_route(
+                    "dup",
+                    "shared-b",
+                    MeshProtocol::Http,
+                    InboundTarget::Local { port: 7002 },
+                    &["peer-b"],
+                ),
+            ],
+            ..test_mesh_config()
+        };
+
+        let err = build_inbound_routes(&config).expect_err("duplicate route id should fail");
+        match err {
+            RouterError::InvalidConfig(message) => {
+                assert!(message.contains("duplicate inbound route_id dup"));
+            }
+            other => panic!("unexpected error: {other}"),
         }
     }
 
@@ -1782,6 +1869,7 @@ mod tests {
 
         let mut config = test_mesh_config();
         config.outbound.push(amber_mesh::OutboundRoute {
+            route_id: "route".to_string(),
             slot: "test-outbound".to_string(),
             listen_port: occupied_addr.port(),
             listen_addr: Some("127.0.0.1".to_string()),
@@ -1800,5 +1888,193 @@ mod tests {
             RouterError::BindFailed { addr, .. } => assert_eq!(addr, occupied_addr),
             other => panic!("expected bind failure, got {other}"),
         }
+    }
+
+    #[test]
+    fn resolve_inbound_route_isolated_by_peer_identity() {
+        let config = MeshConfig {
+            inbound: vec![
+                inbound_route(
+                    "route-a",
+                    "shared",
+                    MeshProtocol::Http,
+                    InboundTarget::Local { port: 7001 },
+                    &["peer-a"],
+                ),
+                inbound_route(
+                    "route-b",
+                    "shared",
+                    MeshProtocol::Http,
+                    InboundTarget::Local { port: 7002 },
+                    &["peer-b"],
+                ),
+            ],
+            ..test_mesh_config()
+        };
+        let inbound_routes = build_inbound_routes(&config).expect("build inbound routes");
+        let open = OpenFrame {
+            route_id: "route-a".to_string(),
+            capability: "shared".to_string(),
+            protocol: MeshProtocol::Http,
+        };
+
+        let a = resolve_inbound_route(&inbound_routes, &open, "peer-a", &HashMap::new())
+            .expect("peer-a route should resolve");
+        let denied = resolve_inbound_route(&inbound_routes, &open, "peer-b", &HashMap::new())
+            .expect_err("peer-c should not be allowed");
+
+        match &a.target {
+            InboundTarget::Local { port } => assert_eq!(*port, 7001),
+            _ => panic!("peer-a should resolve to local route"),
+        }
+        match denied {
+            RouterError::Auth(message) => assert_eq!(message, "peer not allowed"),
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn resolve_inbound_route_rejects_route_id_spoof() {
+        let config = MeshConfig {
+            inbound: vec![
+                inbound_route(
+                    "route-a",
+                    "shared",
+                    MeshProtocol::Http,
+                    InboundTarget::Local { port: 7001 },
+                    &["peer-a"],
+                ),
+                inbound_route(
+                    "route-b",
+                    "shared",
+                    MeshProtocol::Http,
+                    InboundTarget::Local { port: 7002 },
+                    &["peer-b"],
+                ),
+            ],
+            ..test_mesh_config()
+        };
+        let inbound_routes = build_inbound_routes(&config).expect("build inbound routes");
+        let spoofed = OpenFrame {
+            route_id: "route-b".to_string(),
+            capability: "shared".to_string(),
+            protocol: MeshProtocol::Http,
+        };
+        let denied = resolve_inbound_route(&inbound_routes, &spoofed, "peer-a", &HashMap::new())
+            .expect_err("peer-a should not be able to use peer-b route id");
+        match denied {
+            RouterError::Auth(message) => assert_eq!(message, "peer not allowed"),
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn resolve_inbound_route_dynamic_issuers_apply_only_to_exports() {
+        let config = MeshConfig {
+            inbound: vec![
+                inbound_route(
+                    "external-route",
+                    "shared",
+                    MeshProtocol::Http,
+                    InboundTarget::External {
+                        url_env: "SHARED_URL".to_string(),
+                        optional: false,
+                    },
+                    &["consumer"],
+                ),
+                inbound_route(
+                    "export-route",
+                    "shared",
+                    MeshProtocol::Http,
+                    InboundTarget::MeshForward {
+                        peer_addr: "127.0.0.1:1234".to_string(),
+                        peer_id: "provider".to_string(),
+                        route_id: "provider-route".to_string(),
+                        capability: "upstream".to_string(),
+                    },
+                    &["router"],
+                ),
+            ],
+            ..test_mesh_config()
+        };
+        let inbound_routes = build_inbound_routes(&config).expect("build inbound routes");
+        let open = OpenFrame {
+            route_id: "export-route".to_string(),
+            capability: "shared".to_string(),
+            protocol: MeshProtocol::Http,
+        };
+        let dynamic = HashSet::from([String::from("dynamic-peer")]);
+        let issuers = HashMap::from([(String::from("export-route"), dynamic.clone())]);
+
+        let dynamic_route = resolve_inbound_route(&inbound_routes, &open, "dynamic-peer", &issuers)
+            .expect("dynamic issuer should resolve");
+        let denied = resolve_inbound_route(&inbound_routes, &open, "consumer", &HashMap::new())
+            .expect_err("consumer should not be authorized for export route");
+
+        assert!(
+            matches!(&dynamic_route.target, InboundTarget::MeshForward { .. }),
+            "dynamic issuers must only authorize mesh-forward exports"
+        );
+        match denied {
+            RouterError::Auth(message) => assert_eq!(message, "peer not allowed"),
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_export_peer_succeeds_when_export_key_collides_with_external_slot() {
+        let mut config = test_mesh_config();
+        config.inbound = vec![
+            inbound_route(
+                "export-route",
+                "shared",
+                MeshProtocol::Http,
+                InboundTarget::MeshForward {
+                    peer_addr: "127.0.0.1:1234".to_string(),
+                    peer_id: "provider".to_string(),
+                    route_id: "provider-route".to_string(),
+                    capability: "upstream".to_string(),
+                },
+                &[config.identity.id.as_str()],
+            ),
+            inbound_route(
+                "external-route",
+                "shared",
+                MeshProtocol::Http,
+                InboundTarget::External {
+                    url_env: "SHARED_URL".to_string(),
+                    optional: false,
+                },
+                &["consumer"],
+            ),
+        ];
+        let inbound_routes = build_inbound_routes(&config).expect("build inbound routes");
+        let trust = TrustBundle::new(&config).expect("trust");
+        let dynamic_issuers: DynamicIssuers = Arc::new(RwLock::new(HashMap::new()));
+        let peer = test_peer("dynamic-peer");
+        let payload = ControlExportPeer {
+            peer_id: peer.id.clone(),
+            peer_key: base64::engine::general_purpose::STANDARD.encode(peer.public_key),
+            protocol: "http".to_string(),
+        };
+
+        register_export_peer(
+            "shared",
+            payload,
+            &trust,
+            &inbound_routes,
+            &dynamic_issuers,
+            &config.identity.id,
+        )
+        .await
+        .expect("export registration should succeed");
+
+        let issuers = dynamic_issuers.read().await;
+        assert!(
+            issuers
+                .get("export-route")
+                .is_some_and(|ids| ids.contains("dynamic-peer")),
+            "dynamic issuer should be registered under the export key"
+        );
     }
 }

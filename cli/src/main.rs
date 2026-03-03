@@ -22,7 +22,7 @@ use amber_compiler::{
 use amber_manifest::ManifestRef;
 use amber_mesh::{
     InboundRoute, InboundTarget, MeshConfig, MeshIdentity, MeshIdentityPublic, MeshPeer,
-    MeshProtocol, OutboundRoute, TransportConfig,
+    MeshProtocol, OutboundRoute, TransportConfig, component_route_id, router_export_route_id,
 };
 use amber_resolver::Resolver;
 use amber_router as router;
@@ -430,6 +430,7 @@ async fn proxy(args: ProxyArgs) -> Result<()> {
         })?;
         println!("registered export {export} via router control ({control_endpoint})");
         outbound.push(OutboundRoute {
+            route_id: router_export_route_id(export, protocol),
             slot: export.to_string(),
             listen_port: binding.listen.port(),
             listen_addr: Some(binding.listen.ip().to_string()),
@@ -468,6 +469,7 @@ async fn proxy(args: ProxyArgs) -> Result<()> {
                 ));
             }
             inbound.push(InboundRoute {
+                route_id: component_route_id(&proxy_identity.id, slot, MeshProtocol::Http),
                 capability: slot.to_string(),
                 protocol: MeshProtocol::Http,
                 target: InboundTarget::Local {
