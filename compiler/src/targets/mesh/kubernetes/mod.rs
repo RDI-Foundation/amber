@@ -1211,6 +1211,7 @@ fn render_kubernetes(
             mesh_port: router_mesh_port,
             control_port: router_ports.as_ref().expect("router ports missing").control,
             control_socket: None,
+            control_socket_volume: None,
         };
         let proxy_metadata = ProxyMetadata {
             version: PROXY_METADATA_VERSION.to_string(),

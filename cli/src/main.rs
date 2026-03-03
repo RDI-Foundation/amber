@@ -181,6 +181,7 @@ struct ProxyTarget {
 enum ControlEndpoint {
     Tcp(String),
     Unix(PathBuf),
+    VolumeSocket { volume: String, socket_path: String },
 }
 
 impl fmt::Display for ControlEndpoint {
@@ -188,6 +189,12 @@ impl fmt::Display for ControlEndpoint {
         match self {
             Self::Tcp(addr) => f.write_str(addr),
             Self::Unix(path) => write!(f, "unix://{}", path.display()),
+            Self::VolumeSocket {
+                volume,
+                socket_path,
+            } => {
+                write!(f, "volume://{volume}{socket_path}")
+            }
         }
     }
 }
@@ -802,18 +809,30 @@ fn resolve_control_endpoint(args: &ProxyArgs, target: &ProxyTarget) -> Result<Co
         .router
         .as_ref()
         .ok_or_else(|| miette::miette!("router metadata missing; re-run `amber compile`"))?;
+    let compose_project = match target.kind {
+        ProxyTargetKind::DockerCompose => infer_default_compose_project_name(&target.source),
+        ProxyTargetKind::Kubernetes => None,
+    };
+    if matches!(target.kind, ProxyTargetKind::DockerCompose)
+        && let Some(volume) = router.control_socket_volume.as_ref()
+    {
+        let resolved_volume = expand_env_templates(volume, compose_project.as_deref())?;
+        let socket_path = router
+            .control_socket
+            .as_deref()
+            .unwrap_or("/amber/control/router-control.sock");
+        return Ok(ControlEndpoint::VolumeSocket {
+            volume: resolved_volume,
+            socket_path: socket_path.to_string(),
+        });
+    }
     if let Some(socket) = router.control_socket.as_ref() {
-        let compose_project = match target.kind {
-            ProxyTargetKind::DockerCompose => infer_default_compose_project_name(&target.source),
-            ProxyTargetKind::Kubernetes => None,
-        };
         let resolved = expand_env_templates(socket, compose_project.as_deref())?;
         return Ok(ControlEndpoint::Unix(PathBuf::from(resolved)));
     }
     if matches!(target.kind, ProxyTargetKind::DockerCompose) {
         return Err(miette::miette!(
-            "docker-compose output is missing router control socket metadata; re-run `amber \
-             compile`"
+            "docker-compose output is missing router control metadata; re-run `amber compile`"
         ));
     }
     if router.control_port == 0 {
@@ -929,6 +948,7 @@ const CONTROL_UPDATE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const EXPORT_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(30);
 const ROUTER_IDENTITY_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_CURL_IMAGE: &str = "curlimages/curl:8.12.1";
+const CONTROL_SOCKET_MOUNT_DIR: &str = "/amber/control";
 
 impl ControlExportPayload {
     fn new(identity: &MeshIdentity, protocol: &str) -> Self {
@@ -1127,6 +1147,10 @@ async fn send_control_request(
             }
             Err(_) => send_control_request_via_container(path, request).await,
         },
+        ControlEndpoint::VolumeSocket {
+            volume,
+            socket_path,
+        } => send_control_request_via_volume(volume, socket_path, request).await,
     }
 }
 
@@ -1153,7 +1177,6 @@ async fn send_control_request_via_container(
     socket_path: &Path,
     request: &str,
 ) -> Result<String, ControlUpdateError> {
-    let (method, path, body) = parse_control_request(request)?;
     let socket_dir = socket_path.parent().ok_or_else(|| {
         ControlUpdateError::Fatal(format!(
             "invalid unix control path (missing parent): {}",
@@ -1169,10 +1192,45 @@ async fn send_control_request_via_container(
                 socket_path.display()
             ))
         })?;
+    send_control_request_via_mount(
+        &format!("{}:{CONTROL_SOCKET_MOUNT_DIR}", socket_dir.display()),
+        &format!("{CONTROL_SOCKET_MOUNT_DIR}/{socket_file}"),
+        request,
+    )
+    .await
+}
 
+async fn send_control_request_via_volume(
+    volume: &str,
+    socket_path: &str,
+    request: &str,
+) -> Result<String, ControlUpdateError> {
+    if volume.trim().is_empty() {
+        return Err(ControlUpdateError::Fatal(
+            "invalid router control volume name (empty)".to_string(),
+        ));
+    }
+    if !socket_path.starts_with('/') {
+        return Err(ControlUpdateError::Fatal(format!(
+            "invalid router control socket path (must be absolute): {socket_path}"
+        )));
+    }
+    send_control_request_via_mount(
+        &format!("{volume}:{CONTROL_SOCKET_MOUNT_DIR}"),
+        socket_path,
+        request,
+    )
+    .await
+}
+
+async fn send_control_request_via_mount(
+    socket_mount: &str,
+    socket_path: &str,
+    request: &str,
+) -> Result<String, ControlUpdateError> {
+    let (method, path, body) = parse_control_request(request)?;
     let mut last_error = None::<String>;
     for runtime in ["docker", "podman"] {
-        let socket_mount = format!("{}:/amber/control", socket_dir.display());
         let mut cmd = ProcessCommand::new(runtime);
         cmd.arg("run")
             .arg("--rm")
@@ -1182,7 +1240,7 @@ async fn send_control_request_via_container(
             .arg(socket_mount)
             .arg(CONTROL_CURL_IMAGE)
             .arg("--unix-socket")
-            .arg(format!("/amber/control/{socket_file}"))
+            .arg(socket_path)
             .arg("-sS")
             .arg("-i")
             .arg("-X")

@@ -27,6 +27,8 @@ pub struct RouterMetadata {
     pub control_port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_socket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_socket_volume: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

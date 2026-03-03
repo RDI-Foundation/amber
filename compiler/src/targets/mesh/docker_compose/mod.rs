@@ -32,7 +32,6 @@ use crate::{
         internal_images::resolve_internal_images,
         mesh_config::{
             MeshServiceName, RouterPorts, ServiceMeshAddressing, build_mesh_config_plan,
-            scenario_ir_digest,
         },
         plan::{MeshOptions, component_label, map_program_components},
         ports::{allocate_mesh_ports, allocate_slot_ports},
@@ -44,6 +43,7 @@ use crate::{
 const MESH_NETWORK_NAME: &str = "amber_mesh";
 
 const ROUTER_SERVICE_NAME: &str = "amber-router";
+const ROUTER_CONTROL_INIT_SERVICE_NAME: &str = "amber-router-control-init";
 const PROVISIONER_SERVICE_NAME: &str = "amber-provisioner";
 const HELPER_VOLUME_NAME: &str = "amber-helper-bin";
 const HELPER_INIT_SERVICE: &str = "amber-init";
@@ -58,12 +58,12 @@ const PROVISIONER_CONFIG_ROOT: &str = "/amber/provision";
 const PROVISIONER_PLAN_CONFIG_NAME: &str = "amber-mesh-provision-plan";
 const PROVISIONER_PLAN_PATH: &str = "/amber/plan/mesh-provision-plan.json";
 const HOST_GATEWAY_ENTRY: &str = "host.docker.internal:host-gateway";
+const ROUTER_CONTROL_SOCKET_VOLUME_NAME: &str = "amber-router-control";
 const ROUTER_CONTROL_SOCKET_PATH_IN_CONTAINER: &str = "/amber/control/router-control.sock";
 const ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER: &str = "/amber/control";
-const ROUTER_CONTROL_SOCKET_FILENAME: &str = "router-control.sock";
-const ROUTER_CONTROL_SOCKET_HOST_ROOT: &str = "/tmp/amber-control";
-const ROUTER_CONTROL_SOCKET_DIR_ENV: &str = "AMBER_ROUTER_CONTROL_SOCKET_DIR";
 const COMPOSE_PROJECT_NAME_ENV: &str = "COMPOSE_PROJECT_NAME";
+const ROUTER_RUNTIME_UID: u32 = 65532;
+const ROUTER_RUNTIME_GID: u32 = 65532;
 
 const COMPONENT_MESH_PORT_BASE: u16 = 23000;
 const ROUTER_MESH_PORT_BASE: u16 = 24000;
@@ -333,11 +333,11 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     )
     .map_err(|err| DockerComposeError::Other(err.to_string()))?;
     let router_metadata = if needs_router {
-        let control_socket = compose_control_socket_host_path_expr(s)?;
         Some(RouterMetadata {
             mesh_port: router_mesh_port,
             control_port: router_ports.as_ref().expect("router ports missing").control,
-            control_socket: Some(control_socket),
+            control_socket: Some(ROUTER_CONTROL_SOCKET_PATH_IN_CONTAINER.to_string()),
+            control_socket_volume: Some(compose_control_socket_volume_expr()),
         })
     } else {
         None
@@ -460,6 +460,32 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     }
 
     if needs_router {
+        compose
+            .volumes
+            .entry(ROUTER_CONTROL_SOCKET_VOLUME_NAME.to_string())
+            .or_insert_with(EmptyMap::default);
+
+        let mut control_init_service = Service::new("busybox:1.36.1".to_string());
+        control_init_service.user = Some("0:0".to_string());
+        control_init_service.command = Some(vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            format!(
+                "mkdir -p {ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER} && chown \
+                 {ROUTER_RUNTIME_UID}:{ROUTER_RUNTIME_GID} \
+                 {ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER} && chmod 0700 \
+                 {ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER}"
+            ),
+        ]);
+        control_init_service.volumes.push(format!(
+            "{ROUTER_CONTROL_SOCKET_VOLUME_NAME}:{ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER}"
+        ));
+        control_init_service.restart = Some("no".to_string());
+        compose.services.insert(
+            ROUTER_CONTROL_INIT_SERVICE_NAME.to_string(),
+            control_init_service,
+        );
+
         let mut env_entries = mesh_config_plan.router_env_passthrough.clone();
         env_entries.push(format!("AMBER_ROUTER_CONFIG_PATH={}", mesh_config_path()));
         env_entries.push(format!(
@@ -498,16 +524,20 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
             .volumes
             .push(format!("{router_volume}:{MESH_CONFIG_DIR}:ro"));
         router_service.volumes.push(format!(
-            "{}:{}",
-            compose_control_socket_host_dir_expr(s)?,
-            ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER
+            "{ROUTER_CONTROL_SOCKET_VOLUME_NAME}:{ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER}"
         ));
         router_service.depends_on = build_depends_on(
             false,
-            vec![(
-                PROVISIONER_SERVICE_NAME.to_string(),
-                "service_completed_successfully",
-            )],
+            vec![
+                (
+                    PROVISIONER_SERVICE_NAME.to_string(),
+                    "service_completed_successfully",
+                ),
+                (
+                    ROUTER_CONTROL_INIT_SERVICE_NAME.to_string(),
+                    "service_completed_successfully",
+                ),
+            ],
         );
 
         compose
@@ -962,27 +992,11 @@ fn service_base_name(id: ComponentId, local_name: &str) -> String {
     format!("c{}-{}", id.0, slug)
 }
 
-fn compose_control_socket_host_dir_expr(s: &Scenario) -> DcResult<String> {
-    Ok(format!(
-        "${{{}:-{}/{}}}/${{{}:-default}}",
-        ROUTER_CONTROL_SOCKET_DIR_ENV,
-        ROUTER_CONTROL_SOCKET_HOST_ROOT,
-        scenario_socket_token(s)?,
-        COMPOSE_PROJECT_NAME_ENV,
-    ))
-}
-
-fn compose_control_socket_host_path_expr(s: &Scenario) -> DcResult<String> {
-    Ok(format!(
-        "{}/{}",
-        compose_control_socket_host_dir_expr(s)?,
-        ROUTER_CONTROL_SOCKET_FILENAME
-    ))
-}
-
-fn scenario_socket_token(s: &Scenario) -> DcResult<String> {
-    let digest = scenario_ir_digest(s)?;
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..8]))
+fn compose_control_socket_volume_expr() -> String {
+    format!(
+        "${{{}:-default}}_{}",
+        COMPOSE_PROJECT_NAME_ENV, ROUTER_CONTROL_SOCKET_VOLUME_NAME
+    )
 }
 
 fn sanitize_service_suffix(s: &str) -> String {

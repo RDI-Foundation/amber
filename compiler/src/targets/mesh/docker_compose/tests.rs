@@ -345,68 +345,11 @@ fn target_for_service<'a>(plan: &'a MeshProvisionPlan, service: &str) -> &'a Mes
 }
 
 #[test]
-fn control_socket_token_depends_on_whole_scenario_ir() {
-    let root_a = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
-    };
-    let scenario_a = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root_a)],
-        bindings: Vec::new(),
-        exports: Vec::new(),
-    };
-
-    let root_b = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: vec![ComponentId(1)],
-    };
-    let child_b = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/child"),
-        digest: digest(1),
-        config: None,
-        config_schema: None,
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
-    };
-    let scenario_b = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root_b), Some(child_b)],
-        bindings: Vec::new(),
-        exports: Vec::new(),
-    };
-
-    let token_a = super::scenario_socket_token(&scenario_a).expect("token generation should work");
-    let token_b = super::scenario_socket_token(&scenario_b).expect("token generation should work");
-    assert_ne!(
-        token_a, token_b,
-        "control socket token should change when scenario IR changes"
+fn control_socket_volume_name_uses_compose_project() {
+    let volume_expr = super::compose_control_socket_volume_expr();
+    assert_eq!(
+        volume_expr,
+        "${COMPOSE_PROJECT_NAME:-default}_amber-router-control"
     );
 }
 
@@ -1463,8 +1406,15 @@ fn compose_emits_export_metadata_and_labels() {
         .control_socket
         .as_deref()
         .expect("router control socket missing");
-    assert!(control_socket.contains("/tmp/amber-control/"));
-    assert!(control_socket.contains("${COMPOSE_PROJECT_NAME:-default}"));
+    assert_eq!(control_socket, "/amber/control/router-control.sock");
+    let control_volume = router_meta
+        .control_socket_volume
+        .as_deref()
+        .expect("router control socket volume missing");
+    assert_eq!(
+        control_volume,
+        "${COMPOSE_PROJECT_NAME:-default}_amber-router-control"
+    );
 
     let router_service = service(&compose, "amber-router");
     assert!(
@@ -1488,7 +1438,20 @@ fn compose_emits_export_metadata_and_labels() {
         router_service
             .volumes
             .iter()
-            .any(|v| v.ends_with(":/amber/control"))
+            .any(|v| v == "amber-router-control:/amber/control")
+    );
+    assert_depends_on(
+        router_service,
+        "amber-router-control-init",
+        "service_completed_successfully",
+    );
+    let control_init_service = service(&compose, "amber-router-control-init");
+    assert_eq!(control_init_service.user.as_deref(), Some("0:0"));
+    assert!(
+        control_init_service
+            .volumes
+            .iter()
+            .any(|v| v == "amber-router-control:/amber/control")
     );
     let labels_json = router_service
         .labels

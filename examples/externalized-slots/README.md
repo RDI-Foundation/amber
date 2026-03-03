@@ -21,7 +21,7 @@ docker compose -f /tmp/amber-external.yaml up -d
 ```
 
 Router control is resolved automatically by `amber proxy` from compile metadata.
-For Compose output, this is a scenario-scoped Unix socket path.
+For Compose output, this is a project-scoped named volume that carries the router control socket.
 A single `amber proxy` process uses one mesh identity across all bindings.
 
 3. In another terminal, bind the slot and expose the export:
