@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use jsonptr::PointerBuf;
 use serde_json::{Map, Value};
 
 use crate::{ConfigError, Result};
@@ -410,12 +411,14 @@ fn schema_secret_flag(schema: &Value) -> bool {
 }
 
 fn push_pointer(base: &str, segment: &str) -> String {
-    let escaped = segment.replace('~', "~0").replace('/', "~1");
-    if base.is_empty() {
-        format!("/{escaped}")
+    let mut pointer = if base.is_empty() {
+        PointerBuf::new()
     } else {
-        format!("{base}/{escaped}")
-    }
+        PointerBuf::parse(base.to_string())
+            .expect("schema walker pointers are always internally-constructed")
+    };
+    pointer.push_back(segment);
+    pointer.to_string()
 }
 
 #[derive(Clone, Debug)]

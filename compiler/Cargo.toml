@@ -15,6 +15,7 @@ amber-template = { workspace = true }
 base64 = { workspace = true }
 dashmap = "6.1.0"
 futures = { workspace = true }
+jsonptr = { workspace = true }
 jsonschema = { workspace = true }
 miette = { workspace = true, features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }

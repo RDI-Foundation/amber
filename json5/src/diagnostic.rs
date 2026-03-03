@@ -1,5 +1,6 @@
 use std::fmt::{Display, Formatter};
 
+use jsonptr::PointerBuf;
 use miette::SourceSpan;
 use pest::Parser as _;
 use serde::Deserialize;
@@ -237,28 +238,36 @@ fn serde_path_segments(path: &serde_path_to_error::Path) -> Option<Vec<SerdePath
 }
 
 fn json_pointer_from_segments(segments: &[SerdePathSegment<'_>]) -> String {
-    let mut out = String::new();
-    for segment in segments {
-        out.push('/');
-        match segment {
-            SerdePathSegment::Key(key) => push_json_pointer_segment(&mut out, key),
-            SerdePathSegment::Index(index) => {
-                use std::fmt::Write as _;
-                let _ = write!(out, "{index}");
-            }
-        }
-    }
-    out
+    let tokens = segments.iter().map(|segment| match segment {
+        SerdePathSegment::Key(key) => (*key).to_string(),
+        SerdePathSegment::Index(index) => index.to_string(),
+    });
+    PointerBuf::from_tokens(tokens).to_string()
 }
 
-fn push_json_pointer_segment(out: &mut String, segment: &str) {
-    for c in segment.chars() {
-        match c {
-            '~' => out.push_str("~0"),
-            '/' => out.push_str("~1"),
-            other => out.push(other),
-        }
+fn parse_pointer(pointer: &str) -> PointerBuf {
+    if pointer.is_empty() {
+        PointerBuf::new()
+    } else {
+        PointerBuf::parse(pointer.to_string())
+            .expect("span lookup pointers are constructed from serde path segments")
     }
+}
+
+fn pointer_with_child(pointer: &str, segment: &str) -> String {
+    let mut parsed = parse_pointer(pointer);
+    parsed.push_back(segment);
+    parsed.to_string()
+}
+
+fn pointer_parent(pointer: &str) -> Option<String> {
+    if pointer.is_empty() {
+        return None;
+    }
+
+    let mut parsed = parse_pointer(pointer);
+    parsed.pop_back();
+    Some(parsed.to_string())
 }
 
 #[derive(Clone, Debug)]
@@ -290,35 +299,33 @@ impl<'s, 'p> SpanLookup<'s, 'p> {
     }
 
     fn span_for_parent_key(&self, field: &str) -> Option<SourceSpan> {
-        let mut parent = self.segments.clone();
-        if parent
-            .last()
-            .is_some_and(|s| matches!(s, SerdePathSegment::Key(key) if *key == field))
-        {
-            parent.pop();
-        }
-        let parent_pointer = json_pointer_from_segments(&parent);
+        let parent_pointer =
+            if self.segments.last().is_some_and(
+                |segment| matches!(segment, SerdePathSegment::Key(key) if *key == field),
+            ) {
+                pointer_parent(&self.pointer)?
+            } else {
+                self.pointer.clone()
+            };
         let parent_span = self.span_for_pointer(&parent_pointer)?;
         crate::spans::span_for_object_key(self.source, parent_span, field)
     }
 
     fn span_for_present_field(&self, field: &str) -> Option<SourceSpan> {
-        let mut pointer = self.pointer.clone();
-        pointer.push('/');
-        push_json_pointer_segment(&mut pointer, field);
+        let pointer = pointer_with_child(&self.pointer, field);
         self.span_for_pointer(&pointer)
     }
 
     fn object_span_for_value(&self, value_span: &SourceSpan) -> Option<SourceSpan> {
-        if self.segments.is_empty() {
+        if self.pointer.is_empty() {
             return None;
         }
 
-        let mut parent = self.segments.clone();
-        if matches!(parent.last(), Some(SerdePathSegment::Key(_))) {
-            parent.pop();
-        }
-        let parent_pointer = json_pointer_from_segments(&parent);
+        let parent_pointer = if matches!(self.segments.last(), Some(SerdePathSegment::Key(_))) {
+            pointer_parent(&self.pointer)?
+        } else {
+            self.pointer.clone()
+        };
         let parent_span = self.span_for_pointer(&parent_pointer)?;
 
         if parent_span.offset() <= value_span.offset()

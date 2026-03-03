@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 pub use amber_json5::spans::span_for_json_pointer;
 use amber_json5::spans::span_for_object_key;
+use jsonptr::PointerBuf;
 use miette::SourceSpan;
 use serde_json::{Map, Value};
 
@@ -543,28 +544,11 @@ fn extract_program_spans(program_value: &Value, program: SpanCursor<'_>) -> Prog
 }
 
 fn pointer_for_key(key: &str) -> String {
-    let mut out = String::with_capacity(key.len() + 1);
-    out.push('/');
-    push_json_pointer_segment(&mut out, key);
-    out
+    PointerBuf::from_tokens([key]).to_string()
 }
 
 fn pointer_for_index(index: usize) -> String {
-    let mut out = String::new();
-    out.push('/');
-    use std::fmt::Write as _;
-    let _ = write!(out, "{index}");
-    out
-}
-
-fn push_json_pointer_segment(out: &mut String, segment: &str) {
-    for c in segment.chars() {
-        match c {
-            '~' => out.push_str("~0"),
-            '/' => out.push_str("~1"),
-            other => out.push(other),
-        }
-    }
+    PointerBuf::from_tokens([index]).to_string()
 }
 
 #[cfg(test)]

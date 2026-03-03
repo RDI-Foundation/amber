@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use jsonptr::Token;
 use miette::SourceSpan;
 use pest::Parser as _;
 use pest_derive::Parser;
@@ -112,29 +113,11 @@ pub(crate) fn shift_span(span: SourceSpan, base: usize) -> SourceSpan {
 }
 
 fn unescape_json_pointer_segment(input: &str) -> Cow<'_, str> {
-    if !input.contains('~') {
+    let Ok(token) = Token::from_encoded(input) else {
         return Cow::Borrowed(input);
+    };
+    match token.decoded() {
+        Cow::Borrowed(_) => Cow::Borrowed(input),
+        Cow::Owned(decoded) => Cow::Owned(decoded),
     }
-
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars();
-
-    while let Some(c) = chars.next() {
-        if c != '~' {
-            out.push(c);
-            continue;
-        }
-
-        match chars.next() {
-            Some('0') => out.push('~'),
-            Some('1') => out.push('/'),
-            Some(other) => {
-                out.push('~');
-                out.push(other);
-            }
-            None => out.push('~'),
-        }
-    }
-
-    Cow::Owned(out)
 }

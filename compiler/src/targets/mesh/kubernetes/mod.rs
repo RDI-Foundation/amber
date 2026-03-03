@@ -10,6 +10,7 @@ use amber_manifest::{MountSource, span_for_json_pointer};
 use amber_mesh::{MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProvisionOutput};
 use amber_scenario::{ComponentId, Scenario};
 use base64::Engine as _;
+use jsonptr::PointerBuf;
 use miette::{LabeledSpan, NamedSource, SourceSpan};
 pub use resources::*;
 use serde::Serialize;
@@ -1332,13 +1333,11 @@ fn component_config_image_source(
     let url = &provenance.resolved_url;
     let stored = output.store.get_source(url)?;
     let root_span: SourceSpan = (0usize, stored.source.len()).into();
-    let child_ptr = json_pointer_escape(child_name);
-    let mut config_ptr = format!("/components/{child_ptr}/config");
+    let mut config_ptr = PointerBuf::from_tokens(["components", child_name, "config"]);
     for segment in path.split('.').filter(|segment| !segment.is_empty()) {
-        config_ptr.push('/');
-        config_ptr.push_str(&json_pointer_escape(segment));
+        config_ptr.push_back(segment);
     }
-    let span = span_for_json_pointer(stored.source.as_ref(), root_span, &config_ptr)?;
+    let span = span_for_json_pointer(stored.source.as_ref(), root_span, &config_ptr.to_string())?;
     let src =
         NamedSource::new(crate::store::display_url(url), stored.source).with_language("json5");
     Some(ProgramImageSource {
@@ -1366,10 +1365,6 @@ fn component_program_image_source(
         span,
         label: "program.image interpolation here".to_string(),
     })
-}
-
-fn json_pointer_escape(segment: &str) -> String {
-    segment.replace('~', "~0").replace('/', "~1")
 }
 
 fn program_image_error(
