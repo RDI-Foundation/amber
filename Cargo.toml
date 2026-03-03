@@ -1,34 +1,34 @@
 [workspace]
 members = [
   "cli",
-  "config",
   "compiler",
-  "docker-gateway",
-  "helper",
+  "compiler/config",
+  "compiler/json5",
+  "compiler/manifest",
+  "compiler/resolver",
+  "compiler/scenario",
+  "compiler/template",
   "images",
-  "json5",
-  "mesh",
-  "manifest",
   "node",
-  "provisioner",
-  "resolver",
-  "router",
-  "scenario",
-  "template",
+  "runtime/docker-gateway",
+  "runtime/helper",
+  "runtime/mesh",
+  "runtime/provisioner",
+  "runtime/router",
 ]
 resolver = "2"
 
 [workspace.dependencies]
 amber-compiler = { path = "compiler" }
-amber-config = { path = "config" }
+amber-config = { path = "compiler/config" }
 amber-images = { path = "images" }
-amber-json5 = { path = "json5" }
-amber-manifest = { path = "manifest" }
-amber-mesh = { path = "mesh" }
-amber-resolver = { path = "resolver" }
-amber-router = { path = "router" }
-amber-scenario = { path = "scenario" }
-amber-template = { path = "template" }
+amber-json5 = { path = "compiler/json5" }
+amber-manifest = { path = "compiler/manifest" }
+amber-mesh = { path = "runtime/mesh" }
+amber-resolver = { path = "compiler/resolver" }
+amber-router = { path = "runtime/router" }
+amber-scenario = { path = "compiler/scenario" }
+amber-template = { path = "compiler/template" }
 base64 = "0.22.1"
 futures = "0.3.31"
 hyper-util = { version = "0.1.10", features = ["client-legacy", "tokio"] }

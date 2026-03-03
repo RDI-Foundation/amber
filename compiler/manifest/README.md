@@ -1,6 +1,6 @@
 # Amber Component Manifest (JSON5) Format
 
-This document defines the **manifest file format** and the **validation/linting performed by `manifest/src/lib.rs` and `manifest/src/lint.rs`**.
+This document defines the **manifest file format** and the **validation/linting performed by `compiler/manifest/src/lib.rs` and `compiler/manifest/src/lint.rs`**.
 
 A manifest describes **one component**. A component may:
 
