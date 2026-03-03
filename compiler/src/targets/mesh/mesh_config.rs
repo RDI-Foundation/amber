@@ -384,7 +384,6 @@ fn mesh_protocol(protocol: NetworkProtocol) -> Result<MeshProtocol, MeshError> {
     let mapped = match protocol {
         NetworkProtocol::Http | NetworkProtocol::Https => MeshProtocol::Http,
         NetworkProtocol::Tcp => MeshProtocol::Tcp,
-        NetworkProtocol::Udp => MeshProtocol::Udp,
         _ => {
             return Err(MeshError::new(
                 "unsupported network protocol for mesh routing",

@@ -189,7 +189,6 @@ fn parse_identity_json(raw: &str) -> Result<MeshIdentitySecret, RouterError> {
 }
 
 pub async fn run(config: MeshConfig) -> Result<(), RouterError> {
-    validate_config(&config)?;
     let trust = Arc::new(TrustBundle::new(&config)?);
     let inbound_routes = Arc::new(build_inbound_routes(&config));
     let dynamic_issuers = Arc::new(RwLock::new(HashMap::new()));
@@ -292,26 +291,6 @@ pub async fn run(config: MeshConfig) -> Result<(), RouterError> {
             "listener task panicked: {err}"
         ))),
     }
-}
-
-fn validate_config(config: &MeshConfig) -> Result<(), RouterError> {
-    for route in &config.inbound {
-        if route.protocol == MeshProtocol::Udp {
-            return Err(RouterError::InvalidConfig(format!(
-                "udp protocol not supported for inbound capability {}",
-                route.capability
-            )));
-        }
-    }
-    for route in &config.outbound {
-        if route.protocol == MeshProtocol::Udp {
-            return Err(RouterError::InvalidConfig(format!(
-                "udp protocol not supported for outbound slot {}",
-                route.slot
-            )));
-        }
-    }
-    Ok(())
 }
 
 async fn run_mesh_listener(
@@ -510,9 +489,6 @@ async fn proxy_by_external_protocol(
     match protocol {
         MeshProtocol::Http => proxy_noise_to_external(session, target, client).await,
         MeshProtocol::Tcp => proxy_noise_to_external_tcp(session, target).await,
-        MeshProtocol::Udp => Err(RouterError::InvalidConfig(
-            "external targets do not support udp protocol".to_string(),
-        )),
     }
 }
 
@@ -975,7 +951,6 @@ fn control_protocol(value: &str) -> Result<MeshProtocol, String> {
     match value {
         "http" | "https" => Ok(MeshProtocol::Http),
         "tcp" => Ok(MeshProtocol::Tcp),
-        "udp" => Ok(MeshProtocol::Udp),
         _ => Err(format!("unsupported protocol {value}")),
     }
 }
@@ -997,7 +972,6 @@ fn protocol_string(protocol: MeshProtocol) -> String {
     match protocol {
         MeshProtocol::Http => "http".to_string(),
         MeshProtocol::Tcp => "tcp".to_string(),
-        MeshProtocol::Udp => "udp".to_string(),
     }
 }
 

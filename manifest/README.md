@@ -220,7 +220,7 @@ program: {
       {
         name: "http",          // required; unique within endpoints
         port: 8080,            // required
-        protocol: "http",      // optional; default "http" (http/https/tcp/udp)
+        protocol: "http",      // optional; default "http" (http/https/tcp)
       },
     ],
   },

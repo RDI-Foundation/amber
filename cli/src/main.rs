@@ -406,9 +406,6 @@ async fn proxy(args: ProxyArgs) -> Result<()> {
             .get(export)
             .ok_or_else(|| miette::miette!("export {} not found in output", export))?;
         let protocol = mesh_protocol_from_metadata(&export_meta.protocol)?;
-        if protocol == MeshProtocol::Udp {
-            return Err(miette::miette!("udp exports are not supported yet"));
-        }
 
         let register_payload = ControlExportPayload::new(&proxy_identity, &export_meta.protocol);
         register_export_with_retry(
@@ -445,7 +442,6 @@ async fn proxy(args: ProxyArgs) -> Result<()> {
         let local_url = match protocol {
             MeshProtocol::Http => format!("http://{}", binding.listen),
             MeshProtocol::Tcp => format!("tcp://{}", binding.listen),
-            MeshProtocol::Udp => format!("udp://{}", binding.listen),
         };
         println!("export {export} -> {local_url}");
     }
@@ -1283,7 +1279,6 @@ fn mesh_protocol_from_metadata(protocol: &str) -> Result<MeshProtocol> {
     Ok(match protocol {
         "http" | "https" => MeshProtocol::Http,
         "tcp" => MeshProtocol::Tcp,
-        "udp" => MeshProtocol::Udp,
         _ => {
             return Err(miette::miette!(
                 "unsupported network protocol for mesh routing"

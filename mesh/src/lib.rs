@@ -101,7 +101,6 @@ pub struct MeshPeer {
 pub enum MeshProtocol {
     Http,
     Tcp,
-    Udp,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
