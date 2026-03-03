@@ -32,7 +32,6 @@ use tokio::{
     sync::RwLock,
     time::{sleep, timeout},
 };
-use url::form_urlencoded;
 
 const CONFIG_B64_ENV: &str = "AMBER_DOCKER_GATEWAY_CONFIG_B64";
 const CONFIG_JSON_ENV: &str = "AMBER_DOCKER_GATEWAY_CONFIG_JSON";
@@ -888,12 +887,15 @@ fn build_label_filter_query(required_labels: &[String], include_all: bool) -> St
     });
     let encoded_filters = serde_json::to_string(&filters)
         .expect("serializing static label filter JSON should succeed");
-    let mut serializer = form_urlencoded::Serializer::new(String::new());
+
+    let mut query_pairs = Vec::new();
     if include_all {
-        serializer.append_pair("all", "1");
+        query_pairs.push(("all".to_string(), "1".to_string()));
     }
-    serializer.append_pair("filters", &encoded_filters);
-    serializer.finish()
+    query_pairs.push(("filters".to_string(), encoded_filters));
+
+    serde_urlencoded::to_string(query_pairs)
+        .expect("serializing static label query params should succeed")
 }
 
 async fn shutdown_signal() -> ShutdownReason {
@@ -1492,14 +1494,15 @@ fn ensure_host(req: &mut Request<ProxyBody>) {
 
 fn add_label_filters_to_uri(uri: &Uri, required: &[String]) -> GatewayResult<Uri> {
     let path = uri.path().to_string();
-    let mut pairs: Vec<(String, String)> = uri
-        .query()
-        .map(|query| {
-            form_urlencoded::parse(query.as_bytes())
-                .into_owned()
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut pairs: Vec<(String, String)> = match uri.query() {
+        Some(query) => serde_urlencoded::from_str(query).map_err(|err| {
+            boxed_response(docker_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid query parameters: {err}"),
+            ))
+        })?,
+        None => Vec::new(),
+    };
 
     let mut filters = if let Some(idx) = pairs.iter().position(|(key, _)| key == "filters") {
         let raw = &pairs[idx].1;
@@ -1539,9 +1542,12 @@ fn add_label_filters_to_uri(uri: &Uri, required: &[String]) -> GatewayResult<Uri
         pairs.push(("filters".to_string(), new_filters));
     }
 
-    let new_query = form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(pairs)
-        .finish();
+    let new_query = serde_urlencoded::to_string(&pairs).map_err(|err| {
+        boxed_response(docker_error(
+            StatusCode::BAD_REQUEST,
+            format!("query parameter serialization error: {err}"),
+        ))
+    })?;
 
     let path_and_query = if new_query.is_empty() {
         path
@@ -2228,7 +2234,7 @@ mod tests {
             .path_and_query
             .split_once('?')
             .expect("request should include query");
-        let query_map: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
+        let query_map: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
             .into_owned()
             .collect();
         let filters = query_map.get("filters").expect("filters query param");
@@ -2564,7 +2570,7 @@ mod tests {
         let required = vec!["c=d".to_string()];
         let out = add_label_filters_to_uri(&uri, &required).expect("filters");
         let query = out.query().expect("query");
-        let parsed_query: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
+        let parsed_query: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
             .into_owned()
             .collect();
         let filters = parsed_query.get("filters").expect("filters");
@@ -2592,7 +2598,7 @@ mod tests {
         let required = vec!["amber.component=/green".to_string()];
         let out = add_label_filters_to_uri(&uri, &required).expect("filters");
         let query = out.query().expect("query");
-        let parsed_query: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
+        let parsed_query: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
             .into_owned()
             .collect();
         let filters = parsed_query.get("filters").expect("filters");
@@ -2638,7 +2644,7 @@ mod tests {
 
         let out = add_label_filters_to_uri(&uri, &required).expect("filters");
         let query = out.query().expect("query");
-        let parsed_query: HashMap<String, String> = form_urlencoded::parse(query.as_bytes())
+        let parsed_query: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
             .into_owned()
             .collect();
         let filters = parsed_query.get("filters").expect("filters");

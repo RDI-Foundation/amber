@@ -159,6 +159,7 @@ dependencies = [
  "moka",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "serde_with",
  "tempfile",
  "thiserror 2.0.18",
