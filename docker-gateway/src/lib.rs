@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     env,
-    hash::Hash,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
@@ -25,7 +24,8 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
 };
 use hyperlocal::{UnixConnector, Uri as HyperlocalUri};
-use serde::{Deserialize, Deserializer, de::DeserializeOwned};
+use serde::{Deserialize, de::DeserializeOwned};
+use serde_with::{DefaultOnNull, serde_as};
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, UnixStream},
@@ -235,18 +235,23 @@ struct ContainerCreateRequest {
     networking_config: Option<NetworkingConfigRequest>,
 }
 
+#[serde_as]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct HostConfigRequest {
     #[serde(default)]
     network_mode: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
+    #[serde(default)]
+    #[serde_as(deserialize_as = "DefaultOnNull")]
     binds: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
+    #[serde(default)]
+    #[serde_as(deserialize_as = "DefaultOnNull")]
     mounts: Vec<MountRequest>,
-    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
+    #[serde(default)]
+    #[serde_as(deserialize_as = "DefaultOnNull")]
     volumes_from: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
+    #[serde(default)]
+    #[serde_as(deserialize_as = "DefaultOnNull")]
     links: Vec<String>,
     #[serde(default)]
     pid_mode: Option<String>,
@@ -263,28 +268,13 @@ struct MountRequest {
     source: Option<String>,
 }
 
+#[serde_as]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct NetworkingConfigRequest {
-    #[serde(default, deserialize_with = "deserialize_map_or_default")]
+    #[serde(default)]
+    #[serde_as(deserialize_as = "DefaultOnNull")]
     endpoints_config: HashMap<String, serde_json::Value>,
-}
-
-fn deserialize_vec_or_default<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
-}
-
-fn deserialize_map_or_default<'de, D, K, V>(deserializer: D) -> Result<HashMap<K, V>, D::Error>
-where
-    D: Deserializer<'de>,
-    K: Deserialize<'de> + Eq + Hash,
-    V: Deserialize<'de>,
-{
-    Ok(Option::<HashMap<K, V>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl DockerGatewayConfig {

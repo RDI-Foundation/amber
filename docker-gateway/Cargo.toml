@@ -13,6 +13,7 @@ hyper-util = { workspace = true }
 hyperlocal = { version = "0.9.1", features = ["client"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+serde_with = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "signal"] }
 url = { workspace = true }
