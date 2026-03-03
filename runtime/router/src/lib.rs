@@ -7,8 +7,8 @@ use std::{
 };
 
 use amber_mesh::{
-    InboundRoute, InboundTarget, MeshConfig, MeshConfigPublic, MeshIdentity, MeshIdentityPublic,
-    MeshIdentitySecret, MeshPeer, MeshProtocol, component_route_id,
+    HttpRoutePlugin, InboundRoute, InboundTarget, MeshConfig, MeshConfigPublic, MeshIdentity,
+    MeshIdentityPublic, MeshIdentitySecret, MeshPeer, MeshProtocol, component_route_id,
 };
 use base64::Engine as _;
 use bytes::Bytes;
@@ -20,6 +20,7 @@ use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo},
+    service::TowerToHyperService,
 };
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
@@ -33,7 +34,11 @@ use tokio::{
     sync::{Mutex, RwLock},
     task::JoinSet,
 };
+use tower::{ServiceBuilder, ServiceExt as _, service_fn as tower_service_fn};
+use tower_http::{compression::CompressionLayer, decompression::Decompression};
 use url::Url;
+
+mod a2a;
 
 #[derive(Debug, Error)]
 pub enum RouterError {
@@ -83,7 +88,78 @@ struct HttpProxyState {
     target: ExternalTarget,
 }
 
-type HttpClient = Client<HttpsConnector<HttpConnector>, Incoming>;
+#[derive(Clone)]
+struct LocalHttpProxyState {
+    client: HttpClient,
+    base_url: Url,
+    plugins: Arc<[Arc<dyn HttpExchangePlugin>]>,
+}
+
+type HttpClient = Client<HttpsConnector<HttpConnector>, BoxBody>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyMode {
+    Stream,
+    Collect,
+}
+
+#[allow(dead_code)]
+enum FilterDecision {
+    Continue,
+    Reject { status: StatusCode, message: String },
+}
+
+struct RewriteContext<'a> {
+    requester_base: Option<&'a Url>,
+}
+
+trait HttpExchangePlugin: Send + Sync {
+    fn matches(&self, req: &http::request::Parts) -> bool;
+
+    fn request_body_mode(&self, _req: &http::request::Parts) -> BodyMode {
+        BodyMode::Stream
+    }
+
+    fn response_body_mode(&self, _req: &http::request::Parts) -> BodyMode {
+        BodyMode::Stream
+    }
+
+    fn filter_request(
+        &self,
+        _ctx: &RewriteContext<'_>,
+        _parts: &http::request::Parts,
+        _body: Option<&[u8]>,
+    ) -> FilterDecision {
+        FilterDecision::Continue
+    }
+
+    fn filter_response(
+        &self,
+        _ctx: &RewriteContext<'_>,
+        _parts: &http::response::Parts,
+        _body: Option<&[u8]>,
+    ) -> FilterDecision {
+        FilterDecision::Continue
+    }
+
+    fn rewrite_request(
+        &self,
+        _ctx: &RewriteContext<'_>,
+        _parts: &mut http::request::Parts,
+        _body: &mut Vec<u8>,
+    ) -> bool {
+        false
+    }
+
+    fn rewrite_response(
+        &self,
+        _ctx: &RewriteContext<'_>,
+        _parts: &mut http::response::Parts,
+        _body: &mut Vec<u8>,
+    ) -> bool {
+        false
+    }
+}
 
 #[derive(Clone, Debug)]
 struct ExternalTarget {
@@ -359,8 +435,18 @@ async fn handle_inbound(
 
     match route.target {
         InboundTarget::Local { port } => {
-            let target = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
-            proxy_noise_to_plain(&mut session, target).await?;
+            if route.protocol == MeshProtocol::Http {
+                let plugins = resolve_http_plugins(&route);
+                if plugins.is_empty() {
+                    let target = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+                    proxy_noise_to_plain(&mut session, target).await?;
+                } else {
+                    proxy_noise_to_local_http(&mut session, port, client.clone(), plugins).await?;
+                }
+            } else {
+                let target = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+                proxy_noise_to_plain(&mut session, target).await?;
+            }
         }
         InboundTarget::External { url_env, optional } => {
             let override_url = {
@@ -853,9 +939,17 @@ fn control_empty(status: StatusCode) -> Response<BoxBody> {
     Response::builder()
         .status(status)
         .header(header::CONTENT_LENGTH, "0")
-        .body(Full::new(Bytes::new()).map_err(|err| match err {}).boxed())
+        .body(
+            Full::new(Bytes::new())
+                .map_err(|never| match never {})
+                .boxed(),
+        )
         .unwrap_or_else(|_| {
-            Response::new(Full::new(Bytes::new()).map_err(|err| match err {}).boxed())
+            Response::new(
+                Full::new(Bytes::new())
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
         })
 }
 
@@ -875,11 +969,15 @@ fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response<BoxBod
         .header(header::CONTENT_LENGTH, body.len().to_string())
         .body(
             Full::new(Bytes::from(body))
-                .map_err(|err| match err {})
+                .map_err(|never| match never {})
                 .boxed(),
         )
         .unwrap_or_else(|_| {
-            Response::new(Full::new(Bytes::new()).map_err(|err| match err {}).boxed())
+            Response::new(
+                Full::new(Bytes::new())
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
         })
 }
 
@@ -955,6 +1053,19 @@ fn control_protocol(value: &str) -> Result<MeshProtocol, String> {
 fn build_inbound_routes(config: &MeshConfig) -> Result<InboundRoutes, RouterError> {
     let mut map = HashMap::new();
     for route in &config.inbound {
+        if route.protocol != MeshProtocol::Http && !route.http_plugins.is_empty() {
+            return Err(RouterError::InvalidConfig(format!(
+                "inbound route {} has http plugins but uses {} protocol",
+                route.route_id,
+                protocol_string(route.protocol)
+            )));
+        }
+        if !route.http_plugins.is_empty() && !matches!(route.target, InboundTarget::Local { .. }) {
+            return Err(RouterError::InvalidConfig(format!(
+                "inbound route {} has http plugins but target is not local",
+                route.route_id
+            )));
+        }
         if map.insert(route.route_id.clone(), route.clone()).is_some() {
             return Err(RouterError::InvalidConfig(format!(
                 "duplicate inbound route_id {}",
@@ -1004,6 +1115,20 @@ fn route_allowed(
     dynamic_issuers_for_key
         .map(|issuers| issuers.contains(remote_id))
         .unwrap_or(false)
+}
+
+fn resolve_http_plugins(route: &InboundRoute) -> Arc<[Arc<dyn HttpExchangePlugin>]> {
+    route
+        .http_plugins
+        .iter()
+        .copied()
+        .map(|plugin| -> Arc<dyn HttpExchangePlugin> {
+            match plugin {
+                HttpRoutePlugin::A2a => Arc::new(a2a::AgentCardUrlRewritePlugin::new()),
+            }
+        })
+        .collect::<Vec<Arc<dyn HttpExchangePlugin>>>()
+        .into()
 }
 
 fn protocol_string(protocol: MeshProtocol) -> String {
@@ -1347,6 +1472,186 @@ async fn proxy_noise_to_external_tcp(
     proxy_noise_to_plain(session, upstream).await
 }
 
+async fn proxy_noise_to_local_http(
+    session: &mut NoiseSession,
+    port: u16,
+    client: Arc<HttpClient>,
+    plugins: Arc<[Arc<dyn HttpExchangePlugin>]>,
+) -> Result<(), RouterError> {
+    let (local, remote) = duplex(64 * 1024);
+    let mut noise_session = session.clone();
+
+    let bridge = tokio::spawn(async move { proxy_noise_to_plain(&mut noise_session, local).await });
+
+    let base_url = Url::parse(&format!("http://127.0.0.1:{port}"))
+        .map_err(|err| RouterError::InvalidConfig(format!("invalid local http target: {err}")))?;
+    let state = LocalHttpProxyState {
+        client: (*client).clone(),
+        base_url,
+        plugins,
+    };
+
+    let service =
+        ServiceBuilder::new()
+            .layer(CompressionLayer::new())
+            .service(tower_service_fn(move |req| {
+                let state = state.clone();
+                async move {
+                    Ok::<_, std::convert::Infallible>(proxy_local_http_request(state, req).await)
+                }
+            }));
+    let service = TowerToHyperService::new(service);
+
+    if let Err(err) = hyper::server::conn::http1::Builder::new()
+        .serve_connection(TokioIo::new(remote), service)
+        .await
+    {
+        return Err(RouterError::Transport(err.to_string()));
+    }
+
+    let _ = bridge.await;
+    Ok(())
+}
+
+async fn proxy_local_http_request(
+    state: LocalHttpProxyState,
+    req: Request<Incoming>,
+) -> Response<BoxBody> {
+    let requester_base = requester_base_url(req.uri(), req.headers());
+    let mut parts = req.into_parts();
+    let matching_plugins: Vec<&dyn HttpExchangePlugin> = state
+        .plugins
+        .iter()
+        .map(Arc::as_ref)
+        .filter(|plugin| plugin.matches(&parts.0))
+        .collect();
+    let request_body_collect = matching_plugins
+        .iter()
+        .any(|plugin| plugin.request_body_mode(&parts.0) == BodyMode::Collect);
+    let response_body_collect = matching_plugins
+        .iter()
+        .any(|plugin| plugin.response_body_mode(&parts.0) == BodyMode::Collect);
+    let ctx = RewriteContext {
+        requester_base: requester_base.as_ref(),
+    };
+
+    let request_body = if request_body_collect {
+        let mut body = match parts.1.collect().await {
+            Ok(collected) => collected.to_bytes().to_vec(),
+            Err(err) => {
+                tracing::warn!("router request body read failed: {err}");
+                return error_response(StatusCode::BAD_GATEWAY, "upstream request read failed");
+            }
+        };
+        if let Some(response) =
+            apply_request_filters(&matching_plugins, &ctx, &parts.0, Some(body.as_slice()))
+        {
+            return response;
+        }
+
+        let mut rewritten = false;
+        for plugin in &matching_plugins {
+            rewritten |= plugin.rewrite_request(&ctx, &mut parts.0, &mut body);
+        }
+        if rewritten {
+            strip_request_body_validators(&mut parts.0.headers);
+        }
+        parts
+            .0
+            .headers
+            .insert(header::CONTENT_LENGTH, content_length_header(body.len()));
+        Full::new(Bytes::from(body))
+            .map_err(|never| match never {})
+            .boxed()
+    } else {
+        if let Some(response) = apply_request_filters(&matching_plugins, &ctx, &parts.0, None) {
+            return response;
+        }
+        parts.1.boxed()
+    };
+
+    let target_url = join_url(&state.base_url, &parts.0.uri);
+    let Some(host) = target_url.host_str() else {
+        return error_response(StatusCode::BAD_GATEWAY, "target url missing host");
+    };
+
+    let host_header = match target_url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+
+    let mut request_parts = parts.0;
+    request_parts.uri = match Uri::try_from(target_url.as_str()) {
+        Ok(uri) => uri,
+        Err(_) => return error_response(StatusCode::BAD_GATEWAY, "invalid target url"),
+    };
+
+    sanitize_request_headers(&mut request_parts.headers, &host_header);
+
+    let proxied = Request::from_parts(request_parts, request_body);
+    if response_body_collect {
+        let response = match Decompression::new(state.client.clone())
+            .oneshot(proxied)
+            .await
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                tracing::warn!("router request failed: {err}");
+                return error_response(StatusCode::BAD_GATEWAY, "upstream request failed");
+            }
+        };
+        let (mut response_parts, response_body) = response.into_parts();
+        let mut body = match response_body.collect().await {
+            Ok(collected) => collected.to_bytes().to_vec(),
+            Err(err) => {
+                tracing::warn!("router response body read failed: {err}");
+                return error_response(StatusCode::BAD_GATEWAY, "upstream response read failed");
+            }
+        };
+        if let Some(response) = apply_response_filters(
+            &matching_plugins,
+            &ctx,
+            &response_parts,
+            Some(body.as_slice()),
+        ) {
+            return response;
+        }
+
+        let mut rewritten = false;
+        for plugin in &matching_plugins {
+            rewritten |= plugin.rewrite_response(&ctx, &mut response_parts, &mut body);
+        }
+
+        sanitize_response_headers(&mut response_parts.headers);
+        if rewritten {
+            strip_response_body_validators(&mut response_parts.headers);
+        }
+        response_parts
+            .headers
+            .insert(header::CONTENT_LENGTH, content_length_header(body.len()));
+        return Response::from_parts(
+            response_parts,
+            Full::new(Bytes::from(body))
+                .map_err(|never| match never {})
+                .boxed(),
+        );
+    }
+
+    let response = match state.client.request(proxied).await {
+        Ok(resp) => resp,
+        Err(err) => {
+            tracing::warn!("router request failed: {err}");
+            return error_response(StatusCode::BAD_GATEWAY, "upstream request failed");
+        }
+    };
+    let (mut response_parts, response_body) = response.into_parts();
+    if let Some(response) = apply_response_filters(&matching_plugins, &ctx, &response_parts, None) {
+        return response;
+    }
+    sanitize_response_headers(&mut response_parts.headers);
+    Response::from_parts(response_parts, response_body.boxed())
+}
+
 async fn proxy_http_request(state: HttpProxyState, req: Request<Incoming>) -> Response<BoxBody> {
     let target_url = match resolve_target_url(&state.target, &req) {
         Ok(url) => url,
@@ -1370,7 +1675,7 @@ async fn proxy_http_request(state: HttpProxyState, req: Request<Incoming>) -> Re
 
     sanitize_request_headers(&mut parts.0.headers, &host_header);
 
-    let proxied = Request::from_parts(parts.0, parts.1);
+    let proxied = Request::from_parts(parts.0, parts.1.boxed());
 
     let response = match state.client.request(proxied).await {
         Ok(resp) => resp,
@@ -1384,6 +1689,73 @@ async fn proxy_http_request(state: HttpProxyState, req: Request<Incoming>) -> Re
     sanitize_response_headers(&mut parts.0.headers);
     let body = parts.1.boxed();
     Response::from_parts(parts.0, body)
+}
+
+fn requester_base_url(uri: &Uri, headers: &HeaderMap) -> Option<Url> {
+    let scheme = uri.scheme_str().unwrap_or("http");
+    let authority = uri
+        .authority()
+        .map(|value| value.as_str().trim().to_string())
+        .or_else(|| {
+            headers
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.trim().to_string())
+        })?;
+    if authority.is_empty() {
+        return None;
+    }
+    Url::parse(&format!("{scheme}://{authority}")).ok()
+}
+
+fn strip_request_body_validators(headers: &mut HeaderMap) {
+    headers.remove(http::header::HeaderName::from_static("content-md5"));
+    headers.remove(http::header::HeaderName::from_static("digest"));
+}
+
+fn strip_response_body_validators(headers: &mut HeaderMap) {
+    headers.remove(header::ETAG);
+    headers.remove(header::LAST_MODIFIED);
+    headers.remove(http::header::HeaderName::from_static("content-md5"));
+    headers.remove(http::header::HeaderName::from_static("digest"));
+}
+
+fn content_length_header(length: usize) -> HeaderValue {
+    HeaderValue::from_str(&length.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0"))
+}
+
+fn apply_request_filters(
+    plugins: &[&dyn HttpExchangePlugin],
+    ctx: &RewriteContext<'_>,
+    parts: &http::request::Parts,
+    body: Option<&[u8]>,
+) -> Option<Response<BoxBody>> {
+    for plugin in plugins {
+        match plugin.filter_request(ctx, parts, body) {
+            FilterDecision::Continue => {}
+            FilterDecision::Reject { status, message } => {
+                return Some(error_response(status, &message));
+            }
+        }
+    }
+    None
+}
+
+fn apply_response_filters(
+    plugins: &[&dyn HttpExchangePlugin],
+    ctx: &RewriteContext<'_>,
+    parts: &http::response::Parts,
+    body: Option<&[u8]>,
+) -> Option<Response<BoxBody>> {
+    for plugin in plugins {
+        match plugin.filter_response(ctx, parts, body) {
+            FilterDecision::Continue => {}
+            FilterDecision::Reject { status, message } => {
+                return Some(error_response(status, &message));
+            }
+        }
+    }
+    None
 }
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
@@ -1536,14 +1908,18 @@ fn parse_mesh_external(value: &str) -> Result<MeshExternalTarget, RouterError> {
 
 fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
     let body = Full::new(Bytes::from(message.to_string()))
-        .map_err(|err| match err {})
+        .map_err(|never| match never {})
         .boxed();
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "text/plain")
         .body(body)
         .unwrap_or_else(|_| {
-            Response::new(Full::new(Bytes::new()).map_err(|err| match err {}).boxed())
+            Response::new(
+                Full::new(Bytes::new())
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
         })
 }
 
@@ -1732,6 +2108,7 @@ mod tests {
             route_id: route_id.to_string(),
             capability: capability.to_string(),
             protocol,
+            http_plugins: Vec::new(),
             target,
             allowed_issuers: allowed_issuers.iter().map(ToString::to_string).collect(),
         }
@@ -1763,6 +2140,57 @@ mod tests {
         match err {
             RouterError::InvalidConfig(message) => {
                 assert!(message.contains("duplicate inbound route_id dup"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn build_inbound_routes_rejects_http_plugins_on_non_http_route() {
+        let config = MeshConfig {
+            inbound: vec![InboundRoute {
+                route_id: "bad-route".to_string(),
+                capability: "cap".to_string(),
+                protocol: MeshProtocol::Tcp,
+                http_plugins: vec![HttpRoutePlugin::A2a],
+                target: InboundTarget::Local { port: 7001 },
+                allowed_issuers: vec!["peer-a".to_string()],
+            }],
+            ..test_mesh_config()
+        };
+
+        let err =
+            build_inbound_routes(&config).expect_err("non-http route with http plugin should fail");
+        match err {
+            RouterError::InvalidConfig(message) => {
+                assert!(message.contains("has http plugins but uses tcp protocol"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn build_inbound_routes_rejects_http_plugins_on_non_local_target() {
+        let config = MeshConfig {
+            inbound: vec![InboundRoute {
+                route_id: "bad-route".to_string(),
+                capability: "cap".to_string(),
+                protocol: MeshProtocol::Http,
+                http_plugins: vec![HttpRoutePlugin::A2a],
+                target: InboundTarget::External {
+                    url_env: "TEST_URL".to_string(),
+                    optional: false,
+                },
+                allowed_issuers: vec!["peer-a".to_string()],
+            }],
+            ..test_mesh_config()
+        };
+
+        let err = build_inbound_routes(&config)
+            .expect_err("non-local target with http plugin should fail");
+        match err {
+            RouterError::InvalidConfig(message) => {
+                assert!(message.contains("has http plugins but target is not local"));
             }
             other => panic!("unexpected error: {other}"),
         }

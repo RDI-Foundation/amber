@@ -209,8 +209,16 @@ pub struct InboundRoute {
     pub route_id: String,
     pub capability: String,
     pub protocol: MeshProtocol,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub http_plugins: Vec<HttpRoutePlugin>,
     pub target: InboundTarget,
     pub allowed_issuers: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpRoutePlugin {
+    A2a,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
