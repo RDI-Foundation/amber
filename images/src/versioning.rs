@@ -2,6 +2,32 @@ use std::collections::HashSet;
 
 use semver::Version;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ManifestVersionSpec {
+    Concrete(Version),
+    Wildcard(WildcardVersionSpec),
+}
+
+impl ManifestVersionSpec {
+    pub fn seed_version(&self) -> &Version {
+        match self {
+            Self::Concrete(version) => version,
+            Self::Wildcard(spec) => spec.seed_version(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WildcardVersionSpec {
+    seed: Version,
+}
+
+impl WildcardVersionSpec {
+    pub fn seed_version(&self) -> &Version {
+        &self.seed
+    }
+}
+
 pub fn parse_manifest_version(version: &str) -> Result<Version, String> {
     let raw = version.trim();
     if raw.is_empty() {
@@ -15,6 +41,24 @@ pub fn parse_manifest_version(version: &str) -> Result<Version, String> {
         return Err("version must not include build metadata (+...)".to_string());
     }
     Ok(parsed)
+}
+
+pub fn parse_manifest_version_spec(version: &str) -> Result<ManifestVersionSpec, String> {
+    let raw = version.trim();
+    if !raw.ends_with(".x") {
+        return parse_manifest_version(raw).map(ManifestVersionSpec::Concrete);
+    }
+
+    let prefix = raw
+        .strip_suffix('x')
+        .expect("wildcard versions should always end with x");
+    let seed_version = format!("{prefix}0");
+    let parsed = parse_manifest_version(&seed_version)
+        .map_err(|err| format!("invalid wildcard version {raw}: {err}"))?;
+
+    Ok(ManifestVersionSpec::Wildcard(WildcardVersionSpec {
+        seed: parsed,
+    }))
 }
 
 pub fn runtime_tag(version: &Version) -> String {
@@ -78,7 +122,10 @@ fn prerelease_channel(version: &Version) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{floating_tags, parse_manifest_version, runtime_tag};
+    use super::{
+        ManifestVersionSpec, floating_tags, parse_manifest_version, parse_manifest_version_spec,
+        runtime_tag,
+    };
 
     #[test]
     fn stable_major_one_tags() {
@@ -116,5 +163,52 @@ mod tests {
         let err = parse_manifest_version("v1.2.3+build.4")
             .expect_err("build metadata should be rejected");
         assert_eq!(err, "version must not include build metadata (+...)");
+    }
+
+    #[test]
+    fn parses_concrete_manifest_version_spec() {
+        let parsed =
+            parse_manifest_version_spec("v1.2.3").expect("concrete version spec should parse");
+        match parsed {
+            ManifestVersionSpec::Concrete(version) => {
+                assert_eq!(version.to_string(), "1.2.3");
+            }
+            ManifestVersionSpec::Wildcard(_) => panic!("expected concrete version"),
+        }
+    }
+
+    #[test]
+    fn parses_stable_wildcard_manifest_version_spec() {
+        let parsed = parse_manifest_version_spec("v1.2.x")
+            .expect("stable wildcard version spec should parse");
+        match parsed {
+            ManifestVersionSpec::Wildcard(spec) => {
+                assert_eq!(spec.seed_version().to_string(), "1.2.0");
+            }
+            ManifestVersionSpec::Concrete(_) => panic!("expected wildcard version"),
+        }
+    }
+
+    #[test]
+    fn parses_prerelease_wildcard_manifest_version_spec() {
+        let parsed = parse_manifest_version_spec("v1.2.3-alpha.x")
+            .expect("prerelease wildcard version spec should parse");
+        match parsed {
+            ManifestVersionSpec::Wildcard(spec) => {
+                assert_eq!(spec.seed_version().to_string(), "1.2.3-alpha.0");
+            }
+            ManifestVersionSpec::Concrete(_) => panic!("expected wildcard version"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_wildcard_version_spec() {
+        let err = parse_manifest_version_spec("v1.x")
+            .expect_err("invalid wildcard version spec should fail");
+        assert_eq!(
+            err,
+            "invalid wildcard version v1.x: unexpected end of input while parsing minor version \
+             number"
+        );
     }
 }

@@ -5,6 +5,10 @@ on:
     branches:
       - main
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   image-matrix:
     name: Image Matrix
@@ -119,17 +123,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Compute semver tag metadata
-        id: version_tags
-        shell: bash
-        run: |
-          set -euo pipefail
-          json="$(cargo run -q -p amber-images --bin version_tags -- docker/images.json)"
-          {
-            echo "json<<EOF"
-            echo "$json"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
       - name: Publish base multi-arch tags (main + sha)
         shell: bash
         run: |
@@ -146,6 +139,17 @@ jobs:
               "${image}:${GITHUB_SHA}-amd64" \
               "${image}:${GITHUB_SHA}-arm64"
           done <<< "$images"
+      - name: Compute semver tag metadata
+        id: version_tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          json="$(cargo run -q -p amber-images --bin version_tags -- --resolve --registry "$IMAGE_REGISTRY" --sha "$GITHUB_SHA" docker/images.json)"
+          {
+            echo "json<<EOF"
+            echo "$json"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
       - name: Publish release versions and semver channels
         shell: bash
         run: |
@@ -178,7 +182,7 @@ jobs:
               release_sig="$(manifest_signature "$release_ref")"
               sha_sig="$(manifest_signature "$sha_ref")"
               if [ "$release_sig" != "$sha_sig" ]; then
-                echo "::error::Release tag ${release_ref} already exists but does not match ${sha_ref}. Bump docker/images.json version for ${name} when image contents change."
+                echo "::error::Release tag ${release_ref} already exists but does not match ${sha_ref}. Update docker/images.json version template for ${name} to a higher range."
                 exit 1
               fi
               echo "release tag already exists and matches current sha: $release_ref"
@@ -218,23 +222,23 @@ jobs:
           fi
           image_registry="${image_registry%/}"
           echo "IMAGE_REGISTRY=${image_registry}" >> "$GITHUB_ENV"
-      - name: Compute semver tag metadata
-        id: version_tags
-        shell: bash
-        run: |
-          set -euo pipefail
-          json="$(cargo run -q -p amber-images --bin version_tags -- docker/images.json)"
-          {
-            echo "json<<EOF"
-            echo "$json"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute semver tag metadata
+        id: version_tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          json="$(cargo run -q -p amber-images --bin version_tags -- --resolve --registry "$IMAGE_REGISTRY" --sha "$GITHUB_SHA" docker/images.json)"
+          {
+            echo "json<<EOF"
+            echo "$json"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
       - name: Verify tags exist
         shell: bash
         run: |
@@ -305,7 +309,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          json="$(cargo run -q -p amber-images --bin version_tags -- docker/images.json)"
+          json="$(cargo run -q -p amber-images --bin version_tags -- --resolve --registry "$IMAGE_REGISTRY" --sha "$GITHUB_SHA" docker/images.json)"
           {
             echo "json<<EOF"
             echo "$json"
