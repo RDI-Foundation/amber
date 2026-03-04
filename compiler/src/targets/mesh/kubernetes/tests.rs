@@ -7,7 +7,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use amber_images::{AMBER_HELPER, AMBER_PROVISIONER, AMBER_ROUTER};
 use amber_manifest::ManifestRef;
 use amber_mesh::{
     MeshConfig, MeshConfigPublic, MeshIdentity, MeshIdentityPublic, MeshIdentitySecret, MeshPeer,
@@ -21,17 +20,24 @@ use tempfile::tempdir;
 use url::Url;
 
 use super::{KubernetesReporter, KubernetesReporterConfig, PROVISIONER_NAME};
-use crate::{CompileOptions, Compiler, DigestStore, OptimizeOptions, reporter::Reporter as _};
-
-const HELPER_IMAGE: &str = AMBER_HELPER.reference;
-const ROUTER_IMAGE: &str = AMBER_ROUTER.reference;
-const PROVISIONER_IMAGE: &str = AMBER_PROVISIONER.reference;
+use crate::{
+    CompileOptions, Compiler, DigestStore, OptimizeOptions, reporter::Reporter as _,
+    targets::mesh::internal_images::resolve_internal_images,
+};
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("compiler crate should live under the workspace root")
         .to_path_buf()
+}
+
+fn internal_images() -> crate::targets::mesh::internal_images::InternalImages {
+    resolve_internal_images().expect("internal images should resolve for tests")
+}
+
+fn use_prebuilt_images() -> bool {
+    std::env::var("AMBER_TEST_USE_PREBUILT_IMAGES").is_ok()
 }
 
 fn docker_platform() -> String {
@@ -75,32 +81,46 @@ fn ensure_image_platform(tag: &str, platform: &str) {
     }
 }
 
-fn build_router_image() {
-    let root = workspace_root();
-    let dockerfile = root.join("docker/amber-router/Dockerfile");
+fn build_docker_image(tag: &str, dockerfile: &Path, context: &Path) {
+    if use_prebuilt_images() {
+        image_platform_opt(tag).unwrap_or_else(|| {
+            panic!(
+                "AMBER_TEST_USE_PREBUILT_IMAGES is set but {tag} is not available locally. Ensure \
+                 images are pulled and retagged before running tests."
+            )
+        });
+        return;
+    }
+
     let mut cmd = Command::new("docker");
     cmd.arg("build")
         .env("DOCKER_BUILDKIT", "1")
         .arg("-t")
-        .arg(ROUTER_IMAGE)
+        .arg(tag)
         .arg("-f")
-        .arg(&dockerfile)
-        .arg(&root);
-    checked_status(&mut cmd, "docker build amber-router image");
+        .arg(dockerfile)
+        .arg(context);
+    checked_status(&mut cmd, &format!("docker build {tag} image"));
+}
+
+fn build_router_image() {
+    let root = workspace_root();
+    let images = internal_images();
+    build_docker_image(
+        &images.router,
+        &root.join("docker/amber-router/Dockerfile"),
+        &root,
+    );
 }
 
 fn build_provisioner_image() {
     let root = workspace_root();
-    let dockerfile = root.join("docker/amber-provisioner/Dockerfile");
-    let mut cmd = Command::new("docker");
-    cmd.arg("build")
-        .env("DOCKER_BUILDKIT", "1")
-        .arg("-t")
-        .arg(PROVISIONER_IMAGE)
-        .arg("-f")
-        .arg(&dockerfile)
-        .arg(&root);
-    checked_status(&mut cmd, "docker build amber-provisioner image");
+    let images = internal_images();
+    build_docker_image(
+        &images.provisioner,
+        &root.join("docker/amber-provisioner/Dockerfile"),
+        &root,
+    );
 }
 
 fn file_url(path: &Path) -> Url {
@@ -303,15 +323,12 @@ fn checked_status(cmd: &mut Command, context: &str) {
 
 fn build_helper_image() {
     let root = workspace_root();
-    let dockerfile = root.join("docker/amber-helper/Dockerfile");
-    let mut cmd = Command::new("docker");
-    cmd.arg("build")
-        .arg("-t")
-        .arg(HELPER_IMAGE)
-        .arg("-f")
-        .arg(&dockerfile)
-        .arg(&root);
-    checked_status(&mut cmd, "docker build amber-helper image");
+    let images = internal_images();
+    build_docker_image(
+        &images.helper,
+        &root.join("docker/amber-helper/Dockerfile"),
+        &root,
+    );
 }
 
 struct KindClusterGuard {
@@ -822,6 +839,7 @@ fn kubernetes_smoke_config_roundtrip() {
     build_router_image();
     build_provisioner_image();
     ensure_image_platform("busybox:1.36", &platform);
+    let images = internal_images();
 
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -831,9 +849,9 @@ fn kubernetes_smoke_config_roundtrip() {
     let _cluster_guard = KindClusterGuard::new(cluster_name.clone(), &kubeconfig);
 
     for image in [
-        HELPER_IMAGE,
-        ROUTER_IMAGE,
-        PROVISIONER_IMAGE,
+        images.helper.as_str(),
+        images.router.as_str(),
+        images.provisioner.as_str(),
         "busybox:1.36",
     ] {
         let mut cmd = kind_cmd(&kubeconfig);
@@ -1018,6 +1036,7 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
     build_router_image();
     build_provisioner_image();
     ensure_image_platform("busybox:1.36.1", &platform);
+    let images = internal_images();
 
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1026,7 +1045,11 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
     let cluster_name = format!("amber-test-{}-{nonce}", std::process::id());
     let _cluster_guard = KindClusterGuard::new(cluster_name.clone(), &kubeconfig);
 
-    for image in [ROUTER_IMAGE, PROVISIONER_IMAGE, "busybox:1.36.1"] {
+    for image in [
+        images.router.as_str(),
+        images.provisioner.as_str(),
+        "busybox:1.36.1",
+    ] {
         let mut cmd = kind_cmd(&kubeconfig);
         cmd.arg("load")
             .arg("docker-image")
@@ -1394,6 +1417,7 @@ sleep infinity
     build_router_image();
     build_provisioner_image();
     ensure_image_platform("busybox:1.36.1", &platform);
+    let images = internal_images();
 
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1402,7 +1426,11 @@ sleep infinity
     let cluster_name = format!("amber-test-{}-{nonce}", std::process::id());
     let _cluster_guard = KindClusterGuard::new(cluster_name.clone(), &kubeconfig);
 
-    for image in [ROUTER_IMAGE, PROVISIONER_IMAGE, "busybox:1.36.1"] {
+    for image in [
+        images.router.as_str(),
+        images.provisioner.as_str(),
+        "busybox:1.36.1",
+    ] {
         let mut cmd = kind_cmd(&kubeconfig);
         cmd.arg("load")
             .arg("docker-image")
@@ -1656,6 +1684,7 @@ fn kubernetes_smoke_export_routes_to_host() {
     build_router_image();
     build_provisioner_image();
     ensure_image_platform("busybox:1.36.1", &platform);
+    let images = internal_images();
 
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1664,7 +1693,11 @@ fn kubernetes_smoke_export_routes_to_host() {
     let cluster_name = format!("amber-test-{}-{nonce}", std::process::id());
     let _cluster_guard = KindClusterGuard::new(cluster_name.clone(), &kubeconfig);
 
-    for image in [ROUTER_IMAGE, PROVISIONER_IMAGE, "busybox:1.36.1"] {
+    for image in [
+        images.router.as_str(),
+        images.provisioner.as_str(),
+        "busybox:1.36.1",
+    ] {
         let mut cmd = kind_cmd(&kubeconfig);
         cmd.arg("load")
             .arg("docker-image")
