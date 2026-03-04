@@ -308,7 +308,10 @@ pub fn lint_manifest(
         });
     }
 
-    for slot_name in manifest.slots().keys() {
+    for (slot_name, slot_decl) in manifest.slots().iter() {
+        if slot_decl.optional {
+            continue;
+        }
         if !bound_slots.contains(slot_name)
             && !program_used_slots.contains(slot_name)
             && !exported_slots.contains(slot_name)
@@ -587,6 +590,23 @@ mod tests {
             entrypoint: ["x"],
             env: { LLM_URL: "${slots.llm.url}" },
           },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedSlot { name, .. } if name == "llm"
+        )));
+    }
+
+    #[test]
+    fn optional_slot_is_not_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { llm: { kind: "llm", optional: true } },
         }
         "#;
         let raw = parse_raw(input);

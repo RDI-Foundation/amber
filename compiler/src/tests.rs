@@ -2309,6 +2309,57 @@ async fn compile_emits_manifest_lints() {
     }));
 }
 
+#[tokio::test]
+async fn check_treats_weak_binding_targets_as_optional_for_unused_slot_lint() {
+    let dir = tmp_dir("scenario-optional-slot-downstream-lint");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { api: { kind: "http" } },
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              slots: {{ upstream: {{ kind: "http", optional: true }} }},
+              components: {{ child: "{child}" }},
+              bindings: [
+                {{ to: "#child.api", from: "self.upstream", weak: true }},
+              ],
+            }}
+            "##,
+            child = file_url(&child_path),
+        ),
+    );
+
+    let compiler = default_compiler();
+    let root_ref = manifest_ref_for_path(&root_path);
+    let output = compiler
+        .check(root_ref, standard_compile_options())
+        .await
+        .unwrap();
+
+    assert!(!output.has_errors);
+    assert!(
+        !has_diagnostic_code(&output.diagnostics, "manifest::unused_slot"),
+        "unexpected manifest::unused_slot diagnostics: {:?}",
+        output
+            .diagnostics
+            .iter()
+            .map(|diag| diag.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compile_is_spawnable_on_multithread_runtime() {
     let dir = tmp_dir("scenario-compile-send");
