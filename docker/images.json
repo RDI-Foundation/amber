@@ -10,25 +10,25 @@
       "name": "amber-helper",
       "context": ".",
       "dockerfile": "docker/amber-helper/Dockerfile",
-      "version": "v1.0.0"
+      "version": "v1.0.x"
     },
     {
       "name": "amber-router",
       "context": ".",
       "dockerfile": "docker/amber-router/Dockerfile",
-      "version": "v1.0.0"
+      "version": "v1.0.x"
     },
     {
       "name": "amber-docker-gateway",
       "context": ".",
       "dockerfile": "docker/amber-docker-gateway/Dockerfile",
-      "version": "v1.0.0"
+      "version": "v1.0.x"
     },
     {
       "name": "amber-provisioner",
       "context": ".",
       "dockerfile": "docker/amber-provisioner/Dockerfile",
-      "version": "v1.0.0"
+      "version": "v1.0.x"
     }
   ]
 }
