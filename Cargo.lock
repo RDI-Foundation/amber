@@ -300,11 +300,13 @@ dependencies = [
 name = "amber-router"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "amber-mesh",
  "base64",
  "bytes",
  "curve25519-dalek",
  "ed25519-dalek",
+ "futures",
  "http",
  "http-body-util",
  "hyper",
