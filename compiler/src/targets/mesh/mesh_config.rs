@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use amber_manifest::{Manifest, NetworkProtocol};
+use amber_manifest::{CapabilityKind, Manifest, NetworkProtocol};
 use amber_mesh::{
-    InboundRoute, InboundTarget, MeshConfigTemplate, MeshIdentityTemplate, MeshPeerTemplate,
-    MeshProtocol, OutboundRoute, component_route_id, router_export_route_id,
+    HttpRoutePlugin, InboundRoute, InboundTarget, MeshConfigTemplate, MeshIdentityTemplate,
+    MeshPeerTemplate, MeshProtocol, OutboundRoute, component_route_id, router_export_route_id,
     router_external_route_id,
 };
 use amber_scenario::{ComponentId, Scenario};
@@ -161,7 +161,7 @@ pub(crate) fn build_mesh_config_plan(
         })?;
 
         let mut inbound = Vec::new();
-        for provide_name in scenario.component(*id).provides.keys() {
+        for (provide_name, provide_decl) in &scenario.component(*id).provides {
             let endpoint = mesh_plan
                 .bindings
                 .iter()
@@ -203,6 +203,13 @@ pub(crate) fn build_mesh_config_plan(
                 route_id: component_route_id(&identity.id, provide_name, protocol),
                 capability: provide_name.clone(),
                 protocol,
+                http_plugins: matches!(
+                    (provide_decl.decl.kind, protocol),
+                    (CapabilityKind::A2a, MeshProtocol::Http)
+                )
+                .then_some(HttpRoutePlugin::A2a)
+                .into_iter()
+                .collect(),
                 target: InboundTarget::Local {
                     port: endpoint.port,
                 },
@@ -326,6 +333,7 @@ pub(crate) fn build_mesh_config_plan(
                 route_id: router_external_route_id(&slot.name),
                 capability: slot.name.clone(),
                 protocol: MeshProtocol::Http,
+                http_plugins: Vec::new(),
                 target: InboundTarget::External {
                     url_env: slot.url_env.clone(),
                     optional: slot.optional,
@@ -347,6 +355,7 @@ pub(crate) fn build_mesh_config_plan(
                 route_id: router_export_route_id(&export.name, protocol),
                 capability: export.name.clone(),
                 protocol,
+                http_plugins: Vec::new(),
                 target: InboundTarget::MeshForward {
                     peer_addr,
                     peer_id,

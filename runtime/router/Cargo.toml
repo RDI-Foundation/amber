@@ -19,12 +19,14 @@ hyper-rustls = { version = "0.27.7", default-features = false, features = [
   "tls12",
   "webpki-tokio",
 ] }
-hyper-util = { workspace = true }
+hyper-util = { workspace = true, features = ["service"] }
 rustls = { version = "0.23.36", default-features = false, features = ["aws_lc_rs"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = "0.10.9"
 snow = "0.9.6"
+tower = { version = "0.5.2", features = ["util"] }
+tower-http = { version = "0.6.8", default-features = false, features = ["compression-br", "compression-deflate", "compression-gzip", "compression-zstd", "decompression-br", "decompression-deflate", "decompression-gzip", "decompression-zstd"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net"] }
 tracing = { workspace = true }

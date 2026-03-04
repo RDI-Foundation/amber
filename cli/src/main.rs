@@ -479,6 +479,7 @@ async fn proxy(args: ProxyArgs) -> Result<()> {
                 route_id: component_route_id(&proxy_identity.id, slot, MeshProtocol::Http),
                 capability: slot.to_string(),
                 protocol: MeshProtocol::Http,
+                http_plugins: Vec::new(),
                 target: InboundTarget::Local {
                     port: binding.upstream.port(),
                 },

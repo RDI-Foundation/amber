@@ -16,6 +16,7 @@ use amber_mesh::{
 use amber_resolver::Resolver;
 use amber_router as router;
 use base64::Engine as _;
+use serde_json::json;
 use tempfile::tempdir;
 use url::Url;
 
@@ -1242,6 +1243,294 @@ spec:
             client_logs, router_logs, external_logs
         );
     }
+}
+
+#[test]
+#[ignore = "requires docker + kind + kubectl; run manually"]
+fn kubernetes_smoke_a2a_card_url_rewrite_routes_follow_up_call() {
+    if !k8s_smoke_preflight() {
+        return;
+    }
+
+    let dir = tempdir().expect("temp dir");
+    let kubeconfig = dir.path().join("kubeconfig");
+    let root_path = dir.path().join("root.json");
+    let agent_path = dir.path().join("agent.json");
+    let client_path = dir.path().join("client.json");
+
+    let agent_entrypoint = r#"
+set -eu
+mkdir -p /www/.well-known /www/cgi-bin
+cat >/www/.well-known/agent-card.json <<'JSON'
+{"name":"agent","description":"test agent","supportedInterfaces":[{"url":"http://127.0.0.1:8080/cgi-bin/a2a","protocolBinding":"JSONRPC","protocolVersion":"1.0"}],"capabilities":{},"defaultInputModes":["text/plain"],"defaultOutputModes":["text/plain"],"skills":[]}
+JSON
+cat >/www/cgi-bin/a2a <<'SH'
+#!/bin/sh
+touch /tmp/a2a-invoked
+echo 'Status: 200 OK'
+echo 'Content-Type: text/plain'
+echo
+echo 'a2a-ok'
+SH
+chmod +x /www/cgi-bin/a2a
+httpd -f -p 8080 -h /www
+"#;
+    let client_entrypoint = r#"
+set -eu
+i=0
+while [ "$i" -lt 60 ]; do
+  card="$(wget -qO- --timeout=2 --tries=1 "$AGENT_URL/.well-known/agent-card.json" 2>/dev/null || true)"
+  target="$(printf '%s' "$card" | sed -n 's/.*"url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  if [ -n "$target" ] && wget -qO- --timeout=2 --tries=1 "$target" >/tmp/a2a-response 2>/dev/null; then
+    touch /tmp/a2a-client-success
+    sleep infinity
+  fi
+  i=$((i+1))
+  sleep 1
+done
+touch /tmp/a2a-client-failed
+sleep infinity
+"#;
+
+    let root_manifest = json!({
+        "manifest_version": "0.1.0",
+        "components": {
+            "agent": "./agent.json",
+            "client": "./client.json"
+        },
+        "bindings": [{
+            "to": "#client.agent",
+            "from": "#agent.agent"
+        }]
+    });
+    fs::write(
+        &root_path,
+        serde_json::to_string_pretty(&root_manifest).expect("serialize root manifest"),
+    )
+    .expect("write root manifest");
+
+    let agent_manifest = json!({
+        "manifest_version": "0.1.0",
+        "program": {
+            "image": "busybox:1.36.1",
+            "args": ["sh", "-lc", agent_entrypoint],
+            "network": {
+                "endpoints": [{ "name": "agent", "port": 8080, "protocol": "http" }]
+            }
+        },
+        "provides": {
+            "agent": { "kind": "a2a", "endpoint": "agent" }
+        }
+    });
+    fs::write(
+        &agent_path,
+        serde_json::to_string_pretty(&agent_manifest).expect("serialize agent manifest"),
+    )
+    .expect("write agent manifest");
+
+    let client_manifest = json!({
+        "manifest_version": "0.1.0",
+        "program": {
+            "image": "busybox:1.36.1",
+            "args": ["sh", "-lc", client_entrypoint],
+            "env": {
+                "AGENT_URL": "${slots.agent.url}"
+            }
+        },
+        "slots": {
+            "agent": { "kind": "a2a" }
+        }
+    });
+    fs::write(
+        &client_path,
+        serde_json::to_string_pretty(&client_manifest).expect("serialize client manifest"),
+    )
+    .expect("write client manifest");
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..Default::default()
+    };
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let output = rt
+        .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
+        .expect("compile scenario");
+
+    let reporter = KubernetesReporter {
+        config: KubernetesReporterConfig {
+            disable_networkpolicy_check: true,
+        },
+    };
+    let artifact = reporter.emit(&output).expect("render kubernetes output");
+
+    let output_dir = dir.path().join("kubernetes");
+    write_kubernetes_output(&output_dir, &artifact);
+
+    let kustomization =
+        fs::read_to_string(output_dir.join("kustomization.yaml")).expect("read kustomization");
+    let kust_doc: serde_yaml::Value =
+        serde_yaml::from_str(&kustomization).expect("parse kustomization");
+    let namespace = kust_doc["namespace"]
+        .as_str()
+        .expect("kustomization namespace");
+
+    let platform = docker_platform();
+    build_router_image();
+    build_provisioner_image();
+    ensure_image_platform("busybox:1.36.1", &platform);
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let cluster_name = format!("amber-test-{}-{nonce}", std::process::id());
+    let _cluster_guard = KindClusterGuard::new(cluster_name.clone(), &kubeconfig);
+
+    for image in [ROUTER_IMAGE, PROVISIONER_IMAGE, "busybox:1.36.1"] {
+        let mut cmd = kind_cmd(&kubeconfig);
+        cmd.arg("load")
+            .arg("docker-image")
+            .arg(image)
+            .arg("--name")
+            .arg(&cluster_name);
+        checked_status(&mut cmd, &format!("kind load {image} image"));
+    }
+
+    let mut cmd = kubectl_cmd(&kubeconfig);
+    cmd.arg("apply").arg("-k").arg(&output_dir);
+    checked_status(&mut cmd, "kubectl apply amber");
+
+    let mut cmd = kubectl_cmd(&kubeconfig);
+    cmd.arg("wait")
+        .arg("--for=condition=complete")
+        .arg("--timeout=120s")
+        .arg("job")
+        .arg(PROVISIONER_NAME)
+        .arg("-n")
+        .arg(namespace);
+    checked_status(&mut cmd, "kubectl wait for provisioner job");
+
+    let mut cmd = kubectl_cmd(&kubeconfig);
+    cmd.arg("wait")
+        .arg("--for=condition=available")
+        .arg("--timeout=120s")
+        .arg("deployment")
+        .arg("--all")
+        .arg("-n")
+        .arg(namespace);
+    checked_status(&mut cmd, "kubectl wait for deployments");
+
+    let client_pod = {
+        let mut cmd = kubectl_cmd(&kubeconfig);
+        cmd.arg("get")
+            .arg("pod")
+            .arg("-n")
+            .arg(namespace)
+            .arg("-l")
+            .arg("amber.io/component=c2-client")
+            .arg("-o")
+            .arg("jsonpath={.items[0].metadata.name}");
+        let output = checked_output(&mut cmd, "kubectl get client pod");
+        let pod = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert!(!pod.is_empty(), "no client pod found");
+        pod
+    };
+    let agent_pod = {
+        let mut cmd = kubectl_cmd(&kubeconfig);
+        cmd.arg("get")
+            .arg("pod")
+            .arg("-n")
+            .arg(namespace)
+            .arg("-l")
+            .arg("amber.io/component=c1-agent")
+            .arg("-o")
+            .arg("jsonpath={.items[0].metadata.name}");
+        let output = checked_output(&mut cmd, "kubectl get agent pod");
+        let pod = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert!(!pod.is_empty(), "no agent pod found");
+        pod
+    };
+
+    for pod in [&client_pod, &agent_pod] {
+        let mut cmd = kubectl_cmd(&kubeconfig);
+        cmd.arg("wait")
+            .arg("--for=condition=ready")
+            .arg("--timeout=120s")
+            .arg("pod")
+            .arg("-n")
+            .arg(namespace)
+            .arg(pod);
+        checked_status(&mut cmd, &format!("kubectl wait for pod {pod}"));
+    }
+
+    let pod_logs = |pod: &str, container: &str| -> String {
+        let output = kubectl_cmd(&kubeconfig)
+            .arg("logs")
+            .arg("-n")
+            .arg(namespace)
+            .arg(pod)
+            .arg("-c")
+            .arg(container)
+            .output();
+        match output {
+            Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
+            Err(err) => format!("failed to capture logs for {pod}/{container}: {err}"),
+        }
+    };
+
+    let mut client_ok = false;
+    for _ in 0..60 {
+        let output = kubectl_cmd(&kubeconfig)
+            .arg("exec")
+            .arg("-n")
+            .arg(namespace)
+            .arg(&client_pod)
+            .arg("-c")
+            .arg("main")
+            .arg("--")
+            .arg("sh")
+            .arg("-lc")
+            .arg("test -f /tmp/a2a-client-success")
+            .output()
+            .unwrap();
+        if output.status.success() {
+            client_ok = true;
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    if !client_ok {
+        panic!(
+            "client never completed card discovery + follow-up call\nclient main \
+             logs:\n{}\nclient net logs:\n{}\nagent main logs:\n{}\nagent net logs:\n{}",
+            pod_logs(&client_pod, "main"),
+            pod_logs(&client_pod, "net"),
+            pod_logs(&agent_pod, "main"),
+            pod_logs(&agent_pod, "net"),
+        );
+    }
+
+    let invoked = kubectl_cmd(&kubeconfig)
+        .arg("exec")
+        .arg("-n")
+        .arg(namespace)
+        .arg(&agent_pod)
+        .arg("-c")
+        .arg("main")
+        .arg("--")
+        .arg("sh")
+        .arg("-lc")
+        .arg("test -f /tmp/a2a-invoked")
+        .output()
+        .unwrap();
+    assert!(
+        invoked.status.success(),
+        "agent endpoint was not invoked after card fetch\nagent main logs:\n{}\nagent net \
+         logs:\n{}",
+        pod_logs(&agent_pod, "main"),
+        pod_logs(&agent_pod, "net"),
+    );
 }
 
 #[test]
