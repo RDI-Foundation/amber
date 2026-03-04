@@ -43,32 +43,6 @@ fn docker_platform() -> String {
     format!("linux/{arch}")
 }
 
-fn tool_available(cmd: &str, args: &[&str]) -> bool {
-    Command::new(cmd)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()
-        .is_some_and(|status| status.success())
-}
-
-fn k8s_smoke_preflight() -> bool {
-    if !tool_available("docker", &["info"]) {
-        eprintln!("skipping kubernetes smoke test: docker daemon unavailable");
-        return false;
-    }
-    if !tool_available("kind", &["version"]) {
-        eprintln!("skipping kubernetes smoke test: kind not available");
-        return false;
-    }
-    if !tool_available("kubectl", &["version", "--client=true", "--short"]) {
-        eprintln!("skipping kubernetes smoke test: kubectl not available");
-        return false;
-    }
-    true
-}
-
 fn image_platform_opt(tag: &str) -> Option<String> {
     let output = Command::new("docker")
         .arg("image")
@@ -808,10 +782,6 @@ fn kubernetes_emits_router_for_external_slots() {
 #[test]
 #[ignore = "requires docker + kind + kubectl + curl; run manually"]
 fn kubernetes_smoke_config_roundtrip() {
-    if !k8s_smoke_preflight() {
-        return;
-    }
-
     let fixture_dir = tempdir().expect("create fixture temp dir");
     let scenario_path = write_kubernetes_smoke_fixture(fixture_dir.path());
 
@@ -972,10 +942,6 @@ fn kubernetes_smoke_config_roundtrip() {
 #[test]
 #[ignore = "requires docker + kind + kubectl; run manually"]
 fn kubernetes_smoke_external_slot_routes_to_outside_service() {
-    if !k8s_smoke_preflight() {
-        return;
-    }
-
     let dir = tempdir().expect("temp dir");
     let kubeconfig = dir.path().join("kubeconfig");
     let root_path = dir.path().join("root.json5");
@@ -1003,7 +969,7 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
           manifest_version: "0.1.0",
           program: {
             image: "busybox:1.36.1",
-            args: ["sh", "-lc", "sleep 3600"],
+            entrypoint: ["sh", "-lc", "sleep 3600"],
             env: { API_URL: "${slots.api.url}" }
           },
           slots: { api: { kind: "http" } }
@@ -1160,26 +1126,6 @@ spec:
         .arg(&client_pod);
     checked_status(&mut cmd, "kubectl wait for client pod");
 
-    let bypass = kubectl_cmd(&kubeconfig)
-        .arg("exec")
-        .arg("-n")
-        .arg(namespace)
-        .arg(&client_pod)
-        .arg("-c")
-        .arg("main")
-        .arg("--")
-        .arg("sh")
-        .arg("-lc")
-        .arg(r#"wget -qO- --timeout=2 --tries=1 "http://external-echo:8080" 2>/dev/null"#)
-        .output()
-        .unwrap();
-    if bypass.status.success() {
-        eprintln!(
-            "NetworkPolicy not enforced: client can reach external-echo directly; skipping bypass \
-             assertion"
-        );
-    }
-
     let mut ok = false;
     for _ in 0..30 {
         let output = kubectl_cmd(&kubeconfig)
@@ -1247,18 +1193,15 @@ spec:
 
 #[test]
 #[ignore = "requires docker + kind + kubectl; run manually"]
-fn kubernetes_smoke_a2a_card_url_rewrite_routes_follow_up_call() {
-    if !k8s_smoke_preflight() {
-        return;
-    }
-
+fn kubernetes_smoke_a2a_three_party_url_rewrite_routes_follow_up_call() {
     let dir = tempdir().expect("temp dir");
     let kubeconfig = dir.path().join("kubeconfig");
     let root_path = dir.path().join("root.json");
-    let agent_path = dir.path().join("agent.json");
-    let client_path = dir.path().join("client.json");
+    let agent_a_path = dir.path().join("agent-a.json");
+    let agent_b_path = dir.path().join("agent-b.json");
+    let client_c_path = dir.path().join("client-c.json");
 
-    let agent_entrypoint = r#"
+    let agent_a_entrypoint = r#"
 set -eu
 mkdir -p /www/.well-known /www/cgi-bin
 cat >/www/.well-known/agent-card.json <<'JSON'
@@ -1266,42 +1209,81 @@ cat >/www/.well-known/agent-card.json <<'JSON'
 JSON
 cat >/www/cgi-bin/a2a <<'SH'
 #!/bin/sh
-touch /tmp/a2a-invoked
+touch /tmp/a-invoked
 echo 'Status: 200 OK'
 echo 'Content-Type: text/plain'
 echo
-echo 'a2a-ok'
+echo 'a-ok'
 SH
 chmod +x /www/cgi-bin/a2a
 httpd -f -p 8080 -h /www
 "#;
-    let client_entrypoint = r#"
+    let agent_b_entrypoint = r#"
+set -eu
+mkdir -p /www/cgi-bin
+cat >/www/cgi-bin/inbox <<'SH'
+#!/bin/sh
+set -eu
+body="$(cat)"
+url="$(printf '%s' "$body" | sed -n 's/.*"url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+printf '%s' "$url" >/tmp/received-url
+expected_a_base="$(printf '%s' "$A_URL" | sed 's:/*$::')"
+expected_a_url="$expected_a_base/cgi-bin/a2a"
+if [ -n "$A_URL" ] && [ "$url" = "$expected_a_url" ]; then
+  touch /tmp/url-matched-a-slot
+fi
+if [ -n "$url" ] && wget -qO- --timeout=2 --tries=1 "$url" >/tmp/a-follow-up-response 2>/dev/null; then
+  touch /tmp/follow-up-success
+fi
+echo 'Status: 200 OK'
+echo 'Content-Type: text/plain'
+echo
+echo 'b-ok'
+SH
+chmod +x /www/cgi-bin/inbox
+httpd -f -p 8080 -h /www
+"#;
+    let client_c_entrypoint = r#"
 set -eu
 i=0
 while [ "$i" -lt 60 ]; do
-  card="$(wget -qO- --timeout=2 --tries=1 "$AGENT_URL/.well-known/agent-card.json" 2>/dev/null || true)"
+  card="$(wget -qO- --timeout=2 --tries=1 "$A_URL/.well-known/agent-card.json" 2>/dev/null || true)"
   target="$(printf '%s' "$card" | sed -n 's/.*"url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
-  if [ -n "$target" ] && wget -qO- --timeout=2 --tries=1 "$target" >/tmp/a2a-response 2>/dev/null; then
-    touch /tmp/a2a-client-success
-    sleep infinity
+  if [ -n "$target" ]; then
+    payload="{\"url\":\"$target\"}"
+    if wget -qO- --timeout=2 --tries=1 --header='Content-Type: application/json' --post-data "$payload" "$B_URL/cgi-bin/inbox" >/tmp/c-send-response 2>/dev/null; then
+      touch /tmp/c-send-success
+      sleep infinity
+    fi
   fi
   i=$((i+1))
   sleep 1
 done
-touch /tmp/a2a-client-failed
+touch /tmp/c-send-failed
 sleep infinity
 "#;
 
     let root_manifest = json!({
         "manifest_version": "0.1.0",
         "components": {
-            "agent": "./agent.json",
-            "client": "./client.json"
+            "agent-a": "./agent-a.json",
+            "agent-b": "./agent-b.json",
+            "client-c": "./client-c.json"
         },
-        "bindings": [{
-            "to": "#client.agent",
-            "from": "#agent.agent"
-        }]
+        "bindings": [
+            {
+                "to": "#agent-b.agent_a",
+                "from": "#agent-a.agent"
+            },
+            {
+                "to": "#client-c.z_agent_a",
+                "from": "#agent-a.agent"
+            },
+            {
+                "to": "#client-c.agent_b",
+                "from": "#agent-b.agent"
+            }
+        ]
     });
     fs::write(
         &root_path,
@@ -1309,41 +1291,74 @@ sleep infinity
     )
     .expect("write root manifest");
 
-    let agent_manifest = json!({
+    let agent_a_manifest = json!({
         "manifest_version": "0.1.0",
         "program": {
             "image": "busybox:1.36.1",
-            "args": ["sh", "-lc", agent_entrypoint],
+            "entrypoint": ["sh", "-lc", agent_a_entrypoint],
             "network": {
                 "endpoints": [{ "name": "agent", "port": 8080, "protocol": "http" }]
             }
         },
         "provides": {
             "agent": { "kind": "a2a", "endpoint": "agent" }
+        },
+        "exports": {
+            "agent": "agent"
         }
     });
     fs::write(
-        &agent_path,
-        serde_json::to_string_pretty(&agent_manifest).expect("serialize agent manifest"),
+        &agent_a_path,
+        serde_json::to_string_pretty(&agent_a_manifest).expect("serialize agent manifest"),
     )
     .expect("write agent manifest");
 
-    let client_manifest = json!({
+    let agent_b_manifest = json!({
         "manifest_version": "0.1.0",
         "program": {
             "image": "busybox:1.36.1",
-            "args": ["sh", "-lc", client_entrypoint],
+            "entrypoint": ["sh", "-lc", agent_b_entrypoint],
             "env": {
-                "AGENT_URL": "${slots.agent.url}"
+                "A_URL": "${slots.agent_a.url}"
+            },
+            "network": {
+                "endpoints": [{ "name": "agent", "port": 8080, "protocol": "http" }]
             }
         },
         "slots": {
-            "agent": { "kind": "a2a" }
+            "agent_a": { "kind": "a2a" }
+        },
+        "provides": {
+            "agent": { "kind": "a2a", "endpoint": "agent" }
+        },
+        "exports": {
+            "agent": "agent"
         }
     });
     fs::write(
-        &client_path,
-        serde_json::to_string_pretty(&client_manifest).expect("serialize client manifest"),
+        &agent_b_path,
+        serde_json::to_string_pretty(&agent_b_manifest).expect("serialize agent manifest"),
+    )
+    .expect("write agent manifest");
+
+    let client_c_manifest = json!({
+        "manifest_version": "0.1.0",
+        "program": {
+            "image": "busybox:1.36.1",
+            "entrypoint": ["sh", "-lc", client_c_entrypoint],
+            "env": {
+                "A_URL": "${slots.z_agent_a.url}",
+                "B_URL": "${slots.agent_b.url}"
+            }
+        },
+        "slots": {
+            "agent_b": { "kind": "a2a" },
+            "z_agent_a": { "kind": "a2a" }
+        }
+    });
+    fs::write(
+        &client_c_path,
+        serde_json::to_string_pretty(&client_c_manifest).expect("serialize client manifest"),
     )
     .expect("write client manifest");
 
@@ -1428,7 +1443,7 @@ sleep infinity
             .arg("-n")
             .arg(namespace)
             .arg("-l")
-            .arg("amber.io/component=c2-client")
+            .arg("amber.io/component=c3-client-c")
             .arg("-o")
             .arg("jsonpath={.items[0].metadata.name}");
         let output = checked_output(&mut cmd, "kubectl get client pod");
@@ -1436,23 +1451,38 @@ sleep infinity
         assert!(!pod.is_empty(), "no client pod found");
         pod
     };
-    let agent_pod = {
+    let agent_a_pod = {
         let mut cmd = kubectl_cmd(&kubeconfig);
         cmd.arg("get")
             .arg("pod")
             .arg("-n")
             .arg(namespace)
             .arg("-l")
-            .arg("amber.io/component=c1-agent")
+            .arg("amber.io/component=c1-agent-a")
             .arg("-o")
             .arg("jsonpath={.items[0].metadata.name}");
-        let output = checked_output(&mut cmd, "kubectl get agent pod");
+        let output = checked_output(&mut cmd, "kubectl get agent-a pod");
         let pod = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        assert!(!pod.is_empty(), "no agent pod found");
+        assert!(!pod.is_empty(), "no agent-a pod found");
+        pod
+    };
+    let agent_b_pod = {
+        let mut cmd = kubectl_cmd(&kubeconfig);
+        cmd.arg("get")
+            .arg("pod")
+            .arg("-n")
+            .arg(namespace)
+            .arg("-l")
+            .arg("amber.io/component=c2-agent-b")
+            .arg("-o")
+            .arg("jsonpath={.items[0].metadata.name}");
+        let output = checked_output(&mut cmd, "kubectl get agent-b pod");
+        let pod = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert!(!pod.is_empty(), "no agent-b pod found");
         pod
     };
 
-    for pod in [&client_pod, &agent_pod] {
+    for pod in [&client_pod, &agent_a_pod, &agent_b_pod] {
         let mut cmd = kubectl_cmd(&kubeconfig);
         cmd.arg("wait")
             .arg("--for=condition=ready")
@@ -1491,7 +1521,7 @@ sleep infinity
             .arg("--")
             .arg("sh")
             .arg("-lc")
-            .arg("test -f /tmp/a2a-client-success")
+            .arg("test -f /tmp/c-send-success")
             .output()
             .unwrap();
         if output.status.success() {
@@ -1502,44 +1532,64 @@ sleep infinity
     }
     if !client_ok {
         panic!(
-            "client never completed card discovery + follow-up call\nclient main \
-             logs:\n{}\nclient net logs:\n{}\nagent main logs:\n{}\nagent net logs:\n{}",
+            "client C never completed card discovery + relay call\nclient main logs:\n{}\nclient \
+             net logs:\n{}\nagent-a main logs:\n{}\nagent-a net logs:\n{}\nagent-b main \
+             logs:\n{}\nagent-b net logs:\n{}",
             pod_logs(&client_pod, "main"),
             pod_logs(&client_pod, "net"),
-            pod_logs(&agent_pod, "main"),
-            pod_logs(&agent_pod, "net"),
+            pod_logs(&agent_a_pod, "main"),
+            pod_logs(&agent_a_pod, "net"),
+            pod_logs(&agent_b_pod, "main"),
+            pod_logs(&agent_b_pod, "net"),
         );
     }
 
-    let invoked = kubectl_cmd(&kubeconfig)
+    let follow_up = kubectl_cmd(&kubeconfig)
         .arg("exec")
         .arg("-n")
         .arg(namespace)
-        .arg(&agent_pod)
+        .arg(&agent_b_pod)
         .arg("-c")
         .arg("main")
         .arg("--")
         .arg("sh")
         .arg("-lc")
-        .arg("test -f /tmp/a2a-invoked")
+        .arg("test -f /tmp/follow-up-success && test -f /tmp/url-matched-a-slot")
+        .output()
+        .unwrap();
+    assert!(
+        follow_up.status.success(),
+        "agent B did not receive an A URL rewritten to B's local slot view\nagent-b main \
+         logs:\n{}\nagent-b net logs:\n{}",
+        pod_logs(&agent_b_pod, "main"),
+        pod_logs(&agent_b_pod, "net"),
+    );
+
+    let invoked = kubectl_cmd(&kubeconfig)
+        .arg("exec")
+        .arg("-n")
+        .arg(namespace)
+        .arg(&agent_a_pod)
+        .arg("-c")
+        .arg("main")
+        .arg("--")
+        .arg("sh")
+        .arg("-lc")
+        .arg("test -f /tmp/a-invoked")
         .output()
         .unwrap();
     assert!(
         invoked.status.success(),
-        "agent endpoint was not invoked after card fetch\nagent main logs:\n{}\nagent net \
-         logs:\n{}",
-        pod_logs(&agent_pod, "main"),
-        pod_logs(&agent_pod, "net"),
+        "agent A endpoint was not invoked by agent B follow-up call\nagent-a main \
+         logs:\n{}\nagent-a net logs:\n{}",
+        pod_logs(&agent_a_pod, "main"),
+        pod_logs(&agent_a_pod, "net"),
     );
 }
 
 #[test]
 #[ignore = "requires docker + kind + kubectl; run manually"]
 fn kubernetes_smoke_export_routes_to_host() {
-    if !k8s_smoke_preflight() {
-        return;
-    }
-
     let dir = tempdir().expect("temp dir");
     let kubeconfig = dir.path().join("kubeconfig");
     let root_path = dir.path().join("root.json5");
@@ -1564,10 +1614,11 @@ fn kubernetes_smoke_export_routes_to_host() {
           manifest_version: "0.1.0",
           program: {
             image: "busybox:1.36.1",
-            args: ["sh", "-lc", "mkdir -p /www && echo export-ok > /www/index.html && httpd -f -p 8080 -h /www"],
+            entrypoint: ["sh", "-lc", "mkdir -p /www && echo export-ok > /www/index.html && httpd -f -p 8080 -h /www"],
             network: { endpoints: [ { name: "api", port: 8080, protocol: "http" } ] }
           },
-          provides: { api: { kind: "http", endpoint: "api" } }
+          provides: { api: { kind: "http", endpoint: "api" } },
+          exports: { api: "api" }
         }
         "#,
     )
@@ -1809,6 +1860,7 @@ fn kubernetes_smoke_export_routes_to_host() {
             listen_port: proxy_listen.port(),
             listen_addr: Some(proxy_listen.ip().to_string()),
             protocol: MeshProtocol::Http,
+            http_plugins: Vec::new(),
             peer_addr: router_addr.to_string(),
             peer_id: router_id.clone(),
             capability: export_name.to_string(),

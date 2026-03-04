@@ -230,6 +230,8 @@ pub struct OutboundRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_addr: Option<String>,
     pub protocol: MeshProtocol,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub http_plugins: Vec<HttpRoutePlugin>,
     pub peer_addr: String,
     pub peer_id: String,
     pub capability: String,

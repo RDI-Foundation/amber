@@ -1797,7 +1797,7 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
 
 #[test]
 #[ignore = "requires docker + docker compose; run manually"]
-fn docker_smoke_a2a_card_url_rewrite_routes_follow_up_call() {
+fn docker_smoke_a2a_three_party_url_rewrite_routes_follow_up_call() {
     use tempfile::tempdir;
 
     struct ComposeGuard {
@@ -1841,7 +1841,7 @@ fn docker_smoke_a2a_card_url_rewrite_routes_follow_up_call() {
     ]);
     ensure_image_platform("busybox:1.36.1", &platform);
 
-    let agent_entrypoint = r#"
+    let agent_a_entrypoint = r#"
 set -eu
 mkdir -p /www/.well-known /www/cgi-bin
 cat >/www/.well-known/agent-card.json <<'JSON'
@@ -1849,45 +1849,85 @@ cat >/www/.well-known/agent-card.json <<'JSON'
 JSON
 cat >/www/cgi-bin/a2a <<'SH'
 #!/bin/sh
-touch /tmp/a2a-invoked
+touch /tmp/a-invoked
 echo 'Status: 200 OK'
 echo 'Content-Type: text/plain'
 echo
-echo 'a2a-ok'
+echo 'a-ok'
 SH
 chmod +x /www/cgi-bin/a2a
 httpd -f -p 8080 -h /www
 "#;
-    let client_entrypoint = r#"
+    let agent_b_entrypoint = r#"
+set -eu
+mkdir -p /www/cgi-bin
+cat >/www/cgi-bin/inbox <<'SH'
+#!/bin/sh
+set -eu
+body="$(cat)"
+url="$(printf '%s' "$body" | sed -n 's/.*"url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+printf '%s' "$url" >/tmp/received-url
+expected_a_base="$(printf '%s' "$A_URL" | sed 's:/*$::')"
+expected_a_url="$expected_a_base/cgi-bin/a2a"
+if [ -n "$A_URL" ] && [ "$url" = "$expected_a_url" ]; then
+  touch /tmp/url-matched-a-slot
+fi
+if [ -n "$url" ] && wget -qO- --timeout=2 --tries=1 "$url" >/tmp/a-follow-up-response 2>/dev/null; then
+  touch /tmp/follow-up-success
+fi
+echo 'Status: 200 OK'
+echo 'Content-Type: text/plain'
+echo
+echo 'b-ok'
+SH
+chmod +x /www/cgi-bin/inbox
+httpd -f -p 8080 -h /www
+"#;
+    let client_c_entrypoint = r#"
 set -eu
 i=0
 while [ "$i" -lt 60 ]; do
-  card="$(wget -qO- --timeout=2 --tries=1 "$AGENT_URL/.well-known/agent-card.json" 2>/dev/null || true)"
+  card="$(wget -qO- --timeout=2 --tries=1 "$A_URL/.well-known/agent-card.json" 2>/dev/null || true)"
   target="$(printf '%s' "$card" | sed -n 's/.*"url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
-  if [ -n "$target" ] && wget -qO- --timeout=2 --tries=1 "$target" >/tmp/a2a-response 2>/dev/null; then
-    touch /tmp/a2a-client-success
-    sleep infinity
+  if [ -n "$target" ]; then
+    payload="{\"url\":\"$target\"}"
+    if wget -qO- --timeout=2 --tries=1 --header='Content-Type: application/json' --post-data "$payload" "$B_URL/cgi-bin/inbox" >/tmp/c-send-response 2>/dev/null; then
+      touch /tmp/c-send-success
+      sleep infinity
+    fi
   fi
   i=$((i+1))
   sleep 1
 done
-touch /tmp/a2a-client-failed
+touch /tmp/c-send-failed
 sleep infinity
 "#;
 
-    let agent_program = serde_json::from_value(json!({
+    let agent_a_program = serde_json::from_value(json!({
         "image": "busybox:1.36.1",
-        "entrypoint": ["sh", "-lc", agent_entrypoint],
+        "entrypoint": ["sh", "-lc", agent_a_entrypoint],
         "network": {
             "endpoints": [{ "name": "agent", "port": 8080, "protocol": "http" }]
         }
     }))
     .unwrap();
-    let client_program = serde_json::from_value(json!({
+    let agent_b_program = serde_json::from_value(json!({
         "image": "busybox:1.36.1",
-        "entrypoint": ["sh", "-lc", client_entrypoint],
+        "entrypoint": ["sh", "-lc", agent_b_entrypoint],
         "env": {
-            "AGENT_URL": "${slots.agent.url}"
+            "A_URL": "${slots.agent_a.url}"
+        },
+        "network": {
+            "endpoints": [{ "name": "agent", "port": 8080, "protocol": "http" }]
+        }
+    }))
+    .unwrap();
+    let client_c_program = serde_json::from_value(json!({
+        "image": "busybox:1.36.1",
+        "entrypoint": ["sh", "-lc", client_c_entrypoint],
+        "env": {
+            "A_URL": "${slots.z_agent_a.url}",
+            "B_URL": "${slots.agent_b.url}"
         }
     }))
     .unwrap();
@@ -1908,31 +1948,48 @@ sleep infinity
         provides: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
-        children: vec![ComponentId(1), ComponentId(2)],
+        children: vec![ComponentId(1), ComponentId(2), ComponentId(3)],
     };
-    let agent = Component {
+    let agent_a = Component {
         id: ComponentId(1),
         parent: Some(ComponentId(0)),
-        moniker: moniker("/agent"),
+        moniker: moniker("/agent-a"),
         digest: digest(1),
         config: None,
         config_schema: None,
-        program: Some(agent_program),
+        program: Some(agent_a_program),
         slots: BTreeMap::new(),
+        provides: BTreeMap::from([("agent".to_string(), provide_a2a.clone())]),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+    let agent_b = Component {
+        id: ComponentId(2),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/agent-b"),
+        digest: digest(2),
+        config: None,
+        config_schema: None,
+        program: Some(agent_b_program),
+        slots: BTreeMap::from([("agent_a".to_string(), slot_a2a.clone())]),
         provides: BTreeMap::from([("agent".to_string(), provide_a2a)]),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
-    let client = Component {
-        id: ComponentId(2),
+    let client_c = Component {
+        id: ComponentId(3),
         parent: Some(ComponentId(0)),
         moniker: moniker("/client"),
-        digest: digest(2),
+        digest: digest(3),
         config: None,
         config_schema: None,
-        program: Some(client_program),
-        slots: BTreeMap::from([("agent".to_string(), slot_a2a)]),
+        program: Some(client_c_program),
+        slots: BTreeMap::from([
+            ("agent_b".to_string(), slot_a2a.clone()),
+            ("z_agent_a".to_string(), slot_a2a),
+        ]),
         provides: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
@@ -1941,19 +1998,45 @@ sleep infinity
 
     let scenario = Scenario {
         root: ComponentId(0),
-        components: vec![Some(root), Some(agent), Some(client)],
-        bindings: vec![BindingEdge {
-            name: None,
-            from: BindingFrom::Component(ProvideRef {
-                component: ComponentId(1),
-                name: "agent".to_string(),
-            }),
-            to: SlotRef {
-                component: ComponentId(2),
-                name: "agent".to_string(),
+        components: vec![Some(root), Some(agent_a), Some(agent_b), Some(client_c)],
+        bindings: vec![
+            BindingEdge {
+                name: None,
+                from: BindingFrom::Component(ProvideRef {
+                    component: ComponentId(1),
+                    name: "agent".to_string(),
+                }),
+                to: SlotRef {
+                    component: ComponentId(2),
+                    name: "agent_a".to_string(),
+                },
+                weak: false,
             },
-            weak: false,
-        }],
+            BindingEdge {
+                name: None,
+                from: BindingFrom::Component(ProvideRef {
+                    component: ComponentId(1),
+                    name: "agent".to_string(),
+                }),
+                to: SlotRef {
+                    component: ComponentId(3),
+                    name: "z_agent_a".to_string(),
+                },
+                weak: false,
+            },
+            BindingEdge {
+                name: None,
+                from: BindingFrom::Component(ProvideRef {
+                    component: ComponentId(2),
+                    name: "agent".to_string(),
+                }),
+                to: SlotRef {
+                    component: ComponentId(3),
+                    name: "agent_b".to_string(),
+                },
+                weak: false,
+            },
+        ],
         exports: Vec::new(),
     };
 
@@ -1978,10 +2061,10 @@ sleep infinity
         let output = compose(&[
             "exec",
             "-T",
-            "c2-client",
+            "c3-client",
             "sh",
             "-lc",
-            "test -f /tmp/a2a-client-success",
+            "test -f /tmp/c-send-success",
         ])
         .output()
         .unwrap();
@@ -1998,24 +2081,62 @@ sleep infinity
             .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
             .unwrap_or_else(|err| format!("failed to capture compose logs: {err}"));
         panic!(
-            "client never completed card discovery + follow-up call\ncompose logs:\n{}",
+            "client C never completed card discovery + relay call\ncompose logs:\n{}",
             compose_logs
         );
     }
 
+    let follow_up = compose(&[
+        "exec",
+        "-T",
+        "c2-agent-b",
+        "sh",
+        "-lc",
+        "test -f /tmp/follow-up-success && test -f /tmp/url-matched-a-slot",
+    ])
+    .output()
+    .unwrap();
+    let received_url = compose(&[
+        "exec",
+        "-T",
+        "c2-agent-b",
+        "sh",
+        "-lc",
+        "cat /tmp/received-url 2>/dev/null || true",
+    ])
+    .output()
+    .unwrap();
+    let expected_a_url = compose(&[
+        "exec",
+        "-T",
+        "c2-agent-b",
+        "sh",
+        "-lc",
+        "printf '%s' \"$A_URL\"",
+    ])
+    .output()
+    .unwrap();
+    assert!(
+        follow_up.status.success(),
+        "agent B did not receive an A URL rewritten to B's local slot view\nreceived URL: \
+         {}\nA_URL: {}",
+        String::from_utf8_lossy(&received_url.stdout).trim(),
+        String::from_utf8_lossy(&expected_a_url.stdout).trim(),
+    );
+
     let invoked = compose(&[
         "exec",
         "-T",
-        "c1-agent",
+        "c1-agent-a",
         "sh",
         "-lc",
-        "test -f /tmp/a2a-invoked",
+        "test -f /tmp/a-invoked",
     ])
     .output()
     .unwrap();
     assert!(
         invoked.status.success(),
-        "agent endpoint was not invoked after card fetch"
+        "agent A endpoint was not invoked by agent B follow-up call"
     );
 }
 

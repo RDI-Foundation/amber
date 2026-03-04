@@ -442,6 +442,7 @@ async fn proxy(args: ProxyArgs) -> Result<()> {
             listen_port: binding.listen.port(),
             listen_addr: Some(binding.listen.ip().to_string()),
             protocol,
+            http_plugins: Vec::new(),
             peer_addr: router_addr.to_string(),
             peer_id: router_identity.id.clone(),
             capability: export.to_string(),

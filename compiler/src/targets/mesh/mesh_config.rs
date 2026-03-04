@@ -242,12 +242,24 @@ pub(crate) fn build_mesh_config_plan(
                 .id
                 .clone();
             let protocol = mesh_protocol(binding.endpoint.protocol)?;
+            let provide_decl = scenario
+                .component(binding.provider)
+                .provides
+                .get(&binding.provide)
+                .expect("binding provide should exist");
             outbound.push(OutboundRoute {
                 route_id: component_route_id(&peer_id, &binding.provide, protocol),
                 slot: binding.slot.clone(),
                 listen_port,
                 listen_addr: None,
                 protocol,
+                http_plugins: matches!(
+                    (provide_decl.decl.kind, protocol),
+                    (CapabilityKind::A2a, MeshProtocol::Http)
+                )
+                .then_some(HttpRoutePlugin::A2a)
+                .into_iter()
+                .collect(),
                 peer_addr,
                 peer_id: peer_id.clone(),
                 capability: binding.provide.clone(),
@@ -282,6 +294,7 @@ pub(crate) fn build_mesh_config_plan(
                 listen_port,
                 listen_addr: None,
                 protocol,
+                http_plugins: Vec::new(),
                 peer_addr: router_addr,
                 peer_id: router_identity.id.clone(),
                 capability: binding.external_slot.clone(),
