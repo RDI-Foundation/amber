@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 #[cfg(test)]
 mod tests;
@@ -180,17 +183,23 @@ impl Compiler {
             &self.store,
         );
         diagnostics.extend(binding_reports);
-        diagnostics.extend(collect_manifest_diagnostics_from_tree(
-            &tree,
-            &self.store,
-            &suppressed_unused_config_lints,
-        ));
         let mut has_errors = false;
+        let tree_for_manifest_lints = tree.clone();
 
         match linker::link(tree, &self.store) {
-            Ok((_scenario, _provenance)) => {}
+            Ok((scenario, provenance)) => diagnostics.extend(collect_manifest_diagnostics(
+                &scenario,
+                &provenance,
+                &self.store,
+                &suppressed_unused_config_lints,
+            )),
             Err(err) => {
                 has_errors = true;
+                diagnostics.extend(collect_manifest_diagnostics_from_tree(
+                    &tree_for_manifest_lints,
+                    &self.store,
+                    &suppressed_unused_config_lints,
+                ));
                 let mut link_errors = Vec::new();
                 match err {
                     linker::Error::Multiple { errors, .. } => link_errors.extend(errors),
@@ -265,6 +274,7 @@ fn collect_manifest_diagnostics(
     suppressed_unused_config_lints: &binding_validation::SuppressedUnusedConfigLints,
 ) -> Vec<Report> {
     let mut diagnostics = Vec::new();
+    let optional_slots = effective_optional_slots_by_component(scenario, provenance);
 
     for (_, component) in scenario.components_iter() {
         let manifest = store
@@ -287,6 +297,7 @@ fn collect_manifest_diagnostics(
                 .into_iter()
                 .filter(|lint| {
                     !suppress_manifest_unused_config_lint(lint, suppressed_unused_config_lints)
+                        && !suppress_manifest_unused_slot_lint(lint, &optional_slots)
                 })
                 .map(Report::new),
         );
@@ -365,4 +376,55 @@ fn suppress_manifest_unused_config_lint(
     suppressed_unused_config_lints
         .get(component)
         .is_some_and(|paths| paths.contains(path))
+}
+
+fn suppress_manifest_unused_slot_lint(
+    lint: &ManifestLint,
+    optional_slots_by_component: &BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    let ManifestLint::UnusedSlot {
+        name, component, ..
+    } = lint
+    else {
+        return false;
+    };
+
+    optional_slots_by_component
+        .get(component)
+        .is_some_and(|slots| slots.contains(name))
+}
+
+fn effective_optional_slots_by_component(
+    scenario: &Scenario,
+    provenance: &Provenance,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut out = BTreeMap::new();
+
+    for (_, component) in scenario.components_iter() {
+        let component_path = provenance
+            .for_component(component.id)
+            .authored_moniker
+            .to_string();
+        let slots = out.entry(component_path).or_insert_with(BTreeSet::new);
+        for (slot_name, slot_decl) in &component.slots {
+            if slot_decl.optional {
+                slots.insert(slot_name.clone());
+            }
+        }
+    }
+
+    for binding in &scenario.bindings {
+        if !binding.weak {
+            continue;
+        }
+        let component_path = provenance
+            .for_component(binding.to.component)
+            .authored_moniker
+            .to_string();
+        out.entry(component_path)
+            .or_insert_with(BTreeSet::new)
+            .insert(binding.to.name.clone());
+    }
+
+    out
 }
