@@ -42,13 +42,13 @@ fn main() {
             continue;
         };
         let version = version.trim();
-        let parsed = versioning::parse_manifest_version(version).unwrap_or_else(|reason| {
+        let parsed = versioning::parse_manifest_version_spec(version).unwrap_or_else(|reason| {
             panic!(
                 "image {} has invalid version {}: {reason}",
                 image.name, version
             )
         });
-        let tag = versioning::runtime_tag(&parsed);
+        let tag = versioning::runtime_tag(parsed.seed_version());
         let const_name = const_name(&image.name);
         if const_name.is_empty() {
             panic!("image {} produced an empty constant name", image.name);
