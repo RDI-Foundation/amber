@@ -382,6 +382,53 @@ impl Drop for KindClusterGuard {
     }
 }
 
+struct KindCluster {
+    name: String,
+    kubeconfig: PathBuf,
+    _guard: Option<KindClusterGuard>,
+}
+
+impl KindCluster {
+    fn from_env_or_create(default_kubeconfig: &Path) -> Self {
+        match (
+            std::env::var("AMBER_TEST_KIND_CLUSTER_NAME").ok(),
+            std::env::var("AMBER_TEST_KIND_KUBECONFIG").ok(),
+        ) {
+            (Some(name), Some(kubeconfig)) => {
+                if name.is_empty() || kubeconfig.is_empty() {
+                    panic!(
+                        "AMBER_TEST_KIND_CLUSTER_NAME and AMBER_TEST_KIND_KUBECONFIG must be \
+                         non-empty when set"
+                    );
+                }
+                Self {
+                    name,
+                    kubeconfig: PathBuf::from(kubeconfig),
+                    _guard: None,
+                }
+            }
+            (None, None) => {
+                let nonce = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time")
+                    .as_nanos();
+                let name = format!("amber-test-{}-{nonce}", std::process::id());
+                let guard = KindClusterGuard::new(name.clone(), default_kubeconfig);
+                Self {
+                    name,
+                    kubeconfig: default_kubeconfig.to_path_buf(),
+                    _guard: Some(guard),
+                }
+            }
+            _ => {
+                panic!(
+                    "set both AMBER_TEST_KIND_CLUSTER_NAME and AMBER_TEST_KIND_KUBECONFIG together"
+                );
+            }
+        }
+    }
+}
+
 struct PortForwardGuard {
     child: std::process::Child,
     log_path: PathBuf,
@@ -841,12 +888,9 @@ fn kubernetes_smoke_config_roundtrip() {
     ensure_image_platform("busybox:1.36", &platform);
     let images = internal_images();
 
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time")
-        .as_nanos();
-    let cluster_name = format!("amber-test-{}-{nonce}", std::process::id());
-    let _cluster_guard = KindClusterGuard::new(cluster_name.clone(), &kubeconfig);
+    let cluster = KindCluster::from_env_or_create(&kubeconfig);
+    let cluster_name = cluster.name.clone();
+    let kubeconfig = cluster.kubeconfig.clone();
 
     for image in [
         images.helper.as_str(),
@@ -1038,12 +1082,9 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
     ensure_image_platform("busybox:1.36.1", &platform);
     let images = internal_images();
 
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time")
-        .as_nanos();
-    let cluster_name = format!("amber-test-{}-{nonce}", std::process::id());
-    let _cluster_guard = KindClusterGuard::new(cluster_name.clone(), &kubeconfig);
+    let cluster = KindCluster::from_env_or_create(&kubeconfig);
+    let cluster_name = cluster.name.clone();
+    let kubeconfig = cluster.kubeconfig.clone();
 
     for image in [
         images.router.as_str(),
@@ -1419,12 +1460,9 @@ sleep infinity
     ensure_image_platform("busybox:1.36.1", &platform);
     let images = internal_images();
 
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time")
-        .as_nanos();
-    let cluster_name = format!("amber-test-{}-{nonce}", std::process::id());
-    let _cluster_guard = KindClusterGuard::new(cluster_name.clone(), &kubeconfig);
+    let cluster = KindCluster::from_env_or_create(&kubeconfig);
+    let cluster_name = cluster.name.clone();
+    let kubeconfig = cluster.kubeconfig.clone();
 
     for image in [
         images.router.as_str(),
@@ -1686,12 +1724,9 @@ fn kubernetes_smoke_export_routes_to_host() {
     ensure_image_platform("busybox:1.36.1", &platform);
     let images = internal_images();
 
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time")
-        .as_secs();
-    let cluster_name = format!("amber-test-{}-{nonce}", std::process::id());
-    let _cluster_guard = KindClusterGuard::new(cluster_name.clone(), &kubeconfig);
+    let cluster = KindCluster::from_env_or_create(&kubeconfig);
+    let cluster_name = cluster.name.clone();
+    let kubeconfig = cluster.kubeconfig.clone();
 
     for image in [
         images.router.as_str(),

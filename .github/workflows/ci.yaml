@@ -67,6 +67,15 @@ jobs:
             chmod +x /tmp/kubectl
             sudo mv /tmp/kubectl /usr/local/bin/kubectl
           fi
+      - name: Create shared KinD cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+          cluster_name="amber-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          kubeconfig="${RUNNER_TEMP}/amber-kind-kubeconfig"
+          kind create cluster --name "$cluster_name" --kubeconfig "$kubeconfig" --wait 120s
+          echo "AMBER_TEST_KIND_CLUSTER_NAME=${cluster_name}" >> "$GITHUB_ENV"
+          echo "AMBER_TEST_KIND_KUBECONFIG=${kubeconfig}" >> "$GITHUB_ENV"
       - name: Compute image registries
         if: github.event_name == 'pull_request'
         id: registry
@@ -136,6 +145,14 @@ jobs:
           cargo test -p amber-compiler --all-features kubernetes_smoke_config_roundtrip -- --ignored --test-threads=1
           cargo test -p amber-compiler --all-features kubernetes_smoke_external_slot_routes_to_outside_service -- --ignored --test-threads=1
           cargo test -p amber-compiler --all-features kubernetes_smoke_export_routes_to_host -- --ignored --test-threads=1
+      - name: Delete shared KinD cluster
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${AMBER_TEST_KIND_CLUSTER_NAME:-}" ]; then
+            kind delete cluster --name "${AMBER_TEST_KIND_CLUSTER_NAME}" --kubeconfig "${AMBER_TEST_KIND_KUBECONFIG}"
+          fi
 
   image-matrix:
     name: Image Matrix
