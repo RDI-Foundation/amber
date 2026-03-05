@@ -71,13 +71,14 @@ jobs:
         with:
           images: ${{ steps.registry.outputs.image_registry }}/${{ matrix.image }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=semver,pattern=v{{version}}
-            type=semver,pattern=v{{major}}.{{minor}}
-            type=semver,pattern=v{{major}}
-            type=raw,value=${{ github.sha }}
+            type=ref,event=branch,enable=${{ github.ref == 'refs/heads/main' }}
+            type=ref,event=tag,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern=v{{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern=v{{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern=v{{major}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=${{ github.sha }},enable=${{ github.ref == 'refs/heads/main' }}
           flavor: |
+            latest=false
             suffix=-${{ matrix.arch }}
       - name: Build and push
         uses: docker/build-push-action@v5
@@ -139,12 +140,14 @@ jobs:
         with:
           images: ${{ steps.images.outputs.images }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=semver,pattern=v{{version}}
-            type=semver,pattern=v{{major}}.{{minor}}
-            type=semver,pattern=v{{major}}
-            type=raw,value=${{ github.sha }}
+            type=ref,event=branch,enable=${{ github.ref == 'refs/heads/main' }}
+            type=ref,event=tag,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern=v{{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern=v{{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern=v{{major}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=${{ github.sha }},enable=${{ github.ref == 'refs/heads/main' }}
+          flavor: |
+            latest=false
       - name: Publish multi-arch manifests
         run: |
           set -euo pipefail
