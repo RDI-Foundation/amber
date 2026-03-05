@@ -1,5 +1,6 @@
 use std::{fs, path::Path, process::Command};
 
+use amber_compiler::reporter::direct::DIRECT_CONTROL_SOCKET_RELATIVE_PATH;
 use amber_images::AMBER_ROUTER;
 use serde_json::Value;
 use serde_yaml::Value as YamlValue;
@@ -396,5 +397,136 @@ fn compile_with_binding_interpolation() {
     assert_eq!(
         env_value(provisioner, "AMBER_MESH_PROVISION_PLAN_PATH").as_deref(),
         Some("/amber/plan/mesh-provision-plan.json")
+    );
+}
+
+#[test]
+fn compile_writes_direct_artifact() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+    let manifest = workspace_root
+        .join("examples")
+        .join("direct-security")
+        .join("scenario.json5");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("direct-outputs-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+    let artifact_dir = outputs_dir.path().join("direct");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&artifact_dir)
+        .arg(&manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    if !output.status.success() {
+        panic!(
+            "amber compile --direct failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let direct_plan_path = artifact_dir.join("direct-plan.json");
+    let provision_plan_path = artifact_dir.join("mesh-provision-plan.json");
+    let run_script_path = artifact_dir.join("run.sh");
+    assert!(direct_plan_path.is_file(), "missing direct-plan.json");
+    assert!(
+        provision_plan_path.is_file(),
+        "missing mesh-provision-plan.json"
+    );
+    assert!(run_script_path.is_file(), "missing run.sh");
+
+    let direct_plan = fs::read_to_string(&direct_plan_path).expect("failed to read direct plan");
+    let direct_json: Value =
+        serde_json::from_str(&direct_plan).expect("direct plan should be valid JSON");
+    assert_eq!(direct_json["version"], "1");
+    let components = direct_json["components"]
+        .as_array()
+        .expect("direct plan components should be an array");
+    assert!(
+        !components.is_empty(),
+        "direct plan should include at least one component"
+    );
+    assert_eq!(
+        direct_json["router"]["control_socket_path"].as_str(),
+        Some(DIRECT_CONTROL_SOCKET_RELATIVE_PATH)
+    );
+    assert_eq!(direct_json["router"]["control_port"].as_u64(), Some(0));
+
+    let proxy_metadata_path = artifact_dir.join("amber-proxy.json");
+    let proxy_metadata =
+        fs::read_to_string(&proxy_metadata_path).expect("failed to read direct proxy metadata");
+    let proxy_json: Value =
+        serde_json::from_str(&proxy_metadata).expect("proxy metadata should be valid JSON");
+    assert_eq!(
+        proxy_json["router"]["control_socket"].as_str(),
+        Some(DIRECT_CONTROL_SOCKET_RELATIVE_PATH)
+    );
+    assert_eq!(proxy_json["router"]["control_port"].as_u64(), Some(0));
+}
+
+#[test]
+fn compile_direct_rejects_program_path_without_separator() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("direct-bare-program-path-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let manifest = outputs_dir.path().join("scenario.json5");
+    fs::write(
+        &manifest,
+        r#"{
+  manifest_version: "0.1.0",
+  program: {
+    path: "python3",
+    args: ["-m", "http.server", "8080"],
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"#,
+    )
+    .expect("failed to write manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(outputs_dir.path().join("direct"))
+        .arg(&manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    assert!(
+        !output.status.success(),
+        "amber compile --direct unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("does not search PATH"),
+        "expected PATH rejection in stderr, got:\n{stderr}"
     );
 }

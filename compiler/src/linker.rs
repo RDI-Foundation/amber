@@ -1030,30 +1030,48 @@ fn validate_config_tree(
             }
         };
 
-        if let Ok(image) = program.image.parse::<InterpolatedString>() {
-            for part in &image.parts {
+        if let Some(executable) = program.image_ref() {
+            if let Ok(parsed) = executable.parse::<InterpolatedString>() {
+                for part in &parsed.parts {
+                    let InterpolatedPart::Interpolation { source, query } = part else {
+                        continue;
+                    };
+                    if *source == InterpolationSource::Config {
+                        validate_config_ref("program.image".to_string(), query);
+                    }
+                }
+            }
+        } else if let Some(executable) = program.path_ref()
+            && let Ok(parsed) = executable.parse::<InterpolatedString>()
+        {
+            for part in &parsed.parts {
                 let InterpolatedPart::Interpolation { source, query } = part else {
                     continue;
                 };
                 if *source == InterpolationSource::Config {
-                    validate_config_ref("program.image".to_string(), query);
+                    validate_config_ref("program.path".to_string(), query);
                 }
             }
         }
 
-        // entrypoint / env are structured (InterpolatedString), so we never need to re-parse `${...}`.
-        for (arg_idx, arg) in program.entrypoint.0.iter().enumerate() {
+        // args/env are structured (InterpolatedString), so we never need to re-parse `${...}`.
+        let command_location = if program.image_ref().is_some() {
+            "program.entrypoint"
+        } else {
+            "program.args"
+        };
+        for (arg_idx, arg) in program.command().0.iter().enumerate() {
             for part in &arg.parts {
                 let InterpolatedPart::Interpolation { source, query } = part else {
                     continue;
                 };
                 if *source == InterpolationSource::Config {
-                    validate_config_ref(format!("program.entrypoint[{arg_idx}]"), query);
+                    validate_config_ref(format!("{command_location}[{arg_idx}]"), query);
                 }
             }
         }
 
-        for (k, v) in &program.env {
+        for (k, v) in program.env() {
             for part in &v.parts {
                 let InterpolatedPart::Interpolation { source, query } = part else {
                     continue;
@@ -2043,21 +2061,23 @@ fn collect_program_slot_uses(manifest: &Manifest) -> HashSet<String> {
     };
 
     let mut used_all = false;
-    if let Ok(image) = program.image.parse::<InterpolatedString>() {
-        used_all = add_program_slot_uses(manifest, &mut uses, &image);
+    if let Some(executable) = program.path_ref().or_else(|| program.image_ref())
+        && let Ok(parsed) = executable.parse::<InterpolatedString>()
+    {
+        used_all = add_program_slot_uses(manifest, &mut uses, &parsed);
         if used_all {
             return uses;
         }
     }
 
-    for arg in &program.entrypoint.0 {
+    for arg in &program.command().0 {
         used_all = add_program_slot_uses(manifest, &mut uses, arg);
         if used_all {
             return uses;
         }
     }
 
-    for value in program.env.values() {
+    for value in program.env().values() {
         used_all = add_program_slot_uses(manifest, &mut uses, value);
         if used_all {
             return uses;

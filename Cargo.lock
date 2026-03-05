@@ -101,14 +101,18 @@ name = "amber-cli"
 version = "0.1.0"
 dependencies = [
  "amber-compiler",
+ "amber-config",
  "amber-images",
  "amber-manifest",
  "amber-mesh",
  "amber-resolver",
  "amber-router",
+ "amber-template",
  "base64",
  "clap",
+ "libc",
  "miette",
+ "serde",
  "serde_json",
  "serde_yaml",
  "similar",

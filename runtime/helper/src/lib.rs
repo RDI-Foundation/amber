@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, ffi::OsString};
 
 use amber_config::{self as config, CONFIG_ENV_PREFIX, ConfigError};
-use amber_template::{ConfigTemplatePayload, TemplateSpec};
+use amber_template::{ConfigTemplatePayload, RuntimeTemplateContext, TemplateSpec};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,10 +11,11 @@ const ROOT_SCHEMA_ENV: &str = "AMBER_ROOT_CONFIG_SCHEMA_B64";
 const COMPONENT_SCHEMA_ENV: &str = "AMBER_COMPONENT_CONFIG_SCHEMA_B64";
 const COMPONENT_TEMPLATE_ENV: &str = "AMBER_COMPONENT_CONFIG_TEMPLATE_B64";
 const TEMPLATE_SPEC_ENV: &str = "AMBER_TEMPLATE_SPEC_B64";
-const DIRECT_ENTRYPOINT_ENV: &str = "AMBER_DIRECT_ENTRYPOINT_B64";
-const DIRECT_ENV_ENV: &str = "AMBER_DIRECT_ENV_B64";
+const RESOLVED_ENTRYPOINT_ENV: &str = "AMBER_RESOLVED_ENTRYPOINT_B64";
+const RESOLVED_ENV_ENV: &str = "AMBER_RESOLVED_ENV_B64";
 const MOUNT_SPEC_ENV: &str = "AMBER_MOUNT_SPEC_B64";
 const DOCKER_MOUNT_PROXY_SPEC_ENV: &str = "AMBER_DOCKER_MOUNT_PROXY_SPEC_B64";
+const RUNTIME_TEMPLATE_CONTEXT_ENV: &str = "AMBER_RUNTIME_TEMPLATE_CONTEXT_B64";
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
@@ -86,14 +87,14 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
     let mut component_schema_b64 = None;
     let mut component_template_b64 = None;
     let mut template_spec_b64 = None;
-    let mut direct_entrypoint_b64 = None;
-    let mut direct_env_b64 = None;
+    let mut resolved_entrypoint_b64 = None;
+    let mut resolved_env_b64 = None;
     let mut mount_spec_b64 = None;
     let mut docker_mount_proxy_spec_b64 = None;
+    let mut runtime_template_context_b64 = None;
 
     for (key, value) in env {
         let Some(key_str) = key.to_str() else {
-            passthrough_env.insert(key, value);
             continue;
         };
 
@@ -122,17 +123,17 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
                     .map_err(|_| HelperError::Msg(format!("{TEMPLATE_SPEC_ENV} is required")))?;
                 template_spec_b64 = Some(value);
             }
-            DIRECT_ENTRYPOINT_ENV => {
+            RESOLVED_ENTRYPOINT_ENV => {
                 let value = value.into_string().map_err(|_| {
-                    HelperError::Msg(format!("{DIRECT_ENTRYPOINT_ENV} is required"))
+                    HelperError::Msg(format!("{RESOLVED_ENTRYPOINT_ENV} is required"))
                 })?;
-                direct_entrypoint_b64 = Some(value);
+                resolved_entrypoint_b64 = Some(value);
             }
-            DIRECT_ENV_ENV => {
+            RESOLVED_ENV_ENV => {
                 let value = value
                     .into_string()
-                    .map_err(|_| HelperError::Msg(format!("{DIRECT_ENV_ENV} is required")))?;
-                direct_env_b64 = Some(value);
+                    .map_err(|_| HelperError::Msg(format!("{RESOLVED_ENV_ENV} is required")))?;
+                resolved_env_b64 = Some(value);
             }
             MOUNT_SPEC_ENV => {
                 let value = value
@@ -146,15 +147,22 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
                 })?;
                 docker_mount_proxy_spec_b64 = Some(value);
             }
+            RUNTIME_TEMPLATE_CONTEXT_ENV => {
+                let value = value.into_string().map_err(|_| {
+                    HelperError::Msg(format!("{RUNTIME_TEMPLATE_CONTEXT_ENV} is required"))
+                })?;
+                runtime_template_context_b64 = Some(value);
+            }
             _ if key_str.starts_with(CONFIG_ENV_PREFIX) => {
                 let value = value
                     .into_string()
                     .map_err(|_| HelperError::Msg(format!("{key_str} must be valid UTF-8")))?;
                 config_env.insert(key_str.to_string(), value);
             }
-            _ => {
+            _ if should_passthrough_env(key_str) => {
                 passthrough_env.insert(key, value);
             }
+            _ => {}
         }
     }
 
@@ -168,38 +176,43 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
     } else {
         Vec::new()
     };
+    let runtime_template_context = if let Some(raw) = runtime_template_context_b64.as_deref() {
+        decode_b64_json_t::<RuntimeTemplateContext>(RUNTIME_TEMPLATE_CONTEXT_ENV, raw)?
+    } else {
+        RuntimeTemplateContext::default()
+    };
 
     let config_payload_present = root_schema_b64.is_some()
         || component_schema_b64.is_some()
         || component_template_b64.is_some();
     let has_template_spec = template_spec_b64.is_some();
-    let has_direct_entrypoint = direct_entrypoint_b64.is_some();
-    let has_direct_env = direct_env_b64.is_some();
-    let has_direct_payload = has_direct_entrypoint || has_direct_env;
+    let has_resolved_entrypoint = resolved_entrypoint_b64.is_some();
+    let has_resolved_env = resolved_env_b64.is_some();
+    let has_resolved_payload = has_resolved_entrypoint || has_resolved_env;
     let mount_requires_config = mounts
         .iter()
         .any(|mount| matches!(mount, MountSpec::Config { .. }));
 
-    if has_direct_payload && (!has_direct_entrypoint || !has_direct_env) {
+    if has_resolved_payload && (!has_resolved_entrypoint || !has_resolved_env) {
         return Err(HelperError::Msg(format!(
-            "{DIRECT_ENTRYPOINT_ENV} and {DIRECT_ENV_ENV} are required together"
+            "{RESOLVED_ENTRYPOINT_ENV} and {RESOLVED_ENV_ENV} are required together"
         )));
     }
 
-    if has_template_spec && has_direct_payload {
+    if has_template_spec && has_resolved_payload {
         return Err(HelperError::Msg(
-            "helper payload must provide either a template spec or a direct entrypoint/env"
+            "helper payload must provide either a template spec or a resolved entrypoint/env"
                 .to_string(),
         ));
     }
 
-    if !has_template_spec && !has_direct_payload {
+    if !has_template_spec && !has_resolved_payload {
         return Err(HelperError::Msg(
             "helper payload must include a program entrypoint/env payload".to_string(),
         ));
     }
 
-    if (has_template_spec || mount_requires_config) && !config_payload_present {
+    if mount_requires_config && !config_payload_present {
         return Err(HelperError::Msg(format!(
             "config payload is required (missing {ROOT_SCHEMA_ENV}, {COMPONENT_SCHEMA_ENV}, \
              {COMPONENT_TEMPLATE_ENV})"
@@ -227,7 +240,11 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
         let root_config = config::build_root_config(&root_schema, &config_env)?;
 
         // 2) Resolve component config from template.
-        let component_config = config::eval_config_template(&component_template, &root_config)?;
+        let component_config = config::eval_config_template_with_context(
+            &component_template,
+            &root_config,
+            &runtime_template_context,
+        )?;
 
         if !component_config.is_object() {
             return Err(HelperError::Schema(
@@ -261,9 +278,14 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
 
     let (entrypoint, rendered_env) = if let Some(template_spec_b64) = template_spec_b64 {
         let spec = decode_b64_json_t::<TemplateSpec>(TEMPLATE_SPEC_ENV, &template_spec_b64)?;
-        let component_config = component_config
-            .as_ref()
-            .ok_or_else(|| HelperError::Msg("template spec requires config payload".to_string()))?;
+        let empty_component_config = Value::Object(serde_json::Map::new());
+        let component_config = if template_spec_requires_config(&spec) {
+            component_config.as_ref().ok_or_else(|| {
+                HelperError::Msg("template spec requires config payload".to_string())
+            })?
+        } else {
+            component_config.as_ref().unwrap_or(&empty_component_config)
+        };
 
         if spec.program.entrypoint.is_empty() {
             return Err(HelperError::Interp(
@@ -273,26 +295,36 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
 
         let mut entrypoint: Vec<String> = Vec::with_capacity(spec.program.entrypoint.len());
         for ts in &spec.program.entrypoint {
-            entrypoint.push(config::render_template_string(ts, component_config)?);
+            entrypoint.push(config::render_template_string_with_context(
+                ts,
+                component_config,
+                &runtime_template_context,
+            )?);
         }
 
         let mut rendered_env: BTreeMap<String, String> = BTreeMap::new();
         for (k, ts) in &spec.program.env {
             rendered_env.insert(
                 k.clone(),
-                config::render_template_string(ts, component_config)?,
+                config::render_template_string_with_context(
+                    ts,
+                    component_config,
+                    &runtime_template_context,
+                )?,
             );
         }
 
         (entrypoint, rendered_env)
     } else {
-        let entrypoint_b64 = direct_entrypoint_b64
-            .ok_or_else(|| HelperError::Msg(format!("{DIRECT_ENTRYPOINT_ENV} is required")))?;
-        let env_b64 = direct_env_b64
-            .ok_or_else(|| HelperError::Msg(format!("{DIRECT_ENV_ENV} is required")))?;
+        let entrypoint_b64 = resolved_entrypoint_b64
+            .ok_or_else(|| HelperError::Msg(format!("{RESOLVED_ENTRYPOINT_ENV} is required")))?;
+        let env_b64 = resolved_env_b64
+            .ok_or_else(|| HelperError::Msg(format!("{RESOLVED_ENV_ENV} is required")))?;
 
-        let entrypoint = decode_b64_json_t::<Vec<String>>(DIRECT_ENTRYPOINT_ENV, &entrypoint_b64)?;
-        let rendered_env = decode_b64_json_t::<BTreeMap<String, String>>(DIRECT_ENV_ENV, &env_b64)?;
+        let entrypoint =
+            decode_b64_json_t::<Vec<String>>(RESOLVED_ENTRYPOINT_ENV, &entrypoint_b64)?;
+        let rendered_env =
+            decode_b64_json_t::<BTreeMap<String, String>>(RESOLVED_ENV_ENV, &env_b64)?;
 
         (entrypoint, rendered_env)
     };
@@ -312,6 +344,28 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
             .map(|spec| (spec.path, spec.tcp_host, spec.tcp_port))
             .collect(),
     })
+}
+
+fn should_passthrough_env(key: &str) -> bool {
+    matches!(key, "PATH" | "HOME" | "TMPDIR")
+}
+
+fn template_spec_requires_config(spec: &TemplateSpec) -> bool {
+    spec.program
+        .entrypoint
+        .iter()
+        .any(|parts| template_string_requires_config(parts))
+        || spec
+            .program
+            .env
+            .values()
+            .any(|parts| template_string_requires_config(parts))
+}
+
+fn template_string_requires_config(parts: &[amber_template::TemplatePart]) -> bool {
+    parts
+        .iter()
+        .any(|part| matches!(part, amber_template::TemplatePart::Config { .. }))
 }
 
 fn decode_b64_json(name: &'static str, raw: &str) -> Result<Value> {
@@ -339,7 +393,8 @@ fn write_mounts(mounts: &[MountSpec], component_config: Option<&Value>) -> Resul
             MountSpec::Config { path, config } => {
                 let config_value = component_config.ok_or_else(|| {
                     HelperError::Msg(format!(
-                        "mount {path} requires config resolution but helper is in direct mode"
+                        "mount {path} requires config resolution but no config payload was \
+                         provided"
                     ))
                 })?;
                 let value = config::get_by_path(config_value, config)?;
@@ -443,7 +498,47 @@ mod tests {
     }
 
     #[test]
-    fn direct_mode_writes_mounts() {
+    fn build_run_plan_drops_unexpected_ambient_env() {
+        let entrypoint = vec!["sh".to_string(), "-ceu".to_string(), "echo ok".to_string()];
+        let env = BTreeMap::<String, String>::new();
+
+        let envs = BTreeMap::from([
+            (
+                RESOLVED_ENTRYPOINT_ENV.to_string(),
+                base64::engine::general_purpose::STANDARD
+                    .encode(serde_json::to_vec(&entrypoint).unwrap()),
+            ),
+            (
+                RESOLVED_ENV_ENV.to_string(),
+                base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&env).unwrap()),
+            ),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ("HOME".to_string(), "/tmp/home".to_string()),
+            ("HOST_SECRET".to_string(), "top-secret".to_string()),
+        ]);
+
+        let os_env = envs
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let plan = build_run_plan(os_env).expect("build run plan");
+
+        assert_eq!(plan.entrypoint[0], "sh");
+        assert_eq!(
+            plan.env.get(&OsString::from("PATH")),
+            Some(&OsString::from("/usr/bin:/bin"))
+        );
+        assert_eq!(
+            plan.env.get(&OsString::from("HOME")),
+            Some(&OsString::from("/tmp/home"))
+        );
+        assert!(
+            !plan.env.contains_key(&OsString::from("HOST_SECRET")),
+            "unexpected ambient env should not be forwarded"
+        );
+    }
+
+    #[test]
+    fn helper_writes_mounts() {
         use base64::engine::general_purpose::STANDARD;
         use tempfile::tempdir;
 
@@ -459,11 +554,11 @@ mod tests {
 
         let envs = BTreeMap::from([
             (
-                DIRECT_ENTRYPOINT_ENV.to_string(),
+                RESOLVED_ENTRYPOINT_ENV.to_string(),
                 STANDARD.encode(serde_json::to_vec(&entrypoint).unwrap()),
             ),
             (
-                DIRECT_ENV_ENV.to_string(),
+                RESOLVED_ENV_ENV.to_string(),
                 STANDARD.encode(serde_json::to_vec(&env).unwrap()),
             ),
             (
@@ -481,7 +576,60 @@ mod tests {
     }
 
     #[test]
-    fn direct_mode_mount_requires_config_payload() {
+    fn build_run_plan_renders_slot_and_binding_templates_without_config_payload() {
+        let template_spec = TemplateSpec {
+            program: amber_template::ProgramTemplateSpec {
+                entrypoint: vec![
+                    vec![TemplatePart::lit("/app/bin/server")],
+                    vec![TemplatePart::slot(7, "api.url")],
+                    vec![TemplatePart::binding(11, "upstream.url")],
+                ],
+                env: BTreeMap::from([(
+                    "UPSTREAM".to_string(),
+                    vec![TemplatePart::binding(11, "upstream.url")],
+                )]),
+            },
+        };
+        let runtime_context = RuntimeTemplateContext {
+            slots_by_scope: BTreeMap::from([(
+                7,
+                BTreeMap::from([("api.url".to_string(), "http://127.0.0.1:31001".to_string())]),
+            )]),
+            bindings_by_scope: BTreeMap::from([(
+                11,
+                BTreeMap::from([(
+                    "upstream.url".to_string(),
+                    "tcp://127.0.0.1:32002".to_string(),
+                )]),
+            )]),
+        };
+
+        let env = BTreeMap::from([
+            (
+                TEMPLATE_SPEC_ENV.to_string(),
+                encode_spec_b64(&template_spec),
+            ),
+            (
+                RUNTIME_TEMPLATE_CONTEXT_ENV.to_string(),
+                STANDARD.encode(serde_json::to_vec(&runtime_context).unwrap()),
+            ),
+        ]);
+
+        let os_env = env
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let plan = build_run_plan(os_env).expect("run plan should build");
+
+        assert_eq!(plan.entrypoint[1], "http://127.0.0.1:31001");
+        assert_eq!(plan.entrypoint[2], "tcp://127.0.0.1:32002");
+        assert_eq!(
+            plan.env.get(&OsString::from("UPSTREAM")),
+            Some(&OsString::from("tcp://127.0.0.1:32002"))
+        );
+    }
+
+    #[test]
+    fn helper_mount_requires_config_payload() {
         use base64::engine::general_purpose::STANDARD;
 
         let entrypoint = vec!["/bin/echo".to_string(), "ok".to_string()];
@@ -493,11 +641,11 @@ mod tests {
 
         let envs = BTreeMap::from([
             (
-                DIRECT_ENTRYPOINT_ENV.to_string(),
+                RESOLVED_ENTRYPOINT_ENV.to_string(),
                 STANDARD.encode(serde_json::to_vec(&entrypoint).unwrap()),
             ),
             (
-                DIRECT_ENV_ENV.to_string(),
+                RESOLVED_ENV_ENV.to_string(),
                 STANDARD.encode(serde_json::to_vec(&env).unwrap()),
             ),
             (
@@ -514,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_mode_mount_with_config_payload() {
+    fn helper_mount_with_config_payload() {
         use base64::engine::general_purpose::STANDARD;
         use tempfile::tempdir;
 
@@ -538,11 +686,11 @@ mod tests {
 
         let envs = BTreeMap::from([
             (
-                DIRECT_ENTRYPOINT_ENV.to_string(),
+                RESOLVED_ENTRYPOINT_ENV.to_string(),
                 STANDARD.encode(serde_json::to_vec(&entrypoint).unwrap()),
             ),
             (
-                DIRECT_ENV_ENV.to_string(),
+                RESOLVED_ENV_ENV.to_string(),
                 STANDARD.encode(serde_json::to_vec(&env).unwrap()),
             ),
             (ROOT_SCHEMA_ENV.to_string(), encode_json_b64(&schema)),
@@ -574,7 +722,32 @@ mod tests {
     }
 
     #[test]
-    fn direct_mode_decodes_docker_mount_proxy_specs() {
+    fn helper_accepts_program_name_without_path_lookup() {
+        use base64::engine::general_purpose::STANDARD;
+
+        let entrypoint = vec!["sh".to_string(), "-lc".to_string(), "echo ok".to_string()];
+        let env = BTreeMap::<String, String>::new();
+
+        let envs = BTreeMap::from([
+            (
+                RESOLVED_ENTRYPOINT_ENV.to_string(),
+                STANDARD.encode(serde_json::to_vec(&entrypoint).unwrap()),
+            ),
+            (
+                RESOLVED_ENV_ENV.to_string(),
+                STANDARD.encode(serde_json::to_vec(&env).unwrap()),
+            ),
+        ]);
+
+        let os_env = envs
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let plan = build_run_plan(os_env).expect("build run plan");
+        assert_eq!(plan.entrypoint, entrypoint);
+    }
+
+    #[test]
+    fn helper_decodes_docker_mount_proxy_specs() {
         use base64::engine::general_purpose::STANDARD;
 
         let entrypoint = vec!["/bin/echo".to_string(), "ok".to_string()];
@@ -587,11 +760,11 @@ mod tests {
 
         let envs = BTreeMap::from([
             (
-                DIRECT_ENTRYPOINT_ENV.to_string(),
+                RESOLVED_ENTRYPOINT_ENV.to_string(),
                 STANDARD.encode(serde_json::to_vec(&entrypoint).unwrap()),
             ),
             (
-                DIRECT_ENV_ENV.to_string(),
+                RESOLVED_ENV_ENV.to_string(),
                 STANDARD.encode(serde_json::to_vec(&env).unwrap()),
             ),
             (

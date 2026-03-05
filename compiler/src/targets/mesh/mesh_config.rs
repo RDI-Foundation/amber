@@ -15,7 +15,24 @@ use super::{
     proxy_metadata::external_slot_env_var,
 };
 
-pub(crate) const ROUTER_ID: &str = "/router";
+pub(crate) const DEFAULT_ROUTER_ID: &str = "/router";
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MeshConfigBuildOptions<'a> {
+    pub(crate) router_identity_id: &'a str,
+    pub(crate) component_mesh_listen_addr: &'a str,
+    pub(crate) router_mesh_listen_addr: &'a str,
+    pub(crate) router_control_listen_addr: &'a str,
+}
+
+pub(crate) fn default_mesh_config_build_options() -> MeshConfigBuildOptions<'static> {
+    MeshConfigBuildOptions {
+        router_identity_id: DEFAULT_ROUTER_ID,
+        component_mesh_listen_addr: "0.0.0.0",
+        router_mesh_listen_addr: "0.0.0.0",
+        router_control_listen_addr: "0.0.0.0",
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RouterPorts {
@@ -28,6 +45,17 @@ pub(crate) struct MeshConfigPlan {
     pub(crate) component_configs: HashMap<ComponentId, MeshConfigTemplate>,
     pub(crate) router_config: Option<MeshConfigTemplate>,
     pub(crate) router_env_passthrough: Vec<String>,
+}
+
+pub(crate) struct MeshConfigBuildInput<'a, Addressing: MeshAddressing + ?Sized> {
+    pub(crate) scenario: &'a Scenario,
+    pub(crate) mesh_plan: &'a MeshPlan,
+    pub(crate) root_manifest: &'a Manifest,
+    pub(crate) slot_ports_by_component: &'a HashMap<ComponentId, BTreeMap<String, u16>>,
+    pub(crate) mesh_ports_by_component: &'a HashMap<ComponentId, u16>,
+    pub(crate) router_ports: Option<RouterPorts>,
+    pub(crate) addressing: &'a Addressing,
+    pub(crate) options: MeshConfigBuildOptions<'a>,
 }
 
 pub(crate) trait MeshAddressing {
@@ -91,15 +119,20 @@ impl<Names: MeshServiceName> MeshAddressing for ServiceMeshAddressing<'_, Names>
     }
 }
 
-pub(crate) fn build_mesh_config_plan(
-    scenario: &Scenario,
-    mesh_plan: &MeshPlan,
-    root_manifest: &Manifest,
-    slot_ports_by_component: &HashMap<ComponentId, BTreeMap<String, u16>>,
-    mesh_ports_by_component: &HashMap<ComponentId, u16>,
-    router_ports: Option<RouterPorts>,
-    addressing: &impl MeshAddressing,
+pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
+    input: MeshConfigBuildInput<'_, A>,
 ) -> Result<MeshConfigPlan, MeshError> {
+    let MeshConfigBuildInput {
+        scenario,
+        mesh_plan,
+        root_manifest,
+        slot_ports_by_component,
+        mesh_ports_by_component,
+        router_ports,
+        addressing,
+        options,
+    } = input;
+
     let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
     if needs_router && router_ports.is_none() {
         return Err(MeshError::new("router ports missing"));
@@ -118,7 +151,7 @@ pub(crate) fn build_mesh_config_plan(
 
     let router_identity = if needs_router {
         Some(MeshIdentityTemplate {
-            id: ROUTER_ID.to_string(),
+            id: options.router_identity_id.to_string(),
             mesh_scope: Some(mesh_scope.clone()),
         })
     } else {
@@ -314,7 +347,9 @@ pub(crate) fn build_mesh_config_plan(
             });
         }
 
-        let mesh_listen = format!("0.0.0.0:{mesh_port}").parse().expect("mesh listen");
+        let mesh_listen = format!("{}:{mesh_port}", options.component_mesh_listen_addr)
+            .parse()
+            .expect("mesh listen");
         let config_peers = required_peers(&identity.id, &inbound, &outbound);
 
         let config = MeshConfigTemplate {
@@ -403,13 +438,16 @@ pub(crate) fn build_mesh_config_plan(
             });
         }
 
-        let mesh_listen = format!("0.0.0.0:{router_mesh_port}")
+        let mesh_listen = format!("{}:{router_mesh_port}", options.router_mesh_listen_addr)
             .parse()
             .expect("mesh listen");
         let control_listen = Some(
-            format!("0.0.0.0:{}", router_ports.control)
-                .parse()
-                .expect("control listen"),
+            format!(
+                "{}:{}",
+                options.router_control_listen_addr, router_ports.control
+            )
+            .parse()
+            .expect("control listen"),
         );
         let outbound = Vec::new();
         let config_peers = required_peers(&router_identity.id, &inbound, &outbound);

@@ -15,13 +15,14 @@ pub use schema::{
     validate_config_schema,
 };
 pub use template::{
-    eval_config_template, get_by_path, render_template_string, stringify_for_interpolation,
-    stringify_for_mount, template_string_is_runtime,
+    eval_config_template, eval_config_template_with_context, get_by_path, render_template_string,
+    render_template_string_with_context, stringify_for_interpolation, stringify_for_mount,
+    template_string_is_runtime,
 };
 
 #[cfg(test)]
 mod tests {
-    use amber_template::ConfigTemplatePayload;
+    use amber_template::{ConfigTemplatePayload, RuntimeTemplateContext, TemplatePart};
     use serde_json::json;
 
     use super::*;
@@ -106,6 +107,60 @@ mod tests {
                 "token": "secret",
                 "limits": { "max_jobs": 3 },
                 "label": "token=secret"
+            })
+        );
+    }
+
+    #[test]
+    fn component_config_template_renders_runtime_slot_and_binding_values() {
+        let root = json!({
+            "api": { "token": "secret" }
+        });
+
+        let template_value = json!({
+            "slot_url": { "$template": [
+                { "slot": "api.url", "scope": 7 }
+            ] },
+            "binding_url": { "$template": [
+                { "binding": "upstream.url", "scope": 11 }
+            ] },
+            "label": { "$template": [
+                { "lit": "token=" },
+                { "config": "api.token" },
+                { "lit": "@" },
+                TemplatePart::slot(7, "api.url"),
+                { "lit": "->" },
+                TemplatePart::binding(11, "upstream.url")
+            ] }
+        });
+
+        let template =
+            ConfigTemplatePayload::from_value(template_value).expect("template should parse");
+        let runtime_context = RuntimeTemplateContext {
+            slots_by_scope: std::collections::BTreeMap::from([(
+                7,
+                std::collections::BTreeMap::from([(
+                    "api.url".to_string(),
+                    "http://127.0.0.1:31001".to_string(),
+                )]),
+            )]),
+            bindings_by_scope: std::collections::BTreeMap::from([(
+                11,
+                std::collections::BTreeMap::from([(
+                    "upstream.url".to_string(),
+                    "http://127.0.0.1:32002".to_string(),
+                )]),
+            )]),
+        };
+        let config = eval_config_template_with_context(&template, &root, &runtime_context)
+            .expect("config should resolve");
+
+        assert_eq!(
+            config,
+            json!({
+                "slot_url": "http://127.0.0.1:31001",
+                "binding_url": "http://127.0.0.1:32002",
+                "label": "token=secret@http://127.0.0.1:31001->http://127.0.0.1:32002"
             })
         );
     }

@@ -10,7 +10,8 @@ use bon::bon;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use serde_with::{
-    DefaultOnNull, DeserializeFromStr, MapPreventDuplicates, SerializeDisplay, serde_as,
+    DefaultOnNull, DeserializeFromStr, MapPreventDuplicates, SerializeDisplay, rust::double_option,
+    serde_as,
 };
 
 use crate::{
@@ -26,18 +27,198 @@ use crate::{
 };
 
 #[serde_as]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(untagged)]
+#[non_exhaustive]
+pub enum Program {
+    Image(ProgramImage),
+    Path(ProgramPath),
+}
+
+impl<'de> Deserialize<'de> for Program {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[serde_as]
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ProgramFields {
+            #[serde(default)]
+            image: Option<ProgramImageField>,
+            #[serde(default)]
+            path: Option<ProgramPathField>,
+            #[serde(default)]
+            #[serde(deserialize_with = "double_option::deserialize")]
+            entrypoint: Option<Option<ProgramEntrypoint>>,
+            #[serde(default)]
+            #[serde(deserialize_with = "double_option::deserialize")]
+            args: Option<Option<ProgramEntrypoint>>,
+            #[serde_as(as = "MapPreventDuplicates<_, _>")]
+            #[serde(default)]
+            env: BTreeMap<String, InterpolatedString>,
+            #[serde(default)]
+            network: Option<Network>,
+            #[serde(default)]
+            mounts: Vec<ProgramMount>,
+        }
+
+        let fields = ProgramFields::deserialize(deserializer)?;
+        match (fields.image, fields.path) {
+            (Some(image), None) => {
+                if fields.args.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "program.args is only supported with program.path",
+                    ));
+                }
+                Ok(Self::Image(ProgramImage {
+                    image: image.0,
+                    entrypoint: fields.entrypoint.flatten().unwrap_or_default(),
+                    common: ProgramCommon {
+                        env: fields.env,
+                        network: fields.network,
+                        mounts: fields.mounts,
+                    },
+                }))
+            }
+            (None, Some(path)) => {
+                if fields.entrypoint.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "program.entrypoint is only supported with program.image",
+                    ));
+                }
+                Ok(Self::Path(ProgramPath {
+                    path: path.0,
+                    args: fields.args.flatten().unwrap_or_default(),
+                    common: ProgramCommon {
+                        env: fields.env,
+                        network: fields.network,
+                        mounts: fields.mounts,
+                    },
+                }))
+            }
+            (Some(_), Some(_)) => Err(serde::de::Error::custom(
+                "program must declare exactly one of `image` or `path`",
+            )),
+            (None, None) => Err(serde::de::Error::custom(
+                "program must declare either `image` or `path`",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(transparent)]
+struct ProgramImageField(#[serde(deserialize_with = "deserialize_program_image")] String);
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(transparent)]
+struct ProgramPathField(#[serde(deserialize_with = "deserialize_program_path")] String);
+
+impl Program {
+    pub fn image(image: ProgramImage) -> Self {
+        Self::Image(image)
+    }
+
+    pub fn path(path: ProgramPath) -> Self {
+        Self::Path(path)
+    }
+
+    pub fn image_ref(&self) -> Option<&str> {
+        match self {
+            Self::Image(program) => Some(program.image.as_str()),
+            Self::Path(_) => None,
+        }
+    }
+
+    pub fn path_ref(&self) -> Option<&str> {
+        match self {
+            Self::Image(_) => None,
+            Self::Path(program) => Some(program.path.as_str()),
+        }
+    }
+
+    pub fn command(&self) -> &ProgramEntrypoint {
+        match self {
+            Self::Image(program) => &program.entrypoint,
+            Self::Path(program) => &program.args,
+        }
+    }
+
+    pub fn env(&self) -> &BTreeMap<String, InterpolatedString> {
+        match self {
+            Self::Image(program) => &program.common.env,
+            Self::Path(program) => &program.common.env,
+        }
+    }
+
+    pub fn network(&self) -> Option<&Network> {
+        match self {
+            Self::Image(program) => program.common.network.as_ref(),
+            Self::Path(program) => program.common.network.as_ref(),
+        }
+    }
+
+    pub fn mounts(&self) -> &[ProgramMount] {
+        match self {
+            Self::Image(program) => &program.common.mounts,
+            Self::Path(program) => &program.common.mounts,
+        }
+    }
+}
+
+#[serde_as]
 #[derive(
     Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, bon::Builder,
 )]
 #[builder(on(String, into))]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
-pub struct Program {
+pub struct ProgramImage {
     #[serde(deserialize_with = "deserialize_program_image")]
     pub image: String,
     #[serde(default)]
     #[builder(default)]
     pub entrypoint: ProgramEntrypoint,
+    #[serde(flatten)]
+    pub common: ProgramCommon,
+}
+
+#[serde_as]
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, bon::Builder,
+)]
+#[builder(on(String, into))]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ProgramPath {
+    #[serde(deserialize_with = "deserialize_program_path")]
+    pub path: String,
+    #[serde(default)]
+    #[builder(default)]
+    pub args: ProgramEntrypoint,
+    #[serde(flatten)]
+    pub common: ProgramCommon,
+}
+
+#[serde_as]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    bon::Builder,
+)]
+#[builder(on(String, into))]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ProgramCommon {
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
     #[builder(default)]
@@ -172,6 +353,16 @@ where
         .parse::<InterpolatedString>()
         .map_err(serde::de::Error::custom)?;
     Ok(image)
+}
+
+fn deserialize_program_path<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let path = String::deserialize(deserializer)?;
+    path.parse::<InterpolatedString>()
+        .map_err(serde::de::Error::custom)?;
+    Ok(path)
 }
 
 #[derive(

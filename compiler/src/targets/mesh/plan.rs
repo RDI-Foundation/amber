@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeSet, HashMap},
-    fmt,
     sync::Arc,
 };
 
@@ -10,6 +9,7 @@ use amber_manifest::{
 use amber_scenario::{BindingFrom, ComponentId, Scenario};
 
 use crate::DigestStore;
+pub(crate) use crate::targets::common::{TargetError as MeshError, component_label};
 
 #[derive(Clone, Debug)]
 pub(crate) struct MeshOptions {
@@ -65,33 +65,6 @@ pub(crate) struct ResolvedFrameworkBinding {
 pub(crate) struct EndpointInfo {
     pub(crate) port: u16,
     pub(crate) protocol: NetworkProtocol,
-}
-
-#[derive(Debug)]
-pub(crate) struct MeshError {
-    message: String,
-}
-
-impl MeshError {
-    pub(crate) fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl fmt::Display for MeshError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for MeshError {}
-
-impl From<String> for MeshError {
-    fn from(message: String) -> Self {
-        Self::new(message)
-    }
 }
 
 pub(crate) fn build_mesh_plan(
@@ -234,10 +207,6 @@ pub(crate) fn build_mesh_plan(
     })
 }
 
-pub(crate) fn component_label(scenario: &Scenario, id: ComponentId) -> String {
-    scenario.component(id).moniker.as_str().to_string()
-}
-
 pub(crate) fn map_program_components<T>(
     scenario: &Scenario,
     program_components: &[ComponentId],
@@ -278,7 +247,7 @@ fn resolve_provide_endpoint(
         ))
     })?;
 
-    let network = program.network.as_ref().ok_or_else(|| {
+    let network = program.network().ok_or_else(|| {
         MeshError::new(format!(
             "provide {}.{} requires program.network, but none exists",
             component_label(scenario, component_id),

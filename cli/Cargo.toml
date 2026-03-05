@@ -9,16 +9,21 @@ path = "src/main.rs"
 
 [dependencies]
 amber-compiler = { workspace = true }
+amber-config = { workspace = true }
 amber-manifest = { workspace = true }
 amber-mesh = { workspace = true }
 amber-resolver = { workspace = true }
 amber-router = { workspace = true }
+amber-template = { workspace = true }
 base64 = { workspace = true }
 clap = { version = "4.5.46", features = ["derive"] }
+libc = "0.2.177"
 miette = { workspace = true, features = ["fancy"] }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }

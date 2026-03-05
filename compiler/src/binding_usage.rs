@@ -80,13 +80,16 @@ pub(crate) fn collect_binding_usage(scenario: &Scenario) -> BindingUsage {
 
     for (id, component) in scenario.components_iter() {
         if let Some(program) = component.program.as_ref() {
-            if let Ok(image) = program.image.parse::<InterpolatedString>() {
-                record_binding_parts(&image.parts, id, BindingUseSource::Program, id, &mut usage);
+            let executable = program.path_ref().or_else(|| program.image_ref());
+            if let Some(executable) = executable
+                && let Ok(parsed) = executable.parse::<InterpolatedString>()
+            {
+                record_binding_parts(&parsed.parts, id, BindingUseSource::Program, id, &mut usage);
             }
-            for arg in &program.entrypoint.0 {
+            for arg in &program.command().0 {
                 record_binding_parts(&arg.parts, id, BindingUseSource::Program, id, &mut usage);
             }
-            for value in program.env.values() {
+            for value in program.env().values() {
                 record_binding_parts(&value.parts, id, BindingUseSource::Program, id, &mut usage);
             }
 
@@ -131,16 +134,19 @@ fn record_binding_parts(
 fn collect_program_used_config_paths(program: &amber_manifest::Program) -> BTreeSet<String> {
     let mut used = BTreeSet::new();
 
-    if let Ok(image) = program.image.parse::<InterpolatedString>() {
-        record_program_config_parts(&image.parts, &mut used);
+    let executable = program.path_ref().or_else(|| program.image_ref());
+    if let Some(executable) = executable
+        && let Ok(parsed) = executable.parse::<InterpolatedString>()
+    {
+        record_program_config_parts(&parsed.parts, &mut used);
     }
-    for arg in &program.entrypoint.0 {
+    for arg in &program.command().0 {
         record_program_config_parts(&arg.parts, &mut used);
     }
-    for value in program.env.values() {
+    for value in program.env().values() {
         record_program_config_parts(&value.parts, &mut used);
     }
-    for mount in &program.mounts {
+    for mount in program.mounts() {
         match &mount.source {
             MountSource::Config(path) | MountSource::Secret(path) => {
                 used.insert(path.clone());

@@ -91,7 +91,7 @@ impl ConfigNode {
                 let mut s = String::new();
                 for part in parts {
                     let TemplatePart::Lit { lit } = part else {
-                        unreachable!("no config or binding parts in static template");
+                        unreachable!("no runtime template parts in static template");
                     };
                     s.push_str(lit);
                 }
@@ -110,7 +110,7 @@ impl ConfigNode {
                     let mut s = String::new();
                     for part in parts {
                         let TemplatePart::Lit { lit } = part else {
-                            unreachable!("no config or binding parts in static template");
+                            unreachable!("no runtime template parts in static template");
                         };
                         s.push_str(lit);
                     }
@@ -194,7 +194,7 @@ impl ConfigNode {
                     let mut s = String::new();
                     for part in parts {
                         let TemplatePart::Lit { lit } = part else {
-                            unreachable!("no config or binding parts in static template");
+                            unreachable!("no runtime template parts in static template");
                         };
                         s.push_str(&lit);
                     }
@@ -275,6 +275,9 @@ pub fn compose_config_template(
                             let resolved = resolve_against_parent(parent, &parent_path)?;
                             let inlined = inline_as_template_parts(&resolved)?;
                             out.extend(inlined);
+                        }
+                        TemplatePart::Slot { slot, scope } => {
+                            out.push(TemplatePart::slot(scope, slot));
                         }
                         TemplatePart::Binding { binding, scope } => {
                             out.push(TemplatePart::binding(scope, binding));

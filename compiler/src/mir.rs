@@ -890,19 +890,20 @@ fn collect_program_used_slots(component: &amber_scenario::Component) -> Vec<Stri
     };
     let all_slots = || component.slots.keys().cloned().collect();
 
-    if let Ok(image) = program.image.parse::<amber_manifest::InterpolatedString>()
-        && image.visit_slot_uses(|slot| mark_slot(slot, &mut used))
+    if let Some(executable) = program.path_ref().or_else(|| program.image_ref())
+        && let Ok(parsed) = executable.parse::<amber_manifest::InterpolatedString>()
+        && parsed.visit_slot_uses(|slot| mark_slot(slot, &mut used))
     {
         return all_slots();
     }
 
-    for arg in &program.entrypoint.0 {
+    for arg in &program.command().0 {
         if arg.visit_slot_uses(|slot| mark_slot(slot, &mut used)) {
             return all_slots();
         }
     }
 
-    for value in program.env.values() {
+    for value in program.env().values() {
         if value.visit_slot_uses(|slot| mark_slot(slot, &mut used)) {
             return all_slots();
         }

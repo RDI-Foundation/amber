@@ -4,7 +4,7 @@ This document defines the **manifest file format** and the **validation/linting 
 
 A manifest describes **one component**. A component may:
 
-* Run a `program` (container image + entrypoint/env + optional network endpoints; required when providing capabilities).
+* Run a `program` (either container image + entrypoint or native path + args, plus env and optional network endpoints; required when providing capabilities).
 * Contain named child `components` (each points at another manifest).
 * Declare required inputs (`slots`) and produced outputs (`provides`).
 * Wire capabilities into slots (`bindings`).
@@ -188,44 +188,67 @@ Example:
 
 ## `program`
 
+`program` is a tagged union with two variants:
+
+### Container program (`image` + `entrypoint`)
+
 ```json5
 program: {
-  image: "ghcr.io/acme/my-component:v1", // required
+  image: "ghcr.io/acme/my-component:v1", // required for container programs
 
-  // entrypoint: optional; default [].
+  // entrypoint: required for image programs.
   // Either:
   // - a list of strings, or
   // - a single string tokenized with shlex rules.
   entrypoint: ["--port", "8080"],
   // entrypoint: "--port 8080",
 
-  // env: optional; default {}.
-  // Values support interpolation.
+  // shared fields (env/mounts/network) are available on both program variants:
   env: {
     LOG_LEVEL: "debug",
     API_URL: "${slots.backend.url}",
   },
-
-  // mounts: optional; default [].
-  // Mount config/secret values as files inside the container.
   mounts: [
     { path: "/run/config.json", from: "config.app" },
     { path: "/run/secret.txt", from: "secret.api.token" },
   ],
-
-  // network: optional
   network: {
-    // endpoints: optional; default []
     endpoints: [
-      {
-        name: "http",          // required; unique within endpoints
-        port: 8080,            // required
-        protocol: "http",      // optional; default "http" (http/https/tcp)
-      },
+      { name: "http", port: 8080, protocol: "http" },
     ],
   },
 }
 ```
+
+### Native program (`path` + `args`)
+
+```json5
+program: {
+  path: "/usr/bin/env", // required for native programs
+
+  // args: optional; default [].
+  // Same parsing rules as entrypoint.
+  args: ["python3", "-m", "http.server", "8080"],
+  // args: "python3 -m http.server 8080",
+
+  env: {
+    LOG_LEVEL: "debug",
+  },
+  network: {
+    endpoints: [
+      { name: "http", port: 8080, protocol: "http" },
+    ],
+  },
+}
+```
+
+Rules:
+
+* `program` must declare exactly one of `image` or `path`.
+* `program.entrypoint` is only valid with `program.image`.
+* `program.args` is only valid with `program.path`.
+* `program.path` must be an explicit absolute path or a relative path containing a separator
+  such as `./bin/server`; direct execution does not search `PATH`.
 
 ### `program.mounts`
 
@@ -260,9 +283,9 @@ Notes:
 * `secret.<path>` requires the path to be secret in the component’s config schema.
 * `config.<path>` must not reference secret values.
 
-### Interpolation in `image`, `entrypoint`, and `env`
+### Interpolation in `image`/`path`, `entrypoint`/`args`, and `env`
 
-`image`, `entrypoint` elements, and `env` values support `${...}` interpolation.
+`image` (or `path`), command arguments (`entrypoint` or `args`), and `env` values support `${...}` interpolation.
 
 Supported sources:
 

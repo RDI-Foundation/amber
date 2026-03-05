@@ -448,7 +448,7 @@ fn validate_endpoints(
 ) -> Result<(), Error> {
     let mut defined_endpoints = BTreeSet::new();
     if let Some(program) = program
-        && let Some(network) = &program.network
+        && let Some(network) = program.network()
     {
         for endpoint in &network.endpoints {
             if !defined_endpoints.insert(endpoint.name.as_str()) {
@@ -488,7 +488,7 @@ fn validate_mounts(
     let mut names = BTreeSet::new();
     let mut paths = BTreeSet::new();
 
-    for mount in &program.mounts {
+    for mount in program.mounts() {
         if let Some(name) = mount.name.as_deref() {
             ensure_name_no_dot(name, "mount")?;
             if !names.insert(name) {
@@ -678,10 +678,16 @@ impl RawManifest {
             &experimental_features,
         )?;
 
-        if let Some(program) = program.as_ref()
-            && program.entrypoint.0.is_empty()
-        {
-            return Err(Error::EmptyEntrypoint);
+        if let Some(program) = program.as_ref() {
+            match program {
+                Program::Image(program) if program.entrypoint.0.is_empty() => {
+                    return Err(Error::EmptyEntrypoint);
+                }
+                Program::Path(program) if program.path.trim().is_empty() => {
+                    return Err(Error::EmptyProgramPath);
+                }
+                _ => {}
+            }
         }
 
         Ok(Manifest {

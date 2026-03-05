@@ -206,7 +206,8 @@ pub struct Component {
     /// Optional config schema declared by this component.
     pub config_schema: Option<Value>,
 
-    /// Program definition (image/entrypoint/env/network) extracted from the manifest.
+    /// Program definition (image+entrypoint or path+args, plus env/network/mounts) extracted from
+    /// the manifest.
     pub program: Option<Program>,
 
     /// Declared input slots (capability requirements).

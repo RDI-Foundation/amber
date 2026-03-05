@@ -794,7 +794,6 @@ pub async fn run(config: MeshConfig) -> Result<(), RouterError> {
     };
     let config = Arc::new(config);
     let external_overrides = Arc::new(RwLock::new(HashMap::new()));
-
     let mut listeners = JoinSet::new();
 
     {
@@ -902,7 +901,7 @@ async fn run_mesh_listener(state: InboundRuntime) -> Result<(), RouterError> {
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_inbound(stream, state).await {
-                tracing::warn!(target: "amber.internal", "mesh connection failed: {err}");
+                tracing::warn!(target: "amber.internal", "mesh tcp connection failed: {err}");
             }
         });
     }
@@ -1243,6 +1242,30 @@ async fn run_control_server_unix(
     dynamic_issuers: DynamicIssuers,
     identity: MeshIdentityPublic,
 ) -> Result<(), RouterError> {
+    let listener = bind_unix_listener(path.as_str())?;
+    let state = ControlServiceState {
+        external_overrides,
+        trust,
+        inbound_routes,
+        dynamic_issuers,
+        identity,
+    };
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(err) = serve_control_connection(stream, state, true).await {
+                tracing::warn!(target: "amber.internal", "control unix connection failed: {err}");
+            }
+        });
+    }
+}
+
+#[cfg(unix)]
+fn bind_unix_listener(path: &str) -> Result<UnixListener, RouterError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
     let path = path.trim().to_string();
     if path.is_empty() {
         return Err(RouterError::InvalidConfig(format!(
@@ -1267,23 +1290,13 @@ async fn run_control_server_unix(
             path: path.clone(),
             source,
         })?;
-    let state = ControlServiceState {
-        external_overrides,
-        trust,
-        inbound_routes,
-        dynamic_issuers,
-        identity,
-    };
-
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let state = state.clone();
-        tokio::spawn(async move {
-            if let Err(err) = serve_control_connection(stream, state, true).await {
-                tracing::warn!(target: "amber.internal", "control unix connection failed: {err}");
-            }
-        });
-    }
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)).map_err(
+        |source| RouterError::BindUnixFailed {
+            path: path.clone(),
+            source,
+        },
+    )?;
+    Ok(listener)
 }
 
 async fn serve_control_connection<IO>(

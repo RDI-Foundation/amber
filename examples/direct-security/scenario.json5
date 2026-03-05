@@ -1,0 +1,18 @@
+{
+  manifest_version: "0.1.0",
+
+  components: {
+    secret: "./secret.json5",
+    allowed: "./allowed.json5",
+    denied: "./denied.json5",
+  },
+
+  bindings: [
+    { to: "#allowed.secret", from: "#secret.secret" },
+  ],
+
+  exports: {
+    allowed: "#allowed.public",
+    denied: "#denied.public",
+  },
+}

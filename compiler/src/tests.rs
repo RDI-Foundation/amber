@@ -2664,14 +2664,15 @@ fn bundle_loader_from_path_rejects_unsupported_version() {
 #[test]
 fn compile_from_tree_handles_malformed_program_image_from_builder() {
     let manifest = Manifest::builder()
-        .program(
-            amber_manifest::Program::builder()
+        .program(amber_manifest::Program::image(
+            amber_manifest::ProgramImage::builder()
                 .image("${config.image")
                 .entrypoint(amber_manifest::ProgramEntrypoint(vec![
                     "run".parse().unwrap(),
                 ]))
+                .common(amber_manifest::ProgramCommon::default())
                 .build(),
-        )
+        ))
         .build()
         .unwrap();
     let digest = manifest.digest();
@@ -2702,14 +2703,15 @@ fn compile_from_tree_handles_malformed_program_image_from_builder() {
 #[test]
 fn check_from_tree_handles_malformed_program_image_from_builder_with_source() {
     let manifest = Manifest::builder()
-        .program(
-            amber_manifest::Program::builder()
+        .program(amber_manifest::Program::image(
+            amber_manifest::ProgramImage::builder()
                 .image("${config.image")
                 .entrypoint(amber_manifest::ProgramEntrypoint(vec![
                     "run".parse().unwrap(),
                 ]))
+                .common(amber_manifest::ProgramCommon::default())
                 .build(),
-        )
+        ))
         .build()
         .unwrap();
     let digest = manifest.digest();

@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 pub enum TemplatePart {
     Lit { lit: String },
     Config { config: String },
+    Slot { slot: String, scope: u64 },
     Binding { binding: String, scope: u64 },
 }
 
@@ -22,6 +23,13 @@ impl TemplatePart {
         }
     }
 
+    pub fn slot(scope: u64, value: impl Into<String>) -> Self {
+        Self::Slot {
+            slot: value.into(),
+            scope,
+        }
+    }
+
     pub fn binding(scope: u64, value: impl Into<String>) -> Self {
         Self::Binding {
             binding: value.into(),
@@ -33,6 +41,7 @@ impl TemplatePart {
         match self {
             Self::Lit { lit } => Some(lit.as_str()),
             Self::Config { .. } => None,
+            Self::Slot { .. } => None,
             Self::Binding { .. } => None,
         }
     }
@@ -41,12 +50,24 @@ impl TemplatePart {
         matches!(self, Self::Config { .. })
     }
 
+    pub fn is_slot(&self) -> bool {
+        matches!(self, Self::Slot { .. })
+    }
+
     pub fn is_binding(&self) -> bool {
         matches!(self, Self::Binding { .. })
     }
 }
 
 pub type TemplateString = Vec<TemplatePart>;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeTemplateContext {
+    #[serde(default)]
+    pub slots_by_scope: BTreeMap<u64, BTreeMap<String, String>>,
+    #[serde(default)]
+    pub bindings_by_scope: BTreeMap<u64, BTreeMap<String, String>>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
