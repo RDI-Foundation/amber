@@ -2105,10 +2105,6 @@ mod tests {
         addr
     }
 
-    fn reserve_loopback_port() -> u16 {
-        reserve_loopback_socket_addr().port()
-    }
-
     async fn wait_until_gateway_listens(addr: SocketAddr, task: &JoinHandle<()>) {
         for _ in 0..400 {
             if TcpStream::connect(addr).await.is_ok() {
@@ -2136,21 +2132,15 @@ mod tests {
         send_gateway_request_on_stream(stream, method, target, headers, body).await
     }
 
-    async fn send_gateway_request_from_port(
-        addr: SocketAddr,
+    async fn send_gateway_request_from_socket(
+        socket: TcpSocket,
         source_port: u16,
+        addr: SocketAddr,
         method: Method,
         target: &str,
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> GatewayResponse {
-        let socket = TcpSocket::new_v4().expect("create v4 tcp socket");
-        socket
-            .bind(SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::LOCALHOST,
-                source_port,
-            )))
-            .unwrap_or_else(|err| panic!("bind local source port {source_port} failed: {err}"));
         let stream = socket.connect(addr).await.unwrap_or_else(|err| {
             panic!("connect from local source port {source_port} failed: {err}")
         });
@@ -2848,9 +2838,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn enforces_port_restrictions_for_authenticated_callers() {
-        let allowed_port = reserve_loopback_port();
-        let denied_port = reserve_loopback_port();
-        assert_ne!(allowed_port, denied_port);
+        let (allowed_socket, allowed_port) = reserve_bound_loopback_socket();
+        let (denied_socket, denied_port) = reserve_bound_loopback_socket();
 
         let gateway = GatewayHarness::start(vec![CallerConfig {
             host: "127.0.0.1".to_string(),
@@ -2866,9 +2855,10 @@ mod tests {
             serde_json::json!({"Version":"24.0"}),
         );
 
-        let denied = send_gateway_request_from_port(
-            gateway.addr,
+        let denied = send_gateway_request_from_socket(
+            denied_socket,
             denied_port,
+            gateway.addr,
             Method::GET,
             "/version",
             &[],
@@ -2877,9 +2867,10 @@ mod tests {
         .await;
         assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
 
-        let allowed = send_gateway_request_from_port(
-            gateway.addr,
+        let allowed = send_gateway_request_from_socket(
+            allowed_socket,
             allowed_port,
+            gateway.addr,
             Method::GET,
             "/version",
             &[],
@@ -4243,7 +4234,6 @@ mod tests {
 
         let (caller_a_socket, caller_a_port) = reserve_bound_loopback_socket();
         let (caller_b_socket, caller_b_port) = reserve_bound_loopback_socket();
-        assert_ne!(caller_a_port, caller_b_port);
 
         let listen = reserve_loopback_socket_addr();
         let config = DockerGatewayConfig {
