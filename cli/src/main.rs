@@ -689,6 +689,12 @@ const DIRECT_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const DIRECT_RUNTIME_STATE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DIRECT_RUNTIME_STATE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DirectControlSocketPaths {
+    link: PathBuf,
+    runtime: PathBuf,
+}
+
 async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
     let plan_path = canonicalize_user_path(&args.plan, "direct plan")?;
     let plan_root = plan_path
@@ -724,265 +730,273 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
         .into_diagnostic()
         .wrap_err("failed to create direct runtime workspace")?;
     let runtime_root = runtime_dir.path().to_path_buf();
-    provision_mesh_filesystem(&mesh_plan, &runtime_root)?;
-    let direct_runtime_state_path = direct_runtime_state_path(&plan_root);
-    if direct_runtime_state_path.exists() {
-        let _ = fs::remove_file(&direct_runtime_state_path);
-    }
-
-    let mut sandbox = DirectSandbox::detect(&runtime_root);
-    if !sandbox.is_available() {
-        return Err(miette::miette!(
-            "direct runtime requires a sandbox backend for process isolation; {}",
-            missing_direct_sandbox_help()
-        ));
-    }
-    #[cfg(target_os = "linux")]
-    let slirp4netns = find_in_path("slirp4netns").ok_or_else(|| {
-        miette::miette!(
-            "direct runtime requires `slirp4netns` on Linux for isolated component networking"
-        )
-    })?;
-    let runtime_state = assign_direct_runtime_ports(&runtime_root, &direct_plan)?;
-    write_direct_runtime_state(&plan_root, &runtime_state)?;
-    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-    let mesh_network = configure_direct_mesh_network(&runtime_root, &runtime_state, &direct_plan)?;
-
+    let runtime_state_path = direct_runtime_state_path(&plan_root);
     let mut children = Vec::<ManagedChild>::new();
     let mut log_tasks = Vec::new();
     let mut component_sidecar_pid_by_id = HashMap::new();
+    let mut control_socket_paths = None;
 
-    let router_binary = resolve_runtime_binary("amber-router")?;
-    if let Some(router) = direct_plan.router.as_ref() {
-        let direct_control_socket_link = plan_root.join(&router.control_socket_path);
-        let direct_control_link_dir = direct_control_socket_link
-            .parent()
-            .ok_or_else(|| miette::miette!("invalid direct control socket path"))?
-            .to_path_buf();
-        let direct_control_runtime_path = direct_runtime_control_socket_path(&plan_root);
-        let direct_control_runtime_dir = direct_control_runtime_path
-            .parent()
-            .ok_or_else(|| miette::miette!("invalid runtime control socket path"))?
-            .to_path_buf();
-        let mut env = BTreeMap::new();
-        env.insert(
-            "AMBER_ROUTER_CONFIG_PATH".to_string(),
-            runtime_root
-                .join(&router.mesh_config_path)
-                .display()
-                .to_string(),
-        );
-        env.insert(
-            "AMBER_ROUTER_IDENTITY_PATH".to_string(),
-            runtime_root
-                .join(&router.mesh_identity_path)
-                .display()
-                .to_string(),
-        );
-        env.insert(
-            "AMBER_ROUTER_CONTROL_SOCKET_PATH".to_string(),
-            direct_control_runtime_path.display().to_string(),
-        );
-        for passthrough in &router.env_passthrough {
-            if let Ok(value) = env::var(passthrough) {
-                env.insert(passthrough.clone(), value);
-            }
+    let supervision = async {
+        provision_mesh_filesystem(&mesh_plan, &runtime_root)?;
+        if runtime_state_path.exists() {
+            let _ = fs::remove_file(&runtime_state_path);
         }
-        let work_dir = runtime_root.join("work/router");
-        fs::create_dir_all(&work_dir)
-            .into_diagnostic()
-            .wrap_err_with(|| {
-                format!(
-                    "failed to create router runtime directory {}",
-                    work_dir.display()
-                )
-            })?;
-        fs::create_dir_all(&direct_control_link_dir)
-            .into_diagnostic()
-            .wrap_err_with(|| {
-                format!(
-                    "failed to create router control directory {}",
-                    direct_control_link_dir.display()
-                )
-            })?;
-        fs::create_dir_all(&direct_control_runtime_dir)
-            .into_diagnostic()
-            .wrap_err_with(|| {
-                format!(
-                    "failed to create runtime router control directory {}",
-                    direct_control_runtime_dir.display()
-                )
-            })?;
-        if direct_control_socket_link.exists() {
-            fs::remove_file(&direct_control_socket_link)
-                .into_diagnostic()
-                .wrap_err_with(|| {
-                    format!(
-                        "failed to remove stale router control symlink {}",
-                        direct_control_socket_link.display()
-                    )
-                })?;
-        }
-        if direct_control_runtime_path.exists() {
-            fs::remove_file(&direct_control_runtime_path)
-                .into_diagnostic()
-                .wrap_err_with(|| {
-                    format!(
-                        "failed to remove stale runtime router control socket {}",
-                        direct_control_runtime_path.display()
-                    )
-                })?;
-        }
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&direct_control_runtime_path, &direct_control_socket_link)
-            .into_diagnostic()
-            .wrap_err_with(|| {
-                format!(
-                    "failed to create router control symlink {} -> {}",
-                    direct_control_socket_link.display(),
-                    direct_control_runtime_path.display()
-                )
-            })?;
-        let spec = ProcessSpec {
-            name: "router".to_string(),
-            program: router_binary.clone(),
-            args: Vec::new(),
-            env,
-            work_dir,
-            read_only_mounts: vec![ReadOnlyMount {
-                source: runtime_root.join("mesh"),
-                dest: runtime_root.join("mesh"),
-            }],
-            writable_dirs: Vec::new(),
-            bind_dirs: vec![direct_control_runtime_dir.clone()],
-            hidden_paths: Vec::new(),
-            network: ProcessNetwork::Host,
-        };
-        let _ = spawn_managed_process(spec, &mut sandbox, &mut children, &mut log_tasks).await?;
-    }
 
-    let mut components_by_id = HashMap::new();
-    for component in &direct_plan.components {
-        components_by_id.insert(component.id, component);
-    }
-
-    for component in &direct_plan.components {
-        let mut env = BTreeMap::new();
-        env.insert(
-            "AMBER_ROUTER_CONFIG_PATH".to_string(),
-            runtime_root
-                .join(&component.sidecar.mesh_config_path)
-                .display()
-                .to_string(),
-        );
-        env.insert(
-            "AMBER_ROUTER_IDENTITY_PATH".to_string(),
-            runtime_root
-                .join(&component.sidecar.mesh_identity_path)
-                .display()
-                .to_string(),
-        );
-        let work_dir = runtime_root.join(&component.program.work_dir);
-        fs::create_dir_all(&work_dir)
-            .into_diagnostic()
-            .wrap_err_with(|| {
-                format!(
-                    "failed to create component runtime directory {}",
-                    work_dir.display()
-                )
-            })?;
-        let spec = ProcessSpec {
-            name: component.sidecar.log_name.clone(),
-            program: router_binary.clone(),
-            args: Vec::new(),
-            env,
-            work_dir,
-            read_only_mounts: vec![ReadOnlyMount {
-                source: runtime_root.join("mesh"),
-                dest: runtime_root.join("mesh"),
-            }],
-            writable_dirs: Vec::new(),
-            bind_dirs: Vec::new(),
-            hidden_paths: Vec::new(),
-            network: {
-                #[cfg(target_os = "linux")]
-                {
-                    ProcessNetwork::Isolated
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    ProcessNetwork::Host
-                }
-            },
-        };
-        let sidecar_pid =
-            spawn_managed_process(spec, &mut sandbox, &mut children, &mut log_tasks).await?;
+        let mut sandbox = DirectSandbox::detect(&runtime_root);
+        if !sandbox.is_available() {
+            return Err(miette::miette!(
+                "direct runtime requires a sandbox backend for process isolation; {}",
+                missing_direct_sandbox_help()
+            ));
+        }
         #[cfg(target_os = "linux")]
-        {
-            let mesh_port = mesh_network
-                .component_mesh_port_by_id
-                .get(&component.id)
-                .copied()
-                .ok_or_else(|| {
-                    miette::miette!(
-                        "missing sidecar mesh listen port for component {}",
-                        component.moniker
-                    )
-                })?;
-            spawn_component_slirp4netns(
-                &slirp4netns,
-                &runtime_root,
-                component,
-                sidecar_pid,
-                mesh_port,
-                &mut children,
-                &mut log_tasks,
-            )
-            .await?;
-        }
-        component_sidecar_pid_by_id.insert(component.id, sidecar_pid);
-    }
-
-    for component_id in &direct_plan.startup_order {
-        let component = components_by_id.get(component_id).ok_or_else(|| {
+        let slirp4netns = find_in_path("slirp4netns").ok_or_else(|| {
             miette::miette!(
-                "direct plan startup order references unknown component id {}",
-                component_id
+                "direct runtime requires `slirp4netns` on Linux for isolated component networking"
             )
         })?;
-        let mut spec = component_program_spec(
-            &runtime_root,
-            component,
-            &direct_plan.runtime_addresses,
-            &runtime_state,
-        )?;
-        spec.hidden_paths.push(runtime_root.join("mesh"));
-        #[cfg(target_os = "linux")]
-        {
-            let pid = component_sidecar_pid_by_id
-                .get(component_id)
-                .copied()
-                .ok_or_else(|| {
-                    miette::miette!("missing sidecar pid for component {}", component.moniker)
-                })?;
-            spec.network = ProcessNetwork::Join(pid);
-        }
-        let _ = spawn_managed_process(spec, &mut sandbox, &mut children, &mut log_tasks).await?;
-    }
+        let runtime_state = assign_direct_runtime_ports(&runtime_root, &direct_plan)?;
+        write_direct_runtime_state(&plan_root, &runtime_state)?;
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+        let mesh_network =
+            configure_direct_mesh_network(&runtime_root, &runtime_state, &direct_plan)?;
 
-    let supervision = supervise_children(&mut children).await;
-    terminate_children(&mut children).await;
-    for task in log_tasks {
-        let _ = task.await;
+        let router_binary = resolve_runtime_binary("amber-router")?;
+        if let Some(router) = direct_plan.router.as_ref() {
+            let paths = DirectControlSocketPaths {
+                link: resolve_direct_artifact_path(&plan_root, &router.control_socket_path),
+                runtime: direct_runtime_control_socket_path(&runtime_root),
+            };
+            let direct_control_link_dir = paths
+                .link
+                .parent()
+                .ok_or_else(|| miette::miette!("invalid direct control socket path"))?
+                .to_path_buf();
+            let direct_control_runtime_dir = paths
+                .runtime
+                .parent()
+                .ok_or_else(|| miette::miette!("invalid runtime control socket path"))?
+                .to_path_buf();
+            let mut env = BTreeMap::new();
+            env.insert(
+                "AMBER_ROUTER_CONFIG_PATH".to_string(),
+                runtime_root
+                    .join(&router.mesh_config_path)
+                    .display()
+                    .to_string(),
+            );
+            env.insert(
+                "AMBER_ROUTER_IDENTITY_PATH".to_string(),
+                runtime_root
+                    .join(&router.mesh_identity_path)
+                    .display()
+                    .to_string(),
+            );
+            env.insert(
+                "AMBER_ROUTER_CONTROL_SOCKET_PATH".to_string(),
+                paths.runtime.display().to_string(),
+            );
+            for passthrough in &router.env_passthrough {
+                if let Ok(value) = env::var(passthrough) {
+                    env.insert(passthrough.clone(), value);
+                }
+            }
+            let work_dir = runtime_root.join("work/router");
+            fs::create_dir_all(&work_dir)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to create router runtime directory {}",
+                        work_dir.display()
+                    )
+                })?;
+            fs::create_dir_all(&direct_control_link_dir)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to create router control directory {}",
+                        direct_control_link_dir.display()
+                    )
+                })?;
+            fs::create_dir_all(&direct_control_runtime_dir)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to create runtime router control directory {}",
+                        direct_control_runtime_dir.display()
+                    )
+                })?;
+            if fs::symlink_metadata(&paths.link).is_ok() {
+                fs::remove_file(&paths.link)
+                    .into_diagnostic()
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to remove stale router control symlink {}",
+                            paths.link.display()
+                        )
+                    })?;
+            }
+            if paths.runtime.exists() {
+                fs::remove_file(&paths.runtime)
+                    .into_diagnostic()
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to remove stale runtime router control socket {}",
+                            paths.runtime.display()
+                        )
+                    })?;
+            }
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&paths.runtime, &paths.link)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to create router control symlink {} -> {}",
+                        paths.link.display(),
+                        paths.runtime.display()
+                    )
+                })?;
+            let spec = ProcessSpec {
+                name: "router".to_string(),
+                program: router_binary.clone(),
+                args: Vec::new(),
+                env,
+                work_dir,
+                read_only_mounts: vec![ReadOnlyMount {
+                    source: runtime_root.join("mesh"),
+                    dest: runtime_root.join("mesh"),
+                }],
+                writable_dirs: Vec::new(),
+                bind_dirs: vec![direct_control_runtime_dir.clone()],
+                hidden_paths: Vec::new(),
+                network: ProcessNetwork::Host,
+            };
+            let _ =
+                spawn_managed_process(spec, &mut sandbox, &mut children, &mut log_tasks).await?;
+            control_socket_paths = Some(paths);
+        }
+
+        let mut components_by_id = HashMap::new();
+        for component in &direct_plan.components {
+            components_by_id.insert(component.id, component);
+        }
+
+        for component in &direct_plan.components {
+            let mut env = BTreeMap::new();
+            env.insert(
+                "AMBER_ROUTER_CONFIG_PATH".to_string(),
+                runtime_root
+                    .join(&component.sidecar.mesh_config_path)
+                    .display()
+                    .to_string(),
+            );
+            env.insert(
+                "AMBER_ROUTER_IDENTITY_PATH".to_string(),
+                runtime_root
+                    .join(&component.sidecar.mesh_identity_path)
+                    .display()
+                    .to_string(),
+            );
+            let work_dir = runtime_root.join(&component.program.work_dir);
+            fs::create_dir_all(&work_dir)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to create component runtime directory {}",
+                        work_dir.display()
+                    )
+                })?;
+            let spec = ProcessSpec {
+                name: component.sidecar.log_name.clone(),
+                program: router_binary.clone(),
+                args: Vec::new(),
+                env,
+                work_dir,
+                read_only_mounts: vec![ReadOnlyMount {
+                    source: runtime_root.join("mesh"),
+                    dest: runtime_root.join("mesh"),
+                }],
+                writable_dirs: Vec::new(),
+                bind_dirs: Vec::new(),
+                hidden_paths: Vec::new(),
+                network: {
+                    #[cfg(target_os = "linux")]
+                    {
+                        ProcessNetwork::Isolated
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        ProcessNetwork::Host
+                    }
+                },
+            };
+            let sidecar_pid =
+                spawn_managed_process(spec, &mut sandbox, &mut children, &mut log_tasks).await?;
+            #[cfg(target_os = "linux")]
+            {
+                let mesh_port = mesh_network
+                    .component_mesh_port_by_id
+                    .get(&component.id)
+                    .copied()
+                    .ok_or_else(|| {
+                        miette::miette!(
+                            "missing sidecar mesh listen port for component {}",
+                            component.moniker
+                        )
+                    })?;
+                spawn_component_slirp4netns(
+                    &slirp4netns,
+                    &runtime_root,
+                    component,
+                    sidecar_pid,
+                    mesh_port,
+                    &mut children,
+                    &mut log_tasks,
+                )
+                .await?;
+            }
+            component_sidecar_pid_by_id.insert(component.id, sidecar_pid);
+        }
+
+        for component_id in &direct_plan.startup_order {
+            let component = components_by_id.get(component_id).ok_or_else(|| {
+                miette::miette!(
+                    "direct plan startup order references unknown component id {}",
+                    component_id
+                )
+            })?;
+            let mut spec = component_program_spec(
+                &runtime_root,
+                component,
+                &direct_plan.runtime_addresses,
+                &runtime_state,
+            )?;
+            spec.hidden_paths.push(runtime_root.join("mesh"));
+            #[cfg(target_os = "linux")]
+            {
+                let pid = component_sidecar_pid_by_id
+                    .get(component_id)
+                    .copied()
+                    .ok_or_else(|| {
+                        miette::miette!("missing sidecar pid for component {}", component.moniker)
+                    })?;
+                spec.network = ProcessNetwork::Join(pid);
+            }
+            let _ =
+                spawn_managed_process(spec, &mut sandbox, &mut children, &mut log_tasks).await?;
+        }
+
+        supervise_children(&mut children).await
     }
-    if let Some(router) = direct_plan.router.as_ref() {
-        let direct_control_socket_link = plan_root.join(&router.control_socket_path);
-        let direct_control_runtime_path = direct_runtime_control_socket_path(&plan_root);
-        let _ = fs::remove_file(&direct_control_socket_link);
-        let _ = fs::remove_file(&direct_control_runtime_path);
-    }
-    let _ = fs::remove_file(&direct_runtime_state_path);
-    drop(runtime_dir);
+    .await;
+    cleanup_direct_runtime(
+        &mut children,
+        log_tasks,
+        &runtime_state_path,
+        control_socket_paths.as_ref(),
+        runtime_dir,
+    )
+    .await;
 
     let (reason, exit_code) = supervision?;
     match reason {
@@ -1001,13 +1015,58 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
     }
 }
 
-fn direct_runtime_control_socket_path(plan_root: &Path) -> PathBuf {
+fn resolve_direct_artifact_path(plan_root: &Path, path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        plan_root.join(path)
+    }
+}
+
+fn direct_runtime_control_socket_path(runtime_root: &Path) -> PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    plan_root.hash(&mut hasher);
+    runtime_root.hash(&mut hasher);
     let suffix = hasher.finish();
     env::temp_dir()
         .join("amber-direct-control")
         .join(format!("{suffix:016x}.sock"))
+}
+
+fn remove_direct_control_socket_link(paths: &DirectControlSocketPaths) {
+    #[cfg(unix)]
+    {
+        if fs::read_link(&paths.link)
+            .ok()
+            .is_some_and(|target| target == paths.runtime)
+        {
+            let _ = fs::remove_file(&paths.link);
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = fs::remove_file(&paths.link);
+    }
+}
+
+async fn cleanup_direct_runtime(
+    children: &mut [ManagedChild],
+    log_tasks: Vec<tokio::task::JoinHandle<()>>,
+    runtime_state_path: &Path,
+    control_socket_paths: Option<&DirectControlSocketPaths>,
+    runtime_dir: tempfile::TempDir,
+) {
+    terminate_children(children).await;
+    for task in log_tasks {
+        let _ = task.await;
+    }
+    if let Some(paths) = control_socket_paths {
+        remove_direct_control_socket_link(paths);
+        let _ = fs::remove_file(&paths.runtime);
+    }
+    let _ = fs::remove_file(runtime_state_path);
+    drop(runtime_dir);
 }
 
 fn direct_runtime_state_path(plan_root: &Path) -> PathBuf {
@@ -3562,9 +3621,9 @@ fn resolve_control_endpoint(args: &ProxyArgs, target: &ProxyTarget) -> Result<Co
     if let Some(socket) = router.control_socket.as_ref() {
         let resolved = expand_env_templates(socket, compose_project.as_deref())?;
         if matches!(target.kind, ProxyTargetKind::Direct) {
-            let _ = resolved;
-            return Ok(ControlEndpoint::Unix(direct_runtime_control_socket_path(
+            return Ok(ControlEndpoint::Unix(resolve_direct_artifact_path(
                 &target.source,
+                &resolved,
             )));
         }
         return Ok(ControlEndpoint::Unix(PathBuf::from(resolved)));
@@ -4527,6 +4586,19 @@ fn write_direct_output(root: &Path, artifact: &DirectArtifact) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn test_proxy_args() -> ProxyArgs {
+        ProxyArgs {
+            output: String::new(),
+            slot: Vec::new(),
+            export: Vec::new(),
+            mesh_addr: None,
+            router_addr: None,
+            router_control_addr: None,
+            router_config_b64: None,
+            router_config: None,
+        }
+    }
+
     #[test]
     fn verbosity_levels_follow_v_flag_ladder() {
         assert_eq!(verbosity_level(0), "error");
@@ -4703,6 +4775,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_control_endpoint_uses_direct_artifact_control_socket_link() {
+        let target = ProxyTarget {
+            kind: ProxyTargetKind::Direct,
+            metadata: ProxyMetadata {
+                version: PROXY_METADATA_VERSION.to_string(),
+                router: Some(amber_compiler::mesh::RouterMetadata {
+                    mesh_port: 0,
+                    control_port: 0,
+                    control_socket: Some(".amber/router-control.sock".to_string()),
+                    control_socket_volume: None,
+                }),
+                ..Default::default()
+            },
+            source: PathBuf::from("/tmp/direct-output"),
+        };
+
+        let endpoint =
+            resolve_control_endpoint(&test_proxy_args(), &target).expect("endpoint should resolve");
+
+        assert_eq!(
+            endpoint.to_string(),
+            "unix:///tmp/direct-output/.amber/router-control.sock"
+        );
+    }
+
+    #[test]
+    fn direct_runtime_control_socket_path_is_unique_per_run() {
+        let first = tempfile::tempdir().expect("temp dir should be created");
+        let second = tempfile::tempdir().expect("temp dir should be created");
+
+        assert_ne!(
+            direct_runtime_control_socket_path(first.path()),
+            direct_runtime_control_socket_path(second.path())
+        );
+    }
+
     #[tokio::test]
     async fn wait_for_direct_runtime_router_port_reads_state_written_after_startup() {
         let temp = tempfile::tempdir().expect("temp dir should be created");
@@ -4727,6 +4836,108 @@ mod tests {
         writer.await.expect("writer task should finish");
 
         assert_eq!(port, 32123);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_direct_control_socket_link_preserves_newer_run_symlink() {
+        let plan_root = tempfile::tempdir().expect("temp dir should be created");
+        let runtime_one = tempfile::tempdir().expect("temp dir should be created");
+        let runtime_two = tempfile::tempdir().expect("temp dir should be created");
+        let paths_one = DirectControlSocketPaths {
+            link: plan_root.path().join(".amber/router-control.sock"),
+            runtime: direct_runtime_control_socket_path(runtime_one.path()),
+        };
+        let runtime_two_socket = direct_runtime_control_socket_path(runtime_two.path());
+        fs::create_dir_all(paths_one.link.parent().expect("link parent"))
+            .expect("link parent should be created");
+        std::os::unix::fs::symlink(&runtime_two_socket, &paths_one.link)
+            .expect("symlink should be created");
+
+        remove_direct_control_socket_link(&paths_one);
+
+        assert_eq!(
+            fs::read_link(&paths_one.link).expect("newer run symlink should remain"),
+            runtime_two_socket
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_direct_runtime_removes_partial_startup_artifacts() {
+        let plan_root = tempfile::tempdir().expect("temp dir should be created");
+        let runtime_dir = tempfile::Builder::new()
+            .prefix("amber-direct-test-")
+            .tempdir()
+            .expect("runtime dir should be created");
+        let runtime_root = runtime_dir.path().to_path_buf();
+        let runtime_state_path = direct_runtime_state_path(plan_root.path());
+        fs::create_dir_all(runtime_state_path.parent().expect("state parent"))
+            .expect("state parent should be created");
+        fs::write(&runtime_state_path, "{}").expect("state file should be written");
+
+        let control_socket_paths = DirectControlSocketPaths {
+            link: plan_root.path().join(".amber/router-control.sock"),
+            runtime: direct_runtime_control_socket_path(&runtime_root),
+        };
+        fs::create_dir_all(control_socket_paths.link.parent().expect("link parent"))
+            .expect("link parent should be created");
+        fs::create_dir_all(
+            control_socket_paths
+                .runtime
+                .parent()
+                .expect("runtime parent"),
+        )
+        .expect("runtime parent should be created");
+        fs::write(&control_socket_paths.runtime, "").expect("runtime socket placeholder");
+        std::os::unix::fs::symlink(&control_socket_paths.runtime, &control_socket_paths.link)
+            .expect("symlink should be created");
+
+        let child = TokioCommand::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("child should spawn");
+        let mut children = vec![ManagedChild {
+            name: "partial-startup-child".to_string(),
+            child,
+        }];
+
+        cleanup_direct_runtime(
+            &mut children,
+            Vec::new(),
+            &runtime_state_path,
+            Some(&control_socket_paths),
+            runtime_dir,
+        )
+        .await;
+
+        assert!(
+            fs::symlink_metadata(&control_socket_paths.link).is_err(),
+            "control socket link should be removed"
+        );
+        assert!(
+            fs::metadata(&control_socket_paths.runtime).is_err(),
+            "runtime control socket should be removed"
+        );
+        assert!(
+            fs::metadata(&runtime_state_path).is_err(),
+            "runtime state should be removed"
+        );
+        assert!(
+            fs::metadata(&runtime_root).is_err(),
+            "runtime workspace should be removed"
+        );
+
+        let status = children[0]
+            .child
+            .wait()
+            .await
+            .expect("child should be reaped after cleanup");
+        assert!(
+            !status.success(),
+            "cleanup should terminate partial-startup child"
+        );
     }
 
     #[cfg(unix)]
