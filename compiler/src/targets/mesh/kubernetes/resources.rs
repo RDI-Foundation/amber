@@ -294,6 +294,24 @@ pub struct DeploymentSpec {
     pub template: PodTemplateSpec,
 }
 
+// ---- DaemonSet ----
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonSet {
+    pub api_version: &'static str,
+    pub kind: &'static str,
+    pub metadata: ObjectMeta,
+    pub spec: DaemonSetSpec,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonSetSpec {
+    pub selector: LabelSelector,
+    pub template: PodTemplateSpec,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LabelSelector {
@@ -504,6 +522,8 @@ pub struct Volume {
     pub secret: Option<SecretVolumeSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub empty_dir: Option<EmptyDirVolumeSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_path: Option<HostPathVolumeSource>,
 }
 
 impl Volume {
@@ -515,6 +535,7 @@ impl Volume {
             }),
             secret: None,
             empty_dir: None,
+            host_path: None,
         }
     }
 
@@ -526,6 +547,7 @@ impl Volume {
                 secret_name: secret_name.into(),
             }),
             empty_dir: None,
+            host_path: None,
         }
     }
 
@@ -535,6 +557,20 @@ impl Volume {
             config_map: None,
             secret: None,
             empty_dir: Some(EmptyDirVolumeSource {}),
+            host_path: None,
+        }
+    }
+
+    pub fn host_path(name: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            config_map: None,
+            secret: None,
+            empty_dir: None,
+            host_path: Some(HostPathVolumeSource {
+                path: path.into(),
+                volume_type: None,
+            }),
         }
     }
 }
@@ -554,6 +590,14 @@ pub struct SecretVolumeSource {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EmptyDirVolumeSource {}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostPathVolumeSource {
+    pub path: String,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub volume_type: Option<String>,
+}
 
 // ---- NetworkPolicy ----
 

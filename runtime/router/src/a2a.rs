@@ -806,6 +806,9 @@ mod tests {
         OutboundRoute {
             route_id: route_id.to_string(),
             slot: "slot".to_string(),
+            binding_name: None,
+            capability_kind: Some("a2a".to_string()),
+            capability_profile: None,
             listen_port,
             listen_addr: listen_addr.map(ToString::to_string),
             protocol: MeshProtocol::Http,
@@ -820,6 +823,9 @@ mod tests {
         InboundRoute {
             route_id: route_id.to_string(),
             capability: "agent".to_string(),
+            binding_name: None,
+            capability_kind: Some("a2a".to_string()),
+            capability_profile: None,
             protocol: MeshProtocol::Http,
             http_plugins: vec![HttpRoutePlugin::A2a],
             target: InboundTarget::Local { port },

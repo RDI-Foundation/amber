@@ -202,6 +202,9 @@ pub(crate) fn build_mesh_config_plan(
             inbound.push(InboundRoute {
                 route_id: component_route_id(&identity.id, provide_name, protocol),
                 capability: provide_name.clone(),
+                binding_name: None,
+                capability_kind: Some(provide_decl.decl.kind.to_string()),
+                capability_profile: provide_decl.decl.profile.clone(),
                 protocol,
                 http_plugins: matches!(
                     (provide_decl.decl.kind, protocol),
@@ -250,6 +253,9 @@ pub(crate) fn build_mesh_config_plan(
             outbound.push(OutboundRoute {
                 route_id: component_route_id(&peer_id, &binding.provide, protocol),
                 slot: binding.slot.clone(),
+                binding_name: binding.binding_name.clone(),
+                capability_kind: Some(provide_decl.decl.kind.to_string()),
+                capability_profile: provide_decl.decl.profile.clone(),
                 listen_port,
                 listen_addr: None,
                 protocol,
@@ -288,9 +294,16 @@ pub(crate) fn build_mesh_config_plan(
                 .ok_or_else(|| MeshError::new("external bindings require router identity"))?;
             let router_addr = addressing.mesh_addr_for_router()?;
             let protocol = MeshProtocol::Http;
+            let slot_decl = root_manifest
+                .slots()
+                .get(binding.external_slot.as_str())
+                .expect("external slot should exist on root");
             outbound.push(OutboundRoute {
                 route_id: router_external_route_id(&binding.external_slot),
                 slot: binding.slot.clone(),
+                binding_name: binding.binding_name.clone(),
+                capability_kind: Some(slot_decl.decl.kind.to_string()),
+                capability_profile: slot_decl.decl.profile.clone(),
                 listen_port,
                 listen_addr: None,
                 protocol,
@@ -345,6 +358,9 @@ pub(crate) fn build_mesh_config_plan(
             inbound.push(InboundRoute {
                 route_id: router_external_route_id(&slot.name),
                 capability: slot.name.clone(),
+                binding_name: None,
+                capability_kind: Some(slot.decl.kind.to_string()),
+                capability_profile: slot.decl.profile.clone(),
                 protocol: MeshProtocol::Http,
                 http_plugins: Vec::new(),
                 target: InboundTarget::External {
@@ -363,10 +379,18 @@ pub(crate) fn build_mesh_config_plan(
                 .id
                 .clone();
             let protocol = mesh_protocol(export.endpoint.protocol)?;
+            let provide_decl = scenario
+                .component(export.provider)
+                .provides
+                .get(&export.provide)
+                .expect("export provide should exist");
             let provider_route_id = component_route_id(&peer_id, &export.provide, protocol);
             inbound.push(InboundRoute {
                 route_id: router_export_route_id(&export.name, protocol),
                 capability: export.name.clone(),
+                binding_name: Some(export.name.clone()),
+                capability_kind: Some(provide_decl.decl.kind.to_string()),
+                capability_profile: provide_decl.decl.profile.clone(),
                 protocol,
                 http_plugins: Vec::new(),
                 target: InboundTarget::MeshForward {
@@ -455,6 +479,7 @@ fn required_peers(
 
 struct RouterExternalSlot {
     name: String,
+    decl: amber_manifest::CapabilityDecl,
     url_env: String,
     optional: bool,
 }
@@ -476,6 +501,7 @@ fn build_router_external_slots(
             .expect("external slot should exist on root");
         out.push(RouterExternalSlot {
             name: name.clone(),
+            decl: decl.decl.clone(),
             url_env: external_slot_env_var(&name),
             optional: decl.optional,
         });

@@ -1,0 +1,317 @@
+volumes:
+  amber-router-control: {}
+  amber-router-mesh: {}
+  c1-client-net-mesh: {}
+  c2-server-net-mesh: {}
+services:
+  amber-otelcol:
+    image: ${AMBER_OTELCOL_IMAGE:-otel/opentelemetry-collector-contrib:0.143.0}
+    user: 0:0
+    networks:
+      amber_mesh: {}
+    command:
+    - --config=/etc/otelcol/config.yaml
+    environment:
+    - AMBER_SCENARIO_RUN_ID=${COMPOSE_PROJECT_NAME:-default}
+    - AMBER_OTEL_UPSTREAM_OTLP_HTTP_ENDPOINT=${AMBER_OTEL_UPSTREAM_OTLP_HTTP_ENDPOINT:-http://host.docker.internal:18890}
+    extra_hosts:
+    - host.docker.internal:host-gateway
+    volumes:
+    - ${AMBER_DOCKER_CONTAINER_LOGS_DIR:-/var/lib/docker/containers}:/var/lib/docker/containers:ro
+    configs:
+    - source: amber-otelcol-config
+      target: /etc/otelcol/config.yaml
+  amber-provisioner:
+    image: ghcr.io/rdi-foundation/amber-provisioner:obs-current
+    user: 0:0
+    cap_drop:
+    - ALL
+    security_opt:
+    - no-new-privileges:true
+    environment:
+    - AMBER_MESH_PROVISION_PLAN_PATH=/amber/plan/mesh-provision-plan.json
+    volumes:
+    - c1-client-net-mesh:/amber/provision/c1-client-net
+    - c2-server-net-mesh:/amber/provision/c2-server-net
+    - amber-router-mesh:/amber/provision/amber-router
+    configs:
+    - source: amber-mesh-provision-plan
+      target: /amber/plan/mesh-provision-plan.json
+    restart: no
+  amber-router:
+    image: ghcr.io/rdi-foundation/amber-router:obs-current
+    networks:
+      amber_mesh: {}
+    environment:
+    - AMBER_EXTERNAL_SLOT_EXT_API_URL
+    - AMBER_ROUTER_CONFIG_PATH=/amber/mesh/mesh-config.json
+    - AMBER_ROUTER_IDENTITY_PATH=/amber/mesh/mesh-identity.json
+    - AMBER_ROUTER_CONTROL_SOCKET_PATH=/amber/control/router-control.sock
+    - AMBER_SCENARIO_RUN_ID=${COMPOSE_PROJECT_NAME:-default}
+    - OTEL_TRACES_SAMPLER=always_on
+    - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+    - OTEL_EXPORTER_OTLP_ENDPOINT=http://amber-otelcol:4318
+    labels:
+      amber.exports: '{"client_status":{"component":"/client","provide":"status","protocol":"http","router_mesh_port":24000},"public":{"component":"/server","provide":"api","protocol":"http","router_mesh_port":24000}}'
+    ports:
+    - 127.0.0.1:24000:24000
+    extra_hosts:
+    - host.docker.internal:host-gateway
+    volumes:
+    - amber-router-mesh:/amber/mesh:ro
+    - amber-router-control:/amber/control
+    depends_on:
+      amber-provisioner:
+        condition: service_completed_successfully
+      amber-router-control-init:
+        condition: service_completed_successfully
+  amber-router-control-init:
+    image: busybox:1.36.1
+    user: 0:0
+    command:
+    - sh
+    - -lc
+    - mkdir -p /amber/control && chown 65532:65532 /amber/control && chmod 0700 /amber/control
+    volumes:
+    - amber-router-control:/amber/control
+    restart: no
+  c1-client:
+    image: busybox:1.36
+    network_mode: service:c1-client-net
+    entrypoint:
+    - sh
+    - -lc
+    - 'mkdir -p /www && echo client-ok > /www/index.html; httpd -f -p 9010 -h /www & echo ''[client] started''; while true; do echo ''[client] internal rpc -> server''; wget -qO- --header=''x-amber-tutorial: internal-edge'' "$$SERVER_API_URL/rpc" >/dev/null || true; echo ''[client] external rpc -> upstream'' >&2; wget -qO- --header=''content-type: application/json'' --header=''x-amber-tutorial: external-edge'' --post-data=''{"jsonrpc":"2.0","id":"external-1","method":"tools/call"}'' "$$EXT_API_URL/rpc" >/dev/null || true; echo ''[client] external sse -> upstream''; wget -qO- --header=''x-amber-tutorial: external-sse'' "$$EXT_API_URL/stream" >/dev/null || true; sleep 4; done'
+    environment:
+      AMBER_COMPONENT_MONIKER: /client
+      AMBER_SCENARIO_RUN_ID: ${COMPOSE_PROJECT_NAME:-default}
+      AMBER_SCENARIO_SCOPE: sha256:EHHaKqbe46S193K4VHXny0evYACq0qG3Z6urNRtMpuc=
+      EXT_API_URL: http://127.0.0.1:20000
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://amber-otelcol:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_SAMPLER: always_on
+      SERVER_API_URL: http://127.0.0.1:20001
+    labels:
+      amber_component_moniker: /client
+      amber_service_name: amber.${COMPOSE_PROJECT_NAME:-default}.client
+    logging:
+      driver: json-file
+      options:
+        labels: amber_component_moniker,amber_service_name
+    depends_on:
+    - c1-client-net
+    - c2-server
+  c1-client-net:
+    image: ghcr.io/rdi-foundation/amber-router:obs-current
+    networks:
+      amber_mesh: {}
+    environment:
+    - AMBER_ROUTER_CONFIG_PATH=/amber/mesh/mesh-config.json
+    - AMBER_ROUTER_IDENTITY_PATH=/amber/mesh/mesh-identity.json
+    - AMBER_SCENARIO_RUN_ID=${COMPOSE_PROJECT_NAME:-default}
+    - OTEL_TRACES_SAMPLER=always_on
+    - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+    - OTEL_EXPORTER_OTLP_ENDPOINT=http://amber-otelcol:4318
+    volumes:
+    - c1-client-net-mesh:/amber/mesh:ro
+    depends_on:
+      amber-provisioner:
+        condition: service_completed_successfully
+  c2-server:
+    image: python:3.13-alpine
+    network_mode: service:c2-server-net
+    entrypoint:
+    - sh
+    - -lc
+    - |-
+      python3 - <<'PY'
+      from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+      RESPONSE = b'{"jsonrpc":"2.0","id":"server-static","method":"tools/list","result":{"source":"server","ok":true}}'
+
+
+      class Handler(BaseHTTPRequestHandler):
+          def do_GET(self):
+              tutorial = self.headers.get('x-amber-tutorial', '-')
+              print(f'[server] received GET {self.path} x-amber-tutorial={tutorial}', flush=True)
+              self.send_response(200)
+              self.send_header('content-type', 'application/json')
+              self.send_header('content-length', str(len(RESPONSE)))
+              self.end_headers()
+              self.wfile.write(RESPONSE)
+              print(f'[server] responded 200 {self.path} id=server-static', flush=True)
+
+          def log_message(self, _format, *_args):
+              pass
+
+
+      print('[server] listening on :9000', flush=True)
+      ThreadingHTTPServer(('0.0.0.0', 9000), Handler).serve_forever()
+      PY
+    environment:
+      AMBER_COMPONENT_MONIKER: /server
+      AMBER_SCENARIO_RUN_ID: ${COMPOSE_PROJECT_NAME:-default}
+      AMBER_SCENARIO_SCOPE: sha256:EHHaKqbe46S193K4VHXny0evYACq0qG3Z6urNRtMpuc=
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://amber-otelcol:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_SAMPLER: always_on
+    labels:
+      amber_component_moniker: /server
+      amber_service_name: amber.${COMPOSE_PROJECT_NAME:-default}.server
+    logging:
+      driver: json-file
+      options:
+        labels: amber_component_moniker,amber_service_name
+    depends_on:
+    - c2-server-net
+  c2-server-net:
+    image: ghcr.io/rdi-foundation/amber-router:obs-current
+    networks:
+      amber_mesh: {}
+    environment:
+    - AMBER_ROUTER_CONFIG_PATH=/amber/mesh/mesh-config.json
+    - AMBER_ROUTER_IDENTITY_PATH=/amber/mesh/mesh-identity.json
+    - AMBER_SCENARIO_RUN_ID=${COMPOSE_PROJECT_NAME:-default}
+    - OTEL_TRACES_SAMPLER=always_on
+    - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+    - OTEL_EXPORTER_OTLP_ENDPOINT=http://amber-otelcol:4318
+    volumes:
+    - c2-server-net-mesh:/amber/mesh:ro
+    depends_on:
+      amber-provisioner:
+        condition: service_completed_successfully
+configs:
+  amber-mesh-provision-plan:
+    content: '{"version":"1","targets":[{"kind":"component","config":{"identity":{"id":"/client","mesh_scope":"sha256:EHHaKqbe46S193K4VHXny0evYACq0qG3Z6urNRtMpuc="},"mesh_listen":"0.0.0.0:23000","peers":[{"id":"/router"},{"id":"/server"}],"inbound":[{"route_id":"component:/client:status:http","capability":"status","capability_kind":"http","protocol":"http","target":{"kind":"local","port":9010},"allowed_issuers":["/router"]}],"outbound":[{"route_id":"component:/server:api:http","slot":"server_api","binding_name":"client_server_api","capability_kind":"mcp","capability_profile":"debug-jsonrpc","listen_port":20001,"protocol":"http","peer_addr":"c2-server-net:23000","peer_id":"/server","capability":"api"},{"route_id":"router:external:ext_api:http","slot":"ext_api","binding_name":"client_external_api","capability_kind":"http","capability_profile":"debug-external","listen_port":20000,"protocol":"http","peer_addr":"amber-router:24000","peer_id":"/router","capability":"ext_api"}],"transport":{"kind":"noise_ik"}},"output":{"kind":"filesystem","dir":"/amber/provision/c1-client-net"}},{"kind":"component","config":{"identity":{"id":"/server","mesh_scope":"sha256:EHHaKqbe46S193K4VHXny0evYACq0qG3Z6urNRtMpuc="},"mesh_listen":"0.0.0.0:23000","peers":[{"id":"/client"},{"id":"/router"}],"inbound":[{"route_id":"component:/server:api:http","capability":"api","capability_kind":"mcp","capability_profile":"debug-jsonrpc","protocol":"http","target":{"kind":"local","port":9000},"allowed_issuers":["/client","/router"]}],"outbound":[],"transport":{"kind":"noise_ik"}},"output":{"kind":"filesystem","dir":"/amber/provision/c2-server-net"}},{"kind":"router","config":{"identity":{"id":"/router","mesh_scope":"sha256:EHHaKqbe46S193K4VHXny0evYACq0qG3Z6urNRtMpuc="},"mesh_listen":"0.0.0.0:24000","peers":[{"id":"/client"},{"id":"/server"}],"inbound":[{"route_id":"router:external:ext_api:http","capability":"ext_api","capability_kind":"http","capability_profile":"debug-external","protocol":"http","target":{"kind":"external","url_env":"AMBER_EXTERNAL_SLOT_EXT_API_URL"},"allowed_issuers":["/client"]},{"route_id":"router:export:client_status:http","capability":"client_status","binding_name":"client_status","capability_kind":"http","protocol":"http","target":{"kind":"mesh_forward","peer_addr":"c1-client-net:23000","peer_id":"/client","route_id":"component:/client:status:http","capability":"status"},"allowed_issuers":["/router"]},{"route_id":"router:export:public:http","capability":"public","binding_name":"public","capability_kind":"mcp","capability_profile":"debug-jsonrpc","protocol":"http","target":{"kind":"mesh_forward","peer_addr":"c2-server-net:23000","peer_id":"/server","route_id":"component:/server:api:http","capability":"api"},"allowed_issuers":["/router"]}],"outbound":[],"transport":{"kind":"noise_ik"}},"output":{"kind":"filesystem","dir":"/amber/provision/amber-router"}}]}'
+  amber-otelcol-config:
+    content: |2
+
+      receivers:
+        otlp:
+          protocols:
+            grpc:
+              endpoint: 0.0.0.0:4317
+            http:
+              endpoint: 0.0.0.0:4318
+        filelog/docker:
+          include:
+            - /var/lib/docker/containers/*/*-json.log
+          start_at: end
+          include_file_path: true
+          operators:
+            - type: json_parser
+              parse_from: body
+            - type: move
+              from: attributes.log
+              to: body
+            - type: move
+              from: attributes.stream
+              to: attributes.amber_stream
+            - type: json_parser
+              if: body matches "^[{]"
+              parse_from: body
+            - type: severity_parser
+              if: attributes.level != nil
+              parse_from: attributes.level
+            - type: move
+              if: attributes.message != nil
+              from: attributes.message
+              to: body
+            - type: time_parser
+              parse_from: attributes.time
+              layout_type: gotime
+              layout: '2006-01-02T15:04:05.999999999Z07:00'
+            - type: remove
+              field: attributes.time
+              if: attributes.time != nil
+
+      processors:
+        memory_limiter:
+          check_interval: 1s
+          limit_mib: 256
+          spike_limit_mib: 128
+        batch: {}
+        resource/amber:
+          attributes:
+            - key: amber.scenario.run_id
+              action: upsert
+              value: $${env:AMBER_SCENARIO_RUN_ID}
+        transform/program_logs:
+          error_mode: ignore
+          log_statements:
+            - context: scope
+              statements:
+                - set(scope.name, "amber.program")
+            - context: log
+              statements:
+                - set(log.attributes["service.name"], log.attributes["attrs"]["amber_service_name"]) where log.attributes["attrs"] != nil and log.attributes["attrs"]["amber_service_name"] != nil
+                - set(log.attributes["amber.component.moniker"], log.attributes["attrs"]["amber_component_moniker"]) where log.attributes["attrs"] != nil and log.attributes["attrs"]["amber_component_moniker"] != nil
+                - delete_key(log.attributes, "attrs") where log.attributes["attrs"] != nil
+                - set(log.severity_number, SEVERITY_NUMBER_ERROR) where log.severity_number == 0 and IsString(log.body) and IsMatch(log.body, "(?i)\b(error|failed|exception|fatal|panic)\b")
+                - set(log.severity_number, SEVERITY_NUMBER_WARN) where log.severity_number == 0 and IsString(log.body) and IsMatch(log.body, "(?i)\b(warn|warning)\b")
+                - set(log.severity_number, SEVERITY_NUMBER_WARN) where log.severity_number == 0 and log.attributes["amber_stream"] == "stderr"
+                - set(log.severity_number, SEVERITY_NUMBER_INFO) where log.severity_number == 0
+                - set(log.severity_text, "Error") where log.severity_text == "" and log.severity_number >= SEVERITY_NUMBER_ERROR
+                - set(log.severity_text, "Warning") where log.severity_text == "" and log.severity_number >= SEVERITY_NUMBER_WARN and log.severity_number < SEVERITY_NUMBER_ERROR
+                - set(log.severity_text, "Information") where log.severity_text == "" and log.severity_number >= SEVERITY_NUMBER_INFO and log.severity_number < SEVERITY_NUMBER_WARN
+        filter/program_logs:
+          error_mode: ignore
+          logs:
+            log_record:
+              - log.attributes["service.name"] == nil
+              - log.attributes["amber.component.moniker"] == nil
+        groupbyattrs/program_log_identity:
+          keys:
+            - service.name
+            - amber.component.moniker
+
+      exporters:
+        otlphttp/upstream:
+          endpoint: $${env:AMBER_OTEL_UPSTREAM_OTLP_HTTP_ENDPOINT}
+          compression: none
+          encoding: proto
+
+      service:
+        pipelines:
+          traces:
+            receivers: [otlp]
+            processors: [memory_limiter, resource/amber, batch]
+            exporters: [otlphttp/upstream]
+          logs/otlp:
+            receivers: [otlp]
+            processors: [memory_limiter, resource/amber, batch]
+            exporters: [otlphttp/upstream]
+          logs/program:
+            receivers: [filelog/docker]
+            processors: [memory_limiter, transform/program_logs, filter/program_logs, groupbyattrs/program_log_identity, resource/amber, batch]
+            exporters: [otlphttp/upstream]
+          metrics:
+            receivers: [otlp]
+            processors: [memory_limiter, resource/amber, batch]
+            exporters: [otlphttp/upstream]
+networks:
+  amber_mesh:
+    driver: bridge
+x-amber:
+  version: '1'
+  router:
+    mesh_port: 24000
+    control_port: 24100
+    control_socket: /router-control.sock
+    control_socket_volume: ${COMPOSE_PROJECT_NAME:-default}_amber-router-control
+  exports:
+    client_status:
+      component: /client
+      provide: status
+      protocol: http
+      router_mesh_port: 24000
+    public:
+      component: /server
+      provide: api
+      protocol: http
+      router_mesh_port: 24000
+  external_slots:
+    ext_api:
+      required: true
+      kind: http
+      url_env: AMBER_EXTERNAL_SLOT_EXT_API_URL

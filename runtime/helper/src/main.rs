@@ -1,7 +1,9 @@
 use std::{
     env, fs,
+    io::{BufRead as _, BufReader, Read},
     path::Path,
-    process::{Command, ExitCode, ExitStatus},
+    process::{Command, ExitCode, ExitStatus, Stdio},
+    thread,
 };
 #[cfg(unix)]
 use std::{
@@ -10,10 +12,14 @@ use std::{
     net::TcpStream,
     os::unix::net::{UnixListener, UnixStream},
     os::unix::process::{CommandExt, ExitStatusExt},
-    thread,
 };
 
 use amber_helper::{HelperError, RunPlan, build_run_plan};
+use amber_mesh::telemetry::{
+    COMPONENT_MONIKER_ENV, OtlpIdentity, OtlpInstallMode, SCENARIO_SCOPE_ENV, SubscriberFormat,
+    SubscriberOptions, init_otel_tracer, init_subscriber, observability_log_scope_name,
+    shutdown_tracer_provider, structured_logs_enabled,
+};
 #[cfg(unix)]
 use signal_hook::{consts::signal, iterator::Signals};
 use tracing_subscriber::EnvFilter;
@@ -29,22 +35,58 @@ const FORWARDED_SIGNALS: &[i32] = &[
 fn main() -> ExitCode {
     init_tracing();
 
-    match run_main() {
+    let exit_code = match run_main() {
         Ok(code) => code,
         Err(err) => {
             tracing::error!("{err}");
             ExitCode::from(1)
         }
-    }
+    };
+
+    shutdown_tracer_provider();
+    exit_code
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .without_time()
-        .init();
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("warn,amber_helper=info,amber.program=info"));
+    let moniker = std::env::var(COMPONENT_MONIKER_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/unknown".to_string());
+    let scope = std::env::var(SCENARIO_SCOPE_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let tracer = match init_otel_tracer(
+        OtlpIdentity {
+            moniker: moniker.as_str(),
+            component_kind: Some("program"),
+            scenario_scope: scope.as_deref(),
+        },
+        OtlpInstallMode::Simple,
+    ) {
+        Ok(tracer) => tracer,
+        Err(err) => {
+            eprintln!("warning: failed to initialize OTLP tracing: {err}");
+            None
+        }
+    };
+    let format = if structured_logs_enabled() {
+        SubscriberFormat::RuntimeJson
+    } else {
+        SubscriberFormat::RuntimeText
+    };
+    init_subscriber(
+        filter,
+        tracer,
+        format,
+        SubscriberOptions {
+            log_scope_name: Some(observability_log_scope_name(Some("program"))),
+            ..SubscriberOptions::default()
+        },
+    );
 }
 
 fn run_main() -> Result<ExitCode, HelperError> {
@@ -127,15 +169,14 @@ fn exec_plan(plan: RunPlan) -> Result<ExitCode, HelperError> {
     cmd.args(iter);
     cmd.env_clear();
     cmd.envs(env);
+    let component_moniker = std::env::var(COMPONENT_MONIKER_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "/unknown".to_string());
 
     #[cfg(unix)]
     {
-        if docker_mount_proxies.is_empty() {
-            let err = cmd.exec();
-            return Err(HelperError::Msg(format!("failed to exec program: {err}")));
-        }
-
-        let status = run_child_with_signal_forwarding(&mut cmd)?;
+        let status = run_child_with_signal_forwarding(&mut cmd, component_moniker.as_str())?;
         Ok(exit_code_from_status(status))
     }
 
@@ -147,15 +188,16 @@ fn exec_plan(plan: RunPlan) -> Result<ExitCode, HelperError> {
             ));
         }
 
-        let status = cmd
-            .status()
-            .map_err(|err| HelperError::Msg(format!("failed to run program: {err}")))?;
+        let status = run_child_with_log_capture(&mut cmd, component_moniker.as_str())?;
         Ok(exit_code_from_status(status))
     }
 }
 
 #[cfg(unix)]
-fn run_child_with_signal_forwarding(cmd: &mut Command) -> Result<ExitStatus, HelperError> {
+fn run_child_with_signal_forwarding(
+    cmd: &mut Command,
+    component_moniker: &str,
+) -> Result<ExitStatus, HelperError> {
     // Isolate the workload in its own process group so we can relay stop signals to
     // the full workload tree without signaling amber-helper itself.
     unsafe {
@@ -168,9 +210,8 @@ fn run_child_with_signal_forwarding(cmd: &mut Command) -> Result<ExitStatus, Hel
         });
     }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|err| HelperError::Msg(format!("failed to spawn program: {err}")))?;
+    let mut child_with_logs = spawn_child_with_logs(cmd, component_moniker)?;
+    let child = &mut child_with_logs.child;
     let child_pgid = child.id() as i32;
 
     let mut signals = Signals::new(FORWARDED_SIGNALS)
@@ -194,9 +235,101 @@ fn run_child_with_signal_forwarding(cmd: &mut Command) -> Result<ExitStatus, Hel
     let status = child
         .wait()
         .map_err(|err| HelperError::Msg(format!("failed to wait for program: {err}")))?;
+    for forwarder in child_with_logs.forwarders {
+        let _ = forwarder.join();
+    }
     signal_handle.close();
     let _ = forwarder.join();
     Ok(status)
+}
+
+#[cfg(not(unix))]
+fn run_child_with_log_capture(
+    cmd: &mut Command,
+    component_moniker: &str,
+) -> Result<ExitStatus, HelperError> {
+    let mut child_with_logs = spawn_child_with_logs(cmd, component_moniker)?;
+    let status = child_with_logs
+        .child
+        .wait()
+        .map_err(|err| HelperError::Msg(format!("failed to wait for program: {err}")))?;
+    for forwarder in child_with_logs.forwarders {
+        let _ = forwarder.join();
+    }
+    Ok(status)
+}
+
+struct ChildWithLogs {
+    child: std::process::Child,
+    forwarders: Vec<thread::JoinHandle<()>>,
+}
+
+fn spawn_child_with_logs(
+    cmd: &mut Command,
+    component_moniker: &str,
+) -> Result<ChildWithLogs, HelperError> {
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|err| HelperError::Msg(format!("failed to spawn program: {err}")))?;
+    let log_span = tracing::info_span!(
+        "amber.node.logs",
+        amber_kind = "node.log",
+        amber_component_moniker = component_moniker
+    );
+
+    let mut forwarders = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        forwarders.push(start_log_forwarder(stdout, "stdout", log_span.clone()));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        forwarders.push(start_log_forwarder(stderr, "stderr", log_span));
+    }
+
+    Ok(ChildWithLogs { child, forwarders })
+}
+
+fn start_log_forwarder<R: Read + Send + 'static>(
+    reader: R,
+    stream: &'static str,
+    span: tracing::Span,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            let read = match reader.read_until(b'\n', &mut buf) {
+                Ok(read) => read,
+                Err(err) => {
+                    tracing::warn!("failed to read child {stream}: {err}");
+                    break;
+                }
+            };
+            if read == 0 {
+                break;
+            }
+
+            let line = String::from_utf8_lossy(&buf);
+            let line = line.trim_end_matches(['\r', '\n']);
+            span.in_scope(|| match workload_log_level(stream) {
+                tracing::Level::WARN => {
+                    tracing::warn!(target: "amber.program", amber_stream = stream, amber_log_line = line, "{line}");
+                }
+                _ => {
+                    tracing::info!(target: "amber.program", amber_stream = stream, amber_log_line = line, "{line}");
+                }
+            });
+        }
+    })
+}
+
+fn workload_log_level(stream: &str) -> tracing::Level {
+    match stream {
+        "stderr" => tracing::Level::WARN,
+        _ => tracing::Level::INFO,
+    }
 }
 
 fn exit_code_from_status(status: ExitStatus) -> ExitCode {
@@ -267,4 +400,16 @@ fn proxy_unix_to_tcp(unix: UnixStream, tcp: TcpStream) -> io::Result<()> {
     let _ = unix_to_tcp.join();
     let _ = tcp_to_unix.join();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::workload_log_level;
+
+    #[test]
+    fn stderr_logs_are_promoted_to_warn() {
+        assert_eq!(workload_log_level("stdout"), tracing::Level::INFO);
+        assert_eq!(workload_log_level("stderr"), tracing::Level::WARN);
+        assert_eq!(workload_log_level("other"), tracing::Level::INFO);
+    }
 }

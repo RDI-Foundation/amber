@@ -64,6 +64,21 @@ const ROUTER_EXTERNAL_SECRET_NAME: &str = "amber-router-external";
 const COMPONENT_MESH_PORT_BASE: u16 = 23000;
 const ROUTER_MESH_PORT_BASE: u16 = 24000;
 const ROUTER_CONTROL_PORT_BASE: u16 = 24100;
+const SCENARIO_RUN_ID_ENV: &str = "AMBER_SCENARIO_RUN_ID";
+const OTELCOL_NAME: &str = "amber-otelcol";
+const OTELCOL_CONFIGMAP_NAME: &str = "amber-otelcol-config";
+const OTELCOL_CONFIG_KEY: &str = "config.yaml";
+const OTELCOL_CONFIG_DIR: &str = "/etc/otelcol";
+const OTELCOL_CONFIG_PATH: &str = "/etc/otelcol/config.yaml";
+const OTELCOL_SERVICE_PORT_GRPC: u16 = 4317;
+const OTELCOL_SERVICE_PORT_HTTP: u16 = 4318;
+const OTELCOL_UPSTREAM_ENV: &str = "AMBER_OTEL_UPSTREAM_OTLP_HTTP_ENDPOINT";
+const OTELCOL_DEFAULT_UPSTREAM_ENDPOINT: &str = "http://host.docker.internal:18890";
+const DEFAULT_OTELCOL_IMAGE: &str = "otel/opentelemetry-collector-contrib:0.143.0";
+const ROUTER_OTLP_ENDPOINT: &str = "http://amber-otelcol:4318";
+const OTELCOL_SERVICE_ACCOUNT: &str = "amber-otelcol";
+const OTELCOL_ROLE_NAME: &str = "amber-otelcol";
+const OTELCOL_ROLE_BINDING_NAME: &str = "amber-otelcol";
 
 const ROOT_CONFIG_SECRET_NAME: &str = "amber-root-config-secret";
 const ROOT_CONFIG_CONFIGMAP_NAME: &str = "amber-root-config";
@@ -310,6 +325,15 @@ fn render_kubernetes(
         m.insert("amber.io/component".to_string(), ROUTER_NAME.to_string());
         m
     };
+    let otelcol_labels = scenario_labels(&[
+        ("amber.io/type", "collector"),
+        ("amber.io/component", OTELCOL_NAME),
+    ]);
+    let otelcol_selector = {
+        let mut m = BTreeMap::new();
+        m.insert("amber.io/component".to_string(), OTELCOL_NAME.to_string());
+        m
+    };
 
     // ---- Generate resources ----
 
@@ -317,6 +341,161 @@ fn render_kubernetes(
 
     let ns = Namespace::new(&namespace, scenario_labels(&[]));
     files.insert(PathBuf::from("00-namespace.yaml"), to_yaml(&ns)?);
+
+    let otelcol_config = ConfigMap::new(
+        OTELCOL_CONFIGMAP_NAME,
+        &namespace,
+        otelcol_labels.clone(),
+        BTreeMap::from([(OTELCOL_CONFIG_KEY.to_string(), otelcol_config_content())]),
+    );
+    files.insert(
+        PathBuf::from("01-configmaps/amber-otelcol-config.yaml"),
+        to_yaml(&otelcol_config)?,
+    );
+    let otelcol_service_account = ServiceAccount::new(OTELCOL_SERVICE_ACCOUNT, &namespace);
+    files.insert(
+        PathBuf::from("02-rbac/amber-otelcol-sa.yaml"),
+        to_yaml(&otelcol_service_account)?,
+    );
+
+    let otelcol_role = Role::new(
+        OTELCOL_ROLE_NAME,
+        &namespace,
+        vec![PolicyRule {
+            api_groups: vec!["".to_string()],
+            resources: vec!["pods".to_string()],
+            verbs: vec!["get".to_string(), "list".to_string(), "watch".to_string()],
+            resource_names: None,
+        }],
+    );
+    files.insert(
+        PathBuf::from("02-rbac/amber-otelcol-role.yaml"),
+        to_yaml(&otelcol_role)?,
+    );
+
+    let otelcol_role_binding = RoleBinding::new(
+        OTELCOL_ROLE_BINDING_NAME,
+        &namespace,
+        Subject {
+            kind: "ServiceAccount".to_string(),
+            name: OTELCOL_SERVICE_ACCOUNT.to_string(),
+            namespace: Some(namespace.clone()),
+        },
+        RoleRef {
+            api_group: "rbac.authorization.k8s.io".to_string(),
+            kind: "Role".to_string(),
+            name: OTELCOL_ROLE_NAME.to_string(),
+        },
+    );
+    files.insert(
+        PathBuf::from("02-rbac/amber-otelcol-rolebinding.yaml"),
+        to_yaml(&otelcol_role_binding)?,
+    );
+
+    let otelcol_container = Container {
+        name: "otelcol".to_string(),
+        image: DEFAULT_OTELCOL_IMAGE.to_string(),
+        command: Vec::new(),
+        args: vec![format!("--config={OTELCOL_CONFIG_PATH}")],
+        env: vec![
+            EnvVar::literal(SCENARIO_RUN_ID_ENV, &namespace),
+            EnvVar::literal(OTELCOL_UPSTREAM_ENV, OTELCOL_DEFAULT_UPSTREAM_ENDPOINT),
+        ],
+        env_from: Vec::new(),
+        ports: vec![
+            ContainerPort {
+                name: "otlp-grpc".to_string(),
+                container_port: OTELCOL_SERVICE_PORT_GRPC,
+                protocol: "TCP",
+            },
+            ContainerPort {
+                name: "otlp-http".to_string(),
+                container_port: OTELCOL_SERVICE_PORT_HTTP,
+                protocol: "TCP",
+            },
+        ],
+        readiness_probe: None,
+        volume_mounts: vec![
+            VolumeMount {
+                name: "otelcol-config".to_string(),
+                mount_path: OTELCOL_CONFIG_DIR.to_string(),
+                read_only: Some(true),
+            },
+            VolumeMount {
+                name: "otelcol-host-containers".to_string(),
+                mount_path: "/var/log/containers".to_string(),
+                read_only: Some(true),
+            },
+            VolumeMount {
+                name: "otelcol-host-pods".to_string(),
+                mount_path: "/var/log/pods".to_string(),
+                read_only: Some(true),
+            },
+        ],
+    };
+
+    let otelcol_daemonset = DaemonSet {
+        api_version: "apps/v1",
+        kind: "DaemonSet",
+        metadata: ObjectMeta {
+            name: OTELCOL_NAME.to_string(),
+            namespace: Some(namespace.clone()),
+            labels: otelcol_labels.clone(),
+            ..Default::default()
+        },
+        spec: DaemonSetSpec {
+            selector: LabelSelector {
+                match_labels: otelcol_selector.clone(),
+            },
+            template: PodTemplateSpec {
+                metadata: ObjectMeta {
+                    labels: otelcol_labels.clone(),
+                    ..Default::default()
+                },
+                spec: PodSpec {
+                    init_containers: Vec::new(),
+                    containers: vec![otelcol_container],
+                    volumes: vec![
+                        Volume::config_map("otelcol-config", OTELCOL_CONFIGMAP_NAME),
+                        Volume::host_path("otelcol-host-containers", "/var/log/containers"),
+                        Volume::host_path("otelcol-host-pods", "/var/log/pods"),
+                    ],
+                    service_account_name: Some(OTELCOL_SERVICE_ACCOUNT.to_string()),
+                    automount_service_account_token: Some(true),
+                    restart_policy: None,
+                },
+            },
+        },
+    };
+    files.insert(
+        PathBuf::from("03-daemonsets/amber-otelcol.yaml"),
+        to_yaml(&otelcol_daemonset)?,
+    );
+
+    let otelcol_service = Service::new(
+        OTELCOL_NAME,
+        &namespace,
+        otelcol_labels.clone(),
+        otelcol_selector.clone(),
+        vec![
+            ServicePort {
+                name: "otlp-grpc".to_string(),
+                port: OTELCOL_SERVICE_PORT_GRPC,
+                target_port: OTELCOL_SERVICE_PORT_GRPC,
+                protocol: "TCP",
+            },
+            ServicePort {
+                name: "otlp-http".to_string(),
+                port: OTELCOL_SERVICE_PORT_HTTP,
+                target_port: OTELCOL_SERVICE_PORT_HTTP,
+                protocol: "TCP",
+            },
+        ],
+    );
+    files.insert(
+        PathBuf::from("04-services/amber-otelcol.yaml"),
+        to_yaml(&otelcol_service)?,
+    );
 
     let root_leaves = &config_plan.root_leaves;
     let root_leaf_by_path: BTreeMap<&str, &rc::SchemaLeaf> = root_leaves
@@ -445,6 +624,7 @@ fn render_kubernetes(
         let program_plan = program_plans.get(id).unwrap();
         let mesh_port = *mesh_ports_by_component.get(id).expect("mesh port missing");
         let label = component_label(s, *id);
+        let pod_annotations = component_pod_annotations(&namespace, &label);
         let image_source = program_image_source(output, s, *id, program_plan.image_origin());
         let (program_image, image_source_env_var) = render_kubernetes_image(
             program_plan.image(),
@@ -482,6 +662,17 @@ fn render_kubernetes(
                 // so we don't need AMBER_CONFIG_* env vars here.
                 let container_env: Vec<EnvVar> =
                     env.iter().map(|(k, v)| EnvVar::literal(k, v)).collect();
+                let mut container_env = container_env;
+                let scenario_scope = mesh_config_plan
+                    .component_configs
+                    .get(id)
+                    .and_then(|cfg| cfg.identity.mesh_scope.as_deref());
+                push_program_observability_env(
+                    &mut container_env,
+                    &label,
+                    scenario_scope,
+                    &namespace,
+                );
 
                 let container = Container {
                     name: "main".to_string(),
@@ -542,6 +733,16 @@ fn render_kubernetes(
                 if let Some(mount_spec_b64) = mount_spec_b64 {
                     container_env.push(EnvVar::literal("AMBER_MOUNT_SPEC_B64", mount_spec_b64));
                 }
+                let scenario_scope = mesh_config_plan
+                    .component_configs
+                    .get(id)
+                    .and_then(|cfg| cfg.identity.mesh_scope.as_deref());
+                push_program_observability_env(
+                    &mut container_env,
+                    &label,
+                    scenario_scope,
+                    &namespace,
+                );
                 build_helper_runner_container(program_image.clone(), ports, container_env)
             }
         };
@@ -551,21 +752,34 @@ fn render_kubernetes(
             mesh_secret,
         ));
 
+        let mut sidecar_env = vec![
+            EnvVar::literal(
+                "AMBER_ROUTER_CONFIG_PATH",
+                format!("{MESH_CONFIG_DIR}/{MESH_CONFIG_FILENAME}"),
+            ),
+            EnvVar::literal(
+                "AMBER_ROUTER_IDENTITY_PATH",
+                format!("{MESH_CONFIG_DIR}/{MESH_IDENTITY_FILENAME}"),
+            ),
+            EnvVar::literal(SCENARIO_RUN_ID_ENV, &namespace),
+            EnvVar::literal("OTEL_TRACES_SAMPLER", "always_on"),
+            EnvVar::literal("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
+            EnvVar::literal("OTEL_EXPORTER_OTLP_ENDPOINT", ROUTER_OTLP_ENDPOINT),
+        ];
+        if let Some(scope) = mesh_config_plan
+            .component_configs
+            .get(id)
+            .and_then(|cfg| cfg.identity.mesh_scope.as_deref())
+        {
+            sidecar_env.push(EnvVar::literal("AMBER_SCENARIO_SCOPE", scope));
+        }
+
         let sidecar = Container {
             name: "sidecar".to_string(),
             image: images.router.clone(),
             command: Vec::new(),
             args: Vec::new(),
-            env: vec![
-                EnvVar::literal(
-                    "AMBER_ROUTER_CONFIG_PATH",
-                    format!("{MESH_CONFIG_DIR}/{MESH_CONFIG_FILENAME}"),
-                ),
-                EnvVar::literal(
-                    "AMBER_ROUTER_IDENTITY_PATH",
-                    format!("{MESH_CONFIG_DIR}/{MESH_IDENTITY_FILENAME}"),
-                ),
-            ],
+            env: sidecar_env,
             env_from: Vec::new(),
             ports: vec![ContainerPort {
                 name: "mesh".to_string(),
@@ -675,6 +889,7 @@ fn render_kubernetes(
                 template: PodTemplateSpec {
                     metadata: ObjectMeta {
                         labels: labels.clone(),
+                        annotations: pod_annotations,
                         ..Default::default()
                     },
                     spec: pod_spec,
@@ -698,6 +913,23 @@ fn render_kubernetes(
             "AMBER_ROUTER_IDENTITY_PATH",
             format!("{MESH_CONFIG_DIR}/{MESH_IDENTITY_FILENAME}"),
         ));
+        env.push(EnvVar::literal(SCENARIO_RUN_ID_ENV, &namespace));
+        env.push(EnvVar::literal("OTEL_TRACES_SAMPLER", "always_on"));
+        env.push(EnvVar::literal(
+            "OTEL_EXPORTER_OTLP_PROTOCOL",
+            "http/protobuf",
+        ));
+        env.push(EnvVar::literal(
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            ROUTER_OTLP_ENDPOINT,
+        ));
+        if let Some(scope) = mesh_config_plan
+            .router_config
+            .as_ref()
+            .and_then(|cfg| cfg.identity.mesh_scope.as_deref())
+        {
+            env.push(EnvVar::literal("AMBER_SCENARIO_SCOPE", scope));
+        }
 
         let mut env_from = Vec::new();
         if !router_env_passthrough.is_empty() {
@@ -889,6 +1121,19 @@ fn render_kubernetes(
                         port: 53,
                     },
                 ],
+            });
+            netpol.add_egress_rule(NetworkPolicyEgressRule {
+                to: vec![NetworkPolicyPeer {
+                    pod_selector: Some(LabelSelector {
+                        match_labels: otelcol_selector.clone(),
+                    }),
+                    namespace_selector: None,
+                    ip_block: None,
+                }],
+                ports: vec![NetworkPolicyPort {
+                    protocol: "TCP",
+                    port: OTELCOL_SERVICE_PORT_HTTP,
+                }],
             });
 
             if let Some(by_provider) = egress_from_consumers {
@@ -1233,6 +1478,163 @@ fn render_kubernetes(
 }
 
 // ---- Helper functions ----
+
+fn otelcol_config_content() -> String {
+    format!(
+        r#"
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:{OTELCOL_SERVICE_PORT_GRPC}
+      http:
+        endpoint: 0.0.0.0:{OTELCOL_SERVICE_PORT_HTTP}
+  filelog/kubernetes:
+    include:
+      - /var/log/containers/*_${{env:{SCENARIO_RUN_ID_ENV}}}_main-*.log
+    start_at: end
+    include_file_path: true
+    operators:
+      - type: container
+      - type: json_parser
+        if: body matches "^[{{]"
+        parse_from: body
+      - type: severity_parser
+        if: attributes.level != nil
+        parse_from: attributes.level
+      - type: move
+        if: attributes.message != nil
+        from: attributes.message
+        to: body
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 128
+  batch: {{}}
+  k8sattributes/program_logs:
+    auth_type: serviceAccount
+    extract:
+      metadata:
+        - k8s.namespace.name
+        - k8s.pod.name
+        - k8s.pod.uid
+        - k8s.container.name
+      annotations:
+        - tag_name: service.name
+          key: resource.opentelemetry.io/service.name
+          from: pod
+        - tag_name: amber.component.moniker
+          key: amber.io/component-moniker
+          from: pod
+    pod_association:
+      - sources:
+          - from: resource_attribute
+            name: k8s.pod.uid
+  transform/program_logs:
+    error_mode: ignore
+    log_statements:
+      - context: scope
+        statements:
+          - set(scope.name, "amber.program")
+      - context: log
+        statements:
+          - set(log.attributes["amber_stream"], log.attributes["log.iostream"]) where log.attributes["amber_stream"] == nil and log.attributes["log.iostream"] != nil
+          - set(log.severity_number, SEVERITY_NUMBER_ERROR) where log.severity_number == 0 and IsString(log.body) and IsMatch(log.body, "(?i)\b(error|failed|exception|fatal|panic)\b")
+          - set(log.severity_number, SEVERITY_NUMBER_WARN) where log.severity_number == 0 and IsString(log.body) and IsMatch(log.body, "(?i)\b(warn|warning)\b")
+          - set(log.severity_number, SEVERITY_NUMBER_WARN) where log.severity_number == 0 and log.attributes["amber_stream"] == "stderr"
+          - set(log.severity_number, SEVERITY_NUMBER_INFO) where log.severity_number == 0
+          - set(log.severity_text, "Error") where log.severity_text == "" and log.severity_number >= SEVERITY_NUMBER_ERROR
+          - set(log.severity_text, "Warning") where log.severity_text == "" and log.severity_number >= SEVERITY_NUMBER_WARN and log.severity_number < SEVERITY_NUMBER_ERROR
+          - set(log.severity_text, "Information") where log.severity_text == "" and log.severity_number >= SEVERITY_NUMBER_INFO and log.severity_number < SEVERITY_NUMBER_WARN
+  resource/amber:
+    attributes:
+      - key: amber.scenario.run_id
+        action: upsert
+        value: ${{env:{SCENARIO_RUN_ID_ENV}}}
+
+exporters:
+  otlphttp/upstream:
+    endpoint: ${{env:{OTELCOL_UPSTREAM_ENV}}}
+    compression: none
+    encoding: proto
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/amber, batch]
+      exporters: [otlphttp/upstream]
+    logs/otlp:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/amber, batch]
+      exporters: [otlphttp/upstream]
+    logs/program:
+      receivers: [filelog/kubernetes]
+      processors: [memory_limiter, k8sattributes/program_logs, transform/program_logs, resource/amber, batch]
+      exporters: [otlphttp/upstream]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/amber, batch]
+      exporters: [otlphttp/upstream]
+"#
+    )
+}
+
+fn component_pod_annotations(namespace: &str, component_moniker: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            "resource.opentelemetry.io/service.name".to_string(),
+            kubernetes_component_service_name(namespace, component_moniker),
+        ),
+        (
+            "amber.io/component-moniker".to_string(),
+            component_moniker.to_string(),
+        ),
+    ])
+}
+
+fn kubernetes_component_service_name(namespace: &str, component_moniker: &str) -> String {
+    format!(
+        "amber.{namespace}.{}",
+        sanitize_component_moniker(component_moniker)
+    )
+}
+
+fn sanitize_component_moniker(component_moniker: &str) -> String {
+    let sanitized = component_moniker.trim_matches('/').replace('/', ".");
+    if sanitized.is_empty() {
+        "root".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn push_program_observability_env(
+    env: &mut Vec<EnvVar>,
+    component_moniker: &str,
+    scenario_scope: Option<&str>,
+    scenario_run_id: &str,
+) {
+    env.push(EnvVar::literal(SCENARIO_RUN_ID_ENV, scenario_run_id));
+    env.push(EnvVar::literal("OTEL_TRACES_SAMPLER", "always_on"));
+    env.push(EnvVar::literal(
+        "OTEL_EXPORTER_OTLP_PROTOCOL",
+        "http/protobuf",
+    ));
+    env.push(EnvVar::literal(
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        ROUTER_OTLP_ENDPOINT,
+    ));
+    env.push(EnvVar::literal(
+        "AMBER_COMPONENT_MONIKER",
+        component_moniker,
+    ));
+    if let Some(scope) = scenario_scope {
+        env.push(EnvVar::literal("AMBER_SCENARIO_SCOPE", scope));
+    }
+}
 
 fn render_kubernetes_image(
     image: &ProgramImagePlan,

@@ -25,6 +25,11 @@ use amber_manifest::ManifestRef;
 use amber_mesh::{
     InboundRoute, InboundTarget, MeshConfig, MeshIdentity, MeshIdentityPublic, MeshPeer,
     MeshProtocol, OutboundRoute, TransportConfig, component_route_id, router_export_route_id,
+    telemetry::{
+        OtlpIdentity, OtlpInstallMode, SubscriberFormat, SubscriberOptions, init_otel_tracer,
+        init_subscriber, observability_log_scope_name, shutdown_tracer_provider,
+        suppress_otlp_bridge_target,
+    },
 };
 use amber_resolver::Resolver;
 use amber_router as router;
@@ -37,8 +42,7 @@ use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     time::{Duration, Instant, sleep},
 };
-use tracing_error::ErrorLayer;
-use tracing_subscriber::{EnvFilter, fmt as tracing_fmt, prelude::*};
+use tracing_subscriber::EnvFilter;
 use url::{Url, form_urlencoded};
 
 #[derive(Parser)]
@@ -60,6 +64,7 @@ enum Command {
     Check(CheckArgs),
     Docs(DocsArgs),
     Proxy(ProxyArgs),
+    Dashboard(DashboardArgs),
 }
 
 #[derive(Args)]
@@ -181,6 +186,45 @@ struct ProxyArgs {
     router_config: Option<PathBuf>,
 }
 
+#[derive(Args)]
+struct DashboardArgs {
+    /// Docker image to run for the dashboard.
+    #[arg(long = "image", value_name = "IMAGE")]
+    image: Option<String>,
+
+    /// Docker container name for the dashboard.
+    #[arg(long = "name", value_name = "NAME", default_value = "amber-dashboard")]
+    name: String,
+
+    /// Dashboard frontend listen address on the host.
+    #[arg(
+        long = "ui-addr",
+        value_name = "HOST:PORT",
+        default_value = "127.0.0.1:18888"
+    )]
+    ui_addr: SocketAddr,
+
+    /// Dashboard OTLP/gRPC listen address on the host.
+    #[arg(
+        long = "otlp-grpc-addr",
+        value_name = "HOST:PORT",
+        default_value = "127.0.0.1:18889"
+    )]
+    otlp_grpc_addr: SocketAddr,
+
+    /// Dashboard OTLP/HTTP (protobuf) listen address on the host.
+    #[arg(
+        long = "otlp-http-addr",
+        value_name = "HOST:PORT",
+        default_value = "127.0.0.1:18890"
+    )]
+    otlp_http_addr: SocketAddr,
+
+    /// Run the dashboard in the background.
+    #[arg(long = "detach")]
+    detach: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProxyTargetKind {
     DockerCompose,
@@ -231,35 +275,159 @@ struct ExportBinding {
 async fn main() -> Result<()> {
     miette::set_panic_hook();
     let cli = Cli::parse();
-    init_tracing(cli.verbose)?;
+    let verbose = cli.verbose;
 
-    match cli.command {
-        Command::Compile(args) => compile(args).await,
-        Command::Check(args) => check(args).await,
-        Command::Docs(args) => docs(args),
-        Command::Proxy(args) => proxy(args).await,
+    let result = match cli.command {
+        Command::Proxy(args) => proxy(args, verbose).await,
+        command => {
+            init_tracing(verbose, None)?;
+            match command {
+                Command::Compile(args) => compile(args).await,
+                Command::Check(args) => check(args).await,
+                Command::Docs(args) => docs(args),
+                Command::Dashboard(args) => dashboard(args).await,
+                Command::Proxy(_) => unreachable!("handled above"),
+            }
+        }
+    };
+
+    shutdown_tracer_provider();
+    result
+}
+
+async fn dashboard(args: DashboardArgs) -> Result<()> {
+    let image = args
+        .image
+        .unwrap_or_else(|| "mcr.microsoft.com/dotnet/nightly/aspire-dashboard".to_string());
+
+    println!("dashboard ui: http://{}", args.ui_addr);
+    println!("dashboard otlp grpc: http://{}", args.otlp_grpc_addr);
+    println!("dashboard otlp http: http://{}", args.otlp_http_addr);
+    println!(
+        "from docker compose containers use: http://host.docker.internal:{}",
+        args.otlp_http_addr.port()
+    );
+
+    let mut cmd = ProcessCommand::new("docker");
+    cmd.arg("run");
+    if args.detach {
+        cmd.arg("-d");
+    } else {
+        cmd.arg("--rm");
+    }
+    cmd.args(["--name", &args.name]);
+    cmd.args([
+        "-p",
+        &format!("{}:18888", args.ui_addr),
+        "-p",
+        &format!("{}:18889", args.otlp_grpc_addr),
+        "-p",
+        &format!("{}:18890", args.otlp_http_addr),
+    ]);
+    cmd.args([
+        "-e",
+        "DOTNET_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS=true",
+        "-e",
+        "ASPNETCORE_URLS=http://0.0.0.0:18888",
+        "-e",
+        "DOTNET_DASHBOARD_OTLP_ENDPOINT_URL=http://0.0.0.0:18889",
+        "-e",
+        "DOTNET_DASHBOARD_OTLP_HTTP_ENDPOINT_URL=http://0.0.0.0:18890",
+    ]);
+    cmd.arg(image);
+
+    let status = cmd
+        .status()
+        .map_err(|err| miette::miette!("failed to run docker: {err}"))?;
+    if !status.success() {
+        return Err(miette::miette!("dashboard exited with status {status}"));
+    }
+    Ok(())
+}
+
+fn verbosity_level(verbose: u8) -> &'static str {
+    match verbose {
+        0 => "error",
+        1 => "warn",
+        2 => "info",
+        3 => "debug",
+        _ => "trace",
     }
 }
 
-fn init_tracing(verbose: u8) -> Result<()> {
-    let filter = if std::env::var_os("RUST_LOG").is_some() {
-        EnvFilter::try_from_default_env().into_diagnostic()?
+fn console_filter_spec(verbose: u8) -> String {
+    let level = verbosity_level(verbose);
+    format!(
+        "error,amber={level},amber_={level},amber_router={level},amber.binding={level},amber.\
+         proxy={level}"
+    )
+}
+
+fn proxy_telemetry_filter_spec(verbose: u8) -> String {
+    let amber_level = verbosity_level(verbose);
+    let router_level = match verbose {
+        0..=2 => "info",
+        3 => "debug",
+        _ => "trace",
+    };
+    format!(
+        "error,amber={amber_level},amber_={amber_level},amber_router={router_level},amber.\
+         proxy={amber_level}"
+    )
+}
+
+fn init_tracing(verbose: u8, otel_identity: Option<&MeshIdentity>) -> Result<()> {
+    let (filter, telemetry_filter) = if std::env::var_os("RUST_LOG").is_some() {
+        let filter = EnvFilter::try_from_default_env().into_diagnostic()?;
+        let telemetry_filter = otel_identity.is_some().then(|| {
+            suppress_otlp_bridge_target(
+                suppress_otlp_bridge_target(filter.clone(), "amber.binding"),
+                "amber.internal",
+            )
+        });
+        (filter, telemetry_filter)
     } else {
-        let amber_level = match verbose {
-            0 => "error",
-            1 => "warn",
-            2 => "info",
-            3 => "debug",
-            _ => "trace",
-        };
-        EnvFilter::new(format!("error,amber={amber_level},amber_={amber_level}"))
+        let filter = EnvFilter::new(console_filter_spec(verbose));
+        let telemetry_filter = otel_identity.is_some().then(|| {
+            suppress_otlp_bridge_target(
+                suppress_otlp_bridge_target(
+                    EnvFilter::new(proxy_telemetry_filter_spec(verbose)),
+                    "amber.binding",
+                ),
+                "amber.internal",
+            )
+        });
+        (filter, telemetry_filter)
     };
 
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(tracing_fmt::layer())
-        .with(ErrorLayer::default())
-        .init();
+    let tracer = if let Some(identity) = otel_identity {
+        match init_otel_tracer(
+            OtlpIdentity {
+                moniker: identity.id.as_str(),
+                component_kind: None,
+                scenario_scope: identity.mesh_scope.as_deref(),
+            },
+            OtlpInstallMode::BatchTokio,
+        ) {
+            Ok(tracer) => tracer,
+            Err(err) => {
+                eprintln!("warning: failed to initialize OTLP tracing: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    init_subscriber(
+        filter,
+        tracer,
+        SubscriberFormat::CliText,
+        SubscriberOptions {
+            include_error_layer: true,
+            telemetry_filter,
+            log_scope_name: otel_identity.map(|_| observability_log_scope_name(None)),
+        },
+    );
 
     Ok(())
 }
@@ -371,7 +539,7 @@ fn docs(args: DocsArgs) -> Result<()> {
     docs::run(args)
 }
 
-async fn proxy(args: ProxyArgs) -> Result<()> {
+async fn proxy(args: ProxyArgs, verbose: u8) -> Result<()> {
     let slot_bindings = parse_slot_bindings(&args)?;
     let export_bindings = parse_export_bindings(&args)?;
     if slot_bindings.is_empty() && export_bindings.is_empty() {
@@ -403,6 +571,9 @@ async fn proxy(args: ProxyArgs) -> Result<()> {
         .router_addr
         .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], router_port)));
     let proxy_identity = build_proxy_identity("/proxy", &router_identity);
+
+    init_tracing(verbose, Some(&proxy_identity))?;
+
     let (mesh_addr, mesh_listen) = if slot_bindings.is_empty() {
         (None, SocketAddr::from(([127, 0, 0, 1], 0)))
     } else {
@@ -446,6 +617,9 @@ async fn proxy(args: ProxyArgs) -> Result<()> {
         outbound.push(OutboundRoute {
             route_id: router_export_route_id(export, protocol),
             slot: export.to_string(),
+            binding_name: None,
+            capability_kind: None,
+            capability_profile: None,
             listen_port: binding.listen.port(),
             listen_addr: Some(binding.listen.ip().to_string()),
             protocol,
@@ -486,6 +660,9 @@ async fn proxy(args: ProxyArgs) -> Result<()> {
             inbound.push(InboundRoute {
                 route_id: component_route_id(&proxy_identity.id, slot, MeshProtocol::Http),
                 capability: slot.to_string(),
+                binding_name: None,
+                capability_kind: Some(slot_meta.kind.clone()),
+                capability_profile: None,
                 protocol: MeshProtocol::Http,
                 http_plugins: Vec::new(),
                 target: InboundTarget::Local {
@@ -566,7 +743,7 @@ async fn resolve_router_identity(
                     ));
                 }
                 if !warned {
-                    tracing::warn!("waiting for router control at {control_endpoint}...");
+                    eprintln!("waiting for router control at {control_endpoint}...");
                     warned = true;
                 }
                 sleep(CONTROL_UPDATE_RETRY_INTERVAL).await;
@@ -826,13 +1003,18 @@ fn resolve_control_endpoint(args: &ProxyArgs, target: &ProxyTarget) -> Result<Co
         && let Some(volume) = router.control_socket_volume.as_ref()
     {
         let resolved_volume = expand_env_templates(volume, compose_project.as_deref())?;
-        let socket_path = router
+        let raw_socket_path = router
             .control_socket
             .as_deref()
             .unwrap_or("/amber/control/router-control.sock");
+        let socket_path = Path::new(raw_socket_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| format!("/{name}"))
+            .unwrap_or_else(|| raw_socket_path.to_string());
         return Ok(ControlEndpoint::VolumeSocket {
             volume: resolved_volume,
-            socket_path: socket_path.to_string(),
+            socket_path,
         });
     }
     if let Some(socket) = router.control_socket.as_ref() {
@@ -958,6 +1140,7 @@ const EXPORT_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(30);
 const ROUTER_IDENTITY_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_CURL_IMAGE: &str = "curlimages/curl:8.12.1";
 const CONTROL_SOCKET_MOUNT_DIR: &str = "/amber/control";
+const CONTROL_SOCKET_UID_GID: &str = "65532:65532";
 
 impl ControlExportPayload {
     fn new(identity: &MeshIdentity, protocol: &str) -> Self {
@@ -1224,9 +1407,18 @@ async fn send_control_request_via_volume(
             "invalid router control socket path (must be absolute): {socket_path}"
         )));
     }
+    let socket_file = Path::new(socket_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            ControlUpdateError::Fatal(format!(
+                "invalid router control socket path (missing filename): {socket_path}"
+            ))
+        })?;
+    let mounted_socket_path = format!("{CONTROL_SOCKET_MOUNT_DIR}/{socket_file}");
     send_control_request_via_mount(
         &format!("{volume}:{CONTROL_SOCKET_MOUNT_DIR}"),
-        socket_path,
+        &mounted_socket_path,
         request,
     )
     .await
@@ -1245,6 +1437,8 @@ async fn send_control_request_via_mount(
             .arg("--rm")
             .arg("--network")
             .arg("none")
+            .arg("--user")
+            .arg(CONTROL_SOCKET_UID_GID)
             .arg("-v")
             .arg(socket_mount)
             .arg(CONTROL_CURL_IMAGE)
@@ -1727,4 +1921,36 @@ fn write_kubernetes_output(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{console_filter_spec, proxy_telemetry_filter_spec, verbosity_level};
+
+    #[test]
+    fn verbosity_levels_follow_v_flag_ladder() {
+        assert_eq!(verbosity_level(0), "error");
+        assert_eq!(verbosity_level(1), "warn");
+        assert_eq!(verbosity_level(2), "info");
+        assert_eq!(verbosity_level(3), "debug");
+        assert_eq!(verbosity_level(4), "trace");
+        assert_eq!(verbosity_level(9), "trace");
+    }
+
+    #[test]
+    fn proxy_console_is_quiet_by_default() {
+        assert_eq!(
+            console_filter_spec(0),
+            "error,amber=error,amber_=error,amber_router=error,amber.binding=error,amber.\
+             proxy=error"
+        );
+    }
+
+    #[test]
+    fn proxy_telemetry_keeps_router_info_without_verbose_output() {
+        assert_eq!(
+            proxy_telemetry_filter_spec(0),
+            "error,amber=error,amber_=error,amber_router=info,amber.proxy=error"
+        );
+    }
 }

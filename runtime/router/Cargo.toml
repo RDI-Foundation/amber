@@ -32,7 +32,9 @@ tower-http = { version = "0.6.8", default-features = false, features = ["compres
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net"] }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["json"] }
+opentelemetry = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]

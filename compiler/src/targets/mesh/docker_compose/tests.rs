@@ -324,6 +324,189 @@ fn assert_depends_on(service: &super::Service, name: &str, condition: &str) {
     }
 }
 
+#[test]
+fn compose_emits_otelcol_agent_and_wires_router_otel_env() {
+    let program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["sh", "-lc", "sleep infinity"],
+        "env": {}
+    }))
+    .unwrap();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: Some(program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root)],
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    };
+
+    let output = compile_output(scenario);
+    let yaml = DockerComposeReporter
+        .emit(&output)
+        .expect("compose render should succeed");
+    let compose = parse_compose(&yaml);
+
+    assert!(
+        compose.services.contains_key(super::OTELCOL_SERVICE_NAME),
+        "{yaml}"
+    );
+    assert!(
+        compose.configs.contains_key(super::OTELCOL_CONFIG_NAME),
+        "{yaml}"
+    );
+
+    let otelcol = service(&compose, super::OTELCOL_SERVICE_NAME);
+    assert!(
+        otelcol.networks.contains_key(super::MESH_NETWORK_NAME),
+        "{yaml}"
+    );
+    assert!(
+        otelcol
+            .extra_hosts
+            .iter()
+            .any(|entry| entry == super::HOST_GATEWAY_ENTRY),
+        "{yaml}"
+    );
+    assert_eq!(
+        env_value(otelcol, super::SCENARIO_RUN_ID_ENV).as_deref(),
+        Some("${COMPOSE_PROJECT_NAME:-default}"),
+        "{yaml}"
+    );
+    assert_eq!(
+        env_value(otelcol, super::OTELCOL_UPSTREAM_ENV).as_deref(),
+        Some("${AMBER_OTEL_UPSTREAM_OTLP_HTTP_ENDPOINT:-http://host.docker.internal:18890}"),
+        "{yaml}"
+    );
+    assert!(
+        otelcol
+            .configs
+            .iter()
+            .any(|mount| mount.source == super::OTELCOL_CONFIG_NAME
+                && mount.target.as_deref() == Some(super::OTELCOL_CONFIG_PATH)),
+        "{yaml}"
+    );
+    assert!(
+        otelcol
+            .volumes
+            .iter()
+            .any(|mount| mount.contains(super::DOCKER_CONTAINER_LOGS_DIR)),
+        "{yaml}"
+    );
+
+    let otelcol_config = &compose
+        .configs
+        .get(super::OTELCOL_CONFIG_NAME)
+        .expect("otelcol config missing")
+        .content;
+    assert!(otelcol_config.contains("endpoint: 0.0.0.0:4317"));
+    assert!(otelcol_config.contains("endpoint: 0.0.0.0:4318"));
+    assert!(otelcol_config.contains(
+        "receivers:
+  otlp:"
+    ));
+    assert!(otelcol_config.contains("traces:"));
+    assert!(otelcol_config.contains("logs/otlp:"));
+    assert!(otelcol_config.contains("logs/program:"));
+    assert!(otelcol_config.contains("metrics:"));
+    assert!(otelcol_config.contains("resource/amber"));
+    assert!(otelcol_config.contains("value: $${env:AMBER_SCENARIO_RUN_ID}"));
+    assert!(otelcol_config.contains("endpoint: $${env:AMBER_OTEL_UPSTREAM_OTLP_HTTP_ENDPOINT}"));
+    assert!(otelcol_config.contains("filelog/docker"));
+    assert!(otelcol_config.contains(super::DOCKER_CONTAINER_LOGS_DIR));
+    assert!(otelcol_config.contains("transform/program_logs"));
+    assert!(otelcol_config.contains("set(scope.name, \"amber.program\")"));
+    assert!(
+        otelcol_config.contains(
+            "set(log.severity_number, SEVERITY_NUMBER_INFO) where log.severity_number == 0"
+        )
+    );
+    assert!(otelcol_config.contains(
+        "set(log.severity_number, SEVERITY_NUMBER_WARN) where log.severity_number == 0 and \
+         log.attributes[\"amber_stream\"] == \"stderr\""
+    ));
+
+    let sidecar = service(&compose, "c0-component-net");
+    assert_eq!(
+        env_value(sidecar, "OTEL_TRACES_SAMPLER").as_deref(),
+        Some("always_on"),
+        "{yaml}"
+    );
+    assert_eq!(
+        env_value(sidecar, "OTEL_EXPORTER_OTLP_PROTOCOL").as_deref(),
+        Some("http/protobuf"),
+        "{yaml}"
+    );
+    assert_eq!(
+        env_value(sidecar, "OTEL_EXPORTER_OTLP_ENDPOINT").as_deref(),
+        Some("http://amber-otelcol:4318"),
+        "{yaml}"
+    );
+    assert!(env_value(sidecar, "AMBER_LOG_FORMAT").is_none(), "{yaml}");
+
+    let program = service(&compose, "c0-component");
+    assert_eq!(
+        env_value(program, "OTEL_TRACES_SAMPLER").as_deref(),
+        Some("always_on"),
+        "{yaml}"
+    );
+    assert_eq!(
+        env_value(program, "OTEL_EXPORTER_OTLP_PROTOCOL").as_deref(),
+        Some("http/protobuf"),
+        "{yaml}"
+    );
+    assert_eq!(
+        env_value(program, "OTEL_EXPORTER_OTLP_ENDPOINT").as_deref(),
+        Some("http://amber-otelcol:4318"),
+        "{yaml}"
+    );
+    assert_eq!(
+        env_value(program, "AMBER_COMPONENT_MONIKER").as_deref(),
+        Some("/"),
+        "{yaml}"
+    );
+    assert!(env_value(program, "AMBER_LOG_FORMAT").is_none(), "{yaml}");
+    let logging = program
+        .logging
+        .as_ref()
+        .expect("program logging configured");
+    assert_eq!(logging.driver, "json-file", "{yaml}");
+    assert_eq!(
+        logging.options.get("labels").map(String::as_str),
+        Some(super::LOG_LABEL_LIST),
+        "{yaml}"
+    );
+    assert_eq!(
+        program
+            .labels
+            .get(super::LOG_LABEL_MONIKER)
+            .map(String::as_str),
+        Some("/"),
+        "{yaml}"
+    );
+    assert_eq!(
+        program
+            .labels
+            .get(super::LOG_LABEL_SERVICE_NAME)
+            .map(String::as_str),
+        Some("amber.${COMPOSE_PROJECT_NAME:-default}.root"),
+        "{yaml}"
+    );
+}
+
 fn provision_plan(compose: &super::DockerComposeFile) -> MeshProvisionPlan {
     let raw = &compose
         .configs
@@ -1406,7 +1589,7 @@ fn compose_emits_export_metadata_and_labels() {
         .control_socket
         .as_deref()
         .expect("router control socket missing");
-    assert_eq!(control_socket, "/amber/control/router-control.sock");
+    assert_eq!(control_socket, "/router-control.sock");
     let control_volume = router_meta
         .control_socket_volume
         .as_deref()

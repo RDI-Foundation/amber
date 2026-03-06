@@ -4,19 +4,28 @@ summary: Bind an external HTTP slot and re-export a public HTTP capability via o
 
 # Externalized slots
 
-This scenario has a required external HTTP slot (`api`) and one exported HTTP capability
-(`public`). It is the canonical local-dev workflow for wiring both directions with one
-`amber proxy` process.
+This example shows both directions with one `amber proxy` process:
+- external slot ingress (`api`) from scenario -> your local HTTP server
+- exported capability egress (`public`) from host -> scenario
 
-## Docker Compose loop
+## Quick start (Docker Compose)
 
-1. Start a local upstream service (slot target):
+Use three terminals.
+
+If `amber` is not on your `PATH`, replace it with `target/debug/amber`.
+
+1. Terminal A: start a local upstream HTTP service (slot target).
 
 ```sh
-python3 -m http.server 8081
+mkdir -p /tmp/amber-external-upstream
+printf 'hello from upstream\n' > /tmp/amber-external-upstream/index.html
+cd /tmp/amber-external-upstream
+python3 -m http.server 8081 --bind 127.0.0.1
 ```
 
-2. Compile and run the scenario:
+Keep this terminal running. You will use its logs to confirm slot traffic.
+
+2. Terminal B: compile and start the scenario.
 
 ```sh
 amber compile examples/externalized-slots/scenario.json5 \
@@ -24,11 +33,7 @@ amber compile examples/externalized-slots/scenario.json5 \
 docker compose -f /tmp/amber-external.yaml up -d
 ```
 
-Router control is resolved automatically by `amber proxy` from compile metadata.
-For Compose output, this is a project-scoped named volume that carries the router control socket.
-A single `amber proxy` process uses one mesh identity across all bindings.
-
-3. In another terminal, bind the slot and expose the export:
+3. Terminal C: run one proxy for both mappings.
 
 ```sh
 amber proxy /tmp/amber-external.yaml \
@@ -36,27 +41,37 @@ amber proxy /tmp/amber-external.yaml \
   --export public=127.0.0.1:18080
 ```
 
-4. Verify slot traffic:
-
-```sh
-docker compose -f /tmp/amber-external.yaml logs -f c0-component
-```
-
-You should see repeated calls from the root component to your local server.
-
-5. Verify export traffic:
+4. Verify host -> scenario (export path).
 
 ```sh
 curl -i http://127.0.0.1:18080
 ```
 
-The sample server may return `404` for `/`; that still confirms routing works if you get an
-HTTP response from the proxy.
+You should get an HTTP response. A startup `503` for the first request can happen; retry after a
+second. `404` for `/` is also fine here and still confirms end-to-end routing.
 
-### Multiple local copies
+5. Verify scenario -> host (slot path).
 
-If you run the same compose file with an explicit project name, pass the same
-`COMPOSE_PROJECT_NAME` to `amber proxy` so it resolves the matching control socket:
+In Terminal A, you should see repeated lines like:
+
+```text
+"GET / HTTP/1.1" 200 -
+```
+
+That confirms the component is calling your local upstream through the externalized slot.
+
+## Cleanup
+
+```sh
+docker compose -f /tmp/amber-external.yaml down -v
+```
+
+Stop Terminal A and Terminal C with `Ctrl-C`.
+
+## Troubleshooting
+
+- `address already in use`: change `8081` and/or `18080` consistently in commands above.
+- If you run Compose with `-p <name>`, set the same project name for proxy resolution:
 
 ```sh
 docker compose -p amber-external-a -f /tmp/amber-external.yaml up -d
@@ -66,10 +81,7 @@ COMPOSE_PROJECT_NAME=amber-external-a \
     --export public=127.0.0.1:18080
 ```
 
-You can run multiple `amber proxy` processes against one scenario. Each proxy process gets its own
-mesh identity.
-
-## Kubernetes loop
+## Kubernetes (advanced)
 
 Compile and apply:
 
@@ -83,14 +95,13 @@ kubectl -n "$NS" rollout status deploy/amber-router
 kubectl -n "$NS" rollout status deploy/c0-component
 ```
 
-Start your local upstream server:
+Start the same local upstream server as in the Compose section:
 
 ```sh
-python3 -m http.server 8081
+python3 -m http.server 8081 --bind 127.0.0.1
 ```
 
-Create a shared env file with free local ports (so multiple scenarios can run side-by-side
-without collisions):
+Pick free local ports and save them:
 
 ```sh
 pick_free_port() {
@@ -111,13 +122,7 @@ PROXY_EXPORT_LOCAL_PORT=$(pick_free_port)
 EOF
 ```
 
-The env file now contains:
-- `ROUTER_MESH_LOCAL_PORT`: local port where `amber proxy` reaches router mesh traffic.
-- `ROUTER_CONTROL_LOCAL_PORT`: local port where `amber proxy` reaches router control APIs.
-- `PROXY_MESH_LOCAL_PORT`: local port where router mesh traffic reaches `amber proxy`.
-- `PROXY_EXPORT_LOCAL_PORT`: local port where host clients reach the exported capability.
-
-Port-forward router mesh and control in a dedicated terminal (keep it running):
+Terminal B (keep running): port-forward router mesh + control.
 
 ```sh
 source /tmp/amber-external.k8s.env
@@ -126,7 +131,7 @@ kubectl -n "$NS" port-forward deploy/amber-router \
   "${ROUTER_CONTROL_LOCAL_PORT}:24100"
 ```
 
-In another terminal, run one proxy command for both mappings:
+Terminal C: run proxy.
 
 ```sh
 source /tmp/amber-external.k8s.env
@@ -142,16 +147,12 @@ amber proxy /tmp/amber-external \
   --router-control-addr "127.0.0.1:${ROUTER_CONTROL_LOCAL_PORT}"
 ```
 
-Why all three addresses are needed:
-- `--router-addr` and `--router-control-addr` tell `amber proxy` how to reach the
-  router through local `kubectl port-forward`.
-- `--mesh-addr` tells the router pod how to reach `amber proxy` for external slot traffic.
-  This must be routable from inside the cluster.
-
 Verify:
 
 ```sh
 source /tmp/amber-external.k8s.env
-kubectl -n "$NS" logs -f deploy/c0-component -c main
 curl -i "http://127.0.0.1:${PROXY_EXPORT_LOCAL_PORT}"
+kubectl -n "$NS" logs -f deploy/c0-component -c main
 ```
+
+As with Compose, brief startup `503` responses are expected until proxy wiring is ready.
