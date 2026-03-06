@@ -691,7 +691,8 @@ const DIRECT_RUNTIME_STATE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DirectControlSocketPaths {
-    link: PathBuf,
+    artifact_link: PathBuf,
+    current_link: PathBuf,
     runtime: PathBuf,
 }
 
@@ -764,13 +765,22 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
         let router_binary = resolve_runtime_binary("amber-router")?;
         if let Some(router) = direct_plan.router.as_ref() {
             let paths = DirectControlSocketPaths {
-                link: resolve_direct_artifact_path(&plan_root, &router.control_socket_path),
+                artifact_link: resolve_direct_artifact_path(
+                    &plan_root,
+                    &router.control_socket_path,
+                ),
+                current_link: direct_current_control_socket_path(&plan_root),
                 runtime: direct_runtime_control_socket_path(&runtime_root),
             };
-            let direct_control_link_dir = paths
-                .link
+            let direct_control_artifact_link_dir = paths
+                .artifact_link
                 .parent()
                 .ok_or_else(|| miette::miette!("invalid direct control socket path"))?
+                .to_path_buf();
+            let direct_control_current_link_dir = paths
+                .current_link
+                .parent()
+                .ok_or_else(|| miette::miette!("invalid current control socket path"))?
                 .to_path_buf();
             let direct_control_runtime_dir = paths
                 .runtime
@@ -810,12 +820,20 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                         work_dir.display()
                     )
                 })?;
-            fs::create_dir_all(&direct_control_link_dir)
+            fs::create_dir_all(&direct_control_artifact_link_dir)
                 .into_diagnostic()
                 .wrap_err_with(|| {
                     format!(
                         "failed to create router control directory {}",
-                        direct_control_link_dir.display()
+                        direct_control_artifact_link_dir.display()
+                    )
+                })?;
+            fs::create_dir_all(&direct_control_current_link_dir)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to create current router control directory {}",
+                        direct_control_current_link_dir.display()
                     )
                 })?;
             fs::create_dir_all(&direct_control_runtime_dir)
@@ -826,16 +844,6 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                         direct_control_runtime_dir.display()
                     )
                 })?;
-            if fs::symlink_metadata(&paths.link).is_ok() {
-                fs::remove_file(&paths.link)
-                    .into_diagnostic()
-                    .wrap_err_with(|| {
-                        format!(
-                            "failed to remove stale router control symlink {}",
-                            paths.link.display()
-                        )
-                    })?;
-            }
             if paths.runtime.exists() {
                 fs::remove_file(&paths.runtime)
                     .into_diagnostic()
@@ -846,16 +854,16 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                         )
                     })?;
             }
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&paths.runtime, &paths.link)
-                .into_diagnostic()
-                .wrap_err_with(|| {
-                    format!(
-                        "failed to create router control symlink {} -> {}",
-                        paths.link.display(),
-                        paths.runtime.display()
-                    )
-                })?;
+            ensure_direct_control_socket_link(
+                &paths.artifact_link,
+                &paths.current_link,
+                "router control symlink",
+            )?;
+            ensure_direct_control_socket_link(
+                &paths.current_link,
+                &paths.runtime,
+                "runtime router control symlink",
+            )?;
             let spec = ProcessSpec {
                 name: "router".to_string(),
                 program: router_binary.clone(),
@@ -1024,29 +1032,72 @@ fn resolve_direct_artifact_path(plan_root: &Path, path: &str) -> PathBuf {
     }
 }
 
+fn direct_current_control_socket_path(plan_root: &Path) -> PathBuf {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    plan_root.hash(&mut hasher);
+    let suffix = hasher.finish();
+    env::temp_dir()
+        .join("amber-direct-control")
+        .join(format!("current-{suffix:016x}.sock"))
+}
+
 fn direct_runtime_control_socket_path(runtime_root: &Path) -> PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     runtime_root.hash(&mut hasher);
     let suffix = hasher.finish();
     env::temp_dir()
         .join("amber-direct-control")
-        .join(format!("{suffix:016x}.sock"))
+        .join(format!("runtime-{suffix:016x}.sock"))
+}
+
+#[cfg(unix)]
+fn ensure_direct_control_socket_link(link: &Path, target: &Path, description: &str) -> Result<()> {
+    if fs::read_link(link)
+        .ok()
+        .is_some_and(|existing_target| existing_target == target)
+    {
+        return Ok(());
+    }
+
+    if fs::symlink_metadata(link).is_ok() {
+        fs::remove_file(link)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to remove stale {description} {}", link.display()))?;
+    }
+
+    std::os::unix::fs::symlink(target, link)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to create {description} {} -> {}",
+                link.display(),
+                target.display()
+            )
+        })
+}
+
+#[cfg(not(unix))]
+fn ensure_direct_control_socket_link(link: &Path, target: &Path, description: &str) -> Result<()> {
+    let _ = (link, target, description);
+    Err(miette::miette!(
+        "direct runtime control sockets require unix symlink support"
+    ))
 }
 
 fn remove_direct_control_socket_link(paths: &DirectControlSocketPaths) {
     #[cfg(unix)]
     {
-        if fs::read_link(&paths.link)
+        if fs::read_link(&paths.current_link)
             .ok()
             .is_some_and(|target| target == paths.runtime)
         {
-            let _ = fs::remove_file(&paths.link);
+            let _ = fs::remove_file(&paths.current_link);
         }
     }
 
     #[cfg(not(unix))]
     {
-        let _ = fs::remove_file(&paths.link);
+        let _ = fs::remove_file(&paths.current_link);
     }
 }
 
@@ -3621,9 +3672,9 @@ fn resolve_control_endpoint(args: &ProxyArgs, target: &ProxyTarget) -> Result<Co
     if let Some(socket) = router.control_socket.as_ref() {
         let resolved = expand_env_templates(socket, compose_project.as_deref())?;
         if matches!(target.kind, ProxyTargetKind::Direct) {
-            return Ok(ControlEndpoint::Unix(resolve_direct_artifact_path(
+            let _ = resolved;
+            return Ok(ControlEndpoint::Unix(direct_current_control_socket_path(
                 &target.source,
-                &resolved,
             )));
         }
         return Ok(ControlEndpoint::Unix(PathBuf::from(resolved)));
@@ -4776,7 +4827,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_control_endpoint_uses_direct_artifact_control_socket_link() {
+    fn resolve_control_endpoint_uses_short_direct_control_socket_alias() {
+        let source = PathBuf::from(
+            "/home/runner/work/amber/amber/target/cli-test-outputs/direct-smoke-FOF9wf/out",
+        );
         let target = ProxyTarget {
             kind: ProxyTargetKind::Direct,
             metadata: ProxyMetadata {
@@ -4789,15 +4843,20 @@ mod tests {
                 }),
                 ..Default::default()
             },
-            source: PathBuf::from("/tmp/direct-output"),
+            source: source.clone(),
         };
 
         let endpoint =
             resolve_control_endpoint(&test_proxy_args(), &target).expect("endpoint should resolve");
 
-        assert_eq!(
-            endpoint.to_string(),
-            "unix:///tmp/direct-output/.amber/router-control.sock"
+        let ControlEndpoint::Unix(path) = endpoint else {
+            panic!("expected unix control endpoint");
+        };
+        assert_eq!(path, direct_current_control_socket_path(&source));
+        assert!(
+            path.as_os_str().len() < 100,
+            "direct control alias should stay well below unix socket path limits: {}",
+            path.display()
         );
     }
 
@@ -4845,19 +4904,20 @@ mod tests {
         let runtime_one = tempfile::tempdir().expect("temp dir should be created");
         let runtime_two = tempfile::tempdir().expect("temp dir should be created");
         let paths_one = DirectControlSocketPaths {
-            link: plan_root.path().join(".amber/router-control.sock"),
+            artifact_link: plan_root.path().join(".amber/router-control.sock"),
+            current_link: direct_current_control_socket_path(plan_root.path()),
             runtime: direct_runtime_control_socket_path(runtime_one.path()),
         };
         let runtime_two_socket = direct_runtime_control_socket_path(runtime_two.path());
-        fs::create_dir_all(paths_one.link.parent().expect("link parent"))
+        fs::create_dir_all(paths_one.current_link.parent().expect("link parent"))
             .expect("link parent should be created");
-        std::os::unix::fs::symlink(&runtime_two_socket, &paths_one.link)
+        std::os::unix::fs::symlink(&runtime_two_socket, &paths_one.current_link)
             .expect("symlink should be created");
 
         remove_direct_control_socket_link(&paths_one);
 
         assert_eq!(
-            fs::read_link(&paths_one.link).expect("newer run symlink should remain"),
+            fs::read_link(&paths_one.current_link).expect("newer run symlink should remain"),
             runtime_two_socket
         );
     }
@@ -4877,11 +4937,24 @@ mod tests {
         fs::write(&runtime_state_path, "{}").expect("state file should be written");
 
         let control_socket_paths = DirectControlSocketPaths {
-            link: plan_root.path().join(".amber/router-control.sock"),
+            artifact_link: plan_root.path().join(".amber/router-control.sock"),
+            current_link: direct_current_control_socket_path(plan_root.path()),
             runtime: direct_runtime_control_socket_path(&runtime_root),
         };
-        fs::create_dir_all(control_socket_paths.link.parent().expect("link parent"))
-            .expect("link parent should be created");
+        fs::create_dir_all(
+            control_socket_paths
+                .artifact_link
+                .parent()
+                .expect("link parent"),
+        )
+        .expect("link parent should be created");
+        fs::create_dir_all(
+            control_socket_paths
+                .current_link
+                .parent()
+                .expect("current link parent"),
+        )
+        .expect("current link parent should be created");
         fs::create_dir_all(
             control_socket_paths
                 .runtime
@@ -4890,8 +4963,16 @@ mod tests {
         )
         .expect("runtime parent should be created");
         fs::write(&control_socket_paths.runtime, "").expect("runtime socket placeholder");
-        std::os::unix::fs::symlink(&control_socket_paths.runtime, &control_socket_paths.link)
-            .expect("symlink should be created");
+        std::os::unix::fs::symlink(
+            &control_socket_paths.current_link,
+            &control_socket_paths.artifact_link,
+        )
+        .expect("artifact symlink should be created");
+        std::os::unix::fs::symlink(
+            &control_socket_paths.runtime,
+            &control_socket_paths.current_link,
+        )
+        .expect("symlink should be created");
 
         let child = TokioCommand::new("sh")
             .arg("-c")
@@ -4913,8 +4994,17 @@ mod tests {
         .await;
 
         assert!(
-            fs::symlink_metadata(&control_socket_paths.link).is_err(),
-            "control socket link should be removed"
+            fs::symlink_metadata(&control_socket_paths.artifact_link).is_ok(),
+            "artifact control socket link should remain available for future runs"
+        );
+        assert_eq!(
+            fs::read_link(&control_socket_paths.artifact_link)
+                .expect("artifact link should still point at current alias"),
+            control_socket_paths.current_link
+        );
+        assert!(
+            fs::symlink_metadata(&control_socket_paths.current_link).is_err(),
+            "current control socket link should be removed"
         );
         assert!(
             fs::metadata(&control_socket_paths.runtime).is_err(),
