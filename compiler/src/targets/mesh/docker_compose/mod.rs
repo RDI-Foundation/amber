@@ -866,8 +866,8 @@ processors:
           - set(log.attributes["service.name"], log.attributes["attrs"]["{LOG_LABEL_SERVICE_NAME}"]) where log.attributes["attrs"] != nil and log.attributes["attrs"]["{LOG_LABEL_SERVICE_NAME}"] != nil
           - set(log.attributes["amber.component.moniker"], log.attributes["attrs"]["{LOG_LABEL_MONIKER}"]) where log.attributes["attrs"] != nil and log.attributes["attrs"]["{LOG_LABEL_MONIKER}"] != nil
           - delete_key(log.attributes, "attrs") where log.attributes["attrs"] != nil
-          - set(log.severity_number, SEVERITY_NUMBER_ERROR) where log.severity_number == 0 and IsString(log.body) and IsMatch(log.body, "(?i)\b(error|failed|exception|fatal|panic)\b")
-          - set(log.severity_number, SEVERITY_NUMBER_WARN) where log.severity_number == 0 and IsString(log.body) and IsMatch(log.body, "(?i)\b(warn|warning)\b")
+          - set(log.severity_number, SEVERITY_NUMBER_ERROR) where log.severity_number == 0 and IsString(log.body) and IsMatch(log.body, "(?i)\\b(error|failed|exception|fatal|panic)\\b")
+          - set(log.severity_number, SEVERITY_NUMBER_WARN) where log.severity_number == 0 and IsString(log.body) and IsMatch(log.body, "(?i)\\b(warn|warning)\\b")
           - set(log.severity_number, SEVERITY_NUMBER_WARN) where log.severity_number == 0 and log.attributes["amber_stream"] == "stderr"
           - set(log.severity_number, SEVERITY_NUMBER_INFO) where log.severity_number == 0
           - set(log.severity_text, "Error") where log.severity_text == "" and log.severity_number >= SEVERITY_NUMBER_ERROR

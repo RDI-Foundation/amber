@@ -430,6 +430,11 @@ fn compose_emits_otelcol_agent_and_wires_router_otel_env() {
     assert!(otelcol_config.contains("transform/program_logs"));
     assert!(otelcol_config.contains("set(scope.name, \"amber.program\")"));
     assert!(
+        otelcol_config
+            .contains(r#"IsMatch(log.body, "(?i)\\b(error|failed|exception|fatal|panic)\\b")"#)
+    );
+    assert!(otelcol_config.contains(r#"IsMatch(log.body, "(?i)\\b(warn|warning)\\b")"#));
+    assert!(
         otelcol_config.contains(
             "set(log.severity_number, SEVERITY_NUMBER_INFO) where log.severity_number == 0"
         )

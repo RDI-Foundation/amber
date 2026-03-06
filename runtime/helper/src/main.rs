@@ -232,12 +232,7 @@ fn run_child_with_signal_forwarding(
         }
     });
 
-    let status = child
-        .wait()
-        .map_err(|err| HelperError::Msg(format!("failed to wait for program: {err}")))?;
-    for forwarder in child_with_logs.forwarders {
-        let _ = forwarder.join();
-    }
+    let status = wait_for_child_exit(child_with_logs)?;
     signal_handle.close();
     let _ = forwarder.join();
     Ok(status)
@@ -248,15 +243,7 @@ fn run_child_with_log_capture(
     cmd: &mut Command,
     component_moniker: &str,
 ) -> Result<ExitStatus, HelperError> {
-    let mut child_with_logs = spawn_child_with_logs(cmd, component_moniker)?;
-    let status = child_with_logs
-        .child
-        .wait()
-        .map_err(|err| HelperError::Msg(format!("failed to wait for program: {err}")))?;
-    for forwarder in child_with_logs.forwarders {
-        let _ = forwarder.join();
-    }
-    Ok(status)
+    wait_for_child_exit(spawn_child_with_logs(cmd, component_moniker)?)
 }
 
 struct ChildWithLogs {
@@ -288,6 +275,18 @@ fn spawn_child_with_logs(
     }
 
     Ok(ChildWithLogs { child, forwarders })
+}
+
+fn wait_for_child_exit(mut child_with_logs: ChildWithLogs) -> Result<ExitStatus, HelperError> {
+    let status = child_with_logs
+        .child
+        .wait()
+        .map_err(|err| HelperError::Msg(format!("failed to wait for program: {err}")))?;
+    // Descendants can inherit stdout/stderr and keep the pipe writers open after the main
+    // process exits. Dropping the join handles detaches the forwarders so helper shutdown is
+    // driven by the workload exit status rather than EOF on those inherited pipes.
+    child_with_logs.forwarders.clear();
+    Ok(status)
 }
 
 fn start_log_forwarder<R: Read + Send + 'static>(
@@ -404,12 +403,36 @@ fn proxy_unix_to_tcp(unix: UnixStream, tcp: TcpStream) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::workload_log_level;
+    use std::{
+        process::Command,
+        time::{Duration, Instant},
+    };
+
+    use super::{spawn_child_with_logs, wait_for_child_exit, workload_log_level};
 
     #[test]
     fn stderr_logs_are_promoted_to_warn() {
         assert_eq!(workload_log_level("stdout"), tracing::Level::INFO);
         assert_eq!(workload_log_level("stderr"), tracing::Level::WARN);
         assert_eq!(workload_log_level("other"), tracing::Level::INFO);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_exit_is_not_blocked_by_descendant_holding_log_pipe_open() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 2 & exit 7"]);
+
+        let child = spawn_child_with_logs(&mut cmd, "/test")
+            .expect("child with log forwarding should spawn");
+        let start = Instant::now();
+        let status = wait_for_child_exit(child).expect("child wait should succeed");
+
+        assert_eq!(status.code(), Some(7));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "waiting for child exit took {:?}",
+            start.elapsed()
+        );
     }
 }
