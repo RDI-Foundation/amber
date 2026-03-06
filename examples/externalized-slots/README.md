@@ -1,3 +1,7 @@
+<!-- amber-docs
+summary: Bind an external HTTP slot and re-export a public HTTP capability via one proxy.
+-->
+
 # Externalized slots
 
 This scenario has a required external HTTP slot (`api`) and one exported HTTP capability
