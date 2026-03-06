@@ -1,3 +1,7 @@
+<!-- amber-docs
+summary: Forward a root export through router-level slot forwarding.
+-->
+
 # Slot forwarding
 
 This scenario exports `api` at the root, but the export is actually served by

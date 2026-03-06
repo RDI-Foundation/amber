@@ -1,3 +1,5 @@
+mod docs;
+
 use std::{
     collections::BTreeSet,
     fmt, fs,
@@ -127,7 +129,21 @@ struct DocsArgs {
 
 #[derive(Subcommand)]
 enum DocsCommand {
+    /// Dump the top-level Amber README.
+    Readme,
+
+    /// List examples or dump one example's files.
+    Examples(DocsExamplesArgs),
+
+    /// Dump the manifest schema README.
     Manifest,
+}
+
+#[derive(Args)]
+struct DocsExamplesArgs {
+    /// Example name to dump. Omit to list available examples.
+    #[arg(value_name = "EXAMPLE")]
+    example: Option<String>,
 }
 
 #[derive(Args)]
@@ -352,16 +368,7 @@ async fn check(args: CheckArgs) -> Result<()> {
 }
 
 fn docs(args: DocsArgs) -> Result<()> {
-    match args.command {
-        DocsCommand::Manifest => {
-            const MANIFEST_DOCS: &str = include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../compiler/manifest/README.md"
-            ));
-            print!("{MANIFEST_DOCS}");
-            Ok(())
-        }
-    }
+    docs::run(args)
 }
 
 async fn proxy(args: ProxyArgs) -> Result<()> {

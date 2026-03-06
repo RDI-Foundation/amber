@@ -7,7 +7,8 @@ Command-line front-end for the compiler. It resolves a root manifest, runs compi
 - Render diagnostics via `miette`, including treating selected warnings as errors.
 - Write compile outputs only when requested; `amber compile` requires at least one output flag (`--output`, `--dot`, `--docker-compose`/`--compose`, `--metadata`, `--kubernetes`, or `--bundle`).
 - Detect bundle and Scenario IR inputs and emit bundle directories via `--bundle`.
-- Surface the manifest README via `amber docs manifest`.
+- Surface embedded project docs via `amber docs readme`, `amber docs manifest`, and
+  `amber docs examples [example]`.
 
 ## Where to look
 - `src/main.rs`: command flow, diagnostics policy, and output paths.

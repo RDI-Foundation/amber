@@ -24,6 +24,9 @@ tracing-error = "0.2.1"
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
 
+[build-dependencies]
+amber-manifest = { workspace = true }
+
 [dev-dependencies]
 amber-images = { workspace = true }
 serde_yaml = { workspace = true }

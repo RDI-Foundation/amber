@@ -1,3 +1,7 @@
+<!-- amber-docs
+summary: Use experimental `framework.docker` bindings and mounts in Docker Compose.
+-->
+
 # framework.docker Example (Docker Compose)
 
 This example shows how to use the experimental `framework.docker` capability in Docker Compose.
