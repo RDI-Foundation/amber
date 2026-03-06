@@ -52,6 +52,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 COPY compiler/config ./compiler/config
 COPY runtime/helper ./runtime/helper
+COPY runtime/mesh ./runtime/mesh
 COPY compiler/template ./compiler/template
 
 ARG BUILD_MODE=release
