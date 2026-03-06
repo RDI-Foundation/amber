@@ -23,6 +23,28 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Validate README CLI Docker tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_tag="$(
+            cargo run -q -p amber-images --bin version_tags -- docker/images.json |
+              jq -re '.images[] | select(.name == "amber-cli") | .runtime_tag'
+          )"
+          image_ref="ghcr.io/rdi-foundation/amber-cli:${runtime_tag}"
+          readme_refs="$(grep -oE 'ghcr\.io/rdi-foundation/amber-cli:[A-Za-z0-9._-]+' README.md || true)"
+          if [ -z "$readme_refs" ]; then
+            echo "::error::README.md does not reference the amber-cli Docker image."
+            exit 1
+          fi
+
+          unexpected_refs="$(printf '%s\n' "$readme_refs" | grep -Fvx "$image_ref" || true)"
+          if [ -n "$unexpected_refs" ]; then
+            echo "::error::README.md must use ${image_ref} for every amber-cli Docker example."
+            printf '%s\n' "$unexpected_refs"
+            exit 1
+          fi
+
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-features --all-targets -- -D warnings -D clippy::dbg_macro
 
