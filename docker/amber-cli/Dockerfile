@@ -28,6 +28,7 @@ FROM base-builder AS builder
 
 # Prefetch Rust dependencies for better Docker layer caching.
 COPY Cargo.toml Cargo.lock ./
+COPY README.md ./
 COPY cli/Cargo.toml cli/
 COPY compiler/config/Cargo.toml compiler/config/
 COPY compiler/Cargo.toml compiler/
@@ -52,6 +53,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 COPY cli ./cli
 COPY compiler ./compiler
+COPY examples ./examples
 COPY images ./images
 COPY runtime/mesh ./runtime/mesh
 COPY runtime/router ./runtime/router

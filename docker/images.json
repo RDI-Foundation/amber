@@ -4,7 +4,8 @@
     {
       "name": "amber-cli",
       "context": ".",
-      "dockerfile": "docker/amber-cli/Dockerfile"
+      "dockerfile": "docker/amber-cli/Dockerfile",
+      "version": "v0.1.x"
     },
     {
       "name": "amber-helper",
