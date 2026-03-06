@@ -1,0 +1,28 @@
+{
+  manifest_version: "0.1.0",
+  slots: {
+    server_api: { kind: "mcp", profile: "debug-jsonrpc" },
+    ext_api: { kind: "http", profile: "debug-external" },
+  },
+  program: {
+    image: "busybox:1.36",
+    entrypoint: [
+      "sh",
+      "-lc",
+      "mkdir -p /www && echo client-ok > /www/index.html; httpd -f -p 9010 -h /www & echo '[client] started'; while true; do echo '[client] internal rpc -> server'; wget -qO- --header='x-amber-tutorial: internal-edge' \"$SERVER_API_URL/rpc\" >/dev/null || true; echo '[client] external rpc -> upstream' >&2; wget -qO- --header='content-type: application/json' --header='x-amber-tutorial: external-edge' --post-data='{\"jsonrpc\":\"2.0\",\"id\":\"external-1\",\"method\":\"tools/call\"}' \"$EXT_API_URL/rpc\" >/dev/null || true; echo '[client] external sse -> upstream'; wget -qO- --header='x-amber-tutorial: external-sse' \"$EXT_API_URL/stream\" >/dev/null || true; sleep 4; done",
+    ],
+    env: {
+      SERVER_API_URL: "${slots.server_api.url}",
+      EXT_API_URL: "${slots.ext_api.url}",
+    },
+    network: {
+      endpoints: [{ name: "status", port: 9010 }],
+    },
+  },
+  provides: {
+    status: { kind: "http", endpoint: "status" },
+  },
+  exports: {
+    status: "status",
+  },
+}

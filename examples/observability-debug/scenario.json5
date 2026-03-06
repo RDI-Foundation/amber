@@ -1,0 +1,27 @@
+{
+  manifest_version: "0.1.0",
+  slots: {
+    ext_api: { kind: "http", profile: "debug-external" },
+  },
+  components: {
+    client: "./client.json5",
+    server: "./server.json5",
+  },
+  bindings: [
+    {
+      name: "client_server_api",
+      to: "#client.server_api",
+      from: "#server.api",
+    },
+    {
+      name: "client_external_api",
+      to: "#client.ext_api",
+      from: "self.ext_api",
+      weak: true,
+    },
+  ],
+  exports: {
+    public: "#server.api",
+    client_status: "#client.status",
+  },
+}

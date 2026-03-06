@@ -844,6 +844,174 @@ fn kubernetes_emits_router_for_external_slots() {
 }
 
 #[test]
+fn kubernetes_emits_otelcol_and_wires_otel_env() {
+    let dir = tempdir().expect("temp dir");
+    let root_path = dir.path().join("root.json5");
+    let worker_path = dir.path().join("worker.json5");
+
+    fs::write(
+        &root_path,
+        r##"
+        {
+          manifest_version: "0.1.0",
+          components: { worker: "./worker.json5" }
+        }
+        "##,
+    )
+    .expect("write root manifest");
+
+    fs::write(
+        &worker_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "busybox:1.36.1",
+            entrypoint: ["sh", "-lc", "echo hello && sleep 3600"]
+          }
+        }
+        "#,
+    )
+    .expect("write worker manifest");
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..Default::default()
+    };
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let output = rt
+        .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
+        .expect("compile scenario");
+
+    let reporter = KubernetesReporter {
+        config: KubernetesReporterConfig {
+            disable_networkpolicy_check: true,
+        },
+    };
+    let artifact = reporter.emit(&output).expect("render kubernetes output");
+
+    let otelcol_config = artifact
+        .files
+        .get(&PathBuf::from("01-configmaps/amber-otelcol-config.yaml"))
+        .expect("otelcol config");
+    assert!(
+        otelcol_config.contains("endpoint: 0.0.0.0:4317"),
+        "{otelcol_config}"
+    );
+    assert!(
+        otelcol_config.contains("endpoint: 0.0.0.0:4318"),
+        "{otelcol_config}"
+    );
+    assert!(otelcol_config.contains("service:"), "{otelcol_config}");
+    assert!(otelcol_config.contains("traces:"), "{otelcol_config}");
+    assert!(otelcol_config.contains("logs/otlp:"), "{otelcol_config}");
+    assert!(otelcol_config.contains("logs/program:"), "{otelcol_config}");
+    assert!(otelcol_config.contains("metrics:"), "{otelcol_config}");
+    assert!(
+        otelcol_config.contains("resource/amber"),
+        "{otelcol_config}"
+    );
+    assert!(
+        otelcol_config.contains("${env:AMBER_SCENARIO_RUN_ID}"),
+        "{otelcol_config}"
+    );
+    assert!(
+        otelcol_config.contains("filelog/kubernetes"),
+        "{otelcol_config}"
+    );
+    assert!(
+        otelcol_config.contains("/var/log/containers"),
+        "{otelcol_config}"
+    );
+    assert!(
+        otelcol_config.contains("transform/program_logs"),
+        "{otelcol_config}"
+    );
+    assert!(
+        otelcol_config.contains("set(scope.name, \"amber.program\")"),
+        "{otelcol_config}"
+    );
+    assert!(
+        otelcol_config
+            .contains("set(log.attributes[\"amber_stream\"], log.attributes[\"log.iostream\"])"),
+        "{otelcol_config}"
+    );
+    assert!(
+        otelcol_config.contains(
+            "set(log.severity_number, SEVERITY_NUMBER_INFO) where log.severity_number == 0"
+        ),
+        "{otelcol_config}"
+    );
+
+    let otelcol_daemonset = artifact
+        .files
+        .get(&PathBuf::from("03-daemonsets/amber-otelcol.yaml"))
+        .expect("otelcol daemonset");
+    assert!(
+        otelcol_daemonset.contains("AMBER_SCENARIO_RUN_ID"),
+        "{otelcol_daemonset}"
+    );
+    assert!(
+        otelcol_daemonset.contains("AMBER_OTEL_UPSTREAM_OTLP_HTTP_ENDPOINT"),
+        "{otelcol_daemonset}"
+    );
+    assert!(
+        otelcol_daemonset.contains("serviceAccountName: amber-otelcol"),
+        "{otelcol_daemonset}"
+    );
+    assert!(
+        otelcol_daemonset.contains("/var/log/containers"),
+        "{otelcol_daemonset}"
+    );
+    assert!(
+        otelcol_daemonset.contains("/var/log/pods"),
+        "{otelcol_daemonset}"
+    );
+
+    let otelcol_service = artifact
+        .files
+        .get(&PathBuf::from("04-services/amber-otelcol.yaml"))
+        .expect("otelcol service");
+    assert!(otelcol_service.contains("port: 4317"), "{otelcol_service}");
+    assert!(otelcol_service.contains("port: 4318"), "{otelcol_service}");
+
+    let component_deploy = artifact
+        .files
+        .iter()
+        .find_map(|(path, content)| {
+            let path = path.to_string_lossy();
+            (path.starts_with("03-deployments/") && path.ends_with("worker.yaml"))
+                .then_some(content)
+        })
+        .expect("worker deployment");
+    assert!(
+        component_deploy.contains("OTEL_EXPORTER_OTLP_ENDPOINT"),
+        "{component_deploy}"
+    );
+    assert!(
+        component_deploy.contains("http://amber-otelcol:4318"),
+        "{component_deploy}"
+    );
+    assert!(
+        component_deploy.contains("AMBER_COMPONENT_MONIKER"),
+        "{component_deploy}"
+    );
+    assert!(
+        !component_deploy.contains("AMBER_LOG_FORMAT"),
+        "{component_deploy}"
+    );
+    assert!(
+        component_deploy.contains("resource.opentelemetry.io/service.name"),
+        "{component_deploy}"
+    );
+    assert!(
+        component_deploy.contains("amber.io/component-moniker"),
+        "{component_deploy}"
+    );
+}
+
+#[test]
 #[ignore = "requires docker + kind + kubectl + curl; run manually"]
 fn kubernetes_smoke_config_roundtrip() {
     let fixture_dir = tempdir().expect("create fixture temp dir");
@@ -1925,6 +2093,9 @@ fn kubernetes_smoke_export_routes_to_host() {
         outbound: vec![OutboundRoute {
             route_id: router_export_route_id(export_name, MeshProtocol::Http),
             slot: export_name.to_string(),
+            binding_name: None,
+            capability_kind: None,
+            capability_profile: None,
             listen_port: proxy_listen.port(),
             listen_addr: Some(proxy_listen.ip().to_string()),
             protocol: MeshProtocol::Http,

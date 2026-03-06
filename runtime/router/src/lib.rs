@@ -1,15 +1,16 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
     net::{IpAddr, SocketAddr},
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use amber_mesh::{
     HttpRoutePlugin, InboundRoute, InboundTarget, MeshConfig, MeshConfigPublic, MeshIdentity,
     MeshIdentityPublic, MeshIdentitySecret, MeshPeer, MeshProtocol, OutboundRoute,
     component_route_id,
+    telemetry::{OtlpLogMessage, OtlpTraceContext, emit_otlp_log},
 };
 use base64::Engine as _;
 use bytes::Bytes;
@@ -18,7 +19,7 @@ use futures::StreamExt as _;
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri, header};
 use http_body_util::{BodyExt as _, BodyStream, Full, StreamBody};
 use hyper::{
-    body::{Frame, Incoming},
+    body::{Body as _, Frame, Incoming},
     client::conn::http1 as client_http1,
     server::conn::http1,
     service::service_fn,
@@ -28,6 +29,11 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo},
     service::TowerToHyperService,
+};
+use opentelemetry::{
+    Key,
+    logs::{AnyValue, Severity},
+    trace::TraceContextExt as _,
 };
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
@@ -43,6 +49,8 @@ use tokio::{
 };
 use tower::{ServiceBuilder, ServiceExt as _, service_fn as tower_service_fn};
 use tower_http::{compression::CompressionLayer, decompression::Decompression};
+use tracing::Instrument as _;
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use url::Url;
 
 mod a2a;
@@ -87,12 +95,199 @@ struct OpenFrame {
     route_id: String,
     capability: String,
     protocol: MeshProtocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    binding_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capability_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capability_profile: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HttpEdgeKind {
+    Binding,
+    ExternalSlot,
+    Export,
+}
+
+impl HttpEdgeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Binding => "binding",
+            Self::ExternalSlot => "external_slot",
+            Self::Export => "export",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct HttpExchangeLabels {
+    kind: HttpEdgeKind,
+    emit_telemetry: bool,
+    slot: Option<Arc<str>>,
+    capability: Arc<str>,
+    binding_name: Option<Arc<str>>,
+    capability_kind: Option<Arc<str>>,
+    capability_profile: Option<Arc<str>>,
+    source_component: Option<Arc<str>>,
+    source_endpoint: Arc<str>,
+    destination_component: Option<Arc<str>>,
+    destination_endpoint: Arc<str>,
+    edge_owner_component: Option<Arc<str>>,
+}
+
+impl HttpExchangeLabels {
+    fn inbound_from_route(
+        local_id: Arc<str>,
+        remote_id: Arc<str>,
+        route: &InboundRoute,
+        open: &OpenFrame,
+    ) -> Self {
+        let slot = open.slot.as_deref().map(Arc::<str>::from);
+        let binding_name = route
+            .binding_name
+            .clone()
+            .or_else(|| open.binding_name.clone())
+            .map(Arc::<str>::from);
+        let capability = Arc::<str>::from(route.capability.as_str());
+        let capability_kind = route
+            .capability_kind
+            .clone()
+            .or_else(|| open.capability_kind.clone())
+            .map(Arc::<str>::from);
+        let capability_profile = route
+            .capability_profile
+            .clone()
+            .or_else(|| open.capability_profile.clone())
+            .map(Arc::<str>::from);
+        let source_from_open = source_endpoint_from_open(open);
+        let router_forwarded_export = remote_id.as_ref() == "/router"
+            && (binding_name.is_some() || source_from_open.is_some());
+
+        let (
+            kind,
+            emit_telemetry,
+            source_component,
+            source_endpoint,
+            destination_component,
+            destination_endpoint,
+            edge_owner_component,
+        ) = match &route.target {
+            InboundTarget::Local { .. } => {
+                if router_forwarded_export {
+                    (
+                        HttpEdgeKind::Export,
+                        false,
+                        None,
+                        binding_name
+                            .clone()
+                            .or_else(|| source_from_open.clone())
+                            .unwrap_or_else(|| capability.clone()),
+                        Some(local_id.clone()),
+                        capability.clone(),
+                        None,
+                    )
+                } else {
+                    (
+                        HttpEdgeKind::Binding,
+                        true,
+                        Some(remote_id.clone()),
+                        source_from_open.unwrap_or_else(|| capability.clone()),
+                        Some(local_id.clone()),
+                        capability.clone(),
+                        binding_name.as_ref().map(|_| remote_id.clone()),
+                    )
+                }
+            }
+            InboundTarget::External { .. } => (
+                HttpEdgeKind::ExternalSlot,
+                true,
+                Some(remote_id.clone()),
+                source_from_open.unwrap_or_else(|| capability.clone()),
+                None,
+                capability.clone(),
+                binding_name.as_ref().map(|_| remote_id.clone()),
+            ),
+            InboundTarget::MeshForward {
+                peer_id,
+                capability: forward_capability,
+                ..
+            } => (
+                HttpEdgeKind::Export,
+                true,
+                None,
+                binding_name
+                    .clone()
+                    .or(source_from_open)
+                    .unwrap_or_else(|| capability.clone()),
+                Some(Arc::<str>::from(peer_id.as_str())),
+                Arc::<str>::from(forward_capability.as_str()),
+                None,
+            ),
+        };
+
+        Self {
+            kind,
+            emit_telemetry,
+            slot,
+            capability,
+            binding_name,
+            capability_kind,
+            capability_profile,
+            source_component,
+            source_endpoint,
+            destination_component,
+            destination_endpoint,
+            edge_owner_component,
+        }
+    }
+
+    fn outbound_from_route(local_id: Arc<str>, route: &OutboundRoute) -> Self {
+        let kind = if route.peer_id == "/router" {
+            HttpEdgeKind::ExternalSlot
+        } else {
+            HttpEdgeKind::Binding
+        };
+        let destination_component = match kind {
+            HttpEdgeKind::ExternalSlot => None,
+            HttpEdgeKind::Binding | HttpEdgeKind::Export => {
+                Some(Arc::<str>::from(route.peer_id.as_str()))
+            }
+        };
+        Self {
+            kind,
+            emit_telemetry: true,
+            slot: Some(Arc::<str>::from(route.slot.as_str())),
+            capability: Arc::<str>::from(route.capability.as_str()),
+            binding_name: route.binding_name.as_deref().map(Arc::<str>::from),
+            capability_kind: route.capability_kind.as_deref().map(Arc::<str>::from),
+            capability_profile: route.capability_profile.as_deref().map(Arc::<str>::from),
+            source_component: Some(local_id.clone()),
+            source_endpoint: Arc::<str>::from(route.slot.as_str()),
+            destination_component,
+            destination_endpoint: Arc::<str>::from(route.capability.as_str()),
+            edge_owner_component: route.binding_name.as_ref().map(|_| local_id),
+        }
+    }
+}
+
+fn source_endpoint_from_open(open: &OpenFrame) -> Option<Arc<str>> {
+    open.slot
+        .as_deref()
+        .map(Arc::<str>::from)
+        .or_else(|| open.binding_name.as_deref().map(Arc::<str>::from))
+        .or_else(|| {
+            (!open.capability.is_empty()).then(|| Arc::<str>::from(open.capability.as_str()))
+        })
 }
 
 #[derive(Clone)]
 struct HttpProxyState {
     client: HttpClient,
     target: ExternalTarget,
+    labels: HttpExchangeLabels,
 }
 
 #[derive(Clone)]
@@ -101,6 +296,7 @@ struct LocalHttpProxyState {
     base_url: Url,
     plugins: Arc<[Arc<dyn HttpExchangePlugin>]>,
     route_id: Arc<str>,
+    labels: HttpExchangeLabels,
 }
 
 #[derive(Clone)]
@@ -108,6 +304,7 @@ struct OutboundHttpProxyState {
     upstream: Arc<Mutex<client_http1::SendRequest<BoxBody>>>,
     plugins: Arc<[Arc<dyn HttpExchangePlugin>]>,
     route_id: Arc<str>,
+    labels: HttpExchangeLabels,
 }
 
 type HttpClient = Client<HttpsConnector<HttpConnector>, BoxBody>;
@@ -134,6 +331,267 @@ struct RewriteContext {
 enum RewriteFlow {
     Inbound,
     Outbound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HttpLifecyclePart {
+    Request,
+    Response,
+}
+
+impl RewriteFlow {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Inbound => "inbound",
+            Self::Outbound => "outbound",
+        }
+    }
+
+    fn otel_kind(self) -> &'static str {
+        match self {
+            Self::Inbound => "server",
+            Self::Outbound => "client",
+        }
+    }
+
+    fn local_role(self) -> &'static str {
+        match self {
+            Self::Inbound => "receiver",
+            Self::Outbound => "sender",
+        }
+    }
+
+    fn peer_role(self) -> &'static str {
+        match self {
+            Self::Inbound => "sender",
+            Self::Outbound => "receiver",
+        }
+    }
+
+    fn lifecycle_stage(self, part: HttpLifecyclePart) -> &'static str {
+        match (self, part) {
+            (Self::Outbound, HttpLifecyclePart::Request) => "sender_request",
+            (Self::Inbound, HttpLifecyclePart::Request) => "receiver_request",
+            (Self::Inbound, HttpLifecyclePart::Response) => "receiver_response",
+            (Self::Outbound, HttpLifecyclePart::Response) => "sender_response",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct HttpExchangeTelemetryContext {
+    flow: RewriteFlow,
+    flow_name: &'static str,
+    otel_kind: &'static str,
+    local_role: &'static str,
+    peer_role: &'static str,
+    edge_kind: HttpEdgeKind,
+    capability: Arc<str>,
+    slot: Option<Arc<str>>,
+    binding_name: Option<Arc<str>>,
+    capability_kind: Option<Arc<str>>,
+    capability_profile: Option<Arc<str>>,
+    source_component: Option<Arc<str>>,
+    source_endpoint: Arc<str>,
+    destination_component: Option<Arc<str>>,
+    destination_endpoint: Arc<str>,
+    edge_owner_component: Option<Arc<str>>,
+    source_ref: Arc<str>,
+    destination_ref: Arc<str>,
+    edge_ref: Arc<str>,
+    summary: Arc<StdMutex<ProtocolSummary>>,
+}
+
+impl HttpExchangeTelemetryContext {
+    fn new(flow: RewriteFlow, labels: &HttpExchangeLabels) -> Self {
+        let source_ref = Arc::<str>::from(source_ref_for(labels).into_boxed_str());
+        let destination_ref = Arc::<str>::from(destination_ref_for(labels).into_boxed_str());
+        let edge_ref = Arc::<str>::from(
+            edge_ref_for(flow, labels, &source_ref, &destination_ref).into_boxed_str(),
+        );
+        Self {
+            flow,
+            flow_name: flow.as_str(),
+            otel_kind: flow.otel_kind(),
+            local_role: flow.local_role(),
+            peer_role: flow.peer_role(),
+            edge_kind: labels.kind,
+            capability: labels.capability.clone(),
+            slot: labels.slot.clone(),
+            binding_name: labels.binding_name.clone(),
+            capability_kind: labels.capability_kind.clone(),
+            capability_profile: labels.capability_profile.clone(),
+            source_component: labels.source_component.clone(),
+            source_endpoint: labels.source_endpoint.clone(),
+            destination_component: labels.destination_component.clone(),
+            destination_endpoint: labels.destination_endpoint.clone(),
+            edge_owner_component: labels.edge_owner_component.clone(),
+            source_ref,
+            destination_ref,
+            edge_ref,
+            summary: Arc::new(StdMutex::new(ProtocolSummary::default())),
+        }
+    }
+
+    fn slot(&self) -> &str {
+        self.slot.as_deref().unwrap_or("")
+    }
+
+    fn binding_name(&self) -> &str {
+        self.binding_name.as_deref().unwrap_or("")
+    }
+
+    fn capability_kind(&self) -> &str {
+        self.capability_kind.as_deref().unwrap_or("")
+    }
+
+    fn capability_profile(&self) -> &str {
+        self.capability_profile.as_deref().unwrap_or("")
+    }
+
+    fn local_role(&self) -> &'static str {
+        self.local_role
+    }
+
+    fn peer_role(&self) -> &'static str {
+        self.peer_role
+    }
+
+    fn lifecycle_stage(&self, part: HttpLifecyclePart) -> &'static str {
+        self.flow.lifecycle_stage(part)
+    }
+
+    fn edge_kind(&self) -> &'static str {
+        self.edge_kind.as_str()
+    }
+
+    fn source_component(&self) -> &str {
+        self.source_component.as_deref().unwrap_or("")
+    }
+
+    fn source_endpoint(&self) -> &str {
+        self.source_endpoint.as_ref()
+    }
+
+    fn destination_component(&self) -> &str {
+        self.destination_component
+            .as_deref()
+            .filter(|component| !component.is_empty())
+            .unwrap_or(match self.edge_kind {
+                HttpEdgeKind::ExternalSlot => "external",
+                HttpEdgeKind::Binding | HttpEdgeKind::Export => "",
+            })
+    }
+
+    fn destination_endpoint(&self) -> &str {
+        self.destination_endpoint.as_ref()
+    }
+
+    fn edge_owner_component(&self) -> &str {
+        self.edge_owner_component.as_deref().unwrap_or("")
+    }
+
+    fn source_ref(&self) -> &str {
+        self.source_ref.as_ref()
+    }
+
+    fn destination_ref(&self) -> &str {
+        self.destination_ref.as_ref()
+    }
+
+    fn edge_ref(&self) -> &str {
+        self.edge_ref.as_ref()
+    }
+
+    fn span_name(&self, req: &Request<Incoming>) -> String {
+        format!("{} {} {}", self.edge_ref(), req.method(), req.uri().path())
+    }
+
+    fn remember_summary(&self, summary: &ProtocolSummary) {
+        if summary.is_empty() {
+            return;
+        }
+        let mut state = self.summary.lock().unwrap_or_else(|err| err.into_inner());
+        state.merge_from(summary);
+    }
+
+    fn summary_snapshot(&self) -> ProtocolSummary {
+        self.summary
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+}
+
+fn component_endpoint_ref(
+    component: Option<&str>,
+    endpoint: &str,
+    root_prefix: Option<&str>,
+) -> String {
+    match component {
+        Some(component) if !component.is_empty() => format!("{component}.{endpoint}"),
+        _ => match root_prefix {
+            Some(prefix) => format!("{prefix}.{endpoint}"),
+            None => endpoint.to_string(),
+        },
+    }
+}
+
+fn source_ref_for(labels: &HttpExchangeLabels) -> String {
+    match labels.kind {
+        HttpEdgeKind::Export => labels.source_endpoint.to_string(),
+        HttpEdgeKind::Binding => component_endpoint_ref(
+            labels.source_component.as_deref(),
+            labels.source_endpoint.as_ref(),
+            None,
+        ),
+        HttpEdgeKind::ExternalSlot => component_endpoint_ref(
+            labels.source_component.as_deref(),
+            labels.source_endpoint.as_ref(),
+            None,
+        ),
+    }
+}
+
+fn destination_ref_for(labels: &HttpExchangeLabels) -> String {
+    match labels.kind {
+        HttpEdgeKind::ExternalSlot => component_endpoint_ref(
+            labels.destination_component.as_deref(),
+            labels.destination_endpoint.as_ref(),
+            Some("external"),
+        ),
+        HttpEdgeKind::Binding | HttpEdgeKind::Export => component_endpoint_ref(
+            labels.destination_component.as_deref(),
+            labels.destination_endpoint.as_ref(),
+            None,
+        ),
+    }
+}
+
+fn edge_ref_for(
+    flow: RewriteFlow,
+    labels: &HttpExchangeLabels,
+    source_ref: &str,
+    destination_ref: &str,
+) -> String {
+    match labels.kind {
+        HttpEdgeKind::Export => labels
+            .binding_name
+            .as_deref()
+            .unwrap_or(labels.source_endpoint.as_ref())
+            .to_string(),
+        HttpEdgeKind::Binding | HttpEdgeKind::ExternalSlot => {
+            if let (Some(binding_name), Some(owner)) = (
+                labels.binding_name.as_deref(),
+                labels.edge_owner_component.as_deref(),
+            ) {
+                format!("{owner}.{binding_name}")
+            } else {
+                let _ = flow;
+                format!("{source_ref} -> {destination_ref}")
+            }
+        }
+    }
 }
 
 trait HttpExchangePlugin: Send + Sync {
@@ -444,7 +902,7 @@ async fn run_mesh_listener(state: InboundRuntime) -> Result<(), RouterError> {
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_inbound(stream, state).await {
-                tracing::warn!("mesh connection failed: {err}");
+                tracing::warn!(target: "amber.internal", "mesh connection failed: {err}");
             }
         });
     }
@@ -479,25 +937,29 @@ async fn handle_inbound(
         InboundTarget::Local { port } => {
             if route.protocol == MeshProtocol::Http {
                 let plugins = resolve_http_plugins(&route.http_plugins, a2a_url_rewrite_table);
-                if plugins.is_empty() {
-                    let target = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
-                    proxy_noise_to_plain(&mut session, target).await?;
-                } else {
-                    proxy_noise_to_local_http(
-                        &mut session,
-                        route.route_id.clone().into(),
-                        port,
-                        client.clone(),
-                        plugins,
-                    )
-                    .await?;
-                }
+                proxy_noise_to_local_http(
+                    &mut session,
+                    route.route_id.clone().into(),
+                    port,
+                    client.clone(),
+                    plugins,
+                    HttpExchangeLabels::inbound_from_route(
+                        config.identity.id.clone().into(),
+                        remote_id.clone().into(),
+                        &route,
+                        &open,
+                    ),
+                )
+                .await?;
             } else {
                 let target = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
                 proxy_noise_to_plain(&mut session, target).await?;
             }
         }
-        InboundTarget::External { url_env, optional } => {
+        InboundTarget::External {
+            ref url_env,
+            optional,
+        } => {
             let override_url = {
                 let overrides = external_overrides.read().await;
                 overrides.get(&route.capability).cloned()
@@ -522,9 +984,15 @@ async fn handle_inbound(
                 return proxy_by_external_protocol(
                     &mut session,
                     route.protocol,
+                    HttpExchangeLabels::inbound_from_route(
+                        config.identity.id.clone().into(),
+                        remote_id.clone().into(),
+                        &route,
+                        &open,
+                    ),
                     ExternalTarget {
                         name: route.capability.clone(),
-                        url_env,
+                        url_env: url_env.clone(),
                         optional,
                         url_override: Some(override_url),
                     },
@@ -533,7 +1001,7 @@ async fn handle_inbound(
                 .await;
             }
 
-            if let Ok(raw) = env::var(&url_env) {
+            if let Ok(raw) = env::var(url_env) {
                 let trimmed = raw.trim();
                 if maybe_proxy_mesh_external(
                     &mut session,
@@ -551,9 +1019,15 @@ async fn handle_inbound(
             proxy_by_external_protocol(
                 &mut session,
                 route.protocol,
+                HttpExchangeLabels::inbound_from_route(
+                    config.identity.id.clone().into(),
+                    remote_id.clone().into(),
+                    &route,
+                    &open,
+                ),
                 ExternalTarget {
                     name: route.capability.clone(),
-                    url_env,
+                    url_env: url_env.clone(),
                     optional,
                     url_override: None,
                 },
@@ -562,19 +1036,50 @@ async fn handle_inbound(
             .await?;
         }
         InboundTarget::MeshForward {
-            peer_addr,
-            peer_id,
-            route_id,
-            capability,
+            ref peer_addr,
+            ref peer_id,
+            ref route_id,
+            ref capability,
         } => {
-            let outbound = connect_noise(&peer_addr, &peer_id, &config, &trust).await?;
+            let outbound = connect_noise(peer_addr, peer_id, &config, &trust).await?;
+            let labels = HttpExchangeLabels::inbound_from_route(
+                config.identity.id.clone().into(),
+                remote_id.clone().into(),
+                &route,
+                &open,
+            );
             let open = OpenFrame {
-                route_id,
-                capability,
+                route_id: route_id.clone(),
+                capability: capability.clone(),
                 protocol: route.protocol,
+                slot: open.slot.clone(),
+                binding_name: route
+                    .binding_name
+                    .clone()
+                    .or_else(|| open.binding_name.clone()),
+                capability_kind: route
+                    .capability_kind
+                    .clone()
+                    .or_else(|| open.capability_kind.clone()),
+                capability_profile: route
+                    .capability_profile
+                    .clone()
+                    .or_else(|| open.capability_profile.clone()),
             };
             outbound.send_open(&open).await?;
-            proxy_noise_to_noise(&mut session, outbound).await?;
+            if route.protocol == MeshProtocol::Http {
+                let plugins = resolve_http_plugins(&route.http_plugins, a2a_url_rewrite_table);
+                proxy_noise_to_noise_http(
+                    &mut session,
+                    outbound,
+                    route.route_id.clone().into(),
+                    plugins,
+                    labels,
+                )
+                .await?;
+            } else {
+                proxy_noise_to_noise(&mut session, outbound).await?;
+            }
         }
     }
 
@@ -598,6 +1103,10 @@ async fn maybe_proxy_mesh_external(
         route_id: component_route_id(&mesh.peer_id, capability, protocol),
         capability: capability.to_string(),
         protocol,
+        slot: None,
+        binding_name: None,
+        capability_kind: None,
+        capability_profile: None,
     };
     outbound.send_open(&open).await?;
     proxy_noise_to_noise(session, outbound).await?;
@@ -607,11 +1116,12 @@ async fn maybe_proxy_mesh_external(
 async fn proxy_by_external_protocol(
     session: &mut NoiseSession,
     protocol: MeshProtocol,
+    labels: HttpExchangeLabels,
     target: ExternalTarget,
     client: Arc<HttpClient>,
 ) -> Result<(), RouterError> {
     match protocol {
-        MeshProtocol::Http => proxy_noise_to_external(session, target, client).await,
+        MeshProtocol::Http => proxy_noise_to_external(session, labels, target, client).await,
         MeshProtocol::Tcp => proxy_noise_to_external_tcp(session, target).await,
     }
 }
@@ -647,7 +1157,7 @@ async fn run_outbound_listener(
             if let Err(err) =
                 handle_outbound(stream, route, config, trust, a2a_url_rewrite_table).await
             {
-                tracing::warn!("outbound connection failed: {err}");
+                tracing::warn!(target: "amber.internal", "outbound connection failed: {err}");
             }
         });
     }
@@ -666,15 +1176,20 @@ async fn handle_outbound(
         route_id: route.route_id.clone(),
         capability: route.capability.clone(),
         protocol: route.protocol,
+        slot: Some(route.slot.clone()),
+        binding_name: route.binding_name.clone(),
+        capability_kind: route.capability_kind.clone(),
+        capability_profile: route.capability_profile.clone(),
     };
     outbound.send_open(&open).await?;
-    if route.protocol == MeshProtocol::Http && !route.http_plugins.is_empty() {
+    if route.protocol == MeshProtocol::Http {
         let plugins = resolve_http_plugins(&route.http_plugins, a2a_url_rewrite_table);
         proxy_local_http_to_noise(
             &mut outbound,
             route.route_id.clone().into(),
             stream,
             plugins,
+            HttpExchangeLabels::outbound_from_route(config.identity.id.clone().into(), &route),
         )
         .await?;
     } else {
@@ -713,7 +1228,7 @@ async fn run_control_server(
                 .as_ref()
                 .is_none_or(|allow| allow.contains(&peer.ip()));
             if let Err(err) = serve_control_connection(stream, state, allowed).await {
-                tracing::warn!("control connection failed: {err}");
+                tracing::warn!(target: "amber.internal", "control connection failed: {err}");
             }
         });
     }
@@ -765,7 +1280,7 @@ async fn run_control_server_unix(
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(err) = serve_control_connection(stream, state, true).await {
-                tracing::warn!("control unix connection failed: {err}");
+                tracing::warn!(target: "amber.internal", "control unix connection failed: {err}");
             }
         });
     }
@@ -1516,6 +2031,7 @@ async fn proxy_noise_to_noise(
 
 async fn proxy_noise_to_external(
     session: &mut NoiseSession,
+    labels: HttpExchangeLabels,
     target: ExternalTarget,
     client: Arc<HttpClient>,
 ) -> Result<(), RouterError> {
@@ -1527,6 +2043,7 @@ async fn proxy_noise_to_external(
     let state = HttpProxyState {
         client: (*client).clone(),
         target,
+        labels,
     };
 
     let service = service_fn(move |req: Request<Incoming>| {
@@ -1560,6 +2077,7 @@ async fn proxy_noise_to_local_http(
     port: u16,
     client: Arc<HttpClient>,
     plugins: Arc<[Arc<dyn HttpExchangePlugin>]>,
+    labels: HttpExchangeLabels,
 ) -> Result<(), RouterError> {
     let (local, remote) = duplex(64 * 1024);
     let mut noise_session = session.clone();
@@ -1573,6 +2091,7 @@ async fn proxy_noise_to_local_http(
         base_url,
         plugins,
         route_id,
+        labels,
     };
 
     let service =
@@ -1597,182 +2116,2093 @@ async fn proxy_noise_to_local_http(
     Ok(())
 }
 
+async fn proxy_noise_to_noise_http(
+    session: &mut NoiseSession,
+    outbound: NoiseSession,
+    route_id: Arc<str>,
+    plugins: Arc<[Arc<dyn HttpExchangePlugin>]>,
+    labels: HttpExchangeLabels,
+) -> Result<(), RouterError> {
+    let (incoming_local, incoming_remote) = duplex(64 * 1024);
+    let mut incoming_session = session.clone();
+    let incoming_bridge =
+        tokio::spawn(
+            async move { proxy_noise_to_plain(&mut incoming_session, incoming_local).await },
+        );
+
+    let (outgoing_local, outgoing_remote) = duplex(64 * 1024);
+    let mut outgoing_session = outbound.clone();
+    let outgoing_bridge =
+        tokio::spawn(
+            async move { proxy_noise_to_plain(&mut outgoing_session, outgoing_remote).await },
+        );
+
+    let (sender, conn) = client_http1::handshake(TokioIo::new(outgoing_local))
+        .await
+        .map_err(|err| {
+            RouterError::Transport(format!("outbound upstream handshake failed: {err}"))
+        })?;
+    let conn_task = tokio::spawn(async move {
+        if let Err(err) = conn.await {
+            tracing::warn!(target: "amber.internal", "outbound upstream connection failed: {err}");
+        }
+    });
+
+    let state = OutboundHttpProxyState {
+        upstream: Arc::new(Mutex::new(sender)),
+        plugins,
+        route_id,
+        labels,
+    };
+
+    let service = ServiceBuilder::new()
+        .layer(CompressionLayer::new())
+        .service(tower_service_fn(move |req| {
+            let state = state.clone();
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    proxy_inbound_http_request_to_noise(state, req).await,
+                )
+            }
+        }));
+    let service = TowerToHyperService::new(service);
+
+    if let Err(err) = hyper::server::conn::http1::Builder::new()
+        .serve_connection(TokioIo::new(incoming_remote), service)
+        .await
+    {
+        return Err(RouterError::Transport(err.to_string()));
+    }
+
+    let _ = conn_task.await;
+    let _ = outgoing_bridge.await;
+    let _ = incoming_bridge.await;
+    Ok(())
+}
+
+const DEFAULT_HTTP_BODY_CAPTURE_LIMIT_BYTES: usize = 256 * 1024;
+
+// We keep local HeaderMap adapters because opentelemetry-http currently uses
+// `http` 0.2 while the router stack uses `http` 1.x.
+struct HeaderMapExtractor<'a>(&'a HeaderMap);
+
+impl opentelemetry::propagation::Extractor for HeaderMapExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|value| value.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|name| name.as_str()).collect()
+    }
+}
+
+struct HeaderMapInjector<'a>(&'a mut HeaderMap);
+
+impl opentelemetry::propagation::Injector for HeaderMapInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        if let Ok(name) = http::header::HeaderName::from_bytes(key.as_bytes())
+            && let Ok(value) = HeaderValue::from_str(&value)
+        {
+            self.0.insert(name, value);
+        }
+    }
+}
+
+fn start_http_exchange_span(
+    telemetry: &HttpExchangeTelemetryContext,
+    req: &Request<Incoming>,
+) -> tracing::Span {
+    let parent_context = opentelemetry::global::get_text_map_propagator(|prop| {
+        prop.extract(&HeaderMapExtractor(req.headers()))
+    });
+    let span_name = telemetry.span_name(req);
+
+    let span = tracing::info_span!(
+        "amber.binding",
+        otel.name = span_name.as_str(),
+        otel.kind = telemetry.otel_kind,
+        otel.status_code = tracing::field::Empty,
+        otel.status_description = tracing::field::Empty,
+        amber_entity_kind = "binding",
+        amber_edge_kind = telemetry.edge_kind(),
+        amber_edge_ref = telemetry.edge_ref(),
+        amber_edge_owner_component = telemetry.edge_owner_component(),
+        amber_source_ref = telemetry.source_ref(),
+        amber_source_component = telemetry.source_component(),
+        amber_source_endpoint = telemetry.source_endpoint(),
+        amber_destination_ref = telemetry.destination_ref(),
+        amber_destination_component = telemetry.destination_component(),
+        amber_destination_endpoint = telemetry.destination_endpoint(),
+        amber_flow = telemetry.flow_name,
+        amber_local_role = telemetry.local_role(),
+        amber_peer_role = telemetry.peer_role(),
+        amber_transport = "http",
+        amber_exchange_id = tracing::field::Empty,
+        amber_trace_id = tracing::field::Empty,
+        amber_application_error = tracing::field::Empty,
+        amber_protocol = tracing::field::Empty,
+        amber_rpc_kind = tracing::field::Empty,
+        amber_rpc_method = tracing::field::Empty,
+        amber_request_key = tracing::field::Empty,
+        amber_rpc_id = tracing::field::Empty,
+        amber_capability = telemetry.capability.as_ref(),
+        amber_slot = telemetry.slot(),
+        amber_binding_name = telemetry.binding_name(),
+        amber_capability_kind = telemetry.capability_kind(),
+        amber_capability_profile = telemetry.capability_profile(),
+        "http.request.method" = %req.method(),
+        "url.path" = %req.uri().path(),
+        "http.response.status_code" = tracing::field::Empty,
+        http_method = %req.method(),
+        http_path = %req.uri().path(),
+        http_status_code = tracing::field::Empty,
+    );
+    let _ = span.set_parent(parent_context);
+    record_exchange_identity(&span);
+    span
+}
+
+fn inject_trace_context(span: &tracing::Span, headers: &mut HeaderMap) {
+    let context = span.context();
+    opentelemetry::global::get_text_map_propagator(|prop| {
+        prop.inject_context(&context, &mut HeaderMapInjector(headers))
+    });
+}
+
+fn current_exchange_ids(span: &tracing::Span) -> (String, String) {
+    let span_context = span.context().span().span_context().clone();
+    if span_context.is_valid() {
+        (
+            span_context.trace_id().to_string(),
+            span_context.span_id().to_string(),
+        )
+    } else {
+        (String::new(), String::new())
+    }
+}
+
+fn record_exchange_identity(span: &tracing::Span) {
+    let (trace_id, exchange_id) = current_exchange_ids(span);
+    if !trace_id.is_empty() {
+        span.record("amber_trace_id", trace_id.as_str());
+    }
+    if !exchange_id.is_empty() {
+        span.record("amber_exchange_id", exchange_id.as_str());
+    }
+}
+
+fn record_http_status(span: &tracing::Span, status: StatusCode, application_error: bool) {
+    let status_code = status.as_u16();
+    span.record("http_status_code", status_code);
+    span.record("http.response.status_code", status_code);
+    span.record(
+        "otel.status_code",
+        if application_error || status.as_u16() >= 500 {
+            "error"
+        } else {
+            otel_status_code_for_http(status)
+        },
+    );
+}
+
+fn finalize_http_exchange_response(
+    span: &tracing::Span,
+    telemetry: &HttpExchangeTelemetryContext,
+    response: Response<BoxBody>,
+) -> Response<BoxBody> {
+    let status = response.status();
+    let summary = telemetry.summary_snapshot();
+    record_http_status(span, status, summary.has_application_error());
+    if let Some(message) = summary.application_error_message() {
+        span.record("otel.status_description", message.as_str());
+    } else if status.is_server_error() {
+        span.record(
+            "otel.status_description",
+            status.canonical_reason().unwrap_or("server error"),
+        );
+    }
+    response
+}
+
+fn otel_status_code_for_http(status: StatusCode) -> &'static str {
+    if status.as_u16() >= 500 {
+        "error"
+    } else {
+        "ok"
+    }
+}
+
+fn headers_to_json(headers: &HeaderMap) -> String {
+    let mut values: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, value) in headers {
+        values
+            .entry(name.as_str().to_string())
+            .or_default()
+            .push(String::from_utf8_lossy(value.as_bytes()).into_owned());
+    }
+    serde_json::to_string(&values).unwrap_or_else(|_| "{}".to_string())
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ProtocolSummary {
+    protocol: Option<&'static str>,
+    rpc_kind: Option<&'static str>,
+    rpc_method_raw: Option<String>,
+    rpc_method: Option<String>,
+    rpc_id: Option<String>,
+    rpc_is_notification: Option<bool>,
+    rpc_error_code: Option<i64>,
+    rpc_error_message: Option<String>,
+    request_key: Option<String>,
+    parent_request_key: Option<String>,
+    mcp_tool_name: Option<String>,
+    mcp_task_id: Option<String>,
+    mcp_progress_token: Option<String>,
+    mcp_progress: Option<f64>,
+    mcp_progress_total: Option<f64>,
+    mcp_progress_message: Option<String>,
+    mcp_resource_uri: Option<String>,
+    mcp_cursor: Option<String>,
+    mcp_next_cursor: Option<String>,
+    mcp_list_changed: Option<bool>,
+    mcp_tool_is_error: Option<bool>,
+    mcp_log_level: Option<String>,
+    mcp_logger: Option<String>,
+    a2a_message_id: Option<String>,
+    a2a_task_id: Option<String>,
+    a2a_context_id: Option<String>,
+    a2a_reference_task_id: Option<String>,
+    a2a_task_state: Option<String>,
+    a2a_artifact_count: Option<i64>,
+}
+
+impl ProtocolSummary {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    fn merge_from(&mut self, other: &Self) {
+        macro_rules! merge_field {
+            ($field:ident) => {
+                if other.$field.is_some() {
+                    self.$field = other.$field.clone();
+                }
+            };
+        }
+
+        merge_field!(protocol);
+        merge_field!(rpc_kind);
+        merge_field!(rpc_method_raw);
+        merge_field!(rpc_method);
+        merge_field!(rpc_id);
+        merge_field!(rpc_is_notification);
+        merge_field!(rpc_error_code);
+        merge_field!(rpc_error_message);
+        merge_field!(request_key);
+        merge_field!(parent_request_key);
+        merge_field!(mcp_tool_name);
+        merge_field!(mcp_task_id);
+        merge_field!(mcp_progress_token);
+        merge_field!(mcp_progress);
+        merge_field!(mcp_progress_total);
+        merge_field!(mcp_progress_message);
+        merge_field!(mcp_resource_uri);
+        merge_field!(mcp_cursor);
+        merge_field!(mcp_next_cursor);
+        merge_field!(mcp_list_changed);
+        merge_field!(mcp_tool_is_error);
+        merge_field!(mcp_log_level);
+        merge_field!(mcp_logger);
+        merge_field!(a2a_message_id);
+        merge_field!(a2a_task_id);
+        merge_field!(a2a_context_id);
+        merge_field!(a2a_reference_task_id);
+        merge_field!(a2a_task_state);
+        merge_field!(a2a_artifact_count);
+    }
+
+    fn has_application_error(&self) -> bool {
+        self.rpc_error_code.is_some()
+            || self.mcp_tool_is_error == Some(true)
+            || self
+                .a2a_task_state
+                .as_deref()
+                .is_some_and(|state| state.eq_ignore_ascii_case("TASK_STATE_FAILED"))
+    }
+
+    fn application_error_message(&self) -> Option<String> {
+        self.rpc_error_message
+            .clone()
+            .or_else(|| {
+                self.rpc_error_code
+                    .map(|code| format!("json-rpc error {code}"))
+            })
+            .or_else(|| {
+                (self.mcp_tool_is_error == Some(true))
+                    .then_some("tool call returned isError=true".to_string())
+            })
+            .or_else(|| {
+                self.a2a_task_state.as_ref().and_then(|state| {
+                    state
+                        .eq_ignore_ascii_case("TASK_STATE_FAILED")
+                        .then_some(format!("a2a task ended in {state}"))
+                })
+            })
+    }
+}
+
+fn exchange_message(
+    telemetry: &HttpExchangeTelemetryContext,
+    part: HttpLifecyclePart,
+    summary: &ProtocolSummary,
+) -> String {
+    let source_component = telemetry.source_component();
+    let destination_component = telemetry.destination_component();
+    let edge_ref = telemetry.edge_ref();
+    let base = match telemetry.edge_kind {
+        HttpEdgeKind::Export => match part {
+            HttpLifecyclePart::Request => format!(
+                "request received from {} by {}",
+                telemetry.source_ref(),
+                if destination_component.is_empty() {
+                    telemetry.destination_ref()
+                } else {
+                    destination_component
+                }
+            ),
+            HttpLifecyclePart::Response => format!(
+                "response sent from {} to {}",
+                if destination_component.is_empty() {
+                    telemetry.destination_ref()
+                } else {
+                    destination_component
+                },
+                telemetry.source_ref(),
+            ),
+        },
+        HttpEdgeKind::ExternalSlot => match part {
+            HttpLifecyclePart::Request => format!(
+                "request sent from {} to external slot {} via {}",
+                if source_component.is_empty() {
+                    telemetry.source_ref()
+                } else {
+                    source_component
+                },
+                telemetry.destination_endpoint(),
+                edge_ref,
+            ),
+            HttpLifecyclePart::Response => format!(
+                "response received by {} from external slot {} via {}",
+                if source_component.is_empty() {
+                    telemetry.source_ref()
+                } else {
+                    source_component
+                },
+                telemetry.destination_endpoint(),
+                edge_ref,
+            ),
+        },
+        HttpEdgeKind::Binding => match (telemetry.flow, part) {
+            (RewriteFlow::Outbound, HttpLifecyclePart::Request) => format!(
+                "request sent from {} to {} via {}",
+                if source_component.is_empty() {
+                    telemetry.source_ref()
+                } else {
+                    source_component
+                },
+                if destination_component.is_empty() {
+                    telemetry.destination_ref()
+                } else {
+                    destination_component
+                },
+                edge_ref,
+            ),
+            (RewriteFlow::Inbound, HttpLifecyclePart::Request) => format!(
+                "request received by {} from {} via {}",
+                if destination_component.is_empty() {
+                    telemetry.destination_ref()
+                } else {
+                    destination_component
+                },
+                if source_component.is_empty() {
+                    telemetry.source_ref()
+                } else {
+                    source_component
+                },
+                edge_ref,
+            ),
+            (RewriteFlow::Inbound, HttpLifecyclePart::Response) => format!(
+                "response sent from {} to {} via {}",
+                if destination_component.is_empty() {
+                    telemetry.destination_ref()
+                } else {
+                    destination_component
+                },
+                if source_component.is_empty() {
+                    telemetry.source_ref()
+                } else {
+                    source_component
+                },
+                edge_ref,
+            ),
+            (RewriteFlow::Outbound, HttpLifecyclePart::Response) => format!(
+                "response received by {} from {} via {}",
+                if source_component.is_empty() {
+                    telemetry.source_ref()
+                } else {
+                    source_component
+                },
+                if destination_component.is_empty() {
+                    telemetry.destination_ref()
+                } else {
+                    destination_component
+                },
+                edge_ref,
+            ),
+        },
+    };
+    match protocol_detail(summary, part) {
+        Some(detail) => format!("{base}: {detail}"),
+        None => base,
+    }
+}
+
+fn emit_binding_failure_event(
+    span: &tracing::Span,
+    telemetry: &HttpExchangeTelemetryContext,
+    status: StatusCode,
+    reason: &str,
+    error_detail: Option<String>,
+) {
+    let summary = telemetry.summary_snapshot();
+    let mut message = exchange_message(telemetry, HttpLifecyclePart::Request, &summary);
+    message.push_str(" failed");
+    if !reason.is_empty() {
+        message.push_str(": ");
+        message.push_str(reason);
+    }
+
+    let mut extra_attributes = Vec::with_capacity(2);
+    push_log_attr(
+        &mut extra_attributes,
+        "http.response.status_code",
+        i64::from(status.as_u16()),
+    );
+    if let Some(error_detail) = error_detail {
+        push_nonempty_log_attr(
+            &mut extra_attributes,
+            "error.message",
+            error_detail.as_str(),
+        );
+    }
+    emit_binding_log(
+        span,
+        telemetry,
+        &summary,
+        BindingLogSpec {
+            level: Severity::Warn,
+            part: HttpLifecyclePart::Response,
+            step: "error",
+            transport: "http",
+            event_name: "amber.binding.error",
+            message,
+            extra_attributes,
+        },
+    );
+}
+
+fn protocol_detail(summary: &ProtocolSummary, part: HttpLifecyclePart) -> Option<String> {
+    let mut action = summary
+        .rpc_method
+        .as_deref()
+        .or(summary.rpc_method_raw.as_deref())
+        .map(ToString::to_string)
+        .or_else(|| {
+            summary
+                .mcp_tool_name
+                .as_ref()
+                .map(|tool_name| format!("tool {tool_name}"))
+        })
+        .or_else(|| {
+            summary
+                .a2a_task_state
+                .as_ref()
+                .map(|task_state| format!("A2A {task_state}"))
+        })
+        .or_else(|| summary.mcp_progress.map(|_| "MCP progress".to_string()));
+
+    if action.as_deref() == Some("tools/call")
+        && let Some(tool_name) = summary.mcp_tool_name.as_deref()
+    {
+        action = Some(format!("tools/call {tool_name}"));
+    }
+
+    let mut detail = match (part, action) {
+        (HttpLifecyclePart::Request, Some(action)) => {
+            if summary.rpc_is_notification == Some(true) {
+                format!("{action} notification")
+            } else {
+                action
+            }
+        }
+        (HttpLifecyclePart::Response, Some(action)) => {
+            if let Some(code) = summary.rpc_error_code {
+                format!("{action} error {code}")
+            } else if summary.has_application_error() {
+                format!("{action} error")
+            } else if summary.rpc_kind == Some("result") {
+                format!("{action} result")
+            } else {
+                format!("{action} response")
+            }
+        }
+        (_, None) => return None,
+    };
+
+    if let Some(id) = summary.rpc_id.as_deref().filter(|id| !id.is_empty()) {
+        detail.push_str(&format!(" (id={id})"));
+    }
+
+    Some(detail)
+}
+
+#[derive(Clone, Debug, Default)]
+struct JsonRpcExtraction {
+    kind: Option<&'static str>,
+    method_raw: Option<String>,
+    method: Option<String>,
+    id: Option<String>,
+    is_notification: Option<bool>,
+    error_code: Option<i64>,
+    error_message: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct EventProtocolFields<'a> {
+    protocol: &'a str,
+    rpc_kind: &'a str,
+    request_key: &'a str,
+    rpc_id: &'a str,
+    rpc_method: &'a str,
+    application_error: bool,
+}
+
+fn protocol_fields(summary: &ProtocolSummary) -> EventProtocolFields<'_> {
+    EventProtocolFields {
+        protocol: summary.protocol.unwrap_or(""),
+        rpc_kind: summary.rpc_kind.unwrap_or(""),
+        request_key: summary.request_key.as_deref().unwrap_or(""),
+        rpc_id: summary.rpc_id.as_deref().unwrap_or(""),
+        rpc_method: summary.rpc_method.as_deref().unwrap_or(""),
+        application_error: summary.has_application_error(),
+    }
+}
+
+fn record_protocol_summary(span: &tracing::Span, summary: &ProtocolSummary) {
+    if let Some(protocol) = summary.protocol {
+        span.record("amber_protocol", protocol);
+    }
+    if let Some(kind) = summary.rpc_kind {
+        span.record("amber_rpc_kind", kind);
+    }
+    if let Some(method) = summary.rpc_method.as_deref() {
+        span.record("amber_rpc_method", method);
+    }
+    if let Some(request_key) = summary.request_key.as_deref() {
+        span.record("amber_request_key", request_key);
+    }
+    if let Some(rpc_id) = summary.rpc_id.as_deref() {
+        span.record("amber_rpc_id", rpc_id);
+    }
+    if summary.has_application_error() {
+        span.record("amber_application_error", true);
+        span.record("otel.status_code", "error");
+        if let Some(message) = summary.application_error_message() {
+            span.record("otel.status_description", message.as_str());
+        }
+    }
+}
+
+type OtlpLogAttributes = Vec<(Key, AnyValue)>;
+
+struct BindingLogSpec {
+    level: Severity,
+    part: HttpLifecyclePart,
+    step: &'static str,
+    transport: &'static str,
+    event_name: &'static str,
+    message: String,
+    extra_attributes: OtlpLogAttributes,
+}
+
+fn push_log_attr<V>(attributes: &mut OtlpLogAttributes, key: &'static str, value: V)
+where
+    V: Into<AnyValue>,
+{
+    attributes.push((Key::new(key), value.into()));
+}
+
+fn push_nonempty_log_attr(attributes: &mut OtlpLogAttributes, key: &'static str, value: &str) {
+    if !value.is_empty() {
+        push_log_attr(attributes, key, value.to_string());
+    }
+}
+
+fn push_true_log_attr(attributes: &mut OtlpLogAttributes, key: &'static str, value: bool) {
+    if value {
+        push_log_attr(attributes, key, value);
+    }
+}
+
+fn binding_log_trace_context(span: &tracing::Span) -> Option<OtlpTraceContext> {
+    let span_context = span.context().span().span_context().clone();
+    span_context.is_valid().then_some(OtlpTraceContext {
+        trace_id: span_context.trace_id(),
+        span_id: span_context.span_id(),
+        trace_flags: Some(span_context.trace_flags()),
+    })
+}
+
+fn binding_log_attributes(
+    telemetry: &HttpExchangeTelemetryContext,
+    summary: &ProtocolSummary,
+    trace_id: &str,
+    exchange_id: &str,
+    spec: &mut BindingLogSpec,
+) -> OtlpLogAttributes {
+    let fields = protocol_fields(summary);
+    let mut attributes = Vec::with_capacity(24 + spec.extra_attributes.len());
+
+    push_log_attr(&mut attributes, "amber_entity_kind", "binding");
+    push_log_attr(&mut attributes, "amber_edge_kind", telemetry.edge_kind());
+    push_nonempty_log_attr(&mut attributes, "amber_edge_ref", telemetry.edge_ref());
+    push_nonempty_log_attr(
+        &mut attributes,
+        "amber_edge_owner_component",
+        telemetry.edge_owner_component(),
+    );
+    push_nonempty_log_attr(&mut attributes, "amber_source_ref", telemetry.source_ref());
+    push_nonempty_log_attr(
+        &mut attributes,
+        "amber_source_component",
+        telemetry.source_component(),
+    );
+    push_nonempty_log_attr(
+        &mut attributes,
+        "amber_source_endpoint",
+        telemetry.source_endpoint(),
+    );
+    push_nonempty_log_attr(
+        &mut attributes,
+        "amber_destination_ref",
+        telemetry.destination_ref(),
+    );
+    push_nonempty_log_attr(
+        &mut attributes,
+        "amber_destination_component",
+        telemetry.destination_component(),
+    );
+    push_nonempty_log_attr(
+        &mut attributes,
+        "amber_destination_endpoint",
+        telemetry.destination_endpoint(),
+    );
+    push_log_attr(&mut attributes, "amber_flow", telemetry.flow_name);
+    push_log_attr(&mut attributes, "amber_local_role", telemetry.local_role());
+    push_log_attr(&mut attributes, "amber_peer_role", telemetry.peer_role());
+    push_log_attr(
+        &mut attributes,
+        "amber_lifecycle_stage",
+        telemetry.lifecycle_stage(spec.part),
+    );
+    push_log_attr(&mut attributes, "amber_exchange_step", spec.step);
+    push_log_attr(&mut attributes, "amber_transport", spec.transport);
+    push_nonempty_log_attr(&mut attributes, "amber_trace_id", trace_id);
+    push_nonempty_log_attr(&mut attributes, "amber_exchange_id", exchange_id);
+    push_nonempty_log_attr(
+        &mut attributes,
+        "amber_capability",
+        telemetry.capability.as_ref(),
+    );
+    push_nonempty_log_attr(&mut attributes, "amber_slot", telemetry.slot());
+    push_nonempty_log_attr(
+        &mut attributes,
+        "amber_binding_name",
+        telemetry.binding_name(),
+    );
+    push_nonempty_log_attr(
+        &mut attributes,
+        "amber_capability_kind",
+        telemetry.capability_kind(),
+    );
+    push_nonempty_log_attr(
+        &mut attributes,
+        "amber_capability_profile",
+        telemetry.capability_profile(),
+    );
+    push_nonempty_log_attr(&mut attributes, "amber_protocol", fields.protocol);
+    push_nonempty_log_attr(&mut attributes, "amber_rpc_kind", fields.rpc_kind);
+    push_nonempty_log_attr(&mut attributes, "amber_request_key", fields.request_key);
+    push_nonempty_log_attr(&mut attributes, "amber_rpc_id", fields.rpc_id);
+    push_nonempty_log_attr(&mut attributes, "amber_rpc_method", fields.rpc_method);
+    push_true_log_attr(
+        &mut attributes,
+        "amber_application_error",
+        fields.application_error,
+    );
+    push_log_attr(&mut attributes, "event", spec.event_name);
+    attributes.append(&mut spec.extra_attributes);
+    attributes
+}
+
+fn emit_binding_console_log(level: Severity, span: &tracing::Span, message: &str) {
+    span.in_scope(|| match level {
+        Severity::Warn
+        | Severity::Warn2
+        | Severity::Warn3
+        | Severity::Warn4
+        | Severity::Error
+        | Severity::Error2
+        | Severity::Error3
+        | Severity::Error4
+        | Severity::Fatal
+        | Severity::Fatal2
+        | Severity::Fatal3
+        | Severity::Fatal4 => tracing::warn!(target: "amber.binding", "{message}"),
+        _ => tracing::info!(target: "amber.binding", "{message}"),
+    });
+}
+
+fn emit_binding_log(
+    span: &tracing::Span,
+    telemetry: &HttpExchangeTelemetryContext,
+    summary: &ProtocolSummary,
+    mut spec: BindingLogSpec,
+) {
+    telemetry.remember_summary(summary);
+    record_protocol_summary(span, summary);
+    let (trace_id, exchange_id) = current_exchange_ids(span);
+
+    emit_binding_console_log(spec.level, span, &spec.message);
+    emit_otlp_log(OtlpLogMessage {
+        scope_name: "amber.binding",
+        target: "amber.binding",
+        event_name: spec.event_name,
+        severity: spec.level,
+        body: spec.message.clone(),
+        attributes: binding_log_attributes(
+            telemetry,
+            summary,
+            trace_id.as_str(),
+            exchange_id.as_str(),
+            &mut spec,
+        ),
+        trace_context: binding_log_trace_context(span),
+    });
+}
+
+fn emit_headers_event(
+    span: &tracing::Span,
+    telemetry: &HttpExchangeTelemetryContext,
+    part: HttpLifecyclePart,
+    event_name: &'static str,
+    content_type: Option<&str>,
+    content_encoding: Option<&str>,
+    headers: &HeaderMap,
+) {
+    let headers_json = headers_to_json(headers);
+    let summary = telemetry.summary_snapshot();
+    let message = format!("{} [headers]", exchange_message(telemetry, part, &summary));
+    let mut extra_attributes = Vec::with_capacity(3);
+    push_nonempty_log_attr(
+        &mut extra_attributes,
+        "amber_headers_json",
+        headers_json.as_str(),
+    );
+    push_nonempty_log_attr(
+        &mut extra_attributes,
+        "amber_body_content_type",
+        content_type.unwrap_or(""),
+    );
+    push_nonempty_log_attr(
+        &mut extra_attributes,
+        "amber_body_content_encoding",
+        content_encoding.unwrap_or(""),
+    );
+    emit_binding_log(
+        span,
+        telemetry,
+        &summary,
+        BindingLogSpec {
+            level: Severity::Info,
+            part,
+            step: "headers",
+            transport: "http",
+            event_name,
+            message,
+            extra_attributes,
+        },
+    );
+}
+
+#[cfg(test)]
+fn extract_json_rpc_from_text(body_text: &str) -> JsonRpcExtraction {
+    if body_text.trim().is_empty() {
+        return JsonRpcExtraction::default();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body_text) else {
+        return JsonRpcExtraction::default();
+    };
+    extract_json_rpc_from_value(&value)
+}
+
+fn extract_json_rpc_from_value(value: &serde_json::Value) -> JsonRpcExtraction {
+    match value {
+        serde_json::Value::Object(_) => extract_json_rpc_from_object(value),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .find_map(|item| {
+                let extracted = extract_json_rpc_from_object(item);
+                (extracted.method.is_some()
+                    || extracted.id.is_some()
+                    || extracted.error_code.is_some()
+                    || extracted.kind.is_some())
+                .then_some(extracted)
+            })
+            .unwrap_or_default(),
+        _ => JsonRpcExtraction::default(),
+    }
+}
+
+fn extract_json_rpc_from_object(value: &serde_json::Value) -> JsonRpcExtraction {
+    let Some(obj) = value.as_object() else {
+        return JsonRpcExtraction::default();
+    };
+    if obj.get("jsonrpc").and_then(|jsonrpc| jsonrpc.as_str()) != Some("2.0") {
+        return JsonRpcExtraction::default();
+    }
+
+    let method_raw = obj
+        .get("method")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string);
+    let method = method_raw.as_deref().map(normalize_json_rpc_method);
+    let id = obj.get("id").and_then(json_rpc_id_to_string);
+    let error = obj.get("error").and_then(|value| value.as_object());
+    let error_code = error
+        .and_then(|error| error.get("code"))
+        .and_then(|code| code.as_i64());
+    let error_message = error
+        .and_then(|error| error.get("message"))
+        .and_then(|message| message.as_str())
+        .map(ToString::to_string);
+    let kind = if error.is_some() {
+        Some("error")
+    } else if obj.get("result").is_some() {
+        Some("result")
+    } else if method_raw.is_some() {
+        Some(if id.is_some() {
+            "request"
+        } else {
+            "notification"
+        })
+    } else {
+        None
+    };
+
+    JsonRpcExtraction {
+        kind,
+        method_raw,
+        method,
+        id,
+        is_notification: kind.map(|value| value == "notification"),
+        error_code,
+        error_message,
+    }
+}
+
+fn normalize_json_rpc_method(method: &str) -> String {
+    match method {
+        "message/send" => "SendMessage".to_string(),
+        "message/stream" => "SendStreamingMessage".to_string(),
+        _ => method.to_string(),
+    }
+}
+
+fn json_rpc_id_to_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::Null => Some("null".to_string()),
+        _ => None,
+    }
+}
+
+fn protocol_hint_for_exchange(
+    telemetry: &HttpExchangeTelemetryContext,
+    rpc: &JsonRpcExtraction,
+) -> Option<&'static str> {
+    match telemetry.capability_kind() {
+        "mcp" => return Some("mcp"),
+        "a2a" => return Some("a2a"),
+        _ => {}
+    }
+
+    if rpc.method.as_deref().is_some_and(|method| {
+        is_mcp_method(method) || is_mcp_method(rpc.method_raw.as_deref().unwrap_or(method))
+    }) || rpc.method_raw.as_deref().is_some_and(is_mcp_method)
+    {
+        Some("mcp")
+    } else if rpc.method.as_deref().is_some_and(is_a2a_method)
+        || rpc.method_raw.as_deref().is_some_and(is_a2a_method)
+    {
+        Some("a2a")
+    } else if rpc.kind.is_some() {
+        Some("jsonrpc")
+    } else {
+        None
+    }
+}
+
+fn is_mcp_method(method: &str) -> bool {
+    matches!(method, "initialize" | "ping")
+        || method.starts_with("completion/")
+        || method.starts_with("elicitation/")
+        || method.starts_with("logging/")
+        || method.starts_with("notifications/")
+        || method.starts_with("prompts/")
+        || method.starts_with("resources/")
+        || method.starts_with("roots/")
+        || method.starts_with("sampling/")
+        || method.starts_with("tasks/")
+        || method.starts_with("tools/")
+}
+
+fn is_a2a_method(method: &str) -> bool {
+    matches!(
+        method,
+        "CancelTask"
+            | "GetExtendedAgentCard"
+            | "GetTask"
+            | "ListTasks"
+            | "SendMessage"
+            | "SendStreamingMessage"
+            | "SubscribeToTask"
+    )
+}
+
+fn first_json_rpc_object(
+    value: &serde_json::Value,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    match value {
+        serde_json::Value::Object(obj) => Some(obj),
+        serde_json::Value::Array(values) => values.iter().find_map(|item| item.as_object()),
+        _ => None,
+    }
+}
+
+fn json_string(value: Option<&serde_json::Value>) -> Option<String> {
+    value.and_then(|value| match value {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Null => Some("null".to_string()),
+        _ => None,
+    })
+}
+
+fn json_f64(value: Option<&serde_json::Value>) -> Option<f64> {
+    value.and_then(|value| match value {
+        serde_json::Value::Number(value) => value.as_f64(),
+        _ => None,
+    })
+}
+
+fn extract_mcp_fields(value: &serde_json::Value, method: Option<&str>) -> ProtocolSummary {
+    let Some(obj) = first_json_rpc_object(value) else {
+        return ProtocolSummary::default();
+    };
+    let params = obj.get("params").and_then(|value| value.as_object());
+    let result = obj.get("result").and_then(|value| value.as_object());
+
+    let mut summary = ProtocolSummary {
+        mcp_task_id: json_string(
+            params
+                .and_then(|value| value.get("taskId"))
+                .or_else(|| result.and_then(|value| value.get("taskId")))
+                .or_else(|| {
+                    result
+                        .and_then(|value| value.get("task"))
+                        .and_then(|value| value.get("taskId"))
+                })
+                .or_else(|| {
+                    result
+                        .and_then(|value| value.get("task"))
+                        .and_then(|value| value.get("id"))
+                }),
+        ),
+        mcp_progress_token: json_string(params.and_then(|value| value.get("progressToken"))),
+        mcp_cursor: json_string(params.and_then(|value| value.get("cursor"))),
+        mcp_next_cursor: json_string(result.and_then(|value| value.get("nextCursor"))),
+        mcp_list_changed: params
+            .and_then(|value| value.get("listChanged"))
+            .and_then(|value| value.as_bool())
+            .or_else(|| {
+                result
+                    .and_then(|value| value.get("listChanged"))
+                    .and_then(|value| value.as_bool())
+            }),
+        mcp_resource_uri: json_string(
+            params
+                .and_then(|value| value.get("uri"))
+                .or_else(|| {
+                    params
+                        .and_then(|value| value.get("resource"))
+                        .and_then(|value| value.get("uri"))
+                })
+                .or_else(|| result.and_then(|value| value.get("uri")))
+                .or_else(|| {
+                    result
+                        .and_then(|value| value.get("contents"))
+                        .and_then(|value| value.as_array())
+                        .and_then(|value| value.first())
+                        .and_then(|value| value.get("uri"))
+                }),
+        ),
+        mcp_tool_is_error: result
+            .and_then(|value| value.get("isError"))
+            .and_then(|value| value.as_bool()),
+        ..ProtocolSummary::default()
+    };
+
+    if matches!(method, Some("tools/call")) {
+        summary.mcp_tool_name = json_string(params.and_then(|value| value.get("name")));
+    }
+    if matches!(method, Some("notifications/progress")) {
+        summary.mcp_progress = json_f64(params.and_then(|value| value.get("progress")));
+        summary.mcp_progress_total = json_f64(params.and_then(|value| value.get("total")));
+        summary.mcp_progress_message = params
+            .and_then(|value| value.get("message"))
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string);
+    }
+    if matches!(method, Some("notifications/message")) {
+        summary.mcp_log_level = params
+            .and_then(|value| value.get("level"))
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string);
+        summary.mcp_logger = params
+            .and_then(|value| value.get("logger"))
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string);
+    }
+
+    summary
+}
+
+fn extract_a2a_fields(value: &serde_json::Value) -> ProtocolSummary {
+    let Some(obj) = first_json_rpc_object(value) else {
+        return ProtocolSummary::default();
+    };
+    let params = obj.get("params").and_then(|value| value.as_object());
+    let result = obj.get("result").and_then(|value| value.as_object());
+    let request_message = params
+        .and_then(|value| value.get("message"))
+        .and_then(|value| value.as_object());
+    let response_message = result
+        .and_then(|value| value.get("message"))
+        .and_then(|value| value.as_object());
+    let task = result
+        .and_then(|value| value.get("task"))
+        .and_then(|value| value.as_object())
+        .or_else(|| {
+            params
+                .and_then(|value| value.get("task"))
+                .and_then(|value| value.as_object())
+        });
+
+    ProtocolSummary {
+        a2a_message_id: request_message
+            .and_then(|value| value.get("messageId"))
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                response_message
+                    .and_then(|value| value.get("messageId"))
+                    .and_then(|value| value.as_str())
+            })
+            .map(ToString::to_string),
+        a2a_context_id: request_message
+            .and_then(|value| value.get("contextId"))
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                response_message
+                    .and_then(|value| value.get("contextId"))
+                    .and_then(|value| value.as_str())
+            })
+            .or_else(|| {
+                task.and_then(|value| value.get("contextId"))
+                    .and_then(|value| value.as_str())
+            })
+            .map(ToString::to_string),
+        a2a_reference_task_id: request_message
+            .and_then(|value| value.get("referenceTaskIds"))
+            .and_then(|value| value.as_array())
+            .and_then(|value| value.first())
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+        a2a_task_id: task
+            .and_then(|value| value.get("id").or_else(|| value.get("taskId")))
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                params
+                    .and_then(|value| value.get("id").or_else(|| value.get("taskId")))
+                    .and_then(|value| value.as_str())
+            })
+            .map(ToString::to_string),
+        a2a_task_state: task
+            .and_then(|value| value.get("status"))
+            .and_then(|value| value.as_object())
+            .and_then(|value| value.get("state"))
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+        a2a_artifact_count: task
+            .and_then(|value| value.get("artifacts"))
+            .and_then(|value| value.as_array())
+            .map(|value| value.len() as i64),
+        ..ProtocolSummary::default()
+    }
+}
+
+fn extract_protocol_summary(
+    telemetry: &HttpExchangeTelemetryContext,
+    body_text: &str,
+) -> ProtocolSummary {
+    if body_text.trim().is_empty() {
+        return ProtocolSummary::default();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body_text) else {
+        return ProtocolSummary::default();
+    };
+
+    let rpc = extract_json_rpc_from_value(&value);
+    let mut summary = ProtocolSummary {
+        protocol: protocol_hint_for_exchange(telemetry, &rpc),
+        rpc_kind: rpc.kind,
+        rpc_method_raw: rpc.method_raw.clone(),
+        rpc_method: rpc.method.clone(),
+        rpc_id: rpc.id.clone(),
+        rpc_is_notification: rpc.is_notification,
+        rpc_error_code: rpc.error_code,
+        rpc_error_message: rpc.error_message.clone(),
+        request_key: rpc.id.as_ref().map(|id| format!("rpc:{id}")),
+        ..ProtocolSummary::default()
+    };
+
+    match summary.protocol {
+        Some("mcp") => {
+            summary.merge_from(&extract_mcp_fields(&value, summary.rpc_method.as_deref()))
+        }
+        Some("a2a") => summary.merge_from(&extract_a2a_fields(&value)),
+        _ => {}
+    }
+
+    if summary.request_key.is_none() {
+        if let Some(task_id) = summary.mcp_task_id.as_deref() {
+            summary.request_key = Some(format!("mcp:task:{task_id}"));
+        } else if let Some(task_id) = summary.a2a_task_id.as_deref() {
+            summary.request_key = Some(format!("a2a:task:{task_id}"));
+        } else if let Some(message_id) = summary.a2a_message_id.as_deref() {
+            summary.request_key = Some(format!("a2a:message:{message_id}"));
+        }
+    }
+    if summary.parent_request_key.is_none()
+        && let Some(task_id) = summary.a2a_reference_task_id.as_deref()
+    {
+        summary.parent_request_key = Some(format!("a2a:task:{task_id}"));
+    }
+
+    summary
+}
+
+struct ParsedSseEvent {
+    event: Option<String>,
+    id: Option<String>,
+    data: String,
+}
+
+#[derive(Default)]
+struct SseStreamParser {
+    pending_line: String,
+    event_name: Option<String>,
+    event_id: Option<String>,
+    data_lines: Vec<String>,
+}
+
+impl SseStreamParser {
+    fn push_text(&mut self, chunk: &str, is_final: bool) -> Vec<ParsedSseEvent> {
+        self.pending_line.push_str(chunk);
+        let mut events = Vec::new();
+
+        while let Some(index) = self.pending_line.find('\n') {
+            let mut line = self.pending_line[..index].to_string();
+            self.pending_line.drain(..=index);
+            if line.ends_with('\r') {
+                line.pop();
+            }
+            self.process_line(line.as_str(), &mut events);
+        }
+
+        if is_final {
+            if !self.pending_line.is_empty() {
+                let mut line = std::mem::take(&mut self.pending_line);
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+                self.process_line(line.as_str(), &mut events);
+            }
+            self.flush_event(&mut events);
+        }
+
+        events
+    }
+
+    fn process_line(&mut self, line: &str, events: &mut Vec<ParsedSseEvent>) {
+        if line.is_empty() {
+            self.flush_event(events);
+            return;
+        }
+        if line.starts_with(':') {
+            return;
+        }
+        let (field, value) = match line.split_once(':') {
+            Some((field, rest)) => (field, rest.strip_prefix(' ').unwrap_or(rest)),
+            None => (line, ""),
+        };
+        match field {
+            "event" => self.event_name = Some(value.to_string()),
+            "id" => self.event_id = Some(value.to_string()),
+            "data" => self.data_lines.push(value.to_string()),
+            _ => {}
+        }
+    }
+
+    fn flush_event(&mut self, events: &mut Vec<ParsedSseEvent>) {
+        if !self.data_lines.is_empty() || self.event_name.is_some() || self.event_id.is_some() {
+            events.push(ParsedSseEvent {
+                event: self.event_name.take(),
+                id: self.event_id.take(),
+                data: self.data_lines.join("\n"),
+            });
+            self.data_lines.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+fn parse_sse_events(body_text: &str) -> Vec<ParsedSseEvent> {
+    let mut parser = SseStreamParser::default();
+    parser.push_text(body_text, true)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BodyCaptureDisposition {
+    Capture,
+    Omit,
+}
+
+fn body_capture_disposition(content_type: Option<&str>) -> BodyCaptureDisposition {
+    let Some(content_type) = content_type else {
+        return BodyCaptureDisposition::Capture;
+    };
+    let content_type = content_type.trim().to_ascii_lowercase();
+    if content_type.starts_with("image/")
+        || content_type.starts_with("audio/")
+        || content_type.starts_with("video/")
+        || content_type.starts_with("application/octet-stream")
+    {
+        BodyCaptureDisposition::Omit
+    } else {
+        BodyCaptureDisposition::Capture
+    }
+}
+
+fn is_sse_content_type(content_type: Option<&str>) -> bool {
+    content_type
+        .map(|value| value.trim().to_ascii_lowercase())
+        .is_some_and(|value| value.starts_with("text/event-stream"))
+}
+
+struct CapturedBodyMetadata<'a> {
+    total_bytes: usize,
+    truncated: bool,
+    omitted: bool,
+    content_type: Option<&'a str>,
+    content_encoding: Option<&'a str>,
+}
+
+fn emit_sse_event(
+    span: &tracing::Span,
+    telemetry: &HttpExchangeTelemetryContext,
+    sse_event: ParsedSseEvent,
+) {
+    let summary = extract_protocol_summary(telemetry, &sse_event.data);
+    let message = format!(
+        "{} [stream event]",
+        exchange_message(telemetry, HttpLifecyclePart::Response, &summary)
+    );
+    let mut extra_attributes = Vec::with_capacity(3);
+    push_nonempty_log_attr(
+        &mut extra_attributes,
+        "amber_sse_event",
+        sse_event.event.as_deref().unwrap_or(""),
+    );
+    push_nonempty_log_attr(
+        &mut extra_attributes,
+        "amber_sse_id",
+        sse_event.id.as_deref().unwrap_or(""),
+    );
+    push_nonempty_log_attr(
+        &mut extra_attributes,
+        "amber_sse_data",
+        sse_event.data.as_str(),
+    );
+    emit_binding_log(
+        span,
+        telemetry,
+        &summary,
+        BindingLogSpec {
+            level: Severity::Info,
+            part: HttpLifecyclePart::Response,
+            step: "stream_event",
+            transport: "sse",
+            event_name: "amber.binding.sse",
+            message,
+            extra_attributes,
+        },
+    );
+}
+
+fn emit_body_event(
+    span: &tracing::Span,
+    telemetry: &HttpExchangeTelemetryContext,
+    part: HttpLifecyclePart,
+    event_name: &'static str,
+    captured: &[u8],
+    metadata: CapturedBodyMetadata<'_>,
+) {
+    let body_utf8 = !metadata.omitted && std::str::from_utf8(captured).is_ok();
+    let body_text = if metadata.omitted || !body_utf8 {
+        ""
+    } else {
+        std::str::from_utf8(captured).unwrap_or("")
+    };
+    let summary = if body_utf8 {
+        extract_protocol_summary(telemetry, body_text)
+    } else {
+        ProtocolSummary::default()
+    };
+    let message = format!("{} [body]", exchange_message(telemetry, part, &summary));
+    let mut extra_attributes = Vec::with_capacity(7);
+    if metadata.total_bytes > 0 {
+        push_log_attr(
+            &mut extra_attributes,
+            "amber_body_size_bytes",
+            i64::try_from(metadata.total_bytes).unwrap_or(i64::MAX),
+        );
+    }
+    push_true_log_attr(
+        &mut extra_attributes,
+        "amber_body_truncated",
+        metadata.truncated,
+    );
+    push_true_log_attr(
+        &mut extra_attributes,
+        "amber_body_omitted",
+        metadata.omitted,
+    );
+    if !body_utf8 {
+        push_log_attr(&mut extra_attributes, "amber_body_utf8", false);
+    }
+    push_nonempty_log_attr(
+        &mut extra_attributes,
+        "amber_body_content_type",
+        metadata.content_type.unwrap_or(""),
+    );
+    push_nonempty_log_attr(
+        &mut extra_attributes,
+        "amber_body_content_encoding",
+        metadata.content_encoding.unwrap_or(""),
+    );
+    push_nonempty_log_attr(&mut extra_attributes, "amber_body_text", body_text);
+    emit_binding_log(
+        span,
+        telemetry,
+        &summary,
+        BindingLogSpec {
+            level: Severity::Info,
+            part,
+            step: "body",
+            transport: "http",
+            event_name,
+            message,
+            extra_attributes,
+        },
+    );
+}
+
+struct CapturedBodyCompletion {
+    span: tracing::Span,
+    telemetry: HttpExchangeTelemetryContext,
+    part: HttpLifecyclePart,
+    event_name: &'static str,
+    disposition: BodyCaptureDisposition,
+    content_type: Option<String>,
+    content_encoding: Option<String>,
+}
+
+fn emit_captured_body_completion(
+    completion: &CapturedBodyCompletion,
+    captured: &[u8],
+    total_bytes: usize,
+    truncated: bool,
+    sse_parser: &mut Option<SseStreamParser>,
+) {
+    if let Some(mut parser) = sse_parser.take() {
+        for sse_event in parser.push_text("", true) {
+            emit_sse_event(&completion.span, &completion.telemetry, sse_event);
+        }
+    }
+    let omitted = matches!(completion.disposition, BodyCaptureDisposition::Omit);
+    emit_body_event(
+        &completion.span,
+        &completion.telemetry,
+        completion.part,
+        completion.event_name,
+        captured,
+        CapturedBodyMetadata {
+            total_bytes,
+            truncated,
+            omitted,
+            content_type: completion.content_type.as_deref(),
+            content_encoding: completion.content_encoding.as_deref(),
+        },
+    );
+}
+
+fn capture_box_body(
+    body: BoxBody,
+    span: tracing::Span,
+    telemetry: HttpExchangeTelemetryContext,
+    part: HttpLifecyclePart,
+    event_name: &'static str,
+    content_type: Option<String>,
+    content_encoding: Option<String>,
+) -> BoxBody {
+    let disposition = body_capture_disposition(content_type.as_deref());
+    let sse_enabled = matches!(disposition, BodyCaptureDisposition::Capture)
+        && is_sse_content_type(content_type.as_deref());
+    let expected_bytes = body
+        .size_hint()
+        .exact()
+        .and_then(|bytes| usize::try_from(bytes).ok());
+    let source = BodyStream::new(body);
+    let captured = Vec::new();
+    let total_bytes: usize = 0;
+    let truncated = false;
+    let sse_parser = sse_enabled.then(SseStreamParser::default);
+    let body_event_emitted = false;
+    let completion = CapturedBodyCompletion {
+        span: span.clone(),
+        telemetry: telemetry.clone(),
+        part,
+        event_name,
+        disposition,
+        content_type: content_type.clone(),
+        content_encoding: content_encoding.clone(),
+    };
+
+    let stream = futures::stream::try_unfold(
+        (
+            source,
+            span,
+            telemetry,
+            disposition,
+            content_type,
+            content_encoding,
+            captured,
+            total_bytes,
+            truncated,
+            sse_parser,
+            body_event_emitted,
+            expected_bytes,
+            completion,
+        ),
+        move |(
+            mut source,
+            span,
+            telemetry,
+            disposition,
+            content_type,
+            content_encoding,
+            mut captured,
+            mut total_bytes,
+            mut truncated,
+            mut sse_parser,
+            mut body_event_emitted,
+            expected_bytes,
+            completion,
+        )| async move {
+            match source.next().await {
+                Some(Ok(frame)) => {
+                    let frame_was_final = source.is_end_stream();
+                    match frame.into_data() {
+                        Ok(chunk) => {
+                            total_bytes = total_bytes.saturating_add(chunk.len());
+                            if matches!(disposition, BodyCaptureDisposition::Capture) && !truncated
+                            {
+                                let remaining = DEFAULT_HTTP_BODY_CAPTURE_LIMIT_BYTES
+                                    .saturating_sub(captured.len());
+                                if remaining == 0 {
+                                    truncated = true;
+                                } else if chunk.len() <= remaining {
+                                    captured.extend_from_slice(&chunk);
+                                } else {
+                                    captured.extend_from_slice(&chunk[..remaining]);
+                                    truncated = true;
+                                }
+                            }
+                            if let Some(parser) = sse_parser.as_mut() {
+                                let chunk_text = String::from_utf8_lossy(chunk.as_ref());
+                                for sse_event in parser.push_text(chunk_text.as_ref(), false) {
+                                    emit_sse_event(&span, &telemetry, sse_event);
+                                }
+                            }
+                            let body_complete = frame_was_final
+                                || expected_bytes.is_some_and(|bytes| total_bytes >= bytes);
+                            if body_complete && !body_event_emitted {
+                                emit_captured_body_completion(
+                                    &completion,
+                                    &captured,
+                                    total_bytes,
+                                    truncated,
+                                    &mut sse_parser,
+                                );
+                                body_event_emitted = true;
+                            }
+
+                            let next_state = (
+                                source,
+                                span,
+                                telemetry,
+                                disposition,
+                                content_type,
+                                content_encoding,
+                                captured,
+                                total_bytes,
+                                truncated,
+                                sse_parser,
+                                body_event_emitted,
+                                expected_bytes,
+                                completion,
+                            );
+                            Ok(Some((Frame::data(chunk), next_state)))
+                        }
+                        Err(frame) => {
+                            let body_complete = frame_was_final
+                                || expected_bytes.is_some_and(|bytes| total_bytes >= bytes);
+                            if body_complete && !body_event_emitted {
+                                emit_captured_body_completion(
+                                    &completion,
+                                    &captured,
+                                    total_bytes,
+                                    truncated,
+                                    &mut sse_parser,
+                                );
+                                body_event_emitted = true;
+                            }
+                            let next_state = (
+                                source,
+                                span,
+                                telemetry,
+                                disposition,
+                                content_type,
+                                content_encoding,
+                                captured,
+                                total_bytes,
+                                truncated,
+                                sse_parser,
+                                body_event_emitted,
+                                expected_bytes,
+                                completion,
+                            );
+                            Ok(Some((frame, next_state)))
+                        }
+                    }
+                }
+                Some(Err(err)) => {
+                    let message = match part {
+                        HttpLifecyclePart::Request => {
+                            format!("{} request body stream error", telemetry.local_role())
+                        }
+                        HttpLifecyclePart::Response => {
+                            format!("{} response body stream error", telemetry.local_role())
+                        }
+                    };
+                    let summary = telemetry.summary_snapshot();
+                    let mut extra_attributes = Vec::with_capacity(1);
+                    push_log_attr(&mut extra_attributes, "amber_body_error", err.to_string());
+                    emit_binding_log(
+                        &span,
+                        &telemetry,
+                        &summary,
+                        BindingLogSpec {
+                            level: Severity::Warn,
+                            part,
+                            step: "body",
+                            transport: if sse_enabled { "sse" } else { "http" },
+                            event_name,
+                            message,
+                            extra_attributes,
+                        },
+                    );
+                    Err(err)
+                }
+                None => {
+                    if !body_event_emitted {
+                        emit_captured_body_completion(
+                            &completion,
+                            &captured,
+                            total_bytes,
+                            truncated,
+                            &mut sse_parser,
+                        );
+                    }
+                    Ok(None)
+                }
+            }
+        },
+    );
+
+    http_body_util::BodyExt::map_err(StreamBody::new(stream), |err| err).boxed()
+}
+
 async fn proxy_local_http_request(
     state: LocalHttpProxyState,
     req: Request<Incoming>,
 ) -> Response<BoxBody> {
-    let request_is_agent_card = a2a::is_agent_card_path(req.uri().path());
-    let mut parts = req.into_parts();
-    let matching_plugins: Vec<&dyn HttpExchangePlugin> = state
-        .plugins
-        .iter()
-        .map(Arc::as_ref)
-        .filter(|plugin| plugin.matches(&parts.0))
-        .collect();
-    let request_body_collect = matching_plugins
-        .iter()
-        .any(|plugin| plugin.request_body_mode(&parts.0) == BodyMode::Collect);
-    let response_body_collect = matching_plugins
-        .iter()
-        .any(|plugin| plugin.response_body_mode(&parts.0) == BodyMode::Collect);
-    let ctx = RewriteContext {
-        flow: RewriteFlow::Inbound,
-        request_is_agent_card,
-        route_id: state.route_id.clone(),
-    };
-    let request_stream_rewriters = if request_body_collect {
-        Vec::new()
+    let emit_telemetry = state.labels.emit_telemetry;
+    let telemetry = HttpExchangeTelemetryContext::new(RewriteFlow::Inbound, &state.labels);
+    let span = if emit_telemetry {
+        start_http_exchange_span(&telemetry, &req)
     } else {
-        collect_request_stream_rewriters(&matching_plugins, &ctx, &parts.0)
+        tracing::Span::none()
     };
+    let instrument_span = span.clone();
+    let status_span = span.clone();
+    let status_telemetry = telemetry.clone();
 
-    let request_body = if request_body_collect {
-        if !is_identity_or_absent_content_encoding(&parts.0.headers) {
-            return error_response(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "unsupported Content-Encoding on request body",
+    let response = async move {
+        let request_is_agent_card = a2a::is_agent_card_path(req.uri().path());
+        let mut parts = req.into_parts();
+        if emit_telemetry {
+            emit_headers_event(
+                &span,
+                &telemetry,
+                HttpLifecyclePart::Request,
+                "amber.binding.request.headers",
+                parts
+                    .0
+                    .headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                parts
+                    .0
+                    .headers
+                    .get(header::CONTENT_ENCODING)
+                    .and_then(|value| value.to_str().ok()),
+                &parts.0.headers,
             );
         }
-        let mut body = match parts.1.collect().await {
-            Ok(collected) => collected.to_bytes().to_vec(),
-            Err(err) => {
-                tracing::warn!("router request body read failed: {err}");
-                return error_response(StatusCode::BAD_GATEWAY, "upstream request read failed");
-            }
+        let matching_plugins: Vec<&dyn HttpExchangePlugin> = state
+            .plugins
+            .iter()
+            .map(Arc::as_ref)
+            .filter(|plugin| plugin.matches(&parts.0))
+            .collect();
+        let request_body_collect = matching_plugins
+            .iter()
+            .any(|plugin| plugin.request_body_mode(&parts.0) == BodyMode::Collect);
+        let response_body_collect = matching_plugins
+            .iter()
+            .any(|plugin| plugin.response_body_mode(&parts.0) == BodyMode::Collect);
+        let ctx = RewriteContext {
+            flow: RewriteFlow::Inbound,
+            request_is_agent_card,
+            route_id: state.route_id.clone(),
         };
-        if let Some(response) =
-            apply_request_filters(&matching_plugins, &ctx, &parts.0, Some(body.as_slice()))
-        {
-            return response;
-        }
-
-        let mut rewritten = false;
-        for plugin in &matching_plugins {
-            rewritten |= plugin.rewrite_request(&ctx, &mut parts.0, &mut body);
-        }
-        if rewritten {
-            strip_request_body_validators(&mut parts.0.headers);
-        }
-        parts
-            .0
-            .headers
-            .insert(header::CONTENT_LENGTH, content_length_header(body.len()));
-        Full::new(Bytes::from(body))
-            .map_err(|never| match never {})
-            .boxed()
-    } else {
-        if let Some(response) = apply_request_filters(&matching_plugins, &ctx, &parts.0, None) {
-            return response;
-        }
-        if request_stream_rewriters.is_empty() {
-            parts.1.boxed()
+        let request_stream_rewriters = if request_body_collect {
+            Vec::new()
         } else {
-            if !is_identity_or_absent_content_encoding(&parts.0.headers) {
-                return error_response(
-                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    "unsupported Content-Encoding on request body",
+            collect_request_stream_rewriters(&matching_plugins, &ctx, &parts.0)
+        };
+
+        let request_body = if request_body_collect
+            && is_identity_or_absent_content_encoding(&parts.0.headers)
+        {
+            let mut body = match parts.1.collect().await {
+                Ok(collected) => collected.to_bytes().to_vec(),
+                Err(err) => {
+                    let error_detail = err.to_string();
+                    tracing::warn!(
+                        target: "amber.internal",
+                        "router request body read failed: {error_detail}"
+                    );
+                    emit_binding_failure_event(
+                        &span,
+                        &telemetry,
+                        StatusCode::BAD_GATEWAY,
+                        "upstream request read failed",
+                        Some(error_detail),
+                    );
+                    return error_response(StatusCode::BAD_GATEWAY, "upstream request read failed");
+                }
+            };
+            if let Some(response) =
+                apply_request_filters(&matching_plugins, &ctx, &parts.0, Some(body.as_slice()))
+            {
+                return response;
+            }
+
+            let mut rewritten = false;
+            for plugin in &matching_plugins {
+                rewritten |= plugin.rewrite_request(&ctx, &mut parts.0, &mut body);
+            }
+            if rewritten {
+                strip_request_body_validators(&mut parts.0.headers);
+            }
+            parts
+                .0
+                .headers
+                .insert(header::CONTENT_LENGTH, content_length_header(body.len()));
+            let content_type = parts
+                .0
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_string());
+            let content_encoding = parts
+                .0
+                .headers
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_string());
+            let omitted = matches!(
+                body_capture_disposition(content_type.as_deref()),
+                BodyCaptureDisposition::Omit
+            );
+            if emit_telemetry {
+                emit_body_event(
+                    &span,
+                    &telemetry,
+                    HttpLifecyclePart::Request,
+                    "amber.binding.request.body",
+                    &body,
+                    CapturedBodyMetadata {
+                        total_bytes: body.len(),
+                        truncated: false,
+                        omitted,
+                        content_type: content_type.as_deref(),
+                        content_encoding: content_encoding.as_deref(),
+                    },
                 );
             }
-            strip_request_body_validators(&mut parts.0.headers);
-            parts.0.headers.remove(header::CONTENT_LENGTH);
-            rewrite_stream_body(parts.1, request_stream_rewriters)
+            Full::new(Bytes::from(body))
+                .map_err(|never| match never {})
+                .boxed()
+        } else {
+            if request_body_collect {
+                tracing::warn!(
+                    target: "amber.internal",
+                    "unsupported Content-Encoding on request body; skipping body-aware \
+                     request                      rewrites"
+                );
+            }
+            if let Some(response) = apply_request_filters(&matching_plugins, &ctx, &parts.0, None) {
+                return response;
+            }
+            let encoding_supported = is_identity_or_absent_content_encoding(&parts.0.headers);
+            let body = if request_stream_rewriters.is_empty() || !encoding_supported {
+                if !request_stream_rewriters.is_empty() && !encoding_supported {
+                    tracing::warn!(
+                        target: "amber.internal",
+                        "unsupported Content-Encoding on request body; skipping request \
+                         stream                          rewrites"
+                    );
+                }
+                parts.1.boxed()
+            } else {
+                strip_request_body_validators(&mut parts.0.headers);
+                parts.0.headers.remove(header::CONTENT_LENGTH);
+                rewrite_stream_body(parts.1, request_stream_rewriters)
+            };
+            if emit_telemetry {
+                capture_box_body(
+                    body,
+                    span.clone(),
+                    telemetry.clone(),
+                    HttpLifecyclePart::Request,
+                    "amber.binding.request.body",
+                    parts
+                        .0
+                        .headers
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .map(|value| value.to_string()),
+                    parts
+                        .0
+                        .headers
+                        .get(header::CONTENT_ENCODING)
+                        .and_then(|value| value.to_str().ok())
+                        .map(|value| value.to_string()),
+                )
+            } else {
+                body
+            }
+        };
+
+        let target_url = join_url(&state.base_url, &parts.0.uri);
+        let Some(host) = target_url.host_str() else {
+            return error_response(StatusCode::BAD_GATEWAY, "target url missing host");
+        };
+
+        let host_header = match target_url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        };
+
+        let mut request_parts = parts.0;
+        request_parts.uri = match Uri::try_from(target_url.as_str()) {
+            Ok(uri) => uri,
+            Err(_) => return error_response(StatusCode::BAD_GATEWAY, "invalid target url"),
+        };
+
+        if !response_body_collect && !matching_plugins.is_empty() {
+            request_parts.headers.remove(header::ACCEPT_ENCODING);
         }
-    };
+        sanitize_request_headers(&mut request_parts.headers, &host_header);
+        if emit_telemetry {
+            inject_trace_context(&span, &mut request_parts.headers);
+        }
+        let upstream_uri = request_parts.uri.to_string();
 
-    let target_url = join_url(&state.base_url, &parts.0.uri);
-    let Some(host) = target_url.host_str() else {
-        return error_response(StatusCode::BAD_GATEWAY, "target url missing host");
-    };
+        let proxied = Request::from_parts(request_parts, request_body);
+        if response_body_collect {
+            let response = match Decompression::new(state.client.clone())
+                .oneshot(proxied)
+                .await
+            {
+                Ok(resp) => resp,
+                Err(err) => {
+                    let error_detail = err.to_string();
+                    tracing::warn!(
+                        target: "amber.internal",
+                        upstream_uri = %upstream_uri,
+                        error = %error_detail,
+                        "router request failed"
+                    );
+                    emit_binding_failure_event(
+                        &span,
+                        &telemetry,
+                        StatusCode::BAD_GATEWAY,
+                        "upstream request failed",
+                        Some(error_detail),
+                    );
+                    return error_response(StatusCode::BAD_GATEWAY, "upstream request failed");
+                }
+            };
+            let (mut response_parts, response_body) = response.into_parts();
+            let mut body = match response_body.collect().await {
+                Ok(collected) => collected.to_bytes().to_vec(),
+                Err(err) => {
+                    let error_detail = err.to_string();
+                    tracing::warn!(
+                        target: "amber.internal",
+                        "router response body read failed: {error_detail}"
+                    );
+                    emit_binding_failure_event(
+                        &span,
+                        &telemetry,
+                        StatusCode::BAD_GATEWAY,
+                        "upstream response read failed",
+                        Some(error_detail),
+                    );
+                    return error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream response read failed",
+                    );
+                }
+            };
+            if let Some(response) = apply_response_filters(
+                &matching_plugins,
+                &ctx,
+                &response_parts,
+                Some(body.as_slice()),
+            ) {
+                return response;
+            }
 
-    let host_header = match target_url.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_string(),
-    };
+            let mut rewritten = false;
+            for plugin in &matching_plugins {
+                rewritten |= plugin.rewrite_response(&ctx, &mut response_parts, &mut body);
+            }
 
-    let mut request_parts = parts.0;
-    request_parts.uri = match Uri::try_from(target_url.as_str()) {
-        Ok(uri) => uri,
-        Err(_) => return error_response(StatusCode::BAD_GATEWAY, "invalid target url"),
-    };
+            sanitize_response_headers(&mut response_parts.headers);
+            if rewritten {
+                strip_response_body_validators(&mut response_parts.headers);
+            }
+            if emit_telemetry {
+                emit_headers_event(
+                    &span,
+                    &telemetry,
+                    HttpLifecyclePart::Response,
+                    "amber.binding.response.headers",
+                    response_parts
+                        .headers
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok()),
+                    response_parts
+                        .headers
+                        .get(header::CONTENT_ENCODING)
+                        .and_then(|value| value.to_str().ok()),
+                    &response_parts.headers,
+                );
+            }
+            response_parts
+                .headers
+                .insert(header::CONTENT_LENGTH, content_length_header(body.len()));
+            let content_type = response_parts
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_string());
+            let content_encoding = response_parts
+                .headers
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_string());
+            let omitted = matches!(
+                body_capture_disposition(content_type.as_deref()),
+                BodyCaptureDisposition::Omit
+            );
+            if emit_telemetry {
+                emit_body_event(
+                    &span,
+                    &telemetry,
+                    HttpLifecyclePart::Response,
+                    "amber.binding.response.body",
+                    &body,
+                    CapturedBodyMetadata {
+                        total_bytes: body.len(),
+                        truncated: false,
+                        omitted,
+                        content_type: content_type.as_deref(),
+                        content_encoding: content_encoding.as_deref(),
+                    },
+                );
+            }
+            return Response::from_parts(
+                response_parts,
+                Full::new(Bytes::from(body))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            );
+        }
 
-    if !response_body_collect && !matching_plugins.is_empty() {
-        request_parts.headers.remove(header::ACCEPT_ENCODING);
-    }
-    sanitize_request_headers(&mut request_parts.headers, &host_header);
-
-    let proxied = Request::from_parts(request_parts, request_body);
-    if response_body_collect {
-        let response = match Decompression::new(state.client.clone())
-            .oneshot(proxied)
-            .await
-        {
+        let response = match state.client.request(proxied).await {
             Ok(resp) => resp,
             Err(err) => {
-                tracing::warn!("router request failed: {err}");
+                let error_detail = err.to_string();
+                tracing::warn!(
+                    target: "amber.internal",
+                    upstream_uri = %upstream_uri,
+                    error = %error_detail,
+                    "router request failed"
+                );
+                emit_binding_failure_event(
+                    &span,
+                    &telemetry,
+                    StatusCode::BAD_GATEWAY,
+                    "upstream request failed",
+                    Some(error_detail),
+                );
                 return error_response(StatusCode::BAD_GATEWAY, "upstream request failed");
             }
         };
         let (mut response_parts, response_body) = response.into_parts();
-        let mut body = match response_body.collect().await {
-            Ok(collected) => collected.to_bytes().to_vec(),
-            Err(err) => {
-                tracing::warn!("router response body read failed: {err}");
-                return error_response(StatusCode::BAD_GATEWAY, "upstream response read failed");
-            }
-        };
-        if let Some(response) = apply_response_filters(
-            &matching_plugins,
-            &ctx,
-            &response_parts,
-            Some(body.as_slice()),
-        ) {
+        if emit_telemetry {
+            emit_headers_event(
+                &span,
+                &telemetry,
+                HttpLifecyclePart::Response,
+                "amber.binding.response.headers",
+                response_parts
+                    .headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                response_parts
+                    .headers
+                    .get(header::CONTENT_ENCODING)
+                    .and_then(|value| value.to_str().ok()),
+                &response_parts.headers,
+            );
+        }
+        if let Some(response) =
+            apply_response_filters(&matching_plugins, &ctx, &response_parts, None)
+        {
             return response;
         }
-
-        let mut rewritten = false;
-        for plugin in &matching_plugins {
-            rewritten |= plugin.rewrite_response(&ctx, &mut response_parts, &mut body);
-        }
-
-        sanitize_response_headers(&mut response_parts.headers);
-        if rewritten {
+        let response_stream_rewriters =
+            collect_response_stream_rewriters(&matching_plugins, &ctx, &response_parts);
+        let response_body = if !response_stream_rewriters.is_empty()
+            && is_identity_or_absent_content_encoding(&response_parts.headers)
+        {
             strip_response_body_validators(&mut response_parts.headers);
-        }
-        response_parts
-            .headers
-            .insert(header::CONTENT_LENGTH, content_length_header(body.len()));
-        return Response::from_parts(
-            response_parts,
-            Full::new(Bytes::from(body))
-                .map_err(|never| match never {})
-                .boxed(),
-        );
+            response_parts.headers.remove(header::CONTENT_LENGTH);
+            rewrite_stream_body(response_body, response_stream_rewriters)
+        } else {
+            response_body.boxed()
+        };
+        sanitize_response_headers(&mut response_parts.headers);
+        let response_body = if emit_telemetry {
+            capture_box_body(
+                response_body,
+                span,
+                telemetry,
+                HttpLifecyclePart::Response,
+                "amber.binding.response.body",
+                response_parts
+                    .headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value.to_string()),
+                response_parts
+                    .headers
+                    .get(header::CONTENT_ENCODING)
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value.to_string()),
+            )
+        } else {
+            response_body
+        };
+        Response::from_parts(response_parts, response_body)
     }
-
-    let response = match state.client.request(proxied).await {
-        Ok(resp) => resp,
-        Err(err) => {
-            tracing::warn!("router request failed: {err}");
-            return error_response(StatusCode::BAD_GATEWAY, "upstream request failed");
-        }
-    };
-    let (mut response_parts, response_body) = response.into_parts();
-    if let Some(response) = apply_response_filters(&matching_plugins, &ctx, &response_parts, None) {
-        return response;
-    }
-    let response_stream_rewriters =
-        collect_response_stream_rewriters(&matching_plugins, &ctx, &response_parts);
-    let response_body = if !response_stream_rewriters.is_empty()
-        && is_identity_or_absent_content_encoding(&response_parts.headers)
-    {
-        strip_response_body_validators(&mut response_parts.headers);
-        response_parts.headers.remove(header::CONTENT_LENGTH);
-        rewrite_stream_body(response_body, response_stream_rewriters)
+    .instrument(instrument_span)
+    .await;
+    if emit_telemetry {
+        finalize_http_exchange_response(&status_span, &status_telemetry, response)
     } else {
-        response_body.boxed()
-    };
-    sanitize_response_headers(&mut response_parts.headers);
-    Response::from_parts(response_parts, response_body)
+        response
+    }
 }
 
 async fn proxy_local_http_to_noise(
@@ -1780,6 +4210,7 @@ async fn proxy_local_http_to_noise(
     route_id: Arc<str>,
     stream: tokio::net::TcpStream,
     plugins: Arc<[Arc<dyn HttpExchangePlugin>]>,
+    labels: HttpExchangeLabels,
 ) -> Result<(), RouterError> {
     let (local, remote) = duplex(64 * 1024);
     let mut noise_session = session.clone();
@@ -1794,7 +4225,7 @@ async fn proxy_local_http_to_noise(
         })?;
     let conn_task = tokio::spawn(async move {
         if let Err(err) = conn.await {
-            tracing::warn!("outbound upstream connection failed: {err}");
+            tracing::warn!(target: "amber.internal", "outbound upstream connection failed: {err}");
         }
     });
 
@@ -1802,6 +4233,7 @@ async fn proxy_local_http_to_noise(
         upstream: Arc::new(Mutex::new(sender)),
         plugins,
         route_id,
+        labels,
     };
 
     let service = ServiceBuilder::new()
@@ -1826,201 +4258,512 @@ async fn proxy_local_http_to_noise(
     Ok(())
 }
 
+async fn proxy_http_request_to_noise(
+    flow: RewriteFlow,
+    state: OutboundHttpProxyState,
+    req: Request<Incoming>,
+) -> Response<BoxBody> {
+    let telemetry = HttpExchangeTelemetryContext::new(flow, &state.labels);
+    let span = start_http_exchange_span(&telemetry, &req);
+    let instrument_span = span.clone();
+    let status_span = span.clone();
+    let status_telemetry = telemetry.clone();
+
+    let response = async move {
+        let request_is_agent_card = a2a::is_agent_card_path(req.uri().path());
+        let mut parts = req.into_parts();
+        emit_headers_event(
+            &span,
+            &telemetry,
+            HttpLifecyclePart::Request,
+            "amber.binding.request.headers",
+            parts
+                .0
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            parts
+                .0
+                .headers
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            &parts.0.headers,
+        );
+        let matching_plugins: Vec<&dyn HttpExchangePlugin> = state
+            .plugins
+            .iter()
+            .map(Arc::as_ref)
+            .filter(|plugin| plugin.matches(&parts.0))
+            .collect();
+        let request_body_collect = matching_plugins
+            .iter()
+            .any(|plugin| plugin.request_body_mode(&parts.0) == BodyMode::Collect);
+        let response_body_collect = matching_plugins
+            .iter()
+            .any(|plugin| plugin.response_body_mode(&parts.0) == BodyMode::Collect);
+        let ctx = RewriteContext {
+            flow,
+            request_is_agent_card,
+            route_id: state.route_id.clone(),
+        };
+        let request_stream_rewriters = if request_body_collect {
+            Vec::new()
+        } else {
+            collect_request_stream_rewriters(&matching_plugins, &ctx, &parts.0)
+        };
+
+        let request_body = if request_body_collect
+            && is_identity_or_absent_content_encoding(&parts.0.headers)
+        {
+            let mut body = match parts.1.collect().await {
+                Ok(collected) => collected.to_bytes().to_vec(),
+                Err(err) => {
+                    let error_detail = err.to_string();
+                    tracing::warn!(
+                        target: "amber.internal",
+                        "router request body read failed: {error_detail}"
+                    );
+                    emit_binding_failure_event(
+                        &span,
+                        &telemetry,
+                        StatusCode::BAD_GATEWAY,
+                        "upstream request read failed",
+                        Some(error_detail),
+                    );
+                    return error_response(StatusCode::BAD_GATEWAY, "upstream request read failed");
+                }
+            };
+            if let Some(response) =
+                apply_request_filters(&matching_plugins, &ctx, &parts.0, Some(body.as_slice()))
+            {
+                return response;
+            }
+
+            let mut rewritten = false;
+            for plugin in &matching_plugins {
+                rewritten |= plugin.rewrite_request(&ctx, &mut parts.0, &mut body);
+            }
+            if rewritten {
+                strip_request_body_validators(&mut parts.0.headers);
+            }
+            parts
+                .0
+                .headers
+                .insert(header::CONTENT_LENGTH, content_length_header(body.len()));
+            let content_type = parts
+                .0
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_string());
+            let content_encoding = parts
+                .0
+                .headers
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_string());
+            let omitted = matches!(
+                body_capture_disposition(content_type.as_deref()),
+                BodyCaptureDisposition::Omit
+            );
+            emit_body_event(
+                &span,
+                &telemetry,
+                HttpLifecyclePart::Request,
+                "amber.binding.request.body",
+                &body,
+                CapturedBodyMetadata {
+                    total_bytes: body.len(),
+                    truncated: false,
+                    omitted,
+                    content_type: content_type.as_deref(),
+                    content_encoding: content_encoding.as_deref(),
+                },
+            );
+            Full::new(Bytes::from(body))
+                .map_err(|never| match never {})
+                .boxed()
+        } else {
+            if request_body_collect {
+                tracing::warn!(
+                    target: "amber.internal",
+                    "unsupported Content-Encoding on request body; skipping body-aware request \
+                     rewrites"
+                );
+            }
+            if let Some(response) = apply_request_filters(&matching_plugins, &ctx, &parts.0, None) {
+                return response;
+            }
+            let encoding_supported = is_identity_or_absent_content_encoding(&parts.0.headers);
+            let body = if request_stream_rewriters.is_empty() || !encoding_supported {
+                if !request_stream_rewriters.is_empty() && !encoding_supported {
+                    tracing::warn!(
+                        target: "amber.internal",
+                        "unsupported Content-Encoding on request body; skipping request stream \
+                         rewrites"
+                    );
+                }
+                parts.1.boxed()
+            } else {
+                strip_request_body_validators(&mut parts.0.headers);
+                parts.0.headers.remove(header::CONTENT_LENGTH);
+                rewrite_stream_body(parts.1, request_stream_rewriters)
+            };
+            capture_box_body(
+                body,
+                span.clone(),
+                telemetry.clone(),
+                HttpLifecyclePart::Request,
+                "amber.binding.request.body",
+                parts
+                    .0
+                    .headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value.to_string()),
+                parts
+                    .0
+                    .headers
+                    .get(header::CONTENT_ENCODING)
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value.to_string()),
+            )
+        };
+
+        let mut request_parts = parts.0;
+        if response_body_collect || !matching_plugins.is_empty() {
+            request_parts.headers.remove(header::ACCEPT_ENCODING);
+        }
+        let host_header = outgoing_host_header(&request_parts.uri, &request_parts.headers);
+        sanitize_request_headers(&mut request_parts.headers, host_header.as_str());
+        inject_trace_context(&span, &mut request_parts.headers);
+        let upstream_uri = request_parts.uri.to_string();
+
+        let proxied = Request::from_parts(request_parts, request_body);
+        let response = {
+            let mut upstream = state.upstream.lock().await;
+            match upstream.send_request(proxied).await {
+                Ok(resp) => resp,
+                Err(err) => {
+                    let error_detail = err.to_string();
+                    tracing::warn!(
+                        target: "amber.internal",
+                        upstream_uri = %upstream_uri,
+                        error = %error_detail,
+                        "router request failed"
+                    );
+                    emit_binding_failure_event(
+                        &span,
+                        &telemetry,
+                        StatusCode::BAD_GATEWAY,
+                        "upstream request failed",
+                        Some(error_detail),
+                    );
+                    return error_response(StatusCode::BAD_GATEWAY, "upstream request failed");
+                }
+            }
+        };
+
+        if response_body_collect {
+            let (mut response_parts, response_body) = response.into_parts();
+            let mut body = match response_body.collect().await {
+                Ok(collected) => collected.to_bytes().to_vec(),
+                Err(err) => {
+                    let error_detail = err.to_string();
+                    tracing::warn!(
+                        target: "amber.internal",
+                        "router response body read failed: {error_detail}"
+                    );
+                    emit_binding_failure_event(
+                        &span,
+                        &telemetry,
+                        StatusCode::BAD_GATEWAY,
+                        "upstream response read failed",
+                        Some(error_detail),
+                    );
+                    return error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream response read failed",
+                    );
+                }
+            };
+            if let Some(response) = apply_response_filters(
+                &matching_plugins,
+                &ctx,
+                &response_parts,
+                Some(body.as_slice()),
+            ) {
+                return response;
+            }
+
+            let mut rewritten = false;
+            for plugin in &matching_plugins {
+                rewritten |= plugin.rewrite_response(&ctx, &mut response_parts, &mut body);
+            }
+
+            sanitize_response_headers(&mut response_parts.headers);
+            if rewritten {
+                strip_response_body_validators(&mut response_parts.headers);
+            }
+            emit_headers_event(
+                &span,
+                &telemetry,
+                HttpLifecyclePart::Response,
+                "amber.binding.response.headers",
+                response_parts
+                    .headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                response_parts
+                    .headers
+                    .get(header::CONTENT_ENCODING)
+                    .and_then(|value| value.to_str().ok()),
+                &response_parts.headers,
+            );
+            response_parts
+                .headers
+                .insert(header::CONTENT_LENGTH, content_length_header(body.len()));
+            let content_type = response_parts
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_string());
+            let content_encoding = response_parts
+                .headers
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_string());
+            let omitted = matches!(
+                body_capture_disposition(content_type.as_deref()),
+                BodyCaptureDisposition::Omit
+            );
+            emit_body_event(
+                &span,
+                &telemetry,
+                HttpLifecyclePart::Response,
+                "amber.binding.response.body",
+                &body,
+                CapturedBodyMetadata {
+                    total_bytes: body.len(),
+                    truncated: false,
+                    omitted,
+                    content_type: content_type.as_deref(),
+                    content_encoding: content_encoding.as_deref(),
+                },
+            );
+            return Response::from_parts(
+                response_parts,
+                Full::new(Bytes::from(body))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            );
+        }
+
+        let (mut response_parts, response_body) = response.into_parts();
+        emit_headers_event(
+            &span,
+            &telemetry,
+            HttpLifecyclePart::Response,
+            "amber.binding.response.headers",
+            response_parts
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            response_parts
+                .headers
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            &response_parts.headers,
+        );
+        if let Some(response) =
+            apply_response_filters(&matching_plugins, &ctx, &response_parts, None)
+        {
+            return response;
+        }
+        let response_stream_rewriters =
+            collect_response_stream_rewriters(&matching_plugins, &ctx, &response_parts);
+        let response_body = if !response_stream_rewriters.is_empty()
+            && is_identity_or_absent_content_encoding(&response_parts.headers)
+        {
+            strip_response_body_validators(&mut response_parts.headers);
+            response_parts.headers.remove(header::CONTENT_LENGTH);
+            rewrite_stream_body(response_body, response_stream_rewriters)
+        } else {
+            response_body.boxed()
+        };
+        sanitize_response_headers(&mut response_parts.headers);
+        let response_body = capture_box_body(
+            response_body,
+            span,
+            telemetry,
+            HttpLifecyclePart::Response,
+            "amber.binding.response.body",
+            response_parts
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_string()),
+            response_parts
+                .headers
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_string()),
+        );
+        Response::from_parts(response_parts, response_body)
+    }
+    .instrument(instrument_span)
+    .await;
+    finalize_http_exchange_response(&status_span, &status_telemetry, response)
+}
+
+async fn proxy_http_request(state: HttpProxyState, req: Request<Incoming>) -> Response<BoxBody> {
+    let telemetry = HttpExchangeTelemetryContext::new(RewriteFlow::Outbound, &state.labels);
+    let span = start_http_exchange_span(&telemetry, &req);
+    let instrument_span = span.clone();
+    let status_span = span.clone();
+    let status_telemetry = telemetry.clone();
+
+    let response = async move {
+        let target_url = match resolve_target_url(&state.target, &req) {
+            Ok(url) => url,
+            Err(err) => return err,
+        };
+
+        let mut parts = req.into_parts();
+        emit_headers_event(
+            &span,
+            &telemetry,
+            HttpLifecyclePart::Request,
+            "amber.binding.request.headers",
+            parts
+                .0
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            parts
+                .0
+                .headers
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            &parts.0.headers,
+        );
+        let Some(host) = target_url.host_str() else {
+            return error_response(StatusCode::BAD_GATEWAY, "target url missing host");
+        };
+
+        let host_header = match target_url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        };
+
+        parts.0.uri = match Uri::try_from(target_url.as_str()) {
+            Ok(uri) => uri,
+            Err(_) => return error_response(StatusCode::BAD_GATEWAY, "invalid target url"),
+        };
+
+        sanitize_request_headers(&mut parts.0.headers, &host_header);
+        inject_trace_context(&span, &mut parts.0.headers);
+
+        let request_body = capture_box_body(
+            parts.1.boxed(),
+            span.clone(),
+            telemetry.clone(),
+            HttpLifecyclePart::Request,
+            "amber.binding.request.body",
+            parts
+                .0
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_string()),
+            parts
+                .0
+                .headers
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_string()),
+        );
+        let proxied = Request::from_parts(parts.0, request_body);
+        let upstream_uri = proxied.uri().to_string();
+
+        let response = match state.client.request(proxied).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                let error_detail = err.to_string();
+                tracing::warn!(
+                    target: "amber.internal",
+                    upstream_uri = %upstream_uri,
+                    error = %error_detail,
+                    "router request failed"
+                );
+                emit_binding_failure_event(
+                    &span,
+                    &telemetry,
+                    StatusCode::BAD_GATEWAY,
+                    "upstream request failed",
+                    Some(error_detail),
+                );
+                return error_response(StatusCode::BAD_GATEWAY, "upstream request failed");
+            }
+        };
+
+        let mut parts = response.into_parts();
+        emit_headers_event(
+            &span,
+            &telemetry,
+            HttpLifecyclePart::Response,
+            "amber.binding.response.headers",
+            parts
+                .0
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            parts
+                .0
+                .headers
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            &parts.0.headers,
+        );
+        sanitize_response_headers(&mut parts.0.headers);
+        let body = capture_box_body(
+            parts.1.boxed(),
+            span,
+            telemetry,
+            HttpLifecyclePart::Response,
+            "amber.binding.response.body",
+            parts
+                .0
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_string()),
+            parts
+                .0
+                .headers
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_string()),
+        );
+        Response::from_parts(parts.0, body)
+    }
+    .instrument(instrument_span)
+    .await;
+    finalize_http_exchange_response(&status_span, &status_telemetry, response)
+}
+
 async fn proxy_outbound_http_request(
     state: OutboundHttpProxyState,
     req: Request<Incoming>,
 ) -> Response<BoxBody> {
-    let request_is_agent_card = a2a::is_agent_card_path(req.uri().path());
-    let mut parts = req.into_parts();
-    let matching_plugins: Vec<&dyn HttpExchangePlugin> = state
-        .plugins
-        .iter()
-        .map(Arc::as_ref)
-        .filter(|plugin| plugin.matches(&parts.0))
-        .collect();
-    let request_body_collect = matching_plugins
-        .iter()
-        .any(|plugin| plugin.request_body_mode(&parts.0) == BodyMode::Collect);
-    let response_body_collect = matching_plugins
-        .iter()
-        .any(|plugin| plugin.response_body_mode(&parts.0) == BodyMode::Collect);
-    let ctx = RewriteContext {
-        flow: RewriteFlow::Outbound,
-        request_is_agent_card,
-        route_id: state.route_id.clone(),
-    };
-    let request_stream_rewriters = if request_body_collect {
-        Vec::new()
-    } else {
-        collect_request_stream_rewriters(&matching_plugins, &ctx, &parts.0)
-    };
-
-    let request_body = if request_body_collect {
-        if !is_identity_or_absent_content_encoding(&parts.0.headers) {
-            return error_response(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "unsupported Content-Encoding on request body",
-            );
-        }
-        let mut body = match parts.1.collect().await {
-            Ok(collected) => collected.to_bytes().to_vec(),
-            Err(err) => {
-                tracing::warn!("router request body read failed: {err}");
-                return error_response(StatusCode::BAD_GATEWAY, "upstream request read failed");
-            }
-        };
-        if let Some(response) =
-            apply_request_filters(&matching_plugins, &ctx, &parts.0, Some(body.as_slice()))
-        {
-            return response;
-        }
-
-        let mut rewritten = false;
-        for plugin in &matching_plugins {
-            rewritten |= plugin.rewrite_request(&ctx, &mut parts.0, &mut body);
-        }
-        if rewritten {
-            strip_request_body_validators(&mut parts.0.headers);
-        }
-        parts
-            .0
-            .headers
-            .insert(header::CONTENT_LENGTH, content_length_header(body.len()));
-        Full::new(Bytes::from(body))
-            .map_err(|never| match never {})
-            .boxed()
-    } else {
-        if let Some(response) = apply_request_filters(&matching_plugins, &ctx, &parts.0, None) {
-            return response;
-        }
-        if request_stream_rewriters.is_empty() {
-            parts.1.boxed()
-        } else {
-            if !is_identity_or_absent_content_encoding(&parts.0.headers) {
-                return error_response(
-                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    "unsupported Content-Encoding on request body",
-                );
-            }
-            strip_request_body_validators(&mut parts.0.headers);
-            parts.0.headers.remove(header::CONTENT_LENGTH);
-            rewrite_stream_body(parts.1, request_stream_rewriters)
-        }
-    };
-
-    let mut request_parts = parts.0;
-    if response_body_collect || !matching_plugins.is_empty() {
-        request_parts.headers.remove(header::ACCEPT_ENCODING);
-    }
-    let host_header = outgoing_host_header(&request_parts.uri, &request_parts.headers);
-    sanitize_request_headers(&mut request_parts.headers, host_header.as_str());
-
-    let proxied = Request::from_parts(request_parts, request_body);
-    let response = {
-        let mut upstream = state.upstream.lock().await;
-        match upstream.send_request(proxied).await {
-            Ok(resp) => resp,
-            Err(err) => {
-                tracing::warn!("router request failed: {err}");
-                return error_response(StatusCode::BAD_GATEWAY, "upstream request failed");
-            }
-        }
-    };
-
-    if response_body_collect {
-        let (mut response_parts, response_body) = response.into_parts();
-        let mut body = match response_body.collect().await {
-            Ok(collected) => collected.to_bytes().to_vec(),
-            Err(err) => {
-                tracing::warn!("router response body read failed: {err}");
-                return error_response(StatusCode::BAD_GATEWAY, "upstream response read failed");
-            }
-        };
-        if let Some(response) = apply_response_filters(
-            &matching_plugins,
-            &ctx,
-            &response_parts,
-            Some(body.as_slice()),
-        ) {
-            return response;
-        }
-
-        let mut rewritten = false;
-        for plugin in &matching_plugins {
-            rewritten |= plugin.rewrite_response(&ctx, &mut response_parts, &mut body);
-        }
-
-        sanitize_response_headers(&mut response_parts.headers);
-        if rewritten {
-            strip_response_body_validators(&mut response_parts.headers);
-        }
-        response_parts
-            .headers
-            .insert(header::CONTENT_LENGTH, content_length_header(body.len()));
-        return Response::from_parts(
-            response_parts,
-            Full::new(Bytes::from(body))
-                .map_err(|never| match never {})
-                .boxed(),
-        );
-    }
-
-    let (mut response_parts, response_body) = response.into_parts();
-    if let Some(response) = apply_response_filters(&matching_plugins, &ctx, &response_parts, None) {
-        return response;
-    }
-    let response_stream_rewriters =
-        collect_response_stream_rewriters(&matching_plugins, &ctx, &response_parts);
-    let response_body = if !response_stream_rewriters.is_empty()
-        && is_identity_or_absent_content_encoding(&response_parts.headers)
-    {
-        strip_response_body_validators(&mut response_parts.headers);
-        response_parts.headers.remove(header::CONTENT_LENGTH);
-        rewrite_stream_body(response_body, response_stream_rewriters)
-    } else {
-        response_body.boxed()
-    };
-    sanitize_response_headers(&mut response_parts.headers);
-    Response::from_parts(response_parts, response_body)
+    proxy_http_request_to_noise(RewriteFlow::Outbound, state, req).await
 }
 
-async fn proxy_http_request(state: HttpProxyState, req: Request<Incoming>) -> Response<BoxBody> {
-    let target_url = match resolve_target_url(&state.target, &req) {
-        Ok(url) => url,
-        Err(err) => return err,
-    };
-
-    let mut parts = req.into_parts();
-    let Some(host) = target_url.host_str() else {
-        return error_response(StatusCode::BAD_GATEWAY, "target url missing host");
-    };
-
-    let host_header = match target_url.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_string(),
-    };
-
-    parts.0.uri = match Uri::try_from(target_url.as_str()) {
-        Ok(uri) => uri,
-        Err(_) => return error_response(StatusCode::BAD_GATEWAY, "invalid target url"),
-    };
-
-    sanitize_request_headers(&mut parts.0.headers, &host_header);
-
-    let proxied = Request::from_parts(parts.0, parts.1.boxed());
-
-    let response = match state.client.request(proxied).await {
-        Ok(resp) => resp,
-        Err(err) => {
-            tracing::warn!("router request failed: {err}");
-            return error_response(StatusCode::BAD_GATEWAY, "upstream request failed");
-        }
-    };
-
-    let mut parts = response.into_parts();
-    sanitize_response_headers(&mut parts.0.headers);
-    let body = parts.1.boxed();
-    Response::from_parts(parts.0, body)
+async fn proxy_inbound_http_request_to_noise(
+    state: OutboundHttpProxyState,
+    req: Request<Incoming>,
+) -> Response<BoxBody> {
+    proxy_http_request_to_noise(RewriteFlow::Inbound, state, req).await
 }
 
 fn outgoing_host_header(uri: &Uri, headers: &HeaderMap) -> String {
@@ -2547,6 +5290,9 @@ mod tests {
         InboundRoute {
             route_id: route_id.to_string(),
             capability: capability.to_string(),
+            binding_name: None,
+            capability_kind: None,
+            capability_profile: None,
             protocol,
             http_plugins: Vec::new(),
             target,
@@ -2591,6 +5337,9 @@ mod tests {
             inbound: vec![InboundRoute {
                 route_id: "bad-route".to_string(),
                 capability: "cap".to_string(),
+                binding_name: None,
+                capability_kind: None,
+                capability_profile: None,
                 protocol: MeshProtocol::Tcp,
                 http_plugins: vec![HttpRoutePlugin::A2a],
                 target: InboundTarget::Local { port: 7001 },
@@ -2615,6 +5364,9 @@ mod tests {
             inbound: vec![InboundRoute {
                 route_id: "bad-route".to_string(),
                 capability: "cap".to_string(),
+                binding_name: None,
+                capability_kind: None,
+                capability_profile: None,
                 protocol: MeshProtocol::Http,
                 http_plugins: vec![HttpRoutePlugin::A2a],
                 target: InboundTarget::External {
@@ -2642,6 +5394,9 @@ mod tests {
             outbound: vec![OutboundRoute {
                 route_id: "bad-route".to_string(),
                 slot: "slot".to_string(),
+                binding_name: None,
+                capability_kind: None,
+                capability_profile: None,
                 listen_port: 20000,
                 listen_addr: None,
                 protocol: MeshProtocol::Tcp,
@@ -2766,6 +5521,9 @@ mod tests {
         config.outbound.push(amber_mesh::OutboundRoute {
             route_id: "route".to_string(),
             slot: "test-outbound".to_string(),
+            binding_name: None,
+            capability_kind: None,
+            capability_profile: None,
             listen_port: occupied_addr.port(),
             listen_addr: Some("127.0.0.1".to_string()),
             protocol: MeshProtocol::Tcp,
@@ -2812,6 +5570,10 @@ mod tests {
             route_id: "route-a".to_string(),
             capability: "shared".to_string(),
             protocol: MeshProtocol::Http,
+            slot: None,
+            binding_name: None,
+            capability_kind: None,
+            capability_profile: None,
         };
 
         let a = resolve_inbound_route(&inbound_routes, &open, "peer-a", &HashMap::new())
@@ -2855,6 +5617,10 @@ mod tests {
             route_id: "route-b".to_string(),
             capability: "shared".to_string(),
             protocol: MeshProtocol::Http,
+            slot: None,
+            binding_name: None,
+            capability_kind: None,
+            capability_profile: None,
         };
         let denied = resolve_inbound_route(&inbound_routes, &spoofed, "peer-a", &HashMap::new())
             .expect_err("peer-a should not be able to use peer-b route id");
@@ -2898,6 +5664,10 @@ mod tests {
             route_id: "export-route".to_string(),
             capability: "shared".to_string(),
             protocol: MeshProtocol::Http,
+            slot: None,
+            binding_name: None,
+            capability_kind: None,
+            capability_profile: None,
         };
         let dynamic = HashSet::from([String::from("dynamic-peer")]);
         let issuers = HashMap::from([(String::from("export-route"), dynamic.clone())]);
@@ -2971,6 +5741,240 @@ mod tests {
                 .get("export-route")
                 .is_some_and(|ids| ids.contains("dynamic-peer")),
             "dynamic issuer should be registered under the export key"
+        );
+    }
+
+    #[test]
+    fn extract_json_rpc_from_text_extracts_method_and_id() {
+        let rpc = extract_json_rpc_from_text(r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#);
+        assert_eq!(rpc.method.as_deref(), Some("tools/list"));
+        assert_eq!(rpc.id.as_deref(), Some("7"));
+        assert_eq!(rpc.is_notification, Some(false));
+        assert_eq!(rpc.error_code, None);
+    }
+
+    #[test]
+    fn extract_json_rpc_from_text_extracts_batch_first_rpc_entry() {
+        let rpc = extract_json_rpc_from_text(
+            r#"[{"jsonrpc":"2.0","id":"a","method":"foo"},{"jsonrpc":"2.0","id":"b","method":"bar"}]"#,
+        );
+        assert_eq!(rpc.method.as_deref(), Some("foo"));
+        assert_eq!(rpc.id.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn parse_sse_events_parses_framed_messages() {
+        let events = parse_sse_events(
+            "id: 1\nevent: message\ndata: \
+             {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\"}\n\n:comment\ndata: plain\n\n",
+        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].id.as_deref(), Some("1"));
+        assert_eq!(events[0].event.as_deref(), Some("message"));
+        assert_eq!(
+            events[0].data,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#
+        );
+        assert_eq!(events[1].event, None);
+        assert_eq!(events[1].id, None);
+        assert_eq!(events[1].data, "plain");
+    }
+
+    #[test]
+    fn inbound_labels_fall_back_to_open_frame_metadata() {
+        let route = InboundRoute {
+            route_id: "route".to_string(),
+            capability: "cap".to_string(),
+            binding_name: None,
+            capability_kind: None,
+            capability_profile: None,
+            protocol: MeshProtocol::Http,
+            http_plugins: Vec::new(),
+            target: InboundTarget::Local { port: 7000 },
+            allowed_issuers: vec!["peer".to_string()],
+        };
+        let open = OpenFrame {
+            route_id: "route".to_string(),
+            capability: "cap".to_string(),
+            protocol: MeshProtocol::Http,
+            slot: Some("slot".to_string()),
+            binding_name: Some("route_llm".to_string()),
+            capability_kind: Some("mcp".to_string()),
+            capability_profile: Some("v1".to_string()),
+        };
+
+        let labels = HttpExchangeLabels::inbound_from_route(
+            Arc::<str>::from("/provider"),
+            Arc::<str>::from("/consumer"),
+            &route,
+            &open,
+        );
+        assert_eq!(labels.slot.as_deref(), Some("slot"));
+        assert_eq!(labels.binding_name.as_deref(), Some("route_llm"));
+        assert_eq!(labels.capability_kind.as_deref(), Some("mcp"));
+        assert_eq!(labels.capability_profile.as_deref(), Some("v1"));
+    }
+
+    #[test]
+    fn inbound_export_delivery_to_provider_is_not_observed_twice() {
+        let route = InboundRoute {
+            route_id: "component:/server:api:http".to_string(),
+            capability: "api".to_string(),
+            binding_name: None,
+            capability_kind: Some("mcp".to_string()),
+            capability_profile: Some("debug-jsonrpc".to_string()),
+            protocol: MeshProtocol::Http,
+            http_plugins: Vec::new(),
+            target: InboundTarget::Local { port: 9000 },
+            allowed_issuers: vec!["/router".to_string()],
+        };
+        let open = OpenFrame {
+            route_id: "router:export:public:http".to_string(),
+            capability: "public".to_string(),
+            protocol: MeshProtocol::Http,
+            slot: Some("public".to_string()),
+            binding_name: Some("public".to_string()),
+            capability_kind: Some("mcp".to_string()),
+            capability_profile: Some("debug-jsonrpc".to_string()),
+        };
+
+        let labels = HttpExchangeLabels::inbound_from_route(
+            Arc::<str>::from("/server"),
+            Arc::<str>::from("/router"),
+            &route,
+            &open,
+        );
+
+        assert_eq!(labels.kind, HttpEdgeKind::Export);
+        assert!(!labels.emit_telemetry);
+        assert_eq!(labels.source_endpoint.as_ref(), "public");
+        assert_eq!(labels.destination_component.as_deref(), Some("/server"));
+    }
+
+    #[test]
+    fn inbound_export_labels_treat_router_slot_only_metadata_as_export() {
+        let route = InboundRoute {
+            route_id: "component:/server:api:http".to_string(),
+            capability: "api".to_string(),
+            binding_name: None,
+            capability_kind: Some("mcp".to_string()),
+            capability_profile: Some("debug-jsonrpc".to_string()),
+            protocol: MeshProtocol::Http,
+            http_plugins: Vec::new(),
+            target: InboundTarget::Local { port: 9000 },
+            allowed_issuers: vec!["/router".to_string()],
+        };
+        let open = OpenFrame {
+            route_id: "router:export:public:http".to_string(),
+            capability: "public".to_string(),
+            protocol: MeshProtocol::Http,
+            slot: Some("public".to_string()),
+            binding_name: None,
+            capability_kind: Some("mcp".to_string()),
+            capability_profile: Some("debug-jsonrpc".to_string()),
+        };
+
+        let labels = HttpExchangeLabels::inbound_from_route(
+            Arc::<str>::from("/server"),
+            Arc::<str>::from("/router"),
+            &route,
+            &open,
+        );
+
+        assert_eq!(labels.kind, HttpEdgeKind::Export);
+        assert!(!labels.emit_telemetry);
+        assert_eq!(labels.source_endpoint.as_ref(), "public");
+        assert_eq!(labels.destination_component.as_deref(), Some("/server"));
+    }
+
+    #[test]
+    fn external_slot_destination_ref_is_user_facing() {
+        let route = OutboundRoute {
+            route_id: "router:external:ext_api:http".to_string(),
+            slot: "ext_api".to_string(),
+            binding_name: Some("client_external_api".to_string()),
+            capability_kind: Some("http".to_string()),
+            capability_profile: Some("debug-external".to_string()),
+            listen_port: 20000,
+            listen_addr: None,
+            protocol: MeshProtocol::Http,
+            peer_addr: "router:24000".to_string(),
+            peer_id: "/router".to_string(),
+            capability: "ext_api".to_string(),
+            http_plugins: Vec::new(),
+        };
+
+        let labels = HttpExchangeLabels::outbound_from_route(Arc::<str>::from("/client"), &route);
+        assert_eq!(destination_ref_for(&labels), "external.ext_api");
+        assert_eq!(
+            edge_ref_for(
+                RewriteFlow::Outbound,
+                &labels,
+                "/client.ext_api",
+                "external.ext_api"
+            ),
+            "/client.client_external_api"
+        );
+    }
+
+    #[test]
+    fn export_messages_use_user_facing_component_story() {
+        let route = InboundRoute {
+            route_id: "router:export:public:http".to_string(),
+            capability: "public".to_string(),
+            binding_name: Some("public".to_string()),
+            capability_kind: Some("mcp".to_string()),
+            capability_profile: Some("debug-jsonrpc".to_string()),
+            protocol: MeshProtocol::Http,
+            http_plugins: Vec::new(),
+            target: InboundTarget::MeshForward {
+                peer_addr: "server:23000".to_string(),
+                peer_id: "/server".to_string(),
+                route_id: "component:/server:api:http".to_string(),
+                capability: "api".to_string(),
+            },
+            allowed_issuers: vec!["/router".to_string()],
+        };
+        let open = OpenFrame {
+            route_id: "router:export:public:http".to_string(),
+            capability: "public".to_string(),
+            protocol: MeshProtocol::Http,
+            slot: Some("public".to_string()),
+            binding_name: Some("public".to_string()),
+            capability_kind: Some("mcp".to_string()),
+            capability_profile: Some("debug-jsonrpc".to_string()),
+        };
+        let labels = HttpExchangeLabels::inbound_from_route(
+            Arc::<str>::from("/router"),
+            Arc::<str>::from("/proxy/example"),
+            &route,
+            &open,
+        );
+        let telemetry = HttpExchangeTelemetryContext::new(RewriteFlow::Inbound, &labels);
+
+        assert_eq!(
+            exchange_message(
+                &telemetry,
+                HttpLifecyclePart::Request,
+                &ProtocolSummary::default(),
+            ),
+            "request received from public by /server"
+        );
+    }
+
+    #[test]
+    fn rewrite_flow_maps_to_expected_otel_kind() {
+        assert_eq!(RewriteFlow::Inbound.otel_kind(), "server");
+        assert_eq!(RewriteFlow::Outbound.otel_kind(), "client");
+    }
+
+    #[test]
+    fn otel_status_code_for_http_marks_server_errors() {
+        assert_eq!(otel_status_code_for_http(StatusCode::OK), "ok");
+        assert_eq!(otel_status_code_for_http(StatusCode::NOT_FOUND), "ok");
+        assert_eq!(
+            otel_status_code_for_http(StatusCode::INTERNAL_SERVER_ERROR),
+            "error"
         );
     }
 }

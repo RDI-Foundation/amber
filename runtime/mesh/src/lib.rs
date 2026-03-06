@@ -6,6 +6,8 @@ use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod telemetry;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct MeshIdentity {
@@ -208,6 +210,12 @@ pub enum MeshProvisionOutput {
 pub struct InboundRoute {
     pub route_id: String,
     pub capability: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_profile: Option<String>,
     pub protocol: MeshProtocol,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub http_plugins: Vec<HttpRoutePlugin>,
@@ -226,6 +234,12 @@ pub enum HttpRoutePlugin {
 pub struct OutboundRoute {
     pub route_id: String,
     pub slot: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_profile: Option<String>,
     pub listen_port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_addr: Option<String>,

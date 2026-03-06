@@ -61,13 +61,27 @@ const HOST_GATEWAY_ENTRY: &str = "host.docker.internal:host-gateway";
 const ROUTER_CONTROL_SOCKET_VOLUME_NAME: &str = "amber-router-control";
 const ROUTER_CONTROL_SOCKET_PATH_IN_CONTAINER: &str = "/amber/control/router-control.sock";
 const ROUTER_CONTROL_SOCKET_DIR_IN_CONTAINER: &str = "/amber/control";
+const ROUTER_CONTROL_SOCKET_PATH_IN_VOLUME: &str = "/router-control.sock";
 const COMPOSE_PROJECT_NAME_ENV: &str = "COMPOSE_PROJECT_NAME";
+const SCENARIO_RUN_ID_ENV: &str = "AMBER_SCENARIO_RUN_ID";
 const ROUTER_RUNTIME_UID: u32 = 65532;
 const ROUTER_RUNTIME_GID: u32 = 65532;
 
 const COMPONENT_MESH_PORT_BASE: u16 = 23000;
 const ROUTER_MESH_PORT_BASE: u16 = 24000;
 const ROUTER_CONTROL_PORT_BASE: u16 = 24100;
+
+const OTELCOL_SERVICE_NAME: &str = "amber-otelcol";
+const OTELCOL_CONFIG_NAME: &str = "amber-otelcol-config";
+const OTELCOL_CONFIG_PATH: &str = "/etc/otelcol/config.yaml";
+const OTELCOL_UPSTREAM_ENV: &str = "AMBER_OTEL_UPSTREAM_OTLP_HTTP_ENDPOINT";
+const OTELCOL_DEFAULT_UPSTREAM_ENDPOINT: &str = "http://host.docker.internal:18890";
+const DEFAULT_OTELCOL_IMAGE: &str = "otel/opentelemetry-collector-contrib:0.143.0";
+const ROUTER_OTLP_ENDPOINT: &str = "http://amber-otelcol:4318";
+const DOCKER_CONTAINER_LOGS_DIR: &str = "/var/lib/docker/containers";
+const LOG_LABEL_MONIKER: &str = "amber_component_moniker";
+const LOG_LABEL_SERVICE_NAME: &str = "amber_service_name";
+const LOG_LABEL_LIST: &str = "amber_component_moniker,amber_service_name";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DockerComposeReporter;
@@ -147,6 +161,8 @@ struct Service {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     configs: Vec<ServiceConfigMount>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    logging: Option<ServiceLogging>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     depends_on: Option<DependsOn>,
     #[serde(skip_serializing_if = "Option::is_none")]
     restart: Option<String>,
@@ -159,6 +175,13 @@ impl Service {
             ..Default::default()
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ServiceLogging {
+    driver: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    options: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -336,7 +359,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         Some(RouterMetadata {
             mesh_port: router_mesh_port,
             control_port: router_ports.as_ref().expect("router ports missing").control,
-            control_socket: Some(ROUTER_CONTROL_SOCKET_PATH_IN_CONTAINER.to_string()),
+            control_socket: Some(ROUTER_CONTROL_SOCKET_PATH_IN_VOLUME.to_string()),
             control_socket_volume: Some(compose_control_socket_volume_expr()),
         })
     } else {
@@ -459,6 +482,47 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
             .insert(PROVISIONER_SERVICE_NAME.to_string(), provisioner_service);
     }
 
+    // Per-scenario OpenTelemetry collector agent.
+    //
+    // Amber runtimes export OTLP traces and logs directly to the collector, which then forwards
+    // them to the configured upstream endpoint (defaulting to the local `amber dashboard` Aspire
+    // OTLP/HTTP port).
+    let otelcol_config = otelcol_config_content();
+    compose.configs.insert(
+        OTELCOL_CONFIG_NAME.to_string(),
+        ComposeConfig {
+            content: otelcol_config,
+        },
+    );
+    let mut otelcol_service =
+        Service::new(format!("${{AMBER_OTELCOL_IMAGE:-{DEFAULT_OTELCOL_IMAGE}}}"));
+    otelcol_service.command = Some(vec![format!("--config={OTELCOL_CONFIG_PATH}")]);
+    otelcol_service.user = Some("0:0".to_string());
+    otelcol_service.environment = Some(Environment::List(vec![
+        format!("{SCENARIO_RUN_ID_ENV}=${{{COMPOSE_PROJECT_NAME_ENV}:-default}}"),
+        format!(
+            "{OTELCOL_UPSTREAM_ENV}=${{{OTELCOL_UPSTREAM_ENV}:\
+             -{OTELCOL_DEFAULT_UPSTREAM_ENDPOINT}}}"
+        ),
+    ]));
+    otelcol_service.configs.push(ServiceConfigMount {
+        source: OTELCOL_CONFIG_NAME.to_string(),
+        target: Some(OTELCOL_CONFIG_PATH.to_string()),
+    });
+    otelcol_service
+        .networks
+        .insert(MESH_NETWORK_NAME.to_string(), EmptyMap::default());
+    otelcol_service
+        .extra_hosts
+        .push(HOST_GATEWAY_ENTRY.to_string());
+    otelcol_service.volumes.push(format!(
+        "${{AMBER_DOCKER_CONTAINER_LOGS_DIR:-{DOCKER_CONTAINER_LOGS_DIR}}}:\
+         {DOCKER_CONTAINER_LOGS_DIR}:ro"
+    ));
+    compose
+        .services
+        .insert(OTELCOL_SERVICE_NAME.to_string(), otelcol_service);
+
     if needs_router {
         compose
             .volumes
@@ -495,6 +559,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         env_entries.push(format!(
             "AMBER_ROUTER_CONTROL_SOCKET_PATH={ROUTER_CONTROL_SOCKET_PATH_IN_CONTAINER}"
         ));
+        push_router_observability_env(&mut env_entries);
         let mut router_service = Service::new(images.router.clone());
         router_service.environment = Some(Environment::List(env_entries));
         router_service
@@ -550,10 +615,12 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         let svc = names.get(id).unwrap();
 
         let mut sidecar_service = Service::new(images.router.clone());
-        sidecar_service.environment = Some(Environment::List(vec![
+        let mut sidecar_env_entries = vec![
             format!("AMBER_ROUTER_CONFIG_PATH={}", mesh_config_path()),
             format!("AMBER_ROUTER_IDENTITY_PATH={}", mesh_identity_path()),
-        ]));
+        ];
+        push_router_observability_env(&mut sidecar_env_entries);
+        sidecar_service.environment = Some(Environment::List(sidecar_env_entries));
         sidecar_service
             .networks
             .insert(MESH_NETWORK_NAME.to_string(), EmptyMap::default());
@@ -587,6 +654,10 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         let mut program_service = Service::new(image);
         program_service.network_mode = Some(format!("service:{}", svc.sidecar));
         let label = component_label(s, *id);
+        let scenario_scope = mesh_config_plan
+            .component_configs
+            .get(id)
+            .and_then(|config| config.identity.mesh_scope.as_deref());
         let mount_specs = config_plan.mount_specs.get(id).map(Vec::as_slice);
         let docker_mount_paths = docker_mount_paths_by_component.get(id);
         let has_docker_mount = docker_mount_paths.is_some_and(|paths| !paths.is_empty());
@@ -630,11 +701,12 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                     .collect::<Vec<_>>();
                 program_service.entrypoint = Some(entrypoint);
 
-                if !env.is_empty() {
-                    let env_map = env
-                        .iter()
-                        .map(|(k, v)| (k.clone(), escape_compose_interpolation(v).into_owned()))
-                        .collect::<BTreeMap<_, _>>();
+                let mut env_map = env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), escape_compose_interpolation(v).into_owned()))
+                    .collect::<BTreeMap<_, _>>();
+                push_program_observability_env_map(&mut env_map, &label, scenario_scope);
+                if !env_map.is_empty() {
                     program_service.environment = Some(Environment::Map(env_map));
                 }
             }
@@ -692,12 +764,18 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                         encode_docker_mount_proxy_spec_b64(paths, "127.0.0.1", local_proxy_port)?;
                     env_entries.push(format!("{DOCKER_MOUNT_PROXY_SPEC_ENV}={spec_b64}"));
                 }
+                push_program_observability_env(&mut env_entries, &label, scenario_scope);
                 program_service.environment = Some(Environment::List(env_entries));
             }
         }
         if Some(*id) == docker_gateway_component {
             configure_injected_docker_gateway_service(&mut program_service, s, *id, svc)?;
         }
+        configure_program_log_shipping(
+            &mut program_service,
+            &label,
+            &compose_component_service_name(&label),
+        );
 
         compose
             .services
@@ -721,6 +799,208 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
 }
 
 // ---- helpers ----
+
+fn otelcol_config_content() -> String {
+    // We use env vars so users can override upstream and emit stable per-run labels without
+    // regenerating compose output.
+    format!(
+        r#"
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  filelog/docker:
+    include:
+      - {DOCKER_CONTAINER_LOGS_DIR}/*/*-json.log
+    start_at: end
+    include_file_path: true
+    operators:
+      - type: json_parser
+        parse_from: body
+      - type: move
+        from: attributes.log
+        to: body
+      - type: move
+        from: attributes.stream
+        to: attributes.amber_stream
+      - type: json_parser
+        if: body matches "^[{{]"
+        parse_from: body
+      - type: severity_parser
+        if: attributes.level != nil
+        parse_from: attributes.level
+      - type: move
+        if: attributes.message != nil
+        from: attributes.message
+        to: body
+      - type: time_parser
+        parse_from: attributes.time
+        layout_type: gotime
+        layout: '2006-01-02T15:04:05.999999999Z07:00'
+      - type: remove
+        field: attributes.time
+        if: attributes.time != nil
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 128
+  batch: {{}}
+  resource/amber:
+    attributes:
+      - key: amber.scenario.run_id
+        action: upsert
+        value: $${{env:{SCENARIO_RUN_ID_ENV}}}
+  transform/program_logs:
+    error_mode: ignore
+    log_statements:
+      - context: scope
+        statements:
+          - set(scope.name, "amber.program")
+      - context: log
+        statements:
+          - set(log.attributes["service.name"], log.attributes["attrs"]["{LOG_LABEL_SERVICE_NAME}"]) where log.attributes["attrs"] != nil and log.attributes["attrs"]["{LOG_LABEL_SERVICE_NAME}"] != nil
+          - set(log.attributes["amber.component.moniker"], log.attributes["attrs"]["{LOG_LABEL_MONIKER}"]) where log.attributes["attrs"] != nil and log.attributes["attrs"]["{LOG_LABEL_MONIKER}"] != nil
+          - delete_key(log.attributes, "attrs") where log.attributes["attrs"] != nil
+          - set(log.severity_number, SEVERITY_NUMBER_ERROR) where log.severity_number == 0 and IsString(log.body) and IsMatch(log.body, "(?i)\\b(error|failed|exception|fatal|panic)\\b")
+          - set(log.severity_number, SEVERITY_NUMBER_WARN) where log.severity_number == 0 and IsString(log.body) and IsMatch(log.body, "(?i)\\b(warn|warning)\\b")
+          - set(log.severity_number, SEVERITY_NUMBER_WARN) where log.severity_number == 0 and log.attributes["amber_stream"] == "stderr"
+          - set(log.severity_number, SEVERITY_NUMBER_INFO) where log.severity_number == 0
+          - set(log.severity_text, "Error") where log.severity_text == "" and log.severity_number >= SEVERITY_NUMBER_ERROR
+          - set(log.severity_text, "Warning") where log.severity_text == "" and log.severity_number >= SEVERITY_NUMBER_WARN and log.severity_number < SEVERITY_NUMBER_ERROR
+          - set(log.severity_text, "Information") where log.severity_text == "" and log.severity_number >= SEVERITY_NUMBER_INFO and log.severity_number < SEVERITY_NUMBER_WARN
+  filter/program_logs:
+    error_mode: ignore
+    logs:
+      log_record:
+        - log.attributes["service.name"] == nil
+        - log.attributes["amber.component.moniker"] == nil
+  groupbyattrs/program_log_identity:
+    keys:
+      - service.name
+      - amber.component.moniker
+
+exporters:
+  otlphttp/upstream:
+    endpoint: $${{env:{OTELCOL_UPSTREAM_ENV}}}
+    compression: none
+    encoding: proto
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/amber, batch]
+      exporters: [otlphttp/upstream]
+    logs/otlp:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/amber, batch]
+      exporters: [otlphttp/upstream]
+    logs/program:
+      receivers: [filelog/docker]
+      processors: [memory_limiter, transform/program_logs, filter/program_logs, groupbyattrs/program_log_identity, resource/amber, batch]
+      exporters: [otlphttp/upstream]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/amber, batch]
+      exporters: [otlphttp/upstream]
+"#
+    )
+}
+
+fn push_router_observability_env(env_entries: &mut Vec<String>) {
+    env_entries.push(format!(
+        "{SCENARIO_RUN_ID_ENV}=${{{COMPOSE_PROJECT_NAME_ENV}:-default}}"
+    ));
+    env_entries.push("OTEL_TRACES_SAMPLER=always_on".to_string());
+    env_entries.push("OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf".to_string());
+    env_entries.push(format!(
+        "OTEL_EXPORTER_OTLP_ENDPOINT={ROUTER_OTLP_ENDPOINT}"
+    ));
+}
+
+fn push_program_observability_env(
+    env_entries: &mut Vec<String>,
+    component_moniker: &str,
+    scenario_scope: Option<&str>,
+) {
+    env_entries.push(format!(
+        "{SCENARIO_RUN_ID_ENV}=${{{COMPOSE_PROJECT_NAME_ENV}:-default}}"
+    ));
+    env_entries.push("OTEL_TRACES_SAMPLER=always_on".to_string());
+    env_entries.push("OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf".to_string());
+    env_entries.push(format!(
+        "OTEL_EXPORTER_OTLP_ENDPOINT={ROUTER_OTLP_ENDPOINT}"
+    ));
+    env_entries.push(format!("AMBER_COMPONENT_MONIKER={component_moniker}"));
+    if let Some(scope) = scenario_scope {
+        env_entries.push(format!("AMBER_SCENARIO_SCOPE={scope}"));
+    }
+}
+
+fn push_program_observability_env_map(
+    env_entries: &mut BTreeMap<String, String>,
+    component_moniker: &str,
+    scenario_scope: Option<&str>,
+) {
+    env_entries.insert(
+        SCENARIO_RUN_ID_ENV.to_string(),
+        format!("${{{COMPOSE_PROJECT_NAME_ENV}:-default}}"),
+    );
+    env_entries.insert("OTEL_TRACES_SAMPLER".to_string(), "always_on".to_string());
+    env_entries.insert(
+        "OTEL_EXPORTER_OTLP_PROTOCOL".to_string(),
+        "http/protobuf".to_string(),
+    );
+    env_entries.insert(
+        "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+        ROUTER_OTLP_ENDPOINT.to_string(),
+    );
+    env_entries.insert(
+        "AMBER_COMPONENT_MONIKER".to_string(),
+        component_moniker.to_string(),
+    );
+    if let Some(scope) = scenario_scope {
+        env_entries.insert("AMBER_SCENARIO_SCOPE".to_string(), scope.to_string());
+    }
+}
+
+fn compose_component_service_name(component_moniker: &str) -> String {
+    format!(
+        "amber.${{{COMPOSE_PROJECT_NAME_ENV}:-default}}.{}",
+        sanitize_component_moniker(component_moniker)
+    )
+}
+
+fn sanitize_component_moniker(component_moniker: &str) -> String {
+    let sanitized = component_moniker.trim_matches('/').replace('/', ".");
+    if sanitized.is_empty() {
+        "root".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn configure_program_log_shipping(
+    service: &mut Service,
+    component_moniker: &str,
+    service_name: &str,
+) {
+    service
+        .labels
+        .insert(LOG_LABEL_MONIKER.to_string(), component_moniker.to_string());
+    service
+        .labels
+        .insert(LOG_LABEL_SERVICE_NAME.to_string(), service_name.to_string());
+    service.logging = Some(ServiceLogging {
+        driver: "json-file".to_string(),
+        options: BTreeMap::from([("labels".to_string(), LOG_LABEL_LIST.to_string())]),
+    });
+}
 
 fn configure_helper_runner_service(service: &mut Service) {
     service
