@@ -141,17 +141,19 @@ fn visit_program_interpolated(
     program: &Program,
     mut visit: impl FnMut(&InterpolatedString) -> bool,
 ) -> bool {
-    if let Ok(image) = program.image.parse::<InterpolatedString>()
-        && visit(&image)
+    let executable = program.path_ref().or_else(|| program.image_ref());
+    if let Some(executable) = executable
+        && let Ok(parsed) = executable.parse::<InterpolatedString>()
+        && visit(&parsed)
     {
         return true;
     }
-    for arg in &program.entrypoint.0 {
+    for arg in &program.command().0 {
         if visit(arg) {
             return true;
         }
     }
-    for value in program.env.values() {
+    for value in program.env().values() {
         if visit(value) {
             return true;
         }
@@ -202,7 +204,7 @@ fn collect_config_uses(manifest: &Manifest) -> ConfigUses {
             collect_config_uses_from_interpolated(value, &mut uses);
             false
         });
-        for mount in &program.mounts {
+        for mount in program.mounts() {
             match &mount.source {
                 MountSource::Config(path) | MountSource::Secret(path) => uses.add_query(path),
                 MountSource::Slot(_) | MountSource::Binding(_) | MountSource::Framework(_) => {}
@@ -543,10 +545,13 @@ mod tests {
 
     #[test]
     fn lint_manifest_handles_malformed_program_image_from_builder() {
-        let program = crate::Program::builder()
-            .image("${config.image")
-            .entrypoint(crate::ProgramEntrypoint(vec!["run".parse().unwrap()]))
-            .build();
+        let program = crate::Program::image(
+            crate::ProgramImage::builder()
+                .image("${config.image")
+                .entrypoint(crate::ProgramEntrypoint(vec!["run".parse().unwrap()]))
+                .common(crate::ProgramCommon::default())
+                .build(),
+        );
         let manifest = Manifest::builder().program(program).build().unwrap();
 
         let input = r#"{ manifest_version: "0.1.0" }"#;

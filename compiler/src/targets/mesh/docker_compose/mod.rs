@@ -20,23 +20,26 @@ use framework_docker_injection::{
 use crate::{
     CompileOutput,
     reporter::{Reporter, ReporterError},
-    targets::mesh::{
-        addressing::{
-            DockerFrameworkBindingPolicy, LocalAddressing, LocalAddressingOptions,
-            build_address_plan,
+    targets::{
+        mesh::{
+            addressing::{
+                DockerFrameworkBindingPolicy, LocalAddressing, LocalAddressingOptions,
+                build_address_plan,
+            },
+            internal_images::resolve_internal_images,
+            mesh_config::{
+                MeshConfigBuildInput, MeshServiceName, RouterPorts, ServiceMeshAddressing,
+                build_mesh_config_plan, default_mesh_config_build_options,
+            },
+            plan::{MeshOptions, component_label, map_program_components},
+            ports::{allocate_mesh_ports, allocate_slot_ports},
+            provision::build_mesh_provision_plan,
+            proxy_metadata::{ProxyMetadata, RouterMetadata, build_proxy_metadata},
         },
-        config::{
-            ComponentExecutionPlan, ProgramImagePart, ProgramImagePlan,
+        program_config::{
+            ComponentExecutionPlan, ProgramImagePart, ProgramImagePlan, ProgramSupport,
             build_component_runtime_plan, build_config_plan,
         },
-        internal_images::resolve_internal_images,
-        mesh_config::{
-            MeshServiceName, RouterPorts, ServiceMeshAddressing, build_mesh_config_plan,
-        },
-        plan::{MeshOptions, component_label, map_program_components},
-        ports::{allocate_mesh_ports, allocate_slot_ports},
-        provision::build_mesh_provision_plan,
-        proxy_metadata::{ProxyMetadata, RouterMetadata, build_proxy_metadata},
     },
 };
 
@@ -250,8 +253,8 @@ impl From<String> for DockerComposeError {
     }
 }
 
-impl From<crate::targets::mesh::plan::MeshError> for DockerComposeError {
-    fn from(value: crate::targets::mesh::plan::MeshError) -> Self {
+impl From<crate::targets::common::TargetError> for DockerComposeError {
+    fn from(value: crate::targets::common::TargetError) -> Self {
         Self::Other(value.to_string())
     }
 }
@@ -291,7 +294,6 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     let docker_mount_paths_by_component =
         collect_framework_docker_mount_paths(s, mesh_plan.program_components.as_slice());
     let program_components = mesh_plan.program_components.as_slice();
-
     // Precompute service names (injective & stable).
     let names: HashMap<ComponentId, ServiceNames> =
         map_program_components(s, program_components, |id, local_name| {
@@ -345,15 +347,16 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         ROUTER_SERVICE_NAME,
         router_mesh_port,
     );
-    let mesh_config_plan = build_mesh_config_plan(
-        s,
-        &mesh_plan,
+    let mesh_config_plan = build_mesh_config_plan(MeshConfigBuildInput {
+        scenario: s,
+        mesh_plan: &mesh_plan,
         root_manifest,
-        &slot_ports_by_component,
-        &mesh_ports_by_component,
+        slot_ports_by_component: &slot_ports_by_component,
+        mesh_ports_by_component: &mesh_ports_by_component,
         router_ports,
-        &mesh_addressing,
-    )
+        addressing: &mesh_addressing,
+        options: default_mesh_config_build_options(),
+    })
     .map_err(|err| DockerComposeError::Other(err.to_string()))?;
     let router_metadata = if needs_router {
         Some(RouterMetadata {
@@ -410,6 +413,10 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
     let config_plan = build_config_plan(
         s,
         program_components,
+        ProgramSupport::ImageOnly {
+            backend_label: "docker-compose output",
+        },
+        crate::targets::program_config::RuntimeAddressResolution::Static,
         &address_plan.slot_values_by_component,
         &address_plan.binding_values_by_component,
     )
@@ -648,7 +655,13 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         let image = if Some(*id) == docker_gateway_component {
             images.docker_gateway.clone()
         } else {
-            render_compose_image(program_plan.image(), &root_leaf_by_path)
+            let image_plan = program_plan.image().ok_or_else(|| {
+                DockerComposeError::Other(format!(
+                    "internal error: {} is missing a container image plan",
+                    component_label(s, *id)
+                ))
+            })?;
+            render_compose_image(image_plan, &root_leaf_by_path)
                 .map_err(DockerComposeError::Other)?
         };
         let mut program_service = Service::new(image);
@@ -693,7 +706,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         program_service.depends_on = build_depends_on(any_helper, deps);
 
         match runtime_plan.execution {
-            ComponentExecutionPlan::Direct { entrypoint, env } => {
+            ComponentExecutionPlan::Resolved { entrypoint, env } => {
                 // Use entrypoint so image entrypoints are ignored.
                 let entrypoint = entrypoint
                     .iter()
@@ -711,8 +724,8 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 }
             }
             ComponentExecutionPlan::HelperRunner {
-                direct_entrypoint_b64,
-                direct_env_b64,
+                entrypoint_b64,
+                env_b64,
                 template_spec_b64,
                 runtime_config,
                 mount_spec_b64,
@@ -720,11 +733,11 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
                 configure_helper_runner_service(&mut program_service);
 
                 let mut env_entries = Vec::new();
-                if let Some(entrypoint_b64) = direct_entrypoint_b64 {
-                    env_entries.push(format!("AMBER_DIRECT_ENTRYPOINT_B64={entrypoint_b64}"));
+                if let Some(entrypoint_b64) = entrypoint_b64 {
+                    env_entries.push(format!("AMBER_RESOLVED_ENTRYPOINT_B64={entrypoint_b64}"));
                 }
-                if let Some(env_b64) = direct_env_b64 {
-                    env_entries.push(format!("AMBER_DIRECT_ENV_B64={env_b64}"));
+                if let Some(env_b64) = env_b64 {
+                    env_entries.push(format!("AMBER_RESOLVED_ENV_B64={env_b64}"));
                 }
                 if let Some(runtime_config) = runtime_config {
                     // Security: only expose root config leaves needed for used component paths.
@@ -1019,7 +1032,7 @@ fn collect_framework_docker_mount_paths(
             continue;
         };
         let paths: Vec<String> = program
-            .mounts
+            .mounts()
             .iter()
             .filter_map(|mount| match &mount.source {
                 MountSource::Framework(name) if name.as_str() == "docker" => {

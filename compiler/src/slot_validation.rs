@@ -3,8 +3,8 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use amber_manifest::{
-    InterpolatedPart, InterpolatedString, InterpolationSource, Manifest, ManifestSpans, SlotDecl,
-    SlotName, span_for_json_pointer,
+    InterpolatedPart, InterpolatedString, InterpolationSource, Manifest, ManifestSpans, Program,
+    SlotDecl, SlotName, span_for_json_pointer,
 };
 use jsonptr::PointerBuf;
 use miette::{Diagnostic, NamedSource, Report, SourceSpan};
@@ -95,19 +95,37 @@ fn validate_manifest_slot_interpolations(
         src_name,
     };
 
-    if let Ok(image) = program.image.parse::<InterpolatedString>() {
-        let location = SlotLocation::Image;
-        let span = location.span(source.as_ref(), spans);
-        validate_interpolated_string(&image, &ctx, location, span, &mut diagnostics);
+    match program {
+        Program::Image(program) => {
+            if let Ok(image) = program.image.parse::<InterpolatedString>() {
+                let location = SlotLocation::Image;
+                let span = location.span(source.as_ref(), spans);
+                validate_interpolated_string(&image, &ctx, location, span, &mut diagnostics);
+            }
+
+            for (idx, arg) in program.entrypoint.0.iter().enumerate() {
+                let location = SlotLocation::Entrypoint(idx);
+                let span = location.span(source.as_ref(), spans);
+                validate_interpolated_string(arg, &ctx, location, span, &mut diagnostics);
+            }
+        }
+        Program::Path(program) => {
+            if let Ok(path) = program.path.parse::<InterpolatedString>() {
+                let location = SlotLocation::Path;
+                let span = location.span(source.as_ref(), spans);
+                validate_interpolated_string(&path, &ctx, location, span, &mut diagnostics);
+            }
+
+            for (idx, arg) in program.args.0.iter().enumerate() {
+                let location = SlotLocation::Args(idx);
+                let span = location.span(source.as_ref(), spans);
+                validate_interpolated_string(arg, &ctx, location, span, &mut diagnostics);
+            }
+        }
+        _ => {}
     }
 
-    for (idx, arg) in program.entrypoint.0.iter().enumerate() {
-        let location = SlotLocation::Entrypoint(idx);
-        let span = location.span(source.as_ref(), spans);
-        validate_interpolated_string(arg, &ctx, location, span, &mut diagnostics);
-    }
-
-    for (key, value) in &program.env {
+    for (key, value) in program.env() {
         let location = SlotLocation::Env(key.as_str());
         let span = location.span(source.as_ref(), spans);
         validate_interpolated_string(value, &ctx, location, span, &mut diagnostics);
@@ -119,7 +137,9 @@ fn validate_manifest_slot_interpolations(
 #[derive(Clone, Copy, Debug)]
 enum SlotLocation<'a> {
     Image,
+    Path,
     Entrypoint(usize),
+    Args(usize),
     Env(&'a str),
 }
 
@@ -127,7 +147,9 @@ impl SlotLocation<'_> {
     fn label(self) -> String {
         match self {
             SlotLocation::Image => "program.image".to_string(),
+            SlotLocation::Path => "program.path".to_string(),
             SlotLocation::Entrypoint(idx) => format!("program.entrypoint[{idx}]"),
+            SlotLocation::Args(idx) => format!("program.args[{idx}]"),
             SlotLocation::Env(key) => format!("program.env.{key}"),
         }
     }
@@ -138,12 +160,29 @@ impl SlotLocation<'_> {
             SlotLocation::Image => span_for_json_pointer(source, root, "/program/image")
                 .or_else(|| spans.program.as_ref().map(|p| p.whole))
                 .unwrap_or_else(|| (0usize, 0usize).into()),
+            SlotLocation::Path => span_for_json_pointer(source, root, "/program/path")
+                .or_else(|| spans.program.as_ref().map(|p| p.whole))
+                .unwrap_or_else(|| (0usize, 0usize).into()),
             SlotLocation::Entrypoint(idx) => {
                 let pointer = format!("/program/entrypoint/{idx}");
                 if let Some(span) = span_for_json_pointer(source, root, &pointer) {
                     return span;
                 }
                 if let Some(span) = span_for_json_pointer(source, root, "/program/entrypoint") {
+                    return span;
+                }
+                spans
+                    .program
+                    .as_ref()
+                    .map(|p| p.whole)
+                    .unwrap_or_else(|| (0usize, 0usize).into())
+            }
+            SlotLocation::Args(idx) => {
+                let pointer = format!("/program/args/{idx}");
+                if let Some(span) = span_for_json_pointer(source, root, &pointer) {
+                    return span;
+                }
+                if let Some(span) = span_for_json_pointer(source, root, "/program/args") {
                     return span;
                 }
                 spans

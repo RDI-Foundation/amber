@@ -1,10 +1,13 @@
-use amber_template::{ConfigTemplate, ConfigTemplatePayload, TemplatePart, TemplateString};
+use amber_template::{
+    ConfigTemplate, ConfigTemplatePayload, RuntimeTemplateContext, TemplatePart, TemplateString,
+};
 use serde_json::Value;
 
 use crate::{ConfigError, Result};
 
 pub fn template_string_is_runtime(ts: &TemplateString) -> bool {
-    ts.iter().any(|p| p.is_config() || p.is_binding())
+    ts.iter()
+        .any(|p| p.is_config() || p.is_slot() || p.is_binding())
 }
 
 pub fn stringify_for_interpolation(v: &Value) -> Result<String> {
@@ -64,31 +67,49 @@ pub fn eval_config_template(
     template: &ConfigTemplatePayload,
     root_config: &Value,
 ) -> Result<Value> {
+    eval_config_template_with_context(template, root_config, &RuntimeTemplateContext::default())
+}
+
+pub fn eval_config_template_with_context(
+    template: &ConfigTemplatePayload,
+    root_config: &Value,
+    runtime_context: &RuntimeTemplateContext,
+) -> Result<Value> {
     match template {
         ConfigTemplatePayload::Root => Ok(root_config.clone()),
-        ConfigTemplatePayload::Template(node) => eval_config_node(node, root_config),
+        ConfigTemplatePayload::Template(node) => {
+            eval_config_node(node, root_config, runtime_context)
+        }
     }
 }
 
-fn eval_config_node(node: &ConfigTemplate, root_config: &Value) -> Result<Value> {
+fn eval_config_node(
+    node: &ConfigTemplate,
+    root_config: &Value,
+    runtime_context: &RuntimeTemplateContext,
+) -> Result<Value> {
     match node {
         ConfigTemplate::Literal(value) => Ok(value.clone()),
         ConfigTemplate::ConfigRef { path } => Ok(get_by_path(root_config, path)?.clone()),
         ConfigTemplate::TemplateString { parts } => {
-            let rendered = render_template_string(parts, root_config)?;
+            let rendered =
+                render_template_string_with_context(parts, root_config, runtime_context)?;
             Ok(Value::String(rendered))
         }
         ConfigTemplate::Array(arr) => {
             let mut out = Vec::with_capacity(arr.len());
             for item in arr {
-                out.push(eval_config_node(item, root_config)?);
+                out.push(eval_config_node(item, root_config, runtime_context)?);
             }
             Ok(Value::Array(out))
         }
         ConfigTemplate::Object(map) => {
             let mut out = serde_json::Map::new();
             for (k, v) in map {
-                out.insert(k.clone(), eval_config_node(v, root_config)?);
+                out.insert(
+                    k.clone(),
+                    eval_config_node(v, root_config, runtime_context)?,
+                );
             }
             Ok(Value::Object(out))
         }
@@ -96,6 +117,14 @@ fn eval_config_node(node: &ConfigTemplate, root_config: &Value) -> Result<Value>
 }
 
 pub fn render_template_string(parts: &TemplateString, config: &Value) -> Result<String> {
+    render_template_string_with_context(parts, config, &RuntimeTemplateContext::default())
+}
+
+pub fn render_template_string_with_context(
+    parts: &TemplateString,
+    config: &Value,
+    runtime_context: &RuntimeTemplateContext,
+) -> Result<String> {
     let mut out = String::new();
     for p in parts {
         match p {
@@ -109,10 +138,31 @@ pub fn render_template_string(parts: &TemplateString, config: &Value) -> Result<
                 }
                 out.push_str(&stringify_for_interpolation(v)?);
             }
-            TemplatePart::Binding { binding, .. } => {
-                return Err(ConfigError::interp(format!(
-                    "binding interpolation bindings.{binding} cannot be rendered at runtime"
-                )));
+            TemplatePart::Slot { slot, scope } => {
+                let value = runtime_context
+                    .slots_by_scope
+                    .get(scope)
+                    .and_then(|slots| slots.get(slot))
+                    .ok_or_else(|| {
+                        ConfigError::interp(format!(
+                            "slot interpolation slots.{slot} cannot be rendered at runtime for \
+                             scope {scope}"
+                        ))
+                    })?;
+                out.push_str(value);
+            }
+            TemplatePart::Binding { binding, scope } => {
+                let value = runtime_context
+                    .bindings_by_scope
+                    .get(scope)
+                    .and_then(|bindings| bindings.get(binding))
+                    .ok_or_else(|| {
+                        ConfigError::interp(format!(
+                            "binding interpolation bindings.{binding} cannot be rendered at \
+                             runtime for scope {scope}"
+                        ))
+                    })?;
+                out.push_str(value);
             }
         }
     }

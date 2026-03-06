@@ -17,7 +17,7 @@ pub(crate) fn allocate_slot_ports(
         let program = component.program.as_ref().unwrap();
 
         let mut reserved: HashSet<u16> = HashSet::new();
-        if let Some(net) = program.network.as_ref() {
+        if let Some(net) = program.network() {
             for ep in &net.endpoints {
                 reserved.insert(ep.port);
             }
@@ -63,7 +63,7 @@ pub(crate) fn allocate_mesh_ports(
         let program = component.program.as_ref().unwrap();
 
         let mut reserved: HashSet<u16> = HashSet::new();
-        if let Some(net) = program.network.as_ref() {
+        if let Some(net) = program.network() {
             for ep in &net.endpoints {
                 reserved.insert(ep.port);
             }

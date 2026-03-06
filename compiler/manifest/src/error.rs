@@ -69,6 +69,10 @@ pub enum Error {
     #[diagnostic(code(manifest::empty_entrypoint))]
     EmptyEntrypoint,
 
+    #[error("program.path must be non-empty")]
+    #[diagnostic(code(manifest::empty_program_path))]
+    EmptyProgramPath,
+
     #[error("export `{export}` references unknown capability `{target}`")]
     #[diagnostic(code(manifest::unknown_export_target))]
     UnknownExportTarget { export: String, target: String },

@@ -60,6 +60,90 @@ jobs:
       - uses: mozilla-actions/sccache-action@v0.0.9
       - run: cargo test --workspace --all-features
 
+  direct-tests:
+    name: Direct Smoke Tests
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Relax AppArmor user namespace restrictions when present
+        run: |
+          set -euo pipefail
+
+          # Ubuntu 24.04 enables AppArmor restrictions for unprivileged user
+          # namespaces. Bubblewrap relies on those namespaces on the hosted
+          # runner, so disable the restriction in this ephemeral CI VM.
+          if sysctl kernel.apparmor_restrict_unprivileged_unconfined >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0
+          fi
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Ensure bubblewrap is available and usable
+        run: |
+          set -euo pipefail
+          probe_bwrap() {
+            bwrap \
+              --die-with-parent \
+              --new-session \
+              --unshare-pid \
+              --unshare-ipc \
+              --unshare-net \
+              --unshare-uts \
+              --ro-bind / / \
+              --proc /proc \
+              --dev /dev \
+              --tmpfs /tmp \
+              --tmpfs /run \
+              -- /usr/bin/true >/dev/null 2>&1
+          }
+          probe_bwrap_verbose() {
+            bwrap \
+              --die-with-parent \
+              --new-session \
+              --unshare-pid \
+              --unshare-ipc \
+              --unshare-net \
+              --unshare-uts \
+              --ro-bind / / \
+              --proc /proc \
+              --dev /dev \
+              --tmpfs /tmp \
+              --tmpfs /run \
+              -- /usr/bin/true
+          }
+
+          if ! command -v bwrap >/dev/null 2>&1 || ! probe_bwrap; then
+            sudo apt-get update
+            sudo apt-get install -y --reinstall bubblewrap
+          fi
+
+          if ! probe_bwrap; then
+            echo "bubblewrap is installed but unusable on this runner" >&2
+            bwrap --version || true
+            ls -l "$(command -v bwrap)" || true
+            sysctl kernel.apparmor_restrict_unprivileged_unconfined || true
+            sysctl kernel.apparmor_restrict_unprivileged_userns || true
+            probe_bwrap_verbose || true
+            exit 1
+          fi
+      - name: Ensure slirp4netns is available
+        run: |
+          set -euo pipefail
+
+          if ! command -v slirp4netns >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y slirp4netns
+          fi
+
+          slirp4netns --version
+      - name: Run direct smoke test
+        run: cargo test -p amber-cli --all-features direct_smoke_ -- --ignored --test-threads=1
+
   kubernetes-tests:
     name: Kubernetes Reporter Tests
     runs-on: ubuntu-latest

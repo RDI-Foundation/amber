@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use amber_manifest::{
     CapabilityDecl, CapabilityKind, ComponentDecl, Endpoint, Error, InterpolatedString, Manifest,
-    ManifestRef, ManifestUrl, Network, Program, ProgramEntrypoint, ProvideDecl,
+    ManifestRef, ManifestUrl, Network, Program, ProgramCommon, ProgramEntrypoint, ProgramImage,
+    ProvideDecl,
 };
 use bon::{map, set};
 use semver::Version;
@@ -10,17 +11,23 @@ use serde_json::json;
 
 #[test]
 fn manifest_builder_constructs_a_valid_manifest() {
-    let program = Program::builder()
-        .image("example:latest")
-        .entrypoint(ProgramEntrypoint(vec![
-            "/bin/true".parse::<InterpolatedString>().unwrap(),
-        ]))
-        .network(
-            Network::builder()
-                .endpoints(set![Endpoint::builder().name("api").port(80).build()])
-                .build(),
-        )
-        .build();
+    let program = Program::image(
+        ProgramImage::builder()
+            .image("example:latest")
+            .entrypoint(ProgramEntrypoint(vec![
+                "/bin/true".parse::<InterpolatedString>().unwrap(),
+            ]))
+            .common(
+                ProgramCommon::builder()
+                    .network(
+                        Network::builder()
+                            .endpoints(set![Endpoint::builder().name("api").port(80).build()])
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build(),
+    );
 
     let provides = map! {
         "http": ProvideDecl::builder()

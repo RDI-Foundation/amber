@@ -1,5 +1,8 @@
-// Mesh config planning: resolve program templates/mounts and compute per-component scope.
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+// Shared backend config planning: resolve program templates/mounts and compute per-component scope.
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    path::Path,
+};
 
 use amber_config as rc;
 use amber_manifest::{InterpolatedPart, InterpolationSource, MountSource, framework_capability};
@@ -14,7 +17,7 @@ use crate::{
     config_scope::{RuntimeConfigView, build_runtime_config_view},
     config_templates,
     slot_query::{SlotObject, resolve_slot_query},
-    targets::mesh::plan::{MeshError, component_label},
+    targets::common::{TargetError as MeshError, component_label},
 };
 
 #[derive(Clone, Debug)]
@@ -22,6 +25,7 @@ pub(crate) struct ConfigPlan {
     pub(crate) root_leaves: Vec<rc::SchemaLeaf>,
     pub(crate) program_plans: HashMap<ComponentId, ProgramPlan>,
     pub(crate) mount_specs: HashMap<ComponentId, Vec<MountSpec>>,
+    pub(crate) binding_values_by_scope: HashMap<u64, BTreeMap<String, BindingObject>>,
     pub(crate) needs_helper: bool,
     pub(crate) needs_runtime_config: bool,
     pub(crate) runtime_views: HashMap<ComponentId, RuntimeConfigView>,
@@ -45,6 +49,18 @@ pub(crate) enum ProgramImageOrigin {
     ComponentConfigPath(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProgramSupport {
+    ImageOnly { backend_label: &'static str },
+    PathOnly { backend_label: &'static str },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeAddressResolution {
+    Static,
+    Deferred,
+}
+
 impl ProgramImagePlan {
     pub(crate) fn collect_runtime_root_paths(&self, out: &mut BTreeSet<String>) {
         let Self::RuntimeTemplate(parts) = self else {
@@ -60,37 +76,69 @@ impl ProgramImagePlan {
 
 #[derive(Clone, Debug)]
 pub(crate) enum ProgramPlan {
-    Direct {
-        image: ProgramImagePlan,
-        image_origin: ProgramImageOrigin,
+    Resolved {
+        source: ProgramSourcePlan,
         entrypoint: Vec<String>,
         env: BTreeMap<String, String>,
     },
     Helper {
-        image: ProgramImagePlan,
-        image_origin: ProgramImageOrigin,
+        source: ProgramSourcePlan,
         template_spec: TemplateSpec,
+        needs_runtime_config: bool,
     },
 }
 
 impl ProgramPlan {
-    pub(crate) fn image(&self) -> &ProgramImagePlan {
+    pub(crate) fn image(&self) -> Option<&ProgramImagePlan> {
         match self {
-            Self::Direct { image, .. } => image,
-            Self::Helper { image, .. } => image,
+            Self::Resolved {
+                source: ProgramSourcePlan::Image { image, .. },
+                ..
+            }
+            | Self::Helper {
+                source: ProgramSourcePlan::Image { image, .. },
+                ..
+            } => Some(image),
+            Self::Resolved { .. } | Self::Helper { .. } => None,
         }
     }
 
-    pub(crate) fn image_origin(&self) -> &ProgramImageOrigin {
+    pub(crate) fn image_origin(&self) -> Option<&ProgramImageOrigin> {
         match self {
-            Self::Direct { image_origin, .. } => image_origin,
-            Self::Helper { image_origin, .. } => image_origin,
+            Self::Resolved {
+                source: ProgramSourcePlan::Image { image_origin, .. },
+                ..
+            }
+            | Self::Helper {
+                source: ProgramSourcePlan::Image { image_origin, .. },
+                ..
+            } => Some(image_origin),
+            Self::Resolved { .. } | Self::Helper { .. } => None,
         }
     }
 
     pub(crate) fn is_helper(&self) -> bool {
         matches!(self, Self::Helper { .. })
     }
+
+    pub(crate) fn needs_runtime_config(&self) -> bool {
+        match self {
+            Self::Resolved { .. } => false,
+            Self::Helper {
+                needs_runtime_config,
+                ..
+            } => *needs_runtime_config,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ProgramSourcePlan {
+    Image {
+        image: ProgramImagePlan,
+        image_origin: ProgramImageOrigin,
+    },
+    Path,
 }
 
 #[derive(Clone, Debug)]
@@ -103,13 +151,13 @@ pub(crate) struct RuntimeConfigPayload<'a> {
 
 #[derive(Clone, Debug)]
 pub(crate) enum ComponentExecutionPlan<'a> {
-    Direct {
+    Resolved {
         entrypoint: &'a [String],
         env: &'a BTreeMap<String, String>,
     },
     HelperRunner {
-        direct_entrypoint_b64: Option<String>,
-        direct_env_b64: Option<String>,
+        entrypoint_b64: Option<String>,
+        env_b64: Option<String>,
         template_spec_b64: Option<String>,
         runtime_config: Option<RuntimeConfigPayload<'a>>,
         mount_spec_b64: Option<String>,
@@ -132,6 +180,8 @@ pub(crate) enum MountSpec {
 pub(crate) fn build_config_plan(
     scenario: &Scenario,
     program_components: &[ComponentId],
+    program_support: ProgramSupport,
+    runtime_address_resolution: RuntimeAddressResolution,
     slot_values_by_component: &HashMap<ComponentId, BTreeMap<String, SlotObject>>,
     binding_values_by_component: &HashMap<ComponentId, BTreeMap<String, BindingObject>>,
 ) -> Result<ConfigPlan, MeshError> {
@@ -164,12 +214,19 @@ pub(crate) fn build_config_plan(
         slot_values_by_component,
         &required_bindings_by_scope,
     )?;
-    let resolved_templates = resolve_binding_templates(
-        composed.templates,
-        &binding_urls_by_scope,
-        &used_config_paths_by_component,
-        scenario,
-    )?;
+    let resolved_templates = if matches!(
+        runtime_address_resolution,
+        RuntimeAddressResolution::Deferred
+    ) {
+        composed.templates
+    } else {
+        resolve_binding_templates(
+            composed.templates,
+            &binding_urls_by_scope,
+            &used_config_paths_by_component,
+            scenario,
+        )?
+    };
 
     let root_schema = scenario
         .component(scenario.root)
@@ -224,6 +281,8 @@ pub(crate) fn build_config_plan(
             scenario,
             *id,
             program,
+            program_support,
+            runtime_address_resolution,
             slots,
             bindings,
             template_opt,
@@ -231,21 +290,25 @@ pub(crate) fn build_config_plan(
         )?;
         if matches!(plan, ProgramPlan::Helper { .. }) {
             needs_helper = true;
+        }
+        if plan.needs_runtime_config() {
             needs_runtime_config = true;
         }
-        let mut runtime_paths = BTreeSet::new();
-        plan.image().collect_runtime_root_paths(&mut runtime_paths);
-        if !runtime_paths.is_empty() {
-            needs_runtime_config = true;
-        }
-        for path in runtime_paths {
-            if !root_leaf_paths.contains(path.as_str()) {
-                return Err(MeshError::new(format!(
-                    "program.image in {} requires runtime config path config.{path}, but runtime \
-                     image interpolation only supports paths that resolve to one concrete root \
-                     config value",
-                    component_label(scenario, *id)
-                )));
+        if let Some(image) = plan.image() {
+            let mut runtime_paths = BTreeSet::new();
+            image.collect_runtime_root_paths(&mut runtime_paths);
+            if !runtime_paths.is_empty() {
+                needs_runtime_config = true;
+            }
+            for path in runtime_paths {
+                if !root_leaf_paths.contains(path.as_str()) {
+                    return Err(MeshError::new(format!(
+                        "program.image in {} requires runtime config path config.{path}, but \
+                         runtime image interpolation only supports paths that resolve to one \
+                         concrete root config value",
+                        component_label(scenario, *id)
+                    )));
+                }
             }
         }
         program_plans.insert(*id, plan);
@@ -279,7 +342,7 @@ pub(crate) fn build_config_plan(
                 .get(id)
                 .expect("program plan should exist for program component");
             let mount_specs = mount_specs.get(id);
-            let needs_config_payload = matches!(program_plan, ProgramPlan::Helper { .. })
+            let needs_config_payload = program_plan.needs_runtime_config()
                 || mount_specs.is_some_and(|specs| mount_specs_need_config(specs));
             if !needs_config_payload {
                 continue;
@@ -313,6 +376,7 @@ pub(crate) fn build_config_plan(
         root_leaves,
         program_plans,
         mount_specs,
+        binding_values_by_scope: binding_urls_by_scope,
         needs_helper,
         needs_runtime_config,
         runtime_views,
@@ -360,7 +424,7 @@ pub(crate) fn build_component_runtime_plan<'a>(
     extra_helper_requirement: bool,
 ) -> Result<ComponentRuntimePlan<'a>, MeshError> {
     let needs_config_payload =
-        program_plan.is_helper() || mount_specs.is_some_and(mount_specs_need_config);
+        program_plan.needs_runtime_config() || mount_specs.is_some_and(mount_specs_need_config);
     let needs_helper =
         program_plan.is_helper() || mount_specs.is_some() || extra_helper_requirement;
 
@@ -408,16 +472,15 @@ pub(crate) fn build_component_runtime_plan<'a>(
     };
 
     let execution = match program_plan {
-        ProgramPlan::Direct {
+        ProgramPlan::Resolved {
             entrypoint, env, ..
-        } if !needs_helper => ComponentExecutionPlan::Direct { entrypoint, env },
-        ProgramPlan::Direct {
+        } if !needs_helper => ComponentExecutionPlan::Resolved { entrypoint, env },
+        ProgramPlan::Resolved {
             entrypoint, env, ..
         } => {
-            let direct_entrypoint_b64 =
+            let entrypoint_b64 =
                 Some(encode_json_b64(entrypoint).map_err(|e| MeshError::new(e.to_string()))?);
-            let direct_env_b64 =
-                Some(encode_json_b64(env).map_err(|e| MeshError::new(e.to_string()))?);
+            let env_b64 = Some(encode_json_b64(env).map_err(|e| MeshError::new(e.to_string()))?);
             let runtime_config = if needs_config_payload {
                 let view = runtime_view.expect("runtime config view should be computed");
                 let (component_schema_b64, component_cfg_template_b64) =
@@ -431,30 +494,38 @@ pub(crate) fn build_component_runtime_plan<'a>(
             };
 
             ComponentExecutionPlan::HelperRunner {
-                direct_entrypoint_b64,
-                direct_env_b64,
+                entrypoint_b64,
+                env_b64,
                 template_spec_b64: None,
                 runtime_config,
                 mount_spec_b64,
             }
         }
-        ProgramPlan::Helper { template_spec, .. } => {
-            let view = runtime_view.expect("runtime config view should be computed");
+        ProgramPlan::Helper {
+            template_spec,
+            needs_runtime_config,
+            ..
+        } => {
             let template_spec_b64 = encode_json_b64(template_spec).map_err(|e| {
                 MeshError::new(format!(
                     "failed to serialize template spec for {component_label}: {e}"
                 ))
             })?;
-            let (component_schema_b64, component_cfg_template_b64) =
-                encode_component_payload(&view.component_template, &view.component_schema)?;
-            let runtime_config = Some(build_runtime_payload(
-                component_schema_b64,
-                component_cfg_template_b64,
-            )?);
+            let runtime_config = if *needs_runtime_config {
+                let view = runtime_view.expect("runtime config view should be computed");
+                let (component_schema_b64, component_cfg_template_b64) =
+                    encode_component_payload(&view.component_template, &view.component_schema)?;
+                Some(build_runtime_payload(
+                    component_schema_b64,
+                    component_cfg_template_b64,
+                )?)
+            } else {
+                None
+            };
 
             ComponentExecutionPlan::HelperRunner {
-                direct_entrypoint_b64: None,
-                direct_env_b64: None,
+                entrypoint_b64: None,
+                env_b64: None,
                 template_spec_b64: Some(template_spec_b64),
                 runtime_config,
                 mount_spec_b64,
@@ -498,11 +569,11 @@ fn build_mount_specs(
             .program
             .as_ref()
             .expect("program component has program");
-        if program.mounts.is_empty() {
+        if program.mounts().is_empty() {
             continue;
         }
 
-        let has_config_or_secret_mount = program.mounts.iter().any(|mount| {
+        let has_config_or_secret_mount = program.mounts().iter().any(|mount| {
             matches!(
                 mount.source,
                 MountSource::Config(_) | MountSource::Secret(_)
@@ -529,7 +600,7 @@ fn build_mount_specs(
         };
 
         let mut specs = Vec::new();
-        for mount in &program.mounts {
+        for mount in program.mounts() {
             let query = match &mount.source {
                 MountSource::Config(path) | MountSource::Secret(path) => path,
                 MountSource::Framework(name) => {
@@ -652,16 +723,18 @@ fn collect_required_bindings_by_scope(
 fn program_used_config_paths(program: &amber_manifest::Program) -> BTreeSet<String> {
     let mut used = BTreeSet::new();
 
-    if let Ok(image) = program.image.parse::<amber_manifest::InterpolatedString>() {
-        collect_program_config_paths(&image.parts, &mut used);
+    if let Some(executable) = program.path_ref().or_else(|| program.image_ref())
+        && let Ok(parsed) = executable.parse::<amber_manifest::InterpolatedString>()
+    {
+        collect_program_config_paths(&parsed.parts, &mut used);
     }
-    for arg in &program.entrypoint.0 {
+    for arg in &program.command().0 {
         collect_program_config_paths(&arg.parts, &mut used);
     }
-    for value in program.env.values() {
+    for value in program.env().values() {
         collect_program_config_paths(&value.parts, &mut used);
     }
-    for mount in &program.mounts {
+    for mount in program.mounts() {
         match &mount.source {
             MountSource::Config(path) | MountSource::Secret(path) => {
                 used.insert(path.clone());
@@ -866,6 +939,12 @@ fn resolve_binding_parts_in_config(
                 match part {
                     TemplatePart::Lit { lit } => out.push(TemplatePart::lit(lit)),
                     TemplatePart::Config { config } => out.push(TemplatePart::config(config)),
+                    TemplatePart::Slot { slot, .. } => {
+                        return Err(MeshError::new(format!(
+                            "internal error: unexpected runtime slot interpolation slots.{slot} \
+                             in config template"
+                        )));
+                    }
                     TemplatePart::Binding { binding, scope } => {
                         let bindings = bindings_by_scope.get(scope).ok_or_else(|| {
                             MeshError::new(format!("bindings scope {scope} is missing"))
@@ -1033,6 +1112,12 @@ fn resolve_program_image_runtime_node(
                         }
                         out.push(ProgramImagePart::RootConfigPath(config.clone()));
                     }
+                    TemplatePart::Slot { slot, .. } => {
+                        return Err(MeshError::new(format!(
+                            "failed to resolve runtime image template: unresolved slots.{slot} \
+                             interpolation"
+                        )));
+                    }
                     TemplatePart::Binding { binding, .. } => {
                         return Err(MeshError::new(format!(
                             "failed to resolve runtime image template: unresolved \
@@ -1125,10 +1210,24 @@ fn render_template_string_static(ts: &TemplateString) -> Result<String, MeshErro
         match part {
             TemplatePart::Lit { lit } => out.push_str(lit),
             TemplatePart::Config { .. } => unreachable!(),
+            TemplatePart::Slot { .. } => unreachable!(),
             TemplatePart::Binding { .. } => unreachable!(),
         }
     }
     Ok(out)
+}
+
+fn validate_explicit_program_path(component: &str, path: &str) -> Result<(), MeshError> {
+    let has_separator = path.contains('/') || path.contains('\\');
+    if Path::new(path).is_absolute() || has_separator {
+        return Ok(());
+    }
+
+    Err(MeshError::new(format!(
+        "component {component} uses program.path `{path}` without a path separator; direct \
+         execution does not search PATH, so use an absolute path or a manifest-relative path like \
+         `./bin/server`"
+    )))
 }
 
 fn push_image_literal(parts: &mut Vec<ProgramImagePart>, lit: impl Into<String>) {
@@ -1189,10 +1288,12 @@ fn resolve_program_template_string(
     id: ComponentId,
     location: &str,
     value: &amber_manifest::InterpolatedString,
+    runtime_address_resolution: RuntimeAddressResolution,
     slots: &BTreeMap<String, SlotObject>,
     bindings: &BTreeMap<String, BindingObject>,
     template_opt: Option<&rc::ConfigNode>,
     needs_helper_for_program_templates: &mut bool,
+    needs_runtime_config_for_program_templates: &mut bool,
     require_non_empty: bool,
 ) -> Result<TemplateString, MeshError> {
     let component = component_label(scenario, id);
@@ -1201,6 +1302,29 @@ fn resolve_program_template_string(
         match part {
             InterpolatedPart::Literal(lit) => ts.push(TemplatePart::lit(lit)),
             InterpolatedPart::Interpolation { source, query } => {
+                match source {
+                    InterpolationSource::Slots
+                        if matches!(
+                            runtime_address_resolution,
+                            RuntimeAddressResolution::Deferred
+                        ) =>
+                    {
+                        ts.push(TemplatePart::slot(id.0 as u64, query.clone()));
+                        *needs_helper_for_program_templates = true;
+                        continue;
+                    }
+                    InterpolationSource::Bindings
+                        if matches!(
+                            runtime_address_resolution,
+                            RuntimeAddressResolution::Deferred
+                        ) =>
+                    {
+                        ts.push(TemplatePart::binding(id.0 as u64, query.clone()));
+                        *needs_helper_for_program_templates = true;
+                        continue;
+                    }
+                    _ => {}
+                }
                 if let Some(value) = resolve_slot_or_binding_interpolation(
                     scenario, id, location, source, query, slots, bindings,
                 )? {
@@ -1212,6 +1336,7 @@ fn resolve_program_template_string(
                     ConfigResolution::Runtime => {
                         ts.push(TemplatePart::config(query.clone()));
                         *needs_helper_for_program_templates = true;
+                        *needs_runtime_config_for_program_templates = true;
                     }
                 }
             }
@@ -1235,6 +1360,8 @@ fn build_program_plan(
     scenario: &Scenario,
     id: ComponentId,
     program: &amber_manifest::Program,
+    program_support: ProgramSupport,
+    runtime_address_resolution: RuntimeAddressResolution,
     slots: &BTreeMap<String, SlotObject>,
     bindings: &BTreeMap<String, BindingObject>,
     template_opt: Option<&rc::ConfigNode>,
@@ -1242,124 +1369,214 @@ fn build_program_plan(
 ) -> Result<ProgramPlan, MeshError> {
     let component = component_label(scenario, id);
     let mut entrypoint_ts: Vec<TemplateString> = Vec::new();
-    // Helper mode is required only for runtime config interpolation in
-    // program.entrypoint/program.env (not for program.image runtime interpolation).
     let mut needs_helper_for_program_templates = false;
-    let mut image_parts: Vec<ProgramImagePart> = Vec::new();
-    let image = program
-        .image
-        .parse::<amber_manifest::InterpolatedString>()
-        .map_err(|err| {
-            MeshError::new(format!(
-                "failed to parse program.image interpolation in {component}: {err}",
-            ))
-        })?;
-    // If program.image is exactly one `${config...}` interpolation, image diagnostics should
-    // point at the corresponding component config path; otherwise they should point at
-    // program.image itself.
-    let image_origin = match image.parts.as_slice() {
-        [
-            InterpolatedPart::Interpolation {
-                source: InterpolationSource::Config,
-                query,
-            },
-        ] => ProgramImageOrigin::ComponentConfigPath(query.clone()),
-        _ => ProgramImageOrigin::ProgramImage,
-    };
-
-    for part in &image.parts {
-        match part {
-            InterpolatedPart::Literal(lit) => push_image_literal(&mut image_parts, lit.clone()),
-            InterpolatedPart::Interpolation { source, query } => {
-                if let Some(value) = resolve_slot_or_binding_interpolation(
-                    scenario,
-                    id,
-                    "program.image",
-                    source,
-                    query,
-                    slots,
-                    bindings,
-                )? {
-                    push_image_literal(&mut image_parts, value);
-                    continue;
-                }
-                match resolve_config_query_for_program_image(template_opt, query)? {
-                    ImageConfigResolution::Static(value) => {
-                        push_image_literal(&mut image_parts, value);
-                    }
-                    ImageConfigResolution::RuntimeTemplate(parts) => {
-                        extend_image_parts(&mut image_parts, parts);
-                    }
-                }
-            }
-            _ => {
+    let mut needs_runtime_config_for_program_templates = false;
+    let (source, program_env) = match program {
+        amber_manifest::Program::Image(program) => {
+            if let ProgramSupport::PathOnly { backend_label } = program_support {
                 return Err(MeshError::new(format!(
-                    "unsupported interpolation part in {component} program.image",
+                    "component {} uses `program.image`, but {backend_label} only supports \
+                     `program.path`",
+                    component_label(scenario, id)
                 )));
             }
-        }
-    }
-    if image_parts.is_empty() {
-        return Err(MeshError::new(format!(
-            "internal error: produced empty image template for {component} program.image",
-        )));
-    }
-    let image = if image_parts
-        .iter()
-        .any(|part| matches!(part, ProgramImagePart::RootConfigPath(_)))
-    {
-        ProgramImagePlan::RuntimeTemplate(image_parts)
-    } else {
-        let mut rendered = String::new();
-        for part in image_parts {
-            let ProgramImagePart::Literal(lit) = part else {
-                unreachable!("runtime root config path was handled above");
+            let mut image_parts: Vec<ProgramImagePart> = Vec::new();
+            let image = program
+                .image
+                .parse::<amber_manifest::InterpolatedString>()
+                .map_err(|err| {
+                    MeshError::new(format!(
+                        "failed to parse program.image interpolation in {component}: {err}",
+                    ))
+                })?;
+            // If program.image is exactly one `${config...}` interpolation, image diagnostics should
+            // point at the corresponding component config path; otherwise they should point at
+            // program.image itself.
+            let image_origin = match image.parts.as_slice() {
+                [
+                    InterpolatedPart::Interpolation {
+                        source: InterpolationSource::Config,
+                        query,
+                    },
+                ] => ProgramImageOrigin::ComponentConfigPath(query.clone()),
+                _ => ProgramImageOrigin::ProgramImage,
             };
-            rendered.push_str(&lit);
+
+            for part in &image.parts {
+                match part {
+                    InterpolatedPart::Literal(lit) => {
+                        push_image_literal(&mut image_parts, lit.clone())
+                    }
+                    InterpolatedPart::Interpolation { source, query } => {
+                        if let Some(value) = resolve_slot_or_binding_interpolation(
+                            scenario,
+                            id,
+                            "program.image",
+                            source,
+                            query,
+                            slots,
+                            bindings,
+                        )? {
+                            push_image_literal(&mut image_parts, value);
+                            continue;
+                        }
+                        match resolve_config_query_for_program_image(template_opt, query)? {
+                            ImageConfigResolution::Static(value) => {
+                                push_image_literal(&mut image_parts, value);
+                            }
+                            ImageConfigResolution::RuntimeTemplate(parts) => {
+                                extend_image_parts(&mut image_parts, parts);
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(MeshError::new(format!(
+                            "unsupported interpolation part in {component} program.image",
+                        )));
+                    }
+                }
+            }
+            if image_parts.is_empty() {
+                return Err(MeshError::new(format!(
+                    "internal error: produced empty image template for {component} program.image",
+                )));
+            }
+            let image = if image_parts
+                .iter()
+                .any(|part| matches!(part, ProgramImagePart::RootConfigPath(_)))
+            {
+                ProgramImagePlan::RuntimeTemplate(image_parts)
+            } else {
+                let mut rendered = String::new();
+                for part in image_parts {
+                    let ProgramImagePart::Literal(lit) = part else {
+                        unreachable!("runtime root config path was handled above");
+                    };
+                    rendered.push_str(&lit);
+                }
+                ProgramImagePlan::Static(rendered)
+            };
+
+            for (idx, arg) in program.entrypoint.0.iter().enumerate() {
+                let location = format!("program.entrypoint[{idx}]");
+                let ts = resolve_program_template_string(
+                    scenario,
+                    id,
+                    &location,
+                    arg,
+                    runtime_address_resolution,
+                    slots,
+                    bindings,
+                    template_opt,
+                    &mut needs_helper_for_program_templates,
+                    &mut needs_runtime_config_for_program_templates,
+                    true,
+                )?;
+                entrypoint_ts.push(ts);
+            }
+
+            (
+                ProgramSourcePlan::Image {
+                    image,
+                    image_origin,
+                },
+                &program.common.env,
+            )
         }
-        ProgramImagePlan::Static(rendered)
+        amber_manifest::Program::Path(program) => {
+            if let ProgramSupport::ImageOnly { backend_label } = program_support {
+                return Err(MeshError::new(format!(
+                    "component {} uses `program.path`, but {backend_label} only supports \
+                     `program.image`; use `amber compile --direct`",
+                    component_label(scenario, id)
+                )));
+            }
+            let path = program
+                .path
+                .parse::<amber_manifest::InterpolatedString>()
+                .map_err(|err| {
+                    MeshError::new(format!(
+                        "failed to parse program.path interpolation in {component}: {err}",
+                    ))
+                })?;
+            let path_ts = resolve_program_template_string(
+                scenario,
+                id,
+                "program.path",
+                &path,
+                runtime_address_resolution,
+                slots,
+                bindings,
+                template_opt,
+                &mut needs_helper_for_program_templates,
+                &mut needs_runtime_config_for_program_templates,
+                true,
+            )?;
+            if rc::template_string_is_runtime(&path_ts) {
+                return Err(MeshError::new(format!(
+                    "component {component} uses runtime interpolation in program.path, but direct \
+                     execution requires an explicit executable path"
+                )));
+            }
+            validate_explicit_program_path(&component, &render_template_string_static(&path_ts)?)?;
+            entrypoint_ts.push(path_ts);
+
+            for (idx, arg) in program.args.0.iter().enumerate() {
+                let location = format!("program.args[{idx}]");
+                let ts = resolve_program_template_string(
+                    scenario,
+                    id,
+                    &location,
+                    arg,
+                    runtime_address_resolution,
+                    slots,
+                    bindings,
+                    template_opt,
+                    &mut needs_helper_for_program_templates,
+                    &mut needs_runtime_config_for_program_templates,
+                    true,
+                )?;
+                entrypoint_ts.push(ts);
+            }
+
+            (ProgramSourcePlan::Path, &program.common.env)
+        }
+        _ => {
+            return Err(MeshError::new(format!(
+                "component {} uses an unsupported program variant",
+                component_label(scenario, id)
+            )));
+        }
     };
 
-    for (idx, arg) in program.entrypoint.0.iter().enumerate() {
-        let location = format!("program.entrypoint[{idx}]");
-        let ts = resolve_program_template_string(
-            scenario,
-            id,
-            &location,
-            arg,
-            slots,
-            bindings,
-            template_opt,
-            &mut needs_helper_for_program_templates,
-            true,
-        )?;
-        entrypoint_ts.push(ts);
-    }
-
     let mut env_ts: BTreeMap<String, TemplateString> = BTreeMap::new();
-    for (k, v) in &program.env {
+    for (k, v) in program_env {
         let location = format!("program.env.{k}");
         let ts = resolve_program_template_string(
             scenario,
             id,
             &location,
             v,
+            runtime_address_resolution,
             slots,
             bindings,
             template_opt,
             &mut needs_helper_for_program_templates,
+            &mut needs_runtime_config_for_program_templates,
             false,
         )?;
         env_ts.insert(k.clone(), ts);
     }
 
     if needs_helper_for_program_templates {
-        component_schema.ok_or_else(|| {
-            MeshError::new(format!(
-                "component {} requires config_schema when using runtime config interpolation",
-                component
-            ))
-        })?;
+        if needs_runtime_config_for_program_templates {
+            component_schema.ok_or_else(|| {
+                MeshError::new(format!(
+                    "component {} requires config_schema when using runtime config interpolation",
+                    component
+                ))
+            })?;
+        }
 
         let spec = TemplateSpec {
             program: ProgramTemplateSpec {
@@ -1369,9 +1586,9 @@ fn build_program_plan(
         };
 
         Ok(ProgramPlan::Helper {
-            image,
-            image_origin,
+            source,
             template_spec: spec,
+            needs_runtime_config: needs_runtime_config_for_program_templates,
         })
     } else {
         let rendered_entrypoint = entrypoint_ts
@@ -1383,9 +1600,8 @@ fn build_program_plan(
             .map(|(k, ts)| render_template_string_static(&ts).map(|rendered| (k, rendered)))
             .collect::<Result<BTreeMap<_, _>, _>>()?;
 
-        Ok(ProgramPlan::Direct {
-            image,
-            image_origin,
+        Ok(ProgramPlan::Resolved {
+            source,
             entrypoint: rendered_entrypoint,
             env: rendered_env,
         })

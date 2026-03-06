@@ -18,27 +18,29 @@ use serde::Serialize;
 use crate::{
     CompileOutput,
     reporter::{Reporter, ReporterError},
-    targets::mesh::{
-        addressing::{
-            DockerFrameworkBindingPolicy, LocalAddressing, LocalAddressingOptions, WorkloadId,
-            build_address_plan, build_allow_plan, build_component_egress_allow,
+    targets::{
+        mesh::{
+            addressing::{
+                DockerFrameworkBindingPolicy, LocalAddressing, LocalAddressingOptions, WorkloadId,
+                build_address_plan, build_allow_plan, build_component_egress_allow,
+            },
+            internal_images::resolve_internal_images,
+            mesh_config::{
+                MeshConfigBuildInput, MeshServiceName, RouterPorts, ServiceMeshAddressing,
+                build_mesh_config_plan, default_mesh_config_build_options, scenario_ir_digest,
+            },
+            plan::{MeshOptions, component_label, map_program_components},
+            ports::{allocate_mesh_ports, allocate_slot_ports},
+            provision::build_mesh_provision_plan,
+            proxy_metadata::{
+                DEFAULT_EXTERNAL_ENV_FILE, ExportMetadata, ExternalSlotMetadata,
+                PROXY_METADATA_FILENAME, PROXY_METADATA_VERSION, ProxyMetadata, RouterMetadata,
+                collect_exports_metadata, collect_external_slot_metadata,
+            },
         },
-        config::{
+        program_config::{
             ComponentExecutionPlan, ProgramImageOrigin, ProgramImagePart, ProgramImagePlan,
-            build_component_runtime_plan, build_config_plan,
-        },
-        internal_images::resolve_internal_images,
-        mesh_config::{
-            MeshServiceName, RouterPorts, ServiceMeshAddressing, build_mesh_config_plan,
-            scenario_ir_digest,
-        },
-        plan::{MeshOptions, component_label, map_program_components},
-        ports::{allocate_mesh_ports, allocate_slot_ports},
-        provision::build_mesh_provision_plan,
-        proxy_metadata::{
-            DEFAULT_EXTERNAL_ENV_FILE, ExportMetadata, ExternalSlotMetadata,
-            PROXY_METADATA_FILENAME, PROXY_METADATA_VERSION, ProxyMetadata, RouterMetadata,
-            collect_exports_metadata, collect_external_slot_metadata,
+            ProgramSupport, build_component_runtime_plan, build_config_plan,
         },
     },
 };
@@ -179,7 +181,7 @@ fn render_kubernetes(
         let Some(program) = component.program.as_ref() else {
             continue;
         };
-        for mount in &program.mounts {
+        for mount in program.mounts() {
             if let MountSource::Framework(capability) = &mount.source
                 && capability.as_str() == "docker"
             {
@@ -247,15 +249,16 @@ fn render_kubernetes(
         ROUTER_NAME,
         router_mesh_port,
     );
-    let mesh_config_plan = build_mesh_config_plan(
-        s,
-        &mesh_plan,
+    let mesh_config_plan = build_mesh_config_plan(MeshConfigBuildInput {
+        scenario: s,
+        mesh_plan: &mesh_plan,
         root_manifest,
-        &slot_ports_by_component,
-        &mesh_ports_by_component,
+        slot_ports_by_component: &slot_ports_by_component,
+        mesh_ports_by_component: &mesh_ports_by_component,
         router_ports,
-        &mesh_addressing,
-    )
+        addressing: &mesh_addressing,
+        options: default_mesh_config_build_options(),
+    })
     .map_err(|e| ReporterError::new(e.to_string()))?;
     let mesh_provision_plan = build_mesh_provision_plan(
         &mesh_config_plan,
@@ -290,6 +293,10 @@ fn render_kubernetes(
     let config_plan = build_config_plan(
         s,
         program_components,
+        ProgramSupport::ImageOnly {
+            backend_label: "kubernetes output",
+        },
+        crate::targets::program_config::RuntimeAddressResolution::Static,
         &address_plan.slot_values_by_component,
         &address_plan.binding_values_by_component,
     )
@@ -604,13 +611,14 @@ fn render_kubernetes(
     }
 
     // Note: Per-component ConfigMaps/Secrets are not generated because:
-    // - Direct mode: all config must be fully static (no runtime interpolation).
+    // - Helper-free execution: all config must already be fully static.
     //   Static values are rendered to strings and inlined directly into the
     //   Deployment YAML as literal env vars. This includes secret config values,
     //   which will be visible in the generated YAML.
-    // - Helper mode: config with runtime interpolation uses the helper binary.
-    //   The helper reads config values from the root config Secret/ConfigMap at
-    //   runtime and resolves templates, so secret values are not inlined.
+    // - Helper execution: config with runtime interpolation uses the helper
+    //   binary. The helper reads config values from the root config
+    //   Secret/ConfigMap at runtime and resolves templates, so secret values are
+    //   not inlined.
     // The only ConfigMaps generated are amber-metadata and the Kustomize-generated
     // root config (when runtime config is needed). Pods only reference explicitly
     // granted keys, so unassigned config never becomes visible inside containers.
@@ -625,9 +633,21 @@ fn render_kubernetes(
         let mesh_port = *mesh_ports_by_component.get(id).expect("mesh port missing");
         let label = component_label(s, *id);
         let pod_annotations = component_pod_annotations(&namespace, &label);
-        let image_source = program_image_source(output, s, *id, program_plan.image_origin());
+        let image_origin = program_plan.image_origin().ok_or_else(|| {
+            ReporterError::new(format!(
+                "internal error: {} is missing a container image origin",
+                component_label(s, *id)
+            ))
+        })?;
+        let image_plan = program_plan.image().ok_or_else(|| {
+            ReporterError::new(format!(
+                "internal error: {} is missing a container image plan",
+                component_label(s, *id)
+            ))
+        })?;
+        let image_source = program_image_source(output, s, *id, image_origin);
         let (program_image, image_source_env_var) = render_kubernetes_image(
-            program_plan.image(),
+            image_plan,
             &root_leaf_by_path,
             &cnames.service,
             &label,
@@ -645,7 +665,7 @@ fn render_kubernetes(
         let needs_helper_for_component = runtime_plan.needs_helper;
 
         let mut ports: Vec<ContainerPort> = Vec::new();
-        if let Some(network) = &program.network {
+        if let Some(network) = program.network() {
             for ep in &network.endpoints {
                 ports.push(ContainerPort {
                     name: sanitize_port_name(&ep.name),
@@ -656,9 +676,8 @@ fn render_kubernetes(
         }
 
         let (container, mut volumes) = match runtime_plan.execution {
-            ComponentExecutionPlan::Direct { entrypoint, env } => {
-                // Direct mode: use resolved entrypoint and env directly.
-                // Config values are already baked into the entrypoint/env strings,
+            ComponentExecutionPlan::Resolved { entrypoint, env } => {
+                // Helper-free execution: entrypoint and env are already fully resolved,
                 // so we don't need AMBER_CONFIG_* env vars here.
                 let container_env: Vec<EnvVar> =
                     env.iter().map(|(k, v)| EnvVar::literal(k, v)).collect();
@@ -689,21 +708,21 @@ fn render_kubernetes(
                 (container, Vec::new())
             }
             ComponentExecutionPlan::HelperRunner {
-                direct_entrypoint_b64,
-                direct_env_b64,
+                entrypoint_b64,
+                env_b64,
                 template_spec_b64,
                 runtime_config,
                 mount_spec_b64,
             } => {
                 let mut container_env = Vec::new();
-                if let Some(entrypoint_b64) = direct_entrypoint_b64 {
+                if let Some(entrypoint_b64) = entrypoint_b64 {
                     container_env.push(EnvVar::literal(
-                        "AMBER_DIRECT_ENTRYPOINT_B64",
+                        "AMBER_RESOLVED_ENTRYPOINT_B64",
                         entrypoint_b64,
                     ));
                 }
-                if let Some(env_b64) = direct_env_b64 {
-                    container_env.push(EnvVar::literal("AMBER_DIRECT_ENV_B64", env_b64));
+                if let Some(env_b64) = env_b64 {
+                    container_env.push(EnvVar::literal("AMBER_RESOLVED_ENV_B64", env_b64));
                 }
                 if let Some(runtime_config) = runtime_config {
                     let mut config_env = build_component_config_env(

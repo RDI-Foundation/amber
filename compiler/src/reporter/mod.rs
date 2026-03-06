@@ -8,9 +8,13 @@ pub mod dot;
 pub mod metadata;
 pub mod scenario_ir;
 
+pub use direct::DirectReporter;
 pub use docker_compose::DockerComposeReporter;
 
-pub use crate::targets::mesh::{docker_compose, kubernetes};
+pub use crate::targets::{
+    direct,
+    mesh::{docker_compose, kubernetes},
+};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]

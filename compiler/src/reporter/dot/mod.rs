@@ -155,7 +155,7 @@ fn endpoint_label_for_provide(component: &Component, provide_name: &str) -> Stri
     let network = component
         .program
         .as_ref()
-        .and_then(|p| p.network.as_ref())
+        .and_then(|p| p.network())
         .expect("scenario invariant: provide requires a network");
 
     let endpoint_name = provide

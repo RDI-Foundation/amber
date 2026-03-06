@@ -11,12 +11,12 @@ multi-agent prototyping.
 
 - **Inputs:** a root component manifest (plus any referenced child manifests).
 - **Outputs:** a linked scenario plus artifacts like Scenario IR JSON, Graphviz DOT, Docker
-  Compose YAML, and offline bundles.
+  Compose YAML, Kubernetes directories, direct/native run directories, and offline bundles.
 - **Behavior:** resolves manifests from local files and `https://` URLs, validates structure
   and wiring, and produces deterministic, inspectable outputs.
 
-Amber does **not** run your agents by itself. It compiles to artifacts that you can run in other
-environments like Docker Compose and Kubernetes.
+Amber can run direct/native artifacts locally (`amber run <direct-output-dir>`), and can also
+compile artifacts for environments like Docker Compose and Kubernetes.
 
 ## Core concepts
 
@@ -113,6 +113,19 @@ amber compile amber-demo/parent.json \
 docker compose -f /tmp/amber-compose.yaml up
 ```
 
+### 3b) Generate direct/native output and run
+
+```sh
+amber compile examples/direct-security/scenario.json5 --direct /tmp/amber-direct
+amber run /tmp/amber-direct
+```
+
+Direct output only supports components that use `program.path`.
+
+`amber run` for direct output requires a local sandbox backend:
+- Linux: `bwrap` and `slirp4netns`
+- macOS: `/usr/bin/sandbox-exec`
+
 The Docker Compose output references the router, provisioner, and helper images used to
 enforce the wiring and provision mesh identities: `ghcr.io/rdi-foundation/amber-router:v1`,
 `ghcr.io/rdi-foundation/amber-provisioner:v1`, and `ghcr.io/rdi-foundation/amber-helper:v1`.
@@ -157,6 +170,16 @@ You can also use an existing Scenario IR as input for `amber compile` to produce
 ```sh
 amber check path/to/root.json5
 ```
+
+### Compile + run direct/native
+
+```sh
+amber compile path/to/root.json5 --direct /tmp/direct-out
+amber run /tmp/direct-out
+```
+
+Direct output requires `program.path` with an explicit absolute path or a manifest-relative path
+like `./bin/server`; it does not search `PATH`.
 
 ### Create a bundle for offline, reproducible builds
 

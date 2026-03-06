@@ -6,7 +6,7 @@ use amber_scenario::{
 };
 use serde_json::json;
 
-use crate::targets::mesh::plan::MeshError;
+use crate::targets::common::TargetError as MeshError;
 
 pub(crate) const FRAMEWORK_DOCKER_GATEWAY_INTERNAL_SLOT: &str = "__amber_internal_framework_docker";
 pub(crate) const FRAMEWORK_DOCKER_GATEWAY_ENDPOINT: &str = "docker";
@@ -46,7 +46,7 @@ pub(crate) fn rewrite_framework_docker_as_injected_component(
         let Some(program) = component.program.as_ref() else {
             continue;
         };
-        if program.mounts.iter().any(|mount| {
+        if program.mounts().iter().any(|mount| {
             matches!(&mount.source, MountSource::Framework(capability) if capability.as_str() == "docker")
         }) {
             docker_mount_consumers.insert(id);
