@@ -54,7 +54,7 @@ If you want `amber` on your PATH, move it into a directory that’s already on P
 ### Option B: Use the Dockerized CLI
 
 ```sh
-docker run --rm -v "$PWD":/work -w /work ghcr.io/rdi-foundation/amber-cli:v0.1 --help
+docker run --rm -v "$PWD":/work -w /work ghcr.io/rdi-foundation/amber-cli:v0.2 --help
 ```
 
 ## Tutorial
@@ -102,7 +102,7 @@ amber compile amber-demo/parent.json --dot -
 If you're using the Dockerized CLI, replace `amber` with:
 
 ```sh
-docker run --rm -v "$PWD":/work -w /work ghcr.io/rdi-foundation/amber-cli:v0.1
+docker run --rm -v "$PWD":/work -w /work ghcr.io/rdi-foundation/amber-cli:v0.2
 ```
 
 ### 3) Generate Docker Compose and run

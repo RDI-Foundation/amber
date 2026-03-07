@@ -4036,23 +4036,13 @@ fn expand_env_templates(input: &str, compose_project_name: Option<&str>) -> Resu
             .ok_or_else(|| miette::miette!("invalid template in control endpoint: {input}"))?;
         let expr = &input[start + 2..end];
         if let Some((name, default)) = expr.split_once(":-") {
-            let value = env_var_non_empty(name)
-                .ok()
-                .or_else(|| {
-                    (name == "COMPOSE_PROJECT_NAME")
-                        .then(|| compose_project_name.map(ToOwned::to_owned))
-                        .flatten()
-                })
+            let value = compose_project_template_value(name, compose_project_name)
+                .or_else(|| env_var_non_empty(name).ok())
                 .unwrap_or_else(|| default.to_string());
             out.push_str(&value);
         } else {
-            let value = std::env::var(expr)
-                .ok()
-                .or_else(|| {
-                    (expr == "COMPOSE_PROJECT_NAME")
-                        .then(|| compose_project_name.map(ToOwned::to_owned))
-                        .flatten()
-                })
+            let value = compose_project_template_value(expr, compose_project_name)
+                .or_else(|| std::env::var(expr).ok())
                 .unwrap_or_default();
             out.push_str(&value);
         }
@@ -4060,6 +4050,16 @@ fn expand_env_templates(input: &str, compose_project_name: Option<&str>) -> Resu
     }
     out.push_str(&input[cursor..]);
     Ok(out)
+}
+
+fn compose_project_template_value(
+    name: &str,
+    compose_project_name: Option<&str>,
+) -> Option<String> {
+    (name == COMPOSE_PROJECT_NAME_ENV)
+        .then_some(compose_project_name)
+        .flatten()
+        .map(ToOwned::to_owned)
 }
 
 fn env_var_non_empty(name: &str) -> Result<String, std::env::VarError> {
@@ -4934,6 +4934,34 @@ fn write_directory_output(
 mod tests {
     use super::*;
 
+    struct EnvVarRestore {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarRestore {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(name);
+            unsafe {
+                std::env::set_var(name, value);
+            }
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe {
+                    std::env::set_var(self.name, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.name);
+                },
+            }
+        }
+    }
+
     fn test_proxy_args() -> ProxyArgs {
         ProxyArgs {
             output: String::new(),
@@ -5016,6 +5044,32 @@ mod tests {
         assert!(rendered.contains("stack-a"), "{rendered}");
         assert!(rendered.contains("stack-b"), "{rendered}");
         assert!(rendered.contains("--project-name"), "{rendered}");
+    }
+
+    #[test]
+    fn expand_env_templates_prefers_explicit_compose_project_name() {
+        let _compose_project = EnvVarRestore::set(COMPOSE_PROJECT_NAME_ENV, "from-env");
+
+        let result = expand_env_templates(
+            "${COMPOSE_PROJECT_NAME}/router/${COMPOSE_PROJECT_NAME:-fallback}",
+            Some("from-flag"),
+        )
+        .expect("template should render");
+
+        assert_eq!(result, "from-flag/router/from-flag");
+    }
+
+    #[test]
+    fn expand_env_templates_uses_env_for_other_names() {
+        let _test_env = EnvVarRestore::set("AMBER_TEMPLATE_TEST", "from-env");
+
+        let result = expand_env_templates(
+            "${AMBER_TEMPLATE_TEST}/${AMBER_TEMPLATE_TEST:-fallback}",
+            Some("from-flag"),
+        )
+        .expect("template should render");
+
+        assert_eq!(result, "from-env/from-env");
     }
 
     #[test]
