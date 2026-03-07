@@ -40,7 +40,7 @@ fn compile_writes_primary_output_and_dot_artifact() {
 
     let primary_output = outputs_dir.path().join("scenario");
     let dot_output = outputs_dir.path().join("scenario.dot");
-    let compose_output = outputs_dir.path().join("scenario.docker-compose.yaml");
+    let compose_output_dir = outputs_dir.path().join("scenario.compose");
 
     let output = Command::new(env!("CARGO_BIN_EXE_amber"))
         .arg("compile")
@@ -49,7 +49,7 @@ fn compile_writes_primary_output_and_dot_artifact() {
         .arg("--dot")
         .arg(&dot_output)
         .arg("--docker-compose")
-        .arg(&compose_output)
+        .arg(&compose_output_dir)
         .arg(&manifest)
         .output()
         .unwrap_or_else(|err| panic!("failed to run amber compile: {err}"));
@@ -145,10 +145,39 @@ fn compile_writes_primary_output_and_dot_artifact() {
         "dot output did not contain a scenario graph"
     );
 
+    let compose_output = compose_output_dir.join("compose.yaml");
     assert!(
         compose_output.is_file(),
         "expected docker compose output file at {}",
         compose_output.display()
+    );
+    let compose_readme = compose_output_dir.join("README.md");
+    assert!(
+        compose_readme.is_file(),
+        "expected docker compose README at {}",
+        compose_readme.display()
+    );
+    let compose_readme_contents =
+        fs::read_to_string(&compose_readme).expect("failed to read docker compose README");
+    assert!(
+        compose_readme_contents.contains("compose.yaml"),
+        "docker compose README should mention the generated compose file"
+    );
+    assert!(
+        compose_readme_contents.contains("amber proxy ."),
+        "docker compose README should include proxy instructions"
+    );
+    let compose_env_sample = compose_output_dir.join("env.example");
+    assert!(
+        compose_env_sample.is_file(),
+        "expected docker compose env sample at {}",
+        compose_env_sample.display()
+    );
+    let compose_env_sample_contents =
+        fs::read_to_string(&compose_env_sample).expect("failed to read docker compose env sample");
+    assert!(
+        compose_env_sample_contents.contains("No env-based runtime inputs are required"),
+        "docker compose env sample should explain when no runtime inputs are needed"
     );
     let compose_contents =
         fs::read_to_string(&compose_output).expect("failed to read docker compose output file");
@@ -340,13 +369,13 @@ fn compile_with_binding_interpolation() {
     )
     .expect("failed to write observer manifest");
 
-    let compose_output = outputs_dir.path().join("scenario.docker-compose.yaml");
+    let compose_output_dir = outputs_dir.path().join("scenario.compose");
 
     let compose_compile = Command::new(env!("CARGO_BIN_EXE_amber"))
         .arg("compile")
         .arg("--no-opt")
         .arg("--docker-compose")
-        .arg(&compose_output)
+        .arg(&compose_output_dir)
         .arg(&root_manifest)
         .output()
         .unwrap_or_else(|err| panic!("failed to run amber compile: {err}"));
@@ -359,6 +388,7 @@ fn compile_with_binding_interpolation() {
         );
     }
 
+    let compose_output = compose_output_dir.join("compose.yaml");
     assert!(
         compose_output.is_file(),
         "expected docker compose output file at {}",

@@ -778,6 +778,10 @@ fn kubernetes_emits_router_for_external_slots() {
         .iter()
         .any(|item| item.as_str() == Some(super::PROXY_METADATA_FILENAME));
     assert!(!contains_proxy, "{kustomization}");
+    let contains_readme = resources
+        .iter()
+        .any(|item| item.as_str() == Some("README.md"));
+    assert!(!contains_readme, "{kustomization}");
 
     let proxy_json = artifact
         .files
@@ -789,6 +793,12 @@ fn kubernetes_emits_router_for_external_slots() {
     assert_eq!(proxy_meta["router"]["mesh_port"], 24000);
     assert_eq!(proxy_meta["router"]["control_port"], 24100);
     assert_eq!(proxy_meta["external_slots"]["api"]["kind"], "http");
+    let readme = artifact
+        .files
+        .get(&PathBuf::from("README.md"))
+        .expect("generated readme");
+    assert!(readme.contains("kubectl apply -k ."), "{readme}");
+    assert!(readme.contains("amber proxy ."), "{readme}");
 
     let role_yaml = artifact
         .files

@@ -17,7 +17,10 @@ use serde::Serialize;
 
 use crate::{
     CompileOutput,
-    reporter::{Reporter, ReporterError},
+    reporter::{
+        Reporter, ReporterError,
+        execution_guide::{GENERATED_README_FILENAME, build_execution_guide},
+    },
     targets::{
         mesh::{
             addressing::{
@@ -1472,6 +1475,18 @@ fn render_kubernetes(
         files.insert(PathBuf::from(PROXY_METADATA_FILENAME), proxy_json);
     }
 
+    let execution_guide = build_execution_guide(&output.scenario, &mesh_plan, &config_plan)?;
+    let mut rollout_deployments: Vec<String> =
+        names.values().map(|names| names.service.clone()).collect();
+    if needs_router {
+        rollout_deployments.push(ROUTER_NAME.to_string());
+    }
+    rollout_deployments.sort();
+    files.insert(
+        PathBuf::from(GENERATED_README_FILENAME),
+        execution_guide.render_kubernetes_readme(&namespace, &rollout_deployments, needs_router),
+    );
+
     // Always generate kustomization.yaml for consistency, even if not using helper mode.
     let mut kust_resources = Vec::new();
 
@@ -1480,6 +1495,7 @@ fn render_kubernetes(
             || path == &PathBuf::from("root-config-secret.env")
             || path == &PathBuf::from(DEFAULT_EXTERNAL_ENV_FILE)
             || path == &PathBuf::from(PROXY_METADATA_FILENAME)
+            || path == &PathBuf::from(GENERATED_README_FILENAME)
         {
             continue; // Skip non-resource files.
         }

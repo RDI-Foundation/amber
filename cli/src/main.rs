@@ -27,7 +27,7 @@ use amber_compiler::{
             DirectPlan, DirectProgramExecutionPlan, DirectReporter, DirectRuntimeAddressPlan,
             DirectRuntimeConfigPayload, DirectRuntimeUrlSource, RUN_SCRIPT_FILENAME,
         },
-        docker_compose::DockerComposeReporter,
+        docker_compose::{COMPOSE_FILENAME, DockerComposeReporter},
         dot::DotReporter,
         kubernetes::{KubernetesReporter, KubernetesReporterConfig},
         metadata::MetadataReporter,
@@ -64,10 +64,189 @@ use tokio::{
 use tracing_subscriber::EnvFilter;
 use url::{Url, form_urlencoded};
 
+const CLI_LONG_ABOUT: &str = "\
+Compile, inspect, and run Amber scenarios.
+
+Amber resolves a root manifest or bundle, validates the component graph, and writes the artifacts \
+                              you need to inspect or run the scenario.
+
+Use `amber <command> --help` to drill into a specific workflow.";
+
+const CLI_AFTER_HELP: &str = "\
+Common workflows:
+  amber check path/to/root.json5
+      Validate manifests and print diagnostics without writing outputs.
+
+  amber compile path/to/root.json5 --docker-compose /tmp/amber-compose
+      Generate runtime artifacts. `amber compile --help` lists every output format.
+
+  amber compile path/to/root.json5 --direct /tmp/amber-direct
+  amber run /tmp/amber-direct
+      Build and start the direct/native runtime locally.
+
+  amber proxy /tmp/amber-compose --export public=127.0.0.1:18080
+      Expose scenario exports or wire external slots on localhost.
+
+  amber docs readme
+      Read the embedded project and CLI reference from the binary.";
+
+const COMPILE_LONG_ABOUT: &str = "\
+Resolve a root manifest or bundle, run the Amber compiler, print diagnostics, and write one or \
+                                  more requested outputs.
+
+If you only want validation, use `amber check` instead.
+
+At least one output flag is required.";
+
+const COMPILE_AFTER_HELP: &str = "\
+Outputs:
+  --output FILE
+      Scenario IR JSON for inspection or downstream tooling.
+
+  --dot FILE
+      Graphviz DOT for visualizing the resolved graph.
+
+  --docker-compose DIR
+      Docker Compose runtime directory with embedded proxy metadata for `amber proxy`.
+
+  --metadata FILE
+      Per-component metadata JSON for tooling or debugging.
+
+  --kubernetes DIR
+      Kubernetes manifests plus proxy metadata.
+
+  --direct DIR
+      Native/direct runtime artifacts for `amber run` and `amber proxy`.
+
+  --bundle DIR
+      Self-contained manifest bundle for offline or reproducible compilation.
+
+Examples:
+  amber compile path/to/root.json5 --output /tmp/scenario.json
+  amber compile path/to/root.json5 --docker-compose /tmp/amber-compose
+  amber compile path/to/root.json5 --direct /tmp/amber-direct";
+
+const CHECK_LONG_ABOUT: &str = "\
+Resolve a root manifest or bundle, run the same validation and lint passes as `amber compile`, \
+                                print diagnostics, and stop before emitting artifacts.";
+
+const CHECK_AFTER_HELP: &str = "\
+Examples:
+  amber check path/to/root.json5
+  amber check -D warnings path/to/root.json5
+
+Use `amber compile --help` when you are ready to write outputs.";
+
+const DOCS_LONG_ABOUT: &str = "\
+Print documentation that ships inside the CLI.
+
+Use this when you want README material, schema docs, or embedded examples without browsing the \
+                               repo.";
+
+const DOCS_AFTER_HELP: &str = "\
+Docs subcommands:
+  amber docs readme
+      Project overview plus CLI reference.
+
+  amber docs manifest
+      Full manifest schema and examples.
+
+  amber docs examples
+      List embedded examples.
+
+  amber docs examples reexport
+      Dump one example's files.";
+
+const DOCS_README_LONG_ABOUT: &str = "\
+Print the top-level Amber README that ships inside the CLI.
+
+This is the quickest way to get the project overview, common workflows, and the CLI reference \
+                                      without opening the repo.";
+
+const DOCS_EXAMPLES_LONG_ABOUT: &str = "\
+List the examples embedded into the CLI, or print every file from one named example.
+
+Use this to discover example scenarios from the terminal, then inspect a specific example without \
+                                        opening the repo.";
+
+const DOCS_EXAMPLES_AFTER_HELP: &str = "\
+Examples:
+  amber docs examples
+  amber docs examples reexport";
+
+const DOCS_MANIFEST_LONG_ABOUT: &str = "\
+Print the manifest schema README that ships inside the CLI.
+
+Use this for the detailed manifest format, field semantics, and authoring examples.";
+
+const RUN_LONG_ABOUT: &str = "\
+Start a previously compiled direct output directory or a `direct-plan.json` file.
+
+This command only understands direct/native artifacts produced by `amber compile --direct`.";
+
+const RUN_AFTER_HELP: &str = "\
+Examples:
+  amber run /tmp/amber-direct
+  amber run /tmp/amber-direct/direct-plan.json
+
+Runtime requirements:
+  Linux: `bwrap` and `slirp4netns`
+  macOS: `/usr/bin/sandbox-exec`";
+
+const PROXY_LONG_ABOUT: &str = "\
+Attach a local proxy to compiled Amber output.
+
+Use `--export` to expose a scenario export on localhost, `--slot` to connect a scenario slot to a \
+                                local upstream, or both at once.
+
+Pass at least one `--export` or `--slot` binding.
+
+The output can be a Docker Compose output directory, a Kubernetes output directory, or a direct \
+                                output directory.";
+
+const PROXY_AFTER_HELP: &str = "\
+Examples:
+  amber proxy /tmp/amber-compose --export public=127.0.0.1:18080
+
+  amber proxy /tmp/amber-compose \\
+    --slot ext_api=127.0.0.1:38081 \\
+    --export public=127.0.0.1:38080
+
+  amber proxy /tmp/amber-k8s \\
+    --mesh-addr 127.0.0.1:24000 \\
+    --router-addr 127.0.0.1:24000 \\
+    --router-control-addr 127.0.0.1:24100 \\
+    --export public=127.0.0.1:18080
+
+Notes:
+  At least one `--slot NAME=ADDR:PORT` or `--export NAME=ADDR:PORT` is required.
+  Docker Compose and direct outputs usually infer router control metadata automatically.
+  If you start Docker Compose with `-p <name>` before the stack is running, pass the same \
+                                `--project-name <name>` to `amber proxy`.
+  Kubernetes output requires `--mesh-addr` when you use `--slot`, unless you are supplying an \
+                                equivalent override.";
+
+const DASHBOARD_LONG_ABOUT: &str = "\
+Start the dashboard container that Amber scenarios can send OpenTelemetry data to.
+
+This is mainly useful when debugging scenarios locally or following one of the observability \
+                                    tutorials.";
+
+const DASHBOARD_AFTER_HELP: &str = concat!(
+    "Examples:\n",
+    "  amber dashboard\n",
+    "  amber dashboard --detach\n\n",
+    "Requirements:\n",
+    "  Docker CLI plus a running Docker daemon.\n\n",
+    "Default UI address: http://127.0.0.1:18888"
+);
+
 #[derive(Parser)]
 #[command(name = "amber")]
 #[command(version)]
-#[command(about = "Amber CLI")]
+#[command(about = "Compile, inspect, and run Amber scenarios")]
+#[command(long_about = CLI_LONG_ABOUT)]
+#[command(after_help = CLI_AFTER_HELP)]
 struct Cli {
     /// Increase log verbosity (-v, -vv, -vvv, -vvvv).
     #[arg(short = 'v', long = "verbose", action = ArgAction::Count, global = true)]
@@ -79,11 +258,41 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(
+        about = "Compile a manifest into Scenario IR and runtime artifacts",
+        long_about = COMPILE_LONG_ABOUT,
+        after_help = COMPILE_AFTER_HELP
+    )]
     Compile(CompileArgs),
+    #[command(
+        about = "Validate a manifest tree without writing outputs",
+        long_about = CHECK_LONG_ABOUT,
+        after_help = CHECK_AFTER_HELP
+    )]
     Check(CheckArgs),
+    #[command(
+        about = "Read embedded Amber documentation",
+        long_about = DOCS_LONG_ABOUT,
+        after_help = DOCS_AFTER_HELP
+    )]
     Docs(DocsArgs),
+    #[command(
+        about = "Run a direct/native Amber artifact locally",
+        long_about = RUN_LONG_ABOUT,
+        after_help = RUN_AFTER_HELP
+    )]
     Run(RunArgs),
+    #[command(
+        about = "Bridge scenario exports and external slots to the host",
+        long_about = PROXY_LONG_ABOUT,
+        after_help = PROXY_AFTER_HELP
+    )]
     Proxy(ProxyArgs),
+    #[command(
+        about = "Run the Aspire dashboard for Amber telemetry",
+        long_about = DASHBOARD_LONG_ABOUT,
+        after_help = DASHBOARD_AFTER_HELP
+    )]
     Dashboard(DashboardArgs),
     #[command(hide = true, name = "run-direct-init")]
     RunDirectInit(RunDirectInitArgs),
@@ -95,7 +304,7 @@ struct CompileArgs {
     #[arg(short = 'D', long = "deny", value_name = "LINT")]
     deny: Vec<String>,
 
-    /// Write the primary output to this path.
+    /// Write Scenario IR JSON to this path.
     #[arg(short = 'o', long = "output", value_name = "FILE")]
     output: Option<PathBuf>,
 
@@ -103,13 +312,8 @@ struct CompileArgs {
     #[arg(long = "dot", value_name = "FILE", allow_hyphen_values = true)]
     dot: Option<PathBuf>,
 
-    /// Write Docker Compose output to this path, or `-` for stdout.
-    #[arg(
-        long = "docker-compose",
-        visible_alias = "compose",
-        value_name = "FILE",
-        allow_hyphen_values = true
-    )]
+    /// Write Docker Compose runtime artifacts to this directory.
+    #[arg(long = "docker-compose", visible_alias = "compose", value_name = "DIR")]
     docker_compose: Option<PathBuf>,
 
     /// Write component metadata (moniker -> metadata JSON) to this path, or `-` for stdout.
@@ -160,13 +364,23 @@ struct DocsArgs {
 
 #[derive(Subcommand)]
 enum DocsCommand {
-    /// Dump the top-level Amber README.
+    #[command(
+        about = "Print the top-level Amber README",
+        long_about = DOCS_README_LONG_ABOUT
+    )]
     Readme,
 
-    /// List examples or dump one example's files.
+    #[command(
+        about = "List embedded examples or print one example's files",
+        long_about = DOCS_EXAMPLES_LONG_ABOUT,
+        after_help = DOCS_EXAMPLES_AFTER_HELP
+    )]
     Examples(DocsExamplesArgs),
 
-    /// Dump the manifest schema README.
+    #[command(
+        about = "Print the manifest schema README",
+        long_about = DOCS_MANIFEST_LONG_ABOUT
+    )]
     Manifest,
 }
 
@@ -179,7 +393,7 @@ struct DocsExamplesArgs {
 
 #[derive(Args)]
 struct RunArgs {
-    /// Compiled output artifact path (for now, a direct output directory).
+    /// Direct output directory or `direct-plan.json` file from `amber compile --direct`.
     #[arg(value_name = "OUTPUT")]
     output: String,
 }
@@ -193,9 +407,13 @@ struct RunDirectInitArgs {
 
 #[derive(Args)]
 struct ProxyArgs {
-    /// Docker Compose file or output directory from `amber compile`.
+    /// Docker Compose output directory, direct output directory, or Kubernetes output directory from `amber compile`.
     #[arg(value_name = "OUTPUT")]
     output: String,
+
+    /// Compose project name override for Docker Compose outputs.
+    #[arg(long = "project-name", value_name = "NAME")]
+    project_name: Option<String>,
 
     /// External slot binding (repeatable): `name=127.0.0.1:PORT`.
     #[arg(long = "slot", value_name = "NAME=ADDR:PORT")]
@@ -525,18 +743,11 @@ async fn compile(args: CompileArgs) -> Result<()> {
         }
     }
 
-    if let Some(compose_dest) = outputs.docker_compose {
+    if let Some(compose_root) = outputs.docker_compose.as_ref() {
         let compose = DockerComposeReporter
             .emit(&output)
             .map_err(miette::Report::new)?;
-        match compose_dest {
-            ArtifactOutput::Stdout => print!("{compose}"),
-            ArtifactOutput::File(path) => {
-                write_artifact(&path, compose.as_bytes()).wrap_err_with(|| {
-                    format!("failed to write docker compose output `{}`", path.display())
-                })?
-            }
-        }
+        write_docker_compose_output(compose_root, &compose)?;
     }
 
     if let Some(kubernetes_dest) = outputs.kubernetes {
@@ -3430,7 +3641,26 @@ fn load_proxy_target(output: &str) -> Result<ProxyTarget> {
         .map_err(|err| miette::miette!("failed to resolve output path {}: {err}", abs.display()))?;
 
     if abs.is_dir() {
+        let compose_path = abs.join(COMPOSE_FILENAME);
+        if compose_path.is_file() {
+            let metadata = load_compose_metadata(&compose_path)?;
+            validate_proxy_metadata(&metadata, &compose_path)?;
+            return Ok(ProxyTarget {
+                kind: ProxyTargetKind::DockerCompose,
+                metadata,
+                source: compose_path,
+            });
+        }
+
         let metadata_path = abs.join(PROXY_METADATA_FILENAME);
+        if !metadata_path.is_file() {
+            return Err(miette::miette!(
+                "output directory {} is not a recognized proxy target (missing `{}` and `{}`)",
+                abs.display(),
+                COMPOSE_FILENAME,
+                PROXY_METADATA_FILENAME
+            ));
+        }
         let metadata = load_proxy_metadata_file(&metadata_path)?;
         validate_proxy_metadata(&metadata, &metadata_path)?;
         let kind = if abs.join(DIRECT_PLAN_FILENAME).is_file() {
@@ -3473,13 +3703,11 @@ fn load_proxy_target(output: &str) -> Result<ProxyTarget> {
         });
     }
 
-    let metadata = load_compose_metadata(&abs)?;
-    validate_proxy_metadata(&metadata, &abs)?;
-    Ok(ProxyTarget {
-        kind: ProxyTargetKind::DockerCompose,
-        metadata,
-        source: abs,
-    })
+    Err(miette::miette!(
+        "output path {} is not a recognized proxy target; pass the generated compose, direct, or \
+         kubernetes output directory",
+        abs.display()
+    ))
 }
 
 fn load_proxy_metadata_file(path: &Path) -> Result<ProxyMetadata> {
@@ -3647,7 +3875,7 @@ fn resolve_control_endpoint(args: &ProxyArgs, target: &ProxyTarget) -> Result<Co
         .as_ref()
         .ok_or_else(|| miette::miette!("router metadata missing; re-run `amber compile`"))?;
     let compose_project = match target.kind {
-        ProxyTargetKind::DockerCompose => infer_default_compose_project_name(&target.source),
+        ProxyTargetKind::DockerCompose => resolve_compose_project_name(args, &target.source)?,
         ProxyTargetKind::Direct => None,
         ProxyTargetKind::Kubernetes => None,
     };
@@ -3695,6 +3923,87 @@ fn resolve_control_endpoint(args: &ProxyArgs, target: &ProxyTarget) -> Result<Co
     )))
 }
 
+fn resolve_compose_project_name(args: &ProxyArgs, compose_file: &Path) -> Result<Option<String>> {
+    if let Some(explicit) = args.project_name.as_deref() {
+        let explicit = explicit.trim();
+        if explicit.is_empty() {
+            return Err(miette::miette!("--project-name must not be empty"));
+        }
+        return Ok(Some(explicit.to_string()));
+    }
+
+    let env_project = env_var_non_empty(COMPOSE_PROJECT_NAME_ENV).ok();
+    let discovered = discover_running_compose_projects(compose_file);
+    choose_compose_project_name(
+        env_project.as_deref(),
+        &discovered,
+        infer_default_compose_project_name(compose_file).as_deref(),
+        compose_file,
+    )
+}
+
+fn choose_compose_project_name(
+    env_project: Option<&str>,
+    discovered: &BTreeSet<String>,
+    inferred: Option<&str>,
+    compose_file: &Path,
+) -> Result<Option<String>> {
+    if let Some(env_project) = env_project {
+        return Ok(Some(env_project.to_string()));
+    }
+    match discovered.len() {
+        0 => {}
+        1 => return Ok(discovered.iter().next().cloned()),
+        _ => {
+            let candidates = discovered.iter().cloned().collect::<Vec<_>>().join(", ");
+            return Err(miette::miette!(
+                "multiple running Compose projects were started from {}: {}. Re-run `amber proxy` \
+                 with `--project-name <name>`.",
+                compose_file.display(),
+                candidates
+            ));
+        }
+    }
+    Ok(inferred.map(ToOwned::to_owned))
+}
+
+fn discover_running_compose_projects(compose_file: &Path) -> BTreeSet<String> {
+    let mut projects = BTreeSet::new();
+    let compose_file = compose_file.display().to_string();
+
+    for runtime in ["docker", "podman"] {
+        let mut cmd = ProcessCommand::new(runtime);
+        cmd.arg("ps")
+            .arg("--filter")
+            .arg(format!(
+                "label=com.docker.compose.project.config_files={compose_file}"
+            ))
+            .arg("--filter")
+            .arg("label=com.docker.compose.service=amber-router")
+            .arg("--format")
+            .arg("{{.Label \"com.docker.compose.project\"}}");
+        let Ok(output) = cmd.output() else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        for project in parse_compose_project_names(&String::from_utf8_lossy(&output.stdout)) {
+            projects.insert(project);
+        }
+    }
+
+    projects
+}
+
+fn parse_compose_project_names(raw: &str) -> BTreeSet<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 fn parse_control_endpoint(value: &str) -> Result<ControlEndpoint> {
     if let Some(path) = value.strip_prefix("unix://") {
         let trimmed = path.trim();
@@ -3727,23 +4036,13 @@ fn expand_env_templates(input: &str, compose_project_name: Option<&str>) -> Resu
             .ok_or_else(|| miette::miette!("invalid template in control endpoint: {input}"))?;
         let expr = &input[start + 2..end];
         if let Some((name, default)) = expr.split_once(":-") {
-            let value = env_var_non_empty(name)
-                .ok()
-                .or_else(|| {
-                    (name == "COMPOSE_PROJECT_NAME")
-                        .then(|| compose_project_name.map(ToOwned::to_owned))
-                        .flatten()
-                })
+            let value = compose_project_template_value(name, compose_project_name)
+                .or_else(|| env_var_non_empty(name).ok())
                 .unwrap_or_else(|| default.to_string());
             out.push_str(&value);
         } else {
-            let value = std::env::var(expr)
-                .ok()
-                .or_else(|| {
-                    (expr == "COMPOSE_PROJECT_NAME")
-                        .then(|| compose_project_name.map(ToOwned::to_owned))
-                        .flatten()
-                })
+            let value = compose_project_template_value(expr, compose_project_name)
+                .or_else(|| std::env::var(expr).ok())
                 .unwrap_or_default();
             out.push_str(&value);
         }
@@ -3751,6 +4050,16 @@ fn expand_env_templates(input: &str, compose_project_name: Option<&str>) -> Resu
     }
     out.push_str(&input[cursor..]);
     Ok(out)
+}
+
+fn compose_project_template_value(
+    name: &str,
+    compose_project_name: Option<&str>,
+) -> Option<String> {
+    (name == COMPOSE_PROJECT_NAME_ENV)
+        .then_some(compose_project_name)
+        .flatten()
+        .map(ToOwned::to_owned)
 }
 
 fn env_var_non_empty(name: &str) -> Result<String, std::env::VarError> {
@@ -3798,6 +4107,7 @@ const EXPORT_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(30);
 const ROUTER_IDENTITY_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_CURL_IMAGE: &str = "curlimages/curl:8.12.1";
 const CONTROL_SOCKET_MOUNT_DIR: &str = "/amber/control";
+const COMPOSE_PROJECT_NAME_ENV: &str = "COMPOSE_PROJECT_NAME";
 const CONTROL_SOCKET_UID_GID: &str = "65532:65532";
 
 impl ControlExportPayload {
@@ -4369,7 +4679,7 @@ enum ArtifactOutput {
 struct OutputPaths {
     primary: Option<PathBuf>,
     dot: Option<ArtifactOutput>,
-    docker_compose: Option<ArtifactOutput>,
+    docker_compose: Option<PathBuf>,
     metadata: Option<ArtifactOutput>,
     kubernetes: Option<PathBuf>,
     direct: Option<PathBuf>,
@@ -4397,25 +4707,21 @@ fn ensure_outputs_requested(args: &CompileArgs) -> Result<()> {
 fn resolve_output_paths(args: &CompileArgs) -> Result<OutputPaths> {
     let primary = args.output.clone();
     let dot = resolve_optional_output(&args.dot);
-    let docker_compose = resolve_optional_output(&args.docker_compose);
+    let docker_compose = args.docker_compose.clone();
     let metadata = resolve_optional_output(&args.metadata);
     let kubernetes = args.kubernetes.clone();
     let direct = args.direct.clone();
 
-    let outputs = [
+    let file_outputs = [
         ("primary output", primary.as_deref()),
         ("dot output", artifact_file_path(dot.as_ref())),
-        (
-            "docker compose output",
-            artifact_file_path(docker_compose.as_ref()),
-        ),
         ("metadata output", artifact_file_path(metadata.as_ref())),
     ];
-    for (index, (left_name, left_path)) in outputs.iter().enumerate() {
+    for (index, (left_name, left_path)) in file_outputs.iter().enumerate() {
         let Some(left_path) = left_path else {
             continue;
         };
-        for (right_name, right_path) in outputs.iter().skip(index + 1) {
+        for (right_name, right_path) in file_outputs.iter().skip(index + 1) {
             if right_path.is_some_and(|right_path| right_path == *left_path) {
                 return Err(miette::miette!(
                     "{} path `{}` must not match {} path",
@@ -4427,29 +4733,42 @@ fn resolve_output_paths(args: &CompileArgs) -> Result<OutputPaths> {
         }
     }
 
-    if let (Some(kubernetes), Some(direct)) = (kubernetes.as_ref(), direct.as_ref())
-        && kubernetes == direct
-    {
-        return Err(miette::miette!(
-            "kubernetes output directory `{}` must not match direct output directory",
-            kubernetes.display()
-        ));
-    }
-
+    let directory_outputs = [
+        ("docker compose output directory", docker_compose.as_ref()),
+        ("kubernetes output directory", kubernetes.as_ref()),
+        ("direct output directory", direct.as_ref()),
+    ];
     for (name, dir) in [
+        ("docker compose output directory", docker_compose.as_ref()),
         ("kubernetes output directory", kubernetes.as_ref()),
         ("direct output directory", direct.as_ref()),
     ] {
         let Some(dir) = dir else {
             continue;
         };
-        for (file_name, file_path) in outputs {
+        for (file_name, file_path) in file_outputs {
             if file_path.is_some_and(|file_path| file_path == dir.as_path()) {
                 return Err(miette::miette!(
                     "{} `{}` must not match {} path",
                     name,
                     dir.display(),
                     file_name
+                ));
+            }
+        }
+    }
+
+    for (index, (left_name, left_dir)) in directory_outputs.iter().enumerate() {
+        let Some(left_dir) = left_dir else {
+            continue;
+        };
+        for (right_name, right_dir) in directory_outputs.iter().skip(index + 1) {
+            if right_dir.is_some_and(|right_dir| right_dir == *left_dir) {
+                return Err(miette::miette!(
+                    "{} `{}` must not match {}",
+                    left_name,
+                    left_dir.display(),
+                    right_name
                 ));
             }
         }
@@ -4532,23 +4851,49 @@ fn write_artifact(path: &Path, contents: &[u8]) -> Result<()> {
         .wrap_err_with(|| format!("failed to write `{}`", path.display()))
 }
 
+fn write_docker_compose_output(
+    root: &Path,
+    artifact: &amber_compiler::reporter::docker_compose::DockerComposeArtifact,
+) -> Result<()> {
+    write_directory_output(
+        root,
+        "docker compose output directory",
+        &artifact.files,
+        None,
+    )
+}
+
 fn write_kubernetes_output(
     root: &Path,
     artifact: &amber_compiler::reporter::kubernetes::KubernetesArtifact,
+) -> Result<()> {
+    write_directory_output(root, "kubernetes output directory", &artifact.files, None)
+}
+
+fn write_direct_output(root: &Path, artifact: &DirectArtifact) -> Result<()> {
+    write_directory_output(
+        root,
+        "direct output directory",
+        &artifact.files,
+        Some(Path::new(RUN_SCRIPT_FILENAME)),
+    )
+}
+
+fn write_directory_output(
+    root: &Path,
+    label: &str,
+    files: &BTreeMap<PathBuf, String>,
+    executable_rel_path: Option<&Path>,
 ) -> Result<()> {
     if root.exists() {
         if root.is_dir() {
             std::fs::remove_dir_all(root)
                 .into_diagnostic()
-                .wrap_err_with(|| {
-                    format!(
-                        "failed to remove kubernetes output directory `{}`",
-                        root.display()
-                    )
-                })?;
+                .wrap_err_with(|| format!("failed to remove {label} `{}`", root.display()))?;
         } else {
             return Err(miette::miette!(
-                "kubernetes output path `{}` is not a directory",
+                "{} `{}` is not a directory",
+                label,
                 root.display()
             ));
         }
@@ -4556,57 +4901,9 @@ fn write_kubernetes_output(
 
     std::fs::create_dir_all(root)
         .into_diagnostic()
-        .wrap_err_with(|| {
-            format!(
-                "failed to create kubernetes output directory `{}`",
-                root.display()
-            )
-        })?;
+        .wrap_err_with(|| format!("failed to create {label} `{}`", root.display()))?;
 
-    for (rel_path, content) in &artifact.files {
-        let full_path = root.join(rel_path);
-        if let Some(parent) = full_path.parent() {
-            std::fs::create_dir_all(parent)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to create directory `{}`", parent.display()))?;
-        }
-        std::fs::write(&full_path, content)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to write `{}`", full_path.display()))?;
-    }
-
-    Ok(())
-}
-
-fn write_direct_output(root: &Path, artifact: &DirectArtifact) -> Result<()> {
-    if root.exists() {
-        if root.is_dir() {
-            std::fs::remove_dir_all(root)
-                .into_diagnostic()
-                .wrap_err_with(|| {
-                    format!(
-                        "failed to remove direct output directory `{}`",
-                        root.display()
-                    )
-                })?;
-        } else {
-            return Err(miette::miette!(
-                "direct output path `{}` is not a directory",
-                root.display()
-            ));
-        }
-    }
-
-    std::fs::create_dir_all(root)
-        .into_diagnostic()
-        .wrap_err_with(|| {
-            format!(
-                "failed to create direct output directory `{}`",
-                root.display()
-            )
-        })?;
-
-    for (rel_path, content) in &artifact.files {
+    for (rel_path, content) in files {
         let full_path = root.join(rel_path);
         if let Some(parent) = full_path.parent() {
             std::fs::create_dir_all(parent)
@@ -4617,7 +4914,7 @@ fn write_direct_output(root: &Path, artifact: &DirectArtifact) -> Result<()> {
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to write `{}`", full_path.display()))?;
         #[cfg(unix)]
-        if rel_path.as_path() == Path::new(RUN_SCRIPT_FILENAME) {
+        if executable_rel_path.is_some_and(|expected| rel_path.as_path() == expected) {
             use std::os::unix::fs::PermissionsExt as _;
             let mut perms = std::fs::metadata(&full_path)
                 .into_diagnostic()
@@ -4637,9 +4934,38 @@ fn write_direct_output(root: &Path, artifact: &DirectArtifact) -> Result<()> {
 mod tests {
     use super::*;
 
+    struct EnvVarRestore {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarRestore {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(name);
+            unsafe {
+                std::env::set_var(name, value);
+            }
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe {
+                    std::env::set_var(self.name, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.name);
+                },
+            }
+        }
+    }
+
     fn test_proxy_args() -> ProxyArgs {
         ProxyArgs {
             output: String::new(),
+            project_name: None,
             slot: Vec::new(),
             export: Vec::new(),
             mesh_addr: None,
@@ -4667,6 +4993,83 @@ mod tests {
             "error,amber=error,amber_=error,amber_router=error,amber.binding=error,amber.\
              proxy=error"
         );
+    }
+
+    #[test]
+    fn parse_compose_project_names_ignores_empty_lines() {
+        let projects = parse_compose_project_names("alpha\n\n beta \n");
+        assert_eq!(
+            projects,
+            BTreeSet::from(["alpha".to_string(), "beta".to_string()])
+        );
+    }
+
+    #[test]
+    fn choose_compose_project_name_prefers_single_running_stack() {
+        let discovered = BTreeSet::from(["custom-stack".to_string()]);
+        let selected = choose_compose_project_name(
+            None,
+            &discovered,
+            Some("tmp"),
+            Path::new("/tmp/amber.yaml"),
+        )
+        .expect("selection should succeed");
+        assert_eq!(selected.as_deref(), Some("custom-stack"));
+    }
+
+    #[test]
+    fn choose_compose_project_name_prefers_env_override() {
+        let discovered = BTreeSet::from(["custom-stack".to_string()]);
+        let selected = choose_compose_project_name(
+            Some("from-env"),
+            &discovered,
+            Some("tmp"),
+            Path::new("/tmp/amber.yaml"),
+        )
+        .expect("selection should succeed");
+        assert_eq!(selected.as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn choose_compose_project_name_rejects_multiple_running_stacks() {
+        let discovered = BTreeSet::from(["stack-a".to_string(), "stack-b".to_string()]);
+        let err = choose_compose_project_name(
+            None,
+            &discovered,
+            Some("tmp"),
+            Path::new("/tmp/amber.yaml"),
+        )
+        .expect_err("selection should fail");
+        let rendered = err.to_string();
+        assert!(rendered.contains("stack-a"), "{rendered}");
+        assert!(rendered.contains("stack-b"), "{rendered}");
+        assert!(rendered.contains("--project-name"), "{rendered}");
+    }
+
+    #[test]
+    fn expand_env_templates_prefers_explicit_compose_project_name() {
+        let _compose_project = EnvVarRestore::set(COMPOSE_PROJECT_NAME_ENV, "from-env");
+
+        let result = expand_env_templates(
+            "${COMPOSE_PROJECT_NAME}/router/${COMPOSE_PROJECT_NAME:-fallback}",
+            Some("from-flag"),
+        )
+        .expect("template should render");
+
+        assert_eq!(result, "from-flag/router/from-flag");
+    }
+
+    #[test]
+    fn expand_env_templates_uses_env_for_other_names() {
+        let _test_env = EnvVarRestore::set("AMBER_TEMPLATE_TEST", "from-env");
+
+        let result = expand_env_templates(
+            "${AMBER_TEMPLATE_TEST}/${AMBER_TEMPLATE_TEST:-fallback}",
+            Some("from-flag"),
+        )
+        .expect("template should render");
+
+        assert_eq!(result, "from-env/from-env");
     }
 
     #[test]

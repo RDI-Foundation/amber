@@ -1,7 +1,9 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
-    path::PathBuf,
+    fmt,
+    ops::Deref,
+    path::{Path, PathBuf},
 };
 
 use amber_config as rc;
@@ -19,7 +21,13 @@ use framework_docker_injection::{
 
 use crate::{
     CompileOutput,
-    reporter::{Reporter, ReporterError},
+    reporter::{
+        Reporter, ReporterError,
+        execution_guide::{
+            GENERATED_COMPOSE_FILENAME, GENERATED_ENV_SAMPLE_FILENAME, GENERATED_README_FILENAME,
+            build_execution_guide,
+        },
+    },
     targets::{
         mesh::{
             addressing::{
@@ -85,12 +93,52 @@ const DOCKER_CONTAINER_LOGS_DIR: &str = "/var/lib/docker/containers";
 const LOG_LABEL_MONIKER: &str = "amber_component_moniker";
 const LOG_LABEL_SERVICE_NAME: &str = "amber_service_name";
 const LOG_LABEL_LIST: &str = "amber_component_moniker,amber_service_name";
+pub const COMPOSE_FILENAME: &str = GENERATED_COMPOSE_FILENAME;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DockerComposeReporter;
 
+#[derive(Clone, Debug)]
+pub struct DockerComposeArtifact {
+    pub files: BTreeMap<PathBuf, String>,
+}
+
+impl DockerComposeArtifact {
+    pub fn compose_yaml(&self) -> &str {
+        self.files
+            .get(Path::new(GENERATED_COMPOSE_FILENAME))
+            .expect("compose artifact should include compose.yaml")
+    }
+}
+
+impl fmt::Display for DockerComposeArtifact {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.compose_yaml())
+    }
+}
+
+impl Deref for DockerComposeArtifact {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.compose_yaml()
+    }
+}
+
+impl AsRef<str> for DockerComposeArtifact {
+    fn as_ref(&self) -> &str {
+        self.compose_yaml()
+    }
+}
+
+impl AsRef<[u8]> for DockerComposeArtifact {
+    fn as_ref(&self) -> &[u8] {
+        self.compose_yaml().as_bytes()
+    }
+}
+
 impl Reporter for DockerComposeReporter {
-    type Artifact = String;
+    type Artifact = DockerComposeArtifact;
 
     fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError> {
         render_docker_compose(output)
@@ -273,11 +321,11 @@ impl DockerComposeError {
 
 type DcResult<T> = Result<T, DockerComposeError>;
 
-fn render_docker_compose(output: &CompileOutput) -> Result<String, ReporterError> {
+fn render_docker_compose(output: &CompileOutput) -> Result<DockerComposeArtifact, ReporterError> {
     render_docker_compose_inner(output).map_err(|err| err.into_reporter_error(output))
 }
 
-fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
+fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<DockerComposeArtifact> {
     let transformed =
         rewrite_framework_docker_as_injected_component(&output.scenario).map_err(dc_other)?;
     let s = &transformed.scenario;
@@ -806,9 +854,23 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<String> {
         compose.x_amber = proxy_metadata;
     }
 
-    serde_yaml::to_string(&compose).map_err(|e| {
+    let compose_yaml = serde_yaml::to_string(&compose).map_err(|e| {
         DockerComposeError::Other(format!("failed to serialize docker-compose yaml: {e}"))
-    })
+    })?;
+    let execution_guide = build_execution_guide(&output.scenario, &mesh_plan, &config_plan)
+        .map_err(|err: ReporterError| DockerComposeError::Other(err.to_string()))?;
+    let mut files = BTreeMap::new();
+    files.insert(PathBuf::from(GENERATED_COMPOSE_FILENAME), compose_yaml);
+    files.insert(
+        PathBuf::from(GENERATED_ENV_SAMPLE_FILENAME),
+        execution_guide.render_env_sample(true, "docker-compose"),
+    );
+    files.insert(
+        PathBuf::from(GENERATED_README_FILENAME),
+        execution_guide.render_compose_readme(),
+    );
+
+    Ok(DockerComposeArtifact { files })
 }
 
 // ---- helpers ----
