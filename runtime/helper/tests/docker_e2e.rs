@@ -5,7 +5,9 @@ use std::{
     process::{Command, Output},
 };
 
-use amber_template::{ConfigTemplatePayload, ProgramTemplateSpec, TemplatePart, TemplateSpec};
+use amber_template::{
+    ConfigTemplatePayload, ProgramArgTemplate, ProgramTemplateSpec, TemplatePart, TemplateSpec,
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::json;
 use tempfile::tempdir;
@@ -115,9 +117,9 @@ fn helper_image_executes_run_plan_in_scratch() {
     let template_spec = TemplateSpec {
         program: ProgramTemplateSpec {
             entrypoint: vec![
-                vec![TemplatePart::lit("/amber-helper")],
-                vec![TemplatePart::lit("install")],
-                vec![TemplatePart::config("dest")],
+                ProgramArgTemplate::Arg(vec![TemplatePart::lit("/amber-helper")]),
+                ProgramArgTemplate::Arg(vec![TemplatePart::lit("install")]),
+                ProgramArgTemplate::Arg(vec![TemplatePart::config("dest")]),
             ],
             env: BTreeMap::new(),
         },

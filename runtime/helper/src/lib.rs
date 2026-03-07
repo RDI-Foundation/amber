@@ -1,7 +1,9 @@
 use std::{collections::BTreeMap, ffi::OsString};
 
 use amber_config::{self as config, CONFIG_ENV_PREFIX, ConfigError};
-use amber_template::{ConfigTemplatePayload, RuntimeTemplateContext, TemplateSpec};
+use amber_template::{
+    ConfigTemplatePayload, ProgramArgTemplate, RuntimeTemplateContext, TemplateSpec,
+};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -240,7 +242,7 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
         let root_config = config::build_root_config(&root_schema, &config_env)?;
 
         // 2) Resolve component config from template.
-        let component_config = config::eval_config_template_with_context(
+        let component_config = config::eval_config_template_partial_with_context(
             &component_template,
             &root_config,
             &runtime_template_context,
@@ -287,19 +289,17 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
             component_config.as_ref().unwrap_or(&empty_component_config)
         };
 
-        if spec.program.entrypoint.is_empty() {
+        let mut entrypoint: Vec<String> = Vec::new();
+        render_program_arg_templates(
+            &spec.program.entrypoint,
+            component_config,
+            &runtime_template_context,
+            &mut entrypoint,
+        )?;
+        if entrypoint.is_empty() {
             return Err(HelperError::Interp(
                 "program.entrypoint is empty; cannot exec".to_string(),
             ));
-        }
-
-        let mut entrypoint: Vec<String> = Vec::with_capacity(spec.program.entrypoint.len());
-        for ts in &spec.program.entrypoint {
-            entrypoint.push(config::render_template_string_with_context(
-                ts,
-                component_config,
-                &runtime_template_context,
-            )?);
         }
 
         let mut rendered_env: BTreeMap<String, String> = BTreeMap::new();
@@ -354,7 +354,7 @@ fn template_spec_requires_config(spec: &TemplateSpec) -> bool {
     spec.program
         .entrypoint
         .iter()
-        .any(|parts| template_string_requires_config(parts))
+        .any(program_arg_template_requires_config)
         || spec
             .program
             .env
@@ -362,10 +362,62 @@ fn template_spec_requires_config(spec: &TemplateSpec) -> bool {
             .any(|parts| template_string_requires_config(parts))
 }
 
+fn program_arg_template_requires_config(arg: &ProgramArgTemplate) -> bool {
+    match arg {
+        ProgramArgTemplate::Arg(parts) => template_string_requires_config(parts),
+        ProgramArgTemplate::Group(group) => {
+            !group.when_present.is_empty()
+                || group
+                    .argv
+                    .iter()
+                    .any(|parts| template_string_requires_config(parts))
+        }
+    }
+}
+
 fn template_string_requires_config(parts: &[amber_template::TemplatePart]) -> bool {
     parts
         .iter()
         .any(|part| matches!(part, amber_template::TemplatePart::Config { .. }))
+}
+
+fn render_program_arg_templates(
+    args: &[ProgramArgTemplate],
+    component_config: &Value,
+    runtime_template_context: &RuntimeTemplateContext,
+    out: &mut Vec<String>,
+) -> Result<()> {
+    for arg in args {
+        match arg {
+            ProgramArgTemplate::Arg(parts) => {
+                out.push(config::render_template_string_with_context(
+                    parts,
+                    component_config,
+                    runtime_template_context,
+                )?);
+            }
+            ProgramArgTemplate::Group(group) => {
+                let present = config_path_is_present(component_config, &group.when_present)?;
+                if !present {
+                    continue;
+                }
+                for parts in &group.argv {
+                    out.push(config::render_template_string_with_context(
+                        parts,
+                        component_config,
+                        runtime_template_context,
+                    )?);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn config_path_is_present(config_value: &Value, path: &str) -> Result<bool> {
+    config::get_by_path_opt(config_value, path)
+        .map(|value| value.is_some_and(|value| !value.is_null()))
+        .map_err(HelperError::from)
 }
 
 fn decode_b64_json(name: &'static str, raw: &str) -> Result<Value> {
@@ -417,7 +469,7 @@ fn write_mounts(mounts: &[MountSpec], component_config: Option<&Value>) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use amber_template::TemplatePart;
+    use amber_template::{ProgramArgTemplate, TemplatePart};
     use base64::engine::general_purpose::STANDARD;
 
     use super::*;
@@ -448,8 +500,11 @@ mod tests {
         let template_spec = TemplateSpec {
             program: amber_template::ProgramTemplateSpec {
                 entrypoint: vec![
-                    vec![TemplatePart::lit("/app/bin/server")],
-                    vec![TemplatePart::lit("--token="), TemplatePart::config("token")],
+                    ProgramArgTemplate::Arg(vec![TemplatePart::lit("/app/bin/server")]),
+                    ProgramArgTemplate::Arg(vec![
+                        TemplatePart::lit("--token="),
+                        TemplatePart::config("token"),
+                    ]),
                 ],
                 env: BTreeMap::from([("COUNT".to_string(), vec![TemplatePart::config("count")])]),
             },
@@ -495,6 +550,118 @@ mod tests {
                 .any(|k| k.to_string_lossy().starts_with(CONFIG_ENV_PREFIX))
         );
         assert!(!plan.env.contains_key(&OsString::from(TEMPLATE_SPEC_ENV)));
+    }
+
+    #[test]
+    fn build_run_plan_skips_conditional_program_arg_group_when_config_is_missing() {
+        let root_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "profile": { "type": "string" }
+            }
+        });
+
+        let component_schema = root_schema.clone();
+
+        let template_spec = TemplateSpec {
+            program: amber_template::ProgramTemplateSpec {
+                entrypoint: vec![
+                    ProgramArgTemplate::Arg(vec![TemplatePart::lit("/app/bin/server")]),
+                    ProgramArgTemplate::Group(amber_template::ConditionalProgramArgTemplate {
+                        when_present: "profile".to_string(),
+                        argv: vec![
+                            vec![TemplatePart::lit("--profile")],
+                            vec![TemplatePart::config("profile")],
+                        ],
+                    }),
+                ],
+                env: BTreeMap::new(),
+            },
+        };
+
+        let env = BTreeMap::from([
+            ("PATH".to_string(), "/bin".to_string()),
+            (
+                TEMPLATE_SPEC_ENV.to_string(),
+                encode_spec_b64(&template_spec),
+            ),
+            (
+                COMPONENT_TEMPLATE_ENV.to_string(),
+                encode_json_b64(&ConfigTemplatePayload::Root.to_value()),
+            ),
+            (
+                COMPONENT_SCHEMA_ENV.to_string(),
+                encode_json_b64(&component_schema),
+            ),
+            (ROOT_SCHEMA_ENV.to_string(), encode_json_b64(&root_schema)),
+        ]);
+
+        let os_env = env
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let plan = build_run_plan(os_env).expect("run plan should build");
+
+        assert_eq!(plan.entrypoint, vec!["/app/bin/server".to_string()]);
+    }
+
+    #[test]
+    fn build_run_plan_renders_conditional_program_arg_group_when_config_is_present() {
+        let root_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "profile": { "type": "string" }
+            }
+        });
+
+        let component_schema = root_schema.clone();
+
+        let template_spec = TemplateSpec {
+            program: amber_template::ProgramTemplateSpec {
+                entrypoint: vec![
+                    ProgramArgTemplate::Arg(vec![TemplatePart::lit("/app/bin/server")]),
+                    ProgramArgTemplate::Group(amber_template::ConditionalProgramArgTemplate {
+                        when_present: "profile".to_string(),
+                        argv: vec![
+                            vec![TemplatePart::lit("--profile")],
+                            vec![TemplatePart::config("profile")],
+                        ],
+                    }),
+                ],
+                env: BTreeMap::new(),
+            },
+        };
+
+        let env = BTreeMap::from([
+            ("PATH".to_string(), "/bin".to_string()),
+            (
+                TEMPLATE_SPEC_ENV.to_string(),
+                encode_spec_b64(&template_spec),
+            ),
+            (
+                COMPONENT_TEMPLATE_ENV.to_string(),
+                encode_json_b64(&ConfigTemplatePayload::Root.to_value()),
+            ),
+            (
+                COMPONENT_SCHEMA_ENV.to_string(),
+                encode_json_b64(&component_schema),
+            ),
+            (ROOT_SCHEMA_ENV.to_string(), encode_json_b64(&root_schema)),
+            ("AMBER_CONFIG_PROFILE".to_string(), "dev".to_string()),
+        ]);
+
+        let os_env = env
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let plan = build_run_plan(os_env).expect("run plan should build");
+
+        assert_eq!(
+            plan.entrypoint,
+            vec![
+                "/app/bin/server".to_string(),
+                "--profile".to_string(),
+                "dev".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -580,9 +747,9 @@ mod tests {
         let template_spec = TemplateSpec {
             program: amber_template::ProgramTemplateSpec {
                 entrypoint: vec![
-                    vec![TemplatePart::lit("/app/bin/server")],
-                    vec![TemplatePart::slot(7, "api.url")],
-                    vec![TemplatePart::binding(11, "upstream.url")],
+                    ProgramArgTemplate::Arg(vec![TemplatePart::lit("/app/bin/server")]),
+                    ProgramArgTemplate::Arg(vec![TemplatePart::slot(7, "api.url")]),
+                    ProgramArgTemplate::Arg(vec![TemplatePart::binding(11, "upstream.url")]),
                 ],
                 env: BTreeMap::from([(
                     "UPSTREAM".to_string(),

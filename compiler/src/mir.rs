@@ -897,9 +897,20 @@ fn collect_program_used_slots(component: &amber_scenario::Component) -> Vec<Stri
         return all_slots();
     }
 
-    for arg in &program.command().0 {
-        if arg.visit_slot_uses(|slot| mark_slot(slot, &mut used)) {
-            return all_slots();
+    for item in &program.command().0 {
+        match item {
+            amber_manifest::ProgramArgItem::Arg(arg) => {
+                if arg.visit_slot_uses(|slot| mark_slot(slot, &mut used)) {
+                    return all_slots();
+                }
+            }
+            amber_manifest::ProgramArgItem::Group(group) => {
+                for arg in &group.argv.0 {
+                    if arg.visit_slot_uses(|slot| mark_slot(slot, &mut used)) {
+                        return all_slots();
+                    }
+                }
+            }
         }
     }
 

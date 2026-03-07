@@ -5,9 +5,14 @@ use std::{
 };
 
 use amber_config as rc;
-use amber_manifest::{InterpolatedPart, InterpolationSource, MountSource, framework_capability};
+use amber_manifest::{
+    InterpolatedPart, InterpolationSource, MountSource, ProgramArgItem, framework_capability,
+};
 use amber_scenario::{ComponentId, Scenario};
-use amber_template::{ProgramTemplateSpec, TemplatePart, TemplateSpec, TemplateString};
+use amber_template::{
+    ConditionalProgramArgTemplate, ProgramArgTemplate, ProgramTemplateSpec, TemplatePart,
+    TemplateSpec, TemplateString,
+};
 use base64::Engine as _;
 use serde::Serialize;
 use serde_json::Value;
@@ -132,6 +137,13 @@ impl ProgramPlan {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigPresence {
+    Present,
+    Absent,
+    Runtime,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum ProgramSourcePlan {
     Image {
@@ -201,7 +213,17 @@ pub(crate) fn build_config_plan(
         let Some(program) = component.program.as_ref() else {
             continue;
         };
-        let used_paths = program_used_config_paths(program);
+        let template_opt = composed
+            .templates
+            .get(id)
+            .and_then(|template| template.node());
+        let slots = slot_values_by_component.get(id).ok_or_else(|| {
+            MeshError::new(format!(
+                "internal error: missing slot values for {}",
+                component_label(scenario, *id)
+            ))
+        })?;
+        let used_paths = program_used_config_paths(program, template_opt, slots)?;
         if !used_paths.is_empty() {
             used_config_paths_by_component.insert(*id, used_paths);
         }
@@ -540,8 +562,16 @@ pub(crate) fn build_component_runtime_plan<'a>(
 }
 
 fn collect_used_paths_from_template_spec(spec: &TemplateSpec, out: &mut BTreeSet<String>) {
-    for ts in &spec.program.entrypoint {
-        collect_used_paths_from_template_string(ts, out);
+    for arg in &spec.program.entrypoint {
+        match arg {
+            ProgramArgTemplate::Arg(ts) => collect_used_paths_from_template_string(ts, out),
+            ProgramArgTemplate::Group(group) => {
+                out.insert(group.when_present.clone());
+                for ts in &group.argv {
+                    collect_used_paths_from_template_string(ts, out);
+                }
+            }
+        }
     }
     for ts in spec.program.env.values() {
         collect_used_paths_from_template_string(ts, out);
@@ -720,7 +750,11 @@ fn collect_required_bindings_by_scope(
     Ok(out)
 }
 
-fn program_used_config_paths(program: &amber_manifest::Program) -> BTreeSet<String> {
+fn program_used_config_paths(
+    program: &amber_manifest::Program,
+    template_opt: Option<&rc::ConfigNode>,
+    slots: &BTreeMap<String, SlotObject>,
+) -> Result<BTreeSet<String>, MeshError> {
     let mut used = BTreeSet::new();
 
     if let Some(executable) = program.path_ref().or_else(|| program.image_ref())
@@ -729,7 +763,33 @@ fn program_used_config_paths(program: &amber_manifest::Program) -> BTreeSet<Stri
         collect_program_config_paths(&parsed.parts, &mut used);
     }
     for arg in &program.command().0 {
-        collect_program_config_paths(&arg.parts, &mut used);
+        match arg {
+            ProgramArgItem::Arg(arg) => collect_program_config_paths(&arg.parts, &mut used),
+            ProgramArgItem::Group(group) => {
+                match resolve_condition_presence_for_program(
+                    group.when_present.source(),
+                    group.when_present.query(),
+                    template_opt,
+                    slots,
+                )? {
+                    ConfigPresence::Present => {
+                        if group.when_present.source() == InterpolationSource::Config {
+                            used.insert(group.when_present.query().to_string());
+                        }
+                        for arg in &group.argv.0 {
+                            collect_program_config_paths(&arg.parts, &mut used);
+                        }
+                    }
+                    ConfigPresence::Absent => {}
+                    ConfigPresence::Runtime => {
+                        used.insert(group.when_present.query().to_string());
+                        for arg in &group.argv.0 {
+                            collect_program_config_paths(&arg.parts, &mut used);
+                        }
+                    }
+                }
+            }
+        }
     }
     for value in program.env().values() {
         collect_program_config_paths(&value.parts, &mut used);
@@ -743,7 +803,7 @@ fn program_used_config_paths(program: &amber_manifest::Program) -> BTreeSet<Stri
         }
     }
 
-    used
+    Ok(used)
 }
 
 fn collect_program_config_paths(parts: &[InterpolatedPart], out: &mut BTreeSet<String>) {
@@ -755,6 +815,98 @@ fn collect_program_config_paths(parts: &[InterpolatedPart], out: &mut BTreeSet<S
             out.insert(query.clone());
         }
     }
+}
+
+fn resolve_condition_presence_for_program(
+    source: InterpolationSource,
+    query: &str,
+    template_opt: Option<&rc::ConfigNode>,
+    slots: &BTreeMap<String, SlotObject>,
+) -> Result<ConfigPresence, MeshError> {
+    match source {
+        InterpolationSource::Config => {
+            let Some(template) = template_opt else {
+                return Ok(ConfigPresence::Runtime);
+            };
+            match resolve_optional_config_query_node(template, query)? {
+                None => Ok(ConfigPresence::Absent),
+                Some(QueryResolution::RuntimePath(_)) => Ok(ConfigPresence::Runtime),
+                Some(QueryResolution::Node(node)) => {
+                    if node.contains_runtime() {
+                        Ok(ConfigPresence::Runtime)
+                    } else {
+                        let value = node
+                            .evaluate_static()
+                            .map_err(|err| MeshError::new(err.to_string()))?;
+                        if value.is_null() {
+                            Ok(ConfigPresence::Absent)
+                        } else {
+                            Ok(ConfigPresence::Present)
+                        }
+                    }
+                }
+            }
+        }
+        InterpolationSource::Slots => Ok(if slot_query_is_present(slots, query)? {
+            ConfigPresence::Present
+        } else {
+            ConfigPresence::Absent
+        }),
+        InterpolationSource::Bindings => Err(MeshError::new(format!(
+            "unsupported conditional interpolation source bindings.{query}"
+        ))),
+        _ => Err(MeshError::new(format!(
+            "unsupported conditional interpolation source for `{source}.{query}`"
+        ))),
+    }
+}
+
+fn slot_query_is_present(
+    slots: &BTreeMap<String, SlotObject>,
+    query: &str,
+) -> Result<bool, MeshError> {
+    let parsed = crate::slot_query::parse_slot_query(query).map_err(|err| {
+        MeshError::new(format!(
+            "invalid slots interpolation 'slots.{query}': {err}"
+        ))
+    })?;
+    Ok(match parsed.target {
+        crate::slot_query::SlotTarget::All => !slots.is_empty(),
+        crate::slot_query::SlotTarget::Slot(slot) => slots.contains_key(slot),
+    })
+}
+
+fn resolve_optional_config_query_node<'a>(
+    template: &'a rc::ConfigNode,
+    query: &str,
+) -> Result<Option<QueryResolution<'a>>, MeshError> {
+    if query.is_empty() {
+        return Ok(Some(QueryResolution::Node(template)));
+    }
+
+    let segments = parse_query_segments(query)?;
+    let mut current = template;
+    for (idx, seg) in segments.iter().enumerate() {
+        match current {
+            rc::ConfigNode::Object(map) => {
+                let Some(next) = map.get(*seg) else {
+                    return Ok(None);
+                };
+                current = next;
+            }
+            rc::ConfigNode::ConfigRef(path) => {
+                let suffix = segments[idx..].join(".");
+                let full = if path.is_empty() {
+                    suffix
+                } else {
+                    format!("{path}.{suffix}")
+                };
+                return Ok(Some(QueryResolution::RuntimePath(full)));
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(QueryResolution::Node(current)))
 }
 
 fn collect_required_bindings_in_paths(
@@ -1356,6 +1508,103 @@ fn resolve_program_template_string(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn append_program_command_item_templates(
+    scenario: &Scenario,
+    id: ComponentId,
+    location_prefix: &str,
+    idx: usize,
+    item: &ProgramArgItem,
+    runtime_address_resolution: RuntimeAddressResolution,
+    slots: &BTreeMap<String, SlotObject>,
+    bindings: &BTreeMap<String, BindingObject>,
+    template_opt: Option<&rc::ConfigNode>,
+    needs_helper_for_program_templates: &mut bool,
+    needs_runtime_config_for_program_templates: &mut bool,
+    out: &mut Vec<ProgramArgTemplate>,
+) -> Result<(), MeshError> {
+    match item {
+        ProgramArgItem::Arg(arg) => {
+            let location = format!("{location_prefix}[{idx}]");
+            let ts = resolve_program_template_string(
+                scenario,
+                id,
+                &location,
+                arg,
+                runtime_address_resolution,
+                slots,
+                bindings,
+                template_opt,
+                needs_helper_for_program_templates,
+                needs_runtime_config_for_program_templates,
+                true,
+            )?;
+            out.push(ProgramArgTemplate::Arg(ts));
+        }
+        ProgramArgItem::Group(group) => match resolve_condition_presence_for_program(
+            group.when_present.source(),
+            group.when_present.query(),
+            template_opt,
+            slots,
+        )? {
+            ConfigPresence::Absent => {}
+            ConfigPresence::Present => {
+                for (group_idx, arg) in group.argv.0.iter().enumerate() {
+                    let location = format!("{location_prefix}[{idx}].argv[{group_idx}]");
+                    let ts = resolve_program_template_string(
+                        scenario,
+                        id,
+                        &location,
+                        arg,
+                        runtime_address_resolution,
+                        slots,
+                        bindings,
+                        template_opt,
+                        needs_helper_for_program_templates,
+                        needs_runtime_config_for_program_templates,
+                        true,
+                    )?;
+                    out.push(ProgramArgTemplate::Arg(ts));
+                }
+            }
+            ConfigPresence::Runtime => {
+                if group.when_present.source() != InterpolationSource::Config {
+                    return Err(MeshError::new(format!(
+                        "internal error: runtime conditional program arg group requires \
+                         config-based `when_present`, got `{}`",
+                        group.when_present
+                    )));
+                }
+                let mut argv = Vec::with_capacity(group.argv.0.len());
+                for (group_idx, arg) in group.argv.0.iter().enumerate() {
+                    let location = format!("{location_prefix}[{idx}].argv[{group_idx}]");
+                    let ts = resolve_program_template_string(
+                        scenario,
+                        id,
+                        &location,
+                        arg,
+                        runtime_address_resolution,
+                        slots,
+                        bindings,
+                        template_opt,
+                        needs_helper_for_program_templates,
+                        needs_runtime_config_for_program_templates,
+                        true,
+                    )?;
+                    argv.push(ts);
+                }
+                *needs_helper_for_program_templates = true;
+                *needs_runtime_config_for_program_templates = true;
+                out.push(ProgramArgTemplate::Group(ConditionalProgramArgTemplate {
+                    when_present: group.when_present.query().to_string(),
+                    argv,
+                }));
+            }
+        },
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_program_plan(
     scenario: &Scenario,
     id: ComponentId,
@@ -1368,7 +1617,7 @@ fn build_program_plan(
     component_schema: Option<&Value>,
 ) -> Result<ProgramPlan, MeshError> {
     let component = component_label(scenario, id);
-    let mut entrypoint_ts: Vec<TemplateString> = Vec::new();
+    let mut entrypoint_ts: Vec<ProgramArgTemplate> = Vec::new();
     let mut needs_helper_for_program_templates = false;
     let mut needs_runtime_config_for_program_templates = false;
     let (source, program_env) = match program {
@@ -1456,22 +1705,21 @@ fn build_program_plan(
                 ProgramImagePlan::Static(rendered)
             };
 
-            for (idx, arg) in program.entrypoint.0.iter().enumerate() {
-                let location = format!("program.entrypoint[{idx}]");
-                let ts = resolve_program_template_string(
+            for (idx, item) in program.entrypoint.0.iter().enumerate() {
+                append_program_command_item_templates(
                     scenario,
                     id,
-                    &location,
-                    arg,
+                    "program.entrypoint",
+                    idx,
+                    item,
                     runtime_address_resolution,
                     slots,
                     bindings,
                     template_opt,
                     &mut needs_helper_for_program_templates,
                     &mut needs_runtime_config_for_program_templates,
-                    true,
+                    &mut entrypoint_ts,
                 )?;
-                entrypoint_ts.push(ts);
             }
 
             (
@@ -1518,24 +1766,23 @@ fn build_program_plan(
                 )));
             }
             validate_explicit_program_path(&component, &render_template_string_static(&path_ts)?)?;
-            entrypoint_ts.push(path_ts);
+            entrypoint_ts.push(ProgramArgTemplate::Arg(path_ts));
 
-            for (idx, arg) in program.args.0.iter().enumerate() {
-                let location = format!("program.args[{idx}]");
-                let ts = resolve_program_template_string(
+            for (idx, item) in program.args.0.iter().enumerate() {
+                append_program_command_item_templates(
                     scenario,
                     id,
-                    &location,
-                    arg,
+                    "program.args",
+                    idx,
+                    item,
                     runtime_address_resolution,
                     slots,
                     bindings,
                     template_opt,
                     &mut needs_helper_for_program_templates,
                     &mut needs_runtime_config_for_program_templates,
-                    true,
+                    &mut entrypoint_ts,
                 )?;
-                entrypoint_ts.push(ts);
             }
 
             (ProgramSourcePlan::Path, &program.common.env)
@@ -1592,8 +1839,18 @@ fn build_program_plan(
     } else {
         let rendered_entrypoint = entrypoint_ts
             .into_iter()
-            .map(|ts| render_template_string_static(&ts))
+            .map(|arg| match arg {
+                ProgramArgTemplate::Arg(ts) => render_template_string_static(&ts),
+                ProgramArgTemplate::Group(_) => Err(MeshError::new(
+                    "internal error: conditional arg group reached resolved program plan",
+                )),
+            })
             .collect::<Result<Vec<_>, _>>()?;
+        if rendered_entrypoint.is_empty() {
+            return Err(MeshError::new(format!(
+                "component {component} resolves to an empty program entrypoint"
+            )));
+        }
         let rendered_env = env_ts
             .into_iter()
             .map(|(k, ts)| render_template_string_static(&ts).map(|rendered| (k, rendered)))

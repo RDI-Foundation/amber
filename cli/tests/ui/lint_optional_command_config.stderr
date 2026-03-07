@@ -1,0 +1,13 @@
+manifest::optional_command_config
+
+  x command argument references optional config `profile` without `when_present` (in component /)
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/lint_optional_command_config.json5:11:25]
+ 10 |     path: "/bin/echo",
+ 11 |     args: ["--profile", "${config.profile}"],
+    :                         ^^^^^^^^^|^^^^^^^^^
+    :                                  `-- unguarded optional config interpolation
+ 12 |     network: {
+    `----
+  help: warning treated as error because it was denied via `-D warnings`
+        Wrap the argument in `{ when_present: "config.profile", argv: [...] }` if it should disappear when unset, or make `config.profile` required.
+Error:   × check failed

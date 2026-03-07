@@ -31,6 +31,13 @@ pub enum Error {
     #[diagnostic(code(manifest::invalid_interpolation))]
     InvalidInterpolation(String),
 
+    #[error(
+        "invalid conditional interpolation path `{0}`: expected `config`, `config.<path>`, \
+         `slots`, or `slots.<path>`"
+    )]
+    #[diagnostic(code(manifest::invalid_conditional_interpolation_path))]
+    InvalidConditionalInterpolationPath(String),
+
     #[error("invalid component ref `{input}`: {message}")]
     #[diagnostic(code(manifest::invalid_component_ref))]
     InvalidComponentRef { input: String, message: String },

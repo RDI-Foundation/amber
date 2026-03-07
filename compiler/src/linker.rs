@@ -1060,13 +1060,38 @@ fn validate_config_tree(
         } else {
             "program.args"
         };
-        for (arg_idx, arg) in program.command().0.iter().enumerate() {
-            for part in &arg.parts {
-                let InterpolatedPart::Interpolation { source, query } = part else {
-                    continue;
-                };
-                if *source == InterpolationSource::Config {
-                    validate_config_ref(format!("{command_location}[{arg_idx}]"), query);
+        for (arg_idx, item) in program.command().0.iter().enumerate() {
+            match item {
+                amber_manifest::ProgramArgItem::Arg(arg) => {
+                    for part in &arg.parts {
+                        let InterpolatedPart::Interpolation { source, query } = part else {
+                            continue;
+                        };
+                        if *source == InterpolationSource::Config {
+                            validate_config_ref(format!("{command_location}[{arg_idx}]"), query);
+                        }
+                    }
+                }
+                amber_manifest::ProgramArgItem::Group(group) => {
+                    if group.when_present.source() == InterpolationSource::Config {
+                        validate_config_ref(
+                            format!("{command_location}[{arg_idx}].when_present"),
+                            group.when_present.query(),
+                        );
+                    }
+                    for (group_idx, arg) in group.argv.0.iter().enumerate() {
+                        for part in &arg.parts {
+                            let InterpolatedPart::Interpolation { source, query } = part else {
+                                continue;
+                            };
+                            if *source == InterpolationSource::Config {
+                                validate_config_ref(
+                                    format!("{command_location}[{arg_idx}].argv[{group_idx}]"),
+                                    query,
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2070,10 +2095,22 @@ fn collect_program_slot_uses(manifest: &Manifest) -> HashSet<String> {
         }
     }
 
-    for arg in &program.command().0 {
-        used_all = add_program_slot_uses(manifest, &mut uses, arg);
-        if used_all {
-            return uses;
+    for item in &program.command().0 {
+        match item {
+            amber_manifest::ProgramArgItem::Arg(arg) => {
+                used_all = add_program_slot_uses(manifest, &mut uses, arg);
+                if used_all {
+                    return uses;
+                }
+            }
+            amber_manifest::ProgramArgItem::Group(group) => {
+                for arg in &group.argv.0 {
+                    used_all = add_program_slot_uses(manifest, &mut uses, arg);
+                    if used_all {
+                        return uses;
+                    }
+                }
+            }
         }
     }
 

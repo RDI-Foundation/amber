@@ -178,8 +178,20 @@ fn collect_config_uses(manifest: &Manifest) -> ConfigUses {
         {
             collect_config_uses_from_interpolated(&parsed, &mut uses);
         }
-        for arg in &program.command().0 {
-            collect_config_uses_from_interpolated(arg, &mut uses);
+        for item in &program.command().0 {
+            match item {
+                amber_manifest::ProgramArgItem::Arg(arg) => {
+                    collect_config_uses_from_interpolated(arg, &mut uses);
+                }
+                amber_manifest::ProgramArgItem::Group(group) => {
+                    if group.when_present.source() == InterpolationSource::Config {
+                        uses.add_query(group.when_present.query());
+                    }
+                    for arg in &group.argv.0 {
+                        collect_config_uses_from_interpolated(arg, &mut uses);
+                    }
+                }
+            }
         }
         for value in program.env().values() {
             collect_config_uses_from_interpolated(value, &mut uses);
@@ -389,10 +401,27 @@ fn validate_manifest_binding_interpolations(
                 validate_interpolated_string(&image, &ctx, location, span, &mut diagnostics);
             }
 
-            for (idx, arg) in program.entrypoint.0.iter().enumerate() {
-                let location = ProgramLocation::Entrypoint(idx);
-                let span = location.span(source.as_ref(), spans);
-                validate_interpolated_string(arg, &ctx, location, span, &mut diagnostics);
+            for (idx, item) in program.entrypoint.0.iter().enumerate() {
+                match item {
+                    amber_manifest::ProgramArgItem::Arg(arg) => {
+                        let location = ProgramLocation::Entrypoint(idx);
+                        let span = location.span(source.as_ref(), spans);
+                        validate_interpolated_string(arg, &ctx, location, span, &mut diagnostics);
+                    }
+                    amber_manifest::ProgramArgItem::Group(group) => {
+                        for (group_idx, arg) in group.argv.0.iter().enumerate() {
+                            let location = ProgramLocation::EntrypointGroup(idx, group_idx);
+                            let span = location.span(source.as_ref(), spans);
+                            validate_interpolated_string(
+                                arg,
+                                &ctx,
+                                location,
+                                span,
+                                &mut diagnostics,
+                            );
+                        }
+                    }
+                }
             }
         }
         Program::Path(program) => {
@@ -402,10 +431,27 @@ fn validate_manifest_binding_interpolations(
                 validate_interpolated_string(&path, &ctx, location, span, &mut diagnostics);
             }
 
-            for (idx, arg) in program.args.0.iter().enumerate() {
-                let location = ProgramLocation::Args(idx);
-                let span = location.span(source.as_ref(), spans);
-                validate_interpolated_string(arg, &ctx, location, span, &mut diagnostics);
+            for (idx, item) in program.args.0.iter().enumerate() {
+                match item {
+                    amber_manifest::ProgramArgItem::Arg(arg) => {
+                        let location = ProgramLocation::Args(idx);
+                        let span = location.span(source.as_ref(), spans);
+                        validate_interpolated_string(arg, &ctx, location, span, &mut diagnostics);
+                    }
+                    amber_manifest::ProgramArgItem::Group(group) => {
+                        for (group_idx, arg) in group.argv.0.iter().enumerate() {
+                            let location = ProgramLocation::ArgsGroup(idx, group_idx);
+                            let span = location.span(source.as_ref(), spans);
+                            validate_interpolated_string(
+                                arg,
+                                &ctx,
+                                location,
+                                span,
+                                &mut diagnostics,
+                            );
+                        }
+                    }
+                }
             }
         }
         _ => {}
@@ -643,7 +689,9 @@ enum ProgramLocation<'a> {
     Image,
     Path,
     Entrypoint(usize),
+    EntrypointGroup(usize, usize),
     Args(usize),
+    ArgsGroup(usize, usize),
     Env(&'a str),
 }
 
@@ -653,7 +701,13 @@ impl ProgramLocation<'_> {
             ProgramLocation::Image => "program.image".to_string(),
             ProgramLocation::Path => "program.path".to_string(),
             ProgramLocation::Entrypoint(idx) => format!("program.entrypoint[{idx}]"),
+            ProgramLocation::EntrypointGroup(idx, group_idx) => {
+                format!("program.entrypoint[{idx}].argv[{group_idx}]")
+            }
             ProgramLocation::Args(idx) => format!("program.args[{idx}]"),
+            ProgramLocation::ArgsGroup(idx, group_idx) => {
+                format!("program.args[{idx}].argv[{group_idx}]")
+            }
             ProgramLocation::Env(key) => format!("program.env.{key}"),
         }
     }
@@ -681,9 +735,45 @@ impl ProgramLocation<'_> {
                     .map(|p| p.whole)
                     .unwrap_or_else(|| (0usize, 0usize).into())
             }
+            ProgramLocation::EntrypointGroup(idx, group_idx) => {
+                let pointer = format!("/program/entrypoint/{idx}/argv/{group_idx}");
+                if let Some(span) = span_for_json_pointer(source, root, &pointer) {
+                    return span;
+                }
+                let outer = format!("/program/entrypoint/{idx}");
+                if let Some(span) = span_for_json_pointer(source, root, &outer) {
+                    return span;
+                }
+                if let Some(span) = span_for_json_pointer(source, root, "/program/entrypoint") {
+                    return span;
+                }
+                spans
+                    .program
+                    .as_ref()
+                    .map(|p| p.whole)
+                    .unwrap_or_else(|| (0usize, 0usize).into())
+            }
             ProgramLocation::Args(idx) => {
                 let pointer = format!("/program/args/{idx}");
                 if let Some(span) = span_for_json_pointer(source, root, &pointer) {
+                    return span;
+                }
+                if let Some(span) = span_for_json_pointer(source, root, "/program/args") {
+                    return span;
+                }
+                spans
+                    .program
+                    .as_ref()
+                    .map(|p| p.whole)
+                    .unwrap_or_else(|| (0usize, 0usize).into())
+            }
+            ProgramLocation::ArgsGroup(idx, group_idx) => {
+                let pointer = format!("/program/args/{idx}/argv/{group_idx}");
+                if let Some(span) = span_for_json_pointer(source, root, &pointer) {
+                    return span;
+                }
+                let outer = format!("/program/args/{idx}");
+                if let Some(span) = span_for_json_pointer(source, root, &outer) {
                     return span;
                 }
                 if let Some(span) = span_for_json_pointer(source, root, "/program/args") {

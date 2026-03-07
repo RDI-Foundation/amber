@@ -103,10 +103,38 @@ fn validate_manifest_slot_interpolations(
                 validate_interpolated_string(&image, &ctx, location, span, &mut diagnostics);
             }
 
-            for (idx, arg) in program.entrypoint.0.iter().enumerate() {
-                let location = SlotLocation::Entrypoint(idx);
-                let span = location.span(source.as_ref(), spans);
-                validate_interpolated_string(arg, &ctx, location, span, &mut diagnostics);
+            for (idx, item) in program.entrypoint.0.iter().enumerate() {
+                match item {
+                    amber_manifest::ProgramArgItem::Arg(arg) => {
+                        let location = SlotLocation::Entrypoint(idx);
+                        let span = location.span(source.as_ref(), spans);
+                        validate_interpolated_string(arg, &ctx, location, span, &mut diagnostics);
+                    }
+                    amber_manifest::ProgramArgItem::Group(group) => {
+                        if group.when_present.source() == InterpolationSource::Slots {
+                            let location = SlotLocation::EntrypointCondition(idx);
+                            let span = location.span(source.as_ref(), spans);
+                            validate_slot_condition(
+                                group.when_present.query(),
+                                &ctx,
+                                location,
+                                span,
+                                &mut diagnostics,
+                            );
+                        }
+                        for (group_idx, arg) in group.argv.0.iter().enumerate() {
+                            let location = SlotLocation::EntrypointGroup(idx, group_idx);
+                            let span = location.span(source.as_ref(), spans);
+                            validate_interpolated_string(
+                                arg,
+                                &ctx,
+                                location,
+                                span,
+                                &mut diagnostics,
+                            );
+                        }
+                    }
+                }
             }
         }
         Program::Path(program) => {
@@ -116,10 +144,38 @@ fn validate_manifest_slot_interpolations(
                 validate_interpolated_string(&path, &ctx, location, span, &mut diagnostics);
             }
 
-            for (idx, arg) in program.args.0.iter().enumerate() {
-                let location = SlotLocation::Args(idx);
-                let span = location.span(source.as_ref(), spans);
-                validate_interpolated_string(arg, &ctx, location, span, &mut diagnostics);
+            for (idx, item) in program.args.0.iter().enumerate() {
+                match item {
+                    amber_manifest::ProgramArgItem::Arg(arg) => {
+                        let location = SlotLocation::Args(idx);
+                        let span = location.span(source.as_ref(), spans);
+                        validate_interpolated_string(arg, &ctx, location, span, &mut diagnostics);
+                    }
+                    amber_manifest::ProgramArgItem::Group(group) => {
+                        if group.when_present.source() == InterpolationSource::Slots {
+                            let location = SlotLocation::ArgsCondition(idx);
+                            let span = location.span(source.as_ref(), spans);
+                            validate_slot_condition(
+                                group.when_present.query(),
+                                &ctx,
+                                location,
+                                span,
+                                &mut diagnostics,
+                            );
+                        }
+                        for (group_idx, arg) in group.argv.0.iter().enumerate() {
+                            let location = SlotLocation::ArgsGroup(idx, group_idx);
+                            let span = location.span(source.as_ref(), spans);
+                            validate_interpolated_string(
+                                arg,
+                                &ctx,
+                                location,
+                                span,
+                                &mut diagnostics,
+                            );
+                        }
+                    }
+                }
             }
         }
         _ => {}
@@ -139,7 +195,11 @@ enum SlotLocation<'a> {
     Image,
     Path,
     Entrypoint(usize),
+    EntrypointCondition(usize),
+    EntrypointGroup(usize, usize),
     Args(usize),
+    ArgsCondition(usize),
+    ArgsGroup(usize, usize),
     Env(&'a str),
 }
 
@@ -149,7 +209,17 @@ impl SlotLocation<'_> {
             SlotLocation::Image => "program.image".to_string(),
             SlotLocation::Path => "program.path".to_string(),
             SlotLocation::Entrypoint(idx) => format!("program.entrypoint[{idx}]"),
+            SlotLocation::EntrypointCondition(idx) => {
+                format!("program.entrypoint[{idx}].when_present")
+            }
+            SlotLocation::EntrypointGroup(idx, group_idx) => {
+                format!("program.entrypoint[{idx}].argv[{group_idx}]")
+            }
             SlotLocation::Args(idx) => format!("program.args[{idx}]"),
+            SlotLocation::ArgsCondition(idx) => format!("program.args[{idx}].when_present"),
+            SlotLocation::ArgsGroup(idx, group_idx) => {
+                format!("program.args[{idx}].argv[{group_idx}]")
+            }
             SlotLocation::Env(key) => format!("program.env.{key}"),
         }
     }
@@ -177,9 +247,81 @@ impl SlotLocation<'_> {
                     .map(|p| p.whole)
                     .unwrap_or_else(|| (0usize, 0usize).into())
             }
+            SlotLocation::EntrypointCondition(idx) => {
+                let pointer = format!("/program/entrypoint/{idx}/when_present");
+                if let Some(span) = span_for_json_pointer(source, root, &pointer) {
+                    return span;
+                }
+                let outer = format!("/program/entrypoint/{idx}");
+                if let Some(span) = span_for_json_pointer(source, root, &outer) {
+                    return span;
+                }
+                if let Some(span) = span_for_json_pointer(source, root, "/program/entrypoint") {
+                    return span;
+                }
+                spans
+                    .program
+                    .as_ref()
+                    .map(|p| p.whole)
+                    .unwrap_or_else(|| (0usize, 0usize).into())
+            }
+            SlotLocation::EntrypointGroup(idx, group_idx) => {
+                let pointer = format!("/program/entrypoint/{idx}/argv/{group_idx}");
+                if let Some(span) = span_for_json_pointer(source, root, &pointer) {
+                    return span;
+                }
+                let outer = format!("/program/entrypoint/{idx}");
+                if let Some(span) = span_for_json_pointer(source, root, &outer) {
+                    return span;
+                }
+                if let Some(span) = span_for_json_pointer(source, root, "/program/entrypoint") {
+                    return span;
+                }
+                spans
+                    .program
+                    .as_ref()
+                    .map(|p| p.whole)
+                    .unwrap_or_else(|| (0usize, 0usize).into())
+            }
             SlotLocation::Args(idx) => {
                 let pointer = format!("/program/args/{idx}");
                 if let Some(span) = span_for_json_pointer(source, root, &pointer) {
+                    return span;
+                }
+                if let Some(span) = span_for_json_pointer(source, root, "/program/args") {
+                    return span;
+                }
+                spans
+                    .program
+                    .as_ref()
+                    .map(|p| p.whole)
+                    .unwrap_or_else(|| (0usize, 0usize).into())
+            }
+            SlotLocation::ArgsCondition(idx) => {
+                let pointer = format!("/program/args/{idx}/when_present");
+                if let Some(span) = span_for_json_pointer(source, root, &pointer) {
+                    return span;
+                }
+                let outer = format!("/program/args/{idx}");
+                if let Some(span) = span_for_json_pointer(source, root, &outer) {
+                    return span;
+                }
+                if let Some(span) = span_for_json_pointer(source, root, "/program/args") {
+                    return span;
+                }
+                spans
+                    .program
+                    .as_ref()
+                    .map(|p| p.whole)
+                    .unwrap_or_else(|| (0usize, 0usize).into())
+            }
+            SlotLocation::ArgsGroup(idx, group_idx) => {
+                let pointer = format!("/program/args/{idx}/argv/{group_idx}");
+                if let Some(span) = span_for_json_pointer(source, root, &pointer) {
+                    return span;
+                }
+                let outer = format!("/program/args/{idx}");
+                if let Some(span) = span_for_json_pointer(source, root, &outer) {
                     return span;
                 }
                 if let Some(span) = span_for_json_pointer(source, root, "/program/args") {
@@ -203,6 +345,23 @@ impl SlotLocation<'_> {
             }
         }
     }
+}
+
+fn validate_slot_condition(
+    query: &str,
+    ctx: &SlotValidationContext<'_>,
+    location: SlotLocation<'_>,
+    span: SourceSpan,
+    diagnostics: &mut Vec<Report>,
+) {
+    let synthetic = if query.is_empty() {
+        "${slots}".to_string()
+    } else {
+        format!("${{slots.{query}}}")
+    }
+    .parse::<InterpolatedString>()
+    .expect("synthetic slots condition should parse");
+    validate_interpolated_string(&synthetic, ctx, location, span, diagnostics);
 }
 
 struct SlotValidationContext<'a> {

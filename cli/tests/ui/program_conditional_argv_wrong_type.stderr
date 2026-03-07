@@ -1,0 +1,12 @@
+Error: manifest::deserialize_error
+
+  × check failed
+  ╰─▶ json5 deserialize error at program.args[0].argv: invalid type: integer
+      `123`, expected a shell-style string or an array of interpolated strings
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/program_conditional_argv_wrong_type.json5:8:15]
+ 7 │         when_present: "config.profile",
+ 8 │         argv: 123,
+   ·               ─┬─
+   ·                ╰── invalid type: integer `123`, expected a shell-style string or an array of interpolated strings
+ 9 │       },
+   ╰────

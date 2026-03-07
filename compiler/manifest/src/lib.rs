@@ -19,7 +19,8 @@ pub use framework::{
     FrameworkBindingShape, FrameworkCapabilitySpec, framework_capabilities, framework_capability,
 };
 pub use interpolation::{
-    InterpolatedPart, InterpolatedString, InterpolationSource, ProgramEntrypoint,
+    ConditionalInterpolationPath, InterpolatedPart, InterpolatedString, InterpolationSource,
+    ProgramArgGroup, ProgramArgItem, ProgramArgList, ProgramEntrypoint,
 };
 pub use manifest::{ExperimentalFeature, Manifest, RawManifest};
 pub use names::{

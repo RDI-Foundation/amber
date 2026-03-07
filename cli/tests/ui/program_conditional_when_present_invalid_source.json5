@@ -1,0 +1,12 @@
+{
+  manifest_version: "0.1.0",
+  program: {
+    path: "/bin/echo",
+    args: [
+      {
+        when_present: "bindings.api.url",
+        argv: ["--api", "${slots.api.url}"],
+      },
+    ],
+  },
+}

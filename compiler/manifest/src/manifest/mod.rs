@@ -76,7 +76,7 @@ impl fmt::Display for ExperimentalFeature {
     }
 }
 
-const SUPPORTED_MANIFEST_VERSION_REQ: &str = "^0.1.0";
+const SUPPORTED_MANIFEST_VERSION_REQ: &str = ">=0.1.0, <1.0.0";
 
 fn supported_manifest_version_req() -> &'static VersionReq {
     static REQ: OnceLock<VersionReq> = OnceLock::new();
@@ -680,7 +680,7 @@ impl RawManifest {
 
         if let Some(program) = program.as_ref() {
             match program {
-                Program::Image(program) if program.entrypoint.0.is_empty() => {
+                Program::Image(program) if program.entrypoint.is_empty() => {
                     return Err(Error::EmptyEntrypoint);
                 }
                 Program::Path(program) if program.path.trim().is_empty() => {
@@ -771,7 +771,7 @@ impl Manifest {
 
     pub fn empty() -> Self {
         RawManifest {
-            manifest_version: Version::new(0, 1, 0),
+            manifest_version: Version::new(0, 2, 0),
             experimental_features: BTreeSet::new(),
             program: None,
             components: BTreeMap::new(),
@@ -800,7 +800,7 @@ impl Manifest {
 impl Manifest {
     #[builder]
     pub fn new(
-        #[builder(default = Version::new(0, 1, 0))] manifest_version: Version,
+        #[builder(default = Version::new(0, 2, 0))] manifest_version: Version,
         #[builder(default)] experimental_features: BTreeSet<ExperimentalFeature>,
         program: Option<Program>,
         #[builder(default)] components: BTreeMap<String, ComponentDecl>,

@@ -1,11 +1,18 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use amber_config::ConfigNode;
-use amber_manifest::{InterpolatedPart, InterpolatedString, InterpolationSource, MountSource};
+use amber_manifest::{
+    InterpolatedPart, InterpolatedString, InterpolationSource, MountSource, ProgramArgItem,
+};
 use amber_scenario::{ComponentId, Scenario};
 use amber_template::TemplatePart;
+use serde_json::Value;
 
-use crate::{binding_query::parse_binding_query, config_templates};
+use crate::{
+    binding_query::parse_binding_query,
+    config_templates,
+    slot_query::{SlotTarget, parse_slot_query},
+};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct BindingUsage {
@@ -86,14 +93,40 @@ pub(crate) fn collect_binding_usage(scenario: &Scenario) -> BindingUsage {
             {
                 record_binding_parts(&parsed.parts, id, BindingUseSource::Program, id, &mut usage);
             }
-            for arg in &program.command().0 {
-                record_binding_parts(&arg.parts, id, BindingUseSource::Program, id, &mut usage);
+            for item in &program.command().0 {
+                match item {
+                    ProgramArgItem::Arg(arg) => {
+                        record_binding_parts(
+                            &arg.parts,
+                            id,
+                            BindingUseSource::Program,
+                            id,
+                            &mut usage,
+                        );
+                    }
+                    ProgramArgItem::Group(group) => {
+                        for arg in &group.argv.0 {
+                            record_binding_parts(
+                                &arg.parts,
+                                id,
+                                BindingUseSource::Program,
+                                id,
+                                &mut usage,
+                            );
+                        }
+                    }
+                }
             }
             for value in program.env().values() {
                 record_binding_parts(&value.parts, id, BindingUseSource::Program, id, &mut usage);
             }
 
-            let used_paths = collect_program_used_config_paths(program);
+            let used_paths = collect_program_used_config_paths(
+                program,
+                templates.get(&id).and_then(|template| template.node()),
+                scenario,
+                id,
+            );
             if !used_paths.is_empty()
                 && let Some(template) = templates.get(&id).and_then(|template| template.node())
             {
@@ -131,7 +164,12 @@ fn record_binding_parts(
     }
 }
 
-fn collect_program_used_config_paths(program: &amber_manifest::Program) -> BTreeSet<String> {
+fn collect_program_used_config_paths(
+    program: &amber_manifest::Program,
+    template_opt: Option<&ConfigNode>,
+    scenario: &Scenario,
+    component_id: ComponentId,
+) -> BTreeSet<String> {
     let mut used = BTreeSet::new();
 
     let executable = program.path_ref().or_else(|| program.image_ref());
@@ -140,8 +178,26 @@ fn collect_program_used_config_paths(program: &amber_manifest::Program) -> BTree
     {
         record_program_config_parts(&parsed.parts, &mut used);
     }
-    for arg in &program.command().0 {
-        record_program_config_parts(&arg.parts, &mut used);
+    for item in &program.command().0 {
+        match item {
+            ProgramArgItem::Arg(arg) => record_program_config_parts(&arg.parts, &mut used),
+            ProgramArgItem::Group(group) => {
+                if conditional_path_may_be_present(
+                    template_opt,
+                    scenario,
+                    component_id,
+                    group.when_present.source(),
+                    group.when_present.query(),
+                ) {
+                    if group.when_present.source() == InterpolationSource::Config {
+                        used.insert(group.when_present.query().to_string());
+                    }
+                    for arg in &group.argv.0 {
+                        record_program_config_parts(&arg.parts, &mut used);
+                    }
+                }
+            }
+        }
     }
     for value in program.env().values() {
         record_program_config_parts(&value.parts, &mut used);
@@ -156,6 +212,69 @@ fn collect_program_used_config_paths(program: &amber_manifest::Program) -> BTree
     }
 
     used
+}
+
+fn conditional_path_may_be_present(
+    template_opt: Option<&ConfigNode>,
+    scenario: &Scenario,
+    component_id: ComponentId,
+    source: InterpolationSource,
+    query: &str,
+) -> bool {
+    match source {
+        InterpolationSource::Config => {
+            let Some(template) = template_opt else {
+                return true;
+            };
+            match resolve_optional_config_node_path(template, query) {
+                None => false,
+                Some(ConfigNode::Null) => false,
+                Some(node) => {
+                    node.contains_runtime() || !matches!(node.static_subset(), Some(Value::Null))
+                }
+            }
+        }
+        InterpolationSource::Slots => slot_query_may_be_present(scenario, component_id, query),
+        InterpolationSource::Bindings => true,
+        _ => true,
+    }
+}
+
+fn slot_query_may_be_present(scenario: &Scenario, component_id: ComponentId, query: &str) -> bool {
+    let Ok(parsed) = parse_slot_query(query) else {
+        return true;
+    };
+    match parsed.target {
+        SlotTarget::All => scenario
+            .bindings
+            .iter()
+            .any(|binding| binding.to.component == component_id),
+        SlotTarget::Slot(slot) => scenario.bindings.iter().any(|binding| {
+            binding.to.component == component_id && binding.to.name.as_str() == slot
+        }),
+    }
+}
+
+fn resolve_optional_config_node_path<'a>(
+    template: &'a ConfigNode,
+    path: &str,
+) -> Option<&'a ConfigNode> {
+    if path.is_empty() {
+        return Some(template);
+    }
+
+    let mut current = template;
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            return None;
+        }
+        match current {
+            ConfigNode::Object(map) => current = map.get(segment)?,
+            ConfigNode::ConfigRef(_) => return Some(current),
+            _ => return None,
+        }
+    }
+    Some(current)
 }
 
 fn record_program_config_parts(parts: &[InterpolatedPart], used: &mut BTreeSet<String>) {

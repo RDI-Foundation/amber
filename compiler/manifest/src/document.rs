@@ -199,7 +199,7 @@ fn help_for_manifest_error(err: &ManifestError) -> Option<String> {
     match err {
         ManifestError::Json5Path(de) => {
             (de.label().starts_with("missing field `manifest_version`"))
-                .then(|| "add `manifest_version: \"0.1.0\"` to the root object".to_string())
+                .then(|| "add `manifest_version: \"0.2.0\"` to the root object".to_string())
         }
         _ => None,
     }
@@ -850,7 +850,7 @@ mod tests {
         let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
         let help = err.help().unwrap().to_string();
         assert!(help.contains("manifest_version"));
-        assert!(help.contains("\"0.1.0\""));
+        assert!(help.contains("\"0.2.0\""));
     }
 
     #[test]

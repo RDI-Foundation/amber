@@ -34,5 +34,5 @@ Error: manifest::deserialize_error
  29 │ ├─▶ }
     · ╰──── missing field `manifest_version`
     ╰────
-  help: add `manifest_version: "0.1.0"` to the root object
+  help: add `manifest_version: "0.2.0"` to the root object
 

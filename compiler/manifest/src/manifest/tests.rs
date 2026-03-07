@@ -4,7 +4,7 @@ use crate::{CapabilityKind, Endpoint, NetworkProtocol};
 #[test]
 fn create_empty_manifest() {
     let manifest = Manifest::empty();
-    assert_eq!(manifest.manifest_version, Version::new(0, 1, 0));
+    assert_eq!(manifest.manifest_version, Version::new(0, 2, 0));
     assert!(manifest.experimental_features.is_empty());
     assert!(manifest.program.is_none());
     assert!(manifest.components.is_empty());
@@ -99,7 +99,7 @@ fn manifest_version_requirement_is_enforced() {
     let raw = parse_raw(
         r#"
         {
-          manifest_version: "0.2.0",
+          manifest_version: "1.0.0",
         }
         "#,
     );
@@ -110,11 +110,24 @@ fn manifest_version_requirement_is_enforced() {
             version,
             supported_req,
         } => {
-            assert_eq!(version, Version::new(0, 2, 0));
-            assert_eq!(supported_req, "^0.1.0");
+            assert_eq!(version, Version::new(1, 0, 0));
+            assert_eq!(supported_req, ">=0.1.0, <1.0.0");
         }
         other => panic!("expected UnsupportedManifestVersion error, got: {other}"),
     }
+}
+
+#[test]
+fn legacy_manifest_version_is_accepted() {
+    let manifest: Manifest = r#"
+        {
+          manifest_version: "0.1.0",
+        }
+    "#
+    .parse()
+    .unwrap();
+
+    assert_eq!(manifest.manifest_version(), &Version::new(0, 1, 0));
 }
 
 #[test]
@@ -133,9 +146,9 @@ fn program_entrypoint_string_sugar_splits() {
     };
     let entrypoint = &program.entrypoint.0;
     assert_eq!(entrypoint.len(), 3);
-    assert_eq!(entrypoint[0].to_string(), "--foo");
-    assert_eq!(entrypoint[1].to_string(), "${config.bar}");
-    assert_eq!(entrypoint[2].to_string(), "--baz");
+    assert_eq!(entrypoint[0].arg().unwrap().to_string(), "--foo");
+    assert_eq!(entrypoint[1].arg().unwrap().to_string(), "${config.bar}");
+    assert_eq!(entrypoint[2].arg().unwrap().to_string(), "--baz");
 }
 
 #[test]
@@ -195,10 +208,10 @@ fn program_path_args_string_sugar_splits() {
         panic!("expected native path program");
     };
     assert_eq!(program.args.0.len(), 4);
-    assert_eq!(program.args.0[0].to_string(), "python3");
-    assert_eq!(program.args.0[1].to_string(), "-m");
-    assert_eq!(program.args.0[2].to_string(), "http.server");
-    assert_eq!(program.args.0[3].to_string(), "8080");
+    assert_eq!(program.args.0[0].arg().unwrap().to_string(), "python3");
+    assert_eq!(program.args.0[1].arg().unwrap().to_string(), "-m");
+    assert_eq!(program.args.0[2].arg().unwrap().to_string(), "http.server");
+    assert_eq!(program.args.0[3].arg().unwrap().to_string(), "8080");
 }
 
 #[test]
