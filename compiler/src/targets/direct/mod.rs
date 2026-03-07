@@ -11,7 +11,12 @@ use url::Url;
 
 use crate::{
     CompileOutput,
-    reporter::{Reporter, ReporterError},
+    reporter::{
+        Reporter, ReporterError,
+        execution_guide::{
+            GENERATED_ENV_SAMPLE_FILENAME, GENERATED_README_FILENAME, build_execution_guide,
+        },
+    },
     targets::{
         common::{TargetError as MeshError, component_label},
         mesh::{
@@ -345,6 +350,18 @@ fn render_direct_inner(output: &CompileOutput) -> Result<DirectArtifact, MeshErr
         }
         files.insert(PathBuf::from(DEFAULT_EXTERNAL_ENV_FILE), env_content);
     }
+
+    let execution_guide = build_execution_guide(&output.scenario, &mesh_plan, &config_plan)
+        .map_err(|err: ReporterError| MeshError::new(err.to_string()))?;
+    files.insert(
+        PathBuf::from(GENERATED_ENV_SAMPLE_FILENAME),
+        execution_guide.render_env_sample(false, "direct"),
+    );
+    files.insert(
+        PathBuf::from(GENERATED_README_FILENAME),
+        execution_guide
+            .render_direct_readme(files.contains_key(&PathBuf::from(DEFAULT_EXTERNAL_ENV_FILE))),
+    );
 
     Ok(DirectArtifact { files })
 }

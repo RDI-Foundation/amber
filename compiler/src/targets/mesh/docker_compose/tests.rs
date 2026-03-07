@@ -259,8 +259,8 @@ fn require_same_platform(images: &[(&str, String)]) -> String {
     first_platform.clone()
 }
 
-fn parse_compose(yaml: &str) -> super::DockerComposeFile {
-    serde_yaml::from_str(yaml).expect("compose yaml should parse")
+fn parse_compose(artifact: &super::DockerComposeArtifact) -> super::DockerComposeFile {
+    serde_yaml::from_str(artifact.compose_yaml()).expect("compose yaml should parse")
 }
 
 fn service<'a>(compose: &'a super::DockerComposeFile, name: &str) -> &'a super::Service {
@@ -322,6 +322,50 @@ fn assert_depends_on(service: &super::Service, name: &str, condition: &str) {
             assert_eq!(actual.condition, condition);
         }
     }
+}
+
+#[test]
+fn compose_artifact_emits_env_sample_and_readme() {
+    let program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["sh", "-lc", "sleep infinity"],
+        "env": {}
+    }))
+    .unwrap();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: Some(program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+    let output = compile_output(Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root)],
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    });
+
+    let artifact = DockerComposeReporter
+        .emit(&output)
+        .expect("compose render should succeed");
+
+    assert!(artifact.files.contains_key(Path::new("env.example")));
+    assert!(artifact.files.contains_key(Path::new("compose.yaml")));
+    let readme = artifact
+        .files
+        .get(Path::new("README.md"))
+        .expect("compose readme should be present");
+    assert!(readme.contains("README.md"), "{readme}");
+    assert!(readme.contains("docker compose up -d"), "{readme}");
 }
 
 #[test]
@@ -1916,7 +1960,7 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
     let yaml = DockerComposeReporter
         .emit(&output)
         .expect("compose render ok");
-    fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
+    fs::write(project.join(super::COMPOSE_FILENAME), yaml).unwrap();
 
     let project_name = format!("amber-ext-slot-{}", std::process::id());
     let external_name = format!("{project_name}-external");
@@ -2232,7 +2276,7 @@ sleep infinity
     let yaml = DockerComposeReporter
         .emit(&output)
         .expect("compose render ok");
-    fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
+    fs::write(project.join(super::COMPOSE_FILENAME), yaml).unwrap();
 
     let _compose_guard = ComposeGuard::new(project);
     let compose = |args: &[&str]| {
@@ -2472,7 +2516,7 @@ fn docker_smoke_sidecar_restart_rejoins_mesh() {
     let yaml = DockerComposeReporter
         .emit(&output)
         .expect("compose render ok");
-    fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
+    fs::write(project.join(super::COMPOSE_FILENAME), yaml).unwrap();
 
     let project_name = format!("amber-sidecar-restart-{}", std::process::id());
     let envs = [("COMPOSE_PROJECT_NAME", project_name.as_str())];
@@ -2936,7 +2980,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
     let yaml = DockerComposeReporter
         .emit(&output)
         .expect("compose render ok");
-    fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
+    fs::write(project.join(super::COMPOSE_FILENAME), yaml).unwrap();
 
     let compose = |args: &[&str]| {
         let mut cmd = Command::new("docker");
@@ -3159,7 +3203,7 @@ fn docker_smoke_config_forwarding_runtime_validation() {
     let yaml = DockerComposeReporter
         .emit(&output)
         .expect("compose render ok");
-    fs::write(project.join("docker-compose.yaml"), yaml).unwrap();
+    fs::write(project.join(super::COMPOSE_FILENAME), yaml).unwrap();
 
     struct ComposeGuard {
         project: std::path::PathBuf,
