@@ -64,10 +64,187 @@ use tokio::{
 use tracing_subscriber::EnvFilter;
 use url::{Url, form_urlencoded};
 
+const CLI_LONG_ABOUT: &str = "\
+Compile, inspect, and run Amber scenarios.
+
+Amber resolves a root manifest or bundle, validates the component graph, and writes the artifacts \
+                              you need to inspect or run the scenario.
+
+Use `amber <command> --help` to drill into a specific workflow.";
+
+const CLI_AFTER_HELP: &str = "\
+Common workflows:
+  amber check path/to/root.json5
+      Validate manifests and print diagnostics without writing outputs.
+
+  amber compile path/to/root.json5 --docker-compose /tmp/amber.yaml
+      Generate runtime artifacts. `amber compile --help` lists every output format.
+
+  amber compile path/to/root.json5 --direct /tmp/amber-direct
+  amber run /tmp/amber-direct
+      Build and start the direct/native runtime locally.
+
+  amber proxy /tmp/amber.yaml --export public=127.0.0.1:18080
+      Expose scenario exports or wire external slots on localhost.
+
+  amber docs readme
+      Read the embedded project and CLI reference from the binary.";
+
+const COMPILE_LONG_ABOUT: &str = "\
+Resolve a root manifest or bundle, run the Amber compiler, print diagnostics, and write one or \
+                                  more requested outputs.
+
+If you only want validation, use `amber check` instead.
+
+At least one output flag is required.";
+
+const COMPILE_AFTER_HELP: &str = "\
+Outputs:
+  --output FILE
+      Scenario IR JSON for inspection or downstream tooling.
+
+  --dot FILE
+      Graphviz DOT for visualizing the resolved graph.
+
+  --docker-compose FILE
+      Docker Compose with embedded proxy metadata for `amber proxy`.
+
+  --metadata FILE
+      Per-component metadata JSON for tooling or debugging.
+
+  --kubernetes DIR
+      Kubernetes manifests plus proxy metadata.
+
+  --direct DIR
+      Native/direct runtime artifacts for `amber run` and `amber proxy`.
+
+  --bundle DIR
+      Self-contained manifest bundle for offline or reproducible compilation.
+
+Examples:
+  amber compile path/to/root.json5 --output /tmp/scenario.json
+  amber compile path/to/root.json5 --docker-compose /tmp/amber.yaml
+  amber compile path/to/root.json5 --direct /tmp/amber-direct";
+
+const CHECK_LONG_ABOUT: &str = "\
+Resolve a root manifest or bundle, run the same validation and lint passes as `amber compile`, \
+                                print diagnostics, and stop before emitting artifacts.";
+
+const CHECK_AFTER_HELP: &str = "\
+Examples:
+  amber check path/to/root.json5
+  amber check -D warnings path/to/root.json5
+
+Use `amber compile --help` when you are ready to write outputs.";
+
+const DOCS_LONG_ABOUT: &str = "\
+Print documentation that ships inside the CLI.
+
+Use this when you want README material, schema docs, or embedded examples without browsing the \
+                               repo.";
+
+const DOCS_AFTER_HELP: &str = "\
+Docs subcommands:
+  amber docs readme
+      Project overview plus CLI reference.
+
+  amber docs manifest
+      Full manifest schema and examples.
+
+  amber docs examples
+      List embedded examples.
+
+  amber docs examples reexport
+      Dump one example's files.";
+
+const DOCS_README_LONG_ABOUT: &str = "\
+Print the top-level Amber README that ships inside the CLI.
+
+This is the quickest way to get the project overview, common workflows, and the CLI reference \
+                                      without opening the repo.";
+
+const DOCS_EXAMPLES_LONG_ABOUT: &str = "\
+List the examples embedded into the CLI, or print every file from one named example.
+
+Use this to discover example scenarios from the terminal, then inspect a specific example without \
+                                        opening the repo.";
+
+const DOCS_EXAMPLES_AFTER_HELP: &str = "\
+Examples:
+  amber docs examples
+  amber docs examples reexport";
+
+const DOCS_MANIFEST_LONG_ABOUT: &str = "\
+Print the manifest schema README that ships inside the CLI.
+
+Use this for the detailed manifest format, field semantics, and authoring examples.";
+
+const RUN_LONG_ABOUT: &str = "\
+Start a previously compiled direct output directory or a `direct-plan.json` file.
+
+This command only understands direct/native artifacts produced by `amber compile --direct`.";
+
+const RUN_AFTER_HELP: &str = "\
+Examples:
+  amber run /tmp/amber-direct
+  amber run /tmp/amber-direct/direct-plan.json
+
+Runtime requirements:
+  Linux: `bwrap` and `slirp4netns`
+  macOS: `/usr/bin/sandbox-exec`";
+
+const PROXY_LONG_ABOUT: &str = "\
+Attach a local proxy to compiled Amber output.
+
+Use `--export` to expose a scenario export on localhost, `--slot` to connect a scenario slot to a \
+                                local upstream, or both at once.
+
+Pass at least one `--export` or `--slot` binding.
+
+The output can be a Docker Compose file, a Kubernetes output directory, or a direct output \
+                                directory.";
+
+const PROXY_AFTER_HELP: &str = "\
+Examples:
+  amber proxy /tmp/amber.yaml --export public=127.0.0.1:18080
+
+  amber proxy /tmp/amber.yaml \\
+    --slot ext_api=127.0.0.1:38081 \\
+    --export public=127.0.0.1:38080
+
+  amber proxy /tmp/amber-k8s \\
+    --mesh-addr 127.0.0.1:24000 \\
+    --router-addr 127.0.0.1:24000 \\
+    --router-control-addr 127.0.0.1:24100 \\
+    --export public=127.0.0.1:18080
+
+Notes:
+  At least one `--slot NAME=ADDR:PORT` or `--export NAME=ADDR:PORT` is required.
+  Docker Compose and direct outputs usually infer router control metadata automatically.
+  Kubernetes output requires `--mesh-addr` when you use `--slot`, unless you are supplying an \
+                                equivalent override.";
+
+const DASHBOARD_LONG_ABOUT: &str = "\
+Start the dashboard container that Amber scenarios can send OpenTelemetry data to.
+
+This is mainly useful when debugging scenarios locally or following one of the observability \
+                                    tutorials.";
+
+const DASHBOARD_AFTER_HELP: &str = concat!(
+    "Examples:\n",
+    "  amber dashboard\n",
+    "  amber dashboard --detach\n\n",
+    "Requirements:\n",
+    "  Docker CLI plus a running Docker daemon.\n\n",
+    "Default UI address: http://127.0.0.1:18888"
+);
+
 #[derive(Parser)]
 #[command(name = "amber")]
 #[command(version)]
-#[command(about = "Amber CLI")]
+#[command(about = "Compile, inspect, and run Amber scenarios")]
+#[command(long_about = CLI_LONG_ABOUT)]
+#[command(after_help = CLI_AFTER_HELP)]
 struct Cli {
     /// Increase log verbosity (-v, -vv, -vvv, -vvvv).
     #[arg(short = 'v', long = "verbose", action = ArgAction::Count, global = true)]
@@ -79,11 +256,41 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(
+        about = "Compile a manifest into Scenario IR and runtime artifacts",
+        long_about = COMPILE_LONG_ABOUT,
+        after_help = COMPILE_AFTER_HELP
+    )]
     Compile(CompileArgs),
+    #[command(
+        about = "Validate a manifest tree without writing outputs",
+        long_about = CHECK_LONG_ABOUT,
+        after_help = CHECK_AFTER_HELP
+    )]
     Check(CheckArgs),
+    #[command(
+        about = "Read embedded Amber documentation",
+        long_about = DOCS_LONG_ABOUT,
+        after_help = DOCS_AFTER_HELP
+    )]
     Docs(DocsArgs),
+    #[command(
+        about = "Run a direct/native Amber artifact locally",
+        long_about = RUN_LONG_ABOUT,
+        after_help = RUN_AFTER_HELP
+    )]
     Run(RunArgs),
+    #[command(
+        about = "Bridge scenario exports and external slots to the host",
+        long_about = PROXY_LONG_ABOUT,
+        after_help = PROXY_AFTER_HELP
+    )]
     Proxy(ProxyArgs),
+    #[command(
+        about = "Run the Aspire dashboard for Amber telemetry",
+        long_about = DASHBOARD_LONG_ABOUT,
+        after_help = DASHBOARD_AFTER_HELP
+    )]
     Dashboard(DashboardArgs),
     #[command(hide = true, name = "run-direct-init")]
     RunDirectInit(RunDirectInitArgs),
@@ -95,7 +302,7 @@ struct CompileArgs {
     #[arg(short = 'D', long = "deny", value_name = "LINT")]
     deny: Vec<String>,
 
-    /// Write the primary output to this path.
+    /// Write Scenario IR JSON to this path.
     #[arg(short = 'o', long = "output", value_name = "FILE")]
     output: Option<PathBuf>,
 
@@ -160,13 +367,23 @@ struct DocsArgs {
 
 #[derive(Subcommand)]
 enum DocsCommand {
-    /// Dump the top-level Amber README.
+    #[command(
+        about = "Print the top-level Amber README",
+        long_about = DOCS_README_LONG_ABOUT
+    )]
     Readme,
 
-    /// List examples or dump one example's files.
+    #[command(
+        about = "List embedded examples or print one example's files",
+        long_about = DOCS_EXAMPLES_LONG_ABOUT,
+        after_help = DOCS_EXAMPLES_AFTER_HELP
+    )]
     Examples(DocsExamplesArgs),
 
-    /// Dump the manifest schema README.
+    #[command(
+        about = "Print the manifest schema README",
+        long_about = DOCS_MANIFEST_LONG_ABOUT
+    )]
     Manifest,
 }
 
@@ -179,7 +396,7 @@ struct DocsExamplesArgs {
 
 #[derive(Args)]
 struct RunArgs {
-    /// Compiled output artifact path (for now, a direct output directory).
+    /// Direct output directory or `direct-plan.json` file from `amber compile --direct`.
     #[arg(value_name = "OUTPUT")]
     output: String,
 }
@@ -193,7 +410,7 @@ struct RunDirectInitArgs {
 
 #[derive(Args)]
 struct ProxyArgs {
-    /// Docker Compose file or output directory from `amber compile`.
+    /// Docker Compose file, direct output directory, or Kubernetes output directory from `amber compile`.
     #[arg(value_name = "OUTPUT")]
     output: String,
 

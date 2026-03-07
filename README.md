@@ -187,6 +187,39 @@ like `./bin/server`; it does not search `PATH`.
 amber compile path/to/root.json5 --bundle /tmp/amber-bundle
 ```
 
+## CLI reference
+
+Every command has its own help page:
+
+```sh
+amber --help
+amber compile --help
+amber docs --help
+amber docs examples --help
+```
+
+Use these commands when you want the repo docs from the binary itself:
+
+- `amber docs readme`: project overview, common workflows, and this CLI reference.
+- `amber docs manifest`: full manifest schema and authoring details.
+- `amber docs examples`: list embedded examples.
+- `amber docs examples <example>`: dump one embedded example's files.
+
+Top-level command guide:
+
+- `amber check <manifest-or-bundle>`: resolve manifests, run validation and linting, and print diagnostics without writing any artifacts.
+- `amber compile <manifest-or-bundle> [output flags]`: compile once and emit one or more outputs such as Scenario IR, Graphviz DOT, Docker Compose, Kubernetes manifests, direct/native artifacts, metadata, or an offline bundle.
+- `amber run <direct-output>`: start a direct/native artifact produced by `amber compile --direct`. You can pass either the output directory or its `direct-plan.json`.
+- `amber proxy <output> --export name=127.0.0.1:PORT`: expose a scenario export on localhost. Add `--slot name=127.0.0.1:PORT` to connect a scenario slot to a local upstream at the same time.
+- `amber dashboard [--detach]`: start the local Aspire dashboard that Amber examples use for observability and tracing workflows.
+
+Output-specific pointers:
+
+- Docker Compose output is the easiest way to get a runnable multi-container scenario quickly.
+- Direct output is the easiest way to run local host binaries that use `program.path`.
+- Kubernetes output is for cluster deployment; when you proxy against it locally, you usually also need explicit router port-forwards and `amber proxy --mesh-addr`.
+- Bundle output is for offline or reproducible recompilation later.
+
 ## More information
 
 If you're working in this repo, these docs go deeper:

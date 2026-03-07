@@ -5,6 +5,8 @@ Command-line front-end for the compiler. It resolves a root manifest, runs compi
 ## Responsibilities
 - Wire `amber-compiler` and `amber-resolver` for compile/check flows.
 - Render diagnostics via `miette`, including treating selected warnings as errors.
+- Keep `amber --help` and nested `--help` pages useful enough that users can discover the CLI
+  surface without reading the source.
 - Write compile outputs only when requested; `amber compile` requires at least one output flag (`--output`, `--dot`, `--docker-compose`/`--compose`, `--metadata`, `--kubernetes`, `--direct`, or `--bundle`).
 - Detect bundle and Scenario IR inputs and emit bundle directories via `--bundle`.
 - Run compiled direct artifacts via `amber run <output-dir>` (delegates to the direct init runtime).
@@ -15,7 +17,7 @@ Command-line front-end for the compiler. It resolves a root manifest, runs compi
   `amber docs examples [example]`.
 
 ## Where to look
-- `src/main.rs`: command flow, diagnostics policy, and output paths.
+- `src/main.rs`: command flow, diagnostics policy, output paths, and clap help text.
 - `amber_compiler::reporter`: reporter implementations.
 
 ## Extending
