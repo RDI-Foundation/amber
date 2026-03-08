@@ -15,6 +15,7 @@ use serde_with::{MapPreventDuplicates, serde_as};
 use crate::{
     error::Error,
     framework::{framework_capabilities, framework_capability},
+    interpolation::ProgramArgItem,
     names::{BindingName, ChildName, ExportName, ProvideName, SlotName, ensure_name_no_dot},
     refs::{ManifestDigest, ManifestRef, ManifestUrl},
     schema::{
@@ -76,7 +77,7 @@ impl fmt::Display for ExperimentalFeature {
     }
 }
 
-const SUPPORTED_MANIFEST_VERSION_REQ: &str = "^0.1.0";
+const SUPPORTED_MANIFEST_VERSION_REQ: &str = ">=0.1.0, <1.0.0";
 
 fn supported_manifest_version_req() -> &'static VersionReq {
     static REQ: OnceLock<VersionReq> = OnceLock::new();
@@ -84,6 +85,65 @@ fn supported_manifest_version_req() -> &'static VersionReq {
         VersionReq::parse(SUPPORTED_MANIFEST_VERSION_REQ)
             .expect("supported manifest version requirement must be valid")
     })
+}
+
+struct UnsupportedProgramSyntax {
+    feature: &'static str,
+    pointer: String,
+}
+
+fn validate_program_syntax_manifest_version(
+    manifest_version: &Version,
+    program: Option<&Program>,
+) -> Result<(), Error> {
+    const REQUIRED_VERSION: &str = "0.2.0";
+
+    let required_version = Version::new(0, 2, 0);
+    if manifest_version >= &required_version {
+        return Ok(());
+    }
+
+    let Some(program) = program else {
+        return Ok(());
+    };
+
+    let Some(unsupported) = find_unsupported_program_syntax(program) else {
+        return Ok(());
+    };
+
+    Err(Error::UnsupportedProgramSyntaxForManifestVersion {
+        manifest_version: Box::new(manifest_version.clone()),
+        required_version: REQUIRED_VERSION,
+        feature: unsupported.feature,
+        pointer: unsupported.pointer,
+    })
+}
+
+fn find_unsupported_program_syntax(program: &Program) -> Option<UnsupportedProgramSyntax> {
+    let (items, field_pointer): (&[ProgramArgItem], &str) = match program {
+        Program::Image(program) => (&program.entrypoint.0, "/program/entrypoint"),
+        Program::Path(program) => (&program.args.0, "/program/args"),
+    };
+
+    for (idx, item) in items.iter().enumerate() {
+        if matches!(item, ProgramArgItem::Group(_)) {
+            return Some(UnsupportedProgramSyntax {
+                feature: "conditional argument groups",
+                pointer: format!("{field_pointer}/{idx}"),
+            });
+        }
+    }
+
+    for (key, value) in program.env() {
+        if value.group().is_some() {
+            return Some(UnsupportedProgramSyntax {
+                feature: "conditional environment values",
+                pointer: format!("/program/env/{key}"),
+            });
+        }
+    }
+
+    None
 }
 
 struct ValidateCtx<'a> {
@@ -648,6 +708,8 @@ impl RawManifest {
             metadata,
         } = self;
 
+        validate_program_syntax_manifest_version(&manifest_version, program.as_ref())?;
+
         if let Some(schema) = config_schema.as_ref() {
             ConfigSchema::validate_value(&schema.0)?;
         }
@@ -680,7 +742,7 @@ impl RawManifest {
 
         if let Some(program) = program.as_ref() {
             match program {
-                Program::Image(program) if program.entrypoint.0.is_empty() => {
+                Program::Image(program) if program.entrypoint.is_empty() => {
                     return Err(Error::EmptyEntrypoint);
                 }
                 Program::Path(program) if program.path.trim().is_empty() => {
@@ -771,7 +833,7 @@ impl Manifest {
 
     pub fn empty() -> Self {
         RawManifest {
-            manifest_version: Version::new(0, 1, 0),
+            manifest_version: Version::new(0, 2, 0),
             experimental_features: BTreeSet::new(),
             program: None,
             components: BTreeMap::new(),
@@ -800,7 +862,7 @@ impl Manifest {
 impl Manifest {
     #[builder]
     pub fn new(
-        #[builder(default = Version::new(0, 1, 0))] manifest_version: Version,
+        #[builder(default = Version::new(0, 2, 0))] manifest_version: Version,
         #[builder(default)] experimental_features: BTreeSet<ExperimentalFeature>,
         program: Option<Program>,
         #[builder(default)] components: BTreeMap<String, ComponentDecl>,

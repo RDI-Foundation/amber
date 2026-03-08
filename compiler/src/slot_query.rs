@@ -1,101 +1,13 @@
-use std::{collections::BTreeMap, fmt};
+use std::collections::BTreeMap;
 
+use amber_config::stringify_for_interpolation;
+pub(crate) use amber_manifest::{SlotQueryError, SlotTarget, parse_slot_query};
 use serde::Serialize;
+use serde_json::Value;
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct SlotObject {
     pub(crate) url: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SlotField {
-    Whole,
-    Url,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SlotTarget<'a> {
-    All,
-    Slot(&'a str),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SlotQuery<'a> {
-    pub(crate) target: SlotTarget<'a>,
-    pub(crate) field: SlotField,
-}
-
-#[derive(Debug)]
-pub(crate) enum SlotQueryError {
-    MissingSlotName,
-    EmptySegment { query: String },
-    UnsupportedField { field: String },
-    UnsupportedPath { path: String },
-}
-
-impl fmt::Display for SlotQueryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SlotQueryError::MissingSlotName => {
-                f.write_str("missing slot name (expected slots.<slot> or slots.<slot>.url)")
-            }
-            SlotQueryError::EmptySegment { query } => {
-                write!(f, "invalid slots path {query:?}: empty segment")
-            }
-            SlotQueryError::UnsupportedField { field } => write!(
-                f,
-                "unsupported slots field {field:?} (only \"url\" is supported)"
-            ),
-            SlotQueryError::UnsupportedPath { path } => write!(
-                f,
-                "unsupported slots path {path:?} (only \"url\" is supported)"
-            ),
-        }
-    }
-}
-
-pub(crate) fn parse_slot_query(query: &str) -> Result<SlotQuery<'_>, SlotQueryError> {
-    if query.is_empty() {
-        return Ok(SlotQuery {
-            target: SlotTarget::All,
-            field: SlotField::Whole,
-        });
-    }
-
-    let mut segments = query.split('.');
-    let slot = segments
-        .next()
-        .expect("split on '.' always yields at least one segment");
-    if slot.is_empty() {
-        return Err(SlotQueryError::MissingSlotName);
-    }
-
-    let rest: Vec<&str> = segments.collect();
-    if rest.iter().any(|seg| seg.is_empty()) {
-        return Err(SlotQueryError::EmptySegment {
-            query: query.to_string(),
-        });
-    }
-
-    let field = match rest.as_slice() {
-        [] => SlotField::Whole,
-        ["url"] => SlotField::Url,
-        [other] => {
-            return Err(SlotQueryError::UnsupportedField {
-                field: (*other).to_string(),
-            });
-        }
-        _ => {
-            return Err(SlotQueryError::UnsupportedPath {
-                path: rest.join("."),
-            });
-        }
-    };
-
-    Ok(SlotQuery {
-        target: SlotTarget::Slot(slot),
-        field,
-    })
 }
 
 pub(crate) fn resolve_slot_query(
@@ -112,8 +24,12 @@ pub(crate) fn resolve_slot_query(
         .map_err(|err| format!("invalid slots interpolation '{label}': {err}"))?;
 
     let render_object = |slots: &BTreeMap<String, SlotObject>| {
-        serde_json::to_string(slots)
+        serde_json::to_value(slots)
             .map_err(|e| format!("failed to serialize {label} as JSON: {e}"))
+            .and_then(|value| {
+                stringify_for_interpolation(&value)
+                    .map_err(|e| format!("failed to stringify {label} for interpolation: {e}"))
+            })
     };
 
     match parsed.target {
@@ -122,11 +38,84 @@ pub(crate) fn resolve_slot_query(
             let slot = slots
                 .get(slot_name)
                 .ok_or_else(|| format!("slots.{slot_name} not found"))?;
-            match parsed.field {
-                SlotField::Whole => serde_json::to_string(slot)
-                    .map_err(|e| format!("failed to serialize slots.{slot_name} as JSON: {e}")),
-                SlotField::Url => Ok(slot.url.clone()),
-            }
+            let slot_value = serde_json::to_value(slot)
+                .map_err(|e| format!("failed to serialize slots.{slot_name} as JSON: {e}"))?;
+            let value = query_value_opt(&slot_value, &parsed.path)
+                .ok_or_else(|| format!("slots.{query} not found"))?;
+            stringify_for_interpolation(value)
+                .map_err(|e| format!("failed to stringify slots.{query} for interpolation: {e}"))
         }
+    }
+}
+
+pub(crate) fn slot_query_is_present(
+    slots: &BTreeMap<String, SlotObject>,
+    query: &str,
+) -> Result<bool, String> {
+    let label = if query.is_empty() {
+        "slots".to_string()
+    } else {
+        format!("slots.{query}")
+    };
+
+    let parsed =
+        parse_slot_query(query).map_err(|err| format!("invalid slot query '{label}': {err}"))?;
+
+    match parsed.target {
+        SlotTarget::All => Ok(true),
+        SlotTarget::Slot(slot_name) => Ok(slots.get(slot_name).is_some_and(|slot| {
+            serde_json::to_value(slot)
+                .ok()
+                .is_some_and(|value| query_value_opt(&value, &parsed.path).is_some())
+        })),
+    }
+}
+
+fn query_value_opt<'a>(root: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = root;
+    for segment in path {
+        match current {
+            Value::Object(map) => current = map.get(*segment)?,
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_slots() -> BTreeMap<String, SlotObject> {
+        BTreeMap::from([(
+            "api".to_string(),
+            SlotObject {
+                url: "https://example.test".to_string(),
+            },
+        )])
+    }
+
+    #[test]
+    fn slot_query_presence_checks_the_full_path() {
+        let slots = test_slots();
+
+        assert!(slot_query_is_present(&slots, "api").unwrap());
+        assert!(slot_query_is_present(&slots, "api.url").unwrap());
+        assert!(!slot_query_is_present(&slots, "missing").unwrap());
+        assert!(!slot_query_is_present(&slots, "api.url.path").unwrap());
+    }
+
+    #[test]
+    fn slot_query_resolution_walks_slot_objects() {
+        let slots = test_slots();
+
+        assert_eq!(
+            resolve_slot_query(&slots, "api.url").unwrap(),
+            "https://example.test"
+        );
+        assert_eq!(
+            resolve_slot_query(&slots, "api").unwrap(),
+            r#"{"url":"https://example.test"}"#
+        );
     }
 }

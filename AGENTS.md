@@ -11,3 +11,7 @@
 * Make error messages and spans as helpful to devs as possible. Rust error messaging is a great example of usability
     - Create UI tests whenever adding a new error type or variant. From the perspective of a dev using the software, ensure that the error is helpful.
 * When adding new crates, make sure to update the dockerfiles
+* The compiler should try to support older versions of the manifest format and scenario IR as long as it would not introduce an undue amount of complexity or legacy code to maintain.
+    - If supporting previous versions is feasible, later versions of the compiler take the old versions but output the later version of compiler outputs.
+* When a breaking change is made, you may need to bump versions of any of: the manifest format, the IR, the docker/images.json version series. If you bump the CLI docker image series, also update README.md to have the latest floating version.
+    - Do not update versions in tests or examples unless they changed in a breaking way and NEED the newer version.

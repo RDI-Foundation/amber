@@ -50,7 +50,7 @@ use amber_mesh::{
 use amber_resolver::Resolver;
 use amber_router as router;
 use amber_scenario::{SCENARIO_IR_SCHEMA, ScenarioIr};
-use amber_template::{RuntimeTemplateContext, TemplatePart, TemplateSpec};
+use amber_template::{ProgramArgTemplate, RuntimeTemplateContext, TemplatePart, TemplateSpec};
 use base64::Engine as _;
 use clap::{ArgAction, Args, Parser, Subcommand};
 use miette::{
@@ -1918,7 +1918,16 @@ fn decode_template_spec_program(raw_b64: &str) -> Result<String> {
         .entrypoint
         .first()
         .ok_or_else(|| miette::miette!("template spec program entrypoint is empty"))?;
-    render_template_string_literal(path_template)
+    render_program_arg_template_literal(path_template)
+}
+
+fn render_program_arg_template_literal(arg: &ProgramArgTemplate) -> Result<String> {
+    let ProgramArgTemplate::Arg(parts) = arg else {
+        return Err(miette::miette!(
+            "internal error: template spec program entrypoint starts with a conditional arg group"
+        ));
+    };
+    render_template_string_literal(parts)
 }
 
 fn render_template_string_literal(parts: &[TemplatePart]) -> Result<String> {

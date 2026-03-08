@@ -54,7 +54,7 @@ If you want `amber` on your PATH, move it into a directory that’s already on P
 ### Option B: Use the Dockerized CLI
 
 ```sh
-docker run --rm -v "$PWD":/work -w /work ghcr.io/rdi-foundation/amber-cli:v0.2 --help
+docker run --rm -v "$PWD":/work -w /work ghcr.io/rdi-foundation/amber-cli:v0.3 --help
 ```
 
 ## Tutorial
@@ -102,7 +102,7 @@ amber compile amber-demo/parent.json --dot -
 If you're using the Dockerized CLI, replace `amber` with:
 
 ```sh
-docker run --rm -v "$PWD":/work -w /work ghcr.io/rdi-foundation/amber-cli:v0.2
+docker run --rm -v "$PWD":/work -w /work ghcr.io/rdi-foundation/amber-cli:v0.3
 ```
 
 ### 3) Generate Docker Compose and run
@@ -127,14 +127,14 @@ Direct output only supports components that use `program.path`.
 - macOS: `/usr/bin/sandbox-exec`
 
 The Docker Compose output references the router, provisioner, and helper images used to
-enforce the wiring and provision mesh identities: `ghcr.io/rdi-foundation/amber-router:v1`,
-`ghcr.io/rdi-foundation/amber-provisioner:v1`, and `ghcr.io/rdi-foundation/amber-helper:v1`.
+enforce the wiring and provision mesh identities: `ghcr.io/rdi-foundation/amber-router:v0.1`,
+`ghcr.io/rdi-foundation/amber-provisioner:v0.1`, and `ghcr.io/rdi-foundation/amber-helper:v0.2`.
 Docker Compose will pull them automatically;
 if you're in a restricted environment, pre-pull them ahead of time.
 
 Some scenarios also use the Docker gateway component to scope Docker Engine API access
 per component. In that case, the compose output will reference
-`ghcr.io/rdi-foundation/amber-docker-gateway:v1`.
+`ghcr.io/rdi-foundation/amber-docker-gateway:v0.1`.
 
 If you're working in this repo, the internal image list and tags live in
 `docker/images.json`; CI publishes and verifies those tags on `main`.

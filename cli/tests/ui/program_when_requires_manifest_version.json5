@@ -1,0 +1,12 @@
+{
+  manifest_version: "0.1.0",
+  program: {
+    path: "/bin/echo",
+    args: [
+      {
+        when: "config.profile",
+        argv: ["--profile", "${config.profile}"],
+      },
+    ],
+  },
+}

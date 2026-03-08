@@ -13,7 +13,8 @@ use crate::{
 };
 
 pub const SCENARIO_IR_SCHEMA: &str = "amber.scenario.ir";
-pub const SCENARIO_IR_VERSION: u32 = 1;
+pub const SCENARIO_IR_VERSION: u32 = 2;
+const MIN_SCENARIO_IR_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScenarioIr {
@@ -55,7 +56,7 @@ impl TryFrom<ScenarioIr> for Scenario {
                 actual: ir.schema,
             });
         }
-        if ir.version != SCENARIO_IR_VERSION {
+        if !(MIN_SCENARIO_IR_VERSION..=SCENARIO_IR_VERSION).contains(&ir.version) {
             return Err(ScenarioIrError::VersionMismatch {
                 expected: SCENARIO_IR_VERSION,
                 actual: ir.version,
@@ -744,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn scenario_ir_serializes_v1_shape() {
+    fn scenario_ir_serializes_v2_shape() {
         let components = vec![
             Some(Component {
                 id: ComponentId(0),
@@ -920,6 +921,37 @@ mod tests {
         });
 
         assert_eq!(value, expected);
+    }
+
+    #[test]
+    fn scenario_ir_accepts_v1_inputs() {
+        let ir = json!({
+            "schema": SCENARIO_IR_SCHEMA,
+            "version": 1,
+            "root": 0,
+            "components": [
+                {
+                    "id": 0,
+                    "moniker": "/",
+                    "parent": null,
+                    "children": [],
+                    "digest": ManifestDigest::new([0u8; 32]).to_string(),
+                    "config": null,
+                    "program": null,
+                    "slots": {},
+                    "provides": {}
+                }
+            ],
+            "bindings": [],
+            "exports": []
+        });
+
+        let parsed: ScenarioIr =
+            serde_json::from_value(ir).expect("deserialize legacy scenario IR");
+        let scenario =
+            Scenario::try_from(parsed).expect("legacy scenario IR should remain accepted");
+        assert_eq!(scenario.root, ComponentId(0));
+        assert_eq!(scenario.components_iter().count(), 1);
     }
 
     #[test]

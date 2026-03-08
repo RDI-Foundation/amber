@@ -31,6 +31,10 @@ pub enum Error {
     #[diagnostic(code(manifest::invalid_interpolation))]
     InvalidInterpolation(String),
 
+    #[error("invalid `when` path `{input}`: {message}")]
+    #[diagnostic(code(manifest::invalid_when_path))]
+    InvalidWhenPath { input: String, message: String },
+
     #[error("invalid component ref `{input}`: {message}")]
     #[diagnostic(code(manifest::invalid_component_ref))]
     InvalidComponentRef { input: String, message: String },
@@ -180,6 +184,18 @@ pub enum Error {
     UnsupportedManifestVersion {
         version: Version,
         supported_req: &'static str,
+    },
+
+    #[error(
+        "using {feature} requires manifest_version >= {required_version}, but found \
+         {manifest_version}"
+    )]
+    #[diagnostic(code(manifest::program_syntax_requires_manifest_version))]
+    UnsupportedProgramSyntaxForManifestVersion {
+        manifest_version: Box<Version>,
+        required_version: &'static str,
+        feature: &'static str,
+        pointer: String,
     },
 
     // --- Environments (resolution environments) ---

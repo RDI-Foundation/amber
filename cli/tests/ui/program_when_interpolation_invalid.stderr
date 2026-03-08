@@ -1,0 +1,12 @@
+compiler::invalid_slots_interpolation
+
+  x invalid slots interpolation in / (program.args[0].argv[1]): unknown slot field "blabla"
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/program_when_interpolation_invalid.json5:14:25]
+ 13 |         when: "config.profile",
+ 14 |         argv: ["--api", "${slots.api.blabla}"],
+    :                         ^^^^^^^^^^|^^^^^^^^^^
+    :                                   `-- slot interpolation here
+ 15 |       },
+    `----
+  help: Slot `api` is an object like `{ url: ... }`. Use `${slots.api}` for the whole object or `${slots.api.url}` for the URL field.
+Error:   × check failed

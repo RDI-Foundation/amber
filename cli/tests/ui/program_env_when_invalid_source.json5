@@ -1,0 +1,12 @@
+{
+  manifest_version: "0.2.0",
+  program: {
+    image: "busybox:1.36",
+    env: {
+      API_URL: {
+        when: "bindings.api.url",
+        value: "https://example.test",
+      },
+    },
+  },
+}

@@ -1,0 +1,24 @@
+{
+  manifest_version: "0.1.0",
+  program: {
+    image: "root",
+    entrypoint: ["root"],
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" },
+      ],
+    },
+  },
+  components: {
+    child: "./lint_required_slot_when_child.json5",
+  },
+  provides: {
+    api: { kind: "http", endpoint: "http" },
+  },
+  bindings: [
+    { to: "#child.api", from: "self.api" },
+  ],
+  exports: {
+    api: "api",
+  },
+}

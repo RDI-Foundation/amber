@@ -3,7 +3,9 @@ use std::{
     sync::Arc,
 };
 
-use amber_manifest::{BindingSource, BindingTarget, Manifest};
+use amber_manifest::{
+    BindingSource, BindingTarget, InterpolationSource, Manifest, SlotTarget, parse_slot_query,
+};
 use amber_scenario::{BindingEdge, BindingFrom, Component, ComponentId, Scenario, SlotRef};
 use miette::Diagnostic;
 use thiserror::Error;
@@ -879,6 +881,19 @@ fn is_live_capability(live: &HashSet<CapKey>, component: usize, name: &str) -> b
     })
 }
 
+fn collect_slot_condition_use(query: &str, mut mark_slot: impl FnMut(&str)) -> bool {
+    match parse_slot_query(query) {
+        Ok(parsed) => match parsed.target {
+            SlotTarget::All => true,
+            SlotTarget::Slot(slot) => {
+                mark_slot(slot);
+                false
+            }
+        },
+        Err(_) => query.is_empty(),
+    }
+}
+
 fn collect_program_used_slots(component: &amber_scenario::Component) -> Vec<String> {
     let Some(program) = component.program.as_ref() else {
         return Vec::new();
@@ -897,14 +912,42 @@ fn collect_program_used_slots(component: &amber_scenario::Component) -> Vec<Stri
         return all_slots();
     }
 
-    for arg in &program.command().0 {
-        if arg.visit_slot_uses(|slot| mark_slot(slot, &mut used)) {
+    for group in program.command().groups() {
+        if group.when.source() == InterpolationSource::Slots
+            && collect_slot_condition_use(group.when.query(), |slot| mark_slot(slot, &mut used))
+        {
             return all_slots();
         }
     }
 
+    for item in &program.command().0 {
+        match item {
+            amber_manifest::ProgramArgItem::Arg(arg) => {
+                if arg.visit_slot_uses(|slot| mark_slot(slot, &mut used)) {
+                    return all_slots();
+                }
+            }
+            amber_manifest::ProgramArgItem::Group(group) => {
+                for arg in &group.argv.0 {
+                    if arg.visit_slot_uses(|slot| mark_slot(slot, &mut used)) {
+                        return all_slots();
+                    }
+                }
+            }
+        }
+    }
+
     for value in program.env().values() {
-        if value.visit_slot_uses(|slot| mark_slot(slot, &mut used)) {
+        if let Some(when) = value.when()
+            && when.source() == InterpolationSource::Slots
+            && collect_slot_condition_use(when.query(), |slot| mark_slot(slot, &mut used))
+        {
+            return all_slots();
+        }
+        if value
+            .value()
+            .visit_slot_uses(|slot| mark_slot(slot, &mut used))
+        {
             return all_slots();
         }
     }

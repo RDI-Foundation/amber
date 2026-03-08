@@ -5,13 +5,13 @@
       "name": "amber-cli",
       "context": ".",
       "dockerfile": "docker/amber-cli/Dockerfile",
-      "version": "v0.2.x"
+      "version": "v0.3.x"
     },
     {
       "name": "amber-helper",
       "context": ".",
       "dockerfile": "docker/amber-helper/Dockerfile",
-      "version": "v0.1.x"
+      "version": "v0.2.x"
     },
     {
       "name": "amber-router",

@@ -61,6 +61,34 @@ impl TemplatePart {
 
 pub type TemplateString = Vec<TemplatePart>;
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConditionalProgramArgTemplate {
+    pub when: String,
+    pub argv: Vec<TemplateString>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProgramArgTemplate {
+    Arg(TemplateString),
+    Group(ConditionalProgramArgTemplate),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConditionalProgramEnvTemplate {
+    pub when: String,
+    pub value: TemplateString,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProgramEnvTemplate {
+    Value(TemplateString),
+    Group(ConditionalProgramEnvTemplate),
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeTemplateContext {
     #[serde(default)]
@@ -78,9 +106,9 @@ pub struct TemplateSpec {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProgramTemplateSpec {
-    pub entrypoint: Vec<TemplateString>,
+    pub entrypoint: Vec<ProgramArgTemplate>,
     #[serde(default)]
-    pub env: BTreeMap<String, TemplateString>,
+    pub env: BTreeMap<String, ProgramEnvTemplate>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

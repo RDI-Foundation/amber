@@ -1,0 +1,27 @@
+{
+  manifest_version: "0.2.0",
+  slots: {
+    api: { kind: "http" },
+  },
+  program: {
+    image: "child",
+    entrypoint: [
+      "child",
+      {
+        when: "slots.api",
+        argv: ["--peer", "${slots.api.url}"],
+      },
+    ],
+    network: {
+      endpoints: [
+        { name: "http", port: 8081, protocol: "http" },
+      ],
+    },
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" },
+  },
+  exports: {
+    http: "http",
+  },
+}

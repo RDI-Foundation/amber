@@ -5,6 +5,12 @@ use serde_json::Value;
 
 use crate::{ConfigError, Result};
 
+#[derive(Clone, Copy)]
+enum MissingConfigBehavior {
+    Error,
+    Omit,
+}
+
 pub fn template_string_is_runtime(ts: &TemplateString) -> bool {
     ts.iter()
         .any(|p| p.is_config() || p.is_slot() || p.is_binding())
@@ -63,6 +69,30 @@ pub fn get_by_path<'a>(root: &'a Value, path: &str) -> Result<&'a Value> {
     Ok(cur)
 }
 
+pub fn get_by_path_opt<'a>(root: &'a Value, path: &str) -> Result<Option<&'a Value>> {
+    if path.is_empty() {
+        return Ok(Some(root));
+    }
+    let mut cur = root;
+    for seg in path.split('.') {
+        if seg.is_empty() {
+            return Err(ConfigError::interp(format!(
+                "invalid config path {path:?}: empty segment"
+            )));
+        }
+        match cur {
+            Value::Object(map) => {
+                let Some(next) = map.get(seg) else {
+                    return Ok(None);
+                };
+                cur = next;
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(cur))
+}
+
 pub fn eval_config_template(
     template: &ConfigTemplatePayload,
     root_config: &Value,
@@ -77,41 +107,82 @@ pub fn eval_config_template_with_context(
 ) -> Result<Value> {
     match template {
         ConfigTemplatePayload::Root => Ok(root_config.clone()),
-        ConfigTemplatePayload::Template(node) => {
-            eval_config_node(node, root_config, runtime_context)
-        }
+        ConfigTemplatePayload::Template(node) => eval_config_node_with_behavior(
+            node,
+            root_config,
+            runtime_context,
+            MissingConfigBehavior::Error,
+        )?
+        .ok_or_else(|| ConfigError::interp("config template resolved to no value".to_string())),
     }
 }
 
-fn eval_config_node(
-    node: &ConfigTemplate,
+pub fn eval_config_template_partial_with_context(
+    template: &ConfigTemplatePayload,
     root_config: &Value,
     runtime_context: &RuntimeTemplateContext,
 ) -> Result<Value> {
+    match template {
+        ConfigTemplatePayload::Root => Ok(root_config.clone()),
+        ConfigTemplatePayload::Template(node) => Ok(eval_config_node_with_behavior(
+            node,
+            root_config,
+            runtime_context,
+            MissingConfigBehavior::Omit,
+        )?
+        .unwrap_or(Value::Object(Default::default()))),
+    }
+}
+
+fn eval_config_node_with_behavior(
+    node: &ConfigTemplate,
+    root_config: &Value,
+    runtime_context: &RuntimeTemplateContext,
+    missing_behavior: MissingConfigBehavior,
+) -> Result<Option<Value>> {
     match node {
-        ConfigTemplate::Literal(value) => Ok(value.clone()),
-        ConfigTemplate::ConfigRef { path } => Ok(get_by_path(root_config, path)?.clone()),
-        ConfigTemplate::TemplateString { parts } => {
-            let rendered =
-                render_template_string_with_context(parts, root_config, runtime_context)?;
-            Ok(Value::String(rendered))
-        }
+        ConfigTemplate::Literal(value) => Ok(Some(value.clone())),
+        ConfigTemplate::ConfigRef { path } => match get_by_path_opt(root_config, path)? {
+            Some(value) => Ok(Some(value.clone())),
+            None if matches!(missing_behavior, MissingConfigBehavior::Omit) => Ok(None),
+            None => Err(ConfigError::interp(format!(
+                "config.{path} not found (missing key in runtime config)"
+            ))),
+        },
+        ConfigTemplate::TemplateString { parts } => render_template_string_with_behavior(
+            parts,
+            root_config,
+            runtime_context,
+            missing_behavior,
+        )
+        .map(|value| value.map(Value::String)),
         ConfigTemplate::Array(arr) => {
             let mut out = Vec::with_capacity(arr.len());
             for item in arr {
-                out.push(eval_config_node(item, root_config, runtime_context)?);
+                if let Some(value) = eval_config_node_with_behavior(
+                    item,
+                    root_config,
+                    runtime_context,
+                    missing_behavior,
+                )? {
+                    out.push(value);
+                }
             }
-            Ok(Value::Array(out))
+            Ok(Some(Value::Array(out)))
         }
         ConfigTemplate::Object(map) => {
             let mut out = serde_json::Map::new();
             for (k, v) in map {
-                out.insert(
-                    k.clone(),
-                    eval_config_node(v, root_config, runtime_context)?,
-                );
+                if let Some(value) = eval_config_node_with_behavior(
+                    v,
+                    root_config,
+                    runtime_context,
+                    missing_behavior,
+                )? {
+                    out.insert(k.clone(), value);
+                }
             }
-            Ok(Value::Object(out))
+            Ok(Some(Value::Object(out)))
         }
     }
 }
@@ -125,13 +196,38 @@ pub fn render_template_string_with_context(
     config: &Value,
     runtime_context: &RuntimeTemplateContext,
 ) -> Result<String> {
+    render_template_string_with_behavior(
+        parts,
+        config,
+        runtime_context,
+        MissingConfigBehavior::Error,
+    )?
+    .ok_or_else(|| ConfigError::interp("template resolved to no value".to_string()))
+}
+
+fn render_template_string_with_behavior(
+    parts: &TemplateString,
+    config: &Value,
+    runtime_context: &RuntimeTemplateContext,
+    missing_behavior: MissingConfigBehavior,
+) -> Result<Option<String>> {
     let mut out = String::new();
     for p in parts {
         match p {
             TemplatePart::Lit { lit } => out.push_str(lit),
             TemplatePart::Config { config: path } => {
-                let v = get_by_path(config, path)?;
+                let Some(v) = get_by_path_opt(config, path)? else {
+                    if matches!(missing_behavior, MissingConfigBehavior::Omit) {
+                        return Ok(None);
+                    }
+                    return Err(ConfigError::interp(format!(
+                        "config.{path} not found (missing key in rendered config)"
+                    )));
+                };
                 if v.is_null() {
+                    if matches!(missing_behavior, MissingConfigBehavior::Omit) {
+                        return Ok(None);
+                    }
                     return Err(ConfigError::interp(format!(
                         "config.{path} is null; cannot interpolate"
                     )));
@@ -166,5 +262,5 @@ pub fn render_template_string_with_context(
             }
         }
     }
-    Ok(out)
+    Ok(Some(out))
 }

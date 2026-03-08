@@ -3,13 +3,15 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use amber_config as rc;
+use jsonptr::PointerBuf;
 use miette::{Diagnostic, NamedSource, SourceSpan};
 use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
     BindingSource, ComponentDecl, ExportTarget, InterpolatedPart, InterpolatedString,
-    InterpolationSource, Manifest, ManifestSpans, MountSource, Program, SlotName,
+    InterpolationSource, Manifest, ManifestSpans, MountSource, Program, ProgramArgItem, SlotName,
+    SlotTarget, parse_slot_query, validate_slot_query_for_slot,
 };
 
 #[allow(unused_assignments)]
@@ -102,6 +104,90 @@ pub enum ManifestLint {
     },
 
     #[error(
+        "command argument references optional config `{path}` without `when` (in component \
+         {component})"
+    )]
+    #[diagnostic(
+        code(manifest::optional_command_config),
+        severity(Warning),
+        help(
+            "Wrap the argument in `{{ when: \"config.{path}\", argv: [...] }}` if it should \
+             disappear when unset, or make `config.{path}` required."
+        )
+    )]
+    OptionalCommandConfig {
+        path: String,
+        component: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label("unguarded optional config interpolation")]
+        span: SourceSpan,
+    },
+
+    #[error(
+        "environment value references optional config `{path}` without `when` (in component \
+         {component})"
+    )]
+    #[diagnostic(
+        code(manifest::optional_env_config),
+        severity(Warning),
+        help(
+            "Wrap the env value in `{{ when: \"config.{path}\", value: ... }}` if it should \
+             disappear when unset, or make `config.{path}` required."
+        )
+    )]
+    OptionalEnvConfig {
+        path: String,
+        component: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label("unguarded optional config interpolation")]
+        span: SourceSpan,
+    },
+
+    #[error(
+        "this `when` condition is unnecessary: slot `{slot}` is required, so it is always bound \
+         and this argv group is always included (in component {component})"
+    )]
+    #[diagnostic(
+        code(manifest::required_slot_when),
+        severity(Warning),
+        help(
+            "Remove `when` if this argv group should always be included. If it should disappear \
+             when the parent does not bind the slot, mark `slots.{slot}` as `optional: true`."
+        )
+    )]
+    RequiredSlotWhen {
+        slot: String,
+        component: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label("slot is required, so this condition is always true")]
+        span: SourceSpan,
+    },
+
+    #[error(
+        "this `when` condition is unnecessary: slot `{slot}` is required, so it is always bound \
+         and this env value is always included (in component {component})"
+    )]
+    #[diagnostic(
+        code(manifest::required_slot_when_env),
+        severity(Warning),
+        help(
+            "Remove `when` if this env value should always be included. If it should disappear \
+             when the parent does not bind the slot, mark `slots.{slot}` as `optional: true`."
+        )
+    )]
+    RequiredEnvSlotWhen {
+        slot: String,
+        component: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label("slot is required, so this condition is always true")]
+        span: SourceSpan,
+    },
+
+    #[error(
         "environment `{environment}` declares resolver `{resolver}` more than once (in component \
          {component})"
     )]
@@ -137,6 +223,28 @@ fn add_program_slot_uses<'a>(
     used_all
 }
 
+fn add_slot_condition_use<'a>(
+    manifest: &'a Manifest,
+    used_slots: &mut BTreeSet<&'a SlotName>,
+    query: &str,
+) {
+    match parse_slot_query(query) {
+        Ok(parsed) => match parsed.target {
+            SlotTarget::All => used_slots.extend(manifest.slots().keys()),
+            SlotTarget::Slot(slot) => {
+                if let Some((slot_key, _)) = manifest.slots().get_key_value(slot) {
+                    used_slots.insert(slot_key);
+                }
+            }
+        },
+        Err(_) => {
+            if query.is_empty() {
+                used_slots.extend(manifest.slots().keys());
+            }
+        }
+    }
+}
+
 fn visit_program_interpolated(
     program: &Program,
     mut visit: impl FnMut(&InterpolatedString) -> bool,
@@ -148,17 +256,333 @@ fn visit_program_interpolated(
     {
         return true;
     }
-    for arg in &program.command().0 {
-        if visit(arg) {
+    for item in &program.command().0 {
+        let mut item_hit = false;
+        item.visit_values(|value| {
+            if !item_hit {
+                item_hit = visit(value);
+            }
+        });
+        if item_hit {
             return true;
         }
     }
     for value in program.env().values() {
-        if visit(value) {
+        if visit(value.value()) {
             return true;
         }
     }
     false
+}
+
+#[derive(Clone, Copy)]
+enum CommandArgLintLocation {
+    Entrypoint(usize),
+    Args(usize),
+}
+
+impl CommandArgLintLocation {
+    fn pointer(self) -> String {
+        match self {
+            Self::Entrypoint(idx) => format!("/program/entrypoint/{idx}"),
+            Self::Args(idx) => format!("/program/args/{idx}"),
+        }
+    }
+}
+
+fn command_arg_optional_config_lints(
+    manifest: &Manifest,
+    component: &str,
+    src: &NamedSource<Arc<str>>,
+    spans: &ManifestSpans,
+    optional_leaf_paths: &BTreeSet<String>,
+) -> Vec<ManifestLint> {
+    let Some(program) = manifest.program() else {
+        return Vec::new();
+    };
+
+    let (items, location_of, field_pointer): (
+        &[ProgramArgItem],
+        fn(usize) -> CommandArgLintLocation,
+        &str,
+    ) = match program {
+        Program::Image(program) => (
+            &program.entrypoint.0,
+            CommandArgLintLocation::Entrypoint,
+            "/program/entrypoint",
+        ),
+        Program::Path(program) => (
+            &program.args.0,
+            CommandArgLintLocation::Args,
+            "/program/args",
+        ),
+    };
+
+    let source = src.inner().as_ref();
+    let root = (0usize, source.len()).into();
+    let fallback = spans
+        .program
+        .as_ref()
+        .map(|program| program.whole)
+        .unwrap_or((0usize, 0usize).into());
+
+    let mut out = Vec::new();
+    for (idx, item) in items.iter().enumerate() {
+        match item {
+            ProgramArgItem::Arg(arg) => {
+                for part in &arg.parts {
+                    let InterpolatedPart::Interpolation {
+                        source: kind,
+                        query,
+                    } = part
+                    else {
+                        continue;
+                    };
+                    if *kind != InterpolationSource::Config || !optional_leaf_paths.contains(query)
+                    {
+                        continue;
+                    }
+                    let span =
+                        crate::span_for_json_pointer(source, root, &location_of(idx).pointer())
+                            .or_else(|| crate::span_for_json_pointer(source, root, field_pointer))
+                            .unwrap_or(fallback);
+                    out.push(ManifestLint::OptionalCommandConfig {
+                        path: query.clone(),
+                        component: component.to_string(),
+                        src: src.clone(),
+                        span,
+                    });
+                }
+            }
+            ProgramArgItem::Group(group) => {
+                for (group_idx, arg) in group.argv.0.iter().enumerate() {
+                    for part in &arg.parts {
+                        let InterpolatedPart::Interpolation {
+                            source: kind,
+                            query,
+                        } = part
+                        else {
+                            continue;
+                        };
+                        if *kind != InterpolationSource::Config
+                            || !optional_leaf_paths.contains(query)
+                            || (group.when.source() == InterpolationSource::Config
+                                && query == group.when.query())
+                        {
+                            continue;
+                        }
+                        let pointer = format!("{}/{idx}/argv/{group_idx}", field_pointer);
+                        let span = crate::span_for_json_pointer(source, root, &pointer)
+                            .or_else(|| {
+                                crate::span_for_json_pointer(
+                                    source,
+                                    root,
+                                    &location_of(idx).pointer(),
+                                )
+                            })
+                            .or_else(|| crate::span_for_json_pointer(source, root, field_pointer))
+                            .unwrap_or(fallback);
+                        out.push(ManifestLint::OptionalCommandConfig {
+                            path: query.clone(),
+                            component: component.to_string(),
+                            src: src.clone(),
+                            span,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn command_arg_required_slot_when_lints(
+    manifest: &Manifest,
+    component: &str,
+    src: &NamedSource<Arc<str>>,
+    spans: &ManifestSpans,
+) -> Vec<ManifestLint> {
+    let Some(program) = manifest.program() else {
+        return Vec::new();
+    };
+
+    let (items, field_pointer): (&[ProgramArgItem], &str) = match program {
+        Program::Image(program) => (&program.entrypoint.0, "/program/entrypoint"),
+        Program::Path(program) => (&program.args.0, "/program/args"),
+    };
+
+    let source = src.inner().as_ref();
+    let root = (0usize, source.len()).into();
+    let fallback = spans
+        .program
+        .as_ref()
+        .map(|program| program.whole)
+        .unwrap_or((0usize, 0usize).into());
+
+    let mut out = Vec::new();
+    for (idx, item) in items.iter().enumerate() {
+        let ProgramArgItem::Group(group) = item else {
+            continue;
+        };
+        if group.when.source() != InterpolationSource::Slots {
+            continue;
+        }
+        let Ok(parsed) = parse_slot_query(group.when.query()) else {
+            continue;
+        };
+        let SlotTarget::Slot(slot) = parsed.target else {
+            continue;
+        };
+        let Some(slot_decl) = manifest.slots().get(slot) else {
+            continue;
+        };
+        let Ok(validation) = validate_slot_query_for_slot(slot_decl, &parsed) else {
+            continue;
+        };
+        if slot_decl.optional || !validation.guaranteed_when_slot_is_bound {
+            continue;
+        }
+
+        let pointer = format!("{field_pointer}/{idx}/when");
+        let item_pointer = format!("{field_pointer}/{idx}");
+        let span = crate::span_for_json_pointer(source, root, &pointer)
+            .or_else(|| crate::span_for_json_pointer(source, root, &item_pointer))
+            .or_else(|| crate::span_for_json_pointer(source, root, field_pointer))
+            .unwrap_or(fallback);
+        out.push(ManifestLint::RequiredSlotWhen {
+            slot: slot.to_string(),
+            component: component.to_string(),
+            src: src.clone(),
+            span,
+        });
+    }
+
+    out
+}
+
+fn program_env_optional_config_lints(
+    manifest: &Manifest,
+    component: &str,
+    src: &NamedSource<Arc<str>>,
+    spans: &ManifestSpans,
+    optional_leaf_paths: &BTreeSet<String>,
+) -> Vec<ManifestLint> {
+    let Some(program) = manifest.program() else {
+        return Vec::new();
+    };
+
+    let source = src.inner().as_ref();
+    let root = (0usize, source.len()).into();
+    let fallback = spans
+        .program
+        .as_ref()
+        .map(|program| program.whole)
+        .unwrap_or((0usize, 0usize).into());
+
+    let mut out = Vec::new();
+    for (key, value) in program.env() {
+        for part in &value.value().parts {
+            let InterpolatedPart::Interpolation {
+                source: kind,
+                query,
+            } = part
+            else {
+                continue;
+            };
+            if *kind != InterpolationSource::Config || !optional_leaf_paths.contains(query) {
+                continue;
+            }
+            if let Some(when) = value.when()
+                && when.source() == InterpolationSource::Config
+                && query == when.query()
+            {
+                continue;
+            }
+
+            let pointer = if value.group().is_some() {
+                PointerBuf::from_tokens(["program", "env", key, "value"]).to_string()
+            } else {
+                PointerBuf::from_tokens(["program", "env", key]).to_string()
+            };
+            let span = crate::span_for_json_pointer(source, root, &pointer)
+                .or_else(|| {
+                    crate::span_for_json_pointer(
+                        source,
+                        root,
+                        &PointerBuf::from_tokens(["program", "env", key]).to_string(),
+                    )
+                })
+                .or_else(|| crate::span_for_json_pointer(source, root, "/program/env"))
+                .unwrap_or(fallback);
+            out.push(ManifestLint::OptionalEnvConfig {
+                path: query.clone(),
+                component: component.to_string(),
+                src: src.clone(),
+                span,
+            });
+        }
+    }
+
+    out
+}
+
+fn program_env_required_slot_when_lints(
+    manifest: &Manifest,
+    component: &str,
+    src: &NamedSource<Arc<str>>,
+    spans: &ManifestSpans,
+) -> Vec<ManifestLint> {
+    let Some(program) = manifest.program() else {
+        return Vec::new();
+    };
+
+    let source = src.inner().as_ref();
+    let root = (0usize, source.len()).into();
+    let fallback = spans
+        .program
+        .as_ref()
+        .map(|program| program.whole)
+        .unwrap_or((0usize, 0usize).into());
+
+    let mut out = Vec::new();
+    for (key, value) in program.env() {
+        let Some(group) = value.group() else {
+            continue;
+        };
+        if group.when.source() != InterpolationSource::Slots {
+            continue;
+        }
+        let Ok(parsed) = parse_slot_query(group.when.query()) else {
+            continue;
+        };
+        let SlotTarget::Slot(slot) = parsed.target else {
+            continue;
+        };
+        let Some(slot_decl) = manifest.slots().get(slot) else {
+            continue;
+        };
+        let Ok(validation) = validate_slot_query_for_slot(slot_decl, &parsed) else {
+            continue;
+        };
+        if slot_decl.optional || !validation.guaranteed_when_slot_is_bound {
+            continue;
+        }
+
+        let pointer = PointerBuf::from_tokens(["program", "env", key, "when"]).to_string();
+        let item_pointer = PointerBuf::from_tokens(["program", "env", key]).to_string();
+        let span = crate::span_for_json_pointer(source, root, &pointer)
+            .or_else(|| crate::span_for_json_pointer(source, root, &item_pointer))
+            .or_else(|| crate::span_for_json_pointer(source, root, "/program/env"))
+            .unwrap_or(fallback);
+        out.push(ManifestLint::RequiredEnvSlotWhen {
+            slot: slot.to_string(),
+            component: component.to_string(),
+            src: src.clone(),
+            span,
+        });
+    }
+
+    out
 }
 
 #[derive(Default)]
@@ -200,6 +624,18 @@ fn collect_config_uses(manifest: &Manifest) -> ConfigUses {
     let mut uses = ConfigUses::default();
 
     if let Some(program) = manifest.program() {
+        for group in program.command().groups() {
+            if group.when.source() == InterpolationSource::Config {
+                uses.add_query(group.when.query());
+            }
+        }
+        for value in program.env().values() {
+            if let Some(when) = value.when()
+                && when.source() == InterpolationSource::Config
+            {
+                uses.add_query(when.query());
+            }
+        }
         let _ = visit_program_interpolated(program, |value| {
             collect_config_uses_from_interpolated(value, &mut uses);
             false
@@ -281,6 +717,18 @@ pub fn lint_manifest(
 
     let mut program_used_slots = BTreeSet::new();
     if let Some(program) = manifest.program() {
+        for group in program.command().groups() {
+            if group.when.source() == InterpolationSource::Slots {
+                add_slot_condition_use(manifest, &mut program_used_slots, group.when.query());
+            }
+        }
+        for value in program.env().values() {
+            if let Some(when) = value.when()
+                && when.source() == InterpolationSource::Slots
+            {
+                add_slot_condition_use(manifest, &mut program_used_slots, when.query());
+            }
+        }
         let _ = visit_program_interpolated(program, |value| {
             add_program_slot_uses(manifest, &mut program_used_slots, value)
         });
@@ -371,6 +819,12 @@ pub fn lint_manifest(
     if let Some(schema) = manifest.config_schema() {
         let config_uses = collect_config_uses(manifest);
         let schema_lints = rc::collect_schema_leaves(&schema.0);
+        let optional_leaf_paths: BTreeSet<String> = schema_lints
+            .leaves
+            .iter()
+            .filter(|leaf| !leaf.required)
+            .map(|leaf| leaf.path.clone())
+            .collect();
 
         if !schema_lints.unsupported.is_empty() {
             let mut reasons: Vec<_> = schema_lints.unsupported.into_iter().collect();
@@ -404,7 +858,29 @@ pub fn lint_manifest(
                 span,
             });
         }
+
+        lints.extend(command_arg_optional_config_lints(
+            manifest,
+            &component,
+            &src,
+            spans,
+            &optional_leaf_paths,
+        ));
+        lints.extend(program_env_optional_config_lints(
+            manifest,
+            &component,
+            &src,
+            spans,
+            &optional_leaf_paths,
+        ));
     }
+
+    lints.extend(command_arg_required_slot_when_lints(
+        manifest, &component, &src, spans,
+    ));
+    lints.extend(program_env_required_slot_when_lints(
+        manifest, &component, &src, spans,
+    ));
 
     lints
 }
@@ -548,7 +1024,9 @@ mod tests {
         let program = crate::Program::image(
             crate::ProgramImage::builder()
                 .image("${config.image")
-                .entrypoint(crate::ProgramEntrypoint(vec!["run".parse().unwrap()]))
+                .entrypoint(crate::ProgramEntrypoint(vec![
+                    "run".parse::<crate::InterpolatedString>().unwrap().into(),
+                ]))
                 .common(crate::ProgramCommon::default())
                 .build(),
         );
@@ -603,6 +1081,88 @@ mod tests {
         assert!(!lints.iter().any(|lint| matches!(
             lint,
             crate::lint::ManifestLint::UnusedSlot { name, .. } if name == "llm"
+        )));
+    }
+
+    #[test]
+    fn slot_used_in_when_is_not_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.2.0",
+          slots: { llm: { kind: "llm", optional: true } },
+          program: {
+            path: "/bin/echo",
+            args: [
+              {
+                when: "slots.llm.url",
+                argv: ["--llm", "${slots.llm.url}"],
+              },
+            ],
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedSlot { name, .. } if name == "llm"
+        )));
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::RequiredSlotWhen { slot, .. } if slot == "llm"
+        )));
+    }
+
+    #[test]
+    fn required_slot_when_is_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.2.0",
+          slots: { llm: { kind: "llm" } },
+          program: {
+            image: "x",
+            entrypoint: [
+              {
+                when: "slots.llm",
+                argv: ["--llm", "${slots.llm.url}"],
+              },
+            ],
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::RequiredSlotWhen { slot, .. } if slot == "llm"
+        )));
+    }
+
+    #[test]
+    fn required_slot_field_when_is_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.2.0",
+          slots: { llm: { kind: "llm" } },
+          program: {
+            image: "x",
+            entrypoint: [
+              {
+                when: "slots.llm.url",
+                argv: ["--llm", "${slots.llm.url}"],
+              },
+            ],
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::RequiredSlotWhen { slot, .. } if slot == "llm"
         )));
     }
 
@@ -737,5 +1297,67 @@ mod tests {
         let manifest = raw.validate().unwrap();
         let lints = lint_for(input, &manifest);
         assert!(lints.is_empty());
+    }
+
+    #[test]
+    fn optional_command_config_is_linted_for_unguarded_args() {
+        let input = r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              profile: { type: "string" },
+            },
+          },
+          program: {
+            path: "/bin/echo",
+            args: ["--profile", "${config.profile}"],
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::OptionalCommandConfig { path, .. } if path == "profile"
+        )));
+    }
+
+    #[test]
+    fn when_suppresses_matching_optional_command_lint_only() {
+        let input = r#"
+        {
+          manifest_version: "0.2.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              profile: { type: "string" },
+              color: { type: "string" },
+            },
+          },
+          program: {
+            path: "/bin/echo",
+            args: [
+              {
+                when: "config.profile",
+                argv: ["--profile", "${config.profile}", "--color", "${config.color}"],
+              },
+            ],
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::OptionalCommandConfig { path, .. } if path == "profile"
+        )));
+        assert!(lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::OptionalCommandConfig { path, .. } if path == "color"
+        )));
     }
 }

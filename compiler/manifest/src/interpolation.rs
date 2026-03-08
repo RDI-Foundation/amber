@@ -1,9 +1,15 @@
 use std::{fmt, str::FromStr};
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{
+        SeqAccess, Visitor,
+        value::{MapAccessDeserializer, SeqAccessDeserializer},
+    },
+};
 use serde_with::{DeserializeFromStr, SerializeDisplay};
 
-use crate::Error;
+use crate::{Error, SlotTarget, parse_slot_query};
 
 #[derive(
     Clone,
@@ -170,39 +176,426 @@ impl fmt::Display for InterpolatedString {
     }
 }
 
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, DeserializeFromStr, SerializeDisplay,
+)]
+pub struct WhenPath {
+    source: InterpolationSource,
+    query: String,
+}
+
+impl WhenPath {
+    pub fn source(&self) -> InterpolationSource {
+        self.source
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+}
+
+impl fmt::Display for WhenPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.source)?;
+        if !self.query.is_empty() {
+            write!(f, ".{}", self.query)?;
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for WhenPath {
+    type Err = Error;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let InterpolatedPart::Interpolation { source, query } = input.parse()? else {
+            unreachable!("when path parser never returns literals");
+        };
+
+        match source {
+            InterpolationSource::Config => validate_config_when_path(input, &query)?,
+            InterpolationSource::Slots => validate_slot_when_path(input, &query)?,
+            InterpolationSource::Bindings => {
+                return Err(Error::InvalidWhenPath {
+                    input: input.to_string(),
+                    message: "expected `config.<path>` or `slots.<path>`".to_string(),
+                });
+            }
+        }
+        Ok(Self { source, query })
+    }
+}
+
+fn validate_config_when_path(input: &str, query: &str) -> Result<(), Error> {
+    if !query.is_empty() && !query.split('.').any(str::is_empty) {
+        return Ok(());
+    }
+
+    Err(Error::InvalidWhenPath {
+        input: input.to_string(),
+        message: "expected `config.<path>` or `slots.<path>`".to_string(),
+    })
+}
+
+fn validate_slot_when_path(input: &str, query: &str) -> Result<(), Error> {
+    let parsed = parse_slot_query(query).map_err(|err| Error::InvalidWhenPath {
+        input: input.to_string(),
+        message: err.to_string(),
+    })?;
+
+    if matches!(parsed.target, SlotTarget::Slot(_)) {
+        return Ok(());
+    }
+
+    Err(Error::InvalidWhenPath {
+        input: input.to_string(),
+        message: "expected `config.<path>` or `slots.<path>`".to_string(),
+    })
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
-pub struct ProgramEntrypoint(pub Vec<InterpolatedString>);
+pub struct ProgramArgList(pub Vec<InterpolatedString>);
+
+impl ProgramArgList {
+    pub fn iter(&self) -> impl Iterator<Item = &InterpolatedString> {
+        self.0.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl<'de> Deserialize<'de> for ProgramArgList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_program_arg_list(deserializer).map(Self)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgramArgGroup {
+    pub when: WhenPath,
+    pub argv: ProgramArgList,
+}
+
+impl ProgramArgGroup {
+    pub fn visit_values(&self, mut visit: impl FnMut(&InterpolatedString)) {
+        for arg in &self.argv.0 {
+            visit(arg);
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ProgramArgItem {
+    Arg(InterpolatedString),
+    Group(ProgramArgGroup),
+}
+
+impl ProgramArgItem {
+    pub fn arg(&self) -> Option<&InterpolatedString> {
+        match self {
+            Self::Arg(arg) => Some(arg),
+            Self::Group(_) => None,
+        }
+    }
+
+    pub fn group(&self) -> Option<&ProgramArgGroup> {
+        match self {
+            Self::Arg(_) => None,
+            Self::Group(group) => Some(group),
+        }
+    }
+
+    pub fn when(&self) -> Option<&WhenPath> {
+        self.group().map(|group| &group.when)
+    }
+
+    pub fn visit_values(&self, mut visit: impl FnMut(&InterpolatedString)) {
+        match self {
+            Self::Arg(arg) => visit(arg),
+            Self::Group(group) => group.visit_values(visit),
+        }
+    }
+}
+
+impl From<InterpolatedString> for ProgramArgItem {
+    fn from(value: InterpolatedString) -> Self {
+        Self::Arg(value)
+    }
+}
+
+impl Serialize for ProgramArgItem {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Arg(arg) => arg.serialize(serializer),
+            Self::Group(group) => group.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProgramArgItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ProgramArgItemVisitor;
+
+        impl<'de> Visitor<'de> for ProgramArgItemVisitor {
+            type Value = ProgramArgItem;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a string or an object with `when` and `argv`")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                value
+                    .parse::<InterpolatedString>()
+                    .map(ProgramArgItem::Arg)
+                    .map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(&value)
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                ProgramArgGroup::deserialize(MapAccessDeserializer::new(map))
+                    .map(ProgramArgItem::Group)
+            }
+        }
+
+        deserializer.deserialize_any(ProgramArgItemVisitor)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ProgramEntrypoint(pub Vec<ProgramArgItem>);
+
+impl ProgramEntrypoint {
+    pub fn visit_args(&self, mut visit: impl FnMut(&InterpolatedString)) {
+        for item in &self.0 {
+            item.visit_values(&mut visit);
+        }
+    }
+
+    pub fn groups(&self) -> impl Iterator<Item = &ProgramArgGroup> {
+        self.0.iter().filter_map(ProgramArgItem::group)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
 
 impl<'de> Deserialize<'de> for ProgramEntrypoint {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum ProgramEntrypointForm {
-            String(String),
-            List(Vec<InterpolatedString>),
+        struct ProgramEntrypointVisitor;
+
+        impl<'de> Visitor<'de> for ProgramEntrypointVisitor {
+            type Value = ProgramEntrypoint;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a shell-style string or an array of arguments")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                parse_program_arg_list(value)
+                    .map(|args| {
+                        ProgramEntrypoint(args.into_iter().map(ProgramArgItem::Arg).collect())
+                    })
+                    .map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(&value)
+            }
+
+            fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                Vec::<ProgramArgItem>::deserialize(SeqAccessDeserializer::new(seq))
+                    .map(ProgramEntrypoint)
+            }
         }
 
-        match ProgramEntrypointForm::deserialize(deserializer)? {
-            ProgramEntrypointForm::String(s) => {
-                let tokens = shlex::split(&s)
-                    .ok_or_else(|| serde::de::Error::custom(Error::UnclosedQuote))?;
-                let mut args = Vec::new();
-                for token in tokens {
-                    args.push(
-                        token
-                            .parse::<InterpolatedString>()
-                            .map_err(serde::de::Error::custom)?,
-                    );
-                }
-                Ok(ProgramEntrypoint(args))
-            }
-            ProgramEntrypointForm::List(list) => Ok(ProgramEntrypoint(list)),
+        deserializer.deserialize_any(ProgramEntrypointVisitor)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgramEnvGroup {
+    pub when: WhenPath,
+    pub value: InterpolatedString,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ProgramEnvValue {
+    Value(InterpolatedString),
+    Group(ProgramEnvGroup),
+}
+
+impl ProgramEnvValue {
+    pub fn value(&self) -> &InterpolatedString {
+        match self {
+            Self::Value(value) => value,
+            Self::Group(group) => &group.value,
         }
     }
+
+    pub fn group(&self) -> Option<&ProgramEnvGroup> {
+        match self {
+            Self::Value(_) => None,
+            Self::Group(group) => Some(group),
+        }
+    }
+
+    pub fn when(&self) -> Option<&WhenPath> {
+        self.group().map(|group| &group.when)
+    }
+
+    pub fn visit_values(&self, mut visit: impl FnMut(&InterpolatedString)) {
+        visit(self.value());
+    }
+}
+
+impl From<InterpolatedString> for ProgramEnvValue {
+    fn from(value: InterpolatedString) -> Self {
+        Self::Value(value)
+    }
+}
+
+impl Serialize for ProgramEnvValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Value(value) => value.serialize(serializer),
+            Self::Group(group) => group.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProgramEnvValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ProgramEnvValueVisitor;
+
+        impl<'de> Visitor<'de> for ProgramEnvValueVisitor {
+            type Value = ProgramEnvValue;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an interpolation string or an object with `when` and `value`")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                value
+                    .parse::<InterpolatedString>()
+                    .map(ProgramEnvValue::Value)
+                    .map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(&value)
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                ProgramEnvGroup::deserialize(MapAccessDeserializer::new(map))
+                    .map(ProgramEnvValue::Group)
+            }
+        }
+
+        deserializer.deserialize_any(ProgramEnvValueVisitor)
+    }
+}
+
+fn deserialize_program_arg_list<'de, D>(
+    deserializer: D,
+) -> Result<Vec<InterpolatedString>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ProgramArgListVisitor;
+
+    impl<'de> Visitor<'de> for ProgramArgListVisitor {
+        type Value = Vec<InterpolatedString>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a shell-style string or an array of strings")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            parse_program_arg_list(value).map_err(E::custom)
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.visit_str(&value)
+        }
+
+        fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            Vec::<InterpolatedString>::deserialize(SeqAccessDeserializer::new(seq))
+        }
+    }
+
+    deserializer.deserialize_any(ProgramArgListVisitor)
+}
+
+fn parse_program_arg_list(input: &str) -> Result<Vec<InterpolatedString>, Error> {
+    let tokens = shlex::split(input).ok_or(Error::UnclosedQuote)?;
+    tokens
+        .into_iter()
+        .map(|token| token.parse::<InterpolatedString>())
+        .collect()
 }
 
 #[cfg(test)]
@@ -272,5 +665,56 @@ mod tests {
     #[test]
     fn interpolation_missing_closing_brace_errors() {
         assert!("x ${config.a".parse::<InterpolatedString>().is_err());
+    }
+
+    #[test]
+    fn when_path_requires_config_path_or_slot_path() {
+        let config = "config.value".parse::<WhenPath>().unwrap();
+        assert_eq!(config.source(), InterpolationSource::Config);
+        assert_eq!(config.query(), "value");
+
+        let slot = "slots.backend".parse::<WhenPath>().unwrap();
+        assert_eq!(slot.source(), InterpolationSource::Slots);
+        assert_eq!(slot.query(), "backend");
+
+        let slot_field = "slots.backend.url".parse::<WhenPath>().unwrap();
+        assert_eq!(slot_field.source(), InterpolationSource::Slots);
+        assert_eq!(slot_field.query(), "backend.url");
+
+        assert!("config".parse::<WhenPath>().is_err());
+        assert!("slots".parse::<WhenPath>().is_err());
+        assert!("slots.backend..url".parse::<WhenPath>().is_err());
+        assert!("bindings.route.url".parse::<WhenPath>().is_err());
+    }
+
+    #[test]
+    fn program_entrypoint_string_sugar_yields_plain_args() {
+        let parsed: ProgramEntrypoint =
+            serde_json::from_str("\"python3 -m http.server 8080\"").unwrap();
+        assert_eq!(parsed.0.len(), 4);
+        assert_eq!(parsed.0[0].arg().unwrap().to_string(), "python3");
+        assert_eq!(parsed.0[1].arg().unwrap().to_string(), "-m");
+        assert_eq!(parsed.0[2].arg().unwrap().to_string(), "http.server");
+        assert_eq!(parsed.0[3].arg().unwrap().to_string(), "8080");
+    }
+
+    #[test]
+    fn conditional_program_arg_group_supports_nested_shlex_sugar() {
+        let parsed: ProgramEntrypoint = serde_json::from_str(
+            r#"[
+              "server",
+              {
+                "when": "config.profile",
+                "argv": "--profile ${config.profile}"
+              }
+            ]"#,
+        )
+        .unwrap();
+        let group = parsed.0[1].group().expect("expected conditional group");
+        assert_eq!(group.when.source(), InterpolationSource::Config);
+        assert_eq!(group.when.query(), "profile");
+        assert_eq!(group.argv.0.len(), 2);
+        assert_eq!(group.argv.0[0].to_string(), "--profile");
+        assert_eq!(group.argv.0[1].to_string(), "${config.profile}");
     }
 }

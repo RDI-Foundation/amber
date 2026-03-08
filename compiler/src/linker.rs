@@ -10,7 +10,7 @@ use amber_config as rc;
 use amber_manifest::{
     BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, ChildName, ExportName,
     ExportTarget, InterpolatedPart, InterpolatedString, InterpolationSource, Manifest,
-    ManifestDigest, framework_capability,
+    ManifestDigest, SlotTarget, framework_capability, parse_slot_query,
 };
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, ProvideRef, Scenario, ScenarioExport,
@@ -1060,24 +1060,59 @@ fn validate_config_tree(
         } else {
             "program.args"
         };
-        for (arg_idx, arg) in program.command().0.iter().enumerate() {
-            for part in &arg.parts {
-                let InterpolatedPart::Interpolation { source, query } = part else {
-                    continue;
-                };
-                if *source == InterpolationSource::Config {
-                    validate_config_ref(format!("{command_location}[{arg_idx}]"), query);
+        for (arg_idx, item) in program.command().0.iter().enumerate() {
+            match item {
+                amber_manifest::ProgramArgItem::Arg(arg) => {
+                    for part in &arg.parts {
+                        let InterpolatedPart::Interpolation { source, query } = part else {
+                            continue;
+                        };
+                        if *source == InterpolationSource::Config {
+                            validate_config_ref(format!("{command_location}[{arg_idx}]"), query);
+                        }
+                    }
+                }
+                amber_manifest::ProgramArgItem::Group(group) => {
+                    if group.when.source() == InterpolationSource::Config {
+                        validate_config_ref(
+                            format!("{command_location}[{arg_idx}].when"),
+                            group.when.query(),
+                        );
+                    }
+                    for (group_idx, arg) in group.argv.0.iter().enumerate() {
+                        for part in &arg.parts {
+                            let InterpolatedPart::Interpolation { source, query } = part else {
+                                continue;
+                            };
+                            if *source == InterpolationSource::Config {
+                                validate_config_ref(
+                                    format!("{command_location}[{arg_idx}].argv[{group_idx}]"),
+                                    query,
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
 
         for (k, v) in program.env() {
-            for part in &v.parts {
+            if let Some(when) = v.when()
+                && when.source() == InterpolationSource::Config
+            {
+                validate_config_ref(format!("program.env.{k}.when"), when.query());
+            }
+            let location = if v.group().is_some() {
+                format!("program.env.{k}.value")
+            } else {
+                format!("program.env.{k}")
+            };
+            for part in &v.value().parts {
                 let InterpolatedPart::Interpolation { source, query } = part else {
                     continue;
                 };
                 if *source == InterpolationSource::Config {
-                    validate_config_ref(format!("program.env.{k}"), query);
+                    validate_config_ref(location.clone(), query);
                 }
             }
         }
@@ -2070,21 +2105,76 @@ fn collect_program_slot_uses(manifest: &Manifest) -> HashSet<String> {
         }
     }
 
-    for arg in &program.command().0 {
-        used_all = add_program_slot_uses(manifest, &mut uses, arg);
-        if used_all {
-            return uses;
+    for group in program.command().groups() {
+        if group.when.source() == InterpolationSource::Slots {
+            used_all = add_program_slot_condition_use(manifest, &mut uses, group.when.query());
+            if used_all {
+                return uses;
+            }
+        }
+    }
+
+    for item in &program.command().0 {
+        match item {
+            amber_manifest::ProgramArgItem::Arg(arg) => {
+                used_all = add_program_slot_uses(manifest, &mut uses, arg);
+                if used_all {
+                    return uses;
+                }
+            }
+            amber_manifest::ProgramArgItem::Group(group) => {
+                for arg in &group.argv.0 {
+                    used_all = add_program_slot_uses(manifest, &mut uses, arg);
+                    if used_all {
+                        return uses;
+                    }
+                }
+            }
         }
     }
 
     for value in program.env().values() {
-        used_all = add_program_slot_uses(manifest, &mut uses, value);
+        if let Some(when) = value.when()
+            && when.source() == InterpolationSource::Slots
+        {
+            used_all = add_program_slot_condition_use(manifest, &mut uses, when.query());
+            if used_all {
+                return uses;
+            }
+        }
+        used_all = add_program_slot_uses(manifest, &mut uses, value.value());
         if used_all {
             return uses;
         }
     }
 
     uses
+}
+
+fn add_program_slot_condition_use(
+    manifest: &Manifest,
+    uses: &mut HashSet<String>,
+    query: &str,
+) -> bool {
+    match parse_slot_query(query) {
+        Ok(parsed) => match parsed.target {
+            SlotTarget::All => {
+                uses.extend(manifest.slots().keys().map(|slot| slot.to_string()));
+                true
+            }
+            SlotTarget::Slot(slot) => {
+                if manifest.slots().contains_key(slot) {
+                    uses.insert(slot.to_string());
+                }
+                false
+            }
+        },
+        Err(_) if query.is_empty() => {
+            uses.extend(manifest.slots().keys().map(|slot| slot.to_string()));
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 fn add_program_slot_uses(
@@ -2312,5 +2402,40 @@ fn validate_all_slots_bound(
                 related,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use amber_manifest::Manifest;
+
+    use super::collect_program_slot_uses;
+
+    #[test]
+    fn collect_program_slot_uses_includes_slot_conditions() {
+        let manifest: Manifest = r#"
+            {
+              manifest_version: "0.2.0",
+              program: {
+                image: "app",
+                entrypoint: [
+                  "app",
+                  { when: "slots.api", argv: ["--serve"] },
+                ],
+              },
+              slots: {
+                api: { kind: "http" },
+              },
+            }
+        "#
+        .parse()
+        .expect("manifest");
+
+        assert_eq!(
+            collect_program_slot_uses(&manifest),
+            HashSet::from(["api".to_string()])
+        );
     }
 }

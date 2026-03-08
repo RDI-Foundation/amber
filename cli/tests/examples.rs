@@ -50,6 +50,10 @@ fn examples_compile_from_ir_matches_manifest_outputs() {
     fs::create_dir_all(&outputs_root).expect("failed to create outputs root");
 
     for example in collect_examples() {
+        if matches!(example_backend(&example), ExampleBackend::CheckOnly) {
+            continue;
+        }
+
         let temp = tempfile::Builder::new()
             .prefix(&format!("example-ir-{}-", example.name))
             .tempdir_in(&outputs_root)
@@ -86,6 +90,7 @@ fn examples_compile_from_ir_matches_manifest_outputs() {
             ExampleBackend::Direct => {
                 assert_same_dir(&manifest_outputs.join("direct"), &ir_outputs.join("direct"));
             }
+            ExampleBackend::CheckOnly => unreachable!("check-only examples are skipped above"),
         }
     }
 }
@@ -109,11 +114,14 @@ fn collect_examples() -> Vec<example_catalog::Example> {
 enum ExampleBackend {
     DockerCompose,
     Direct,
+    CheckOnly,
 }
 
 fn example_backend(example: &example_catalog::Example) -> ExampleBackend {
     if example.name == "direct-security" {
         ExampleBackend::Direct
+    } else if example.name == "interpolation" {
+        ExampleBackend::CheckOnly
     } else {
         ExampleBackend::DockerCompose
     }
@@ -147,6 +155,12 @@ fn compile_example_outputs(
         }
         ExampleBackend::Direct => {
             command.arg("--direct").arg(output_root.join("direct"));
+        }
+        ExampleBackend::CheckOnly => {
+            panic!(
+                "check-only examples should not be compiled: {}",
+                example.name
+            );
         }
     }
 

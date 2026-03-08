@@ -43,7 +43,8 @@ Minimal leaf component exporting an HTTP API:
 
 This crate **parses JSON5**, deserializes into Rust types, and validates:
 
-* `manifest_version` must be valid SemVer and **satisfy `^0.1.0`**.
+* `manifest_version` must be valid SemVer and **satisfy `>=0.1.0, <1.0.0`**.
+  New manifests should use `0.2.0`; older pre-1.0 manifests are still accepted.
 * `experimental_features` entries must be known feature names.
 * No dots (`.`) in:
 
@@ -230,8 +231,27 @@ program: {
   // Same parsing rules as entrypoint.
   args: ["python3", "-m", "http.server", "8080"],
   // args: "python3 -m http.server 8080",
+  //
+  // Args and entrypoint items may also contain `when`-guarded argv groups.
+  // The whole `argv` array is omitted when the `when` path is absent or null.
+  // Presence is not truthiness: false, 0, and "" still count as present.
+  //
+  // args: [
+  //   {
+  //     when: "config.profile",
+  //     argv: "--profile ${config.profile}",
+  //   },
+  // ],
 
   env: {
+    // Env values may also be conditional.
+    // The whole env entry is omitted when the `when` path is absent or null.
+    // Presence is not truthiness: false, 0, and "" still count as present.
+    //
+    // PROFILE: {
+    //   when: "config.profile",
+    //   value: "${config.profile}",
+    // },
     LOG_LEVEL: "debug",
   },
   network: {
@@ -308,6 +328,17 @@ Notes:
   referenced via `${bindings.<name>.url}`.
 * Framework bindings may be **non-URL-shaped**; `${bindings.<name>.url}` is invalid for those
   bindings and is rejected by the compiler.
+* `manifest_version: "0.2.0"` or newer is required for object items in `program.entrypoint` /
+  `program.args` and object values in `program.env`, such as
+  `{ when: "config.profile", argv: [...] }` or
+  `{ when: "config.profile", value: "${config.profile}" }`.
+* `when` is supported in `program.entrypoint`, `program.args`, and `program.env`.
+* `when` accepts `config.<path>` or `slots.<path>`.
+* Slot `when` checks whether the referenced slot query is present. Today that means
+  `slots.<slot>` and `slots.<slot>.url` are both valid.
+* `when: "slots.<slot>"` and `when: "slots.<slot>.url"` are mainly useful for `optional: true`
+  slots. Amber lints conditions on required slots when the queried value is guaranteed to be
+  present after linking.
 * This crate **parses** interpolation syntax but does **not** validate that the referenced paths
   exist. The compiler validates `${config.*}` against `config_schema` and `${slots.*}` against
   declared slots and supported fields. `${bindings.*}` is validated against named bindings that

@@ -1,0 +1,12 @@
+Error: manifest::invalid_when_path
+
+  × check failed
+  ╰─▶ invalid `when` path `bindings.api.url`: `when` must use `config.<path>`
+      or `slots.<path>`
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/program_env_when_invalid_source.json5:7:15]
+ 6 │       API_URL: {
+ 7 │         when: "bindings.api.url",
+   ·               ─────────┬────────
+   ·                        ╰── `when` must use `config.<path>` or `slots.<path>`
+ 8 │         value: "https://example.test",
+   ╰────

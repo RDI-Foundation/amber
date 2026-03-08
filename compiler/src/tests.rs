@@ -2677,7 +2677,10 @@ fn compile_from_tree_handles_malformed_program_image_from_builder() {
             amber_manifest::ProgramImage::builder()
                 .image("${config.image")
                 .entrypoint(amber_manifest::ProgramEntrypoint(vec![
-                    "run".parse().unwrap(),
+                    "run"
+                        .parse::<amber_manifest::InterpolatedString>()
+                        .unwrap()
+                        .into(),
                 ]))
                 .common(amber_manifest::ProgramCommon::default())
                 .build(),
@@ -2716,7 +2719,10 @@ fn check_from_tree_handles_malformed_program_image_from_builder_with_source() {
             amber_manifest::ProgramImage::builder()
                 .image("${config.image")
                 .entrypoint(amber_manifest::ProgramEntrypoint(vec![
-                    "run".parse().unwrap(),
+                    "run"
+                        .parse::<amber_manifest::InterpolatedString>()
+                        .unwrap()
+                        .into(),
                 ]))
                 .common(amber_manifest::ProgramCommon::default())
                 .build(),

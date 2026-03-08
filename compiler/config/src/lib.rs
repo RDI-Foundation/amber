@@ -15,7 +15,8 @@ pub use schema::{
     validate_config_schema,
 };
 pub use template::{
-    eval_config_template, eval_config_template_with_context, get_by_path, render_template_string,
+    eval_config_template, eval_config_template_partial_with_context,
+    eval_config_template_with_context, get_by_path, get_by_path_opt, render_template_string,
     render_template_string_with_context, stringify_for_interpolation, stringify_for_mount,
     template_string_is_runtime,
 };
