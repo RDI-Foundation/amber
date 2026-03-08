@@ -24,7 +24,7 @@ pub use crate::targets::{
 pub struct CompiledScenario {
     scenario: Scenario,
     scenario_ir: ScenarioIr,
-    resolved_urls: Vec<Url>,
+    resolved_urls: Vec<Option<Url>>,
     source_context: Option<CompiledScenarioSourceContext>,
 }
 
@@ -46,19 +46,17 @@ impl CompiledScenario {
             .chain(std::iter::once(scenario_ir.root))
             .max()
             .expect("Scenario IR root id should always be present");
-        let mut resolved_urls = (0..=max_id)
-            .map(synthetic_component_url)
-            .collect::<Vec<_>>();
+        let mut resolved_urls = vec![None; max_id + 1];
         for component in &scenario_ir.components {
             resolved_urls[component.id] = match component.resolved_url.as_deref() {
-                Some(raw) => {
-                    Url::parse(raw).map_err(|source| CompiledScenarioError::InvalidResolvedUrl {
+                Some(raw) => Some(Url::parse(raw).map_err(|source| {
+                    CompiledScenarioError::InvalidResolvedUrl {
                         component: component.moniker.clone(),
                         raw: raw.to_string(),
                         source,
-                    })?
-                }
-                None => synthetic_component_url(component.id),
+                    }
+                })?),
+                None => None,
             };
         }
         let scenario = Scenario::try_from(scenario_ir.clone())
@@ -79,10 +77,11 @@ impl CompiledScenario {
         &self.scenario_ir
     }
 
-    pub fn resolved_url_for_component(&self, id: ComponentId) -> &Url {
+    pub fn resolved_url_for_component(&self, id: ComponentId) -> Option<&Url> {
         self.resolved_urls
             .get(id.0)
-            .expect("resolved URL should exist for each component id")
+            .expect("resolved URL slot should exist for each component id")
+            .as_ref()
     }
 
     pub(crate) fn source_context(&self) -> Option<(&DigestStore, &Provenance)> {
@@ -90,11 +89,6 @@ impl CompiledScenario {
             .as_ref()
             .map(|context| (&context.store, &context.provenance))
     }
-}
-
-fn synthetic_component_url(component_id: usize) -> Url {
-    Url::parse(&format!("amber-ir:/component/{component_id}"))
-        .expect("synthetic Scenario IR component URL should parse")
 }
 
 #[derive(Clone, Debug)]
