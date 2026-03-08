@@ -19,6 +19,7 @@ use serde_json::Value;
 
 use crate::{
     binding_query::{BindingObject, parse_binding_query, resolve_binding_query},
+    config_resolution::{QueryResolution, resolve_config_query_node, validate_config_query_syntax},
     config_scope::{RuntimeConfigView, build_runtime_config_view},
     config_templates,
     slot_query::{SlotObject, resolve_slot_query, slot_query_is_present},
@@ -1165,65 +1166,6 @@ enum MountResolution {
     Runtime,
 }
 
-enum QueryResolution<'a> {
-    Node(&'a rc::ConfigNode),
-    RuntimePath(String),
-}
-
-fn parse_query_segments(query: &str) -> Result<Vec<&str>, MeshError> {
-    query
-        .split('.')
-        .map(|seg| {
-            if seg.is_empty() {
-                Err(MeshError::new(format!(
-                    "invalid config path {query:?}: empty segment"
-                )))
-            } else {
-                Ok(seg)
-            }
-        })
-        .collect()
-}
-
-fn resolve_config_query_node<'a>(
-    template: &'a rc::ConfigNode,
-    query: &str,
-) -> Result<QueryResolution<'a>, MeshError> {
-    if query.is_empty() {
-        return Ok(QueryResolution::Node(template));
-    }
-
-    let segments = parse_query_segments(query)?;
-    let mut current = template;
-    for (idx, seg) in segments.iter().enumerate() {
-        match current {
-            rc::ConfigNode::Object(map) => {
-                let Some(next) = map.get(*seg) else {
-                    return Err(MeshError::new(format!(
-                        "config.{query} not found (missing key {seg:?})"
-                    )));
-                };
-                current = next;
-            }
-            rc::ConfigNode::ConfigRef(path) => {
-                let suffix = segments[idx..].join(".");
-                let full = if path.is_empty() {
-                    suffix
-                } else {
-                    format!("{path}.{suffix}")
-                };
-                return Ok(QueryResolution::RuntimePath(full));
-            }
-            _ => {
-                return Err(MeshError::new(format!(
-                    "config.{query} not found (encountered non-object before segment {seg:?})"
-                )));
-            }
-        }
-    }
-    Ok(QueryResolution::Node(current))
-}
-
 fn resolve_config_query_for_program(
     template: Option<&rc::ConfigNode>,
     query: &str,
@@ -1232,7 +1174,7 @@ fn resolve_config_query_for_program(
         return Ok(ConfigResolution::Runtime);
     };
 
-    let cur = match resolve_config_query_node(template, query)? {
+    let cur = match resolve_config_query_node(template, query).map_err(MeshError::new)? {
         QueryResolution::Node(cur) => cur,
         QueryResolution::RuntimePath(_) => return Ok(ConfigResolution::Runtime),
     };
@@ -1321,13 +1263,13 @@ fn resolve_config_query_for_program_image(
                  string leaf like ${config.image}",
             ));
         }
-        parse_query_segments(query)?;
+        validate_config_query_syntax(query).map_err(MeshError::new)?;
         return Ok(ImageConfigResolution::RuntimeTemplate(vec![
             ProgramImagePart::RootConfigPath(query.to_string()),
         ]));
     };
 
-    match resolve_config_query_node(template, query)? {
+    match resolve_config_query_node(template, query).map_err(MeshError::new)? {
         QueryResolution::RuntimePath(path) => Ok(ImageConfigResolution::RuntimeTemplate(vec![
             ProgramImagePart::RootConfigPath(path),
         ])),
@@ -1355,7 +1297,7 @@ fn resolve_config_query_for_mount(
         return Ok(MountResolution::Runtime);
     };
 
-    let cur = match resolve_config_query_node(template, query)? {
+    let cur = match resolve_config_query_node(template, query).map_err(MeshError::new)? {
         QueryResolution::Node(cur) => cur,
         QueryResolution::RuntimePath(_) => return Ok(MountResolution::Runtime),
     };

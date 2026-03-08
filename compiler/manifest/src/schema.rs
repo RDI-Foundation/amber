@@ -520,11 +520,11 @@ pub struct SlotDecl {
 #[non_exhaustive]
 pub struct StorageResourceParams {
     #[serde(default)]
-    pub size: Option<String>,
+    pub size: Option<InterpolatedString>,
     #[serde(default)]
-    pub retention: Option<String>,
+    pub retention: Option<InterpolatedString>,
     #[serde(default)]
-    pub sharing: Option<String>,
+    pub sharing: Option<InterpolatedString>,
 }
 
 #[derive(

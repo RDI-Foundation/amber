@@ -4,7 +4,7 @@ use std::{
 };
 
 use amber_manifest::{
-    CapabilityDecl, FrameworkCapabilityName, ManifestDigest, Program, ProvideDecl, ResourceDecl,
+    CapabilityDecl, CapabilityKind, FrameworkCapabilityName, ManifestDigest, Program, ProvideDecl,
     SlotDecl,
 };
 use serde::{Deserialize, Serialize};
@@ -235,6 +235,25 @@ pub struct Component {
 
     /// Containment edges (component tree).
     pub children: Vec<ComponentId>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageResourceParams {
+    #[serde(default)]
+    pub size: Option<String>,
+    #[serde(default)]
+    pub retention: Option<String>,
+    #[serde(default)]
+    pub sharing: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceDecl {
+    pub kind: CapabilityKind,
+    #[serde(default)]
+    pub params: StorageResourceParams,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

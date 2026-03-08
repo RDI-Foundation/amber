@@ -9,13 +9,12 @@ use std::{
 };
 
 use amber_manifest::{
-    FrameworkCapabilityName, Manifest, ManifestDigest, ManifestRef, ProvideDecl, ResourceDecl,
-    SlotDecl,
+    FrameworkCapabilityName, Manifest, ManifestDigest, ManifestRef, ProvideDecl, SlotDecl,
 };
 use amber_mesh::{InboundTarget, MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTarget};
 use amber_scenario::{
-    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceRef, Scenario,
-    ScenarioExport, SlotRef,
+    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceDecl,
+    ResourceRef, Scenario, ScenarioExport, SlotRef,
 };
 use base64::Engine as _;
 use serde_json::{Map, Value, json};

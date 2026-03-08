@@ -29,6 +29,19 @@ pub struct InterpolatedString {
 }
 
 impl InterpolatedString {
+    pub fn from_literal(value: impl Into<String>) -> Self {
+        Self {
+            parts: vec![InterpolatedPart::Literal(value.into())],
+        }
+    }
+
+    pub fn as_literal(&self) -> Option<&str> {
+        match self.parts.as_slice() {
+            [InterpolatedPart::Literal(value)] => Some(value.as_str()),
+            _ => None,
+        }
+    }
+
     /// Visit slot names referenced by `${slots...}` interpolations.
     ///
     /// The visited slot name is the first query segment (e.g. `${slots.llm.url}` visits `llm`).
@@ -53,6 +66,18 @@ impl InterpolatedString {
             visit(slot);
         }
         false
+    }
+}
+
+impl From<String> for InterpolatedString {
+    fn from(value: String) -> Self {
+        Self::from_literal(value)
+    }
+}
+
+impl From<&str> for InterpolatedString {
+    fn from(value: &str) -> Self {
+        Self::from_literal(value)
     }
 }
 

@@ -1436,6 +1436,34 @@ fn storage_resource_parses_without_source() {
 }
 
 #[test]
+fn storage_resource_param_parses_interpolation() {
+    let manifest: Manifest = r#"
+        {
+          manifest_version: "0.1.0",
+          resources: {
+            state: {
+              kind: "storage",
+              params: { size: "${config.storage_size}" },
+            },
+          },
+        }
+        "#
+    .parse()
+    .unwrap();
+
+    let resource = manifest.resources().get("state").expect("resource");
+    assert_eq!(
+        resource
+            .params
+            .size
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("${config.storage_size}")
+    );
+}
+
+#[test]
 fn storage_mount_rejects_unknown_slot() {
     let err = r#"
         {

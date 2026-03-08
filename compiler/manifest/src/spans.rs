@@ -86,7 +86,15 @@ pub struct ResourceDeclSpans {
     pub name: SourceSpan,
     pub whole: SourceSpan,
     pub kind: Option<SourceSpan>,
-    pub params: Option<SourceSpan>,
+    pub params: Option<ResourceParamsSpans>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResourceParamsSpans {
+    pub whole: SourceSpan,
+    pub size: Option<SourceSpan>,
+    pub retention: Option<SourceSpan>,
+    pub sharing: Option<SourceSpan>,
 }
 
 #[derive(Clone, Debug)]
@@ -430,8 +438,26 @@ fn collect_resources(
             if obj.contains_key("kind") {
                 resource.kind = decl.child_span("kind");
             }
-            if obj.contains_key("params") {
-                resource.params = decl.child_span("params");
+            if let Some(params_span) = decl.child_span("params") {
+                let mut params = ResourceParamsSpans {
+                    whole: params_span,
+                    size: None,
+                    retention: None,
+                    sharing: None,
+                };
+                if let Some(Value::Object(params_obj)) = obj.get("params") {
+                    let params_cursor = SpanCursor::new(root.source, params_span);
+                    if params_obj.contains_key("size") {
+                        params.size = params_cursor.child_span("size");
+                    }
+                    if params_obj.contains_key("retention") {
+                        params.retention = params_cursor.child_span("retention");
+                    }
+                    if params_obj.contains_key("sharing") {
+                        params.sharing = params_cursor.child_span("sharing");
+                    }
+                }
+                resource.params = Some(params);
             }
         }
 

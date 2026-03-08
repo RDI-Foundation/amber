@@ -1,9 +1,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use amber_manifest::{FrameworkCapabilityName, Manifest, ProvideDecl, ResourceDecl};
+use amber_manifest::{FrameworkCapabilityName, Manifest, ProvideDecl};
 use amber_scenario::{
-    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceRef, Scenario,
-    ScenarioExport, SlotRef,
+    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceDecl,
+    ResourceRef, Scenario, ScenarioExport, SlotRef, StorageResourceParams,
 };
 use serde_json::json;
 
@@ -43,7 +43,19 @@ fn apply_manifest(component: &mut Component, manifest: &Manifest) {
     component.resources = manifest
         .resources()
         .iter()
-        .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
+        .map(|(name, decl)| {
+            (
+                name.as_str().to_string(),
+                ResourceDecl {
+                    kind: decl.kind,
+                    params: StorageResourceParams {
+                        size: decl.params.size.as_ref().map(ToString::to_string),
+                        retention: decl.params.retention.as_ref().map(ToString::to_string),
+                        sharing: decl.params.sharing.as_ref().map(ToString::to_string),
+                    },
+                },
+            )
+        })
         .collect();
 }
 

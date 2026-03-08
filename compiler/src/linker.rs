@@ -14,8 +14,9 @@ use amber_manifest::{
     span_for_json_pointer,
 };
 use amber_scenario::{
-    BindingEdge, BindingFrom, Component, ComponentId, ProvideRef, ResourceRef, Scenario,
-    ScenarioExport, SlotRef, graph::component_path_for,
+    BindingEdge, BindingFrom, Component, ComponentId, ProvideRef,
+    ResourceDecl as ScenarioResourceDecl, ResourceRef, Scenario, ScenarioExport, SlotRef,
+    StorageResourceParams as ScenarioStorageResourceParams, graph::component_path_for,
 };
 use jsonschema::Validator;
 use miette::{Diagnostic, NamedSource, SourceSpan};
@@ -23,7 +24,10 @@ use serde_json::Value;
 use thiserror::Error;
 
 use super::frontend::{ResolvedNode, ResolvedTree};
-use crate::{ComponentProvenance, DigestStore, Provenance, config_templates, store::display_url};
+use crate::{
+    ComponentProvenance, DigestStore, Provenance, config_resolution::render_static_config_string,
+    config_templates, store::display_url,
+};
 
 #[allow(unused_assignments)]
 #[derive(Debug, Error, Diagnostic)]
@@ -245,6 +249,27 @@ impl<'a> ConfigErrorSite<'a> {
         } else {
             None
         }
+    }
+
+    fn resource_param_site(&self, resource: &str, param: &str) -> Option<ConfigSite> {
+        let (src, spans) = source_for_component(self.provenance, self.store, self.id)?;
+        let resource_spans = spans.resources.get(resource)?;
+        let span = resource_spans
+            .params
+            .as_ref()
+            .and_then(|params| match param {
+                "size" => params.size,
+                "retention" => params.retention,
+                "sharing" => params.sharing,
+                _ => None,
+            })
+            .or_else(|| resource_spans.params.as_ref().map(|params| params.whole))
+            .unwrap_or(resource_spans.whole);
+        Some(ConfigSite {
+            src,
+            span,
+            label: "resource param here".to_string(),
+        })
     }
 }
 
@@ -733,11 +758,7 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
             .iter()
             .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
             .collect();
-        c.resources = m
-            .resources()
-            .iter()
-            .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
-            .collect();
+        c.resources.clear();
         c.config_schema = m.config_schema().map(|schema| schema.0.clone());
         c.binding_decls = collect_binding_decls(ComponentId(id), m, &link_index[id]);
         c.metadata = m.metadata().cloned();
@@ -746,13 +767,21 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
     let mut schema_cache: HashMap<ManifestDigest, Arc<Validator>> = HashMap::new();
     let mut errors = Vec::new();
 
-    validate_config_tree(
+    let composed = validate_config_tree(
         root,
         &components,
         &manifests,
         &provenance,
         store,
         &mut schema_cache,
+        &mut errors,
+    );
+    resolve_resource_params(
+        &mut components,
+        &manifests,
+        &composed,
+        &provenance,
+        store,
         &mut errors,
     );
     for id in (0..components.len()).map(ComponentId) {
@@ -1051,7 +1080,7 @@ fn validate_config_tree(
     store: &DigestStore,
     schema_cache: &mut HashMap<ManifestDigest, Arc<Validator>>,
     errors: &mut Vec<Error>,
-) {
+) -> config_templates::ComposedTemplates {
     fn invalid_config_error(
         component_path: String,
         site: &ConfigSite,
@@ -1228,6 +1257,115 @@ fn validate_config_tree(
         }
     }
 
+    fn validate_resource_config_refs(
+        id: ComponentId,
+        components: &[Option<Component>],
+        manifests: &[Option<Arc<Manifest>>],
+        provenance: &Provenance,
+        store: &DigestStore,
+        schema: Option<&Value>,
+        errors: &mut Vec<Error>,
+    ) {
+        let m = manifests[id.0].as_ref().expect("manifest should exist");
+        let component_path = component_path_for(components, id);
+        let site = ConfigErrorSite::new(components, provenance, store, id);
+
+        let mut validate_config_ref =
+            |resource_name: &str, param_name: &str, value: &InterpolatedString| {
+                for part in &value.parts {
+                    let InterpolatedPart::Interpolation { source, query } = part else {
+                        continue;
+                    };
+
+                    let Some(param_site) = site.resource_param_site(resource_name, param_name)
+                    else {
+                        continue;
+                    };
+
+                    match source {
+                        InterpolationSource::Config => {
+                            let interp_suffix = if query.is_empty() {
+                                "".to_string()
+                            } else {
+                                format!(".{query}")
+                            };
+                            let Some(schema) = schema else {
+                                errors.push(invalid_config_error(
+                                    component_path.clone(),
+                                    &param_site,
+                                    format!(
+                                        "resources.{resource_name}.params.{param_name} references \
+                                         ${{config{interp_suffix}}}, but this component does not \
+                                         declare `config_schema`"
+                                    ),
+                                    Some("config definition required".to_string()),
+                                    Vec::new(),
+                                ));
+                                continue;
+                            };
+                            match rc::schema_lookup(schema, query) {
+                                Ok(rc::SchemaLookup::Found) | Ok(rc::SchemaLookup::Unknown) => {}
+                                Err(err) => errors.push(invalid_config_error(
+                                    component_path.clone(),
+                                    &param_site,
+                                    format!(
+                                        "invalid ${{config{interp_suffix}}} reference in \
+                                         resources.{resource_name}.params.{param_name}: {err}"
+                                    ),
+                                    Some("invalid config reference".to_string()),
+                                    Vec::new(),
+                                )),
+                            }
+                        }
+                        InterpolationSource::Slots => errors.push(invalid_config_error(
+                            component_path.clone(),
+                            &param_site,
+                            format!(
+                                "resources.{resource_name}.params.{param_name} uses \
+                                 ${{slots...}}, but resource params only support literal strings \
+                                 and ${{config...}}"
+                            ),
+                            Some("invalid interpolation here".to_string()),
+                            Vec::new(),
+                        )),
+                        InterpolationSource::Bindings => errors.push(invalid_config_error(
+                            component_path.clone(),
+                            &param_site,
+                            format!(
+                                "resources.{resource_name}.params.{param_name} uses \
+                                 ${{bindings...}}, but resource params only support literal \
+                                 strings and ${{config...}}"
+                            ),
+                            Some("invalid interpolation here".to_string()),
+                            Vec::new(),
+                        )),
+                        other => errors.push(invalid_config_error(
+                            component_path.clone(),
+                            &param_site,
+                            format!(
+                                "resources.{resource_name}.params.{param_name} uses unsupported \
+                                 interpolation source `{other}`"
+                            ),
+                            Some("invalid interpolation here".to_string()),
+                            Vec::new(),
+                        )),
+                    }
+                }
+            };
+
+        for (resource_name, resource) in m.resources() {
+            if let Some(size) = resource.params.size.as_ref() {
+                validate_config_ref(resource_name.as_str(), "size", size);
+            }
+            if let Some(retention) = resource.params.retention.as_ref() {
+                validate_config_ref(resource_name.as_str(), "retention", retention);
+            }
+            if let Some(sharing) = resource.params.sharing.as_ref() {
+                validate_config_ref(resource_name.as_str(), "sharing", sharing);
+            }
+        }
+    }
+
     fn required_strings(schema: &Value) -> Vec<String> {
         schema
             .get("required")
@@ -1397,6 +1535,7 @@ fn validate_config_tree(
         let m = manifests[id.0].as_ref().expect("manifest should exist");
         let schema = m.config_schema().map(|s| &s.0);
         validate_program_config_refs(id, components, manifests, provenance, store, schema, errors);
+        validate_resource_config_refs(id, components, manifests, provenance, store, schema, errors);
     }
 
     let composed = config_templates::compose_root_config_templates(root, components);
@@ -1503,6 +1642,105 @@ fn validate_config_tree(
                 errors.push(e);
             }
         }
+    }
+    composed
+}
+
+fn resolve_resource_params(
+    components: &mut [Option<Component>],
+    manifests: &[Option<Arc<Manifest>>],
+    composed: &config_templates::ComposedTemplates,
+    provenance: &Provenance,
+    store: &DigestStore,
+    errors: &mut Vec<Error>,
+) {
+    let components_with_template_errors: HashSet<ComponentId> =
+        composed.errors.iter().map(|err| err.component).collect();
+
+    for id in (0..components.len()).map(ComponentId) {
+        if components[id.0].is_none() {
+            continue;
+        }
+        let manifest = manifests[id.0].as_ref().expect("manifest should exist");
+        let component_path = component_path_for(components, id);
+        let site = ConfigErrorSite::new(components, provenance, store, id);
+        let template = (!components_with_template_errors.contains(&id))
+            .then(|| {
+                composed
+                    .templates
+                    .get(&id)
+                    .and_then(rc::RootConfigTemplate::node)
+            })
+            .flatten();
+        let mut resolved_resources = BTreeMap::new();
+
+        for (resource_name, resource) in manifest.resources() {
+            let mut resolved = ScenarioResourceDecl {
+                kind: resource.kind,
+                params: ScenarioStorageResourceParams::default(),
+            };
+
+            let mut resolve_param =
+                |param_name: &str, value: &Option<InterpolatedString>, out: &mut Option<String>| {
+                    let Some(value) = value.as_ref() else {
+                        return;
+                    };
+                    if components_with_template_errors.contains(&id)
+                        && value.parts.iter().any(|part| {
+                            matches!(
+                                part,
+                                InterpolatedPart::Interpolation {
+                                    source: InterpolationSource::Config,
+                                    ..
+                                }
+                            )
+                        })
+                    {
+                        return;
+                    }
+                    match render_static_config_string(value, template) {
+                        Ok(rendered) => *out = Some(rendered),
+                        Err(err) => {
+                            let param_site = site
+                                .resource_param_site(resource_name.as_str(), param_name)
+                                .unwrap_or_else(|| ConfigSite {
+                                    src: unknown_source(),
+                                    span: (0usize, 0usize).into(),
+                                    label: "resource param here".to_string(),
+                                });
+                            errors.push(Error::InvalidConfig {
+                                component_path: component_path.clone(),
+                                message: format!(
+                                    "failed to resolve \
+                                     resources.{resource_name}.params.{param_name}: {err}"
+                                ),
+                                src: param_site.src,
+                                span: param_site.span,
+                                label: param_site.label,
+                                related: Vec::new(),
+                            });
+                        }
+                    }
+                };
+
+            resolve_param("size", &resource.params.size, &mut resolved.params.size);
+            resolve_param(
+                "retention",
+                &resource.params.retention,
+                &mut resolved.params.retention,
+            );
+            resolve_param(
+                "sharing",
+                &resource.params.sharing,
+                &mut resolved.params.sharing,
+            );
+            resolved_resources.insert(resource_name.as_str().to_string(), resolved);
+        }
+
+        components[id.0]
+            .as_mut()
+            .expect("component should exist")
+            .resources = resolved_resources;
     }
 }
 

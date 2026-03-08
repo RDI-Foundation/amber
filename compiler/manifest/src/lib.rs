@@ -44,5 +44,5 @@ pub use slot_query::{
 pub use spans::{
     BindingSpans, BindingTargetKey, CapabilityDeclSpans, ComponentDeclSpans, EndpointSpans,
     EnvironmentSpans, ExportSpans, ManifestSpans, ProgramSpans, ProvideDeclSpans,
-    ResourceDeclSpans, span_for_json_pointer,
+    ResourceDeclSpans, ResourceParamsSpans, span_for_json_pointer,
 };

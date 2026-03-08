@@ -2,14 +2,14 @@ use std::collections::BTreeMap;
 
 use amber_manifest::{
     CapabilityDecl, FrameworkCapabilityName, ManifestDigest, Program, ProvideDecl, SlotDecl,
-    ResourceDecl, SlotDecl, framework_capability,
+    framework_capability,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceRef, Scenario,
-    ScenarioExport, SlotRef,
+    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceDecl,
+    ResourceRef, Scenario, ScenarioExport, SlotRef,
 };
 
 pub const SCENARIO_IR_SCHEMA: &str = "amber.scenario.ir";
@@ -77,7 +77,6 @@ impl TryFrom<ScenarioIr> for Scenario {
             if components[id].is_some() {
                 return Err(ScenarioIrError::DuplicateComponentId { id });
             }
-            components[id] = Some(component.into_component());
             for name in component.slots.keys() {
                 ensure_name_no_dot(name)?;
             }

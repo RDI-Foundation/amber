@@ -2118,6 +2118,148 @@ async fn mounted_storage_resource_fanout_is_rejected_at_link_time() {
 }
 
 #[tokio::test]
+async fn storage_resource_params_resolve_from_component_config() {
+    let dir = tmp_dir("storage-resource-param-config");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              storage_size: { type: "string" },
+            },
+            required: ["storage_size"],
+          },
+          resources: {
+            state: {
+              kind: "storage",
+              params: { size: "${config.storage_size}" },
+            },
+          },
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              components: {{
+                child: {{
+                  manifest: "{child}",
+                  config: {{
+                    storage_size: "12Gi"
+                  }}
+                }}
+              }}
+            }}
+            "##,
+            child = file_url(&child_path),
+        ),
+    );
+
+    let output = default_compiler()
+        .compile(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .expect("compile storage resource config scenario");
+
+    let child = output
+        .scenario
+        .components_iter()
+        .find(|(_, component)| component.moniker.as_str() == "/child")
+        .map(|(_, component)| component)
+        .expect("child component");
+    assert_eq!(
+        child
+            .resources
+            .get("state")
+            .and_then(|resource| resource.params.size.as_deref()),
+        Some("12Gi")
+    );
+}
+
+#[tokio::test]
+async fn storage_resource_params_reject_runtime_root_config() {
+    let dir = tmp_dir("storage-resource-param-runtime-root");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              storage_size: { type: "string" },
+            },
+            required: ["storage_size"],
+          },
+          resources: {
+            state: {
+              kind: "storage",
+              params: { size: "${config.storage_size}" },
+            },
+          },
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              config_schema: {{
+                type: "object",
+                properties: {{
+                  storage_size: {{ type: "string" }}
+                }},
+                required: ["storage_size"]
+              }},
+              components: {{
+                child: {{
+                  manifest: "{child}",
+                  config: {{
+                    storage_size: "${{config.storage_size}}"
+                  }}
+                }}
+              }}
+            }}
+            "##,
+            child = file_url(&child_path),
+        ),
+    );
+
+    let err = default_compiler()
+        .compile(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .expect_err("runtime root config in storage resource params should fail");
+
+    assert!(
+        error_contains(&err, "resources.state.params.size"),
+        "expected resource param error, got {err}"
+    );
+    assert!(
+        error_contains(&err, "not available at compile time"),
+        "expected compile-time config resolution error, got {err}"
+    );
+}
+
+#[tokio::test]
 async fn exporting_unbound_optional_slot_errors() {
     let dir = tmp_dir("scenario-export-unbound-slot");
     let root_path = dir.path().join("root.json5");
