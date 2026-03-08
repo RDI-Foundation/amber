@@ -17,11 +17,11 @@ use std::{
 };
 
 use amber_compiler::{
-    CompileOptions, CompileOutput, Compiler, ResolverRegistry,
+    CompileOptions, Compiler, ResolverRegistry,
     bundle::{BundleBuilder, BundleLoader},
     mesh::{PROXY_METADATA_FILENAME, PROXY_METADATA_VERSION, ProxyMetadata, external_slot_env_var},
     reporter::{
-        Reporter as _,
+        CompiledScenario, Reporter as _,
         direct::{
             DIRECT_PLAN_FILENAME, DIRECT_PLAN_VERSION, DirectArtifact, DirectComponentPlan,
             DirectPlan, DirectProgramExecutionPlan, DirectReporter, DirectRuntimeAddressPlan,
@@ -49,6 +49,7 @@ use amber_mesh::{
 };
 use amber_resolver::Resolver;
 use amber_router as router;
+use amber_scenario::{SCENARIO_IR_SCHEMA, ScenarioIr};
 use amber_template::{RuntimeTemplateContext, TemplatePart, TemplateSpec};
 use base64::Engine as _;
 use clap::{ArgAction, Args, Parser, Subcommand};
@@ -340,7 +341,7 @@ struct CompileArgs {
     #[arg(long = "no-opt")]
     no_opt: bool,
 
-    /// Root manifest or bundle to compile (URL or local path).
+    /// Root manifest, bundle, or Scenario IR to compile (URL or local path).
     #[arg(value_name = "MANIFEST")]
     manifest: String,
 }
@@ -707,36 +708,58 @@ async fn compile(args: CompileArgs) -> Result<()> {
     ensure_outputs_requested(&args)?;
     let outputs = resolve_output_paths(&args)?;
 
-    let resolved = resolve_input(&args.manifest).await?;
-    let compiler =
-        Compiler::new(resolved.resolver, Default::default()).with_registry(resolved.registry);
-    let mut opts = CompileOptions::default();
-    if args.no_opt {
-        opts.optimize.dce = false;
-    }
+    let mut bundle_tree = None;
+    let mut bundle_store = None;
+    let compiled = match resolve_compile_input(&args.manifest).await? {
+        CompileInput::Manifest(resolved) => {
+            let compiler = Compiler::new(resolved.resolver, Default::default())
+                .with_registry(resolved.registry);
+            let mut opts = CompileOptions::default();
+            if args.no_opt {
+                opts.optimize.dce = false;
+            }
 
-    let tree = compiler
-        .resolve_tree(resolved.manifest.clone(), opts.resolve)
-        .await
-        .wrap_err("compile failed")?;
-    let bundle_tree = args.bundle.as_ref().map(|_| tree.clone());
+            let tree = compiler
+                .resolve_tree(resolved.manifest.clone(), opts.resolve)
+                .await
+                .wrap_err("compile failed")?;
+            if args.bundle.is_some() {
+                bundle_tree = Some(tree.clone());
+                bundle_store = Some(compiler.store().clone());
+            }
 
-    let output = compiler
-        .compile_from_tree(tree, opts.optimize)
-        .wrap_err("compile failed")?;
+            let output = compiler
+                .compile_from_tree(tree, opts.optimize)
+                .wrap_err("compile failed")?;
 
-    let deny = DenySet::new(&args.deny);
-    let has_error = print_diagnostics(&output.diagnostics, &deny)?;
-    if has_error {
-        return Err(miette::miette!("compilation failed"));
-    }
+            let deny = DenySet::new(&args.deny);
+            let has_error = print_diagnostics(&output.diagnostics, &deny)?;
+            if has_error {
+                return Err(miette::miette!("compilation failed"));
+            }
+
+            CompiledScenario::from_compile_output(&output)
+                .into_diagnostic()
+                .wrap_err("failed to convert compiler output into Scenario IR")?
+        }
+        CompileInput::ScenarioIr(compiled) => {
+            if args.bundle.is_some() {
+                return Err(miette::miette!(
+                    help = "Re-run `amber compile` from a manifest or bundle when you need \
+                            `--bundle`; Scenario IR does not include manifest source bytes.",
+                    "bundle output is not supported when compiling from Scenario IR"
+                ));
+            }
+            compiled
+        }
+    };
 
     if let Some(primary) = outputs.primary.as_ref() {
-        write_primary_output(primary, &output)?;
+        write_primary_output(primary, &compiled)?;
     }
 
     if let Some(dot_dest) = outputs.dot {
-        let dot = DotReporter.emit(&output).map_err(miette::Report::new)?;
+        let dot = DotReporter.emit(&compiled).map_err(miette::Report::new)?;
         match dot_dest {
             ArtifactOutput::Stdout => print!("{dot}"),
             ArtifactOutput::File(path) => write_artifact(&path, dot.as_bytes())?,
@@ -745,7 +768,7 @@ async fn compile(args: CompileArgs) -> Result<()> {
 
     if let Some(compose_root) = outputs.docker_compose.as_ref() {
         let compose = DockerComposeReporter
-            .emit(&output)
+            .emit(&compiled)
             .map_err(miette::Report::new)?;
         write_docker_compose_output(compose_root, &compose)?;
     }
@@ -756,18 +779,20 @@ async fn compile(args: CompileArgs) -> Result<()> {
                 disable_networkpolicy_check: args.disable_networkpolicy_check,
             },
         };
-        let artifact = reporter.emit(&output).map_err(miette::Report::new)?;
+        let artifact = reporter.emit(&compiled).map_err(miette::Report::new)?;
         write_kubernetes_output(&kubernetes_dest, &artifact)?;
     }
 
     if let Some(direct_dest) = outputs.direct {
-        let artifact = DirectReporter.emit(&output).map_err(miette::Report::new)?;
+        let artifact = DirectReporter
+            .emit(&compiled)
+            .map_err(miette::Report::new)?;
         write_direct_output(&direct_dest, &artifact)?;
     }
 
     if let Some(metadata_dest) = outputs.metadata {
         let metadata = MetadataReporter
-            .emit(&output)
+            .emit(&compiled)
             .map_err(miette::Report::new)?;
         match metadata_dest {
             ArtifactOutput::Stdout => print!("{metadata}"),
@@ -776,10 +801,10 @@ async fn compile(args: CompileArgs) -> Result<()> {
     }
 
     if let Some(bundle_root) = resolve_bundle_root(&args)? {
-        let tree = bundle_tree.expect("bundle requested");
+        let tree = bundle_tree.expect("bundle requested from manifest input");
+        let store = bundle_store.expect("bundle requested from manifest input");
         prepare_bundle_dir(&bundle_root)?;
-        BundleBuilder::build(&tree, compiler.store(), &bundle_root)
-            .wrap_err("bundle generation failed")?;
+        BundleBuilder::build(&tree, &store, &bundle_root).wrap_err("bundle generation failed")?;
     }
 
     Ok(())
@@ -1637,18 +1662,15 @@ fn component_program_spec(
     runtime_addresses: &DirectRuntimeAddressPlan,
     runtime_state: &DirectRuntimeState,
 ) -> Result<ProcessSpec> {
-    let source_dir = component_manifest_source_dir(component)?;
+    let source_dir = component_source_dir(component)?;
     let work_dir = runtime_root.join(&component.program.work_dir);
     let mut writable_dirs = vec![work_dir.clone()];
     let read_only_mounts = component_program_read_only_mounts(component, source_dir.as_deref())?;
     match &component.program.execution {
         DirectProgramExecutionPlan::Direct { entrypoint, env } => {
             let (program, args) = split_entrypoint(entrypoint)?;
-            let program = resolve_relative_program_path(
-                &program,
-                source_dir.as_deref(),
-                component.moniker.as_str(),
-            )?;
+            let program =
+                ensure_absolute_direct_program_path(&program, component.moniker.as_str())?;
             Ok(ProcessSpec {
                 name: component.program.log_name.clone(),
                 program,
@@ -1672,27 +1694,13 @@ fn component_program_spec(
             let helper_binary = resolve_runtime_binary("amber-helper")?;
             let mut env = BTreeMap::new();
             if let Some(value) = entrypoint_b64.as_ref() {
-                env.insert(
-                    "AMBER_RESOLVED_ENTRYPOINT_B64".to_string(),
-                    resolve_helper_entrypoint_payload(
-                        value,
-                        source_dir.as_deref(),
-                        component.moniker.as_str(),
-                    )?,
-                );
+                env.insert("AMBER_RESOLVED_ENTRYPOINT_B64".to_string(), value.clone());
             }
             if let Some(value) = env_b64.as_ref() {
                 env.insert("AMBER_RESOLVED_ENV_B64".to_string(), value.clone());
             }
             if let Some(value) = template_spec_b64.as_ref() {
-                env.insert(
-                    "AMBER_TEMPLATE_SPEC_B64".to_string(),
-                    resolve_helper_template_spec_payload(
-                        value,
-                        source_dir.as_deref(),
-                        component.moniker.as_str(),
-                    )?,
-                );
+                env.insert("AMBER_TEMPLATE_SPEC_B64".to_string(), value.clone());
             }
             if let Some(value) = mount_spec_b64.as_ref() {
                 env.insert("AMBER_MOUNT_SPEC_B64".to_string(), value.clone());
@@ -1820,32 +1828,19 @@ fn split_entrypoint(entrypoint: &[String]) -> Result<(String, Vec<String>)> {
     Ok((program.clone(), entrypoint[1..].to_vec()))
 }
 
-fn component_manifest_source_dir(component: &DirectComponentPlan) -> Result<Option<PathBuf>> {
-    let manifest_url = Url::parse(component.manifest_url.as_str()).map_err(|err| {
-        miette::miette!(
-            "invalid manifest URL {} for component {}: {err}",
-            component.manifest_url,
-            component.moniker
-        )
-    })?;
-    if manifest_url.scheme() != "file" {
+fn component_source_dir(component: &DirectComponentPlan) -> Result<Option<PathBuf>> {
+    let Some(raw) = component.source_dir.as_deref() else {
         return Ok(None);
+    };
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        return Err(miette::miette!(
+            "direct plan has non-absolute source directory {} for component {}",
+            path.display(),
+            component.moniker
+        ));
     }
-    let manifest_path = manifest_url.to_file_path().map_err(|_| {
-        miette::miette!(
-            "failed to convert manifest URL {} to a local path for component {}",
-            component.manifest_url,
-            component.moniker
-        )
-    })?;
-    let source_dir = manifest_path.parent().ok_or_else(|| {
-        miette::miette!(
-            "manifest path {} has no parent directory for component {}",
-            manifest_path.display(),
-            component.moniker
-        )
-    })?;
-    Ok(Some(source_dir.to_path_buf()))
+    Ok(Some(path))
 }
 
 fn component_program_read_only_mounts(
@@ -1865,11 +1860,11 @@ fn component_program_read_only_mounts(
         );
     }
 
-    let Some(program_path) =
-        component_resolved_program_path(component, source_dir, component.moniker.as_str())?
-    else {
+    let Some(program_path) = component_execution_program_path(component)? else {
         return Ok(mounts.into_values().collect());
     };
+    let program_path =
+        ensure_absolute_direct_program_path(&program_path, component.moniker.as_str())?;
     let program_path = Path::new(&program_path);
     if let Some(parent) = program_path.parent() {
         mounts.entry(parent.to_path_buf()).or_insert(ReadOnlyMount {
@@ -1898,17 +1893,6 @@ fn component_execution_program_path(component: &DirectComponentPlan) -> Result<O
             Ok(None)
         }
     }
-}
-
-fn component_resolved_program_path(
-    component: &DirectComponentPlan,
-    source_dir: Option<&Path>,
-    component_moniker: &str,
-) -> Result<Option<String>> {
-    let Some(program) = component_execution_program_path(component)? else {
-        return Ok(None);
-    };
-    resolve_relative_program_path(&program, source_dir, component_moniker).map(Some)
 }
 
 fn decode_entrypoint_payload_program(raw_b64: &str) -> Result<String> {
@@ -1969,86 +1953,17 @@ fn render_template_string_literal(parts: &[TemplatePart]) -> Result<String> {
     Ok(out)
 }
 
-fn resolve_helper_entrypoint_payload(
-    raw_b64: &str,
-    source_dir: Option<&Path>,
-    component_moniker: &str,
-) -> Result<String> {
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(raw_b64.as_bytes())
-        .map_err(|err| miette::miette!("invalid entrypoint payload: {err}"))?;
-    let mut entrypoint: Vec<String> = serde_json::from_slice(&decoded)
-        .map_err(|err| miette::miette!("invalid entrypoint payload: {err}"))?;
-    let Some(program) = entrypoint.first_mut() else {
-        return Err(miette::miette!("entrypoint payload is empty"));
-    };
-    *program = resolve_relative_program_path(program, source_dir, component_moniker)?;
-
-    let encoded = serde_json::to_vec(&entrypoint)
-        .map_err(|err| miette::miette!("failed to encode entrypoint payload: {err}"))?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(encoded))
-}
-
-fn resolve_helper_template_spec_payload(
-    raw_b64: &str,
-    source_dir: Option<&Path>,
-    component_moniker: &str,
-) -> Result<String> {
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(raw_b64.as_bytes())
-        .map_err(|err| miette::miette!("invalid template spec payload: {err}"))?;
-    let mut spec: TemplateSpec = serde_json::from_slice(&decoded)
-        .map_err(|err| miette::miette!("invalid template spec payload: {err}"))?;
-    let program = decode_template_spec_program(raw_b64)?;
-    let resolved = resolve_relative_program_path(&program, source_dir, component_moniker)?;
-    let Some(path_template) = spec.program.entrypoint.first_mut() else {
-        return Err(miette::miette!("template spec program entrypoint is empty"));
-    };
-    *path_template = vec![TemplatePart::lit(resolved)];
-
-    let encoded = serde_json::to_vec(&spec)
-        .map_err(|err| miette::miette!("failed to encode template spec payload: {err}"))?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(encoded))
-}
-
-fn resolve_relative_program_path(
-    program: &str,
-    source_dir: Option<&Path>,
-    component_moniker: &str,
-) -> Result<String> {
-    let program_path = Path::new(program);
-    let has_separator = program.contains('/') || program.contains('\\');
-    if program_path.is_absolute() {
+fn ensure_absolute_direct_program_path(program: &str, component_moniker: &str) -> Result<String> {
+    if Path::new(program).is_absolute() {
         return Ok(program.to_string());
     }
-    if !has_separator {
-        return Err(miette::miette!(
-            "component {} uses program path `{}` without a path separator; direct execution does \
-             not search PATH",
-            component_moniker,
-            program
-        ));
-    }
 
-    let source_dir = source_dir.ok_or_else(|| {
-        miette::miette!(
-            "component {} has a relative program path `{}`, but its manifest does not come from a \
-             local file URL",
-            component_moniker,
-            program
-        )
-    })?;
-    if !source_dir.is_absolute() {
-        return Err(miette::miette!(
-            "component {} has non-absolute source directory {}; cannot resolve relative program \
-             path `{}`",
-            component_moniker,
-            source_dir.display(),
-            program
-        ));
-    }
-
-    Ok(source_dir.join(program_path).display().to_string())
+    Err(miette::miette!(
+        "direct plan for component {} contains non-absolute program path `{}`; re-run `amber \
+         compile --direct` with a build that resolves direct executable paths at compile time",
+        component_moniker,
+        program
+    ))
 }
 
 fn decode_mount_parent_dirs(raw_b64: &str) -> Result<Vec<PathBuf>> {
@@ -4630,6 +4545,21 @@ struct ResolvedInput {
     registry: ResolverRegistry,
 }
 
+enum CompileInput {
+    Manifest(ResolvedInput),
+    ScenarioIr(CompiledScenario),
+}
+
+async fn resolve_compile_input(input: &str) -> Result<CompileInput> {
+    if let Some(path) = local_input_path(input)?
+        && let Some(compiled) = load_compiled_scenario_ir(&path)?
+    {
+        return Ok(CompileInput::ScenarioIr(compiled));
+    }
+
+    resolve_input(input).await.map(CompileInput::Manifest)
+}
+
 async fn resolve_input(input: &str) -> Result<ResolvedInput> {
     if let Some(path) = local_input_path(input)?
         && let Some(loader) = BundleLoader::from_path(&path)?
@@ -4648,6 +4578,38 @@ async fn resolve_input(input: &str) -> Result<ResolvedInput> {
         resolver: Resolver::new(),
         registry: ResolverRegistry::default(),
     })
+}
+
+fn load_compiled_scenario_ir(path: &Path) -> Result<Option<CompiledScenario>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read Scenario IR input `{}`", path.display()))?;
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+
+    let Some(obj) = value.as_object() else {
+        return Ok(None);
+    };
+    let Some(schema) = obj.get("schema").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    if schema != SCENARIO_IR_SCHEMA {
+        return Ok(None);
+    }
+
+    let ir: ScenarioIr = serde_json::from_value(value)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("invalid Scenario IR input `{}`", path.display()))?;
+    CompiledScenario::from_ir(ir)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("invalid Scenario IR input `{}`", path.display()))
+        .map(Some)
 }
 
 fn local_input_path(input: &str) -> Result<Option<PathBuf>> {
@@ -4829,9 +4791,9 @@ fn prepare_bundle_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_primary_output(path: &Path, output: &CompileOutput) -> Result<()> {
+fn write_primary_output(path: &Path, compiled: &CompiledScenario) -> Result<()> {
     let ir = ScenarioIrReporter
-        .emit(output)
+        .emit(compiled)
         .map_err(miette::Report::new)?;
     write_artifact(path, ir.as_bytes())
         .wrap_err_with(|| format!("failed to write primary output `{}`", path.display()))
@@ -5073,56 +5035,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_helper_entrypoint_payload_rewrites_relative_program() {
-        let payload = base64::engine::general_purpose::STANDARD.encode(
-            serde_json::to_vec(&vec!["./bin/server", "--port", "8080"])
-                .expect("entrypoint should serialize"),
-        );
-
-        let resolved =
-            resolve_helper_entrypoint_payload(&payload, Some(Path::new("/workspace/app")), "app")
-                .expect("payload should resolve");
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(resolved.as_bytes())
-            .expect("payload should decode");
-        let entrypoint: Vec<String> =
-            serde_json::from_slice(&decoded).expect("payload should parse");
-
-        assert_eq!(entrypoint[0], "/workspace/app/./bin/server");
-        assert_eq!(entrypoint[1], "--port");
-        assert_eq!(entrypoint[2], "8080");
-    }
-
-    #[test]
-    fn resolve_helper_template_spec_payload_rewrites_relative_program() {
-        let spec = TemplateSpec {
-            program: amber_template::ProgramTemplateSpec {
-                entrypoint: vec![
-                    vec![TemplatePart::lit("./bin/server")],
-                    vec![TemplatePart::lit("--port")],
-                    vec![TemplatePart::lit("8080")],
-                ],
-                env: BTreeMap::new(),
-            },
-        };
-        let payload = base64::engine::general_purpose::STANDARD
-            .encode(serde_json::to_vec(&spec).expect("template spec should serialize"));
-
-        let resolved = resolve_helper_template_spec_payload(
-            &payload,
-            Some(Path::new("/workspace/app")),
-            "app",
-        )
-        .expect("payload should resolve");
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(resolved.as_bytes())
-            .expect("payload should decode");
-        let spec: TemplateSpec = serde_json::from_slice(&decoded).expect("payload should parse");
-
-        assert_eq!(
-            spec.program.entrypoint[0],
-            vec![TemplatePart::lit("/workspace/app/./bin/server")]
-        );
+    fn ensure_absolute_direct_program_path_rejects_relative_paths() {
+        let err = ensure_absolute_direct_program_path("./bin/server", "app")
+            .expect_err("relative program path should fail");
+        let rendered = err.to_string();
+        assert!(rendered.contains("non-absolute program path"), "{rendered}");
+        assert!(rendered.contains("amber compile --direct"), "{rendered}");
     }
 
     #[test]
@@ -5139,7 +5057,7 @@ mod tests {
             id: 3,
             moniker: "app".to_string(),
             log_name: "app".to_string(),
-            manifest_url: "file:///workspace/scenarios/app/scenario.json5".to_string(),
+            source_dir: Some("/workspace/scenarios/app".to_string()),
             depends_on: Vec::new(),
             sidecar: amber_compiler::reporter::direct::DirectSidecarPlan {
                 log_name: "app-sidecar".to_string(),
@@ -5151,7 +5069,7 @@ mod tests {
                 log_name: "app-program".to_string(),
                 work_dir: "work/components/app".to_string(),
                 execution: DirectProgramExecutionPlan::Direct {
-                    entrypoint: vec!["../bin/tool".to_string()],
+                    entrypoint: vec!["/workspace/scenarios/app/../bin/tool".to_string()],
                     env: BTreeMap::new(),
                 },
             },

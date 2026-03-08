@@ -70,6 +70,11 @@ fn optimized_compile_options() -> CompileOptions {
     CompileOptions::testing(true)
 }
 
+fn compiled_scenario(output: &crate::CompileOutput) -> crate::reporter::CompiledScenario {
+    crate::reporter::CompiledScenario::from_compile_output(output)
+        .expect("test compiler output should convert to compiled Scenario")
+}
+
 fn component_moniker(scenario: &amber_scenario::Scenario, id: ComponentId) -> String {
     scenario
         .components
@@ -1306,10 +1311,10 @@ async fn routing_scope_named_binding_survives_optimization_for_compose_lowering(
     );
 
     DockerComposeReporter
-        .emit(&with_opt)
+        .emit(&compiled_scenario(&with_opt))
         .expect("compose lowering with optimizations");
     DockerComposeReporter
-        .emit(&without_opt)
+        .emit(&compiled_scenario(&without_opt))
         .expect("compose lowering without optimizations");
 }
 
@@ -2401,7 +2406,9 @@ async fn bundle_compile_matches_direct_ir() {
     let direct = compiler
         .compile_from_tree(tree.clone(), opts.optimize)
         .unwrap();
-    let direct_ir = ScenarioIrReporter.emit(&direct).unwrap();
+    let direct_ir = ScenarioIrReporter
+        .emit(&compiled_scenario(&direct))
+        .unwrap();
 
     let bundle_dir = dir.path().join("bundle");
     BundleBuilder::build(&tree, compiler.store(), &bundle_dir).unwrap();
@@ -2417,7 +2424,9 @@ async fn bundle_compile_matches_direct_ir() {
         .compile(bundle.root, CompileOptions::default())
         .await
         .unwrap();
-    let bundled_ir = ScenarioIrReporter.emit(&bundled).unwrap();
+    let bundled_ir = ScenarioIrReporter
+        .emit(&compiled_scenario(&bundled))
+        .unwrap();
 
     assert_eq!(direct_ir, bundled_ir);
 }

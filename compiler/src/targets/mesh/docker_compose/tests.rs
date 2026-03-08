@@ -35,6 +35,17 @@ fn internal_images() -> crate::targets::mesh::internal_images::InternalImages {
     resolve_internal_images().expect("internal images should resolve for tests")
 }
 
+fn compiled_scenario(output: &crate::CompileOutput) -> crate::reporter::CompiledScenario {
+    crate::reporter::CompiledScenario::from_compile_output(output)
+        .expect("test compiler output should convert to compiled Scenario")
+}
+
+fn render_compose(
+    output: &crate::CompileOutput,
+) -> Result<super::DockerComposeArtifact, crate::reporter::ReporterError> {
+    DockerComposeReporter.emit(&compiled_scenario(output))
+}
+
 fn compile_output_with_manifest_overrides(
     scenario: Scenario,
     overrides: BTreeMap<ComponentId, Map<String, Value>>,
@@ -354,9 +365,7 @@ fn compose_artifact_emits_env_sample_and_readme() {
         exports: Vec::new(),
     });
 
-    let artifact = DockerComposeReporter
-        .emit(&output)
-        .expect("compose render should succeed");
+    let artifact = render_compose(&output).expect("compose render should succeed");
 
     assert!(artifact.files.contains_key(Path::new("env.example")));
     assert!(artifact.files.contains_key(Path::new("compose.yaml")));
@@ -399,9 +408,7 @@ fn compose_emits_otelcol_agent_and_wires_router_otel_env() {
     };
 
     let output = compile_output(scenario);
-    let yaml = DockerComposeReporter
-        .emit(&output)
-        .expect("compose render should succeed");
+    let yaml = render_compose(&output).expect("compose render should succeed");
     let compose = parse_compose(&yaml);
 
     assert!(
@@ -595,7 +602,7 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
         },
     }))
     .unwrap();
-    let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
+    let slot_docker: SlotDecl = serde_json::from_value(json!({ "kind": "docker" })).unwrap();
 
     let root = Component {
         id: ComponentId(0),
@@ -605,7 +612,7 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
         config: None,
         config_schema: None,
         program: Some(program),
-        slots: BTreeMap::from([("docker".to_string(), slot_http)]),
+        slots: BTreeMap::from([("docker".to_string(), slot_docker)]),
         provides: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
@@ -627,9 +634,7 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
     };
 
     let output = compile_output_with_docker_feature(scenario);
-    let yaml = DockerComposeReporter
-        .emit(&output)
-        .expect("compose render should succeed");
+    let yaml = render_compose(&output).expect("compose render should succeed");
     let compose = parse_compose(&yaml);
     assert!(
         !compose.services.contains_key("amber-router"),
@@ -710,9 +715,7 @@ fn docker_compose_emits_framework_docker_mount_proxy_wiring() {
     };
 
     let output = compile_output_with_docker_feature(scenario);
-    let yaml = DockerComposeReporter
-        .emit(&output)
-        .expect("compose render should succeed");
+    let yaml = render_compose(&output).expect("compose render should succeed");
     let compose = parse_compose(&yaml);
     assert!(
         !compose.services.contains_key("amber-router"),
@@ -857,9 +860,7 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
     };
 
     let output = compile_output(scenario);
-    let yaml = DockerComposeReporter
-        .emit(&output)
-        .expect("compose render ok");
+    let yaml = render_compose(&output).expect("compose render ok");
     let compose = parse_compose(&yaml);
     let images = internal_images();
     let plan = provision_plan(&compose);
@@ -1052,9 +1053,7 @@ fn compose_emits_minimal_peer_keys() {
     };
 
     let output = compile_output(scenario);
-    let yaml = DockerComposeReporter
-        .emit(&output)
-        .expect("compose render should succeed");
+    let yaml = render_compose(&output).expect("compose render should succeed");
     let compose = parse_compose(&yaml);
     let plan = provision_plan(&compose);
 
@@ -1120,9 +1119,7 @@ fn compose_escapes_entrypoint_dollars() {
     };
 
     let output = compile_output(scenario);
-    let yaml = DockerComposeReporter
-        .emit(&output)
-        .expect("compose render ok");
+    let yaml = render_compose(&output).expect("compose render ok");
     let compose = parse_compose(&yaml);
 
     let service = compose
@@ -1300,9 +1297,7 @@ fn compose_resolves_binding_urls_in_child_config() {
     overrides.insert(ComponentId(3), observer_overrides);
 
     let output = compile_output_with_manifest_overrides(scenario, overrides);
-    let yaml = DockerComposeReporter
-        .emit(&output)
-        .expect("compose render ok");
+    let yaml = render_compose(&output).expect("compose render ok");
     let compose = parse_compose(&yaml);
 
     assert!(
@@ -1532,9 +1527,7 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
     overrides.insert(ComponentId(5), child_overrides);
 
     let output = compile_output_with_manifest_overrides(scenario, overrides);
-    let yaml = DockerComposeReporter
-        .emit(&output)
-        .expect("compose render ok");
+    let yaml = render_compose(&output).expect("compose render ok");
     let compose = parse_compose(&yaml);
 
     assert!(compose.services.values().any(|svc| {
@@ -1609,9 +1602,7 @@ fn compose_emits_export_metadata_and_labels() {
     };
 
     let output = compile_output(scenario);
-    let yaml = DockerComposeReporter
-        .emit(&output)
-        .expect("compose render ok");
+    let yaml = render_compose(&output).expect("compose render ok");
     let compose = parse_compose(&yaml);
 
     let exports = compose
@@ -1756,9 +1747,7 @@ fn compose_routes_external_slots_through_router() {
     };
 
     let output = compile_output(scenario);
-    let yaml = DockerComposeReporter
-        .emit(&output)
-        .expect("compose render ok");
+    let yaml = render_compose(&output).expect("compose render ok");
     let compose = parse_compose(&yaml);
 
     assert!(compose.services.contains_key("amber-router"));
@@ -1957,9 +1946,7 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
     };
 
     let output = compile_output(scenario);
-    let yaml = DockerComposeReporter
-        .emit(&output)
-        .expect("compose render ok");
+    let yaml = render_compose(&output).expect("compose render ok");
     fs::write(project.join(super::COMPOSE_FILENAME), yaml).unwrap();
 
     let project_name = format!("amber-ext-slot-{}", std::process::id());
@@ -2273,9 +2260,7 @@ sleep infinity
     };
 
     let output = compile_output(scenario);
-    let yaml = DockerComposeReporter
-        .emit(&output)
-        .expect("compose render ok");
+    let yaml = render_compose(&output).expect("compose render ok");
     fs::write(project.join(super::COMPOSE_FILENAME), yaml).unwrap();
 
     let _compose_guard = ComposeGuard::new(project);
@@ -2513,9 +2498,7 @@ fn docker_smoke_sidecar_restart_rejoins_mesh() {
     };
 
     let output = compile_output(scenario);
-    let yaml = DockerComposeReporter
-        .emit(&output)
-        .expect("compose render ok");
+    let yaml = render_compose(&output).expect("compose render ok");
     fs::write(project.join(super::COMPOSE_FILENAME), yaml).unwrap();
 
     let project_name = format!("amber-sidecar-restart-{}", std::process::id());
@@ -2722,9 +2705,7 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
     };
 
     let output = compile_output(scenario);
-    let yaml = DockerComposeReporter
-        .emit(&output)
-        .expect("compose render should succeed");
+    let yaml = render_compose(&output).expect("compose render should succeed");
     let compose = parse_compose(&yaml);
     let plan = provision_plan(&compose);
     let server_target = plan
@@ -2766,59 +2747,6 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
         .expect("admin inbound local target");
     assert_eq!(v1_port, 80);
     assert_eq!(admin_port, 80);
-}
-
-#[test]
-fn docker_compose_rejects_framework_bindings() {
-    let program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["sh", "-lc", "sleep infinity"]
-    }))
-    .unwrap();
-
-    let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: Some(program),
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
-    };
-
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root)],
-        bindings: vec![BindingEdge {
-            name: None,
-            from: BindingFrom::Framework(
-                FrameworkCapabilityName::try_from("dynamic_children").unwrap(),
-            ),
-            to: SlotRef {
-                component: ComponentId(0),
-                name: "control".to_string(),
-            },
-            weak: false,
-        }],
-        exports: Vec::new(),
-    };
-
-    let output = compile_output(scenario);
-    let err = DockerComposeReporter.emit(&output).unwrap_err();
-    let message = err.to_string();
-    assert!(
-        message.contains("framework.dynamic_children"),
-        "unexpected error: {message}"
-    );
-    assert!(
-        message.contains("docker-compose reporter does not support unknown framework binding"),
-        "unexpected error: {message}"
-    );
 }
 
 #[test]
@@ -2977,9 +2905,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
     };
 
     let output = compile_output(scenario);
-    let yaml = DockerComposeReporter
-        .emit(&output)
-        .expect("compose render ok");
+    let yaml = render_compose(&output).expect("compose render ok");
     fs::write(project.join(super::COMPOSE_FILENAME), yaml).unwrap();
 
     let compose = |args: &[&str]| {
@@ -3200,9 +3126,7 @@ fn docker_smoke_config_forwarding_runtime_validation() {
         ))
         .expect("compile ok");
 
-    let yaml = DockerComposeReporter
-        .emit(&output)
-        .expect("compose render ok");
+    let yaml = render_compose(&output).expect("compose render ok");
     fs::write(project.join(super::COMPOSE_FILENAME), yaml).unwrap();
 
     struct ComposeGuard {

@@ -3,8 +3,7 @@ use std::collections::BTreeMap;
 use amber_scenario::Scenario;
 use serde_json::Value;
 
-use super::{Reporter, ReporterError};
-use crate::CompileOutput;
+use super::{CompiledScenario, Reporter, ReporterError};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MetadataReporter;
@@ -12,8 +11,8 @@ pub struct MetadataReporter;
 impl Reporter for MetadataReporter {
     type Artifact = String;
 
-    fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError> {
-        render_metadata(&output.scenario)
+    fn emit(&self, compiled: &CompiledScenario) -> Result<Self::Artifact, ReporterError> {
+        render_metadata(compiled.scenario())
     }
 }
 

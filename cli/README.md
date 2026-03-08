@@ -8,7 +8,9 @@ Command-line front-end for the compiler. It resolves a root manifest, runs compi
 - Keep `amber --help` and nested `--help` pages useful enough that users can discover the CLI
   surface without reading the source.
 - Write compile outputs only when requested; `amber compile` requires at least one output flag (`--output`, `--dot`, `--docker-compose`/`--compose`, `--metadata`, `--kubernetes`, `--direct`, or `--bundle`).
-- Detect bundle and Scenario IR inputs and emit bundle directories via `--bundle`.
+- Detect bundle and Scenario IR inputs for `amber compile`.
+- Emit bundle directories via `--bundle` when the input is a manifest or bundle; Scenario IR
+  inputs do not carry manifest source bytes, so `--bundle` is not available there.
 - Run compiled direct artifacts via `amber run <output-dir>` (delegates to the direct init runtime).
   - Direct mode requires a local sandbox backend: `bwrap` plus `slirp4netns` on Linux, or `/usr/bin/sandbox-exec` on macOS.
   - Direct mode only supports explicit `program.path` executables; it does not resolve bare program names through `PATH`.

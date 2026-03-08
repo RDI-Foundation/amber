@@ -1,18 +1,19 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use amber_manifest::MountSource;
 use amber_mesh::{MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProvisionOutput};
 use amber_scenario::{ComponentId, Scenario};
+use amber_template::{TemplatePart, TemplateSpec};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::{
-    CompileOutput,
     reporter::{
-        Reporter, ReporterError,
+        CompiledScenario, Reporter, ReporterError,
         execution_guide::{
             GENERATED_ENV_SAMPLE_FILENAME, GENERATED_README_FILENAME, build_execution_guide,
         },
@@ -42,7 +43,7 @@ use crate::{
     },
 };
 
-pub const DIRECT_PLAN_VERSION: &str = "1";
+pub const DIRECT_PLAN_VERSION: &str = "2";
 pub const DIRECT_PLAN_FILENAME: &str = "direct-plan.json";
 pub const RUN_SCRIPT_FILENAME: &str = "run.sh";
 pub const MESH_PROVISION_PLAN_FILENAME: &str = "mesh-provision-plan.json";
@@ -97,7 +98,8 @@ pub struct DirectComponentPlan {
     pub id: usize,
     pub moniker: String,
     pub log_name: String,
-    pub manifest_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<usize>,
     pub sidecar: DirectSidecarPlan,
@@ -172,20 +174,19 @@ struct DirectComponentNames {
 impl Reporter for DirectReporter {
     type Artifact = DirectArtifact;
 
-    fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError> {
-        render_direct(output)
+    fn emit(&self, compiled: &CompiledScenario) -> Result<Self::Artifact, ReporterError> {
+        render_direct(compiled)
     }
 }
 
-fn render_direct(output: &CompileOutput) -> Result<DirectArtifact, ReporterError> {
-    render_direct_inner(output).map_err(|err| ReporterError::new(err.to_string()))
+fn render_direct(compiled: &CompiledScenario) -> Result<DirectArtifact, ReporterError> {
+    render_direct_inner(compiled).map_err(|err| ReporterError::new(err.to_string()))
 }
 
-fn render_direct_inner(output: &CompileOutput) -> Result<DirectArtifact, MeshError> {
-    let scenario = &output.scenario;
+fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, MeshError> {
+    let scenario = compiled.scenario();
     let mesh_plan = build_mesh_plan(
         scenario,
-        &output.store,
         MeshOptions {
             backend_label: "direct reporter",
         },
@@ -249,7 +250,6 @@ fn render_direct_inner(output: &CompileOutput) -> Result<DirectArtifact, MeshErr
     let mesh_config_plan = build_mesh_config_plan(MeshConfigBuildInput {
         scenario,
         mesh_plan: &mesh_plan,
-        root_manifest: mesh_plan.root_manifest.as_ref(),
         slot_ports_by_component: &slot_ports_by_component,
         mesh_ports_by_component: &mesh_ports_by_component,
         router_ports,
@@ -281,18 +281,14 @@ fn render_direct_inner(output: &CompileOutput) -> Result<DirectArtifact, MeshErr
         control_socket: Some(DIRECT_CONTROL_SOCKET_RELATIVE_PATH.to_string()),
         control_socket_volume: None,
     });
-    let proxy_metadata = needs_router.then_some(build_proxy_metadata(
-        scenario,
-        &mesh_plan,
-        mesh_plan.root_manifest.as_ref(),
-        router_metadata,
-    ));
+    let proxy_metadata =
+        needs_router.then_some(build_proxy_metadata(scenario, &mesh_plan, router_metadata));
 
     let startup_order = topological_startup_order(program_components, &mesh_plan)?;
     let startup_order_ids = startup_order.iter().map(|id| id.0).collect::<Vec<_>>();
     let components = build_component_plans(
+        compiled,
         scenario,
-        &output.provenance,
         &mesh_plan,
         &config_plan,
         &component_names,
@@ -351,7 +347,7 @@ fn render_direct_inner(output: &CompileOutput) -> Result<DirectArtifact, MeshErr
         files.insert(PathBuf::from(DEFAULT_EXTERNAL_ENV_FILE), env_content);
     }
 
-    let execution_guide = build_execution_guide(&output.scenario, &mesh_plan, &config_plan)
+    let execution_guide = build_execution_guide(scenario, &mesh_plan, &config_plan)
         .map_err(|err: ReporterError| MeshError::new(err.to_string()))?;
     files.insert(
         PathBuf::from(GENERATED_ENV_SAMPLE_FILENAME),
@@ -367,8 +363,8 @@ fn render_direct_inner(output: &CompileOutput) -> Result<DirectArtifact, MeshErr
 }
 
 fn build_component_plans(
+    compiled: &CompiledScenario,
     scenario: &Scenario,
-    provenance: &crate::Provenance,
     mesh_plan: &MeshPlan,
     config_plan: &crate::targets::program_config::ConfigPlan,
     component_names: &HashMap<ComponentId, DirectComponentNames>,
@@ -408,12 +404,20 @@ fn build_component_plans(
             .get(id)
             .map(|deps| deps.iter().map(|dep| dep.0).collect::<Vec<_>>())
             .unwrap_or_default();
+        let source_dir = component_source_dir(compiled, *id, component.moniker.as_str())?;
+        let execution = resolve_direct_execution_plan(
+            direct_execution_plan(runtime_plan.execution),
+            source_dir.as_deref(),
+            component.moniker.as_str(),
+        )?;
 
         out.push(DirectComponentPlan {
             id: id.0,
             moniker: component.moniker.as_str().to_string(),
             log_name: names.base.clone(),
-            manifest_url: provenance.for_component(*id).resolved_url.to_string(),
+            source_dir: source_dir
+                .as_ref()
+                .map(|source_dir| source_dir.display().to_string()),
             depends_on,
             sidecar: DirectSidecarPlan {
                 log_name: format!("{}-sidecar", names.base),
@@ -424,7 +428,7 @@ fn build_component_plans(
             program: DirectProgramPlan {
                 log_name: format!("{}-program", names.base),
                 work_dir: names.work_dir.clone(),
-                execution: direct_execution_plan(runtime_plan.execution),
+                execution,
             },
         });
     }
@@ -462,6 +466,199 @@ fn direct_runtime_config_payload(payload: RuntimeConfigPayload<'_>) -> DirectRun
         component_schema_b64: payload.component_schema_b64,
         allowed_root_leaf_paths: payload.allowed_root_leaf_paths.iter().cloned().collect(),
     }
+}
+
+fn component_source_dir(
+    compiled: &CompiledScenario,
+    id: ComponentId,
+    component_moniker: &str,
+) -> Result<Option<PathBuf>, MeshError> {
+    let Some(resolved_url) = compiled.resolved_url_for_component(id) else {
+        return Ok(None);
+    };
+    if resolved_url.scheme() != "file" {
+        return Ok(None);
+    }
+
+    let manifest_path = resolved_url.to_file_path().map_err(|_| {
+        MeshError::new(format!(
+            "failed to convert resolved_url {} to a local path for component {}",
+            resolved_url, component_moniker
+        ))
+    })?;
+    let source_dir = manifest_path.parent().ok_or_else(|| {
+        MeshError::new(format!(
+            "manifest path {} has no parent directory for component {}",
+            manifest_path.display(),
+            component_moniker
+        ))
+    })?;
+    Ok(Some(source_dir.to_path_buf()))
+}
+
+fn resolve_direct_execution_plan(
+    execution: DirectProgramExecutionPlan,
+    source_dir: Option<&Path>,
+    component_moniker: &str,
+) -> Result<DirectProgramExecutionPlan, MeshError> {
+    match execution {
+        DirectProgramExecutionPlan::Direct {
+            mut entrypoint,
+            env,
+        } => {
+            let Some(program) = entrypoint.first_mut() else {
+                return Err(MeshError::new(format!(
+                    "component {component_moniker} program entrypoint must not be empty"
+                )));
+            };
+            *program = resolve_direct_program_path(program, source_dir, component_moniker)?;
+            Ok(DirectProgramExecutionPlan::Direct { entrypoint, env })
+        }
+        DirectProgramExecutionPlan::HelperRunner {
+            entrypoint_b64,
+            env_b64,
+            template_spec_b64,
+            runtime_config,
+            mount_spec_b64,
+        } => Ok(DirectProgramExecutionPlan::HelperRunner {
+            entrypoint_b64: entrypoint_b64
+                .as_deref()
+                .map(|raw| resolve_helper_entrypoint_payload(raw, source_dir, component_moniker))
+                .transpose()?,
+            env_b64,
+            template_spec_b64: template_spec_b64
+                .as_deref()
+                .map(|raw| resolve_helper_template_spec_payload(raw, source_dir, component_moniker))
+                .transpose()?,
+            runtime_config,
+            mount_spec_b64,
+        }),
+    }
+}
+
+fn resolve_helper_entrypoint_payload(
+    raw_b64: &str,
+    source_dir: Option<&Path>,
+    component_moniker: &str,
+) -> Result<String, MeshError> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(raw_b64.as_bytes())
+        .map_err(|err| MeshError::new(format!("invalid entrypoint payload: {err}")))?;
+    let mut entrypoint: Vec<String> = serde_json::from_slice(&decoded)
+        .map_err(|err| MeshError::new(format!("invalid entrypoint payload: {err}")))?;
+    let Some(program) = entrypoint.first_mut() else {
+        return Err(MeshError::new("entrypoint payload is empty"));
+    };
+    *program = resolve_direct_program_path(program, source_dir, component_moniker)?;
+
+    let encoded = serde_json::to_vec(&entrypoint)
+        .map_err(|err| MeshError::new(format!("failed to encode entrypoint payload: {err}")))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(encoded))
+}
+
+fn resolve_helper_template_spec_payload(
+    raw_b64: &str,
+    source_dir: Option<&Path>,
+    component_moniker: &str,
+) -> Result<String, MeshError> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(raw_b64.as_bytes())
+        .map_err(|err| MeshError::new(format!("invalid template spec payload: {err}")))?;
+    let mut spec: TemplateSpec = serde_json::from_slice(&decoded)
+        .map_err(|err| MeshError::new(format!("invalid template spec payload: {err}")))?;
+    let program = decode_template_spec_program(raw_b64)?;
+    let resolved = resolve_direct_program_path(&program, source_dir, component_moniker)?;
+    let Some(path_template) = spec.program.entrypoint.first_mut() else {
+        return Err(MeshError::new("template spec program entrypoint is empty"));
+    };
+    *path_template = vec![TemplatePart::lit(resolved)];
+
+    let encoded = serde_json::to_vec(&spec)
+        .map_err(|err| MeshError::new(format!("failed to encode template spec payload: {err}")))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(encoded))
+}
+
+fn decode_template_spec_program(raw_b64: &str) -> Result<String, MeshError> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(raw_b64.as_bytes())
+        .map_err(|err| MeshError::new(format!("invalid template spec payload: {err}")))?;
+    let spec: TemplateSpec = serde_json::from_slice(&decoded)
+        .map_err(|err| MeshError::new(format!("invalid template spec payload: {err}")))?;
+    let path_template = spec
+        .program
+        .entrypoint
+        .first()
+        .ok_or_else(|| MeshError::new("template spec program entrypoint is empty"))?;
+    render_template_string_literal(path_template)
+}
+
+fn render_template_string_literal(parts: &[TemplatePart]) -> Result<String, MeshError> {
+    let mut out = String::new();
+    for part in parts {
+        match part {
+            TemplatePart::Lit { lit } => out.push_str(lit),
+            TemplatePart::Config { config } => {
+                return Err(MeshError::new(format!(
+                    "internal error: unresolved runtime config interpolation `{config}` in direct \
+                     program path"
+                )));
+            }
+            TemplatePart::Slot { slot, .. } => {
+                return Err(MeshError::new(format!(
+                    "internal error: unresolved slot interpolation `{slot}` in direct program path"
+                )));
+            }
+            TemplatePart::Binding { binding, .. } => {
+                return Err(MeshError::new(format!(
+                    "internal error: unresolved binding interpolation `{binding}` in direct \
+                     program path"
+                )));
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(MeshError::new(
+            "internal error: template spec program entrypoint is empty",
+        ));
+    }
+    Ok(out)
+}
+
+fn resolve_direct_program_path(
+    program: &str,
+    source_dir: Option<&Path>,
+    component_moniker: &str,
+) -> Result<String, MeshError> {
+    let program_path = Path::new(program);
+    if program_path.is_absolute() {
+        return Ok(program.to_string());
+    }
+
+    let has_separator = program.contains('/') || program.contains('\\');
+    if !has_separator {
+        return Err(MeshError::new(format!(
+            "component {component_moniker} uses program path `{program}` without a path \
+             separator; direct execution does not search PATH, so use an absolute path or a \
+             manifest-relative path like `./bin/server`"
+        )));
+    }
+
+    let source_dir = source_dir.ok_or_else(|| {
+        MeshError::new(format!(
+            "component {component_moniker} uses relative program path `{program}`, but direct \
+             output can only resolve relative executables for components with a local file \
+             `resolved_url`"
+        ))
+    })?;
+    if !source_dir.is_absolute() {
+        return Err(MeshError::new(format!(
+            "component {component_moniker} has non-absolute source directory {}; cannot resolve \
+             relative program path `{program}`",
+            source_dir.display()
+        )));
+    }
+
+    Ok(source_dir.join(program_path).display().to_string())
 }
 
 fn mesh_config_relative_path(dir: &str) -> String {
@@ -774,5 +971,76 @@ impl MeshAddressing for LoopbackMeshAddressing<'_> {
 
     fn mesh_addr_for_router(&self) -> Result<String, MeshError> {
         Ok(format!("127.0.0.1:{}", self.router_mesh_port))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, path::Path};
+
+    use super::*;
+
+    #[test]
+    fn resolve_helper_entrypoint_payload_rewrites_relative_program() {
+        let payload = base64::engine::general_purpose::STANDARD.encode(
+            serde_json::to_vec(&vec!["./bin/server", "--port", "8080"])
+                .expect("entrypoint should serialize"),
+        );
+
+        let resolved =
+            resolve_helper_entrypoint_payload(&payload, Some(Path::new("/workspace/app")), "app")
+                .expect("payload should resolve");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(resolved.as_bytes())
+            .expect("payload should decode");
+        let entrypoint: Vec<String> =
+            serde_json::from_slice(&decoded).expect("payload should parse");
+
+        assert_eq!(entrypoint[0], "/workspace/app/./bin/server");
+        assert_eq!(entrypoint[1], "--port");
+        assert_eq!(entrypoint[2], "8080");
+    }
+
+    #[test]
+    fn resolve_helper_template_spec_payload_rewrites_relative_program() {
+        let spec = TemplateSpec {
+            program: amber_template::ProgramTemplateSpec {
+                entrypoint: vec![
+                    vec![TemplatePart::lit("./bin/server")],
+                    vec![TemplatePart::lit("--port")],
+                    vec![TemplatePart::lit("8080")],
+                ],
+                env: BTreeMap::new(),
+            },
+        };
+        let payload = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&spec).expect("template spec should serialize"));
+
+        let resolved = resolve_helper_template_spec_payload(
+            &payload,
+            Some(Path::new("/workspace/app")),
+            "app",
+        )
+        .expect("payload should resolve");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(resolved.as_bytes())
+            .expect("payload should decode");
+        let spec: TemplateSpec = serde_json::from_slice(&decoded).expect("payload should parse");
+
+        assert_eq!(
+            spec.program.entrypoint[0],
+            vec![TemplatePart::lit("/workspace/app/./bin/server")]
+        );
+    }
+
+    #[test]
+    fn resolve_direct_program_path_requires_local_file_provenance_for_relative_paths() {
+        let err = resolve_direct_program_path("./bin/server", None, "app")
+            .expect_err("relative path without source dir should fail");
+        assert!(
+            err.to_string().contains("local file `resolved_url`"),
+            "{}",
+            err
+        );
     }
 }

@@ -76,6 +76,7 @@ fn flatten_removes_pure_routing_nodes_and_preserves_debug_data() {
             entrypoint: ["child"],
             network: { endpoints: [{ name: "cap", port: 80 }] },
           },
+          slots: { input: { kind: "http" } },
           provides: { cap: { kind: "http", endpoint: "cap" } },
           exports: { cap: "cap" },
         }
@@ -135,7 +136,7 @@ fn flatten_removes_pure_routing_nodes_and_preserves_debug_data() {
             }),
             to: SlotRef {
                 component: ComponentId(2),
-                name: "cap".to_string(),
+                name: "input".to_string(),
             },
             weak: true,
         }],
@@ -215,7 +216,9 @@ fn flatten_removes_pure_routing_nodes_and_preserves_debug_data() {
         provenance,
         diagnostics: Vec::new(),
     };
-    let dot = DotReporter.emit(&output).unwrap();
+    let dot = DotReporter
+        .emit(&crate::reporter::CompiledScenario::from_compile_output(&output).unwrap())
+        .unwrap();
     assert!(dot.contains("c2 [label=\"/parent/child\"]"), "{dot}");
     assert!(dot.contains("c2 -> e0 [label=\"http\"]"));
 }

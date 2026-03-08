@@ -1401,7 +1401,6 @@ fn build_program_plan(
                 ] => ProgramImageOrigin::ComponentConfigPath(query.clone()),
                 _ => ProgramImageOrigin::ProgramImage,
             };
-
             for part in &image.parts {
                 match part {
                     InterpolatedPart::Literal(lit) => {

@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use amber_manifest::Manifest;
 use amber_scenario::Scenario;
 use serde::{Deserialize, Serialize};
 
@@ -49,14 +48,13 @@ pub struct ExternalSlotMetadata {
 pub fn build_proxy_metadata(
     scenario: &Scenario,
     mesh_plan: &MeshPlan,
-    root_manifest: &Manifest,
     router: Option<RouterMetadata>,
 ) -> ProxyMetadata {
     let exports = match router.as_ref() {
         Some(router) => collect_exports_metadata(scenario, mesh_plan, router.mesh_port),
         None => BTreeMap::new(),
     };
-    let external_slots = collect_external_slot_metadata(root_manifest, mesh_plan);
+    let external_slots = collect_external_slot_metadata(scenario, mesh_plan);
 
     ProxyMetadata {
         version: PROXY_METADATA_VERSION.to_string(),
@@ -87,9 +85,10 @@ pub fn collect_exports_metadata(
 }
 
 pub fn collect_external_slot_metadata(
-    root_manifest: &Manifest,
+    scenario: &Scenario,
     mesh_plan: &MeshPlan,
 ) -> BTreeMap<String, ExternalSlotMetadata> {
+    let root_component = scenario.component(scenario.root);
     let mut external_slot_names = BTreeSet::new();
     for binding in &mesh_plan.external_bindings {
         external_slot_names.insert(binding.external_slot.clone());
@@ -97,8 +96,8 @@ pub fn collect_external_slot_metadata(
 
     let mut external_slots = BTreeMap::new();
     for slot_name in external_slot_names {
-        let decl = root_manifest
-            .slots()
+        let decl = root_component
+            .slots
             .get(slot_name.as_str())
             .expect("external slot should exist on root");
         external_slots.insert(

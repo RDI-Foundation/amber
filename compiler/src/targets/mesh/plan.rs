@@ -1,14 +1,10 @@
-use std::{
-    collections::{BTreeSet, HashMap},
-    sync::Arc,
-};
+use std::collections::{BTreeSet, HashMap};
 
 use amber_manifest::{
-    FrameworkBindingShape, FrameworkCapabilityName, Manifest, NetworkProtocol, framework_capability,
+    FrameworkBindingShape, FrameworkCapabilityName, NetworkProtocol, framework_capability,
 };
 use amber_scenario::{BindingFrom, ComponentId, Scenario};
 
-use crate::DigestStore;
 pub(crate) use crate::targets::common::{TargetError as MeshError, component_label};
 
 #[derive(Clone, Debug)]
@@ -18,7 +14,6 @@ pub(crate) struct MeshOptions {
 
 #[derive(Clone, Debug)]
 pub(crate) struct MeshPlan {
-    pub(crate) root_manifest: Arc<Manifest>,
     pub(crate) program_components: Vec<ComponentId>,
     pub(crate) bindings: Vec<ResolvedBinding>,
     pub(crate) external_bindings: Vec<ResolvedExternalBinding>,
@@ -69,17 +64,8 @@ pub(crate) struct EndpointInfo {
 
 pub(crate) fn build_mesh_plan(
     scenario: &Scenario,
-    store: &DigestStore,
     options: MeshOptions,
 ) -> Result<MeshPlan, MeshError> {
-    let root_component = scenario.component(scenario.root);
-    let root_manifest = store.get(&root_component.digest).ok_or_else(|| {
-        MeshError::new(format!(
-            "internal error: missing manifest content for {} (digest {})",
-            component_label(scenario, scenario.root),
-            root_component.digest
-        ))
-    })?;
     let program_components: Vec<ComponentId> = scenario
         .components_iter()
         .filter_map(|(id, c)| c.program.as_ref().map(|_| id))
@@ -197,7 +183,6 @@ pub(crate) fn build_mesh_plan(
     }
 
     Ok(MeshPlan {
-        root_manifest,
         program_components,
         bindings,
         external_bindings,

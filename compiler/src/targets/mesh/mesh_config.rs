@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use amber_manifest::{CapabilityKind, Manifest, NetworkProtocol};
+use amber_manifest::{CapabilityKind, NetworkProtocol};
 use amber_mesh::{
     HttpRoutePlugin, InboundRoute, InboundTarget, MeshConfigTemplate, MeshIdentityTemplate,
     MeshPeerTemplate, MeshProtocol, OutboundRoute, component_route_id, router_export_route_id,
@@ -50,7 +50,6 @@ pub(crate) struct MeshConfigPlan {
 pub(crate) struct MeshConfigBuildInput<'a, Addressing: MeshAddressing + ?Sized> {
     pub(crate) scenario: &'a Scenario,
     pub(crate) mesh_plan: &'a MeshPlan,
-    pub(crate) root_manifest: &'a Manifest,
     pub(crate) slot_ports_by_component: &'a HashMap<ComponentId, BTreeMap<String, u16>>,
     pub(crate) mesh_ports_by_component: &'a HashMap<ComponentId, u16>,
     pub(crate) router_ports: Option<RouterPorts>,
@@ -125,7 +124,6 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
     let MeshConfigBuildInput {
         scenario,
         mesh_plan,
-        root_manifest,
         slot_ports_by_component,
         mesh_ports_by_component,
         router_ports,
@@ -327,8 +325,9 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                 .ok_or_else(|| MeshError::new("external bindings require router identity"))?;
             let router_addr = addressing.mesh_addr_for_router()?;
             let protocol = MeshProtocol::Http;
-            let slot_decl = root_manifest
-                .slots()
+            let slot_decl = scenario
+                .component(scenario.root)
+                .slots
                 .get(binding.external_slot.as_str())
                 .expect("external slot should exist on root");
             outbound.push(OutboundRoute {
@@ -372,8 +371,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
         let router_mesh_port = router_ports.mesh;
         let mut inbound = Vec::new();
 
-        let external_slots =
-            build_router_external_slots(root_manifest, &mesh_plan.external_bindings);
+        let external_slots = build_router_external_slots(scenario, &mesh_plan.external_bindings);
         for slot in &external_slots {
             router_env_passthrough.push(slot.url_env.clone());
             let mut issuers = BTreeSet::new();
@@ -523,9 +521,10 @@ struct RouterExternalSlot {
 }
 
 fn build_router_external_slots(
-    root_manifest: &Manifest,
+    scenario: &Scenario,
     bindings: &[ResolvedExternalBinding],
 ) -> Vec<RouterExternalSlot> {
+    let root_component = scenario.component(scenario.root);
     let mut slot_names = BTreeSet::new();
     for binding in bindings {
         slot_names.insert(binding.external_slot.clone());
@@ -533,8 +532,8 @@ fn build_router_external_slots(
 
     let mut out = Vec::with_capacity(slot_names.len());
     for name in slot_names {
-        let decl = root_manifest
-            .slots()
+        let decl = root_component
+            .slots
             .get(name.as_str())
             .expect("external slot should exist on root");
         out.push(RouterExternalSlot {
