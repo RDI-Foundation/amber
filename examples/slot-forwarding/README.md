@@ -82,9 +82,8 @@ kind load docker-image example/root:v1 example/consumer:v1
 
 ```sh
 amber compile examples/slot-forwarding/scenario.json5 \
-  --disable-networkpolicy-check \
   --kubernetes /tmp/amber-slot-forwarding
-NS=$(awk '/name: scenario-/{print $2; exit}' /tmp/amber-slot-forwarding/00-namespace.yaml)
+NS=$(awk '/^namespace:/{print $2; exit}' /tmp/amber-slot-forwarding/kustomization.yaml)
 kubectl apply -k /tmp/amber-slot-forwarding
 kubectl -n "$NS" rollout status deploy/amber-router
 kubectl -n "$NS" rollout status deploy/c2-consumer

@@ -4,7 +4,8 @@ use std::{
 };
 
 use amber_manifest::{
-    CapabilityDecl, FrameworkCapabilityName, ManifestDigest, Program, ProvideDecl, SlotDecl,
+    CapabilityDecl, FrameworkCapabilityName, ManifestDigest, Program, ProvideDecl, ResourceDecl,
+    SlotDecl,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -172,6 +173,13 @@ impl Scenario {
                 BindingFrom::Component(provide) => {
                     let _ = self.component(provide.component);
                 }
+                BindingFrom::Resource(resource) => {
+                    let component = self.component(resource.component);
+                    debug_assert!(
+                        component.resources.contains_key(resource.name.as_str()),
+                        "resource missing from component"
+                    );
+                }
                 BindingFrom::External(slot) => {
                     let _ = self.component(slot.component);
                 }
@@ -216,6 +224,9 @@ pub struct Component {
     /// Declared output provides (capability outputs).
     pub provides: BTreeMap<String, ProvideDecl>,
 
+    /// Named framework-managed resources owned by this component.
+    pub resources: BTreeMap<String, ResourceDecl>,
+
     /// Named bindings declared by this component (binding name -> target slot).
     pub binding_decls: BTreeMap<String, SlotRef>,
 
@@ -233,8 +244,15 @@ pub struct ProvideRef {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ResourceRef {
+    pub component: ComponentId,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BindingFrom {
     Component(ProvideRef),
+    Resource(ResourceRef),
     Framework(FrameworkCapabilityName),
     External(SlotRef),
 }

@@ -25,7 +25,8 @@ pub use interpolation::{
 };
 pub use manifest::{ExperimentalFeature, Manifest, RawManifest};
 pub use names::{
-    BindingName, ChildName, ExportName, FrameworkCapabilityName, ProvideName, SlotName,
+    BindingName, ChildName, ExportName, FrameworkCapabilityName, ProvideName, ResourceName,
+    SlotName,
 };
 pub use refs::{ManifestDigest, ManifestRef, ManifestUrl};
 // Keep this available at crate root for internal helpers (spans/document).
@@ -34,7 +35,7 @@ pub use schema::{
     Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityDecl, CapabilityKind,
     ComponentDecl, ComponentRef, ConfigSchema, Endpoint, EnvironmentDecl, ExportTarget,
     LocalComponentRef, MountSource, Network, NetworkProtocol, Program, ProgramCommon, ProgramImage,
-    ProgramMount, ProgramPath, ProvideDecl, RawBinding, RawExportTarget, SlotDecl,
+    ProgramMount, ProgramPath, ProvideDecl, RawBinding, RawExportTarget, ResourceDecl, SlotDecl,
 };
 pub use slot_query::{
     SlotQuery, SlotQueryError, SlotQueryValidation, SlotTarget, parse_slot_query,
@@ -43,5 +44,5 @@ pub use slot_query::{
 pub use spans::{
     BindingSpans, BindingTargetKey, CapabilityDeclSpans, ComponentDeclSpans, EndpointSpans,
     EnvironmentSpans, ExportSpans, ManifestSpans, ProgramSpans, ProvideDeclSpans,
-    span_for_json_pointer,
+    ResourceDeclSpans, span_for_json_pointer,
 };

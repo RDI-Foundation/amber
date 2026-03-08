@@ -29,7 +29,7 @@ use amber_compiler::{
         },
         docker_compose::{COMPOSE_FILENAME, DockerComposeReporter},
         dot::DotReporter,
-        kubernetes::{KubernetesReporter, KubernetesReporterConfig},
+        kubernetes::KubernetesReporter,
         metadata::MetadataReporter,
         scenario_ir::ScenarioIrReporter,
     },
@@ -333,10 +333,6 @@ struct CompileArgs {
     /// Write direct/native runtime artifact files to this directory.
     #[arg(long = "direct", value_name = "DIR")]
     direct: Option<PathBuf>,
-
-    /// Disable generation of NetworkPolicy enforcement check resources.
-    #[arg(long = "disable-networkpolicy-check", requires = "kubernetes")]
-    disable_networkpolicy_check: bool,
 
     /// Disable compiler optimizations.
     #[arg(long = "no-opt")]
@@ -783,12 +779,7 @@ async fn compile(args: CompileArgs) -> Result<()> {
     }
 
     if let Some(kubernetes_dest) = outputs.kubernetes {
-        let reporter = KubernetesReporter {
-            config: KubernetesReporterConfig {
-                disable_networkpolicy_check: args.disable_networkpolicy_check,
-            },
-        };
-        let artifact = reporter.emit(&compiled).map_err(miette::Report::new)?;
+        let artifact = KubernetesReporter.emit(&compiled).map_err(miette::Report::new)?;
         write_kubernetes_output(&kubernetes_dest, &artifact)?;
     }
 

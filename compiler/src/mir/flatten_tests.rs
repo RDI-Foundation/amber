@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use amber_manifest::{Manifest, ManifestRef};
 use amber_scenario::{
-    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
+    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceRef, Scenario,
     ScenarioExport, SlotRef,
 };
 use url::Url;
@@ -24,6 +24,7 @@ fn component(id: usize, moniker: &str) -> Component {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -40,6 +41,11 @@ fn apply_manifest(component: &mut Component, manifest: &Manifest) {
         .collect();
     component.provides = manifest
         .provides()
+        .iter()
+        .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
+        .collect();
+    component.resources = manifest
+        .resources()
         .iter()
         .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
         .collect();
@@ -221,6 +227,116 @@ fn flatten_removes_pure_routing_nodes_and_preserves_debug_data() {
         .unwrap();
     assert!(dot.contains("c2 [label=\"/parent/child\"]"), "{dot}");
     assert!(dot.contains("c2 -> e0 [label=\"http\"]"));
+}
+
+#[test]
+fn flatten_keeps_resource_owners() {
+    let root_manifest: Manifest = r##"
+        {
+          manifest_version: "0.1.0",
+          components: { parent: "file:///parent.json5" },
+        }
+    "##
+    .parse()
+    .unwrap();
+
+    let parent_manifest: Manifest = r##"
+        {
+          manifest_version: "0.1.0",
+          resources: {
+            state: { kind: "storage" },
+          },
+          components: { child: "file:///child.json5" },
+          bindings: [
+            { to: "#child.state", from: "resources.state" },
+          ],
+        }
+    "##
+    .parse()
+    .unwrap();
+
+    let child_manifest: Manifest = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "child",
+            entrypoint: ["child"],
+            mounts: [{ path: "/var/lib/app", from: "slots.state" }],
+          },
+          slots: {
+            state: { kind: "storage" },
+          },
+        }
+    "#
+    .parse()
+    .unwrap();
+
+    let store = DigestStore::new();
+    let mut components = vec![
+        Some(component(0, "/")),
+        Some(component(1, "/parent")),
+        Some(component(2, "/parent/child")),
+    ];
+    components[0].as_mut().unwrap().digest = root_manifest.digest();
+    components[1].as_mut().unwrap().digest = parent_manifest.digest();
+    components[2].as_mut().unwrap().digest = child_manifest.digest();
+
+    components[1].as_mut().unwrap().parent = Some(ComponentId(0));
+    components[2].as_mut().unwrap().parent = Some(ComponentId(1));
+    components[0]
+        .as_mut()
+        .unwrap()
+        .children
+        .push(ComponentId(1));
+    components[1]
+        .as_mut()
+        .unwrap()
+        .children
+        .push(ComponentId(2));
+
+    apply_manifest(components[0].as_mut().unwrap(), &root_manifest);
+    apply_manifest(components[1].as_mut().unwrap(), &parent_manifest);
+    apply_manifest(components[2].as_mut().unwrap(), &child_manifest);
+    store.put(root_manifest.digest(), Arc::new(root_manifest));
+    store.put(parent_manifest.digest(), Arc::new(parent_manifest));
+    store.put(child_manifest.digest(), Arc::new(child_manifest));
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components,
+        bindings: vec![BindingEdge {
+            name: None,
+            from: BindingFrom::Resource(ResourceRef {
+                component: ComponentId(1),
+                name: "state".to_string(),
+            }),
+            to: SlotRef {
+                component: ComponentId(2),
+                name: "state".to_string(),
+            },
+            weak: false,
+        }],
+        exports: Vec::new(),
+    };
+
+    let scenario = flatten_routing_only(scenario, &store).unwrap();
+    assert_eq!(scenario.components.iter().flatten().count(), 3);
+    assert!(
+        scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|component| component.moniker.as_str() == "/parent"),
+        "resource-owning routing components must not be flattened away"
+    );
+    assert_eq!(scenario.bindings.len(), 1);
+    match &scenario.bindings[0].from {
+        BindingFrom::Resource(resource) => {
+            assert_eq!(resource.component, ComponentId(1));
+            assert_eq!(resource.name, "state");
+        }
+        other => panic!("expected resource binding, got {other:?}"),
+    }
 }
 
 #[test]

@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use amber_manifest::{FrameworkCapabilityName, Manifest};
+use amber_manifest::{FrameworkCapabilityName, Manifest, ProvideDecl, ResourceDecl};
 use amber_scenario::{
-    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
+    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceRef, Scenario,
     ScenarioExport, SlotRef,
 };
 use serde_json::json;
@@ -20,6 +20,7 @@ fn component(id: usize, moniker: &str) -> Component {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -36,6 +37,11 @@ fn apply_manifest(component: &mut Component, manifest: &Manifest) {
         .collect();
     component.provides = manifest
         .provides()
+        .iter()
+        .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
+        .collect();
+    component.resources = manifest
+        .resources()
         .iter()
         .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
         .collect();
@@ -112,6 +118,17 @@ fn framework_binding(capability: &str, to_component: usize, to_name: &str) -> Bi
         to: slot(to_component, to_name),
         weak: false,
     }
+}
+
+fn storage_resource_decl(size: Option<&str>) -> ResourceDecl {
+    let value = match size {
+        Some(size) => json!({
+            "kind": "storage",
+            "params": { "size": size },
+        }),
+        None => json!({ "kind": "storage" }),
+    };
+    serde_json::from_value(value).expect("storage resource decl")
 }
 
 fn external_binding(
@@ -277,6 +294,9 @@ fn dce_prunes_unused_transitive_subtree() {
     let edge = &scenario.bindings[0];
     let edge_from = match &edge.from {
         BindingFrom::Component(from) => from,
+        BindingFrom::Resource(resource) => {
+            panic!("unexpected resource binding resources.{}", resource.name)
+        }
         BindingFrom::Framework(name) => {
             panic!("unexpected framework binding framework.{name}")
         }
@@ -524,9 +544,9 @@ fn dce_keeps_storage_slots_used_by_program_mounts() {
     let root: Manifest = r##"
         {
           manifest_version: "0.1.0",
-          slots: {
-            state: { kind: "storage" },
-          },
+      resources: {
+        state: { kind: "storage" },
+      },
           components: {
             app: "file:///app.json5",
           },
@@ -578,7 +598,10 @@ fn dce_keeps_storage_slots_used_by_program_mounts() {
         components,
         bindings: vec![BindingEdge {
             name: None,
-            from: BindingFrom::External(slot(0, "state")),
+            from: BindingFrom::Resource(ResourceRef {
+                component: ComponentId(0),
+                name: "state".to_string(),
+            }),
             to: slot(1, "state"),
             weak: false,
         }],
@@ -601,8 +624,94 @@ fn dce_keeps_storage_slots_used_by_program_mounts() {
         "app component should stay live when its program mounts storage"
     );
     assert!(scenario.bindings.iter().any(|edge| {
-        matches!(&edge.from, BindingFrom::External(from) if from.name == "state")
+        matches!(&edge.from, BindingFrom::Resource(from) if from.component == ComponentId(0) && from.name == "state")
             && edge.to.name == "state"
+    }));
+}
+
+#[test]
+fn dce_keeps_resource_owner_between_export_and_storage_sink() {
+    let storage_slot = serde_json::from_value(json!({ "kind": "storage" })).expect("storage slot");
+    let provide_http: ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "http" })).expect("provide");
+    let out_decl = provide_http.decl.clone();
+    let app_program = serde_json::from_value(json!({
+        "image": "app",
+        "entrypoint": ["app"],
+        "mounts": [
+            { "path": "/var/lib/app", "from": "slots.state" }
+        ],
+        "network": {
+            "endpoints": [{ "name": "http", "port": 80 }]
+        }
+    }))
+    .expect("program");
+
+    let mut components = vec![
+        Some(component(0, "/")),
+        Some(component(1, "/allocator")),
+        Some(component(2, "/allocator/app")),
+    ];
+    connect_parent_child(&mut components, 0, 1);
+    connect_parent_child(&mut components, 1, 2);
+
+    component_mut(&mut components, 1)
+        .resources
+        .insert("state".to_string(), storage_resource_decl(Some("5Gi")));
+    component_mut(&mut components, 2).program = Some(app_program);
+    component_mut(&mut components, 2)
+        .slots
+        .insert("state".to_string(), storage_slot);
+    component_mut(&mut components, 2)
+        .provides
+        .insert("http".to_string(), provide_http);
+
+    let mut scenario = Scenario {
+        root: ComponentId(0),
+        components,
+        bindings: vec![BindingEdge {
+            name: None,
+            from: BindingFrom::Resource(ResourceRef {
+                component: ComponentId(1),
+                name: "state".to_string(),
+            }),
+            to: slot(2, "state"),
+            weak: false,
+        }],
+        exports: vec![ScenarioExport {
+            name: "http".to_string(),
+            capability: out_decl,
+            from: provide(2, "http"),
+        }],
+    };
+    scenario.normalize_order();
+
+    let scenario = dce_only(scenario);
+
+    assert!(
+        scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|component| component.moniker.as_str() == "/allocator"),
+        "resource owner must remain live when a descendant consumes its resource"
+    );
+    let allocator = scenario
+        .components
+        .iter()
+        .flatten()
+        .find(|component| component.moniker.as_str() == "/allocator")
+        .expect("allocator component");
+    assert!(
+        allocator.resources.contains_key("state"),
+        "resource owner should retain its declared resource after dce"
+    );
+    assert!(scenario.bindings.iter().any(|edge| {
+        matches!(
+            &edge.from,
+            BindingFrom::Resource(from)
+                if from.component == allocator.id && from.name == "state"
+        ) && edge.to.component != allocator.id
     }));
 }
 
@@ -1122,6 +1231,9 @@ fn dce_keeps_framework_bound_slots() {
     match &scenario.bindings[0].from {
         BindingFrom::Framework(name) => assert_eq!(name.as_str(), "dynamic_children"),
         BindingFrom::Component(_) => panic!("expected framework binding"),
+        BindingFrom::Resource(resource) => {
+            panic!("unexpected resource binding resources.{}", resource.name)
+        }
         BindingFrom::External(slot) => {
             panic!("unexpected external binding slots.{}", slot.name)
         }

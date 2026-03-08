@@ -1,0 +1,9 @@
+{
+  manifest_version: "0.1.0",
+  components: {
+    app: "./storage_mount_requires_resource_child.json5",
+  },
+  exports: {
+    http: "#app.http",
+  },
+}

@@ -3,13 +3,11 @@ use std::collections::{BTreeMap, HashMap};
 use amber_manifest::{CapabilityKind, MountSource};
 use amber_scenario::{BindingFrom, ComponentId, Scenario};
 
-use crate::targets::common::{TargetError, component_label};
-
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(crate) struct StorageIdentity {
-    pub(crate) consumer: ComponentId,
-    pub(crate) consumer_moniker: String,
-    pub(crate) root_slot: String,
+    pub(crate) owner: ComponentId,
+    pub(crate) owner_moniker: String,
+    pub(crate) resource: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33,8 +31,8 @@ impl StoragePlan {
 pub(crate) fn build_storage_plan(
     scenario: &Scenario,
     program_components: &[ComponentId],
-) -> Result<StoragePlan, TargetError> {
-    let mut root_storage_by_target: BTreeMap<(ComponentId, String), String> = BTreeMap::new();
+) -> StoragePlan {
+    let mut resource_by_target: BTreeMap<(ComponentId, String), StorageIdentity> = BTreeMap::new();
     for binding in &scenario.bindings {
         let Some(slot_decl) = scenario
             .component(binding.to.component)
@@ -47,17 +45,22 @@ pub(crate) fn build_storage_plan(
             continue;
         }
 
-        let BindingFrom::External(root_slot) = &binding.from else {
-            return Err(TargetError::new(format!(
-                "storage slot {}.{} must resolve from a routed root storage slot",
-                component_label(scenario, binding.to.component),
+        let BindingFrom::Resource(resource) = &binding.from else {
+            unreachable!(
+                "linker should reject non-resource storage bindings before storage planning: {}.{}",
+                scenario.component(binding.to.component).moniker,
                 binding.to.name
-            )));
+            );
         };
 
-        root_storage_by_target.insert(
+        let owner = scenario.component(resource.component);
+        resource_by_target.insert(
             (binding.to.component, binding.to.name.clone()),
-            root_slot.name.clone(),
+            StorageIdentity {
+                owner: resource.component,
+                owner_moniker: owner.moniker.as_str().to_string(),
+                resource: resource.name.clone(),
+            },
         );
     }
 
@@ -80,25 +83,19 @@ pub(crate) fn build_storage_plan(
                 continue;
             }
 
-            let Some(root_slot) = root_storage_by_target.get(&(*component_id, slot.clone())) else {
-                let suffix = if slot_decl.optional {
-                    " Optional storage mounts are not supported."
-                } else {
-                    ""
-                };
-                return Err(TargetError::new(format!(
-                    "component {} mounts storage slot `slots.{slot}`, but that slot is not bound \
-                     to a root storage slot.{suffix}",
-                    component_label(scenario, *component_id)
-                )));
-            };
+            let identity = resource_by_target
+                .get(&(*component_id, slot.clone()))
+                .cloned()
+                .unwrap_or_else(|| {
+                    unreachable!(
+                        "linker should reject mounted storage without a resource binding before \
+                         storage planning: {}.{}",
+                        component.moniker, slot
+                    )
+                });
 
             mounts.push(StorageMount {
-                identity: StorageIdentity {
-                    consumer: *component_id,
-                    consumer_moniker: component.moniker.as_str().to_string(),
-                    root_slot: root_slot.clone(),
-                },
+                identity,
                 slot: slot.clone(),
                 mount_path: mount.path.clone(),
             });
@@ -109,7 +106,7 @@ pub(crate) fn build_storage_plan(
         }
     }
 
-    Ok(StoragePlan {
+    StoragePlan {
         mounts_by_component,
-    })
+    }
 }

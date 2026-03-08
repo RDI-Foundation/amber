@@ -342,8 +342,7 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
     let images = resolve_internal_images().map_err(DockerComposeError::Other)?;
     let docker_mount_paths_by_component =
         collect_framework_docker_mount_paths(s, mesh_plan.program_components.as_slice());
-    let storage_plan =
-        build_storage_plan(s, mesh_plan.program_components.as_slice()).map_err(dc_other)?;
+    let storage_plan = build_storage_plan(s, mesh_plan.program_components.as_slice());
     let program_components = mesh_plan.program_components.as_slice();
     // Precompute service names (injective & stable).
     let names: HashMap<ComponentId, ServiceNames> =
@@ -1077,8 +1076,8 @@ fn compose_component_service_name(component_moniker: &str) -> String {
 fn compose_storage_volume_name(identity: &StorageIdentity) -> String {
     format!(
         "amber-storage-{}-{}",
-        sanitize_component_moniker(identity.consumer_moniker.as_str()),
-        sanitize_component_moniker(identity.root_slot.as_str()),
+        sanitize_component_moniker(identity.owner_moniker.as_str()),
+        sanitize_component_moniker(identity.resource.as_str()),
     )
 }
 

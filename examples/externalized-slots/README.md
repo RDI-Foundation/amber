@@ -87,9 +87,8 @@ Compile and apply:
 
 ```sh
 amber compile examples/externalized-slots/scenario.json5 \
-  --disable-networkpolicy-check \
   --kubernetes /tmp/amber-external
-NS=$(awk '/name: scenario-/{print $2; exit}' /tmp/amber-external/00-namespace.yaml)
+NS=$(awk '/^namespace:/{print $2; exit}' /tmp/amber-external/kustomization.yaml)
 kubectl apply -k /tmp/amber-external
 kubectl -n "$NS" rollout status deploy/amber-router
 kubectl -n "$NS" rollout status deploy/c0-component

@@ -90,18 +90,9 @@ const OTELCOL_ROLE_BINDING_NAME: &str = "amber-otelcol";
 const ROOT_CONFIG_SECRET_NAME: &str = "amber-root-config-secret";
 const ROOT_CONFIG_CONFIGMAP_NAME: &str = "amber-root-config";
 
-/// Kubernetes reporter configuration.
-#[derive(Clone, Debug, Default)]
-pub struct KubernetesReporterConfig {
-    /// Disable generation of NetworkPolicy enforcement check resources.
-    pub disable_networkpolicy_check: bool,
-}
-
 /// Reporter that outputs Kubernetes manifests as a directory structure.
 #[derive(Clone, Debug, Default)]
-pub struct KubernetesReporter {
-    pub config: KubernetesReporterConfig,
-}
+pub struct KubernetesReporter;
 
 /// Output artifact containing all generated Kubernetes YAML files.
 #[derive(Clone, Debug)]
@@ -113,8 +104,8 @@ pub struct KubernetesArtifact {
 impl Reporter for KubernetesReporter {
     type Artifact = KubernetesArtifact;
 
-    fn emit(&self, compiled: &CompiledScenario) -> Result<Self::Artifact, ReporterError> {
-        render_kubernetes(compiled, &self.config)
+    fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError> {
+        render_kubernetes(output)
     }
 }
 
@@ -161,21 +152,12 @@ type KubernetesResult<T> = Result<T, ReporterError>;
 
 pub fn render_kubernetes_with_output(
     output: &CompileOutput,
-    config: &KubernetesReporterConfig,
 ) -> KubernetesResult<KubernetesArtifact> {
-    let compiled = CompiledScenario::from_compile_output(output).map_err(|err| {
-        ReporterError::new(format!(
-            "failed to convert compiler output into compiled Scenario: {err}"
-        ))
-    })?;
-    render_kubernetes(&compiled, config)
+    render_kubernetes(output)
 }
 
-fn render_kubernetes(
-    compiled: &CompiledScenario,
-    config: &KubernetesReporterConfig,
-) -> KubernetesResult<KubernetesArtifact> {
-    let s = compiled.scenario();
+fn render_kubernetes(output: &CompileOutput) -> KubernetesResult<KubernetesArtifact> {
+    let s = &output.scenario;
     let scenario_digest =
         scenario_ir_digest(s).map_err(|err| ReporterError::new(err.to_string()))?;
     let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
@@ -309,8 +291,7 @@ fn render_kubernetes(
         &address_plan.binding_values_by_component,
     )
     .map_err(|e| ReporterError::new(e.to_string()))?;
-    let storage_plan =
-        build_storage_plan(s, program_components).map_err(|e| ReporterError::new(e.to_string()))?;
+    let storage_plan = build_storage_plan(s, program_components);
     let scenario_digest_label = encode_scenario_digest(&scenario_digest);
     let scenario_labels = |extra: &[(&str, &str)]| -> BTreeMap<String, String> {
         let mut labels = BTreeMap::new();
@@ -630,6 +611,38 @@ fn render_kubernetes(
     // root config (when runtime config is needed). Pods only reference explicitly
     // granted keys, so unassigned config never becomes visible inside containers.
 
+    let mut storage_claims = BTreeMap::new();
+    for mounts in storage_plan.mounts_by_component.values() {
+        for mount in mounts {
+            let claim_name = storage_claim_name(&mount.identity);
+            storage_claims
+                .entry(claim_name.clone())
+                .or_insert_with(|| PersistentVolumeClaim {
+                    api_version: "v1",
+                    kind: "PersistentVolumeClaim",
+                    metadata: ObjectMeta {
+                        name: claim_name.clone(),
+                        ..Default::default()
+                    },
+                    spec: PersistentVolumeClaimSpec {
+                        access_modes: vec!["ReadWriteOnce".to_string()],
+                        resources: VolumeResourceRequirements {
+                            requests: BTreeMap::from([(
+                                "storage".to_string(),
+                                storage_request_for(s, &mount.identity),
+                            )]),
+                        },
+                    },
+                });
+        }
+    }
+    for (claim_name, claim) in &storage_claims {
+        files.insert(
+            PathBuf::from(format!("03-persistentvolumeclaims/{claim_name}.yaml")),
+            to_yaml(claim)?,
+        );
+    }
+
     // Deployments
     for id in program_components {
         let c = s.component(*id);
@@ -640,11 +653,7 @@ fn render_kubernetes(
             .get(id)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let workload_kind = if storage_mounts.is_empty() {
-            "Deployment"
-        } else {
-            "StatefulSet"
-        };
+        let workload_kind = "Deployment";
         let program = c.program.as_ref().unwrap();
         let program_plan = program_plans.get(id).unwrap();
         let mesh_port = *mesh_ports_by_component.get(id).expect("mesh port missing");
@@ -772,28 +781,15 @@ fn render_kubernetes(
                 build_helper_runner_container(program_image.clone(), ports, container_env)
             }
         };
-        let mut storage_claim_templates = BTreeMap::new();
+        let mut storage_volume_names = BTreeSet::new();
         for storage_mount in storage_mounts {
-            let claim_name = storage_claim_name(storage_mount.identity.root_slot.as_str());
-            storage_claim_templates
-                .entry(claim_name.clone())
-                .or_insert_with(|| PersistentVolumeClaim {
-                    api_version: "v1",
-                    kind: "PersistentVolumeClaim",
-                    metadata: ObjectMeta {
-                        name: claim_name.clone(),
-                        ..Default::default()
-                    },
-                    spec: PersistentVolumeClaimSpec {
-                        access_modes: vec!["ReadWriteOnce".to_string()],
-                        resources: VolumeResourceRequirements {
-                            requests: BTreeMap::from([(
-                                "storage".to_string(),
-                                DEFAULT_STORAGE_REQUEST.to_string(),
-                            )]),
-                        },
-                    },
-                });
+            let claim_name = storage_claim_name(&storage_mount.identity);
+            if storage_volume_names.insert(claim_name.clone()) {
+                volumes.push(Volume::persistent_volume_claim(
+                    claim_name.clone(),
+                    claim_name.clone(),
+                ));
+            }
             container.volume_mounts.push(VolumeMount {
                 name: claim_name,
                 mount_path: storage_mount.mount_path.clone(),
@@ -891,26 +887,6 @@ fn render_kubernetes(
             });
         }
 
-        if !config.disable_networkpolicy_check {
-            init_containers.push(Container {
-                name: "wait-for-netpol-check".to_string(),
-                image: "busybox:1.36".to_string(),
-                command: vec![
-                    "/bin/sh".to_string(),
-                    "-c".to_string(),
-                    "RESPONSE=$(nc amber-netpol-client 8080 </dev/null 2>/dev/null); [ \
-                     \"$RESPONSE\" = \"ready\" ] && echo 'NetworkPolicy enforcement verified'"
-                        .to_string(),
-                ],
-                args: Vec::new(),
-                env: Vec::new(),
-                env_from: Vec::new(),
-                ports: Vec::new(),
-                readiness_probe: None,
-                volume_mounts: Vec::new(),
-            });
-        }
-
         let pod_spec = PodSpec {
             init_containers,
             containers: vec![sidecar, container],
@@ -926,73 +902,37 @@ fn render_kubernetes(
             m
         };
 
-        if storage_claim_templates.is_empty() {
-            let deployment = Deployment {
-                api_version: "apps/v1",
-                kind: "Deployment",
-                metadata: ObjectMeta {
-                    name: cnames.service.clone(),
-                    labels: labels.clone(),
-                    ..Default::default()
+        let deployment = Deployment {
+            api_version: "apps/v1",
+            kind: "Deployment",
+            metadata: ObjectMeta {
+                name: cnames.service.clone(),
+                labels: labels.clone(),
+                ..Default::default()
+            },
+            spec: DeploymentSpec {
+                replicas: 1,
+                selector: LabelSelector {
+                    match_labels: selector,
                 },
-                spec: DeploymentSpec {
-                    replicas: 1,
-                    selector: LabelSelector {
-                        match_labels: selector,
+                strategy: (!storage_mounts.is_empty()).then(|| DeploymentStrategy {
+                    strategy_type: "Recreate".to_string(),
+                }),
+                template: PodTemplateSpec {
+                    metadata: ObjectMeta {
+                        labels: labels.clone(),
+                        annotations: pod_annotations,
+                        ..Default::default()
                     },
-                    template: PodTemplateSpec {
-                        metadata: ObjectMeta {
-                            labels: labels.clone(),
-                            annotations: pod_annotations,
-                            ..Default::default()
-                        },
-                        spec: pod_spec,
-                    },
+                    spec: pod_spec,
                 },
-            };
+            },
+        };
 
-            files.insert(
-                PathBuf::from(format!("03-deployments/{}.yaml", cnames.service)),
-                to_yaml(&deployment)?,
-            );
-        } else {
-            let stateful_set = StatefulSet {
-                api_version: "apps/v1",
-                kind: "StatefulSet",
-                metadata: ObjectMeta {
-                    name: cnames.service.clone(),
-                    labels: labels.clone(),
-                    ..Default::default()
-                },
-                spec: StatefulSetSpec {
-                    service_name: cnames.service.clone(),
-                    replicas: 1,
-                    selector: LabelSelector {
-                        match_labels: selector,
-                    },
-                    template: PodTemplateSpec {
-                        metadata: ObjectMeta {
-                            labels: labels.clone(),
-                            annotations: pod_annotations,
-                            ..Default::default()
-                        },
-                        spec: pod_spec,
-                    },
-                    volume_claim_templates: storage_claim_templates.into_values().collect(),
-                    persistent_volume_claim_retention_policy: Some(
-                        PersistentVolumeClaimRetentionPolicy {
-                            when_deleted: "Retain",
-                            when_scaled: "Retain",
-                        },
-                    ),
-                },
-            };
-
-            files.insert(
-                PathBuf::from(format!("03-statefulsets/{}.yaml", cnames.service)),
-                to_yaml(&stateful_set)?,
-            );
-        }
+        files.insert(
+            PathBuf::from(format!("03-deployments/{}.yaml", cnames.service)),
+            to_yaml(&deployment)?,
+        );
     }
 
     if needs_router {
@@ -1067,6 +1007,7 @@ fn render_kubernetes(
                 selector: LabelSelector {
                     match_labels: router_selector.clone(),
                 },
+                strategy: None,
                 template: PodTemplateSpec {
                     metadata: ObjectMeta {
                         labels: router_labels.clone(),
@@ -1356,17 +1297,6 @@ fn render_kubernetes(
         );
     }
 
-    if !config.disable_networkpolicy_check {
-        let enforcement_resources =
-            generate_netpol_enforcement_check(&namespace, &scenario_labels(&[]));
-        for (filename, resource_yaml) in enforcement_resources {
-            files.insert(
-                PathBuf::from(format!("06-enforcement/{filename}")),
-                resource_yaml?,
-            );
-        }
-    }
-
     let export_metadata = collect_exports_metadata(s, &mesh_plan, router_mesh_port);
 
     let mut input_metadata: BTreeMap<String, InputMetadata> = BTreeMap::new();
@@ -1559,12 +1489,7 @@ fn render_kubernetes(
         .iter()
         .map(|id| {
             let service = &names.get(id).expect("component names").service;
-            let workload = if storage_plan.mounts_by_component.contains_key(id) {
-                "statefulset"
-            } else {
-                "deploy"
-            };
-            format!("kubectl -n {namespace} rollout status {workload}/{service}")
+            format!("kubectl -n {namespace} rollout status deploy/{service}")
         })
         .collect();
     if needs_router {
@@ -1981,8 +1906,28 @@ fn sanitize_label_value(s: &str) -> String {
     truncate_dns_name(&out, 63)
 }
 
-fn storage_claim_name(root_slot: &str) -> String {
-    truncate_dns_name(&format!("storage-{}", sanitize_dns_name(root_slot)), 63)
+fn storage_request_for(
+    scenario: &Scenario,
+    identity: &crate::storage_plan::StorageIdentity,
+) -> String {
+    scenario
+        .component(identity.owner)
+        .resources
+        .get(identity.resource.as_str())
+        .and_then(|resource| resource.params.size.as_deref())
+        .unwrap_or(DEFAULT_STORAGE_REQUEST)
+        .to_string()
+}
+
+fn storage_claim_name(identity: &crate::storage_plan::StorageIdentity) -> String {
+    truncate_dns_name(
+        &format!(
+            "storage-{}-{}",
+            sanitize_dns_name(identity.owner_moniker.as_str()),
+            sanitize_dns_name(identity.resource.as_str())
+        ),
+        63,
+    )
 }
 
 fn sanitize_port_name(s: &str) -> String {
@@ -2048,316 +1993,6 @@ fn build_helper_runner_container(
 }
 
 // ---- Runtime config / helper mode support ----
-
-/// Generates NetworkPolicy enforcement check resources.
-///
-/// This creates a two-phase test within the namespace:
-/// 1. An "allowed" server that the client CAN connect to (proves networking works)
-/// 2. A "blocked" server that the client should NOT be able to connect to
-/// 3. A NetworkPolicy that blocks ingress to the "blocked" server only
-/// 4. A client that verifies both conditions
-///
-/// The client uses a "poison pill" pattern:
-/// - Phase 1: Try to connect to allowed server. If this fails, networking is broken - exit with error.
-/// - Phase 2: Try to connect to blocked server. If this succeeds, NetworkPolicy isn't enforced - exit with error.
-/// - Success: Both checks pass, stay alive.
-fn generate_netpol_enforcement_check(
-    namespace: &str,
-    labels: &BTreeMap<String, String>,
-) -> Vec<(&'static str, KubernetesResult<String>)> {
-    let mut check_labels = labels.clone();
-    check_labels.insert("amber.io/type".to_string(), "netpol-check".to_string());
-
-    let server_labels = {
-        let mut l = check_labels.clone();
-        l.insert(
-            "amber.io/netpol-check-role".to_string(),
-            "server".to_string(),
-        );
-        l
-    };
-
-    let client_labels = {
-        let mut l = check_labels.clone();
-        l.insert(
-            "amber.io/netpol-check-role".to_string(),
-            "client".to_string(),
-        );
-        l
-    };
-
-    let server_deployment = Deployment {
-        api_version: "apps/v1",
-        kind: "Deployment",
-        metadata: ObjectMeta {
-            name: "amber-netpol-server".to_string(),
-            labels: server_labels.clone(),
-            ..Default::default()
-        },
-        spec: DeploymentSpec {
-            replicas: 1,
-            selector: LabelSelector {
-                match_labels: {
-                    let mut m = BTreeMap::new();
-                    m.insert(
-                        "amber.io/netpol-check-role".to_string(),
-                        "server".to_string(),
-                    );
-                    m
-                },
-            },
-            template: PodTemplateSpec {
-                metadata: ObjectMeta {
-                    labels: server_labels.clone(),
-                    ..Default::default()
-                },
-                spec: PodSpec {
-                    init_containers: Vec::new(),
-                    containers: vec![Container {
-                        name: "server".to_string(),
-                        image: "busybox:1.36".to_string(),
-                        command: vec![
-                            "/bin/sh".to_string(),
-                            "-c".to_string(),
-                            // Run two servers - one on port 8080 (allowed), one on 8081 (will be blocked)
-                            "while true; do echo 'ready' | nc -l -p 8080 >/dev/null; done & while \
-                             true; do echo 'ready' | nc -l -p 8081 >/dev/null; done & wait"
-                                .to_string(),
-                        ],
-                        ports: vec![
-                            ContainerPort {
-                                name: "allowed".to_string(),
-                                container_port: 8080,
-                                protocol: "TCP",
-                            },
-                            ContainerPort {
-                                name: "blocked".to_string(),
-                                container_port: 8081,
-                                protocol: "TCP",
-                            },
-                        ],
-                        ..Default::default()
-                    }],
-                    volumes: Vec::new(),
-                    service_account_name: None,
-                    automount_service_account_token: Some(false),
-                    restart_policy: None,
-                },
-            },
-        },
-    };
-
-    let allowed_service = Service::new(
-        "amber-netpol-allowed",
-        namespace,
-        check_labels.clone(),
-        {
-            let mut m = BTreeMap::new();
-            m.insert(
-                "amber.io/netpol-check-role".to_string(),
-                "server".to_string(),
-            );
-            m
-        },
-        vec![ServicePort {
-            name: "tcp".to_string(),
-            port: 8080,
-            target_port: 8080,
-            protocol: "TCP",
-        }],
-    );
-
-    let blocked_service = Service::new(
-        "amber-netpol-blocked",
-        namespace,
-        check_labels.clone(),
-        {
-            let mut m = BTreeMap::new();
-            m.insert(
-                "amber.io/netpol-check-role".to_string(),
-                "server".to_string(),
-            );
-            m
-        },
-        vec![ServicePort {
-            name: "tcp".to_string(),
-            port: 8080,
-            target_port: 8081,
-            protocol: "TCP",
-        }],
-    );
-
-    let deny_policy = NetworkPolicy {
-        api_version: "networking.k8s.io/v1",
-        kind: "NetworkPolicy",
-        metadata: ObjectMeta {
-            name: "amber-netpol-deny-blocked".to_string(),
-            labels: check_labels.clone(),
-            ..Default::default()
-        },
-        spec: NetworkPolicySpec {
-            pod_selector: LabelSelector {
-                match_labels: {
-                    let mut m = BTreeMap::new();
-                    m.insert(
-                        "amber.io/netpol-check-role".to_string(),
-                        "server".to_string(),
-                    );
-                    m
-                },
-            },
-            policy_types: vec!["Ingress"],
-            ingress: vec![NetworkPolicyIngressRule {
-                ports: vec![NetworkPolicyPort {
-                    port: 8080,
-                    protocol: "TCP",
-                }],
-                from: Vec::new(), // from anywhere
-            }],
-            egress: Vec::new(),
-        },
-    };
-
-    // Client check script - simple and fast, relies on Kubernetes restart policy
-    let client_script = r#"
-echo "=========================================="
-echo "Amber NetworkPolicy Enforcement Check"
-echo "=========================================="
-echo ""
-
-# Phase 1: Verify we CAN connect to the allowed server
-# Kubernetes will restart this pod if it fails, so no retry loop needed
-echo "Phase 1: Testing basic connectivity..."
-RESPONSE=$(nc amber-netpol-allowed 8080 </dev/null 2>/dev/null)
-if [ "$RESPONSE" != "ready" ]; then
-    echo "FATAL: Cannot connect to amber-netpol-allowed:8080"
-    echo "Basic networking is not working. Pod will restart."
-    exit 1
-fi
-echo "  SUCCESS: Connected to allowed server and received: $RESPONSE"
-
-# Phase 2: Verify we CANNOT connect to the blocked server
-echo ""
-echo "Phase 2: Testing NetworkPolicy enforcement..."
-RESPONSE=$(nc -w 2 amber-netpol-blocked 8080 </dev/null 2>/dev/null || true)
-if [ -n "$RESPONSE" ]; then
-    echo ""
-    echo "=========================================="
-    echo "FATAL: NetworkPolicy is NOT enforced!"
-    echo "=========================================="
-    echo ""
-    echo "Your Kubernetes cluster's CNI does not support NetworkPolicy."
-    echo "Amber scenarios require NetworkPolicy for security isolation."
-    echo ""
-    echo "To fix this, either:"
-    echo "  1. Install a CNI that supports NetworkPolicy:"
-    echo "     - Calico, Cilium, Weave Net, etc."
-    echo "  2. Re-generate with --disable-networkpolicy-check"
-    echo ""
-    exit 1
-fi
-echo "  SUCCESS: Connection was correctly blocked"
-
-echo ""
-echo "=========================================="
-echo "NetworkPolicy enforcement VERIFIED"
-echo "=========================================="
-echo ""
-
-# Start server to signal readiness to other pods
-echo "Starting readiness server on port 8080..."
-while true; do echo "ready" | nc -l -p 8080 >/dev/null; done
-"#;
-
-    let client_deployment = Deployment {
-        api_version: "apps/v1",
-        kind: "Deployment",
-        metadata: ObjectMeta {
-            name: "amber-netpol-client".to_string(),
-            labels: client_labels.clone(),
-            ..Default::default()
-        },
-        spec: DeploymentSpec {
-            replicas: 1,
-            selector: LabelSelector {
-                match_labels: {
-                    let mut m = BTreeMap::new();
-                    m.insert(
-                        "amber.io/netpol-check-role".to_string(),
-                        "client".to_string(),
-                    );
-                    m
-                },
-            },
-            template: PodTemplateSpec {
-                metadata: ObjectMeta {
-                    labels: client_labels.clone(),
-                    ..Default::default()
-                },
-                spec: PodSpec {
-                    init_containers: Vec::new(),
-                    containers: vec![Container {
-                        name: "client".to_string(),
-                        image: "busybox:1.36".to_string(),
-                        command: vec![
-                            "/bin/sh".to_string(),
-                            "-c".to_string(),
-                            client_script.to_string(),
-                        ],
-                        ports: vec![ContainerPort {
-                            name: "ready".to_string(),
-                            container_port: 8080,
-                            protocol: "TCP",
-                        }],
-                        readiness_probe: Some(Probe {
-                            exec: None,
-                            http_get: None,
-                            tcp_socket: Some(TcpSocketAction { port: 8080 }),
-                            initial_delay_seconds: Some(1),
-                            period_seconds: Some(2),
-                            timeout_seconds: Some(1),
-                            failure_threshold: Some(30),
-                        }),
-                        ..Default::default()
-                    }],
-                    volumes: Vec::new(),
-                    service_account_name: None,
-                    automount_service_account_token: Some(false),
-                    restart_policy: None,
-                },
-            },
-        },
-    };
-
-    let client_service = Service::new(
-        "amber-netpol-client",
-        namespace,
-        client_labels.clone(),
-        {
-            let mut m = BTreeMap::new();
-            m.insert(
-                "amber.io/netpol-check-role".to_string(),
-                "client".to_string(),
-            );
-            m
-        },
-        vec![ServicePort {
-            name: "http".to_string(),
-            port: 8080,
-            target_port: 8080,
-            protocol: "TCP",
-        }],
-    );
-
-    vec![
-        ("server-deployment.yaml", to_yaml(&server_deployment)),
-        ("allowed-service.yaml", to_yaml(&allowed_service)),
-        ("blocked-service.yaml", to_yaml(&blocked_service)),
-        ("deny-policy.yaml", to_yaml(&deny_policy)),
-        ("client-deployment.yaml", to_yaml(&client_deployment)),
-        ("client-service.yaml", to_yaml(&client_service)),
-    ]
-}
 
 fn to_yaml<T: Serialize>(value: &T) -> Result<String, ReporterError> {
     serde_yaml::to_string(value)

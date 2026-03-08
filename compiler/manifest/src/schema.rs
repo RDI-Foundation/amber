@@ -19,8 +19,8 @@ use crate::{
     error::Error,
     interpolation::{InterpolatedString, ProgramEntrypoint, ProgramEnvValue},
     names::{
-        BindingName, ChildName, ExportName, FrameworkCapabilityName, ProvideName, SlotName,
-        ensure_name_no_dot,
+        BindingName, ChildName, ExportName, FrameworkCapabilityName, ProvideName, ResourceName,
+        SlotName, ensure_name_no_dot,
     },
     refs::ManifestRef,
     spans::BindingTargetKey,
@@ -503,6 +503,43 @@ pub struct SlotDecl {
 }
 
 #[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    bon::Builder,
+)]
+#[builder(on(String, into))]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct StorageResourceParams {
+    #[serde(default)]
+    pub size: Option<String>,
+    #[serde(default)]
+    pub retention: Option<String>,
+    #[serde(default)]
+    pub sharing: Option<String>,
+}
+
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, bon::Builder,
+)]
+#[builder(on(String, into))]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ResourceDecl {
+    pub kind: CapabilityKind,
+    #[serde(default)]
+    pub params: StorageResourceParams,
+}
+
+#[derive(
     Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, DeserializeFromStr, SerializeDisplay,
 )]
 #[non_exhaustive]
@@ -547,6 +584,7 @@ impl FromStr for LocalComponentRef {
 pub enum BindingSourceRef {
     Component(LocalComponentRef),
     Framework,
+    Resources,
 }
 
 impl fmt::Display for BindingSourceRef {
@@ -554,6 +592,7 @@ impl fmt::Display for BindingSourceRef {
         match self {
             Self::Component(component) => component.fmt(f),
             Self::Framework => f.write_str("framework"),
+            Self::Resources => f.write_str("resources"),
         }
     }
 }
@@ -1033,11 +1072,15 @@ fn is_framework_ref(input: &str) -> bool {
     input == "framework"
 }
 
+fn is_resources_ref(input: &str) -> bool {
+    input == "resources"
+}
+
 fn parse_binding_target_ref(input: &str) -> Result<LocalComponentRef, Error> {
-    if is_framework_ref(input) {
+    if is_framework_ref(input) || is_resources_ref(input) {
         return Err(Error::InvalidBinding {
             input: input.to_string(),
-            message: "framework cannot be a binding target".to_string(),
+            message: format!("{input} cannot be a binding target"),
         });
     }
     parse_component_ref(input).map_err(|err| Error::InvalidBinding {
@@ -1049,6 +1092,9 @@ fn parse_binding_target_ref(input: &str) -> Result<LocalComponentRef, Error> {
 fn parse_binding_source_ref(input: &str) -> Result<BindingSourceRef, Error> {
     if is_framework_ref(input) {
         return Ok(BindingSourceRef::Framework);
+    }
+    if is_resources_ref(input) {
+        return Ok(BindingSourceRef::Resources);
     }
     let component = parse_component_ref(input).map_err(|err| Error::InvalidBinding {
         input: err.input,
@@ -1120,6 +1166,7 @@ pub enum BindingTarget {
 pub enum BindingSource {
     SelfProvide(ProvideName),
     SelfSlot(SlotName),
+    Resource(ResourceName),
     ChildExport {
         child: ChildName,
         export: ExportName,

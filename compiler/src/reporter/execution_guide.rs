@@ -786,7 +786,7 @@ mod tests {
 
         let kubernetes = guide.render_kubernetes_readme(
             "scenario-test",
-            &["kubectl -n scenario-test rollout status statefulset/c0-component".to_string()],
+            &["kubectl -n scenario-test rollout status deploy/c0-component".to_string()],
             true,
         );
         assert!(

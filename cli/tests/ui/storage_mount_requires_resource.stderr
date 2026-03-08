@@ -1,0 +1,32 @@
+linker::storage_mount_requires_resource
+
+  x storage mount `slots.state` on component /app must resolve from a storage resource
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/storage_mount_requires_resource_child.json5:15:37]
+ 14 |     mounts: [
+ 15 |       { path: "/var/lib/app", from: "slots.state" },
+    :                                     ^^^^^^|^^^^^^
+    :                                           `-- storage mount declared here
+ 16 |     ],
+    `----
+  help: Declare `resources.<name>: { kind: "storage" }` and bind it to the mounted storage slot.
+
+Advice: 
+  > component `app` declared on root component
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/storage_mount_requires_resource.json5:4:5]
+ 3 |   components: {
+ 4 |     app: "./storage_mount_requires_resource_child.json5",
+   :     ^|^
+   :      `-- component declared here
+ 5 |   },
+   `----
+
+Advice: 
+  > storage slot `state` declared on /app
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/storage_mount_requires_resource_child.json5:4:5]
+ 3 |   slots: {
+ 4 |     state: { kind: "storage" },
+   :     ^^|^^
+   :       `-- storage slot declared here
+ 5 |   },
+   `----
+Error:   × check failed

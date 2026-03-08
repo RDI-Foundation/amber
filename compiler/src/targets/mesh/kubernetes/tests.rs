@@ -19,7 +19,7 @@ use serde_json::json;
 use tempfile::tempdir;
 use url::Url;
 
-use super::{KubernetesReporter, KubernetesReporterConfig};
+use super::KubernetesReporter;
 use crate::{
     CompileOptions, Compiler, DigestStore, OptimizeOptions, reporter::Reporter as _,
     targets::mesh::internal_images::resolve_internal_images,
@@ -326,14 +326,14 @@ fn write_kubernetes_counter_storage_fixture(root: &Path, version: &str) -> PathB
         r##"
 {
   manifest_version: "0.1.0",
-  slots: {
+  resources: {
     state: { kind: "storage" },
   },
   components: {
     app: "./app.json5",
   },
   bindings: [
-    { to: "#app.state", from: "self.state" },
+    { to: "#app.state", from: "resources.state" },
   ],
   exports: {
     http: "#app.http",
@@ -393,14 +393,14 @@ fn write_kubernetes_storage_fixture(root: &Path, version: &str, initial_state: &
         &scenario_path,
         r##"{
   manifest_version: "0.1.0",
-  slots: {
+  resources: {
     state: { kind: "storage" },
   },
   components: {
     app: "./app.json5",
   },
   bindings: [
-    { to: "#app.state", from: "self.state" },
+    { to: "#app.state", from: "resources.state" },
   ],
 }
 "##,
@@ -792,12 +792,9 @@ fn compile_fixture(manifest_path: &Path) -> super::KubernetesArtifact {
         .block_on(compiler.compile(ManifestRef::from_url(file_url(manifest_path)), opts))
         .expect("compile scenario");
 
-    let reporter = KubernetesReporter {
-        config: KubernetesReporterConfig {
-            disable_networkpolicy_check: true,
-        },
-    };
-    reporter.emit(&output).expect("render kubernetes output")
+    KubernetesReporter
+        .emit(&output)
+        .expect("render kubernetes output")
 }
 
 impl Drop for PortForwardGuard {
@@ -884,13 +881,8 @@ fn kubernetes_namespace_and_metadata_digest_follow_scenario_ir() {
             .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
             .expect("compile scenario");
 
-        let reporter = KubernetesReporter {
-            config: KubernetesReporterConfig {
-                disable_networkpolicy_check: true,
-            },
-        };
-        let artifact = reporter
-            .emit(&compiled_scenario(&output))
+        let artifact = KubernetesReporter
+            .emit(&output)
             .expect("render kubernetes output");
 
         let kustomization = artifact
@@ -1002,15 +994,8 @@ fn kubernetes_emits_router_for_external_slots() {
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
         .expect("compile scenario");
 
-    let reporter = KubernetesReporter {
-        config: KubernetesReporterConfig {
-            // kind's default CNI doesn't enforce NetworkPolicy, so the netpol
-            // check would keep pods in init forever in this test.
-            disable_networkpolicy_check: true,
-        },
-    };
-    let artifact = reporter
-        .emit(&compiled_scenario(&output))
+    let artifact = KubernetesReporter
+        .emit(&output)
         .expect("render kubernetes output");
 
     let router_deploy = artifact
@@ -1138,7 +1123,7 @@ fn kubernetes_emits_router_for_external_slots() {
 }
 
 #[test]
-fn kubernetes_storage_mounts_emit_statefulset_with_retained_claims() {
+fn kubernetes_storage_mounts_emit_pvc_and_recreate_deployment() {
     let fixture_dir = tempdir().expect("fixture dir");
     let scenario_path = write_kubernetes_counter_storage_fixture(fixture_dir.path(), "v1");
     let artifact = compile_fixture(&scenario_path);
@@ -1150,42 +1135,42 @@ fn kubernetes_storage_mounts_emit_statefulset_with_retained_claims() {
         "runtime artifact should not embed a Namespace object"
     );
 
-    let statefulset_yaml = artifact
+    let pvc_yaml = artifact
         .files
-        .iter()
-        .find_map(|(path, content)| {
-            path.to_string_lossy()
-                .starts_with("03-statefulsets/")
-                .then_some(content)
-        })
-        .expect("statefulset yaml");
+        .get(&PathBuf::from(
+            "03-persistentvolumeclaims/storage-component-state.yaml",
+        ))
+        .expect("pvc yaml");
     assert!(
-        statefulset_yaml.contains("kind: StatefulSet"),
-        "{statefulset_yaml}"
+        pvc_yaml.contains("kind: PersistentVolumeClaim"),
+        "{pvc_yaml}"
+    );
+    assert!(pvc_yaml.contains("ReadWriteOnce"), "{pvc_yaml}");
+    assert!(pvc_yaml.contains("storage: 1Gi"), "{pvc_yaml}");
+
+    let deployment_yaml = artifact
+        .files
+        .get(&PathBuf::from("03-deployments/c1-app.yaml"))
+        .expect("deployment yaml");
+    assert!(
+        deployment_yaml.contains("kind: Deployment"),
+        "{deployment_yaml}"
     );
     assert!(
-        statefulset_yaml.contains("volumeClaimTemplates"),
-        "{statefulset_yaml}"
+        deployment_yaml.contains("type: Recreate"),
+        "{deployment_yaml}"
     );
     assert!(
-        statefulset_yaml.contains("whenDeleted: Retain"),
-        "{statefulset_yaml}"
+        deployment_yaml.contains("claimName: storage-component-state"),
+        "{deployment_yaml}"
     );
     assert!(
-        statefulset_yaml.contains("whenScaled: Retain"),
-        "{statefulset_yaml}"
+        deployment_yaml.contains("mountPath: /var/lib/app"),
+        "{deployment_yaml}"
     );
     assert!(
-        statefulset_yaml.contains("mountPath: /var/lib/app"),
-        "{statefulset_yaml}"
-    );
-    assert!(
-        statefulset_yaml.contains("name: storage-state"),
-        "{statefulset_yaml}"
-    );
-    assert!(
-        !statefulset_yaml.contains("\n  namespace:"),
-        "{statefulset_yaml}"
+        !deployment_yaml.contains("\n  namespace:"),
+        "{deployment_yaml}"
     );
 
     let provision_plan_yaml = artifact
@@ -1231,7 +1216,7 @@ fn kubernetes_storage_mounts_emit_statefulset_with_retained_claims() {
 }
 
 #[test]
-fn kubernetes_emits_statefulset_for_storage_mounts() {
+fn kubernetes_emits_deployment_and_pvc_for_storage_mounts() {
     let fixture_dir = tempdir().expect("create fixture temp dir");
     let scenario_path =
         write_kubernetes_storage_fixture(fixture_dir.path(), "version-v1", "persisted-v1");
@@ -1246,12 +1231,9 @@ fn kubernetes_emits_statefulset_for_storage_mounts() {
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&scenario_path)), opts))
         .expect("compile kubernetes storage scenario");
 
-    let reporter = KubernetesReporter {
-        config: KubernetesReporterConfig {
-            disable_networkpolicy_check: true,
-        },
-    };
-    let artifact = reporter.emit(&output).expect("render kubernetes output");
+    let artifact = KubernetesReporter
+        .emit(&output)
+        .expect("render kubernetes output");
 
     assert!(
         !artifact
@@ -1260,76 +1242,35 @@ fn kubernetes_emits_statefulset_for_storage_mounts() {
         "runtime output should not include a Namespace resource"
     );
 
-    let statefulset = artifact
+    let pvc = artifact
         .files
-        .iter()
-        .find_map(|(path, content)| {
-            path.to_string_lossy()
-                .starts_with("03-statefulsets/")
-                .then_some(content)
-        })
-        .expect("statefulset manifest");
-    assert!(statefulset.contains("kind: StatefulSet"), "{statefulset}");
+        .get(&PathBuf::from(
+            "03-persistentvolumeclaims/storage-component-state.yaml",
+        ))
+        .expect("persistentvolumeclaim manifest");
+    assert!(pvc.contains("kind: PersistentVolumeClaim"), "{pvc}");
+    assert!(pvc.contains("ReadWriteOnce"), "{pvc}");
+    assert!(pvc.contains("storage: 1Gi"), "{pvc}");
+
+    let deployment = artifact
+        .files
+        .get(&PathBuf::from("03-deployments/c1-app.yaml"))
+        .expect("deployment manifest");
+    assert!(deployment.contains("kind: Deployment"), "{deployment}");
+    assert!(deployment.contains("type: Recreate"), "{deployment}");
     assert!(
-        statefulset.contains("volumeClaimTemplates"),
-        "{statefulset}"
+        deployment.contains("claimName: storage-component-state"),
+        "{deployment}"
     );
     assert!(
-        statefulset.contains("persistentVolumeClaimRetentionPolicy"),
-        "{statefulset}"
+        deployment.contains("mountPath: /var/lib/app"),
+        "{deployment}"
     );
-    assert!(statefulset.contains("whenDeleted: Retain"), "{statefulset}");
-    assert!(statefulset.contains("whenScaled: Retain"), "{statefulset}");
     assert!(
-        statefulset.contains("mountPath: /var/lib/app"),
-        "{statefulset}"
-    );
-    assert!(statefulset.contains("name: storage-state"), "{statefulset}");
-    assert!(statefulset.contains("storage: 1Gi"), "{statefulset}");
-    assert!(
-        !artifact
+        artifact
             .files
-            .contains_key(&PathBuf::from("03-deployments/app.yaml")),
-        "storage-backed components should render as StatefulSets"
-    );
-}
-
-#[test]
-fn kubernetes_netpol_check_uses_namespace_agnostic_service_name() {
-    let fixture_dir = tempdir().expect("create fixture temp dir");
-    let scenario_path =
-        write_kubernetes_storage_fixture(fixture_dir.path(), "version-v1", "persisted-v1");
-
-    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
-    let opts = CompileOptions {
-        optimize: OptimizeOptions { dce: false },
-        ..Default::default()
-    };
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let output = rt
-        .block_on(compiler.compile(ManifestRef::from_url(file_url(&scenario_path)), opts))
-        .expect("compile kubernetes storage scenario");
-
-    let artifact = KubernetesReporter::default()
-        .emit(&output)
-        .expect("render kubernetes output");
-
-    let statefulset = artifact
-        .files
-        .iter()
-        .find_map(|(path, content)| {
-            path.to_string_lossy()
-                .starts_with("03-statefulsets/")
-                .then_some(content)
-        })
-        .expect("statefulset manifest");
-    assert!(
-        statefulset.contains("RESPONSE=$(nc amber-netpol-client 8080"),
-        "{statefulset}"
-    );
-    assert!(
-        !statefulset.contains("amber-netpol-client.scenario-"),
-        "{statefulset}"
+            .contains_key(&PathBuf::from("03-deployments/c1-app.yaml")),
+        "storage-backed components should still render as deployments"
     );
 }
 
@@ -1374,13 +1315,8 @@ fn kubernetes_emits_otelcol_and_wires_otel_env() {
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
         .expect("compile scenario");
 
-    let reporter = KubernetesReporter {
-        config: KubernetesReporterConfig {
-            disable_networkpolicy_check: true,
-        },
-    };
-    let artifact = reporter
-        .emit(&compiled_scenario(&output))
+    let artifact = KubernetesReporter
+        .emit(&output)
         .expect("render kubernetes output");
 
     let otelcol_config = artifact
@@ -1749,17 +1685,17 @@ fn kubernetes_smoke_storage_upgrade_reuses_pvc() {
         rollout
             .arg("rollout")
             .arg("status")
-            .arg("statefulset/c1-app")
+            .arg("deployment/c1-app")
             .arg("--timeout=180s")
             .arg("-n")
             .arg(&namespace);
         let rollout_status = rollout.status().unwrap_or_else(|err| {
-            panic!("failed to run kubectl rollout statefulset {version}: {err}");
+            panic!("failed to run kubectl rollout deployment {version}: {err}");
         });
         if !rollout_status.success() {
             let diagnostics = kubernetes_failure_diagnostics(&namespace, &kubeconfig);
             panic!(
-                "kubectl rollout statefulset {version} failed (status: \
+                "kubectl rollout deployment {version} failed (status: \
                  {rollout_status})\n{diagnostics}"
             );
         }
@@ -1788,15 +1724,8 @@ fn kubernetes_smoke_config_roundtrip() {
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&scenario_path)), opts))
         .expect("compile kubernetes scenario");
 
-    let reporter = KubernetesReporter {
-        config: KubernetesReporterConfig {
-            // kind's default CNI doesn't enforce NetworkPolicy, so the netpol
-            // check would keep pods in init forever in this test.
-            disable_networkpolicy_check: true,
-        },
-    };
-    let artifact = reporter
-        .emit(&compiled_scenario(&output))
+    let artifact = KubernetesReporter
+        .emit(&output)
         .expect("render kubernetes output");
 
     let dir = tempdir().expect("create temp dir");
@@ -1973,15 +1902,8 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
         .expect("compile scenario");
 
-    let reporter = KubernetesReporter {
-        config: KubernetesReporterConfig {
-            // kind's default CNI doesn't enforce NetworkPolicy, so the netpol
-            // check would keep pods in init forever in this test.
-            disable_networkpolicy_check: true,
-        },
-    };
-    let artifact = reporter
-        .emit(&compiled_scenario(&output))
+    let artifact = KubernetesReporter
+        .emit(&output)
         .expect("render kubernetes output");
 
     let output_dir = dir.path().join("kubernetes");
@@ -2363,13 +2285,8 @@ sleep infinity
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
         .expect("compile scenario");
 
-    let reporter = KubernetesReporter {
-        config: KubernetesReporterConfig {
-            disable_networkpolicy_check: true,
-        },
-    };
-    let artifact = reporter
-        .emit(&compiled_scenario(&output))
+    let artifact = KubernetesReporter
+        .emit(&output)
         .expect("render kubernetes output");
 
     let output_dir = dir.path().join("kubernetes");
@@ -2633,13 +2550,8 @@ fn kubernetes_smoke_export_routes_to_host() {
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
         .expect("compile scenario");
 
-    let reporter = KubernetesReporter {
-        config: KubernetesReporterConfig {
-            disable_networkpolicy_check: true,
-        },
-    };
-    let artifact = reporter
-        .emit(&compiled_scenario(&output))
+    let artifact = KubernetesReporter
+        .emit(&output)
         .expect("render kubernetes output");
 
     let output_dir = dir.path().join("kubernetes");

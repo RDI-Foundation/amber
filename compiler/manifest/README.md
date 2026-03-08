@@ -114,6 +114,7 @@ Top-level object:
   components: { /* ... */ },   // optional; default {}
   config_schema: { /* ... */ },// optional
   slots: { /* ... */ },        // optional; default {}
+  resources: { /* ... */ },    // optional; default {}
   provides: { /* ... */ },      // optional; default {}
   bindings: [ /* ... */ ],      // optional; default []
   exports: { /* ... */ },       // optional; default {}
@@ -462,7 +463,7 @@ config_schema: {
 
 ---
 
-## Capabilities: `slots`, `provides`, `exports`
+## Capabilities: `slots`, `resources`, `provides`, `exports`
 
 ### Capability declaration shape
 
@@ -505,15 +506,47 @@ slots: {
 Optional slots can be used to break slot-forwarding cycles; if a required slot is part of a cycle,
 linking fails.
 
-Root slots are handled differently by kind:
+Root URL-shaped slots are still external inputs. Storage is different: mounted storage must
+ultimately come from a `resources.<name>` binding, not from a root storage slot.
 
-* Root URL-shaped slots are external inputs and still require weak routing from the parent-less
-  root.
-* Root storage slots are backend-managed storage inputs. They are routed from the root into child
-  storage slots and consumed through `program.mounts`.
-* The durable backing for a root storage slot lives outside the child manifest itself. Backends
-  materialize that root storage slot as a real persistence primitive such as a Compose named
-  volume, a direct-mode host directory, or a Kubernetes PVC.
+### `resources`
+
+`resources` declares framework-managed objects owned by the component.
+
+Today the only supported resource kind is storage:
+
+```json5
+resources: {
+  app_state: {
+    kind: "storage",
+    params: {
+      size: "1Gi",
+    },
+  },
+}
+```
+
+Rules enforced:
+
+* `kind` must currently be `"storage"`.
+* Storage resources are capability sources. Bind them into storage slots with
+  `from: "resources.<name>"`, then consume the slot via `program.mounts`.
+
+Example:
+
+```json5
+resources: {
+  app_state: {
+    kind: "storage",
+    params: {
+      size: "1Gi",
+    },
+  },
+},
+bindings: [
+  { to: "#app.state", from: "resources.app_state" },
+]
+```
 
 ### `provides`
 
@@ -565,8 +598,8 @@ Rules enforced:
 
 ## `bindings`
 
-A binding wires a **target slot** to a **source capability** (provide, slot, child export, or
-framework):
+A binding wires a **target slot** to a **source capability** (provide, slot, resource, child
+export, or framework):
 
 `(<to>.<slot>) <- (<from>.<capability>)`
 
@@ -584,7 +617,8 @@ Framework refs (binding sources only):
 normal child ref.
 
 To satisfy a child slot, create a binding with `to: "#<child>.<slot>"` and a source capability
-(`from: "self.<provide>"`, `from: "self.<slot>"`, or `from: "#<other>.<export>"`).
+(`from: "self.<provide>"`, `from: "self.<slot>"`, `from: "resources.<name>"`, or
+`from: "#<other>.<export>"`).
 
 Forwarding a slot to a child:
 
@@ -623,6 +657,7 @@ Rules enforced by this crate:
 * Binding names (if present) must be unique within the manifest and follow child name rules (no `.`).
 * `to` must reference a child (`#<child>`).
 * `from: "self"` requires `capability` exist in `slots` or `provides`.
+* `from: "resources"` requires the named resource exist in `resources`.
 * `from: "framework"` requires a known framework capability name (see below).
 * `framework` is only valid as a binding source; it cannot appear in `to` or `exports`.
 * Any `#child` referenced in `to` or `from` must exist in `components`.
@@ -735,10 +770,10 @@ This component:
 }
 ```
 
-### 4) Route root storage into a child and mount it (valid)
+### 4) Allocate storage with `resources` and mount it (valid)
 
-The child declares a storage slot and mounts it. The parent owns the root storage slot, which is
-where the backend gets the durable backing from.
+The child declares a storage slot and mounts it. The parent allocates a storage resource and binds
+that resource into the child slot.
 
 Child:
 
@@ -763,14 +798,19 @@ Parent:
 ```json5
 {
   manifest_version: "0.1.0",
-  slots: {
-    app_state: { kind: "storage" },
+  resources: {
+    app_state: {
+      kind: "storage",
+      params: {
+        size: "1Gi",
+      },
+    },
   },
   components: {
     app: "./app.json5",
   },
   bindings: [
-    { to: "#app.state", from: "self.app_state" },
+    { to: "#app.state", from: "resources.app_state" },
   ],
 }
 ```

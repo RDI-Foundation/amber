@@ -2,13 +2,13 @@ use std::collections::BTreeMap;
 
 use amber_manifest::{
     CapabilityDecl, FrameworkCapabilityName, ManifestDigest, Program, ProvideDecl, SlotDecl,
-    framework_capability,
+    ResourceDecl, SlotDecl, framework_capability,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
+    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceRef, Scenario,
     ScenarioExport, SlotRef,
 };
 
@@ -78,8 +78,106 @@ impl TryFrom<ScenarioIr> for Scenario {
                 return Err(ScenarioIrError::DuplicateComponentId { id });
             }
             components[id] = Some(component.into_component());
+            for name in component.slots.keys() {
+                ensure_name_no_dot(name)?;
+            }
+            for name in component.provides.keys() {
+                ensure_name_no_dot(name)?;
+            }
+            for name in component.resources.keys() {
+                ensure_name_no_dot(name)?;
+            }
+            components[id] = Some(component.into_component());
         }
 
+        ensure_component(&components, ir.root, || "root".to_string())?;
+
+        for component in components.iter().flatten() {
+            if let Some(parent) = component.parent {
+                ensure_component(&components, parent.0, || {
+                    format!("parent of component {}", component.id.0)
+                })?;
+            }
+            for child in &component.children {
+                ensure_component(&components, child.0, || {
+                    format!("child of component {}", component.id.0)
+                })?;
+            }
+        }
+
+        for component in components.iter().flatten() {
+            for (name, slot) in &component.binding_decls {
+                ensure_name_no_dot(name)?;
+                ensure_name_no_dot(&slot.name)?;
+                let context = format!(
+                    "binding declaration `{name}` in component {} (id {})",
+                    component.moniker.as_str(),
+                    component.id.0
+                );
+                ensure_component(&components, slot.component.0, || context.clone())?;
+                ensure_slot(&components, slot.component, &slot.name, || context.clone())?;
+            }
+        }
+
+        for binding in &ir.bindings {
+            if let Some(name) = binding.name.as_deref() {
+                ensure_name_no_dot(name)?;
+            }
+            ensure_name_no_dot(&binding.to.slot)?;
+            match &binding.from {
+                BindingFromIr::Component { provide, .. } => {
+                    ensure_name_no_dot(provide)?;
+                }
+                BindingFromIr::Resource { resource, .. } => {
+                    ensure_name_no_dot(resource)?;
+                }
+                BindingFromIr::Framework { capability } => {
+                    ensure_name_no_dot(capability)?;
+                }
+                BindingFromIr::External { slot } => {
+                    ensure_name_no_dot(&slot.slot)?;
+                    ensure_component(&components, slot.component, || {
+                        format!("external slot source for {}", binding.to.slot)
+                    })?;
+                }
+            }
+            if let BindingFromIr::Component { component, .. } = &binding.from {
+                ensure_component(&components, *component, || {
+                    format!("binding source for {}", binding.to.slot)
+                })?;
+            }
+            if let BindingFromIr::Resource {
+                component,
+                resource,
+                ..
+            } = &binding.from
+            {
+                ensure_component(&components, *component, || {
+                    format!("binding resource source for {}", binding.to.slot)
+                })?;
+                let owner = components[*component]
+                    .as_ref()
+                    .expect("resource owner component should exist");
+                if !owner.resources.contains_key(resource) {
+                    return Err(ScenarioIrError::MissingResource {
+                        component: *component,
+                        component_moniker: owner.moniker.to_string(),
+                        resource: resource.clone(),
+                        context: format!("binding source for {}", binding.to.slot),
+                    });
+                }
+            }
+            ensure_component(&components, binding.to.component, || {
+                format!("binding target for {}", binding.to.slot)
+            })?;
+        }
+        for export in &ir.exports {
+            ensure_name_no_dot(&export.name)?;
+            ensure_name_no_dot(&export.from.provide)?;
+            ensure_component(&components, export.from.component, || {
+                format!("export source for {}", export.name)
+            })?;
+        }
         let mut scenario = Scenario {
             root: ComponentId(ir.root),
             components,
@@ -118,6 +216,9 @@ pub struct ComponentIr {
     pub provides: BTreeMap<String, ProvideDecl>,
     #[serde(default)]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub resources: BTreeMap<String, ResourceDecl>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub binding_decls: BTreeMap<String, SlotRefIr>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -138,6 +239,7 @@ impl ComponentIr {
             program: component.program.clone(),
             slots: component.slots.clone(),
             provides: component.provides.clone(),
+            resources: component.resources.clone(),
             binding_decls: component
                 .binding_decls
                 .iter()
@@ -158,6 +260,7 @@ impl ComponentIr {
             program: self.program,
             slots: self.slots,
             provides: self.provides,
+            resources: self.resources,
             binding_decls: self
                 .binding_decls
                 .into_iter()
@@ -173,6 +276,7 @@ impl ComponentIr {
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BindingFromIr {
     Component { component: usize, provide: String },
+    Resource { component: usize, resource: String },
     Framework { capability: String },
     External { slot: SlotRefIr },
 }
@@ -216,6 +320,10 @@ impl From<&BindingFrom> for BindingFromIr {
                 component: provide.component.0,
                 provide: provide.name.clone(),
             },
+            BindingFrom::Resource(resource) => Self::Resource {
+                component: resource.component.0,
+                resource: resource.name.clone(),
+            },
             BindingFrom::Framework(name) => Self::Framework {
                 capability: name.to_string(),
             },
@@ -235,6 +343,13 @@ impl BindingFromIr {
                     name: provide,
                 }))
             }
+            BindingFromIr::Resource {
+                component,
+                resource,
+            } => Ok(BindingFrom::Resource(ResourceRef {
+                component: ComponentId(component),
+                name: resource,
+            })),
             BindingFromIr::Framework { capability } => {
                 let name =
                     FrameworkCapabilityName::try_from(capability.as_str()).map_err(|_| {
@@ -354,6 +469,16 @@ pub enum ScenarioIrError {
         component: usize,
         component_moniker: String,
         provide: String,
+        context: String,
+    },
+    #[error(
+        "{context} references missing resource {resource:?} on component {component_moniker} (id \
+         {component})"
+    )]
+    MissingResource {
+        component: usize,
+        component_moniker: String,
+        resource: String,
         context: String,
     },
     #[error("scenario IR has invalid name {name:?}: dots are reserved")]
@@ -757,6 +882,7 @@ mod tests {
                 program: None,
                 slots: BTreeMap::new(),
                 provides: BTreeMap::new(),
+                resources: BTreeMap::new(),
                 binding_decls: BTreeMap::new(),
                 metadata: None,
                 children: vec![ComponentId(1)],
@@ -798,6 +924,7 @@ mod tests {
                     }))
                     .expect("deserialize provide decl"),
                 )]),
+                resources: BTreeMap::new(),
                 binding_decls: BTreeMap::new(),
                 metadata: None,
                 children: Vec::new(),
@@ -995,6 +1122,7 @@ mod tests {
             program: None,
             slots: BTreeMap::from([("docker".to_string(), slot_decl("docker"))]),
             provides: BTreeMap::new(),
+            resources: BTreeMap::new(),
             binding_decls: BTreeMap::new(),
             metadata: None,
             children: Vec::new(),
@@ -1033,6 +1161,9 @@ mod tests {
         match &binding.from {
             BindingFrom::Framework(name) => assert_eq!(name.as_str(), "docker"),
             BindingFrom::Component(_) => panic!("expected framework binding"),
+            BindingFrom::Resource(resource) => {
+                panic!("unexpected resource binding resources.{}", resource.name)
+            }
             BindingFrom::External(slot) => {
                 panic!("unexpected external binding slots.{}", slot.name)
             }

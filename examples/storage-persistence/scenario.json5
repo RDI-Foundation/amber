@@ -1,8 +1,12 @@
 {
   manifest_version: "0.1.0",
-  slots: {
-    // Root storage slots are the external edge where the backend gets real persistence from.
-    app_state: { kind: "storage" },
+  resources: {
+    app_state: {
+      kind: "storage",
+      params: {
+        size: "1Gi",
+      },
+    },
   },
   components: {
     app: {
@@ -14,7 +18,7 @@
     },
   },
   bindings: [
-    { to: "#app.state", from: "self.app_state" },
+    { to: "#app.state", from: "resources.app_state" },
   ],
   exports: {
     http: "#app.http",

@@ -606,14 +606,14 @@ exec python3 -m http.server 8080 --bind 127.0.0.1 -d /tmp/www
             &root_path,
             r##"{
   manifest_version: "0.1.0",
-  slots: {
+  resources: {
     state: { kind: "storage" },
   },
   components: {
     app: "./app.json5",
   },
   bindings: [
-    { to: "#app.state", from: "self.state" },
+    { to: "#app.state", from: "resources.state" },
   ],
   exports: {
     http: "#app.http",

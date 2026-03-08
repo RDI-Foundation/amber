@@ -152,11 +152,14 @@ fn labels_for_manifest_error(
         ManifestError::DuplicateBindingName { name } => {
             labels_for_duplicate_binding_name(spans, name)
         }
-        ManifestError::BindingTargetSelfSlot { slot } => {
+        ManifestError::UnknownBindingTargetSlot { slot } => {
             labels_for_binding_target_self(spans, slot)
         }
         ManifestError::UnknownBindingSource { capability } => {
             labels_for_unknown_binding_source(spans, capability)
+        }
+        ManifestError::UnknownBindingResource { resource } => {
+            labels_for_unknown_binding_resource(spans, resource)
         }
         ManifestError::UnknownBindingChild { child } => {
             labels_for_unknown_binding_child(spans, child)
@@ -173,6 +176,9 @@ fn labels_for_manifest_error(
             labels_for_missing_provide_endpoint(spans, name)
         }
         ManifestError::UnsupportedProvideKind { name, .. } => labels_for_provide_kind(spans, name),
+        ManifestError::UnsupportedResourceKind { name, .. } => {
+            labels_for_resource_decl(spans, name, "unsupported resource kind here")
+        }
         ManifestError::DuplicateMountName { name } => {
             labels_for_mount_name(spans, name, "duplicate mount name")
         }
@@ -558,6 +564,29 @@ fn labels_for_unknown_binding_source(spans: &ManifestSpans, capability: &str) ->
     )]
 }
 
+fn labels_for_unknown_binding_resource(spans: &ManifestSpans, resource: &str) -> Vec<LabeledSpan> {
+    let span = binding_span_or_default(spans, |binding| {
+        if binding.capability_value.as_deref() == Some(resource)
+            && binding.from_value.as_deref() == Some("resources")
+        {
+            return binding.capability.or(binding.from).or(Some(binding.whole));
+        }
+        if binding
+            .from_value
+            .as_deref()
+            .and_then(|from| from.strip_prefix("resources."))
+            .is_some_and(|name| name == resource)
+        {
+            return binding.from.or(Some(binding.whole));
+        }
+        None
+    });
+    vec![primary(
+        span,
+        Some("unknown resource referenced here".to_string()),
+    )]
+}
+
 fn labels_for_binding_target_self(spans: &ManifestSpans, slot: &str) -> Vec<LabeledSpan> {
     let span = binding_span_or_default(spans, |binding| {
         if binding.slot_value.as_deref() == Some(slot)
@@ -711,6 +740,15 @@ fn labels_for_provide_kind(spans: &ManifestSpans, name: &str) -> Vec<LabeledSpan
         span,
         Some("unsupported provide kind here".to_string()),
     )]
+}
+
+fn labels_for_resource_decl(spans: &ManifestSpans, name: &str, label: &str) -> Vec<LabeledSpan> {
+    let span = spans
+        .resources
+        .get(name)
+        .and_then(|resource| resource.kind.or(Some(resource.name)))
+        .unwrap_or_else(default_span);
+    vec![primary(span, Some(label.to_string()))]
 }
 
 fn labels_for_unknown_environment_extends(spans: &ManifestSpans, name: &str) -> Vec<LabeledSpan> {

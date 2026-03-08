@@ -1,0 +1,12 @@
+Error: manifest::unsupported_resource_kind
+
+  × check failed
+  ╰─▶ resource `api` cannot use capability kind `http`
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/resource_unsupported_kind.json5:4:18]
+ 3 │   resources: {
+ 4 │     api: { kind: "http" },
+   ·                  ───┬──
+   ·                     ╰── unsupported resource kind here
+ 5 │   },
+   ╰────
+  help: Only `kind: "storage"` resources are supported today.

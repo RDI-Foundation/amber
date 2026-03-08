@@ -9,11 +9,12 @@ use std::{
 };
 
 use amber_manifest::{
-    FrameworkCapabilityName, Manifest, ManifestDigest, ManifestRef, ProvideDecl, SlotDecl,
+    FrameworkCapabilityName, Manifest, ManifestDigest, ManifestRef, ProvideDecl, ResourceDecl,
+    SlotDecl,
 };
 use amber_mesh::{InboundTarget, MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTarget};
 use amber_scenario::{
-    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
+    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceRef, Scenario,
     ScenarioExport, SlotRef,
 };
 use base64::Engine as _;
@@ -77,6 +78,12 @@ fn compile_output_with_manifest_overrides(
                 serde_json::to_value(&component.provides).unwrap(),
             );
         }
+        if !component.resources.is_empty() {
+            manifest.insert(
+                "resources".to_string(),
+                serde_json::to_value(&component.resources).unwrap(),
+            );
+        }
         if let Some(extra) = overrides.get(&component.id) {
             for (key, value) in extra {
                 manifest.insert(key.clone(), value.clone());
@@ -135,6 +142,17 @@ fn error_contains(err: &crate::Error, needle: &str) -> bool {
         crate::Error::Linker(err) => err.to_string().contains(needle),
         other => other.to_string().contains(needle),
     }
+}
+
+fn storage_resource_decl(size: Option<&str>) -> ResourceDecl {
+    let value = match size {
+        Some(size) => json!({
+            "kind": "storage",
+            "params": { "size": size },
+        }),
+        None => json!({ "kind": "storage" }),
+    };
+    serde_json::from_value(value).expect("storage resource decl")
 }
 
 fn workspace_root() -> PathBuf {
@@ -359,8 +377,9 @@ fn storage_scenario(version: &str, initial_state: &str) -> Scenario {
         config: None,
         config_schema: None,
         program: None,
-        slots: BTreeMap::from([("state".to_string(), storage_slot.clone())]),
+        slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::from([("state".to_string(), storage_resource_decl(None))]),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1)],
@@ -397,6 +416,7 @@ fn storage_scenario(version: &str, initial_state: &str) -> Scenario {
         program: Some(app_program),
         slots: BTreeMap::from([("state".to_string(), storage_slot)]),
         provides: BTreeMap::from([("http".to_string(), provide_http)]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -407,7 +427,7 @@ fn storage_scenario(version: &str, initial_state: &str) -> Scenario {
         components: vec![Some(root), Some(app)],
         bindings: vec![BindingEdge {
             name: None,
-            from: BindingFrom::External(SlotRef {
+            from: BindingFrom::Resource(ResourceRef {
                 component: ComponentId(0),
                 name: "state".to_string(),
             }),
@@ -440,6 +460,7 @@ fn compose_artifact_emits_env_sample_and_readme() {
         program: Some(program),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -475,8 +496,9 @@ fn compose_emits_storage_volume_mounts() {
         config: None,
         config_schema: None,
         program: None,
-        slots: BTreeMap::from([("state".to_string(), slot_storage.clone())]),
+        slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::from([("state".to_string(), storage_resource_decl(None))]),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1)],
@@ -501,6 +523,7 @@ fn compose_emits_storage_volume_mounts() {
         program: Some(app_program),
         slots: BTreeMap::from([("state".to_string(), slot_storage)]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -511,7 +534,7 @@ fn compose_emits_storage_volume_mounts() {
         components: vec![Some(root), Some(app)],
         bindings: vec![BindingEdge {
             name: None,
-            from: BindingFrom::External(SlotRef {
+            from: BindingFrom::Resource(ResourceRef {
                 component: ComponentId(0),
                 name: "state".to_string(),
             }),
@@ -529,7 +552,7 @@ fn compose_emits_storage_volume_mounts() {
         .expect("compose render ok");
     let compose = parse_compose(&artifact);
     assert!(
-        compose.volumes.contains_key("amber-storage-app-state"),
+        compose.volumes.contains_key("amber-storage-root-state"),
         "compose should declare a named volume for storage mounts"
     );
     let app_service = service(&compose, "c1-app");
@@ -537,7 +560,7 @@ fn compose_emits_storage_volume_mounts() {
         app_service
             .volumes
             .iter()
-            .any(|mount| mount == "amber-storage-app-state:/var/lib/app"),
+            .any(|mount| mount == "amber-storage-root-state:/var/lib/app"),
         "app service should mount the generated storage volume: {:?}",
         app_service.volumes
     );
@@ -562,6 +585,7 @@ fn compose_emits_otelcol_agent_and_wires_router_otel_env() {
         program: Some(program),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -780,6 +804,7 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
         program: Some(program),
         slots: BTreeMap::from([("docker".to_string(), slot_docker)]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -869,6 +894,7 @@ fn docker_compose_emits_framework_docker_mount_proxy_wiring() {
         program: Some(program),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -972,6 +998,7 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(2), ComponentId(1)],
@@ -987,6 +1014,7 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1002,6 +1030,7 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1150,6 +1179,7 @@ fn compose_emits_minimal_peer_keys() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1), ComponentId(2), ComponentId(3)],
@@ -1165,6 +1195,7 @@ fn compose_emits_minimal_peer_keys() {
         program: Some(server1_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api1".to_string(), provide_api1)]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1180,6 +1211,7 @@ fn compose_emits_minimal_peer_keys() {
         program: Some(server2_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api2".to_string(), provide_api2)]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1195,6 +1227,7 @@ fn compose_emits_minimal_peer_keys() {
         program: Some(client_program),
         slots: BTreeMap::from([("api1".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1266,8 +1299,9 @@ fn compose_emits_named_volumes_for_storage_mounts() {
         config: None,
         config_schema: None,
         program: None,
-        slots: BTreeMap::from([("state".to_string(), storage_slot.clone())]),
+        slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::from([("state".to_string(), storage_resource_decl(None))]),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1)],
@@ -1292,6 +1326,7 @@ fn compose_emits_named_volumes_for_storage_mounts() {
         program: Some(app_program),
         slots: BTreeMap::from([("state".to_string(), storage_slot)]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1302,7 +1337,7 @@ fn compose_emits_named_volumes_for_storage_mounts() {
         components: vec![Some(root), Some(app)],
         bindings: vec![BindingEdge {
             name: None,
-            from: BindingFrom::External(SlotRef {
+            from: BindingFrom::Resource(ResourceRef {
                 component: ComponentId(0),
                 name: "state".to_string(),
             }),
@@ -1321,7 +1356,7 @@ fn compose_emits_named_volumes_for_storage_mounts() {
     let compose = parse_compose(&artifact);
 
     assert!(
-        compose.volumes.contains_key("amber-storage-app-state"),
+        compose.volumes.contains_key("amber-storage-root-state"),
         "expected named storage volume in compose file:\n{}",
         artifact.compose_yaml()
     );
@@ -1331,7 +1366,7 @@ fn compose_emits_named_volumes_for_storage_mounts() {
         app_service
             .volumes
             .iter()
-            .any(|mount| mount == "amber-storage-app-state:/var/lib/app"),
+            .any(|mount| mount == "amber-storage-root-state:/var/lib/app"),
         "expected storage mount on app service:\n{}",
         artifact.compose_yaml()
     );
@@ -1355,6 +1390,7 @@ fn compose_escapes_entrypoint_dollars() {
         program: Some(program),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1437,6 +1473,7 @@ fn compose_resolves_binding_urls_in_child_config() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::from([(
             "bind".to_string(),
             SlotRef {
@@ -1458,6 +1495,7 @@ fn compose_resolves_binding_urls_in_child_config() {
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1473,6 +1511,7 @@ fn compose_resolves_binding_urls_in_child_config() {
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1490,6 +1529,7 @@ fn compose_resolves_binding_urls_in_child_config() {
         program: Some(observer_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1616,6 +1656,7 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::from([(
             "bind".to_string(),
             SlotRef {
@@ -1637,6 +1678,7 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1652,6 +1694,7 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1669,6 +1712,7 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(4)],
@@ -1686,6 +1730,7 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(5)],
@@ -1703,6 +1748,7 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         program: Some(child_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1816,6 +1862,7 @@ fn compose_emits_export_metadata_and_labels() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1)],
@@ -1831,6 +1878,7 @@ fn compose_emits_export_metadata_and_labels() {
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1957,6 +2005,7 @@ fn compose_routes_external_slots_through_router() {
         program: None,
         slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1)],
@@ -1972,6 +2021,7 @@ fn compose_routes_external_slots_through_router() {
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -2156,6 +2206,7 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
         program: None,
         slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1)],
@@ -2171,6 +2222,7 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -2414,6 +2466,7 @@ sleep infinity
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1), ComponentId(2), ComponentId(3)],
@@ -2428,6 +2481,7 @@ sleep infinity
         program: Some(agent_a_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("agent".to_string(), provide_a2a.clone())]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -2442,6 +2496,7 @@ sleep infinity
         program: Some(agent_b_program),
         slots: BTreeMap::from([("agent_a".to_string(), slot_a2a.clone())]),
         provides: BTreeMap::from([("agent".to_string(), provide_a2a)]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -2459,6 +2514,7 @@ sleep infinity
             ("z_agent_a".to_string(), slot_a2a),
         ]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -2693,6 +2749,7 @@ fn docker_smoke_sidecar_restart_rejoins_mesh() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1), ComponentId(2)],
@@ -2708,6 +2765,7 @@ fn docker_smoke_sidecar_restart_rejoins_mesh() {
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -2723,6 +2781,7 @@ fn docker_smoke_sidecar_restart_rejoins_mesh() {
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -2880,6 +2939,7 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(2), ComponentId(1)],
@@ -2898,6 +2958,7 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
             ("v1".to_string(), provide_v1),
             ("admin".to_string(), provide_admin),
         ]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -2916,6 +2977,7 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
             ("admin".to_string(), slot_http),
         ]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -3270,6 +3332,7 @@ fn docker_compose_rejects_framework_bindings() {
         program: Some(program),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -3390,6 +3453,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(2), ComponentId(3), ComponentId(1)],
@@ -3405,6 +3469,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -3420,6 +3485,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         program: Some(sleeper_program(json!({ "URL": "${slots.api.url}" }))),
         slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -3435,6 +3501,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         program: Some(sleeper_program(json!({}))),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),

@@ -250,7 +250,7 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
         &address_plan.binding_values_by_component,
         &config_plan.binding_values_by_scope,
     )?;
-    let storage_plan = build_storage_plan(scenario, program_components)?;
+    let storage_plan = build_storage_plan(scenario, program_components);
 
     let router_mesh_port = router_ports.map_or(0, |ports| ports.mesh);
     let mesh_addressing = LoopbackMeshAddressing {
@@ -463,7 +463,6 @@ fn build_component_plans(
                 log_name: format!("{}-program", names.base),
                 work_dir: names.work_dir.clone(),
                 storage_mounts: direct_storage_mounts(
-                    component.moniker.as_str(),
                     storage_plan.mounts_by_component.get(id).map(Vec::as_slice),
                 ),
                 execution,
@@ -474,17 +473,16 @@ fn build_component_plans(
 }
 
 fn direct_storage_mounts(
-    component_moniker: &str,
     mounts: Option<&[crate::storage_plan::StorageMount]>,
 ) -> Vec<DirectStorageMount> {
     let mut out = Vec::new();
-    let component_slug = direct_storage_component_slug(component_moniker);
     for mount in mounts.into_iter().flatten() {
         out.push(DirectStorageMount {
             mount_path: mount.mount_path.clone(),
             state_subdir: format!(
-                "{component_slug}/{}",
-                sanitize_storage_segment(mount.identity.root_slot.as_str())
+                "{}/{}",
+                direct_storage_component_slug(mount.identity.owner_moniker.as_str()),
+                sanitize_storage_segment(mount.identity.resource.as_str())
             ),
         });
     }

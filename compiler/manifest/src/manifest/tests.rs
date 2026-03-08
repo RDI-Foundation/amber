@@ -739,11 +739,14 @@ fn binding_round_trip_through_canonical_json_parses() {
 }
 
 #[test]
-fn binding_to_self_is_disallowed() {
+fn binding_to_self_slot_is_allowed() {
     let raw = parse_raw(
         r#"
         {
           manifest_version: "0.1.0",
+          slots: {
+            needs: { kind: "http" },
+          },
           components: {
             child: "https://example.com/child",
           },
@@ -753,12 +756,14 @@ fn binding_to_self_is_disallowed() {
         }
         "#,
     );
-    let err = raw.validate().unwrap_err();
-
-    match err {
-        Error::BindingTargetSelfSlot { slot } => assert_eq!(slot, "needs"),
-        other => panic!("expected BindingTargetSelfSlot error, got: {other}"),
-    }
+    let manifest = raw.validate().expect("manifest should validate");
+    let binding = manifest
+        .bindings()
+        .get(&BindingTarget::SelfSlot(
+            SlotName::try_from("needs").unwrap(),
+        ))
+        .expect("binding should target self.needs");
+    assert!(matches!(binding.from, BindingSource::ChildExport { .. }));
 }
 
 #[test]
@@ -1411,6 +1416,23 @@ fn storage_mount_source_parses_for_storage_slots() {
     let program = manifest.program.as_ref().expect("program");
     assert_eq!(program.mounts().len(), 1);
     assert_eq!(program.mounts()[0].source.to_string(), "slots.state");
+}
+
+#[test]
+fn storage_resource_parses_without_source() {
+    let manifest: Manifest = r#"
+        {
+          manifest_version: "0.1.0",
+          resources: {
+            state: { kind: "storage" },
+          },
+        }
+        "#
+    .parse()
+    .unwrap();
+
+    let resource = manifest.resources().get("state").expect("resource");
+    assert_eq!(resource.kind, CapabilityKind::Storage);
 }
 
 #[test]

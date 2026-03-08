@@ -101,19 +101,17 @@ pub enum Error {
     #[diagnostic(code(manifest::unknown_binding_child))]
     UnknownBindingChild { child: String },
 
-    #[error("binding target `self.{slot}` is invalid: slots are inputs supplied by the parent")]
-    #[diagnostic(
-        code(manifest::binding_target_self),
-        help(
-            "Bind child slots with `to: \"#<child>.<slot>\"`. Use `from: \"self.<slot>\"` to \
-             forward a slot, or reference it in the program via `${{slots.<slot>...}}`."
-        )
-    )]
-    BindingTargetSelfSlot { slot: String },
+    #[error("binding target `self.{slot}` references unknown slot")]
+    #[diagnostic(code(manifest::unknown_binding_target_slot))]
+    UnknownBindingTargetSlot { slot: String },
 
     #[error("binding source `self.{capability}` references unknown slot or provide")]
     #[diagnostic(code(manifest::unknown_binding_source))]
     UnknownBindingSource { capability: String },
+
+    #[error("binding source `resources.{resource}` references unknown resource")]
+    #[diagnostic(code(manifest::unknown_binding_resource))]
+    UnknownBindingResource { resource: String },
 
     #[error("unknown framework capability `{capability}`")]
     #[diagnostic(code(manifest::unknown_framework_capability), help("{help}"))]
@@ -159,6 +157,16 @@ pub enum Error {
     #[error("duplicate mount name `{name}`")]
     #[diagnostic(code(manifest::duplicate_mount_name))]
     DuplicateMountName { name: String },
+
+    #[error("resource `{name}` cannot use capability kind `{kind}`")]
+    #[diagnostic(
+        code(manifest::unsupported_resource_kind),
+        help("Only `kind: \"storage\"` resources are supported today.")
+    )]
+    UnsupportedResourceKind {
+        name: String,
+        kind: crate::CapabilityKind,
+    },
 
     #[error("duplicate mount path `{path}`")]
     #[diagnostic(code(manifest::duplicate_mount_path))]

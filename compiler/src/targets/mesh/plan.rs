@@ -150,6 +150,16 @@ pub(crate) fn build_mesh_plan(
                     binding_name: binding.name.clone(),
                 });
             }
+            BindingFrom::Resource(resource) => {
+                return Err(MeshError::new(format!(
+                    "internal error: non-storage binding {}.{} resolves from resource \
+                     `resources.{}` on {}",
+                    component_label(scenario, binding.to.component),
+                    binding.to.name,
+                    resource.name,
+                    component_label(scenario, resource.component),
+                )));
+            }
             BindingFrom::External(slot) => {
                 external_bindings.push(ResolvedExternalBinding {
                     consumer: binding.to.component,

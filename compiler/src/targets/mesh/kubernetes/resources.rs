@@ -285,38 +285,16 @@ pub struct Deployment {
 pub struct DeploymentSpec {
     pub replicas: u32,
     pub selector: LabelSelector,
-    pub template: PodTemplateSpec,
-}
-
-// ---- StatefulSet ----
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StatefulSet {
-    pub api_version: &'static str,
-    pub kind: &'static str,
-    pub metadata: ObjectMeta,
-    pub spec: StatefulSetSpec,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StatefulSetSpec {
-    pub service_name: String,
-    pub replicas: u32,
-    pub selector: LabelSelector,
-    pub template: PodTemplateSpec,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub volume_claim_templates: Vec<PersistentVolumeClaim>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub persistent_volume_claim_retention_policy: Option<PersistentVolumeClaimRetentionPolicy>,
+    pub strategy: Option<DeploymentStrategy>,
+    pub template: PodTemplateSpec,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PersistentVolumeClaimRetentionPolicy {
-    pub when_deleted: &'static str,
-    pub when_scaled: &'static str,
+pub struct DeploymentStrategy {
+    #[serde(rename = "type")]
+    pub strategy_type: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -595,6 +573,8 @@ pub struct Volume {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret: Option<SecretVolumeSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistent_volume_claim: Option<PersistentVolumeClaimVolumeSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub empty_dir: Option<EmptyDirVolumeSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_path: Option<HostPathVolumeSource>,
@@ -608,6 +588,7 @@ impl Volume {
                 name: config_map_name.into(),
             }),
             secret: None,
+            persistent_volume_claim: None,
             empty_dir: None,
             host_path: None,
         }
@@ -620,6 +601,20 @@ impl Volume {
             secret: Some(SecretVolumeSource {
                 secret_name: secret_name.into(),
             }),
+            persistent_volume_claim: None,
+            empty_dir: None,
+            host_path: None,
+        }
+    }
+
+    pub fn persistent_volume_claim(name: impl Into<String>, claim_name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            config_map: None,
+            secret: None,
+            persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                claim_name: claim_name.into(),
+            }),
             empty_dir: None,
             host_path: None,
         }
@@ -630,6 +625,7 @@ impl Volume {
             name: name.into(),
             config_map: None,
             secret: None,
+            persistent_volume_claim: None,
             empty_dir: Some(EmptyDirVolumeSource {}),
             host_path: None,
         }
@@ -640,6 +636,7 @@ impl Volume {
             name: name.into(),
             config_map: None,
             secret: None,
+            persistent_volume_claim: None,
             empty_dir: None,
             host_path: Some(HostPathVolumeSource {
                 path: path.into(),
@@ -659,6 +656,12 @@ pub struct ConfigMapVolumeSource {
 #[serde(rename_all = "camelCase")]
 pub struct SecretVolumeSource {
     pub secret_name: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistentVolumeClaimVolumeSource {
+    pub claim_name: String,
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -19,6 +19,7 @@ fn component(id: usize, moniker: &str) -> Component {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -35,6 +36,11 @@ fn apply_manifest(component: &mut Component, manifest: &Manifest) {
         .collect();
     component.provides = manifest
         .provides()
+        .iter()
+        .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
+        .collect();
+    component.resources = manifest
+        .resources()
         .iter()
         .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
         .collect();
