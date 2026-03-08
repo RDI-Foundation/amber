@@ -884,6 +884,52 @@ fn compile_direct_rejects_invalid_scenario_ir_before_backend_lowering() {
 }
 
 #[test]
+fn compile_direct_rejects_scenario_ir_missing_version() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("direct-ir-missing-version-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let ir_path = outputs_dir.path().join("scenario-ir.json");
+    fs::write(
+        &ir_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "amber.scenario.ir",
+            "root": 0,
+            "components": [],
+            "bindings": [],
+            "exports": []
+        }))
+        .expect("Scenario IR should serialize"),
+    )
+    .expect("failed to write Scenario IR");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(outputs_dir.path().join("direct"))
+        .arg(&ir_path)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    assert!(
+        !output.status.success(),
+        "amber compile --direct unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid Scenario IR input") && stderr.contains("missing field `version`"),
+        "expected missing version Scenario IR rejection in stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
 fn compile_direct_allows_absolute_program_path_without_resolved_url() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

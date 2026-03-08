@@ -4599,9 +4599,6 @@ fn load_compiled_scenario_ir(path: &Path) -> Result<Option<CompiledScenario>> {
     let Some(schema) = obj.get("schema").and_then(serde_json::Value::as_str) else {
         return Ok(None);
     };
-    let Some(_) = obj.get("version") else {
-        return Ok(None);
-    };
     if schema != SCENARIO_IR_SCHEMA {
         return Ok(None);
     }
