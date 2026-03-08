@@ -14,7 +14,7 @@ use std::{
     os::unix::process::{CommandExt, ExitStatusExt},
 };
 
-use amber_helper::{HelperError, RunPlan, build_run_plan};
+use amber_helper::{HelperError, RunPlan, build_run_plan, wait_for_mesh_config_scope};
 use amber_mesh::telemetry::{
     COMPONENT_MONIKER_ENV, OtlpIdentity, OtlpInstallMode, SCENARIO_SCOPE_ENV, SubscriberFormat,
     SubscriberOptions, init_otel_tracer, init_subscriber, observability_log_scope_name,
@@ -113,12 +113,42 @@ fn run_main() -> Result<ExitCode, HelperError> {
             }
             run()
         }
+        "wait-mesh-config" => {
+            let Some(config_path) = args.next() else {
+                return Err(usage_error());
+            };
+            let Some(expected_scope) = args.next() else {
+                return Err(usage_error());
+            };
+            let timeout_secs = match args.next() {
+                Some(value) => value.parse::<u64>().map_err(|err| {
+                    HelperError::Msg(format!(
+                        "wait-mesh-config timeout must be an integer number of seconds: {err}"
+                    ))
+                })?,
+                None => 180,
+            };
+            if args.next().is_some() {
+                return Err(usage_error());
+            }
+            wait_for_mesh_config_scope(
+                Path::new(&config_path),
+                &expected_scope,
+                std::time::Duration::from_secs(timeout_secs),
+                std::time::Duration::from_millis(250),
+            )?;
+            Ok(ExitCode::SUCCESS)
+        }
         _ => Err(usage_error()),
     }
 }
 
 fn usage_error() -> HelperError {
-    HelperError::Msg("usage: amber-helper <install DEST|run>".to_string())
+    HelperError::Msg(
+        "usage: amber-helper <install DEST|run|wait-mesh-config CONFIG EXPECTED_SCOPE \
+         [TIMEOUT_SECONDS]>"
+            .to_string(),
+    )
 }
 
 fn install(dest: &Path) -> Result<(), HelperError> {

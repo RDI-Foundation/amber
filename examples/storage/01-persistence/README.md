@@ -82,8 +82,8 @@ for this example.
 Compile the scenario:
 
 ```sh
-amber compile examples/storage-persistence/scenario.json5 --docker-compose /tmp/amber-storage-compose
-amber compile examples/storage-persistence/scenario.json5 --kubernetes /tmp/amber-storage-k8s
+amber compile examples/storage/01-persistence/scenario.json5 --docker-compose /tmp/amber-storage-compose
+amber compile examples/storage/01-persistence/scenario.json5 --kubernetes /tmp/amber-storage-k8s
 ```
 
 Each compiled output includes a generated `README.md`. That file explains the backend-specific
@@ -117,7 +117,7 @@ docker compose down
 At this point the containers are gone, but the named volume still exists.
 
 4. Simulate a new deployment by changing the child component config in
-`examples/storage-persistence/scenario.json5`:
+`examples/storage/01-persistence/scenario.json5`:
 
 ```json5
 config: {
@@ -131,7 +131,7 @@ config: {
 5. Recompile and bring the stack back:
 
 ```sh
-amber compile examples/storage-persistence/scenario.json5 --docker-compose /tmp/amber-storage-compose
+amber compile examples/storage/01-persistence/scenario.json5 --docker-compose /tmp/amber-storage-compose
 cd /tmp/amber-storage-compose
 docker compose up -d
 amber proxy . --export http=127.0.0.1:18080
@@ -212,7 +212,7 @@ That removes the workloads, but the PVC remains in `amber-storage-demo`.
 you apply:
 
 ```sh
-amber compile examples/storage-persistence/scenario.json5 --kubernetes /tmp/amber-storage-k8s
+amber compile examples/storage/01-persistence/scenario.json5 --kubernetes /tmp/amber-storage-k8s
 cd /tmp/amber-storage-k8s
 $EDITOR kustomization.yaml
 kubectl apply -k /tmp/amber-storage-k8s
@@ -247,7 +247,7 @@ That is the cleanest path when the namespace is dedicated to this example.
 Direct mode is still useful for local development, so this example should stay available there:
 
 ```sh
-amber compile examples/storage-persistence/scenario.json5 --direct /tmp/amber-storage-direct
+amber compile examples/storage/01-persistence/scenario.json5 --direct /tmp/amber-storage-direct
 cd /tmp/amber-storage-direct
 ./run.sh --storage-root /tmp/amber-storage-state
 ```

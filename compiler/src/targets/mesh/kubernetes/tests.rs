@@ -1275,6 +1275,39 @@ fn kubernetes_emits_deployment_and_pvc_for_storage_mounts() {
 }
 
 #[test]
+fn kubernetes_mesh_workloads_wait_for_fresh_mesh_config() {
+    let fixture_dir = tempdir().expect("fixture dir");
+    let scenario_path = write_kubernetes_counter_storage_fixture(fixture_dir.path(), "v1");
+    let artifact = compile_fixture(&scenario_path);
+
+    let component_deployment = artifact
+        .files
+        .get(&PathBuf::from("03-deployments/c1-app.yaml"))
+        .expect("component deployment yaml");
+    assert!(
+        component_deployment.contains("name: wait-mesh-config"),
+        "{component_deployment}"
+    );
+    assert!(
+        component_deployment.contains("/amber/mesh/mesh-config.json"),
+        "{component_deployment}"
+    );
+
+    let router_deployment = artifact
+        .files
+        .get(&PathBuf::from("03-deployments/amber-router.yaml"))
+        .expect("router deployment yaml");
+    assert!(
+        router_deployment.contains("name: wait-mesh-config"),
+        "{router_deployment}"
+    );
+    assert!(
+        router_deployment.contains("/amber/mesh/mesh-config.json"),
+        "{router_deployment}"
+    );
+}
+
+#[test]
 fn kubernetes_emits_otelcol_and_wires_otel_env() {
     let dir = tempdir().expect("temp dir");
     let root_path = dir.path().join("root.json5");

@@ -1,0 +1,21 @@
+{
+  manifest_version: "0.1.0",
+  slots: {
+    state: { kind: "storage" },
+  },
+  components: {
+    api: {
+      manifest: "./service.json5",
+      config: {
+        version: "v2",
+        initial_state: "seeded by v2",
+      },
+    },
+  },
+  bindings: [
+    { to: "#api.state", from: "self.state" },
+  ],
+  exports: {
+    http: "#api.http",
+  },
+}

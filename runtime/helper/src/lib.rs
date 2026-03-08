@@ -1,4 +1,12 @@
-use std::{collections::BTreeMap, ffi::OsString};
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    fs,
+    io::ErrorKind,
+    path::Path,
+    thread,
+    time::{Duration, Instant},
+};
 
 use amber_config::{self as config, CONFIG_ENV_PREFIX, ConfigError};
 use amber_template::{
@@ -64,6 +72,62 @@ pub enum HelperError {
 }
 
 pub type Result<T> = std::result::Result<T, HelperError>;
+
+pub fn wait_for_mesh_config_scope(
+    config_path: &Path,
+    expected_scope: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last_observation = "mesh config not observed".to_string();
+
+    loop {
+        match fs::read_to_string(config_path) {
+            Ok(raw) => match mesh_scope_from_config(&raw) {
+                Ok(Some(scope)) if scope == expected_scope => return Ok(()),
+                Ok(Some(scope)) => {
+                    last_observation = format!("observed scope {scope:?}");
+                }
+                Ok(None) => {
+                    last_observation = "mesh_scope is missing".to_string();
+                }
+                Err(err) => {
+                    last_observation = format!("invalid mesh config: {err}");
+                }
+            },
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                last_observation = "mesh config file does not exist yet".to_string();
+            }
+            Err(err) => {
+                last_observation = format!("failed to read mesh config: {err}");
+            }
+        }
+
+        if Instant::now() >= deadline {
+            return Err(HelperError::Msg(format!(
+                "timed out after {}s waiting for mesh config {} to reach scenario scope {:?}; {}",
+                timeout.as_secs(),
+                config_path.display(),
+                expected_scope,
+                last_observation,
+            )));
+        }
+
+        thread::sleep(poll_interval);
+    }
+}
+
+fn mesh_scope_from_config(raw: &str) -> Result<Option<String>> {
+    let value: Value = serde_json::from_str(raw).map_err(|source| HelperError::Json {
+        name: "mesh config",
+        source,
+    })?;
+    Ok(value
+        .pointer("/identity/mesh_scope")
+        .and_then(Value::as_str)
+        .map(str::to_owned))
+}
 
 impl From<ConfigError> for HelperError {
     fn from(err: ConfigError) -> Self {
@@ -490,8 +554,11 @@ fn write_mounts(mounts: &[MountSpec], component_config: Option<&Value>) -> Resul
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use amber_template::{ProgramArgTemplate, TemplatePart};
     use base64::engine::general_purpose::STANDARD;
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -993,5 +1060,76 @@ mod tests {
             err.to_string()
                 .contains("AMBER_CONFIG_INVALID must be valid UTF-8")
         );
+    }
+
+    #[test]
+    fn wait_for_mesh_config_scope_accepts_matching_scope() {
+        let dir = tempdir().expect("temp dir");
+        let config_path = dir.path().join("mesh-config.json");
+        fs::write(
+            &config_path,
+            r#"{"identity":{"id":"/app","mesh_scope":"scope-v1"}}"#,
+        )
+        .expect("write mesh config");
+
+        wait_for_mesh_config_scope(
+            &config_path,
+            "scope-v1",
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        )
+        .expect("scope should match");
+    }
+
+    #[test]
+    fn wait_for_mesh_config_scope_observes_secret_update() {
+        let dir = tempdir().expect("temp dir");
+        let config_path = dir.path().join("mesh-config.json");
+        fs::write(
+            &config_path,
+            r#"{"identity":{"id":"/app","mesh_scope":"scope-v1"}}"#,
+        )
+        .expect("write mesh config");
+
+        let delayed_path = config_path.clone();
+        let updater = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            fs::write(
+                delayed_path,
+                r#"{"identity":{"id":"/app","mesh_scope":"scope-v2"}}"#,
+            )
+            .expect("update mesh config");
+        });
+
+        wait_for_mesh_config_scope(
+            &config_path,
+            "scope-v2",
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+        )
+        .expect("scope should update");
+        updater.join().expect("updater thread should finish");
+    }
+
+    #[test]
+    fn wait_for_mesh_config_scope_times_out_on_mismatch() {
+        let dir = tempdir().expect("temp dir");
+        let config_path = dir.path().join("mesh-config.json");
+        fs::write(
+            &config_path,
+            r#"{"identity":{"id":"/app","mesh_scope":"scope-v1"}}"#,
+        )
+        .expect("write mesh config");
+
+        let err = wait_for_mesh_config_scope(
+            &config_path,
+            "scope-v2",
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+        )
+        .expect_err("mismatched scope should time out");
+        let message = err.to_string();
+        assert!(message.contains("scope-v2"), "{message}");
+        assert!(message.contains("scope-v1"), "{message}");
     }
 }

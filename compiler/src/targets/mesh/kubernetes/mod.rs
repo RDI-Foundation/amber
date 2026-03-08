@@ -86,6 +86,7 @@ const DEFAULT_STORAGE_REQUEST: &str = "1Gi";
 const OTELCOL_SERVICE_ACCOUNT: &str = "amber-otelcol";
 const OTELCOL_ROLE_NAME: &str = "amber-otelcol";
 const OTELCOL_ROLE_BINDING_NAME: &str = "amber-otelcol";
+const MESH_CONFIG_WAIT_TIMEOUT_SECS: u64 = 180;
 
 const ROOT_CONFIG_SECRET_NAME: &str = "amber-root-config-secret";
 const ROOT_CONFIG_CONFIGMAP_NAME: &str = "amber-root-config";
@@ -865,6 +866,14 @@ fn render_kubernetes(output: &CompileOutput) -> KubernetesResult<KubernetesArtif
 
         let mut init_containers = Vec::new();
 
+        if let Some(scope) = mesh_config_plan
+            .component_configs
+            .get(id)
+            .and_then(|cfg| cfg.identity.mesh_scope.as_deref())
+        {
+            init_containers.push(build_mesh_config_wait_init_container(&images.helper, scope));
+        }
+
         if needs_helper_for_component {
             init_containers.push(Container {
                 name: "install-helper".to_string(),
@@ -994,6 +1003,13 @@ fn render_kubernetes(output: &CompileOutput) -> KubernetesResult<KubernetesArtif
         };
         let router_secret = mesh_secret_name(ROUTER_NAME);
 
+        let init_containers = mesh_config_plan
+            .router_config
+            .as_ref()
+            .and_then(|cfg| cfg.identity.mesh_scope.as_deref())
+            .map(|scope| vec![build_mesh_config_wait_init_container(&images.helper, scope)])
+            .unwrap_or_default();
+
         let deployment = Deployment {
             api_version: "apps/v1",
             kind: "Deployment",
@@ -1014,7 +1030,7 @@ fn render_kubernetes(output: &CompileOutput) -> KubernetesResult<KubernetesArtif
                         ..Default::default()
                     },
                     spec: PodSpec {
-                        init_containers: Vec::new(),
+                        init_containers,
                         containers: vec![container],
                         volumes: vec![Volume::secret(
                             MESH_SECRET_VOLUME_NAME.to_string(),
@@ -1820,6 +1836,30 @@ fn program_image_error(
 
 fn mesh_secret_name(service: &str) -> String {
     format!("{service}-mesh")
+}
+
+fn build_mesh_config_wait_init_container(helper_image: &str, expected_scope: &str) -> Container {
+    Container {
+        name: "wait-mesh-config".to_string(),
+        image: helper_image.to_string(),
+        command: vec![
+            "/amber-helper".to_string(),
+            "wait-mesh-config".to_string(),
+            format!("{MESH_CONFIG_DIR}/{MESH_CONFIG_FILENAME}"),
+            expected_scope.to_string(),
+            MESH_CONFIG_WAIT_TIMEOUT_SECS.to_string(),
+        ],
+        args: Vec::new(),
+        env: Vec::new(),
+        env_from: Vec::new(),
+        ports: Vec::new(),
+        readiness_probe: None,
+        volume_mounts: vec![VolumeMount {
+            name: MESH_SECRET_VOLUME_NAME.to_string(),
+            mount_path: MESH_CONFIG_DIR.to_string(),
+            read_only: Some(true),
+        }],
+    }
 }
 
 fn encode_scenario_digest(digest: &[u8; 32]) -> String {
