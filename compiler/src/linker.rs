@@ -10,7 +10,7 @@ use amber_config as rc;
 use amber_manifest::{
     BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, ChildName, ExportName,
     ExportTarget, InterpolatedPart, InterpolatedString, InterpolationSource, Manifest,
-    ManifestDigest, framework_capability,
+    ManifestDigest, SlotTarget, framework_capability, parse_slot_query,
 };
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, ProvideRef, Scenario, ScenarioExport,
@@ -2095,6 +2095,15 @@ fn collect_program_slot_uses(manifest: &Manifest) -> HashSet<String> {
         }
     }
 
+    for group in program.command().groups() {
+        if group.when.source() == InterpolationSource::Slots {
+            used_all = add_program_slot_condition_use(manifest, &mut uses, group.when.query());
+            if used_all {
+                return uses;
+            }
+        }
+    }
+
     for item in &program.command().0 {
         match item {
             amber_manifest::ProgramArgItem::Arg(arg) => {
@@ -2122,6 +2131,32 @@ fn collect_program_slot_uses(manifest: &Manifest) -> HashSet<String> {
     }
 
     uses
+}
+
+fn add_program_slot_condition_use(
+    manifest: &Manifest,
+    uses: &mut HashSet<String>,
+    query: &str,
+) -> bool {
+    match parse_slot_query(query) {
+        Ok(parsed) => match parsed.target {
+            SlotTarget::All => {
+                uses.extend(manifest.slots().keys().map(|slot| slot.to_string()));
+                true
+            }
+            SlotTarget::Slot(slot) => {
+                if manifest.slots().contains_key(slot) {
+                    uses.insert(slot.to_string());
+                }
+                false
+            }
+        },
+        Err(_) if query.is_empty() => {
+            uses.extend(manifest.slots().keys().map(|slot| slot.to_string()));
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 fn add_program_slot_uses(
@@ -2349,5 +2384,40 @@ fn validate_all_slots_bound(
                 related,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use amber_manifest::Manifest;
+
+    use super::collect_program_slot_uses;
+
+    #[test]
+    fn collect_program_slot_uses_includes_slot_conditions() {
+        let manifest: Manifest = r#"
+            {
+              manifest_version: "0.2.0",
+              program: {
+                image: "app",
+                entrypoint: [
+                  "app",
+                  { when: "slots.api", argv: ["--serve"] },
+                ],
+              },
+              slots: {
+                api: { kind: "http" },
+              },
+            }
+        "#
+        .parse()
+        .expect("manifest");
+
+        assert_eq!(
+            collect_program_slot_uses(&manifest),
+            HashSet::from(["api".to_string()])
+        );
     }
 }
