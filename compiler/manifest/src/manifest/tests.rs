@@ -131,6 +131,67 @@ fn legacy_manifest_version_is_accepted() {
 }
 
 #[test]
+fn conditional_program_args_require_manifest_version_0_2_0() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            path: "/bin/echo",
+            args: [
+              {
+                when: "config.profile",
+                argv: ["--profile", "${config.profile}"],
+              },
+            ],
+          },
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::UnsupportedProgramSyntaxForManifestVersion {
+            manifest_version,
+            required_version,
+            feature,
+            pointer,
+        } => {
+            assert_eq!(*manifest_version, Version::new(0, 1, 0));
+            assert_eq!(required_version, "0.2.0");
+            assert_eq!(feature, "conditional argument groups");
+            assert_eq!(pointer, "/program/args/0");
+        }
+        other => panic!("expected UnsupportedProgramSyntaxForManifestVersion error, got: {other}"),
+    }
+}
+
+#[test]
+fn when_is_accepted_in_manifest_version_0_2_0() {
+    let manifest: Manifest = r#"
+        {
+          manifest_version: "0.2.0",
+          program: {
+            path: "/bin/echo",
+            args: [
+              {
+                when: "config.profile",
+                argv: ["--profile", "${config.profile}"],
+              },
+            ],
+          },
+        }
+    "#
+    .parse()
+    .unwrap();
+
+    let Program::Path(program) = manifest.program().expect("program should exist") else {
+        panic!("expected native path program");
+    };
+    assert_eq!(program.args.groups().count(), 1);
+}
+
+#[test]
 fn program_entrypoint_string_sugar_splits() {
     let m: Manifest = r#"
         {

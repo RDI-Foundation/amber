@@ -1073,10 +1073,10 @@ fn validate_config_tree(
                     }
                 }
                 amber_manifest::ProgramArgItem::Group(group) => {
-                    if group.when_present.source() == InterpolationSource::Config {
+                    if group.when.source() == InterpolationSource::Config {
                         validate_config_ref(
-                            format!("{command_location}[{arg_idx}].when_present"),
-                            group.when_present.query(),
+                            format!("{command_location}[{arg_idx}].when"),
+                            group.when.query(),
                         );
                     }
                     for (group_idx, arg) in group.argv.0.iter().enumerate() {

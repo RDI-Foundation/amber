@@ -184,8 +184,8 @@ fn collect_config_uses(manifest: &Manifest) -> ConfigUses {
                     collect_config_uses_from_interpolated(arg, &mut uses);
                 }
                 amber_manifest::ProgramArgItem::Group(group) => {
-                    if group.when_present.source() == InterpolationSource::Config {
-                        uses.add_query(group.when_present.query());
+                    if group.when.source() == InterpolationSource::Config {
+                        uses.add_query(group.when.query());
                     }
                     for arg in &group.argv.0 {
                         collect_config_uses_from_interpolated(arg, &mut uses);

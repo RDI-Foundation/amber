@@ -64,7 +64,7 @@ pub type TemplateString = Vec<TemplatePart>;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConditionalProgramArgTemplate {
-    pub when_present: String,
+    pub when: String,
     pub argv: Vec<TemplateString>,
 }
 

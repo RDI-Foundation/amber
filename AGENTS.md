@@ -13,5 +13,6 @@
 * When adding new crates, make sure to update the dockerfiles
 * The compiler MUST always support older versions of the manifest format and scenario IR.
     - When an old version is received, any outputs are still the latest version.
+    - Any particular version of a manifest, IR, etc. must only interoperate within its own version, not being able to use features or changes from prior or later versions.
 * When a breaking change is made, you may need to bump versions of any of: the manifest format, the IR, the docker/images.json version series. If you bump the CLI docker image series, also update README.md to have the latest floating version.
     - Do not update versions in tests or examples unless they changed in a breaking way and NEED the newer version.

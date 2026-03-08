@@ -14,6 +14,7 @@ pub enum DiagnosticKind {
 #[derive(Clone, Debug)]
 pub struct DiagnosticError {
     kind: DiagnosticKind,
+    detail: String,
     message: String,
     label: String,
     span: SourceSpan,
@@ -29,6 +30,11 @@ impl DiagnosticError {
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
     }
 
     #[must_use]
@@ -84,6 +90,7 @@ fn parse_error(source: &str, err: &json5::Error) -> DiagnosticError {
     let span = hint.map_or_else(|| span_for_json5_error(source, err), |hint| hint.span);
     DiagnosticError {
         kind: DiagnosticKind::Parse,
+        detail: label.clone(),
         message: format!("json5 parse error: {label}"),
         label,
         span,
@@ -97,13 +104,15 @@ fn deserialize_error(
     path: &serde_path_to_error::Path,
     path_string: &str,
 ) -> DiagnosticError {
-    let label = summarize_json5_path_error(source, err);
-    let span = span_for_json5_deserialize_error(source, path, &label)
+    let detail = summarize_json5_path_error(source, err);
+    let label = concise_deserialize_label(&detail);
+    let span = span_for_json5_deserialize_error(source, path, &detail)
         .unwrap_or_else(|| span_for_json5_error(source, err));
 
     DiagnosticError {
         kind: DiagnosticKind::Deserialize,
-        message: format!("json5 deserialize error at {path_string}: {label}"),
+        detail: detail.clone(),
+        message: format!("json5 deserialize error at {path_string}: {detail}"),
         label,
         span,
         path: Some(path_string.to_string()),
@@ -531,6 +540,28 @@ fn summarize_json5_path_error(source: &str, err: &json5::Error) -> String {
         Some(found) => format!("expected {expected}, found {found}"),
         None => format!("expected {expected}"),
     }
+}
+
+fn concise_deserialize_label(detail: &str) -> String {
+    if detail.starts_with("missing field `")
+        || detail.starts_with("unknown field `")
+        || detail.starts_with("expected ")
+    {
+        return detail.to_string();
+    }
+
+    if let Some(expected) = deserialize_expected_suffix(detail) {
+        return format!("expected {expected}");
+    }
+
+    detail.to_string()
+}
+
+fn deserialize_expected_suffix(detail: &str) -> Option<&str> {
+    detail
+        .strip_prefix("invalid type: ")
+        .or_else(|| detail.strip_prefix("invalid value: "))
+        .and_then(|rest| rest.split_once(", expected ").map(|(_, expected)| expected))
 }
 
 fn json5_expected_value_label(code: json5::ErrorCode) -> Option<&'static str> {

@@ -366,7 +366,7 @@ fn program_arg_template_requires_config(arg: &ProgramArgTemplate) -> bool {
     match arg {
         ProgramArgTemplate::Arg(parts) => template_string_requires_config(parts),
         ProgramArgTemplate::Group(group) => {
-            !group.when_present.is_empty()
+            !group.when.is_empty()
                 || group
                     .argv
                     .iter()
@@ -397,7 +397,7 @@ fn render_program_arg_templates(
                 )?);
             }
             ProgramArgTemplate::Group(group) => {
-                let present = config_path_is_present(component_config, &group.when_present)?;
+                let present = config_path_is_present(component_config, &group.when)?;
                 if !present {
                     continue;
                 }
@@ -568,7 +568,7 @@ mod tests {
                 entrypoint: vec![
                     ProgramArgTemplate::Arg(vec![TemplatePart::lit("/app/bin/server")]),
                     ProgramArgTemplate::Group(amber_template::ConditionalProgramArgTemplate {
-                        when_present: "profile".to_string(),
+                        when: "profile".to_string(),
                         argv: vec![
                             vec![TemplatePart::lit("--profile")],
                             vec![TemplatePart::config("profile")],
@@ -620,7 +620,7 @@ mod tests {
                 entrypoint: vec![
                     ProgramArgTemplate::Arg(vec![TemplatePart::lit("/app/bin/server")]),
                     ProgramArgTemplate::Group(amber_template::ConditionalProgramArgTemplate {
-                        when_present: "profile".to_string(),
+                        when: "profile".to_string(),
                         argv: vec![
                             vec![TemplatePart::lit("--profile")],
                             vec![TemplatePart::config("profile")],

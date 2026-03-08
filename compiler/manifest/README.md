@@ -232,13 +232,13 @@ program: {
   args: ["python3", "-m", "http.server", "8080"],
   // args: "python3 -m http.server 8080",
   //
-  // Args and entrypoint items may also contain conditional argv groups.
-  // The whole `argv` array is omitted when `when_present` is absent or null.
+  // Args and entrypoint items may also contain `when`-guarded argv groups.
+  // The whole `argv` array is omitted when the `when` path is absent or null.
   // Presence is not truthiness: false, 0, and "" still count as present.
   //
   // args: [
   //   {
-  //     when_present: "config.profile",
+  //     when: "config.profile",
   //     argv: "--profile ${config.profile}",
   //   },
   // ],
@@ -320,10 +320,15 @@ Notes:
   referenced via `${bindings.<name>.url}`.
 * Framework bindings may be **non-URL-shaped**; `${bindings.<name>.url}` is invalid for those
   bindings and is rejected by the compiler.
-* `when_present` is only supported in `program.entrypoint` and `program.args`, and it must use
-  `config`, `config.<path>`, `slots`, or `slots.<path>`.
-* `when_present: "slots.<slot>..."` is mainly useful for `optional: true` slots. Amber lints
-  non-optional slot conditions because they are always true after linking.
+* `manifest_version: "0.2.0"` or newer is required for object items in `program.entrypoint` /
+  `program.args`, such as `{ when: "config.profile", argv: [...] }`.
+* `when` is only supported in `program.entrypoint` and `program.args`.
+* `when` accepts `config.<path>` or `slots.<path>`.
+* Slot `when` checks whether the referenced slot query is present. Today that means
+  `slots.<slot>` and `slots.<slot>.url` are both valid.
+* `when: "slots.<slot>"` and `when: "slots.<slot>.url"` are mainly useful for `optional: true`
+  slots. Amber lints conditions on required slots when the queried value is guaranteed to be
+  present after linking.
 * This crate **parses** interpolation syntax but does **not** validate that the referenced paths
   exist. The compiler validates `${config.*}` against `config_schema` and `${slots.*}` against
   declared slots and supported fields. `${bindings.*}` is validated against named bindings that

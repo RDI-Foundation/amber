@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use amber_manifest::{
     InterpolatedPart, InterpolatedString, InterpolationSource, Manifest, ManifestSpans, Program,
-    SlotDecl, SlotName, span_for_json_pointer,
+    SlotDecl, SlotName, span_for_json_pointer, validate_slot_query_for_slot,
 };
 use jsonptr::PointerBuf;
 use miette::{Diagnostic, NamedSource, Report, SourceSpan};
@@ -111,11 +111,11 @@ fn validate_manifest_slot_interpolations(
                         validate_interpolated_string(arg, &ctx, location, span, &mut diagnostics);
                     }
                     amber_manifest::ProgramArgItem::Group(group) => {
-                        if group.when_present.source() == InterpolationSource::Slots {
+                        if group.when.source() == InterpolationSource::Slots {
                             let location = SlotLocation::EntrypointCondition(idx);
                             let span = location.span(source.as_ref(), spans);
                             validate_slot_condition(
-                                group.when_present.query(),
+                                group.when.query(),
                                 &ctx,
                                 location,
                                 span,
@@ -152,11 +152,11 @@ fn validate_manifest_slot_interpolations(
                         validate_interpolated_string(arg, &ctx, location, span, &mut diagnostics);
                     }
                     amber_manifest::ProgramArgItem::Group(group) => {
-                        if group.when_present.source() == InterpolationSource::Slots {
+                        if group.when.source() == InterpolationSource::Slots {
                             let location = SlotLocation::ArgsCondition(idx);
                             let span = location.span(source.as_ref(), spans);
                             validate_slot_condition(
-                                group.when_present.query(),
+                                group.when.query(),
                                 &ctx,
                                 location,
                                 span,
@@ -209,14 +209,12 @@ impl SlotLocation<'_> {
             SlotLocation::Image => "program.image".to_string(),
             SlotLocation::Path => "program.path".to_string(),
             SlotLocation::Entrypoint(idx) => format!("program.entrypoint[{idx}]"),
-            SlotLocation::EntrypointCondition(idx) => {
-                format!("program.entrypoint[{idx}].when_present")
-            }
+            SlotLocation::EntrypointCondition(idx) => format!("program.entrypoint[{idx}].when"),
             SlotLocation::EntrypointGroup(idx, group_idx) => {
                 format!("program.entrypoint[{idx}].argv[{group_idx}]")
             }
             SlotLocation::Args(idx) => format!("program.args[{idx}]"),
-            SlotLocation::ArgsCondition(idx) => format!("program.args[{idx}].when_present"),
+            SlotLocation::ArgsCondition(idx) => format!("program.args[{idx}].when"),
             SlotLocation::ArgsGroup(idx, group_idx) => {
                 format!("program.args[{idx}].argv[{group_idx}]")
             }
@@ -248,7 +246,7 @@ impl SlotLocation<'_> {
                     .unwrap_or_else(|| (0usize, 0usize).into())
             }
             SlotLocation::EntrypointCondition(idx) => {
-                let pointer = format!("/program/entrypoint/{idx}/when_present");
+                let pointer = format!("/program/entrypoint/{idx}/when");
                 if let Some(span) = span_for_json_pointer(source, root, &pointer) {
                     return span;
                 }
@@ -298,7 +296,7 @@ impl SlotLocation<'_> {
                     .unwrap_or_else(|| (0usize, 0usize).into())
             }
             SlotLocation::ArgsCondition(idx) => {
-                let pointer = format!("/program/args/{idx}/when_present");
+                let pointer = format!("/program/args/{idx}/when");
                 if let Some(span) = span_for_json_pointer(source, root, &pointer) {
                     return span;
                 }
@@ -354,14 +352,53 @@ fn validate_slot_condition(
     span: SourceSpan,
     diagnostics: &mut Vec<Report>,
 ) {
-    let synthetic = if query.is_empty() {
-        "${slots}".to_string()
-    } else {
-        format!("${{slots.{query}}}")
+    match parse_slot_query(query) {
+        Ok(parsed) => match parsed.target {
+            SlotTarget::All => {}
+            SlotTarget::Slot(slot) => {
+                let Some(slot_decl) = ctx.slots.get(slot) else {
+                    let help = unknown_slot_help(ctx.component_path, ctx.slots);
+                    diagnostics.push(Report::new(InvalidSlotsInterpolation {
+                        component_path: ctx.component_path.to_string(),
+                        location: location.label(),
+                        message: format!("unknown slot `{slot}`"),
+                        help,
+                        src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source))
+                            .with_language("json5"),
+                        span,
+                        label: "slot condition here".to_string(),
+                    }));
+                    return;
+                };
+
+                if let Err(err) = validate_slot_query_for_slot(slot_decl, &parsed) {
+                    let help = slot_query_help(Some(slot), &err);
+                    diagnostics.push(Report::new(InvalidSlotsInterpolation {
+                        component_path: ctx.component_path.to_string(),
+                        location: location.label(),
+                        message: err.to_string(),
+                        help,
+                        src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source))
+                            .with_language("json5"),
+                        span,
+                        label: "slot condition here".to_string(),
+                    }));
+                }
+            }
+        },
+        Err(err) => {
+            let help = slot_query_help(None, &err);
+            diagnostics.push(Report::new(InvalidSlotsInterpolation {
+                component_path: ctx.component_path.to_string(),
+                location: location.label(),
+                message: err.to_string(),
+                help,
+                src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source)).with_language("json5"),
+                span,
+                label: "slot condition here".to_string(),
+            }));
+        }
     }
-    .parse::<InterpolatedString>()
-    .expect("synthetic slots condition should parse");
-    validate_interpolated_string(&synthetic, ctx, location, span, diagnostics);
 }
 
 struct SlotValidationContext<'a> {
@@ -394,7 +431,7 @@ fn validate_interpolated_string(
             Ok(parsed) => match parsed.target {
                 SlotTarget::All => {}
                 SlotTarget::Slot(slot) => {
-                    if !ctx.slots.contains_key(slot) {
+                    let Some(slot_decl) = ctx.slots.get(slot) else {
                         let help = unknown_slot_help(ctx.component_path, ctx.slots);
                         diagnostics.push(Report::new(InvalidSlotsInterpolation {
                             component_path: ctx.component_path.to_string(),
@@ -406,11 +443,26 @@ fn validate_interpolated_string(
                             span,
                             label: "slot interpolation here".to_string(),
                         }));
+                        continue;
+                    };
+
+                    if let Err(err) = validate_slot_query_for_slot(slot_decl, &parsed) {
+                        let help = slot_query_help(Some(slot), &err);
+                        diagnostics.push(Report::new(InvalidSlotsInterpolation {
+                            component_path: ctx.component_path.to_string(),
+                            location: location.label(),
+                            message: err.to_string(),
+                            help,
+                            src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source))
+                                .with_language("json5"),
+                            span,
+                            label: "slot interpolation here".to_string(),
+                        }));
                     }
                 }
             },
             Err(err) => {
-                let help = slot_query_help(&err);
+                let help = slot_query_help(None, &err);
                 diagnostics.push(Report::new(InvalidSlotsInterpolation {
                     component_path: ctx.component_path.to_string(),
                     location: location.label(),
@@ -426,16 +478,32 @@ fn validate_interpolated_string(
     }
 }
 
-fn slot_query_help(err: &SlotQueryError) -> String {
+fn slot_query_help(slot: Option<&str>, err: &SlotQueryError) -> String {
+    let whole_slot = slot.map_or_else(
+        || "${slots.<slot>}".to_string(),
+        |slot| format!("${{slots.{slot}}}"),
+    );
+    let slot_url = slot.map_or_else(
+        || "${slots.<slot>.url}".to_string(),
+        |slot| format!("${{slots.{slot}.url}}"),
+    );
+
     match err {
-        SlotQueryError::MissingSlotName => {
-            "Use slots.<slot> or slots.<slot>.url (for example, slots.agent.url).".to_string()
-        }
-        SlotQueryError::EmptySegment { .. } => "Use dot-separated paths without empty segments \
-                                                (for example, slots.agent.url)."
+        SlotQueryError::MissingSlotName => "Use `${slots.<slot>}` to refer to a slot object, then \
+                                            continue with field paths as needed."
             .to_string(),
-        SlotQueryError::UnsupportedField { .. } | SlotQueryError::UnsupportedPath { .. } => {
-            "Supported slot fields: url.".to_string()
+        SlotQueryError::EmptySegment { .. } => {
+            format!("Use dot-separated slot paths like `{whole_slot}` or `{slot_url}`.")
+        }
+        SlotQueryError::UnknownField { .. } | SlotQueryError::UnknownPath { .. } => {
+            let slot_shape = slot.map_or_else(
+                || "Slots are objects like `{ url: ... }`.".to_string(),
+                |slot| format!("Slot `{slot}` is an object like `{{ url: ... }}`."),
+            );
+            format!(
+                "{slot_shape} Use `{whole_slot}` for the whole object or `{slot_url}` for the URL \
+                 field."
+            )
         }
     }
 }

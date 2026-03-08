@@ -12,6 +12,7 @@ mod manifest;
 mod names;
 mod refs;
 mod schema;
+mod slot_query;
 
 pub use document::{ManifestDocError, ParsedManifest};
 pub use error::Error;
@@ -19,8 +20,8 @@ pub use framework::{
     FrameworkBindingShape, FrameworkCapabilitySpec, framework_capabilities, framework_capability,
 };
 pub use interpolation::{
-    ConditionalInterpolationPath, InterpolatedPart, InterpolatedString, InterpolationSource,
-    ProgramArgGroup, ProgramArgItem, ProgramArgList, ProgramEntrypoint,
+    InterpolatedPart, InterpolatedString, InterpolationSource, ProgramArgGroup, ProgramArgItem,
+    ProgramArgList, ProgramEntrypoint, WhenPath,
 };
 pub use manifest::{ExperimentalFeature, Manifest, RawManifest};
 pub use names::{
@@ -34,6 +35,10 @@ pub use schema::{
     ComponentDecl, ComponentRef, ConfigSchema, Endpoint, EnvironmentDecl, ExportTarget,
     LocalComponentRef, MountSource, Network, NetworkProtocol, Program, ProgramCommon, ProgramImage,
     ProgramMount, ProgramPath, ProvideDecl, RawBinding, RawExportTarget, SlotDecl,
+};
+pub use slot_query::{
+    SlotQuery, SlotQueryError, SlotQueryValidation, SlotTarget, parse_slot_query,
+    validate_slot_query_for_slot,
 };
 pub use spans::{
     BindingSpans, BindingTargetKey, CapabilityDeclSpans, ComponentDeclSpans, EndpointSpans,

@@ -1,17 +1,11 @@
 {
-  manifest_version: "0.1.0",
-  config_schema: {
-    type: "object",
-    properties: {
-      profile: { type: "string" },
-    },
-  },
+  manifest_version: "0.2.0",
   program: {
     path: "/bin/echo",
     args: [
       {
-        when_present: "config.profile",
-        argv: ["--api", "${slots.api.blabla}"],
+        when: "slots.api.blabla",
+        argv: ["--api", "${slots.api.url}"],
       },
     ],
     network: {

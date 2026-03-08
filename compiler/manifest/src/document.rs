@@ -32,8 +32,8 @@ impl ManifestDocError {
         kind: ManifestError,
     ) -> Self {
         let src = NamedSource::new(name, Arc::clone(&source)).with_language("json5");
-        let message = kind.to_string();
-        let labels = labels_for_manifest_error(&kind, spans);
+        let message = display_message_for_manifest_error(&kind);
+        let labels = labels_for_manifest_error(source.as_ref(), &kind, spans);
         let help = help_for_manifest_error(&kind);
         Self {
             kind,
@@ -47,6 +47,11 @@ impl ManifestDocError {
 
 impl Diagnostic for ManifestDocError {
     fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        if let ManifestError::Json5Path(de) = &self.kind
+            && invalid_when_path_parts(de.detail()).is_some()
+        {
+            return Some(Box::new("manifest::invalid_when_path"));
+        }
         self.kind.code()
     }
 
@@ -103,14 +108,30 @@ impl ParsedManifest {
     }
 }
 
-fn labels_for_manifest_error(err: &ManifestError, spans: &ManifestSpans) -> Vec<LabeledSpan> {
+fn labels_for_manifest_error(
+    source: &str,
+    err: &ManifestError,
+    spans: &ManifestSpans,
+) -> Vec<LabeledSpan> {
     match err {
         ManifestError::Json5(parse) => vec![primary(parse.span(), Some(parse.label().to_string()))],
-        ManifestError::Json5Path(de) => vec![primary(de.span(), Some(de.label().to_string()))],
+        ManifestError::Json5Path(de) => {
+            vec![primary(de.span(), Some(manifest_json5_path_label(de)))]
+        }
         ManifestError::UnsupportedManifestVersion { .. } => vec![primary(
             span_or_default(spans.manifest_version),
             Some("unsupported `manifest_version`".to_string()),
         )],
+        ManifestError::UnsupportedProgramSyntaxForManifestVersion { pointer, .. } => {
+            let root_span: SourceSpan = (0usize, source.len()).into();
+            let span = crate::span_for_json_pointer(source, root_span, pointer)
+                .or_else(|| spans.program.as_ref().map(|program| program.whole))
+                .or(spans.manifest_version);
+            vec![primary(
+                span_or_default(span),
+                Some("conditional argument group used here".to_string()),
+            )]
+        }
         ManifestError::InvalidName { kind, name } => labels_for_invalid_name(spans, kind, name),
         ManifestError::MixedBindingForm { to, from } => {
             labels_for_mixed_binding_form(spans, to, from)
@@ -195,12 +216,56 @@ fn labels_for_manifest_error(err: &ManifestError, spans: &ManifestSpans) -> Vec<
     }
 }
 
+fn display_message_for_manifest_error(err: &ManifestError) -> String {
+    match err {
+        ManifestError::Json5Path(de) => invalid_when_path_parts(de.detail()).map_or_else(
+            || err.to_string(),
+            |(input, message)| {
+                if message == "expected `config.<path>` or `slots.<path>`" {
+                    format!(
+                        "invalid `when` path `{input}`: `when` must use `config.<path>` or \
+                         `slots.<path>`"
+                    )
+                } else {
+                    format!("invalid `when` path `{input}`: {message}")
+                }
+            },
+        ),
+        _ => err.to_string(),
+    }
+}
+
+fn manifest_json5_path_label(de: &amber_json5::DiagnosticError) -> String {
+    if let Some((_, message)) = invalid_when_path_parts(de.detail()) {
+        if message == "expected `config.<path>` or `slots.<path>`" {
+            return "`when` must use `config.<path>` or `slots.<path>`".to_string();
+        }
+
+        return "invalid `when` path here".to_string();
+    }
+
+    de.label().to_string()
+}
+
+fn invalid_when_path_parts(detail: &str) -> Option<(&str, &str)> {
+    let detail = detail.strip_prefix("invalid `when` path `")?;
+    let (input, message) = detail.split_once("`: ")?;
+    Some((input, message))
+}
+
 fn help_for_manifest_error(err: &ManifestError) -> Option<String> {
     match err {
         ManifestError::Json5Path(de) => {
             (de.label().starts_with("missing field `manifest_version`"))
                 .then(|| "add `manifest_version: \"0.2.0\"` to the root object".to_string())
         }
+        ManifestError::UnsupportedProgramSyntaxForManifestVersion {
+            required_version,
+            feature,
+            ..
+        } => Some(format!(
+            "set `manifest_version` to \"{required_version}\" or remove {feature}"
+        )),
         _ => None,
     }
 }

@@ -9,7 +9,7 @@ use serde::{
 };
 use serde_with::{DeserializeFromStr, SerializeDisplay};
 
-use crate::Error;
+use crate::{Error, SlotTarget, parse_slot_query};
 
 #[derive(
     Clone,
@@ -179,12 +179,12 @@ impl fmt::Display for InterpolatedString {
 #[derive(
     Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, DeserializeFromStr, SerializeDisplay,
 )]
-pub struct ConditionalInterpolationPath {
+pub struct WhenPath {
     source: InterpolationSource,
     query: String,
 }
 
-impl ConditionalInterpolationPath {
+impl WhenPath {
     pub fn source(&self) -> InterpolationSource {
         self.source
     }
@@ -194,7 +194,7 @@ impl ConditionalInterpolationPath {
     }
 }
 
-impl fmt::Display for ConditionalInterpolationPath {
+impl fmt::Display for WhenPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.source)?;
         if !self.query.is_empty() {
@@ -204,23 +204,53 @@ impl fmt::Display for ConditionalInterpolationPath {
     }
 }
 
-impl FromStr for ConditionalInterpolationPath {
+impl FromStr for WhenPath {
     type Err = Error;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let InterpolatedPart::Interpolation { source, query } = input.parse()? else {
-            unreachable!("conditional interpolation path parser never returns literals");
+            unreachable!("when path parser never returns literals");
         };
-        if !matches!(
-            source,
-            InterpolationSource::Config | InterpolationSource::Slots
-        ) {
-            return Err(Error::InvalidConditionalInterpolationPath(
-                input.to_string(),
-            ));
+
+        match source {
+            InterpolationSource::Config => validate_config_when_path(input, &query)?,
+            InterpolationSource::Slots => validate_slot_when_path(input, &query)?,
+            InterpolationSource::Bindings => {
+                return Err(Error::InvalidWhenPath {
+                    input: input.to_string(),
+                    message: "expected `config.<path>` or `slots.<path>`".to_string(),
+                });
+            }
         }
         Ok(Self { source, query })
     }
+}
+
+fn validate_config_when_path(input: &str, query: &str) -> Result<(), Error> {
+    if !query.is_empty() && !query.split('.').any(str::is_empty) {
+        return Ok(());
+    }
+
+    Err(Error::InvalidWhenPath {
+        input: input.to_string(),
+        message: "expected `config.<path>` or `slots.<path>`".to_string(),
+    })
+}
+
+fn validate_slot_when_path(input: &str, query: &str) -> Result<(), Error> {
+    let parsed = parse_slot_query(query).map_err(|err| Error::InvalidWhenPath {
+        input: input.to_string(),
+        message: err.to_string(),
+    })?;
+
+    if matches!(parsed.target, SlotTarget::Slot(_)) {
+        return Ok(());
+    }
+
+    Err(Error::InvalidWhenPath {
+        input: input.to_string(),
+        message: "expected `config.<path>` or `slots.<path>`".to_string(),
+    })
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -249,7 +279,7 @@ impl<'de> Deserialize<'de> for ProgramArgList {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProgramArgGroup {
-    pub when_present: ConditionalInterpolationPath,
+    pub when: WhenPath,
     pub argv: ProgramArgList,
 }
 
@@ -304,7 +334,7 @@ impl<'de> Deserialize<'de> for ProgramArgItem {
             type Value = ProgramArgItem;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a program arg string or a conditional argv group")
+                f.write_str("a string or an object with `when` and `argv`")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -375,7 +405,7 @@ impl<'de> Deserialize<'de> for ProgramEntrypoint {
             type Value = ProgramEntrypoint;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a shell-style string or an array of program args")
+                f.write_str("a shell-style string or an array of arguments")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -421,7 +451,7 @@ where
         type Value = Vec<InterpolatedString>;
 
         fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("a shell-style string or an array of interpolated strings")
+            f.write_str("a shell-style string or an array of strings")
         }
 
         fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -527,32 +557,23 @@ mod tests {
     }
 
     #[test]
-    fn conditional_interpolation_path_requires_supported_prefix() {
-        let config_root = "config".parse::<ConditionalInterpolationPath>().unwrap();
-        assert_eq!(config_root.source(), InterpolationSource::Config);
-        assert_eq!(config_root.query(), "");
-
-        let config = "config.value"
-            .parse::<ConditionalInterpolationPath>()
-            .unwrap();
+    fn when_path_requires_config_path_or_slot_path() {
+        let config = "config.value".parse::<WhenPath>().unwrap();
         assert_eq!(config.source(), InterpolationSource::Config);
         assert_eq!(config.query(), "value");
 
-        let slots_root = "slots".parse::<ConditionalInterpolationPath>().unwrap();
-        assert_eq!(slots_root.source(), InterpolationSource::Slots);
-        assert_eq!(slots_root.query(), "");
-
-        let slot = "slots.backend.url"
-            .parse::<ConditionalInterpolationPath>()
-            .unwrap();
+        let slot = "slots.backend".parse::<WhenPath>().unwrap();
         assert_eq!(slot.source(), InterpolationSource::Slots);
-        assert_eq!(slot.query(), "backend.url");
+        assert_eq!(slot.query(), "backend");
 
-        assert!(
-            "bindings.route.url"
-                .parse::<ConditionalInterpolationPath>()
-                .is_err()
-        );
+        let slot_field = "slots.backend.url".parse::<WhenPath>().unwrap();
+        assert_eq!(slot_field.source(), InterpolationSource::Slots);
+        assert_eq!(slot_field.query(), "backend.url");
+
+        assert!("config".parse::<WhenPath>().is_err());
+        assert!("slots".parse::<WhenPath>().is_err());
+        assert!("slots.backend..url".parse::<WhenPath>().is_err());
+        assert!("bindings.route.url".parse::<WhenPath>().is_err());
     }
 
     #[test]
@@ -572,15 +593,15 @@ mod tests {
             r#"[
               "server",
               {
-                "when_present": "config.profile",
+                "when": "config.profile",
                 "argv": "--profile ${config.profile}"
               }
             ]"#,
         )
         .unwrap();
         let group = parsed.0[1].group().expect("expected conditional group");
-        assert_eq!(group.when_present.source(), InterpolationSource::Config);
-        assert_eq!(group.when_present.query(), "profile");
+        assert_eq!(group.when.source(), InterpolationSource::Config);
+        assert_eq!(group.when.query(), "profile");
         assert_eq!(group.argv.0.len(), 2);
         assert_eq!(group.argv.0[0].to_string(), "--profile");
         assert_eq!(group.argv.0[1].to_string(), "${config.profile}");

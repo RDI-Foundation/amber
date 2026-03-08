@@ -10,6 +10,7 @@ use thiserror::Error;
 use crate::{
     BindingSource, ComponentDecl, ExportTarget, InterpolatedPart, InterpolatedString,
     InterpolationSource, Manifest, ManifestSpans, MountSource, Program, ProgramArgItem, SlotName,
+    SlotTarget, parse_slot_query, validate_slot_query_for_slot,
 };
 
 #[allow(unused_assignments)]
@@ -102,15 +103,15 @@ pub enum ManifestLint {
     },
 
     #[error(
-        "command argument references optional config `{path}` without `when_present` (in \
-         component {component})"
+        "command argument references optional config `{path}` without `when` (in component \
+         {component})"
     )]
     #[diagnostic(
         code(manifest::optional_command_config),
         severity(Warning),
         help(
-            "Wrap the argument in `{{ when_present: \"config.{path}\", argv: [...] }}` if it \
-             should disappear when unset, or make `config.{path}` required."
+            "Wrap the argument in `{{ when: \"config.{path}\", argv: [...] }}` if it should \
+             disappear when unset, or make `config.{path}` required."
         )
     )]
     OptionalCommandConfig {
@@ -123,23 +124,23 @@ pub enum ManifestLint {
     },
 
     #[error(
-        "command `when_present` checks non-optional slot `{slot}`, so the condition is always \
-         true (in component {component})"
+        "this `when` condition is unnecessary: slot `{slot}` is required, so it is always bound \
+         and this argv group is always included (in component {component})"
     )]
     #[diagnostic(
-        code(manifest::required_slot_when_present),
+        code(manifest::required_slot_when),
         severity(Warning),
         help(
-            "Remove `when_present` if this argv group should always be included, or mark \
-             `slots.{slot}` as `optional: true` if it should disappear when the slot is absent."
+            "Remove `when` if this argv group should always be included. If it should disappear \
+             when the parent does not bind the slot, mark `slots.{slot}` as `optional: true`."
         )
     )]
-    RequiredSlotWhenPresent {
+    RequiredSlotWhen {
         slot: String,
         component: String,
         #[source_code]
         src: NamedSource<Arc<str>>,
-        #[label("non-optional slot condition")]
+        #[label("slot is required, so this condition is always true")]
         span: SourceSpan,
     },
 
@@ -184,18 +185,21 @@ fn add_slot_condition_use<'a>(
     used_slots: &mut BTreeSet<&'a SlotName>,
     query: &str,
 ) {
-    if query.is_empty() {
-        used_slots.extend(manifest.slots().keys());
-        return;
+    match parse_slot_query(query) {
+        Ok(parsed) => match parsed.target {
+            SlotTarget::All => used_slots.extend(manifest.slots().keys()),
+            SlotTarget::Slot(slot) => {
+                if let Some((slot_key, _)) = manifest.slots().get_key_value(slot) {
+                    used_slots.insert(slot_key);
+                }
+            }
+        },
+        Err(_) => {
+            if query.is_empty() {
+                used_slots.extend(manifest.slots().keys());
+            }
+        }
     }
-    let slot = slot_name_from_condition_query(query);
-    if let Some((slot_key, _)) = manifest.slots().get_key_value(slot) {
-        used_slots.insert(slot_key);
-    }
-}
-
-fn slot_name_from_condition_query(query: &str) -> &str {
-    query.split_once('.').map_or(query, |(first, _)| first)
 }
 
 fn visit_program_interpolated(
@@ -324,8 +328,8 @@ fn command_arg_optional_config_lints(
                         };
                         if *kind != InterpolationSource::Config
                             || !optional_leaf_paths.contains(query)
-                            || (group.when_present.source() == InterpolationSource::Config
-                                && query == group.when_present.query())
+                            || (group.when.source() == InterpolationSource::Config
+                                && query == group.when.query())
                         {
                             continue;
                         }
@@ -354,7 +358,7 @@ fn command_arg_optional_config_lints(
     out
 }
 
-fn command_arg_required_slot_when_present_lints(
+fn command_arg_required_slot_when_lints(
     manifest: &Manifest,
     component: &str,
     src: &NamedSource<Arc<str>>,
@@ -382,24 +386,32 @@ fn command_arg_required_slot_when_present_lints(
         let ProgramArgItem::Group(group) = item else {
             continue;
         };
-        if group.when_present.source() != InterpolationSource::Slots {
+        if group.when.source() != InterpolationSource::Slots {
             continue;
         }
-        let slot = slot_name_from_condition_query(group.when_present.query());
+        let Ok(parsed) = parse_slot_query(group.when.query()) else {
+            continue;
+        };
+        let SlotTarget::Slot(slot) = parsed.target else {
+            continue;
+        };
         let Some(slot_decl) = manifest.slots().get(slot) else {
             continue;
         };
-        if slot_decl.optional {
+        let Ok(validation) = validate_slot_query_for_slot(slot_decl, &parsed) else {
+            continue;
+        };
+        if slot_decl.optional || !validation.guaranteed_when_slot_is_bound {
             continue;
         }
 
-        let pointer = format!("{field_pointer}/{idx}/when_present");
+        let pointer = format!("{field_pointer}/{idx}/when");
         let item_pointer = format!("{field_pointer}/{idx}");
         let span = crate::span_for_json_pointer(source, root, &pointer)
             .or_else(|| crate::span_for_json_pointer(source, root, &item_pointer))
             .or_else(|| crate::span_for_json_pointer(source, root, field_pointer))
             .unwrap_or(fallback);
-        out.push(ManifestLint::RequiredSlotWhenPresent {
+        out.push(ManifestLint::RequiredSlotWhen {
             slot: slot.to_string(),
             component: component.to_string(),
             src: src.clone(),
@@ -450,8 +462,8 @@ fn collect_config_uses(manifest: &Manifest) -> ConfigUses {
 
     if let Some(program) = manifest.program() {
         for group in program.command().groups() {
-            if group.when_present.source() == InterpolationSource::Config {
-                uses.add_query(group.when_present.query());
+            if group.when.source() == InterpolationSource::Config {
+                uses.add_query(group.when.query());
             }
         }
         let _ = visit_program_interpolated(program, |value| {
@@ -536,12 +548,8 @@ pub fn lint_manifest(
     let mut program_used_slots = BTreeSet::new();
     if let Some(program) = manifest.program() {
         for group in program.command().groups() {
-            if group.when_present.source() == InterpolationSource::Slots {
-                add_slot_condition_use(
-                    manifest,
-                    &mut program_used_slots,
-                    group.when_present.query(),
-                );
+            if group.when.source() == InterpolationSource::Slots {
+                add_slot_condition_use(manifest, &mut program_used_slots, group.when.query());
             }
         }
         let _ = visit_program_interpolated(program, |value| {
@@ -683,7 +691,7 @@ pub fn lint_manifest(
         ));
     }
 
-    lints.extend(command_arg_required_slot_when_present_lints(
+    lints.extend(command_arg_required_slot_when_lints(
         manifest, &component, &src, spans,
     ));
 
@@ -890,16 +898,16 @@ mod tests {
     }
 
     #[test]
-    fn slot_used_in_when_present_is_not_linted() {
+    fn slot_used_in_when_is_not_linted() {
         let input = r#"
         {
-          manifest_version: "0.1.0",
+          manifest_version: "0.2.0",
           slots: { llm: { kind: "llm", optional: true } },
           program: {
             path: "/bin/echo",
             args: [
               {
-                when_present: "slots.llm",
+                when: "slots.llm.url",
                 argv: ["--llm", "${slots.llm.url}"],
               },
             ],
@@ -915,21 +923,21 @@ mod tests {
         )));
         assert!(!lints.iter().any(|lint| matches!(
             lint,
-            crate::lint::ManifestLint::RequiredSlotWhenPresent { slot, .. } if slot == "llm"
+            crate::lint::ManifestLint::RequiredSlotWhen { slot, .. } if slot == "llm"
         )));
     }
 
     #[test]
-    fn required_slot_when_present_is_linted() {
+    fn required_slot_when_is_linted() {
         let input = r#"
         {
-          manifest_version: "0.1.0",
+          manifest_version: "0.2.0",
           slots: { llm: { kind: "llm" } },
           program: {
             image: "x",
             entrypoint: [
               {
-                when_present: "slots.llm.url",
+                when: "slots.llm",
                 argv: ["--llm", "${slots.llm.url}"],
               },
             ],
@@ -941,7 +949,33 @@ mod tests {
         let lints = lint_for(input, &manifest);
         assert!(lints.iter().any(|lint| matches!(
             lint,
-            crate::lint::ManifestLint::RequiredSlotWhenPresent { slot, .. } if slot == "llm"
+            crate::lint::ManifestLint::RequiredSlotWhen { slot, .. } if slot == "llm"
+        )));
+    }
+
+    #[test]
+    fn required_slot_field_when_is_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.2.0",
+          slots: { llm: { kind: "llm" } },
+          program: {
+            image: "x",
+            entrypoint: [
+              {
+                when: "slots.llm.url",
+                argv: ["--llm", "${slots.llm.url}"],
+              },
+            ],
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::RequiredSlotWhen { slot, .. } if slot == "llm"
         )));
     }
 
@@ -1105,10 +1139,10 @@ mod tests {
     }
 
     #[test]
-    fn when_present_suppresses_matching_optional_command_lint_only() {
+    fn when_suppresses_matching_optional_command_lint_only() {
         let input = r#"
         {
-          manifest_version: "0.1.0",
+          manifest_version: "0.2.0",
           config_schema: {
             type: "object",
             properties: {
@@ -1120,7 +1154,7 @@ mod tests {
             path: "/bin/echo",
             args: [
               {
-                when_present: "config.profile",
+                when: "config.profile",
                 argv: ["--profile", "${config.profile}", "--color", "${config.color}"],
               },
             ],

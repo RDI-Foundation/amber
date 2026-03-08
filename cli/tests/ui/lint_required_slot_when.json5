@@ -10,7 +10,7 @@
     },
   },
   components: {
-    child: "./lint_required_slot_when_present_child.json5",
+    child: "./lint_required_slot_when_child.json5",
   },
   provides: {
     api: { kind: "http", endpoint: "http" },

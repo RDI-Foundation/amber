@@ -21,7 +21,7 @@ use crate::{
     binding_query::{BindingObject, parse_binding_query, resolve_binding_query},
     config_scope::{RuntimeConfigView, build_runtime_config_view},
     config_templates,
-    slot_query::{SlotObject, resolve_slot_query},
+    slot_query::{SlotObject, resolve_slot_query, slot_query_is_present},
     targets::common::{TargetError as MeshError, component_label},
 };
 
@@ -566,7 +566,7 @@ fn collect_used_paths_from_template_spec(spec: &TemplateSpec, out: &mut BTreeSet
         match arg {
             ProgramArgTemplate::Arg(ts) => collect_used_paths_from_template_string(ts, out),
             ProgramArgTemplate::Group(group) => {
-                out.insert(group.when_present.clone());
+                out.insert(group.when.clone());
                 for ts in &group.argv {
                     collect_used_paths_from_template_string(ts, out);
                 }
@@ -767,14 +767,14 @@ fn program_used_config_paths(
             ProgramArgItem::Arg(arg) => collect_program_config_paths(&arg.parts, &mut used),
             ProgramArgItem::Group(group) => {
                 match resolve_condition_presence_for_program(
-                    group.when_present.source(),
-                    group.when_present.query(),
+                    group.when.source(),
+                    group.when.query(),
                     template_opt,
                     slots,
                 )? {
                     ConfigPresence::Present => {
-                        if group.when_present.source() == InterpolationSource::Config {
-                            used.insert(group.when_present.query().to_string());
+                        if group.when.source() == InterpolationSource::Config {
+                            used.insert(group.when.query().to_string());
                         }
                         for arg in &group.argv.0 {
                             collect_program_config_paths(&arg.parts, &mut used);
@@ -782,7 +782,7 @@ fn program_used_config_paths(
                     }
                     ConfigPresence::Absent => {}
                     ConfigPresence::Runtime => {
-                        used.insert(group.when_present.query().to_string());
+                        used.insert(group.when.query().to_string());
                         for arg in &group.argv.0 {
                             collect_program_config_paths(&arg.parts, &mut used);
                         }
@@ -847,11 +847,13 @@ fn resolve_condition_presence_for_program(
                 }
             }
         }
-        InterpolationSource::Slots => Ok(if slot_query_is_present(slots, query)? {
-            ConfigPresence::Present
-        } else {
-            ConfigPresence::Absent
-        }),
+        InterpolationSource::Slots => Ok(
+            if slot_query_is_present(slots, query).map_err(MeshError::new)? {
+                ConfigPresence::Present
+            } else {
+                ConfigPresence::Absent
+            },
+        ),
         InterpolationSource::Bindings => Err(MeshError::new(format!(
             "unsupported conditional interpolation source bindings.{query}"
         ))),
@@ -859,21 +861,6 @@ fn resolve_condition_presence_for_program(
             "unsupported conditional interpolation source for `{source}.{query}`"
         ))),
     }
-}
-
-fn slot_query_is_present(
-    slots: &BTreeMap<String, SlotObject>,
-    query: &str,
-) -> Result<bool, MeshError> {
-    let parsed = crate::slot_query::parse_slot_query(query).map_err(|err| {
-        MeshError::new(format!(
-            "invalid slots interpolation 'slots.{query}': {err}"
-        ))
-    })?;
-    Ok(match parsed.target {
-        crate::slot_query::SlotTarget::All => !slots.is_empty(),
-        crate::slot_query::SlotTarget::Slot(slot) => slots.contains_key(slot),
-    })
 }
 
 fn resolve_optional_config_query_node<'a>(
@@ -1541,8 +1528,8 @@ fn append_program_command_item_templates(
             out.push(ProgramArgTemplate::Arg(ts));
         }
         ProgramArgItem::Group(group) => match resolve_condition_presence_for_program(
-            group.when_present.source(),
-            group.when_present.query(),
+            group.when.source(),
+            group.when.query(),
             template_opt,
             slots,
         )? {
@@ -1567,11 +1554,11 @@ fn append_program_command_item_templates(
                 }
             }
             ConfigPresence::Runtime => {
-                if group.when_present.source() != InterpolationSource::Config {
+                if group.when.source() != InterpolationSource::Config {
                     return Err(MeshError::new(format!(
                         "internal error: runtime conditional program arg group requires \
-                         config-based `when_present`, got `{}`",
-                        group.when_present
+                         config-based `when`, got `{}`",
+                        group.when
                     )));
                 }
                 let mut argv = Vec::with_capacity(group.argv.0.len());
@@ -1595,7 +1582,7 @@ fn append_program_command_item_templates(
                 *needs_helper_for_program_templates = true;
                 *needs_runtime_config_for_program_templates = true;
                 out.push(ProgramArgTemplate::Group(ConditionalProgramArgTemplate {
-                    when_present: group.when_present.query().to_string(),
+                    when: group.when.query().to_string(),
                     argv,
                 }));
             }

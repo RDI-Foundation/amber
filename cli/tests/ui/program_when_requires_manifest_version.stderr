@@ -1,0 +1,16 @@
+Error: manifest::program_syntax_requires_manifest_version
+
+  × check failed
+  ╰─▶ using conditional argument groups requires manifest_version >= 0.2.0,
+      but found 0.1.0
+    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/program_when_requires_manifest_version.json5:6:7]
+  5 │         args: [
+  6 │ ╭─▶       {
+  7 │ │           when: "config.profile",
+  8 │ │           argv: ["--profile", "${config.profile}"],
+  9 │ ├─▶       },
+    · ╰──── conditional argument group used here
+ 10 │         ],
+    ╰────
+  help: set `manifest_version` to "0.2.0" or remove conditional argument
+        groups

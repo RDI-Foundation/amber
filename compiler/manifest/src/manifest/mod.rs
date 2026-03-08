@@ -15,6 +15,7 @@ use serde_with::{MapPreventDuplicates, serde_as};
 use crate::{
     error::Error,
     framework::{framework_capabilities, framework_capability},
+    interpolation::ProgramArgItem,
     names::{BindingName, ChildName, ExportName, ProvideName, SlotName, ensure_name_no_dot},
     refs::{ManifestDigest, ManifestRef, ManifestUrl},
     schema::{
@@ -84,6 +85,56 @@ fn supported_manifest_version_req() -> &'static VersionReq {
         VersionReq::parse(SUPPORTED_MANIFEST_VERSION_REQ)
             .expect("supported manifest version requirement must be valid")
     })
+}
+
+struct UnsupportedProgramSyntax {
+    feature: &'static str,
+    pointer: String,
+}
+
+fn validate_program_syntax_manifest_version(
+    manifest_version: &Version,
+    program: Option<&Program>,
+) -> Result<(), Error> {
+    const REQUIRED_VERSION: &str = "0.2.0";
+
+    let required_version = Version::new(0, 2, 0);
+    if manifest_version >= &required_version {
+        return Ok(());
+    }
+
+    let Some(program) = program else {
+        return Ok(());
+    };
+
+    let Some(unsupported) = find_unsupported_program_syntax(program) else {
+        return Ok(());
+    };
+
+    Err(Error::UnsupportedProgramSyntaxForManifestVersion {
+        manifest_version: Box::new(manifest_version.clone()),
+        required_version: REQUIRED_VERSION,
+        feature: unsupported.feature,
+        pointer: unsupported.pointer,
+    })
+}
+
+fn find_unsupported_program_syntax(program: &Program) -> Option<UnsupportedProgramSyntax> {
+    let (items, field_pointer): (&[ProgramArgItem], &str) = match program {
+        Program::Image(program) => (&program.entrypoint.0, "/program/entrypoint"),
+        Program::Path(program) => (&program.args.0, "/program/args"),
+    };
+
+    for (idx, item) in items.iter().enumerate() {
+        if matches!(item, ProgramArgItem::Group(_)) {
+            return Some(UnsupportedProgramSyntax {
+                feature: "conditional argument groups",
+                pointer: format!("{field_pointer}/{idx}"),
+            });
+        }
+    }
+
+    None
 }
 
 struct ValidateCtx<'a> {
@@ -647,6 +698,8 @@ impl RawManifest {
             exports,
             metadata,
         } = self;
+
+        validate_program_syntax_manifest_version(&manifest_version, program.as_ref())?;
 
         if let Some(schema) = config_schema.as_ref() {
             ConfigSchema::validate_value(&schema.0)?;

@@ -3,16 +3,13 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use amber_config::ConfigNode;
 use amber_manifest::{
     InterpolatedPart, InterpolatedString, InterpolationSource, MountSource, ProgramArgItem,
+    SlotTarget, parse_slot_query,
 };
 use amber_scenario::{ComponentId, Scenario};
 use amber_template::TemplatePart;
 use serde_json::Value;
 
-use crate::{
-    binding_query::parse_binding_query,
-    config_templates,
-    slot_query::{SlotTarget, parse_slot_query},
-};
+use crate::{binding_query::parse_binding_query, config_templates};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct BindingUsage {
@@ -186,11 +183,11 @@ fn collect_program_used_config_paths(
                     template_opt,
                     scenario,
                     component_id,
-                    group.when_present.source(),
-                    group.when_present.query(),
+                    group.when.source(),
+                    group.when.query(),
                 ) {
-                    if group.when_present.source() == InterpolationSource::Config {
-                        used.insert(group.when_present.query().to_string());
+                    if group.when.source() == InterpolationSource::Config {
+                        used.insert(group.when.query().to_string());
                     }
                     for arg in &group.argv.0 {
                         record_program_config_parts(&arg.parts, &mut used);
@@ -242,17 +239,14 @@ fn conditional_path_may_be_present(
 
 fn slot_query_may_be_present(scenario: &Scenario, component_id: ComponentId, query: &str) -> bool {
     let Ok(parsed) = parse_slot_query(query) else {
-        return true;
+        return false;
     };
-    match parsed.target {
-        SlotTarget::All => scenario
-            .bindings
-            .iter()
-            .any(|binding| binding.to.component == component_id),
-        SlotTarget::Slot(slot) => scenario.bindings.iter().any(|binding| {
-            binding.to.component == component_id && binding.to.name.as_str() == slot
-        }),
-    }
+    let SlotTarget::Slot(slot_name) = parsed.target else {
+        return false;
+    };
+    scenario.bindings.iter().any(|binding| {
+        binding.to.component == component_id && binding.to.name.as_str() == slot_name
+    })
 }
 
 fn resolve_optional_config_node_path<'a>(
