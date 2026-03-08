@@ -755,6 +755,28 @@ fn validate_bindings(scenario: &Scenario) -> Result<(), ScenarioIrError> {
                     provide_decl.decl.clone(),
                 )
             }
+            BindingFrom::Resource(resource) => {
+                ensure_name_no_dot(&resource.name)?;
+                let component = component_ref(&scenario.components, resource.component, || {
+                    format!("binding source for {}", binding.to.name)
+                })?;
+                let resource_decl =
+                    component
+                        .resources
+                        .get(resource.name.as_str())
+                        .ok_or_else(|| {
+                            invalid_scenario(format!(
+                                "binding into {target_label} references missing resource \
+                                 {}.resources.{}",
+                                component.moniker.as_str(),
+                                resource.name
+                            ))
+                        })?;
+                (
+                    format!("{}.resources.{}", component.moniker.as_str(), resource.name),
+                    CapabilityDecl::builder().kind(resource_decl.kind).build(),
+                )
+            }
             BindingFrom::Framework(name) => {
                 let spec = framework_capability(name.as_str()).ok_or_else(|| {
                     invalid_scenario(format!(

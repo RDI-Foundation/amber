@@ -874,13 +874,9 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
     let compose_yaml = serde_yaml::to_string(&compose).map_err(|e| {
         DockerComposeError::Other(format!("failed to serialize docker-compose yaml: {e}"))
     })?;
-    let execution_guide = build_execution_guide(
-        &output.scenario,
-        &mesh_plan,
-        &config_plan,
-        !storage_plan.is_empty(),
-    )
-    .map_err(|err: ReporterError| DockerComposeError::Other(err.to_string()))?;
+    let execution_guide =
+        build_execution_guide(scenario, &mesh_plan, &config_plan, !storage_plan.is_empty())
+            .map_err(|err: ReporterError| DockerComposeError::Other(err.to_string()))?;
     let mut files = BTreeMap::new();
     files.insert(PathBuf::from(GENERATED_COMPOSE_FILENAME), compose_yaml);
     files.insert(

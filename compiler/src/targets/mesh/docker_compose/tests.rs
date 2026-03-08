@@ -546,9 +546,7 @@ fn compose_emits_storage_volume_mounts() {
         exports: Vec::new(),
     };
 
-    let artifact = DockerComposeReporter
-        .emit(&compile_output(scenario))
-        .expect("compose render ok");
+    let artifact = render_compose(&compile_output(scenario)).expect("compose render ok");
     let compose = parse_compose(&artifact);
     assert!(
         compose.volumes.contains_key("amber-storage-root-state"),
@@ -1349,9 +1347,8 @@ fn compose_emits_named_volumes_for_storage_mounts() {
         exports: Vec::new(),
     };
 
-    let artifact = DockerComposeReporter
-        .emit(&compile_output(scenario))
-        .expect("compose render should succeed");
+    let artifact =
+        render_compose(&compile_output(scenario)).expect("compose render should succeed");
     let compose = parse_compose(&artifact);
 
     assert!(
@@ -3059,6 +3056,7 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
     assert_eq!(admin_port, 80);
 }
 
+#[test]
 #[ignore = "requires docker + docker compose; run manually"]
 fn docker_smoke_storage_persists_across_upgrade() {
     use std::{
@@ -3233,12 +3231,11 @@ fn docker_smoke_storage_persists_across_upgrade() {
         .collect::<Vec<_>>();
     let _compose_guard = ComposeGuard::new(project, envs_owned);
 
-    let v1 = DockerComposeReporter
-        .emit(&compile_output(storage_scenario(
-            "version-v1",
-            "persisted-v1",
-        )))
-        .expect("compose render v1");
+    let v1 = render_compose(&compile_output(storage_scenario(
+        "version-v1",
+        "persisted-v1",
+    )))
+    .expect("compose render v1");
     fs::write(project.join(super::COMPOSE_FILENAME), v1.compose_yaml()).unwrap();
 
     let compose = |args: &[&str]| {
@@ -3278,12 +3275,11 @@ fn docker_smoke_storage_persists_across_upgrade() {
     );
     drop(proxy);
 
-    let v2 = DockerComposeReporter
-        .emit(&compile_output(storage_scenario(
-            "version-v2",
-            "persisted-v2",
-        )))
-        .expect("compose render v2");
+    let v2 = render_compose(&compile_output(storage_scenario(
+        "version-v2",
+        "persisted-v2",
+    )))
+    .expect("compose render v2");
     fs::write(project.join(super::COMPOSE_FILENAME), v2.compose_yaml()).unwrap();
 
     let status = compose(&["up", "-d"]).status().unwrap();
@@ -3314,58 +3310,6 @@ fn docker_smoke_storage_persists_across_upgrade() {
 }
 
 #[test]
-fn docker_compose_rejects_framework_bindings() {
-    let program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["sh", "-lc", "sleep infinity"]
-    }))
-    .unwrap();
-
-    let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: Some(program),
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
-    };
-
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root)],
-        bindings: vec![BindingEdge {
-            name: None,
-            from: BindingFrom::Framework(
-                FrameworkCapabilityName::try_from("dynamic_children").unwrap(),
-            ),
-            to: SlotRef {
-                component: ComponentId(0),
-                name: "control".to_string(),
-            },
-            weak: false,
-        }],
-        exports: Vec::new(),
-    };
-
-    let output = compile_output(scenario);
-    let err = DockerComposeReporter.emit(&output).unwrap_err();
-    let message = err.to_string();
-    assert!(
-        message.contains("framework.dynamic_children"),
-        "unexpected error: {message}"
-    );
-    assert!(
-        message.contains("docker-compose reporter does not support unknown framework binding"),
-        "unexpected error: {message}"
-    );
-}
 #[ignore = "requires docker + docker compose; run manually"]
 fn docker_smoke_ocap_blocks_unbound_callers() {
     use std::{fs, process::Command};

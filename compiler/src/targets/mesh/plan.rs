@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use amber_manifest::{
-    CapabilityKind, FrameworkBindingShape, FrameworkCapabilityName, Manifest, NetworkProtocol,
+    CapabilityKind, FrameworkBindingShape, FrameworkCapabilityName, NetworkProtocol,
     framework_capability,
 };
 use amber_scenario::{BindingFrom, ComponentId, Scenario};

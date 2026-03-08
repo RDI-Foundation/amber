@@ -2814,41 +2814,6 @@ fn validate_all_slots_bound(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
-
-    use amber_manifest::Manifest;
-
-    use super::collect_program_slot_uses;
-
-    #[test]
-    fn collect_program_slot_uses_includes_slot_conditions() {
-        let manifest: Manifest = r#"
-            {
-              manifest_version: "0.2.0",
-              program: {
-                image: "app",
-                entrypoint: [
-                  "app",
-                  { when: "slots.api", argv: ["--serve"] },
-                ],
-              },
-              slots: {
-                api: { kind: "http" },
-              },
-            }
-        "#
-        .parse()
-        .expect("manifest");
-
-        assert_eq!(
-            collect_program_slot_uses(&manifest),
-            HashSet::from(["api".to_string()])
-        );
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn validate_storage_mounts(
     components: &[Option<Component>],
@@ -2997,5 +2962,40 @@ fn validate_storage_mounts(
             span,
             related,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use amber_manifest::Manifest;
+
+    use super::collect_program_slot_uses;
+
+    #[test]
+    fn collect_program_slot_uses_includes_slot_conditions() {
+        let manifest: Manifest = r#"
+            {
+              manifest_version: "0.2.0",
+              program: {
+                image: "app",
+                entrypoint: [
+                  "app",
+                  { when: "slots.api", argv: ["--serve"] },
+                ],
+              },
+              slots: {
+                api: { kind: "http" },
+              },
+            }
+        "#
+        .parse()
+        .expect("manifest");
+
+        assert_eq!(
+            collect_program_slot_uses(&manifest),
+            HashSet::from(["api".to_string()])
+        );
     }
 }

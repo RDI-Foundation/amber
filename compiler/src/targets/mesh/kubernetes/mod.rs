@@ -105,8 +105,8 @@ pub struct KubernetesArtifact {
 impl Reporter for KubernetesReporter {
     type Artifact = KubernetesArtifact;
 
-    fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError> {
-        render_kubernetes(output)
+    fn emit(&self, compiled: &CompiledScenario) -> Result<Self::Artifact, ReporterError> {
+        render_kubernetes(compiled)
     }
 }
 
@@ -154,11 +154,13 @@ type KubernetesResult<T> = Result<T, ReporterError>;
 pub fn render_kubernetes_with_output(
     output: &CompileOutput,
 ) -> KubernetesResult<KubernetesArtifact> {
-    render_kubernetes(output)
+    let compiled = CompiledScenario::from_compile_output(output)
+        .map_err(|err| ReporterError::new(err.to_string()))?;
+    render_kubernetes(&compiled)
 }
 
-fn render_kubernetes(output: &CompileOutput) -> KubernetesResult<KubernetesArtifact> {
-    let s = &output.scenario;
+fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<KubernetesArtifact> {
+    let s = compiled.scenario();
     let scenario_digest =
         scenario_ir_digest(s).map_err(|err| ReporterError::new(err.to_string()))?;
     let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
@@ -197,7 +199,6 @@ fn render_kubernetes(output: &CompileOutput) -> KubernetesResult<KubernetesArtif
                 netpol: format!("{base}-netpol"),
             }
         });
-    let root_manifest = mesh_plan.root_manifest.as_ref();
     let provisioner_job_name = provisioner_job_name(&scenario_digest);
     let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
 
@@ -1495,12 +1496,8 @@ fn render_kubernetes(output: &CompileOutput) -> KubernetesResult<KubernetesArtif
         files.insert(PathBuf::from(PROXY_METADATA_FILENAME), proxy_json);
     }
 
-    let execution_guide = build_execution_guide(
-        &output.scenario,
-        &mesh_plan,
-        &config_plan,
-        !storage_plan.is_empty(),
-    )?;
+    let execution_guide =
+        build_execution_guide(s, &mesh_plan, &config_plan, !storage_plan.is_empty())?;
     let mut rollout_commands: Vec<String> = program_components
         .iter()
         .map(|id| {

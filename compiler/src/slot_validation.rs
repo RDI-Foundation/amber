@@ -554,7 +554,7 @@ fn validate_interpolated_string(
                         }));
                     }
                 }
-            }
+            },
             Err(err) => {
                 let help = slot_query_help(None, &err);
                 diagnostics.push(Report::new(InvalidSlotsInterpolation {

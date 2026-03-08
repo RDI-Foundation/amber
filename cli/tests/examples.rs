@@ -58,8 +58,9 @@ fn examples_compile_from_ir_matches_manifest_outputs() {
             continue;
         }
 
+        let safe_name = example.name.replace('/', "-");
         let temp = tempfile::Builder::new()
-            .prefix(&format!("example-ir-{}-", example.name))
+            .prefix(&format!("example-ir-{safe_name}-"))
             .tempdir_in(&outputs_root)
             .expect("failed to create temp output directory");
         let manifest_outputs = temp.path().join("manifest");
@@ -254,11 +255,11 @@ fn collect_scenario_variants(dir: &Path) -> Vec<PathBuf> {
     let mut manifests = Vec::new();
 
     while let Some(path) = stack.pop() {
-        let entries =
-            fs::read_dir(&path).unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        let entries = fs::read_dir(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
         for entry in entries {
-            let entry =
-                entry.unwrap_or_else(|err| panic!("failed to read {} entry: {err}", path.display()));
+            let entry = entry
+                .unwrap_or_else(|err| panic!("failed to read {} entry: {err}", path.display()));
             let entry_path = entry.path();
             if entry_path.is_dir() {
                 stack.push(entry_path);

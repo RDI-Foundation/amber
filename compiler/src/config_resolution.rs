@@ -20,6 +20,15 @@ pub(crate) fn validate_config_query_syntax(query: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn parse_query_segments(query: &str) -> Result<Vec<&str>, String> {
+    validate_config_query_syntax(query)?;
+    if query.is_empty() {
+        Ok(Vec::new())
+    } else {
+        Ok(query.split('.').collect())
+    }
+}
+
 pub(crate) fn resolve_config_query_node<'a>(
     template: &'a rc::ConfigNode,
     query: &str,
@@ -28,8 +37,7 @@ pub(crate) fn resolve_config_query_node<'a>(
         return Ok(QueryResolution::Node(template));
     }
 
-    validate_config_query_syntax(query)?;
-    let segments = query.split('.').collect::<Vec<_>>();
+    let segments = parse_query_segments(query)?;
 
     let mut current = template;
     for (idx, seg) in segments.iter().enumerate() {
@@ -135,7 +143,8 @@ mod tests {
     use amber_manifest::InterpolatedString;
 
     use super::{
-        render_static_config_string, resolve_config_query_node, validate_config_query_syntax,
+        parse_query_segments, render_static_config_string, resolve_config_query_node,
+        validate_config_query_syntax,
     };
 
     #[test]
@@ -152,6 +161,14 @@ mod tests {
             super::QueryResolution::RuntimePath(path) => assert_eq!(path, "storage.size"),
             super::QueryResolution::Node(_) => panic!("expected runtime path"),
         }
+    }
+
+    #[test]
+    fn parse_query_segments_preserves_order() {
+        assert_eq!(
+            parse_query_segments("storage.size").unwrap(),
+            vec!["storage", "size"]
+        );
     }
 
     #[test]

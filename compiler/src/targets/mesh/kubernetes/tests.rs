@@ -52,6 +52,12 @@ fn compiled_scenario(output: &crate::CompileOutput) -> crate::reporter::Compiled
         .expect("test compiler output should convert to compiled Scenario")
 }
 
+fn render_artifact(output: &crate::CompileOutput) -> super::KubernetesArtifact {
+    KubernetesReporter
+        .emit(&compiled_scenario(output))
+        .expect("render kubernetes output")
+}
+
 fn use_prebuilt_images() -> bool {
     std::env::var("AMBER_TEST_USE_PREBUILT_IMAGES").is_ok()
 }
@@ -792,9 +798,7 @@ fn compile_fixture(manifest_path: &Path) -> super::KubernetesArtifact {
         .block_on(compiler.compile(ManifestRef::from_url(file_url(manifest_path)), opts))
         .expect("compile scenario");
 
-    KubernetesReporter
-        .emit(&output)
-        .expect("render kubernetes output")
+    render_artifact(&output)
 }
 
 impl Drop for PortForwardGuard {
@@ -881,9 +885,7 @@ fn kubernetes_namespace_and_metadata_digest_follow_scenario_ir() {
             .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
             .expect("compile scenario");
 
-        let artifact = KubernetesReporter
-            .emit(&output)
-            .expect("render kubernetes output");
+        let artifact = render_artifact(&output);
 
         let kustomization = artifact
             .files
@@ -994,9 +996,7 @@ fn kubernetes_emits_router_for_external_slots() {
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
         .expect("compile scenario");
 
-    let artifact = KubernetesReporter
-        .emit(&output)
-        .expect("render kubernetes output");
+    let artifact = render_artifact(&output);
 
     let router_deploy = artifact
         .files
@@ -1231,9 +1231,7 @@ fn kubernetes_emits_deployment_and_pvc_for_storage_mounts() {
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&scenario_path)), opts))
         .expect("compile kubernetes storage scenario");
 
-    let artifact = KubernetesReporter
-        .emit(&output)
-        .expect("render kubernetes output");
+    let artifact = render_artifact(&output);
 
     assert!(
         !artifact
@@ -1348,9 +1346,7 @@ fn kubernetes_emits_otelcol_and_wires_otel_env() {
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
         .expect("compile scenario");
 
-    let artifact = KubernetesReporter
-        .emit(&output)
-        .expect("render kubernetes output");
+    let artifact = render_artifact(&output);
 
     let otelcol_config = artifact
         .files
@@ -1757,9 +1753,7 @@ fn kubernetes_smoke_config_roundtrip() {
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&scenario_path)), opts))
         .expect("compile kubernetes scenario");
 
-    let artifact = KubernetesReporter
-        .emit(&output)
-        .expect("render kubernetes output");
+    let artifact = render_artifact(&output);
 
     let dir = tempdir().expect("create temp dir");
     let kubeconfig = dir.path().join("kubeconfig");
@@ -1935,9 +1929,7 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
         .expect("compile scenario");
 
-    let artifact = KubernetesReporter
-        .emit(&output)
-        .expect("render kubernetes output");
+    let artifact = render_artifact(&output);
 
     let output_dir = dir.path().join("kubernetes");
     write_kubernetes_output(&output_dir, &artifact);
@@ -2318,9 +2310,7 @@ sleep infinity
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
         .expect("compile scenario");
 
-    let artifact = KubernetesReporter
-        .emit(&output)
-        .expect("render kubernetes output");
+    let artifact = render_artifact(&output);
 
     let output_dir = dir.path().join("kubernetes");
     write_kubernetes_output(&output_dir, &artifact);
@@ -2583,9 +2573,7 @@ fn kubernetes_smoke_export_routes_to_host() {
         .block_on(compiler.compile(ManifestRef::from_url(file_url(&root_path)), opts))
         .expect("compile scenario");
 
-    let artifact = KubernetesReporter
-        .emit(&output)
-        .expect("render kubernetes output");
+    let artifact = render_artifact(&output);
 
     let output_dir = dir.path().join("kubernetes");
     write_kubernetes_output(&output_dir, &artifact);

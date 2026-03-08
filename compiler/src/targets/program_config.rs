@@ -19,7 +19,10 @@ use serde_json::Value;
 
 use crate::{
     binding_query::{BindingObject, parse_binding_query, resolve_binding_query},
-    config_resolution::{QueryResolution, resolve_config_query_node, validate_config_query_syntax},
+    config_resolution::{
+        QueryResolution, parse_query_segments, resolve_config_query_node,
+        validate_config_query_syntax,
+    },
     config_scope::{RuntimeConfigView, build_runtime_config_view},
     config_templates,
     slot_query::{SlotObject, resolve_slot_query, slot_query_is_present},

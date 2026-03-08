@@ -15,10 +15,10 @@ use serde_with::{MapPreventDuplicates, serde_as};
 use crate::{
     error::Error,
     framework::{framework_capabilities, framework_capability},
+    interpolation::ProgramArgItem,
     names::{
         BindingName, ChildName, ExportName, ProvideName, ResourceName, SlotName, ensure_name_no_dot,
     },
-    interpolation::ProgramArgItem,
     refs::{ManifestDigest, ManifestRef, ManifestUrl},
     schema::{
         Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityKind, ComponentDecl,

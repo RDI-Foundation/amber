@@ -298,7 +298,6 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
     let startup_order_ids = startup_order.iter().map(|id| id.0).collect::<Vec<_>>();
     let components = build_component_plans(DirectComponentPlanInputs {
         scenario,
-        provenance: &output.provenance,
         mesh_plan: &mesh_plan,
         config_plan: &config_plan,
         storage_plan: &storage_plan,
@@ -359,13 +358,9 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
         files.insert(PathBuf::from(DEFAULT_EXTERNAL_ENV_FILE), env_content);
     }
 
-    let execution_guide = build_execution_guide(
-        &output.scenario,
-        &mesh_plan,
-        &config_plan,
-        !storage_plan.is_empty(),
-    )
-    .map_err(|err: ReporterError| MeshError::new(err.to_string()))?;
+    let execution_guide =
+        build_execution_guide(scenario, &mesh_plan, &config_plan, !storage_plan.is_empty())
+            .map_err(|err: ReporterError| MeshError::new(err.to_string()))?;
     files.insert(
         PathBuf::from(GENERATED_ENV_SAMPLE_FILENAME),
         execution_guide.render_env_sample(false, "direct"),
@@ -381,7 +376,6 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
 
 struct DirectComponentPlanInputs<'a> {
     scenario: &'a Scenario,
-    provenance: &'a crate::Provenance,
     mesh_plan: &'a MeshPlan,
     config_plan: &'a crate::targets::program_config::ConfigPlan,
     storage_plan: &'a StoragePlan,
@@ -396,7 +390,6 @@ fn build_component_plans(
 ) -> Result<Vec<DirectComponentPlan>, MeshError> {
     let DirectComponentPlanInputs {
         scenario,
-        provenance,
         mesh_plan,
         config_plan,
         storage_plan,

@@ -779,7 +779,9 @@ async fn compile(args: CompileArgs) -> Result<()> {
     }
 
     if let Some(kubernetes_dest) = outputs.kubernetes {
-        let artifact = KubernetesReporter.emit(&compiled).map_err(miette::Report::new)?;
+        let artifact = KubernetesReporter
+            .emit(&compiled)
+            .map_err(miette::Report::new)?;
         write_kubernetes_output(&kubernetes_dest, &artifact)?;
     }
 
