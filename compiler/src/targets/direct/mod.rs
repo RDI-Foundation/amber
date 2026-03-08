@@ -6,7 +6,7 @@ use std::{
 use amber_manifest::MountSource;
 use amber_mesh::{MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProvisionOutput};
 use amber_scenario::{ComponentId, Scenario};
-use amber_template::{TemplatePart, TemplateSpec};
+use amber_template::{ProgramArgTemplate, TemplatePart, TemplateSpec};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -571,7 +571,7 @@ fn resolve_helper_template_spec_payload(
     let Some(path_template) = spec.program.entrypoint.first_mut() else {
         return Err(MeshError::new("template spec program entrypoint is empty"));
     };
-    *path_template = vec![TemplatePart::lit(resolved)];
+    *path_template = ProgramArgTemplate::Arg(vec![TemplatePart::lit(resolved)]);
 
     let encoded = serde_json::to_vec(&spec)
         .map_err(|err| MeshError::new(format!("failed to encode template spec payload: {err}")))?;
@@ -589,7 +589,16 @@ fn decode_template_spec_program(raw_b64: &str) -> Result<String, MeshError> {
         .entrypoint
         .first()
         .ok_or_else(|| MeshError::new("template spec program entrypoint is empty"))?;
-    render_template_string_literal(path_template)
+    render_program_arg_template_literal(path_template)
+}
+
+fn render_program_arg_template_literal(arg: &ProgramArgTemplate) -> Result<String, MeshError> {
+    let ProgramArgTemplate::Arg(parts) = arg else {
+        return Err(MeshError::new(
+            "internal error: template spec program entrypoint starts with a conditional arg group",
+        ));
+    };
+    render_template_string_literal(parts)
 }
 
 fn render_template_string_literal(parts: &[TemplatePart]) -> Result<String, MeshError> {
@@ -1006,9 +1015,9 @@ mod tests {
         let spec = TemplateSpec {
             program: amber_template::ProgramTemplateSpec {
                 entrypoint: vec![
-                    vec![TemplatePart::lit("./bin/server")],
-                    vec![TemplatePart::lit("--port")],
-                    vec![TemplatePart::lit("8080")],
+                    ProgramArgTemplate::Arg(vec![TemplatePart::lit("./bin/server")]),
+                    ProgramArgTemplate::Arg(vec![TemplatePart::lit("--port")]),
+                    ProgramArgTemplate::Arg(vec![TemplatePart::lit("8080")]),
                 ],
                 env: BTreeMap::new(),
             },
@@ -1029,7 +1038,7 @@ mod tests {
 
         assert_eq!(
             spec.program.entrypoint[0],
-            vec![TemplatePart::lit("/workspace/app/./bin/server")]
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("/workspace/app/./bin/server")])
         );
     }
 
