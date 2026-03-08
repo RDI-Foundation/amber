@@ -76,6 +76,7 @@ fn flatten_removes_pure_routing_nodes_and_preserves_debug_data() {
             entrypoint: ["child"],
             network: { endpoints: [{ name: "cap", port: 80 }] },
           },
+          slots: { input: { kind: "http" } },
           provides: { cap: { kind: "http", endpoint: "cap" } },
           exports: { cap: "cap" },
         }
@@ -135,7 +136,7 @@ fn flatten_removes_pure_routing_nodes_and_preserves_debug_data() {
             }),
             to: SlotRef {
                 component: ComponentId(2),
-                name: "cap".to_string(),
+                name: "input".to_string(),
             },
             weak: true,
         }],

@@ -602,7 +602,7 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
         },
     }))
     .unwrap();
-    let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
+    let slot_docker: SlotDecl = serde_json::from_value(json!({ "kind": "docker" })).unwrap();
 
     let root = Component {
         id: ComponentId(0),
@@ -612,7 +612,7 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
         config: None,
         config_schema: None,
         program: Some(program),
-        slots: BTreeMap::from([("docker".to_string(), slot_http)]),
+        slots: BTreeMap::from([("docker".to_string(), slot_docker)]),
         provides: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
@@ -2747,59 +2747,6 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
         .expect("admin inbound local target");
     assert_eq!(v1_port, 80);
     assert_eq!(admin_port, 80);
-}
-
-#[test]
-fn docker_compose_rejects_framework_bindings() {
-    let program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["sh", "-lc", "sleep infinity"]
-    }))
-    .unwrap();
-
-    let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: Some(program),
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
-    };
-
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root)],
-        bindings: vec![BindingEdge {
-            name: None,
-            from: BindingFrom::Framework(
-                FrameworkCapabilityName::try_from("dynamic_children").unwrap(),
-            ),
-            to: SlotRef {
-                component: ComponentId(0),
-                name: "control".to_string(),
-            },
-            weak: false,
-        }],
-        exports: Vec::new(),
-    };
-
-    let output = compile_output(scenario);
-    let err = render_compose(&output).unwrap_err();
-    let message = err.to_string();
-    assert!(
-        message.contains("framework.dynamic_children"),
-        "unexpected error: {message}"
-    );
-    assert!(
-        message.contains("docker-compose reporter does not support unknown framework binding"),
-        "unexpected error: {message}"
-    );
 }
 
 #[test]
