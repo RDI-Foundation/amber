@@ -462,6 +462,219 @@ fn dce_keeps_dependencies_for_program_slots() {
 }
 
 #[test]
+fn dce_keeps_dependencies_for_repeated_slot_each() {
+    let root: Manifest = r##"
+    {
+      manifest_version: "0.3.0",
+      components: {
+        consumer: "file:///consumer.json5",
+        provider: "file:///provider.json5",
+      },
+      exports: { out: "#consumer.out" },
+    }
+    "##
+    .parse()
+    .unwrap();
+
+    let consumer: Manifest = r##"
+        {
+          manifest_version: "0.3.0",
+          program: {
+            image: "consumer",
+            entrypoint: [
+              "consumer",
+              {
+                each: "slots.api",
+                argv: ["--api", "${item.url}"],
+              },
+            ],
+            network: { endpoints: [{ name: "out", port: 80 }] },
+          },
+          slots: {
+            api: { kind: "http", optional: true, multiple: true },
+          },
+          provides: { out: { kind: "http", endpoint: "out" } },
+          exports: { out: "out" },
+        }
+    "##
+    .parse()
+    .unwrap();
+
+    let out_decl = consumer
+        .provides()
+        .get("out")
+        .expect("consumer provides out")
+        .decl
+        .clone();
+
+    let provider: Manifest = r##"
+        {
+          manifest_version: "0.3.0",
+          program: {
+            image: "provider",
+            entrypoint: ["provider"],
+            network: { endpoints: [{ name: "api", port: 80 }] },
+          },
+          provides: { api: { kind: "http", endpoint: "api" } },
+          exports: { api: "api" },
+        }
+    "##
+    .parse()
+    .unwrap();
+
+    let mut components = vec![
+        Some(component(0, "/")),
+        Some(component(1, "/consumer")),
+        Some(component(2, "/provider")),
+    ];
+    apply_component_manifest(&mut components, 0, &root);
+    apply_component_manifest(&mut components, 1, &consumer);
+    apply_component_manifest(&mut components, 2, &provider);
+    connect_parent_child(&mut components, 0, 1);
+    connect_parent_child(&mut components, 0, 2);
+
+    let bindings = vec![component_binding(2, "api", 1, "api")];
+
+    let mut scenario = Scenario {
+        root: ComponentId(0),
+        components,
+        bindings,
+        exports: vec![scenario_export("out", out_decl, 1, "out")],
+    };
+    scenario.normalize_order();
+
+    let scenario = dce_only(scenario);
+
+    assert!(
+        scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|c| c.moniker.local_name() == Some("provider"))
+    );
+    assert!(scenario.bindings.iter().any(|edge| {
+        matches!(&edge.from, BindingFrom::Component(from) if from.name == "api")
+            && edge.to.name == "api"
+    }));
+}
+
+#[test]
+fn dce_prunes_dependency_when_repeated_slot_each_is_dead() {
+    let root: Manifest = r##"
+    {
+      manifest_version: "0.3.0",
+      components: {
+        live: "file:///live.json5",
+        dead: "file:///dead.json5",
+        provider: "file:///provider.json5",
+      },
+      exports: { out: "#live.out" },
+    }
+    "##
+    .parse()
+    .unwrap();
+
+    let live: Manifest = r##"
+        {
+          manifest_version: "0.3.0",
+          program: {
+            image: "live",
+            entrypoint: ["live"],
+            network: { endpoints: [{ name: "out", port: 80 }] },
+          },
+          provides: { out: { kind: "http", endpoint: "out" } },
+          exports: { out: "out" },
+        }
+    "##
+    .parse()
+    .unwrap();
+    let out_decl = live
+        .provides()
+        .get("out")
+        .expect("live provides out")
+        .decl
+        .clone();
+
+    let dead: Manifest = r##"
+        {
+          manifest_version: "0.3.0",
+          program: {
+            image: "dead",
+            entrypoint: [
+              "dead",
+              {
+                each: "slots.api",
+                argv: ["--api", "${item.url}"],
+              },
+            ],
+          },
+          slots: {
+            api: { kind: "http", optional: true, multiple: true },
+          },
+        }
+    "##
+    .parse()
+    .unwrap();
+
+    let provider: Manifest = r##"
+        {
+          manifest_version: "0.3.0",
+          program: {
+            image: "provider",
+            entrypoint: ["provider"],
+            network: { endpoints: [{ name: "api", port: 80 }] },
+          },
+          provides: { api: { kind: "http", endpoint: "api" } },
+          exports: { api: "api" },
+        }
+    "##
+    .parse()
+    .unwrap();
+
+    let mut components = vec![
+        Some(component(0, "/")),
+        Some(component(1, "/live")),
+        Some(component(2, "/dead")),
+        Some(component(3, "/provider")),
+    ];
+    apply_component_manifest(&mut components, 0, &root);
+    apply_component_manifest(&mut components, 1, &live);
+    apply_component_manifest(&mut components, 2, &dead);
+    apply_component_manifest(&mut components, 3, &provider);
+    connect_parent_child(&mut components, 0, 1);
+    connect_parent_child(&mut components, 0, 2);
+    connect_parent_child(&mut components, 0, 3);
+
+    let bindings = vec![component_binding(3, "api", 2, "api")];
+
+    let mut scenario = Scenario {
+        root: ComponentId(0),
+        components,
+        bindings,
+        exports: vec![scenario_export("out", out_decl, 1, "out")],
+    };
+    scenario.normalize_order();
+
+    let scenario = dce_only(scenario);
+
+    assert!(
+        !scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|c| c.moniker.local_name() == Some("dead"))
+    );
+    assert!(
+        !scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|c| c.moniker.local_name() == Some("provider"))
+    );
+    assert!(scenario.bindings.is_empty());
+}
+
+#[test]
 fn dce_keeps_program_slots_from_env() {
     let root: Manifest = r##"
         {

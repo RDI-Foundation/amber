@@ -35,6 +35,10 @@ pub enum Error {
     #[diagnostic(code(manifest::invalid_when_path))]
     InvalidWhenPath { input: String, message: String },
 
+    #[error("invalid `each` path `{input}`: {message}")]
+    #[diagnostic(code(manifest::invalid_each_path))]
+    InvalidEachPath { input: String, message: String },
+
     #[error("invalid component ref `{input}`: {message}")]
     #[diagnostic(code(manifest::invalid_component_ref))]
     InvalidComponentRef { input: String, message: String },

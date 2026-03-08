@@ -1120,7 +1120,8 @@ mod tests {
                         "input": {
                             "kind": "mcp",
                             "profile": null,
-                            "optional": false
+                            "optional": false,
+                            "multiple": false
                         }
                     },
                     "provides": {

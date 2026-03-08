@@ -667,6 +667,79 @@ async fn binding_rejects_missing_child_slot() {
 }
 
 #[tokio::test]
+async fn binding_rejects_duplicate_target_for_singular_child_slot() {
+    let dir = tmp_dir("scenario-duplicate-singular-binding");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+    let provider_a_path = dir.path().join("provider-a.json5");
+    let provider_b_path = dir.path().join("provider-b.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "child",
+            entrypoint: ["child"],
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          slots: { api: { kind: "http" } },
+        }
+        "#,
+    );
+    for provider_path in [&provider_a_path, &provider_b_path] {
+        write_file(
+            provider_path,
+            r#"
+            {
+              manifest_version: "0.1.0",
+              program: {
+                image: "provider",
+                entrypoint: ["provider"],
+                network: { endpoints: [{ name: "api", port: 80 }] },
+              },
+              provides: { api: { kind: "http", endpoint: "api" } },
+              exports: { api: "api" },
+            }
+            "#,
+        );
+    }
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              components: {{
+                child: "{child}",
+                provider_a: "{provider_a}",
+                provider_b: "{provider_b}",
+              }},
+              bindings: [
+                {{ to: "#child.api", from: "#provider_a.api" }},
+                {{ to: "#child.api", from: "#provider_b.api" }},
+              ],
+            }}
+            "##,
+            child = file_url(&child_path),
+            provider_a = file_url(&provider_a_path),
+            provider_b = file_url(&provider_b_path),
+        ),
+    );
+
+    let compiler = default_compiler();
+    let root_ref = manifest_ref_for_path(&root_path);
+
+    let err = compiler
+        .compile(root_ref, standard_compile_options())
+        .await
+        .unwrap_err();
+
+    assert!(error_contains(&err, "bound more than once"));
+}
+
+#[tokio::test]
 async fn config_validation_error_points_to_invalid_value() {
     use miette::Diagnostic;
 
@@ -1644,6 +1717,159 @@ async fn slot_forwarding_and_export_chain_resolve_to_provider() {
         ),
         "expected consumer.api bound from root.api, got {:?}",
         binding.from
+    );
+}
+
+#[tokio::test]
+async fn variadic_slot_forwarding_preserves_all_sources_and_authored_order() {
+    let dir = tmp_dir("scenario-variadic-slot-forwarding");
+    let root_path = dir.path().join("root.json5");
+    let relay_path = dir.path().join("relay.json5");
+    let consumer_path = dir.path().join("consumer.json5");
+    let provider_a_path = dir.path().join("provider-a.json5");
+    let provider_b_path = dir.path().join("provider-b.json5");
+
+    write_file(
+        &provider_a_path,
+        r#"
+        {
+          manifest_version: "0.3.0",
+          program: {
+            image: "provider-a",
+            entrypoint: ["provider-a"],
+            network: { endpoints: [{ name: "api", port: 80 }] },
+          },
+          provides: { api: { kind: "http", endpoint: "api" } },
+          exports: { api: "api" },
+        }
+        "#,
+    );
+    write_file(
+        &provider_b_path,
+        r#"
+        {
+          manifest_version: "0.3.0",
+          program: {
+            image: "provider-b",
+            entrypoint: ["provider-b"],
+            network: { endpoints: [{ name: "api", port: 80 }] },
+          },
+          provides: { api: { kind: "http", endpoint: "api" } },
+          exports: { api: "api" },
+        }
+        "#,
+    );
+    write_file(
+        &consumer_path,
+        r#"
+        {
+          manifest_version: "0.3.0",
+          program: {
+            image: "consumer",
+            entrypoint: [
+              "consumer",
+              {
+                each: "slots.upstream",
+                argv: ["--upstream", "${item.url}"],
+              },
+            ],
+            network: { endpoints: [{ name: "http", port: 80 }] },
+          },
+          slots: {
+            upstream: { kind: "http", optional: true, multiple: true },
+          },
+          provides: { http: { kind: "http", endpoint: "http" } },
+          exports: { http: "http" },
+        }
+        "#,
+    );
+    write_file(
+        &relay_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.3.0",
+              slots: {{
+                upstream: {{ kind: "http", optional: true, multiple: true }},
+              }},
+              components: {{
+                consumer: "{consumer}",
+              }},
+              bindings: [
+                {{ to: "#consumer.upstream", from: "self.upstream" }},
+              ],
+              exports: {{ http: "#consumer.http" }},
+            }}
+            "##,
+            consumer = file_url(&consumer_path),
+        ),
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.3.0",
+              components: {{
+                relay: "{relay}",
+                provider_a: "{provider_a}",
+                provider_b: "{provider_b}",
+              }},
+              bindings: [
+                {{ to: "#relay.upstream", from: "#provider_a.api" }},
+                {{ to: "#relay.upstream", from: "#provider_b.api" }},
+              ],
+              exports: {{ http: "#relay.http" }},
+            }}
+            "##,
+            relay = file_url(&relay_path),
+            provider_a = file_url(&provider_a_path),
+            provider_b = file_url(&provider_b_path),
+        ),
+    );
+
+    let compiler = default_compiler();
+    let root_ref = manifest_ref_for_path(&root_path);
+
+    let with_opt = compiler
+        .compile(root_ref.clone(), optimized_compile_options())
+        .await
+        .expect("compile with optimizations");
+    let without_opt = compiler
+        .compile(root_ref, standard_compile_options())
+        .await
+        .expect("compile without optimizations");
+
+    let binding_order = |scenario: &amber_scenario::Scenario| {
+        let consumer_id = scenario
+            .components_iter()
+            .find(|(_, c)| c.moniker.local_name() == Some("consumer"))
+            .map(|(id, _)| id)
+            .expect("consumer component");
+
+        scenario
+            .bindings
+            .iter()
+            .filter(|binding| binding.to.component == consumer_id && binding.to.name == "upstream")
+            .map(|binding| match &binding.from {
+                BindingFrom::Component(provide) => scenario
+                    .component(provide.component)
+                    .moniker
+                    .local_name()
+                    .expect("provider local name")
+                    .to_string(),
+                other => panic!("expected component binding, got {other:?}"),
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        binding_order(&with_opt.scenario),
+        vec!["provider_a", "provider_b"]
+    );
+    assert_eq!(
+        binding_order(&without_opt.scenario),
+        vec!["provider_a", "provider_b"]
     );
 }
 

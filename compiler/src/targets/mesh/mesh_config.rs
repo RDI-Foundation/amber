@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 
 use amber_manifest::{CapabilityKind, NetworkProtocol};
 use amber_mesh::{
@@ -12,6 +12,7 @@ use sha2::Digest as _;
 
 use super::{
     plan::{MeshError, MeshPlan, ResolvedExternalBinding, component_label},
+    ports::LocalRoutePorts,
     proxy_metadata::external_slot_env_var,
 };
 
@@ -50,7 +51,7 @@ pub(crate) struct MeshConfigPlan {
 pub(crate) struct MeshConfigBuildInput<'a, Addressing: MeshAddressing + ?Sized> {
     pub(crate) scenario: &'a Scenario,
     pub(crate) mesh_plan: &'a MeshPlan,
-    pub(crate) slot_ports_by_component: &'a HashMap<ComponentId, BTreeMap<String, u16>>,
+    pub(crate) route_ports: &'a LocalRoutePorts,
     pub(crate) mesh_ports_by_component: &'a HashMap<ComponentId, u16>,
     pub(crate) router_ports: Option<RouterPorts>,
     pub(crate) addressing: &'a Addressing,
@@ -124,7 +125,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
     let MeshConfigBuildInput {
         scenario,
         mesh_plan,
-        slot_ports_by_component,
+        route_ports,
         mesh_ports_by_component,
         router_ports,
         addressing,
@@ -256,15 +257,9 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             if binding.consumer != *id {
                 continue;
             }
-            let slot_ports = slot_ports_by_component.get(id).ok_or_else(|| {
+            let listen_port = route_ports.binding_port(binding).ok_or_else(|| {
                 MeshError::new(format!(
-                    "slot ports missing for {}",
-                    component_label(scenario, *id)
-                ))
-            })?;
-            let listen_port = *slot_ports.get(&binding.slot).ok_or_else(|| {
-                MeshError::new(format!(
-                    "slot port missing for {}.{}",
+                    "route port missing for {}.{}",
                     component_label(scenario, *id),
                     binding.slot
                 ))
@@ -307,15 +302,9 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             if binding.consumer != *id {
                 continue;
             }
-            let slot_ports = slot_ports_by_component.get(id).ok_or_else(|| {
+            let listen_port = route_ports.external_binding_port(binding).ok_or_else(|| {
                 MeshError::new(format!(
-                    "slot ports missing for {}",
-                    component_label(scenario, *id)
-                ))
-            })?;
-            let listen_port = *slot_ports.get(&binding.slot).ok_or_else(|| {
-                MeshError::new(format!(
-                    "slot port missing for {}.{}",
+                    "route port missing for {}.{}",
                     component_label(scenario, *id),
                     binding.slot
                 ))

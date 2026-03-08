@@ -165,6 +165,29 @@ impl Program {
             Self::Path(program) => &program.common.mounts,
         }
     }
+
+    /// Visit slot names referenced anywhere in the program. Returns `true` if the program
+    /// references all slots.
+    pub fn visit_slot_uses(&self, mut visit: impl FnMut(&str)) -> bool {
+        if let Some(executable) = self.path_ref().or_else(|| self.image_ref())
+            && let Ok(parsed) = executable.parse::<InterpolatedString>()
+            && parsed.visit_slot_uses(&mut visit)
+        {
+            return true;
+        }
+
+        if self.command().visit_slot_uses(&mut visit) {
+            return true;
+        }
+
+        for value in self.env().values() {
+            if value.visit_slot_uses(&mut visit) {
+                return true;
+            }
+        }
+
+        false
+    }
 }
 
 #[serde_as]
@@ -506,6 +529,9 @@ pub struct SlotDecl {
     #[serde(default)]
     #[builder(default)]
     pub optional: bool,
+    #[serde(default)]
+    #[builder(default)]
+    pub multiple: bool,
 }
 
 #[derive(
@@ -1186,4 +1212,11 @@ pub struct Binding {
     pub name: Option<BindingName>,
     pub from: BindingSource,
     pub weak: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct ManifestBinding {
+    pub target: BindingTarget,
+    pub binding: Binding,
 }

@@ -128,7 +128,9 @@ fn collect_bindings_for_target(
     selector: BindingTargetSelector<'_>,
 ) -> BindingLookup {
     let mut out = BindingLookup::default();
-    for (target, binding) in manifest.bindings() {
+    for binding_decl in manifest.bindings() {
+        let target = &binding_decl.target;
+        let binding = &binding_decl.binding;
         let matches = match (target, &selector) {
             (BindingTarget::SelfSlot(_), BindingTargetSelector::Self_) => true,
             (BindingTarget::ChildSlot { child, .. }, BindingTargetSelector::Child(name)) => {
@@ -154,7 +156,8 @@ fn collect_bindings_for_target(
 
 fn collect_bindings_in_manifest(manifest: &Manifest) -> BindingLookup {
     let mut out = BindingLookup::default();
-    for binding in manifest.bindings().values() {
+    for binding_decl in manifest.bindings() {
+        let binding = &binding_decl.binding;
         if let Some(name) = binding.name.as_ref() {
             out.named.insert(name.to_string());
             if let Some(capability) = binding_url_unsupported(binding) {
@@ -179,19 +182,12 @@ fn collect_config_uses(manifest: &Manifest) -> ConfigUses {
             collect_config_uses_from_interpolated(&parsed, &mut uses);
         }
         for item in &program.command().0 {
-            match item {
-                amber_manifest::ProgramArgItem::Arg(arg) => {
-                    collect_config_uses_from_interpolated(arg, &mut uses);
-                }
-                amber_manifest::ProgramArgItem::Group(group) => {
-                    if group.when.source() == InterpolationSource::Config {
-                        uses.add_query(group.when.query());
-                    }
-                    for arg in &group.argv.0 {
-                        collect_config_uses_from_interpolated(arg, &mut uses);
-                    }
-                }
+            if let Some(when) = item.when()
+                && when.source() == InterpolationSource::Config
+            {
+                uses.add_query(when.query());
             }
+            item.visit_values(|value| collect_config_uses_from_interpolated(value, &mut uses));
         }
         for value in program.env().values() {
             if let Some(when) = value.when()
@@ -429,6 +425,30 @@ fn validate_manifest_binding_interpolations(
                             );
                         }
                     }
+                    amber_manifest::ProgramArgItem::RepeatedArgv(repeated) => {
+                        for (group_idx, arg) in repeated.argv.0.iter().enumerate() {
+                            let location = ProgramLocation::EntrypointGroup(idx, group_idx);
+                            let span = location.span(source.as_ref(), spans);
+                            validate_interpolated_string(
+                                arg,
+                                &ctx,
+                                location,
+                                span,
+                                &mut diagnostics,
+                            );
+                        }
+                    }
+                    amber_manifest::ProgramArgItem::RepeatedArg(repeated) => {
+                        let location = ProgramLocation::Entrypoint(idx);
+                        let span = location.span(source.as_ref(), spans);
+                        validate_interpolated_string(
+                            &repeated.arg,
+                            &ctx,
+                            location,
+                            span,
+                            &mut diagnostics,
+                        );
+                    }
                 }
             }
         }
@@ -459,6 +479,30 @@ fn validate_manifest_binding_interpolations(
                             );
                         }
                     }
+                    amber_manifest::ProgramArgItem::RepeatedArgv(repeated) => {
+                        for (group_idx, arg) in repeated.argv.0.iter().enumerate() {
+                            let location = ProgramLocation::ArgsGroup(idx, group_idx);
+                            let span = location.span(source.as_ref(), spans);
+                            validate_interpolated_string(
+                                arg,
+                                &ctx,
+                                location,
+                                span,
+                                &mut diagnostics,
+                            );
+                        }
+                    }
+                    amber_manifest::ProgramArgItem::RepeatedArg(repeated) => {
+                        let location = ProgramLocation::Args(idx);
+                        let span = location.span(source.as_ref(), spans);
+                        validate_interpolated_string(
+                            &repeated.arg,
+                            &ctx,
+                            location,
+                            span,
+                            &mut diagnostics,
+                        );
+                    }
                 }
             }
         }
@@ -476,6 +520,17 @@ fn validate_manifest_binding_interpolations(
                 let location = ProgramLocation::EnvValue(key.as_str());
                 let span = location.span(source.as_ref(), spans);
                 validate_interpolated_string(&group.value, &ctx, location, span, &mut diagnostics);
+            }
+            amber_manifest::ProgramEnvValue::Repeated(repeated) => {
+                let location = ProgramLocation::EnvValue(key.as_str());
+                let span = location.span(source.as_ref(), spans);
+                validate_interpolated_string(
+                    &repeated.value,
+                    &ctx,
+                    location,
+                    span,
+                    &mut diagnostics,
+                );
             }
         }
     }

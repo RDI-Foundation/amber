@@ -2,8 +2,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use amber_config::ConfigNode;
 use amber_manifest::{
-    InterpolatedPart, InterpolatedString, InterpolationSource, MountSource, ProgramArgItem,
-    SlotTarget, parse_slot_query,
+    InterpolatedPart, InterpolatedString, InterpolationSource, MountSource, SlotTarget,
+    parse_slot_query,
 };
 use amber_scenario::{ComponentId, Scenario};
 use amber_template::TemplatePart;
@@ -91,28 +91,15 @@ pub(crate) fn collect_binding_usage(scenario: &Scenario) -> BindingUsage {
                 record_binding_parts(&parsed.parts, id, BindingUseSource::Program, id, &mut usage);
             }
             for item in &program.command().0 {
-                match item {
-                    ProgramArgItem::Arg(arg) => {
-                        record_binding_parts(
-                            &arg.parts,
-                            id,
-                            BindingUseSource::Program,
-                            id,
-                            &mut usage,
-                        );
-                    }
-                    ProgramArgItem::Group(group) => {
-                        for arg in &group.argv.0 {
-                            record_binding_parts(
-                                &arg.parts,
-                                id,
-                                BindingUseSource::Program,
-                                id,
-                                &mut usage,
-                            );
-                        }
-                    }
-                }
+                item.visit_values(|value| {
+                    record_binding_parts(
+                        &value.parts,
+                        id,
+                        BindingUseSource::Program,
+                        id,
+                        &mut usage,
+                    );
+                });
             }
             for value in program.env().values() {
                 value.visit_values(|value| {
@@ -184,24 +171,21 @@ fn collect_program_used_config_paths(
         record_program_config_parts(&parsed.parts, &mut used);
     }
     for item in &program.command().0 {
-        match item {
-            ProgramArgItem::Arg(arg) => record_program_config_parts(&arg.parts, &mut used),
-            ProgramArgItem::Group(group) => {
-                if conditional_path_may_be_present(
-                    template_opt,
-                    scenario,
-                    component_id,
-                    group.when.source(),
-                    group.when.query(),
-                ) {
-                    if group.when.source() == InterpolationSource::Config {
-                        used.insert(group.when.query().to_string());
-                    }
-                    for arg in &group.argv.0 {
-                        record_program_config_parts(&arg.parts, &mut used);
-                    }
-                }
+        let Some(when) = item.when() else {
+            item.visit_values(|value| record_program_config_parts(&value.parts, &mut used));
+            continue;
+        };
+        if conditional_path_may_be_present(
+            template_opt,
+            scenario,
+            component_id,
+            when.source(),
+            when.query(),
+        ) {
+            if when.source() == InterpolationSource::Config {
+                used.insert(when.query().to_string());
             }
+            item.visit_values(|value| record_program_config_parts(&value.parts, &mut used));
         }
     }
     for value in program.env().values() {

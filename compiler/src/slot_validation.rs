@@ -135,6 +135,74 @@ fn validate_manifest_slot_interpolations(
                             );
                         }
                     }
+                    amber_manifest::ProgramArgItem::RepeatedArgv(repeated) => {
+                        let location = SlotLocation::EntrypointEach(idx);
+                        let span = location.span(source.as_ref(), spans);
+                        validate_repeated_each(
+                            repeated.each.slot(),
+                            &ctx,
+                            location,
+                            span,
+                            &mut diagnostics,
+                        );
+                        if let Some(when) = repeated.when.as_ref()
+                            && when.source() == InterpolationSource::Slots
+                        {
+                            let location = SlotLocation::EntrypointCondition(idx);
+                            let span = location.span(source.as_ref(), spans);
+                            validate_slot_condition(
+                                when.query(),
+                                &ctx,
+                                location,
+                                span,
+                                &mut diagnostics,
+                            );
+                        }
+                        for (group_idx, arg) in repeated.argv.0.iter().enumerate() {
+                            let location = SlotLocation::EntrypointGroup(idx, group_idx);
+                            let span = location.span(source.as_ref(), spans);
+                            validate_interpolated_string(
+                                arg,
+                                &ctx,
+                                location,
+                                span,
+                                &mut diagnostics,
+                            );
+                        }
+                    }
+                    amber_manifest::ProgramArgItem::RepeatedArg(repeated) => {
+                        let location = SlotLocation::EntrypointEach(idx);
+                        let span = location.span(source.as_ref(), spans);
+                        validate_repeated_each(
+                            repeated.each.slot(),
+                            &ctx,
+                            location,
+                            span,
+                            &mut diagnostics,
+                        );
+                        if let Some(when) = repeated.when.as_ref()
+                            && when.source() == InterpolationSource::Slots
+                        {
+                            let location = SlotLocation::EntrypointCondition(idx);
+                            let span = location.span(source.as_ref(), spans);
+                            validate_slot_condition(
+                                when.query(),
+                                &ctx,
+                                location,
+                                span,
+                                &mut diagnostics,
+                            );
+                        }
+                        let location = SlotLocation::Entrypoint(idx);
+                        let span = location.span(source.as_ref(), spans);
+                        validate_interpolated_string(
+                            &repeated.arg,
+                            &ctx,
+                            location,
+                            span,
+                            &mut diagnostics,
+                        );
+                    }
                 }
             }
         }
@@ -176,6 +244,74 @@ fn validate_manifest_slot_interpolations(
                             );
                         }
                     }
+                    amber_manifest::ProgramArgItem::RepeatedArgv(repeated) => {
+                        let location = SlotLocation::ArgsEach(idx);
+                        let span = location.span(source.as_ref(), spans);
+                        validate_repeated_each(
+                            repeated.each.slot(),
+                            &ctx,
+                            location,
+                            span,
+                            &mut diagnostics,
+                        );
+                        if let Some(when) = repeated.when.as_ref()
+                            && when.source() == InterpolationSource::Slots
+                        {
+                            let location = SlotLocation::ArgsCondition(idx);
+                            let span = location.span(source.as_ref(), spans);
+                            validate_slot_condition(
+                                when.query(),
+                                &ctx,
+                                location,
+                                span,
+                                &mut diagnostics,
+                            );
+                        }
+                        for (group_idx, arg) in repeated.argv.0.iter().enumerate() {
+                            let location = SlotLocation::ArgsGroup(idx, group_idx);
+                            let span = location.span(source.as_ref(), spans);
+                            validate_interpolated_string(
+                                arg,
+                                &ctx,
+                                location,
+                                span,
+                                &mut diagnostics,
+                            );
+                        }
+                    }
+                    amber_manifest::ProgramArgItem::RepeatedArg(repeated) => {
+                        let location = SlotLocation::ArgsEach(idx);
+                        let span = location.span(source.as_ref(), spans);
+                        validate_repeated_each(
+                            repeated.each.slot(),
+                            &ctx,
+                            location,
+                            span,
+                            &mut diagnostics,
+                        );
+                        if let Some(when) = repeated.when.as_ref()
+                            && when.source() == InterpolationSource::Slots
+                        {
+                            let location = SlotLocation::ArgsCondition(idx);
+                            let span = location.span(source.as_ref(), spans);
+                            validate_slot_condition(
+                                when.query(),
+                                &ctx,
+                                location,
+                                span,
+                                &mut diagnostics,
+                            );
+                        }
+                        let location = SlotLocation::Args(idx);
+                        let span = location.span(source.as_ref(), spans);
+                        validate_interpolated_string(
+                            &repeated.arg,
+                            &ctx,
+                            location,
+                            span,
+                            &mut diagnostics,
+                        );
+                    }
                 }
             }
         }
@@ -205,6 +341,33 @@ fn validate_manifest_slot_interpolations(
                 let span = location.span(source.as_ref(), spans);
                 validate_interpolated_string(&group.value, &ctx, location, span, &mut diagnostics);
             }
+            amber_manifest::ProgramEnvValue::Repeated(repeated) => {
+                let location = SlotLocation::EnvEach(key.as_str());
+                let span = location.span(source.as_ref(), spans);
+                validate_repeated_each(
+                    repeated.each.slot(),
+                    &ctx,
+                    location,
+                    span,
+                    &mut diagnostics,
+                );
+                if let Some(when) = repeated.when.as_ref()
+                    && when.source() == InterpolationSource::Slots
+                {
+                    let location = SlotLocation::EnvCondition(key.as_str());
+                    let span = location.span(source.as_ref(), spans);
+                    validate_slot_condition(when.query(), &ctx, location, span, &mut diagnostics);
+                }
+                let location = SlotLocation::EnvValue(key.as_str());
+                let span = location.span(source.as_ref(), spans);
+                validate_interpolated_string(
+                    &repeated.value,
+                    &ctx,
+                    location,
+                    span,
+                    &mut diagnostics,
+                );
+            }
         }
     }
 
@@ -217,12 +380,15 @@ enum SlotLocation<'a> {
     Path,
     Entrypoint(usize),
     EntrypointCondition(usize),
+    EntrypointEach(usize),
     EntrypointGroup(usize, usize),
     Args(usize),
     ArgsCondition(usize),
+    ArgsEach(usize),
     ArgsGroup(usize, usize),
     Env(&'a str),
     EnvCondition(&'a str),
+    EnvEach(&'a str),
     EnvValue(&'a str),
 }
 
@@ -233,16 +399,19 @@ impl SlotLocation<'_> {
             SlotLocation::Path => "program.path".to_string(),
             SlotLocation::Entrypoint(idx) => format!("program.entrypoint[{idx}]"),
             SlotLocation::EntrypointCondition(idx) => format!("program.entrypoint[{idx}].when"),
+            SlotLocation::EntrypointEach(idx) => format!("program.entrypoint[{idx}].each"),
             SlotLocation::EntrypointGroup(idx, group_idx) => {
                 format!("program.entrypoint[{idx}].argv[{group_idx}]")
             }
             SlotLocation::Args(idx) => format!("program.args[{idx}]"),
             SlotLocation::ArgsCondition(idx) => format!("program.args[{idx}].when"),
+            SlotLocation::ArgsEach(idx) => format!("program.args[{idx}].each"),
             SlotLocation::ArgsGroup(idx, group_idx) => {
                 format!("program.args[{idx}].argv[{group_idx}]")
             }
             SlotLocation::Env(key) => format!("program.env.{key}"),
             SlotLocation::EnvCondition(key) => format!("program.env.{key}.when"),
+            SlotLocation::EnvEach(key) => format!("program.env.{key}.each"),
             SlotLocation::EnvValue(key) => format!("program.env.{key}.value"),
         }
     }
@@ -272,6 +441,24 @@ impl SlotLocation<'_> {
             }
             SlotLocation::EntrypointCondition(idx) => {
                 let pointer = format!("/program/entrypoint/{idx}/when");
+                if let Some(span) = span_for_json_pointer(source, root, &pointer) {
+                    return span;
+                }
+                let outer = format!("/program/entrypoint/{idx}");
+                if let Some(span) = span_for_json_pointer(source, root, &outer) {
+                    return span;
+                }
+                if let Some(span) = span_for_json_pointer(source, root, "/program/entrypoint") {
+                    return span;
+                }
+                spans
+                    .program
+                    .as_ref()
+                    .map(|p| p.whole)
+                    .unwrap_or_else(|| (0usize, 0usize).into())
+            }
+            SlotLocation::EntrypointEach(idx) => {
+                let pointer = format!("/program/entrypoint/{idx}/each");
                 if let Some(span) = span_for_json_pointer(source, root, &pointer) {
                     return span;
                 }
@@ -338,6 +525,24 @@ impl SlotLocation<'_> {
                     .map(|p| p.whole)
                     .unwrap_or_else(|| (0usize, 0usize).into())
             }
+            SlotLocation::ArgsEach(idx) => {
+                let pointer = format!("/program/args/{idx}/each");
+                if let Some(span) = span_for_json_pointer(source, root, &pointer) {
+                    return span;
+                }
+                let outer = format!("/program/args/{idx}");
+                if let Some(span) = span_for_json_pointer(source, root, &outer) {
+                    return span;
+                }
+                if let Some(span) = span_for_json_pointer(source, root, "/program/args") {
+                    return span;
+                }
+                spans
+                    .program
+                    .as_ref()
+                    .map(|p| p.whole)
+                    .unwrap_or_else(|| (0usize, 0usize).into())
+            }
             SlotLocation::ArgsGroup(idx, group_idx) => {
                 let pointer = format!("/program/args/{idx}/argv/{group_idx}");
                 if let Some(span) = span_for_json_pointer(source, root, &pointer) {
@@ -380,6 +585,20 @@ impl SlotLocation<'_> {
                     .or_else(|| spans.program.as_ref().map(|p| p.whole))
                     .unwrap_or_else(|| (0usize, 0usize).into())
             }
+            SlotLocation::EnvEach(key) => {
+                let pointer = PointerBuf::from_tokens(["program", "env", key, "each"]).to_string();
+                if let Some(span) = span_for_json_pointer(source, root, &pointer) {
+                    return span;
+                }
+                let outer = PointerBuf::from_tokens(["program", "env", key]).to_string();
+                if let Some(span) = span_for_json_pointer(source, root, &outer) {
+                    return span;
+                }
+                let fallback = span_for_json_pointer(source, root, "/program/env");
+                fallback
+                    .or_else(|| spans.program.as_ref().map(|p| p.whole))
+                    .unwrap_or_else(|| (0usize, 0usize).into())
+            }
             SlotLocation::EnvValue(key) => {
                 let pointer = PointerBuf::from_tokens(["program", "env", key, "value"]).to_string();
                 if let Some(span) = span_for_json_pointer(source, root, &pointer) {
@@ -395,6 +614,39 @@ impl SlotLocation<'_> {
                     .unwrap_or_else(|| (0usize, 0usize).into())
             }
         }
+    }
+}
+
+fn validate_repeated_each(
+    slot_name: &str,
+    ctx: &SlotValidationContext<'_>,
+    location: SlotLocation<'_>,
+    span: SourceSpan,
+    diagnostics: &mut Vec<Report>,
+) {
+    let Some(slot_decl) = ctx.slots.get(slot_name) else {
+        let help = unknown_slot_help(ctx.component_path, ctx.slots);
+        diagnostics.push(Report::new(InvalidSlotsInterpolation {
+            component_path: ctx.component_path.to_string(),
+            location: location.label(),
+            message: format!("unknown slot `{slot_name}`"),
+            help,
+            src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source)).with_language("json5"),
+            span,
+            label: "repeated slot expansion here".to_string(),
+        }));
+        return;
+    };
+    if !slot_decl.multiple {
+        diagnostics.push(Report::new(InvalidSlotsInterpolation {
+            component_path: ctx.component_path.to_string(),
+            location: location.label(),
+            message: format!("slot `{slot_name}` is not declared with `multiple: true`"),
+            help: format!("declare slot `{slot_name}` with `multiple: true` before using `each`"),
+            src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source)).with_language("json5"),
+            span,
+            label: "repeated slot expansion here".to_string(),
+        }));
     }
 }
 

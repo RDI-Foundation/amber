@@ -853,6 +853,7 @@ mod tests {
                 7,
                 BTreeMap::from([("api.url".to_string(), "http://127.0.0.1:31001".to_string())]),
             )]),
+            slot_items_by_scope: BTreeMap::new(),
             bindings_by_scope: BTreeMap::from([(
                 11,
                 BTreeMap::from([(
@@ -883,6 +884,70 @@ mod tests {
         assert_eq!(
             plan.env.get(&OsString::from("UPSTREAM")),
             Some(&OsString::from("tcp://127.0.0.1:32002"))
+        );
+    }
+
+    #[test]
+    fn build_run_plan_renders_item_templates_from_slot_items() {
+        let template_spec = TemplateSpec {
+            program: amber_template::ProgramTemplateSpec {
+                entrypoint: vec![
+                    ProgramArgTemplate::Arg(vec![TemplatePart::lit("/app/bin/server")]),
+                    ProgramArgTemplate::Arg(vec![TemplatePart::item(7, "api", 0, "url")]),
+                    ProgramArgTemplate::Arg(vec![TemplatePart::item(7, "api", 1, "url")]),
+                ],
+                env: BTreeMap::from([(
+                    "UPSTREAMS".to_string(),
+                    ProgramEnvTemplate::Value(vec![
+                        TemplatePart::item(7, "api", 0, "url"),
+                        TemplatePart::lit(","),
+                        TemplatePart::item(7, "api", 1, "url"),
+                    ]),
+                )]),
+            },
+        };
+        let runtime_context = RuntimeTemplateContext {
+            slots_by_scope: BTreeMap::new(),
+            slot_items_by_scope: BTreeMap::from([(
+                7,
+                BTreeMap::from([(
+                    "api".to_string(),
+                    vec![
+                        amber_template::RuntimeSlotObject {
+                            url: "http://127.0.0.1:31001".to_string(),
+                        },
+                        amber_template::RuntimeSlotObject {
+                            url: "http://127.0.0.1:31002".to_string(),
+                        },
+                    ],
+                )]),
+            )]),
+            bindings_by_scope: BTreeMap::new(),
+        };
+
+        let env = BTreeMap::from([
+            (
+                TEMPLATE_SPEC_ENV.to_string(),
+                encode_spec_b64(&template_spec),
+            ),
+            (
+                RUNTIME_TEMPLATE_CONTEXT_ENV.to_string(),
+                STANDARD.encode(serde_json::to_vec(&runtime_context).unwrap()),
+            ),
+        ]);
+
+        let os_env = env
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let plan = build_run_plan(os_env).expect("run plan should build");
+
+        assert_eq!(plan.entrypoint[1], "http://127.0.0.1:31001");
+        assert_eq!(plan.entrypoint[2], "http://127.0.0.1:31002");
+        assert_eq!(
+            plan.env.get(&OsString::from("UPSTREAMS")),
+            Some(&OsString::from(
+                "http://127.0.0.1:31001,http://127.0.0.1:31002"
+            ))
         );
     }
 

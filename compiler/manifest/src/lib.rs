@@ -20,8 +20,9 @@ pub use framework::{
     FrameworkBindingShape, FrameworkCapabilitySpec, framework_capabilities, framework_capability,
 };
 pub use interpolation::{
-    InterpolatedPart, InterpolatedString, InterpolationSource, ProgramArgGroup, ProgramArgItem,
-    ProgramArgList, ProgramEntrypoint, ProgramEnvValue, WhenPath,
+    EachPath, InterpolatedPart, InterpolatedString, InterpolationSource, ProgramArgGroup,
+    ProgramArgItem, ProgramArgList, ProgramEntrypoint, ProgramEnvValue, RepeatedProgramArg,
+    RepeatedProgramArgv, RepeatedProgramEnv, WhenPath,
 };
 pub use manifest::{ExperimentalFeature, Manifest, RawManifest};
 pub use names::{
@@ -34,8 +35,9 @@ pub(crate) use schema::binding_target_key_for_binding;
 pub use schema::{
     Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityDecl, CapabilityKind,
     ComponentDecl, ComponentRef, ConfigSchema, Endpoint, EnvironmentDecl, ExportTarget,
-    LocalComponentRef, MountSource, Network, NetworkProtocol, Program, ProgramCommon, ProgramImage,
-    ProgramMount, ProgramPath, ProvideDecl, RawBinding, RawExportTarget, ResourceDecl, SlotDecl,
+    LocalComponentRef, ManifestBinding, MountSource, Network, NetworkProtocol, Program,
+    ProgramCommon, ProgramImage, ProgramMount, ProgramPath, ProvideDecl, RawBinding,
+    RawExportTarget, ResourceDecl, SlotDecl,
 };
 pub use slot_query::{
     SlotQuery, SlotQueryError, SlotQueryValidation, SlotTarget, parse_slot_query,

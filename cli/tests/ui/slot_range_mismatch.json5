@@ -1,0 +1,12 @@
+{
+  manifest_version: "0.3.0",
+  slots: {
+    upstream: { kind: "http", optional: true, multiple: true },
+  },
+  components: {
+    child: "./slot_range_mismatch_child.json5",
+  },
+  bindings: [
+    { to: "#child.api", from: "self.upstream" },
+  ],
+}

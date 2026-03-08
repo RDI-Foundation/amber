@@ -1044,6 +1044,210 @@ fn compile_direct_preserves_runtime_conditional_program_arg_group_in_template_sp
 }
 
 #[test]
+fn compile_direct_lowers_repeated_slot_expansion_to_slot_items() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("direct-repeated-slot-items-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let root_manifest = outputs_dir.path().join("root.json5");
+    let consumer_manifest = outputs_dir.path().join("consumer.json5");
+    let provider_a_manifest = outputs_dir.path().join("provider-a.json5");
+    let provider_b_manifest = outputs_dir.path().join("provider-b.json5");
+
+    fs::write(
+        &consumer_manifest,
+        r#"{
+  manifest_version: "0.3.0",
+  program: {
+    path: "/usr/bin/env",
+    args: [
+      "consumer",
+      {
+        each: "slots.upstream",
+        argv: ["--upstream", "${item.url}"]
+      }
+    ],
+    env: {
+      UPSTREAMS: {
+        each: "slots.upstream",
+        value: "${item.url}",
+        join: ","
+      }
+    },
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  slots: {
+    upstream: { kind: "http", optional: true, multiple: true }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"#,
+    )
+    .expect("failed to write consumer manifest");
+    fs::write(
+        &provider_a_manifest,
+        r#"{
+  manifest_version: "0.3.0",
+  program: {
+    path: "/usr/bin/env",
+    args: ["provider-a"],
+    network: {
+      endpoints: [
+        { name: "api", port: 8081, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    api: { kind: "http", endpoint: "api" }
+  },
+  exports: {
+    api: "api"
+  }
+}
+"#,
+    )
+    .expect("failed to write provider-a manifest");
+    fs::write(
+        &provider_b_manifest,
+        r#"{
+  manifest_version: "0.3.0",
+  program: {
+    path: "/usr/bin/env",
+    args: ["provider-b"],
+    network: {
+      endpoints: [
+        { name: "api", port: 8082, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    api: { kind: "http", endpoint: "api" }
+  },
+  exports: {
+    api: "api"
+  }
+}
+"#,
+    )
+    .expect("failed to write provider-b manifest");
+    fs::write(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  components: {
+    consumer: "./consumer.json5",
+    provider_a: "./provider-a.json5",
+    provider_b: "./provider-b.json5"
+  },
+  bindings: [
+    { to: "#consumer.upstream", from: "#provider_a.api" },
+    { to: "#consumer.upstream", from: "#provider_b.api" }
+  ],
+  exports: {
+    http: "#consumer.http"
+  }
+}
+"##,
+    )
+    .expect("failed to write root manifest");
+
+    let direct_out = outputs_dir.path().join("direct");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&direct_out)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    if !output.status.success() {
+        panic!(
+            "amber compile --direct failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let plan_path = direct_out.join("direct-plan.json");
+    let plan: Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("failed to read direct plan"))
+            .expect("direct plan should contain valid JSON");
+    let components = plan["components"]
+        .as_array()
+        .expect("direct plan components should be an array");
+    let consumer = components
+        .iter()
+        .find(|component| component["moniker"].as_str() == Some("/consumer"))
+        .expect("consumer component should exist");
+    let consumer_scope = consumer["id"]
+        .as_u64()
+        .expect("consumer component id should be present") as u64;
+    let execution = &consumer["program"]["execution"];
+    let template_spec_b64 = execution["template_spec_b64"]
+        .as_str()
+        .expect("helper plan should include a template spec");
+    let spec_bytes = STANDARD
+        .decode(template_spec_b64)
+        .expect("template spec should be valid base64");
+    let spec: TemplateSpec =
+        serde_json::from_slice(&spec_bytes).expect("template spec should be valid JSON");
+
+    assert_eq!(
+        spec.program.entrypoint,
+        vec![
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("/usr/bin/env")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("consumer")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("--upstream")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::item(
+                consumer_scope,
+                "upstream",
+                0,
+                "url",
+            )]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("--upstream")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::item(
+                consumer_scope,
+                "upstream",
+                1,
+                "url",
+            )]),
+        ]
+    );
+    assert_eq!(
+        spec.program.env.get("UPSTREAMS"),
+        Some(&ProgramEnvTemplate::Value(vec![
+            TemplatePart::item(consumer_scope, "upstream", 0, "url"),
+            TemplatePart::lit(","),
+            TemplatePart::item(consumer_scope, "upstream", 1, "url"),
+        ]))
+    );
+
+    let scope_key = consumer_scope.to_string();
+    let slot_items = plan["runtime_addresses"]["slot_items_by_scope"][scope_key.as_str()]
+        ["upstream"]
+        .as_array()
+        .expect("slot items should be present");
+    assert_eq!(slot_items.len(), 2);
+}
+
+#[test]
 fn compile_direct_resolves_relative_program_path_into_direct_plan() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

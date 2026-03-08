@@ -40,7 +40,7 @@ use crate::{
                 build_mesh_config_plan, default_mesh_config_build_options,
             },
             plan::{MeshOptions, component_label, map_program_components},
-            ports::{allocate_mesh_ports, allocate_slot_ports},
+            ports::{LocalRoutePorts, allocate_local_route_ports, allocate_mesh_ports},
             provision::build_mesh_provision_plan,
             proxy_metadata::{ProxyMetadata, RouterMetadata, build_proxy_metadata},
         },
@@ -358,18 +358,15 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
     let docker_gateway_component = transformed.gateway_component;
     let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
 
-    let slot_ports_by_component = allocate_slot_ports(s, program_components)?;
+    let route_ports = allocate_local_route_ports(s, &mesh_plan)?;
     let mesh_ports_by_component = allocate_mesh_ports(
         s,
         program_components,
         COMPONENT_MESH_PORT_BASE,
-        &slot_ports_by_component,
+        &route_ports,
     )?;
-    let docker_proxy_ports_by_component = docker_proxy_ports_by_component(
-        s,
-        &slot_ports_by_component,
-        &transformed.proxy_slot_by_component,
-    )?;
+    let docker_proxy_ports_by_component =
+        docker_proxy_ports_by_component(s, &route_ports, &transformed.proxy_slot_by_component)?;
     let router_ports = needs_router.then_some(RouterPorts {
         mesh: ROUTER_MESH_PORT_BASE,
         control: ROUTER_CONTROL_PORT_BASE,
@@ -377,7 +374,7 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
 
     let addressing = LocalAddressing::new(
         s,
-        &slot_ports_by_component,
+        &route_ports,
         LocalAddressingOptions {
             backend_label: "docker-compose reporter",
             docker_binding: DockerFrameworkBindingPolicy::LoopbackTcp,
@@ -399,7 +396,7 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
     let mesh_config_plan = build_mesh_config_plan(MeshConfigBuildInput {
         scenario: s,
         mesh_plan: &mesh_plan,
-        slot_ports_by_component: &slot_ports_by_component,
+        route_ports: &route_ports,
         mesh_ports_by_component: &mesh_ports_by_component,
         router_ports,
         addressing: &mesh_addressing,
@@ -1172,25 +1169,20 @@ fn configure_injected_docker_gateway_service(
 
 fn docker_proxy_ports_by_component(
     scenario: &Scenario,
-    slot_ports_by_component: &HashMap<ComponentId, BTreeMap<String, u16>>,
+    route_ports: &LocalRoutePorts,
     proxy_slot_by_component: &HashMap<ComponentId, String>,
 ) -> DcResult<HashMap<ComponentId, u16>> {
     let mut ports = HashMap::new();
     for (component, slot_name) in proxy_slot_by_component {
-        let slot_ports = slot_ports_by_component.get(component).ok_or_else(|| {
-            DockerComposeError::Other(format!(
-                "internal error: missing local slot port for {}.{}",
-                component_label(scenario, *component),
-                slot_name
-            ))
-        })?;
-        let listen_port = *slot_ports.get(slot_name).ok_or_else(|| {
-            DockerComposeError::Other(format!(
-                "internal error: missing local slot port for {}.{}",
-                component_label(scenario, *component),
-                slot_name
-            ))
-        })?;
+        let listen_port = route_ports
+            .slot_port(*component, slot_name)
+            .ok_or_else(|| {
+                DockerComposeError::Other(format!(
+                    "internal error: missing local slot port for {}.{}",
+                    component_label(scenario, *component),
+                    slot_name
+                ))
+            })?;
         ports.insert(*component, listen_port);
     }
     Ok(ports)

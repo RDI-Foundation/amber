@@ -391,6 +391,77 @@ fn command_arg_optional_config_lints(
                     }
                 }
             }
+            ProgramArgItem::RepeatedArgv(repeated) => {
+                for (group_idx, arg) in repeated.argv.0.iter().enumerate() {
+                    for part in &arg.parts {
+                        let InterpolatedPart::Interpolation {
+                            source: kind,
+                            query,
+                        } = part
+                        else {
+                            continue;
+                        };
+                        if *kind != InterpolationSource::Config
+                            || !optional_leaf_paths.contains(query)
+                            || repeated.when.as_ref().is_some_and(|when| {
+                                when.source() == InterpolationSource::Config
+                                    && query == when.query()
+                            })
+                        {
+                            continue;
+                        }
+                        let pointer = format!("{}/{idx}/argv/{group_idx}", field_pointer);
+                        let span = crate::span_for_json_pointer(source, root, &pointer)
+                            .or_else(|| {
+                                crate::span_for_json_pointer(
+                                    source,
+                                    root,
+                                    &location_of(idx).pointer(),
+                                )
+                            })
+                            .or_else(|| crate::span_for_json_pointer(source, root, field_pointer))
+                            .unwrap_or(fallback);
+                        out.push(ManifestLint::OptionalCommandConfig {
+                            path: query.clone(),
+                            component: component.to_string(),
+                            src: src.clone(),
+                            span,
+                        });
+                    }
+                }
+            }
+            ProgramArgItem::RepeatedArg(repeated) => {
+                for part in &repeated.arg.parts {
+                    let InterpolatedPart::Interpolation {
+                        source: kind,
+                        query,
+                    } = part
+                    else {
+                        continue;
+                    };
+                    if *kind != InterpolationSource::Config
+                        || !optional_leaf_paths.contains(query)
+                        || repeated.when.as_ref().is_some_and(|when| {
+                            when.source() == InterpolationSource::Config && query == when.query()
+                        })
+                    {
+                        continue;
+                    }
+                    let pointer = format!("{field_pointer}/{idx}/arg");
+                    let span = crate::span_for_json_pointer(source, root, &pointer)
+                        .or_else(|| {
+                            crate::span_for_json_pointer(source, root, &location_of(idx).pointer())
+                        })
+                        .or_else(|| crate::span_for_json_pointer(source, root, field_pointer))
+                        .unwrap_or(fallback);
+                    out.push(ManifestLint::OptionalCommandConfig {
+                        path: query.clone(),
+                        component: component.to_string(),
+                        src: src.clone(),
+                        span,
+                    });
+                }
+            }
         }
     }
     out
@@ -421,13 +492,13 @@ fn command_arg_required_slot_when_lints(
 
     let mut out = Vec::new();
     for (idx, item) in items.iter().enumerate() {
-        let ProgramArgItem::Group(group) = item else {
+        let Some(when) = item.when() else {
             continue;
         };
-        if group.when.source() != InterpolationSource::Slots {
+        if when.source() != InterpolationSource::Slots {
             continue;
         }
-        let Ok(parsed) = parse_slot_query(group.when.query()) else {
+        let Ok(parsed) = parse_slot_query(when.query()) else {
             continue;
         };
         let SlotTarget::Slot(slot) = parsed.target else {
@@ -499,7 +570,7 @@ fn program_env_optional_config_lints(
                 continue;
             }
 
-            let pointer = if value.group().is_some() {
+            let pointer = if value.group().is_some() || value.repeated().is_some() {
                 PointerBuf::from_tokens(["program", "env", key, "value"]).to_string()
             } else {
                 PointerBuf::from_tokens(["program", "env", key]).to_string()
@@ -546,13 +617,13 @@ fn program_env_required_slot_when_lints(
 
     let mut out = Vec::new();
     for (key, value) in program.env() {
-        let Some(group) = value.group() else {
+        let Some(when) = value.when() else {
             continue;
         };
-        if group.when.source() != InterpolationSource::Slots {
+        if when.source() != InterpolationSource::Slots {
             continue;
         }
-        let Ok(parsed) = parse_slot_query(group.when.query()) else {
+        let Ok(parsed) = parse_slot_query(when.query()) else {
             continue;
         };
         let SlotTarget::Slot(slot) = parsed.target else {
@@ -707,11 +778,11 @@ pub fn lint_manifest(
 
     let mut bound_slots = BTreeSet::new();
     let mut bound_provides = BTreeSet::new();
-    for binding in manifest.bindings().values() {
-        if let BindingSource::SelfProvide(provide_name) = &binding.from {
+    for binding in manifest.bindings() {
+        if let BindingSource::SelfProvide(provide_name) = &binding.binding.from {
             bound_provides.insert(provide_name);
         }
-        if let BindingSource::SelfSlot(slot_name) = &binding.from {
+        if let BindingSource::SelfSlot(slot_name) = &binding.binding.from {
             bound_slots.insert(slot_name);
         }
     }

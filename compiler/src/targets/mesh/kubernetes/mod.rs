@@ -34,7 +34,7 @@ use crate::{
                 build_mesh_config_plan, default_mesh_config_build_options, scenario_ir_digest,
             },
             plan::{MeshOptions, component_label, map_program_components},
-            ports::{allocate_mesh_ports, allocate_slot_ports},
+            ports::{allocate_local_route_ports, allocate_mesh_ports},
             provision::build_mesh_provision_plan,
             proxy_metadata::{
                 DEFAULT_EXTERNAL_ENV_FILE, ExportMetadata, ExternalSlotMetadata,
@@ -202,13 +202,13 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
     let provisioner_job_name = provisioner_job_name(&scenario_digest);
     let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
 
-    let slot_ports_by_component = allocate_slot_ports(s, program_components)
-        .map_err(|e| ReporterError::new(e.to_string()))?;
+    let route_ports =
+        allocate_local_route_ports(s, &mesh_plan).map_err(|e| ReporterError::new(e.to_string()))?;
     let mesh_ports_by_component = allocate_mesh_ports(
         s,
         program_components,
         COMPONENT_MESH_PORT_BASE,
-        &slot_ports_by_component,
+        &route_ports,
     )
     .map_err(|e| ReporterError::new(e.to_string()))?;
     let router_ports = needs_router.then_some(RouterPorts {
@@ -219,7 +219,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
 
     let addressing = LocalAddressing::new(
         s,
-        &slot_ports_by_component,
+        &route_ports,
         LocalAddressingOptions {
             backend_label: "kubernetes reporter",
             docker_binding: DockerFrameworkBindingPolicy::Unsupported {
@@ -245,7 +245,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
     let mesh_config_plan = build_mesh_config_plan(MeshConfigBuildInput {
         scenario: s,
         mesh_plan: &mesh_plan,
-        slot_ports_by_component: &slot_ports_by_component,
+        route_ports: &route_ports,
         mesh_ports_by_component: &mesh_ports_by_component,
         router_ports,
         addressing: &mesh_addressing,

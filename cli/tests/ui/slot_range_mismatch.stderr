@@ -1,0 +1,48 @@
+manifest::unused_program
+
+  ! program is never referenced by bindings or exports (in component /child)
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_range_mismatch_child.json5:3:12]
+  2 |       manifest_version: "0.3.0",
+  3 | ,->   program: {
+  4 | |       image: "child",
+  5 | |       entrypoint: ["child"],
+  6 | |       env: {
+  7 | |         API_URL: "${slots.api.url}",
+  8 | |       },
+  9 | |->   },
+    : `---- unused `program`
+ 10 |       slots: {
+    `----
+  help: Remove the `program` block if it is not needed, or export/bind one of its provides.
+linker::slot_range_mismatch
+
+  x slot range mismatch for `/child.api`: target accepts 0..1, source may provide 0..*
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_range_mismatch.json5:10:5]
+  9 |   bindings: [
+ 10 |     { to: "#child.api", from: "self.upstream" },
+    :     ^^^^^^^^^^^^^^^^^^^^^|^^^^^^^^^^^^^^^^^^^^^
+    :                          `-- binding forwards 0..* into slot accepting 0..1
+ 11 |   ],
+    `----
+  help: The target slot range must cover the source slot range. Adjust `optional`/`multiple` on the source or target slot so the forwarded fan-in is always valid.
+
+Advice: 
+  > target slot `api` declared on /child
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_range_mismatch_child.json5:11:18]
+ 10 |   slots: {
+ 11 |     api: { kind: "http", optional: true },
+    :                  ^^^|^^
+    :                     `-- target slot declared here
+ 12 |   },
+    `----
+
+Advice: 
+  > source slot `upstream` declared on /
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_range_mismatch.json5:4:23]
+ 3 |   slots: {
+ 4 |     upstream: { kind: "http", optional: true, multiple: true },
+   :                       ^^^|^^
+   :                          `-- source slot declared here
+ 5 |   },
+   `----
+Error:   × check failed

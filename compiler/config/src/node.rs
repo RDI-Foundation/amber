@@ -282,6 +282,14 @@ pub fn compose_config_template(
                         TemplatePart::Binding { binding, scope } => {
                             out.push(TemplatePart::binding(scope, binding));
                         }
+                        TemplatePart::Item {
+                            item,
+                            scope,
+                            slot,
+                            index,
+                        } => {
+                            out.push(TemplatePart::item(scope, slot, index, item));
+                        }
                     }
                 }
                 Ok(ConfigNode::StringTemplate(out).simplify())

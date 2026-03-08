@@ -3,9 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use amber_manifest::{
-    BindingSource, BindingTarget, InterpolationSource, Manifest, SlotTarget, parse_slot_query,
-};
+use amber_manifest::{BindingSource, BindingTarget, Manifest};
 use amber_scenario::{BindingEdge, BindingFrom, Component, ComponentId, Scenario, SlotRef};
 use miette::Diagnostic;
 use thiserror::Error;
@@ -273,7 +271,9 @@ fn build_forward_map(
         };
         let child_by_name = &child_index[id.0];
 
-        for (target, binding) in manifest.bindings() {
+        for binding_decl in manifest.bindings() {
+            let target = &binding_decl.target;
+            let binding = &binding_decl.binding;
             let BindingTarget::ChildSlot { child, slot } = target else {
                 continue;
             };
@@ -365,52 +365,29 @@ fn rewrite_bindings(
         }
     }
 
-    let mut merged: HashMap<(BindingFrom, SlotRef, Option<String>), BindingEdge> = HashMap::new();
+    let mut merged_indices: HashMap<(BindingFrom, SlotRef, Option<String>), usize> = HashMap::new();
+    let mut bindings: Vec<BindingEdge> = Vec::new();
     for binding in rewritten {
         let key = (
             binding.from.clone(),
             binding.to.clone(),
             binding.name.clone(),
         );
-        if let Some(existing) = merged.get_mut(&key) {
+        if let Some(&idx) = merged_indices.get(&key) {
+            let existing = &mut bindings[idx];
             // Multiple rewrite paths can produce the same edge. If any path is strong,
             // the merged edge must stay strong.
             existing.weak &= binding.weak;
             continue;
         }
-        merged.insert(key, binding);
+        merged_indices.insert(key, bindings.len());
+        bindings.push(binding);
     }
 
-    let mut bindings: Vec<BindingEdge> = merged.into_values().collect();
-    bindings.sort_by(|a, b| binding_sort_key(a).cmp(&binding_sort_key(b)));
     scenario.bindings = bindings;
     scenario.normalize_order();
     scenario
 }
-
-fn binding_sort_key(binding: &BindingEdge) -> (u8, usize, &str, usize, &str, bool, bool, &str) {
-    let (from_kind, from_component, from_name) = match &binding.from {
-        BindingFrom::Component(provide) => (0, provide.component.0, provide.name.as_str()),
-        BindingFrom::Resource(resource) => (1, resource.component.0, resource.name.as_str()),
-        BindingFrom::External(slot) => (2, slot.component.0, slot.name.as_str()),
-        BindingFrom::Framework(name) => (3, 0, name.as_str()),
-    };
-    let (name_present, name) = match binding.name.as_deref() {
-        Some(name) => (true, name),
-        None => (false, ""),
-    };
-    (
-        from_kind,
-        from_component,
-        from_name,
-        binding.to.component.0,
-        binding.to.name.as_str(),
-        binding.weak,
-        name_present,
-        name,
-    )
-}
-
 fn rewrite_binding_decls(
     mut scenario: Scenario,
     forward_map: &HashMap<(ComponentId, String), Vec<ForwardEdge>>,
@@ -430,15 +407,10 @@ fn rewrite_binding_decls(
         let mut updated = BTreeMap::new();
         for (name, slot_ref) in &component.binding_decls {
             let mut stack = HashSet::new();
-            let mut targets = resolve_forward_targets(&scenario, forward_map, slot_ref, &mut stack);
-            targets.sort_by(|a, b| {
-                (a.target.component, &a.target.name).cmp(&(b.target.component, &b.target.name))
-            });
-            let chosen = targets
-                .first()
-                .map(|t| t.target.clone())
-                .unwrap_or_else(|| slot_ref.clone());
-            updated.insert(name.clone(), chosen);
+            let targets = resolve_forward_targets(&scenario, forward_map, slot_ref, &mut stack);
+            if let [target] = targets.as_slice() {
+                updated.insert(name.clone(), target.target.clone());
+            }
         }
         updates.push(Some(updated));
     }
@@ -487,7 +459,9 @@ fn is_pure_routing(
         }
     }
 
-    for (target, binding) in manifest.bindings() {
+    for binding_decl in manifest.bindings() {
+        let target = &binding_decl.target;
+        let binding = &binding_decl.binding;
         match (target, &binding.from) {
             (BindingTarget::ChildSlot { .. }, BindingSource::SelfSlot(_)) => {}
             _ => return false,
@@ -927,75 +901,19 @@ fn is_live_capability(live: &HashSet<CapKey>, component: usize, name: &str) -> b
     })
 }
 
-fn collect_slot_condition_use(query: &str, mut mark_slot: impl FnMut(&str)) -> bool {
-    match parse_slot_query(query) {
-        Ok(parsed) => match parsed.target {
-            SlotTarget::All => true,
-            SlotTarget::Slot(slot) => {
-                mark_slot(slot);
-                false
-            }
-        },
-        Err(_) => query.is_empty(),
-    }
-}
-
 fn collect_program_used_slots(component: &amber_scenario::Component) -> Vec<String> {
     let Some(program) = component.program.as_ref() else {
         return Vec::new();
     };
 
     let mut used = BTreeSet::new();
-    let mark_slot = |slot: &str, used: &mut BTreeSet<String>| {
+    let mark_slot = |slot: &str| {
         used.insert(slot.to_string());
     };
     let all_slots = || component.slots.keys().cloned().collect();
 
-    if let Some(executable) = program.path_ref().or_else(|| program.image_ref())
-        && let Ok(parsed) = executable.parse::<amber_manifest::InterpolatedString>()
-        && parsed.visit_slot_uses(|slot| mark_slot(slot, &mut used))
-    {
+    if program.visit_slot_uses(mark_slot) {
         return all_slots();
-    }
-
-    for group in program.command().groups() {
-        if group.when.source() == InterpolationSource::Slots
-            && collect_slot_condition_use(group.when.query(), |slot| mark_slot(slot, &mut used))
-        {
-            return all_slots();
-        }
-    }
-
-    for item in &program.command().0 {
-        match item {
-            amber_manifest::ProgramArgItem::Arg(arg) => {
-                if arg.visit_slot_uses(|slot| mark_slot(slot, &mut used)) {
-                    return all_slots();
-                }
-            }
-            amber_manifest::ProgramArgItem::Group(group) => {
-                for arg in &group.argv.0 {
-                    if arg.visit_slot_uses(|slot| mark_slot(slot, &mut used)) {
-                        return all_slots();
-                    }
-                }
-            }
-        }
-    }
-
-    for value in program.env().values() {
-        if let Some(when) = value.when()
-            && when.source() == InterpolationSource::Slots
-            && collect_slot_condition_use(when.query(), |slot| mark_slot(slot, &mut used))
-        {
-            return all_slots();
-        }
-        if value
-            .value()
-            .visit_slot_uses(|slot| mark_slot(slot, &mut used))
-        {
-            return all_slots();
-        }
     }
 
     for mount in program.mounts() {
@@ -1003,7 +921,6 @@ fn collect_program_used_slots(component: &amber_scenario::Component) -> Vec<Stri
             mark_slot(slot, &mut used);
         }
     }
-
     used.into_iter().collect()
 }
 

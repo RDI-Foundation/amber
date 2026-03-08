@@ -22,8 +22,8 @@ use crate::{
     refs::{ManifestDigest, ManifestRef, ManifestUrl},
     schema::{
         Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityKind, ComponentDecl,
-        ConfigSchema, EnvironmentDecl, ExportTarget, LocalComponentRef, MountSource, Program,
-        ProvideDecl, RawBinding, RawExportTarget, ResourceDecl, SlotDecl,
+        ConfigSchema, EnvironmentDecl, ExportTarget, LocalComponentRef, ManifestBinding,
+        MountSource, Program, ProvideDecl, RawBinding, RawExportTarget, ResourceDecl, SlotDecl,
     },
 };
 
@@ -59,7 +59,7 @@ pub struct RawManifest {
     #[serde(default)]
     pub resources: BTreeMap<String, ResourceDecl>,
     #[serde(default)]
-    pub bindings: BTreeSet<RawBinding>,
+    pub bindings: Vec<RawBinding>,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
     pub exports: BTreeMap<String, RawExportTarget>,
@@ -101,50 +101,79 @@ fn validate_program_syntax_manifest_version(
     manifest_version: &Version,
     program: Option<&Program>,
 ) -> Result<(), Error> {
-    const REQUIRED_VERSION: &str = "0.2.0";
-
-    let required_version = Version::new(0, 2, 0);
-    if manifest_version >= &required_version {
-        return Ok(());
-    }
-
     let Some(program) = program else {
         return Ok(());
     };
 
-    let Some(unsupported) = find_unsupported_program_syntax(program) else {
+    let Some((required_version, unsupported)) =
+        find_unsupported_program_syntax(program, manifest_version)
+    else {
         return Ok(());
     };
 
     Err(Error::UnsupportedProgramSyntaxForManifestVersion {
         manifest_version: Box::new(manifest_version.clone()),
-        required_version: REQUIRED_VERSION,
+        required_version,
         feature: unsupported.feature,
         pointer: unsupported.pointer,
     })
 }
 
-fn find_unsupported_program_syntax(program: &Program) -> Option<UnsupportedProgramSyntax> {
+fn find_unsupported_program_syntax(
+    program: &Program,
+    manifest_version: &Version,
+) -> Option<(&'static str, UnsupportedProgramSyntax)> {
+    let supports_conditionals = manifest_version >= &Version::new(0, 2, 0);
+    let supports_repeated = manifest_version >= &Version::new(0, 3, 0);
     let (items, field_pointer): (&[ProgramArgItem], &str) = match program {
         Program::Image(program) => (&program.entrypoint.0, "/program/entrypoint"),
         Program::Path(program) => (&program.args.0, "/program/args"),
     };
 
     for (idx, item) in items.iter().enumerate() {
-        if matches!(item, ProgramArgItem::Group(_)) {
-            return Some(UnsupportedProgramSyntax {
-                feature: "conditional argument groups",
-                pointer: format!("{field_pointer}/{idx}"),
-            });
+        if !supports_conditionals && matches!(item, ProgramArgItem::Group(_)) {
+            return Some((
+                "0.2.0",
+                UnsupportedProgramSyntax {
+                    feature: "conditional argument groups",
+                    pointer: format!("{field_pointer}/{idx}"),
+                },
+            ));
+        }
+        if !supports_repeated
+            && matches!(
+                item,
+                ProgramArgItem::RepeatedArgv(_) | ProgramArgItem::RepeatedArg(_)
+            )
+        {
+            return Some((
+                "0.3.0",
+                UnsupportedProgramSyntax {
+                    feature: "repeated slot argument expansion",
+                    pointer: format!("{field_pointer}/{idx}"),
+                },
+            ));
         }
     }
 
     for (key, value) in program.env() {
-        if value.group().is_some() {
-            return Some(UnsupportedProgramSyntax {
-                feature: "conditional environment values",
-                pointer: format!("/program/env/{key}"),
-            });
+        if !supports_conditionals && value.group().is_some() {
+            return Some((
+                "0.2.0",
+                UnsupportedProgramSyntax {
+                    feature: "conditional environment values",
+                    pointer: format!("/program/env/{key}"),
+                },
+            ));
+        }
+        if !supports_repeated && value.repeated().is_some() {
+            return Some((
+                "0.3.0",
+                UnsupportedProgramSyntax {
+                    feature: "repeated slot environment expansion",
+                    pointer: format!("/program/env/{key}"),
+                },
+            ));
         }
     }
 
@@ -421,11 +450,11 @@ fn resolve_binding_source(
 }
 
 fn build_bindings(
-    bindings: BTreeSet<RawBinding>,
+    bindings: Vec<RawBinding>,
     ctx: &ValidateCtx<'_>,
     enabled_features: &BTreeSet<ExperimentalFeature>,
-) -> Result<BTreeMap<BindingTarget, Binding>, Error> {
-    let mut bindings_out = BTreeMap::new();
+) -> Result<Vec<ManifestBinding>, Error> {
+    let mut bindings_out = Vec::with_capacity(bindings.len());
     let mut binding_names = BTreeSet::new();
 
     for binding in bindings {
@@ -464,26 +493,14 @@ fn build_bindings(
         let target = resolve_binding_target(ctx, to, slot)?;
         let source = resolve_binding_source(ctx, from, capability, enabled_features)?;
 
-        if bindings_out.contains_key(&target) {
-            let to = match &target {
-                BindingTarget::SelfSlot(_) => "self".to_string(),
-                BindingTarget::ChildSlot { child, .. } => format!("#{child}"),
-            };
-            let slot = match &target {
-                BindingTarget::SelfSlot(name) => name.to_string(),
-                BindingTarget::ChildSlot { slot, .. } => slot.to_string(),
-            };
-            return Err(Error::DuplicateBindingTarget { to, slot });
-        }
-
-        bindings_out.insert(
+        bindings_out.push(ManifestBinding {
             target,
-            Binding {
+            binding: Binding {
                 name,
                 from: source,
                 weak,
             },
-        );
+        });
     }
 
     Ok(bindings_out)
@@ -852,7 +869,7 @@ pub struct Manifest {
     slots: BTreeMap<SlotName, SlotDecl>,
     provides: BTreeMap<ProvideName, ProvideDecl>,
     resources: BTreeMap<ResourceName, ResourceDecl>,
-    bindings: BTreeMap<BindingTarget, Binding>,
+    bindings: Vec<ManifestBinding>,
     exports: BTreeMap<ExportName, ExportTarget>,
     metadata: Option<Value>,
     digest: ManifestDigest,
@@ -899,7 +916,7 @@ impl Manifest {
         &self.resources
     }
 
-    pub fn bindings(&self) -> &BTreeMap<BindingTarget, Binding> {
+    pub fn bindings(&self) -> &[ManifestBinding] {
         &self.bindings
     }
 
@@ -918,7 +935,7 @@ impl Manifest {
             slots: BTreeMap::new(),
             provides: BTreeMap::new(),
             resources: BTreeMap::new(),
-            bindings: BTreeSet::new(),
+            bindings: Vec::new(),
             exports: BTreeMap::new(),
             metadata: None,
         }
@@ -948,7 +965,7 @@ impl Manifest {
         #[builder(default)] slots: BTreeMap<String, SlotDecl>,
         #[builder(default)] provides: BTreeMap<String, ProvideDecl>,
         #[builder(default)] resources: BTreeMap<String, ResourceDecl>,
-        #[builder(default)] bindings: BTreeSet<RawBinding>,
+        #[builder(default)] bindings: Vec<RawBinding>,
         #[builder(default)] exports: BTreeMap<String, RawExportTarget>,
         metadata: Option<Value>,
     ) -> Result<Self, Error> {
@@ -1015,8 +1032,8 @@ impl From<&Manifest> for RawManifest {
         let bindings = manifest
             .bindings
             .iter()
-            .map(|(target, binding)| {
-                let (to, slot) = match target {
+            .map(|manifest_binding| {
+                let (to, slot) = match &manifest_binding.target {
                     BindingTarget::SelfSlot(name) => (LocalComponentRef::Self_, name.to_string()),
                     BindingTarget::ChildSlot { child, slot } => (
                         LocalComponentRef::Child(child.to_string()),
@@ -1024,7 +1041,7 @@ impl From<&Manifest> for RawManifest {
                     ),
                 };
 
-                let (from, capability) = match &binding.from {
+                let (from, capability) = match &manifest_binding.binding.from {
                     BindingSource::SelfProvide(name) => (
                         BindingSourceRef::Component(LocalComponentRef::Self_),
                         name.to_string(),
@@ -1046,12 +1063,16 @@ impl From<&Manifest> for RawManifest {
                 };
 
                 RawBinding {
-                    name: binding.name.as_ref().map(ToString::to_string),
+                    name: manifest_binding
+                        .binding
+                        .name
+                        .as_ref()
+                        .map(ToString::to_string),
                     to,
                     slot,
                     from,
                     capability,
-                    weak: binding.weak,
+                    weak: manifest_binding.binding.weak,
                     mixed_form: false,
                     raw_to: None,
                     raw_from: None,

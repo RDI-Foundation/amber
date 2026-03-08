@@ -31,6 +31,7 @@ use crate::{
                 build_mesh_config_plan,
             },
             plan::{MeshOptions, MeshPlan, build_mesh_plan, map_program_components},
+            ports::placeholder_local_route_ports,
             provision::build_mesh_provision_plan,
             proxy_metadata::{
                 DEFAULT_EXTERNAL_ENV_FILE, PROXY_METADATA_FILENAME, RouterMetadata,
@@ -78,20 +79,38 @@ pub struct DirectRuntimeAddressPlan {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub slots_by_scope: BTreeMap<usize, BTreeMap<String, DirectRuntimeUrlSource>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub slot_items_by_scope: BTreeMap<usize, BTreeMap<String, Vec<DirectRuntimeUrlSource>>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bindings_by_scope: BTreeMap<usize, BTreeMap<String, DirectRuntimeUrlSource>>,
 }
 
 impl DirectRuntimeAddressPlan {
     fn is_empty(&self) -> bool {
-        self.slots_by_scope.is_empty() && self.bindings_by_scope.is_empty()
+        self.slots_by_scope.is_empty()
+            && self.slot_items_by_scope.is_empty()
+            && self.bindings_by_scope.is_empty()
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DirectRuntimeUrlSource {
-    pub component_id: usize,
-    pub slot: String,
-    pub scheme: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DirectRuntimeUrlSource {
+    Slot {
+        component_id: usize,
+        slot: String,
+        scheme: String,
+    },
+    SlotItem {
+        component_id: usize,
+        slot: String,
+        item_index: usize,
+        scheme: String,
+    },
+    Binding {
+        component_id: usize,
+        binding: String,
+        scheme: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -214,7 +233,7 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
             }
         });
 
-    let slot_ports_by_component = placeholder_slot_ports(scenario, program_components);
+    let route_ports = placeholder_local_route_ports(scenario, &mesh_plan);
     let mesh_ports_by_component = placeholder_mesh_ports(program_components);
 
     let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
@@ -225,7 +244,7 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
 
     let addressing = LocalAddressing::new(
         scenario,
-        &slot_ports_by_component,
+        &route_ports,
         LocalAddressingOptions {
             backend_label: "direct reporter",
             docker_binding: DockerFrameworkBindingPolicy::Unsupported {
@@ -260,7 +279,7 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
     let mesh_config_plan = build_mesh_config_plan(MeshConfigBuildInput {
         scenario,
         mesh_plan: &mesh_plan,
-        slot_ports_by_component: &slot_ports_by_component,
+        route_ports: &route_ports,
         mesh_ports_by_component: &mesh_ports_by_component,
         router_ports,
         addressing: &mesh_addressing,
@@ -705,6 +724,12 @@ fn render_template_string_literal(parts: &[TemplatePart]) -> Result<String, Mesh
                      program path"
                 )));
             }
+            TemplatePart::Item { item, .. } => {
+                return Err(MeshError::new(format!(
+                    "internal error: unresolved repeated item interpolation `{item}` in direct \
+                     program path"
+                )));
+            }
         }
     }
     if out.is_empty() {
@@ -855,25 +880,6 @@ fn ensure_no_endpoint_port_conflicts(
         conflicts.join("\n")
     )))
 }
-
-fn placeholder_slot_ports(
-    scenario: &Scenario,
-    program_components: &[ComponentId],
-) -> HashMap<ComponentId, BTreeMap<String, u16>> {
-    let mut out = HashMap::new();
-    for id in program_components {
-        let mut slot_ports = BTreeMap::new();
-        for (slot_name, slot_decl) in &scenario.component(*id).slots {
-            if slot_decl.decl.kind == amber_manifest::CapabilityKind::Storage {
-                continue;
-            }
-            slot_ports.insert(slot_name.clone(), 0);
-        }
-        out.insert(*id, slot_ports);
-    }
-    out
-}
-
 fn placeholder_mesh_ports(program_components: &[ComponentId]) -> HashMap<ComponentId, u16> {
     let mut out = HashMap::new();
     for id in program_components {
@@ -883,11 +889,8 @@ fn placeholder_mesh_ports(program_components: &[ComponentId]) -> HashMap<Compone
 }
 
 fn build_runtime_address_plan(
-    scenario: &Scenario,
-    slot_values_by_component: &HashMap<
-        ComponentId,
-        BTreeMap<String, crate::slot_query::SlotObject>,
-    >,
+    _scenario: &Scenario,
+    slot_values_by_component: &HashMap<ComponentId, BTreeMap<String, crate::slot_query::SlotValue>>,
     binding_values_by_component: &HashMap<
         ComponentId,
         BTreeMap<String, crate::binding_query::BindingObject>,
@@ -895,91 +898,72 @@ fn build_runtime_address_plan(
     binding_values_by_scope: &HashMap<u64, BTreeMap<String, crate::binding_query::BindingObject>>,
 ) -> Result<DirectRuntimeAddressPlan, MeshError> {
     let mut slots_by_scope = BTreeMap::new();
+    let mut slot_items_by_scope = BTreeMap::new();
     for (scope, slots) in slot_values_by_component {
-        let mut scope_entries = BTreeMap::new();
+        let mut singular_entries = BTreeMap::new();
+        let mut repeated_entries = BTreeMap::new();
         for (slot, value) in slots {
-            scope_entries.insert(
-                slot.clone(),
-                DirectRuntimeUrlSource {
-                    component_id: scope.0,
-                    slot: slot.clone(),
-                    scheme: url_scheme(&value.url)?,
-                },
-            );
+            match value {
+                crate::slot_query::SlotValue::One(value) => {
+                    singular_entries.insert(
+                        slot.clone(),
+                        DirectRuntimeUrlSource::Slot {
+                            component_id: scope.0,
+                            slot: slot.clone(),
+                            scheme: url_scheme(&value.url)?,
+                        },
+                    );
+                }
+                crate::slot_query::SlotValue::Many(values) => {
+                    let mut sources = Vec::with_capacity(values.len());
+                    for (item_index, value) in values.iter().enumerate() {
+                        sources.push(DirectRuntimeUrlSource::SlotItem {
+                            component_id: scope.0,
+                            slot: slot.clone(),
+                            item_index,
+                            scheme: url_scheme(&value.url)?,
+                        });
+                    }
+                    repeated_entries.insert(slot.clone(), sources);
+                }
+            }
         }
-        if !scope_entries.is_empty() {
-            slots_by_scope.insert(scope.0, scope_entries);
+        if !singular_entries.is_empty() {
+            slots_by_scope.insert(scope.0, singular_entries);
+        }
+        if !repeated_entries.is_empty() {
+            slot_items_by_scope.insert(scope.0, repeated_entries);
         }
     }
 
     let mut bindings_by_scope = BTreeMap::new();
     for (scope, bindings) in binding_values_by_component {
-        let component = scenario.component(*scope);
         let scope_entries = bindings_by_scope
             .entry(scope.0)
             .or_insert_with(BTreeMap::new);
-        for binding_name in bindings.keys() {
-            let slot_ref = component
-                .binding_decls
-                .get(binding_name.as_str())
-                .ok_or_else(|| {
-                    MeshError::new(format!(
-                        "internal error: missing binding declaration {} in {}",
-                        binding_name, component.moniker
-                    ))
-                })?;
-            let slot_url = slot_values_by_component
-                .get(&slot_ref.component)
-                .and_then(|slots| slots.get(slot_ref.name.as_str()))
-                .ok_or_else(|| {
-                    MeshError::new(format!(
-                        "internal error: missing slot value for {}.{}",
-                        component_label(scenario, slot_ref.component),
-                        slot_ref.name
-                    ))
-                })?;
+        for (binding_name, binding) in bindings {
             scope_entries.insert(
                 binding_name.clone(),
-                DirectRuntimeUrlSource {
-                    component_id: slot_ref.component.0,
-                    slot: slot_ref.name.clone(),
-                    scheme: url_scheme(&slot_url.url)?,
+                DirectRuntimeUrlSource::Binding {
+                    component_id: scope.0,
+                    binding: binding_name.clone(),
+                    scheme: url_scheme(&binding.url)?,
                 },
             );
         }
     }
 
     for (&scope, bindings) in binding_values_by_scope {
-        let component = scenario.component(ComponentId(scope as usize));
         let scope_entries = bindings_by_scope
             .entry(scope as usize)
             .or_insert_with(BTreeMap::new);
-        for binding_name in bindings.keys() {
-            let slot_ref = component
-                .binding_decls
-                .get(binding_name.as_str())
-                .ok_or_else(|| {
-                    MeshError::new(format!(
-                        "internal error: missing binding declaration {} in {}",
-                        binding_name, component.moniker
-                    ))
-                })?;
-            let slot_url = slot_values_by_component
-                .get(&slot_ref.component)
-                .and_then(|slots| slots.get(slot_ref.name.as_str()))
-                .ok_or_else(|| {
-                    MeshError::new(format!(
-                        "internal error: missing slot value for {}.{}",
-                        component_label(scenario, slot_ref.component),
-                        slot_ref.name
-                    ))
-                })?;
+        for (binding_name, binding) in bindings {
             scope_entries.insert(
                 binding_name.clone(),
-                DirectRuntimeUrlSource {
-                    component_id: slot_ref.component.0,
-                    slot: slot_ref.name.clone(),
-                    scheme: url_scheme(&slot_url.url)?,
+                DirectRuntimeUrlSource::Binding {
+                    component_id: scope as usize,
+                    binding: binding_name.clone(),
+                    scheme: url_scheme(&binding.url)?,
                 },
             );
         }
@@ -987,6 +971,7 @@ fn build_runtime_address_plan(
 
     Ok(DirectRuntimeAddressPlan {
         slots_by_scope,
+        slot_items_by_scope,
         bindings_by_scope,
     })
 }
@@ -1070,10 +1055,43 @@ impl MeshAddressing for LoopbackMeshAddressing<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, path::Path};
+    use std::{
+        collections::{BTreeMap, HashMap},
+        path::Path,
+        sync::Arc,
+    };
+
+    use amber_scenario::{BindingEdge, Component, Moniker, Scenario};
 
     use super::*;
     use crate::storage_plan::{StorageIdentity, StorageMount};
+    use crate::{
+        binding_query::BindingObject,
+        slot_query::{SlotObject, SlotValue},
+    };
+
+    fn test_scenario() -> Scenario {
+        Scenario {
+            root: ComponentId(0),
+            components: vec![Some(Component {
+                id: ComponentId(0),
+                parent: None,
+                moniker: Moniker::from(Arc::<str>::from("/")),
+                digest: amber_manifest::ManifestDigest::new([0; 32]),
+                config: None,
+                config_schema: None,
+                program: None,
+                slots: BTreeMap::new(),
+                provides: BTreeMap::new(),
+                resources: BTreeMap::new(),
+                binding_decls: BTreeMap::new(),
+                metadata: None,
+                children: Vec::new(),
+            })],
+            bindings: Vec::<BindingEdge>::new(),
+            exports: Vec::new(),
+        }
+    }
 
     #[test]
     fn resolve_helper_entrypoint_payload_rewrites_relative_program() {
@@ -1166,5 +1184,92 @@ mod tests {
         assert_ne!(mounts[0].state_subdir, mounts[1].state_subdir);
         assert!(mounts[0].state_subdir.starts_with("db/state-"));
         assert!(mounts[1].state_subdir.starts_with("db/state-"));
+    }
+
+    #[test]
+    fn build_runtime_address_plan_preserves_slot_item_order_and_binding_sources() {
+        let slot_values_by_component = HashMap::from([(
+            ComponentId(0),
+            BTreeMap::from([
+                (
+                    "api".to_string(),
+                    SlotValue::One(SlotObject {
+                        url: "http://127.0.0.1:31001".to_string(),
+                    }),
+                ),
+                (
+                    "upstream".to_string(),
+                    SlotValue::Many(vec![
+                        SlotObject {
+                            url: "http://127.0.0.1:32001".to_string(),
+                        },
+                        SlotObject {
+                            url: "http://127.0.0.1:32002".to_string(),
+                        },
+                    ]),
+                ),
+            ]),
+        )]);
+        let binding_values_by_component = HashMap::from([(
+            ComponentId(0),
+            BTreeMap::from([(
+                "primary".to_string(),
+                BindingObject {
+                    url: "http://127.0.0.1:33003".to_string(),
+                },
+            )]),
+        )]);
+
+        let plan = build_runtime_address_plan(
+            &test_scenario(),
+            &slot_values_by_component,
+            &binding_values_by_component,
+            &HashMap::new(),
+        )
+        .expect("runtime address plan");
+
+        assert!(matches!(
+            plan.slots_by_scope.get(&0).and_then(|slots| slots.get("api")),
+            Some(DirectRuntimeUrlSource::Slot {
+                component_id: 0,
+                slot,
+                scheme
+            }) if slot == "api" && scheme == "http"
+        ));
+        assert!(matches!(
+            plan.bindings_by_scope
+                .get(&0)
+                .and_then(|bindings| bindings.get("primary")),
+            Some(DirectRuntimeUrlSource::Binding {
+                component_id: 0,
+                binding,
+                scheme
+            }) if binding == "primary" && scheme == "http"
+        ));
+
+        let slot_items = plan
+            .slot_items_by_scope
+            .get(&0)
+            .and_then(|slots| slots.get("upstream"))
+            .expect("slot items");
+        assert_eq!(slot_items.len(), 2);
+        assert!(matches!(
+            &slot_items[0],
+            DirectRuntimeUrlSource::SlotItem {
+                component_id: 0,
+                slot,
+                item_index: 0,
+                scheme,
+            } if slot == "upstream" && scheme == "http"
+        ));
+        assert!(matches!(
+            &slot_items[1],
+            DirectRuntimeUrlSource::SlotItem {
+                component_id: 0,
+                slot,
+                item_index: 1,
+                scheme,
+            } if slot == "upstream" && scheme == "http"
+        ));
     }
 }

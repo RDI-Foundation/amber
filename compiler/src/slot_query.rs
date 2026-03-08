@@ -10,8 +10,15 @@ pub(crate) struct SlotObject {
     pub(crate) url: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum SlotValue {
+    One(SlotObject),
+    Many(Vec<SlotObject>),
+}
+
 pub(crate) fn resolve_slot_query(
-    slots: &BTreeMap<String, SlotObject>,
+    slots: &BTreeMap<String, SlotValue>,
     query: &str,
 ) -> Result<String, String> {
     let label = if query.is_empty() {
@@ -23,7 +30,15 @@ pub(crate) fn resolve_slot_query(
     let parsed = parse_slot_query(query)
         .map_err(|err| format!("invalid slots interpolation '{label}': {err}"))?;
 
-    let render_object = |slots: &BTreeMap<String, SlotObject>| {
+    let render_object = |slots: &BTreeMap<String, SlotValue>| {
+        if slots
+            .values()
+            .any(|slot| matches!(slot, SlotValue::Many(_)))
+        {
+            return Err(
+                "slots contains repeated values; use repeated slot expansion instead".to_string(),
+            );
+        }
         serde_json::to_value(slots)
             .map_err(|e| format!("failed to serialize {label} as JSON: {e}"))
             .and_then(|value| {
@@ -38,6 +53,12 @@ pub(crate) fn resolve_slot_query(
             let slot = slots
                 .get(slot_name)
                 .ok_or_else(|| format!("slots.{slot_name} not found"))?;
+            if matches!(slot, SlotValue::Many(_)) {
+                return Err(format!(
+                    "slots.{slot_name} is repeated; use `each: \"slots.{slot_name}\"` and \
+                     `${{item...}}`"
+                ));
+            }
             let slot_value = serde_json::to_value(slot)
                 .map_err(|e| format!("failed to serialize slots.{slot_name} as JSON: {e}"))?;
             let value = query_value_opt(&slot_value, &parsed.path)
@@ -49,7 +70,7 @@ pub(crate) fn resolve_slot_query(
 }
 
 pub(crate) fn slot_query_is_present(
-    slots: &BTreeMap<String, SlotObject>,
+    slots: &BTreeMap<String, SlotValue>,
     query: &str,
 ) -> Result<bool, String> {
     let label = if query.is_empty() {
@@ -63,10 +84,18 @@ pub(crate) fn slot_query_is_present(
 
     match parsed.target {
         SlotTarget::All => Ok(true),
-        SlotTarget::Slot(slot_name) => Ok(slots.get(slot_name).is_some_and(|slot| {
-            serde_json::to_value(slot)
+        SlotTarget::Slot(slot_name) => Ok(slots.get(slot_name).is_some_and(|slot| match slot {
+            SlotValue::One(slot) => serde_json::to_value(slot)
                 .ok()
-                .is_some_and(|value| query_value_opt(&value, &parsed.path).is_some())
+                .is_some_and(|value| query_value_opt(&value, &parsed.path).is_some()),
+            SlotValue::Many(slots) => {
+                if slots.is_empty() {
+                    return false;
+                }
+                serde_json::to_value(&slots[0])
+                    .ok()
+                    .is_some_and(|value| query_value_opt(&value, &parsed.path).is_some())
+            }
         })),
     }
 }
@@ -86,12 +115,12 @@ fn query_value_opt<'a>(root: &'a Value, path: &[&str]) -> Option<&'a Value> {
 mod tests {
     use super::*;
 
-    fn test_slots() -> BTreeMap<String, SlotObject> {
+    fn test_slots() -> BTreeMap<String, SlotValue> {
         BTreeMap::from([(
             "api".to_string(),
-            SlotObject {
+            SlotValue::One(SlotObject {
                 url: "https://example.test".to_string(),
-            },
+            }),
         )])
     }
 

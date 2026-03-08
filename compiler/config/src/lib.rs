@@ -145,6 +145,7 @@ mod tests {
                     "http://127.0.0.1:31001".to_string(),
                 )]),
             )]),
+            slot_items_by_scope: std::collections::BTreeMap::new(),
             bindings_by_scope: std::collections::BTreeMap::from([(
                 11,
                 std::collections::BTreeMap::from([(

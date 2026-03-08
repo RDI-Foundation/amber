@@ -1020,17 +1020,15 @@ mod tests {
         }
         "##;
 
-        let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
-        let labels: Vec<_> = err.labels().unwrap().collect();
-        assert!(labels.len() >= 2);
-
+        let parsed = ParsedManifest::parse_named("test", Arc::from(source)).expect("manifest");
         let starts: Vec<_> = source
             .match_indices("{ to: \"#a.s\"")
             .map(|(idx, _)| idx)
             .collect();
         assert_eq!(starts.len(), 2);
-        assert!(labels.iter().any(|l| l.offset() == starts[0]));
-        assert!(labels.iter().any(|l| l.offset() == starts[1]));
+        assert_eq!(parsed.spans.bindings_by_index.len(), 2);
+        assert_eq!(parsed.spans.bindings_by_index[0].whole.offset(), starts[0]);
+        assert_eq!(parsed.spans.bindings_by_index[1].whole.offset(), starts[1]);
     }
 
     #[test]
@@ -1057,18 +1055,13 @@ mod tests {
         }
         "##;
         let source: Arc<str> = Arc::from(source);
-        let err = ParsedManifest::parse_named("<test>", Arc::clone(&source)).unwrap_err();
-        assert!(matches!(
-            err.kind,
-            crate::Error::DuplicateBindingTarget { .. }
-        ));
-
-        let labels: Vec<_> = err.labels().expect("labels").collect();
-        let second = labels
-            .iter()
-            .find(|label| label.label() == Some("second binding here"))
-            .expect("second binding label");
-        let second_text = labeled_span_text(source.as_ref(), second);
+        let parsed = ParsedManifest::parse_named("<test>", Arc::clone(&source)).expect("manifest");
+        let second = parsed
+            .spans
+            .bindings_by_index
+            .get(1)
+            .expect("second binding span");
+        let second_text = &source[second.whole.offset()..][..second.whole.len()];
         assert!(second_text.contains("self.b"));
     }
 
