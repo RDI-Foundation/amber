@@ -283,6 +283,14 @@ pub struct ProgramArgGroup {
     pub argv: ProgramArgList,
 }
 
+impl ProgramArgGroup {
+    pub fn visit_values(&self, mut visit: impl FnMut(&InterpolatedString)) {
+        for arg in &self.argv.0 {
+            visit(arg);
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ProgramArgItem {
     Arg(InterpolatedString),
@@ -301,6 +309,17 @@ impl ProgramArgItem {
         match self {
             Self::Arg(_) => None,
             Self::Group(group) => Some(group),
+        }
+    }
+
+    pub fn when(&self) -> Option<&WhenPath> {
+        self.group().map(|group| &group.when)
+    }
+
+    pub fn visit_values(&self, mut visit: impl FnMut(&InterpolatedString)) {
+        match self {
+            Self::Arg(arg) => visit(arg),
+            Self::Group(group) => group.visit_values(visit),
         }
     }
 }
@@ -374,14 +393,7 @@ pub struct ProgramEntrypoint(pub Vec<ProgramArgItem>);
 impl ProgramEntrypoint {
     pub fn visit_args(&self, mut visit: impl FnMut(&InterpolatedString)) {
         for item in &self.0 {
-            match item {
-                ProgramArgItem::Arg(arg) => visit(arg),
-                ProgramArgItem::Group(group) => {
-                    for arg in &group.argv.0 {
-                        visit(arg);
-                    }
-                }
-            }
+            item.visit_values(&mut visit);
         }
     }
 
@@ -436,6 +448,105 @@ impl<'de> Deserialize<'de> for ProgramEntrypoint {
         }
 
         deserializer.deserialize_any(ProgramEntrypointVisitor)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgramEnvGroup {
+    pub when: WhenPath,
+    pub value: InterpolatedString,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ProgramEnvValue {
+    Value(InterpolatedString),
+    Group(ProgramEnvGroup),
+}
+
+impl ProgramEnvValue {
+    pub fn value(&self) -> &InterpolatedString {
+        match self {
+            Self::Value(value) => value,
+            Self::Group(group) => &group.value,
+        }
+    }
+
+    pub fn group(&self) -> Option<&ProgramEnvGroup> {
+        match self {
+            Self::Value(_) => None,
+            Self::Group(group) => Some(group),
+        }
+    }
+
+    pub fn when(&self) -> Option<&WhenPath> {
+        self.group().map(|group| &group.when)
+    }
+
+    pub fn visit_values(&self, mut visit: impl FnMut(&InterpolatedString)) {
+        visit(self.value());
+    }
+}
+
+impl From<InterpolatedString> for ProgramEnvValue {
+    fn from(value: InterpolatedString) -> Self {
+        Self::Value(value)
+    }
+}
+
+impl Serialize for ProgramEnvValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Value(value) => value.serialize(serializer),
+            Self::Group(group) => group.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProgramEnvValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ProgramEnvValueVisitor;
+
+        impl<'de> Visitor<'de> for ProgramEnvValueVisitor {
+            type Value = ProgramEnvValue;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an interpolation string or an object with `when` and `value`")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                value
+                    .parse::<InterpolatedString>()
+                    .map(ProgramEnvValue::Value)
+                    .map_err(E::custom)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(&value)
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                ProgramEnvGroup::deserialize(MapAccessDeserializer::new(map))
+                    .map(ProgramEnvValue::Group)
+            }
+        }
+
+        deserializer.deserialize_any(ProgramEnvValueVisitor)
     }
 }
 

@@ -10,8 +10,8 @@ use amber_manifest::{
 };
 use amber_scenario::{ComponentId, Scenario};
 use amber_template::{
-    ConditionalProgramArgTemplate, ProgramArgTemplate, ProgramTemplateSpec, TemplatePart,
-    TemplateSpec, TemplateString,
+    ConditionalProgramArgTemplate, ConditionalProgramEnvTemplate, ProgramArgTemplate,
+    ProgramEnvTemplate, ProgramTemplateSpec, TemplatePart, TemplateSpec, TemplateString,
 };
 use base64::Engine as _;
 use serde::Serialize;
@@ -573,8 +573,14 @@ fn collect_used_paths_from_template_spec(spec: &TemplateSpec, out: &mut BTreeSet
             }
         }
     }
-    for ts in spec.program.env.values() {
-        collect_used_paths_from_template_string(ts, out);
+    for value in spec.program.env.values() {
+        match value {
+            ProgramEnvTemplate::Value(ts) => collect_used_paths_from_template_string(ts, out),
+            ProgramEnvTemplate::Group(group) => {
+                out.insert(group.when.clone());
+                collect_used_paths_from_template_string(&group.value, out);
+            }
+        }
     }
 }
 
@@ -792,7 +798,28 @@ fn program_used_config_paths(
         }
     }
     for value in program.env().values() {
-        collect_program_config_paths(&value.parts, &mut used);
+        if let Some(when) = value.when() {
+            match resolve_condition_presence_for_program(
+                when.source(),
+                when.query(),
+                template_opt,
+                slots,
+            )? {
+                ConfigPresence::Present => {
+                    if when.source() == InterpolationSource::Config {
+                        used.insert(when.query().to_string());
+                    }
+                    collect_program_config_paths(&value.value().parts, &mut used);
+                }
+                ConfigPresence::Absent => {}
+                ConfigPresence::Runtime => {
+                    used.insert(when.query().to_string());
+                    collect_program_config_paths(&value.value().parts, &mut used);
+                }
+            }
+            continue;
+        }
+        collect_program_config_paths(&value.value().parts, &mut used);
     }
     for mount in program.mounts() {
         match &mount.source {
@@ -1782,23 +1809,86 @@ fn build_program_plan(
         }
     };
 
-    let mut env_ts: BTreeMap<String, TemplateString> = BTreeMap::new();
+    let mut env_ts: BTreeMap<String, ProgramEnvTemplate> = BTreeMap::new();
     for (k, v) in program_env {
-        let location = format!("program.env.{k}");
-        let ts = resolve_program_template_string(
-            scenario,
-            id,
-            &location,
-            v,
-            runtime_address_resolution,
-            slots,
-            bindings,
-            template_opt,
-            &mut needs_helper_for_program_templates,
-            &mut needs_runtime_config_for_program_templates,
-            false,
-        )?;
-        env_ts.insert(k.clone(), ts);
+        match v {
+            amber_manifest::ProgramEnvValue::Value(value) => {
+                let location = format!("program.env.{k}");
+                let ts = resolve_program_template_string(
+                    scenario,
+                    id,
+                    &location,
+                    value,
+                    runtime_address_resolution,
+                    slots,
+                    bindings,
+                    template_opt,
+                    &mut needs_helper_for_program_templates,
+                    &mut needs_runtime_config_for_program_templates,
+                    false,
+                )?;
+                env_ts.insert(k.clone(), ProgramEnvTemplate::Value(ts));
+            }
+            amber_manifest::ProgramEnvValue::Group(group) => {
+                match resolve_condition_presence_for_program(
+                    group.when.source(),
+                    group.when.query(),
+                    template_opt,
+                    slots,
+                )? {
+                    ConfigPresence::Absent => {}
+                    ConfigPresence::Present => {
+                        let location = format!("program.env.{k}.value");
+                        let ts = resolve_program_template_string(
+                            scenario,
+                            id,
+                            &location,
+                            &group.value,
+                            runtime_address_resolution,
+                            slots,
+                            bindings,
+                            template_opt,
+                            &mut needs_helper_for_program_templates,
+                            &mut needs_runtime_config_for_program_templates,
+                            false,
+                        )?;
+                        env_ts.insert(k.clone(), ProgramEnvTemplate::Value(ts));
+                    }
+                    ConfigPresence::Runtime => {
+                        if group.when.source() != InterpolationSource::Config {
+                            return Err(MeshError::new(format!(
+                                "internal error: runtime conditional program env value requires \
+                                 config-based `when`, got `{}`",
+                                group.when
+                            )));
+                        }
+                        let location = format!("program.env.{k}.value");
+                        let ts = resolve_program_template_string(
+                            scenario,
+                            id,
+                            &location,
+                            &group.value,
+                            runtime_address_resolution,
+                            slots,
+                            bindings,
+                            template_opt,
+                            &mut needs_helper_for_program_templates,
+                            &mut needs_runtime_config_for_program_templates,
+                            false,
+                        )?;
+                        needs_helper_for_program_templates = true;
+                        needs_runtime_config_for_program_templates = true;
+                        env_ts.insert(
+                            k.clone(),
+                            ProgramEnvTemplate::Group(ConditionalProgramEnvTemplate {
+                                when: group.when.query().to_string(),
+                                value: ts,
+                            }),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     if needs_helper_for_program_templates {
@@ -1840,7 +1930,14 @@ fn build_program_plan(
         }
         let rendered_env = env_ts
             .into_iter()
-            .map(|(k, ts)| render_template_string_static(&ts).map(|rendered| (k, rendered)))
+            .map(|(k, value)| match value {
+                ProgramEnvTemplate::Value(ts) => {
+                    render_template_string_static(&ts).map(|rendered| (k, rendered))
+                }
+                ProgramEnvTemplate::Group(_) => Err(MeshError::new(
+                    "internal error: conditional env value reached resolved program plan",
+                )),
+            })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
 
         Ok(ProgramPlan::Resolved {

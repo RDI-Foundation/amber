@@ -2,7 +2,8 @@ use std::{collections::BTreeMap, ffi::OsString};
 
 use amber_config::{self as config, CONFIG_ENV_PREFIX, ConfigError};
 use amber_template::{
-    ConfigTemplatePayload, ProgramArgTemplate, RuntimeTemplateContext, TemplateSpec,
+    ConfigTemplatePayload, ProgramArgTemplate, ProgramEnvTemplate, RuntimeTemplateContext,
+    TemplateSpec,
 };
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -303,15 +304,26 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
         }
 
         let mut rendered_env: BTreeMap<String, String> = BTreeMap::new();
-        for (k, ts) in &spec.program.env {
-            rendered_env.insert(
-                k.clone(),
-                config::render_template_string_with_context(
+        for (k, value) in &spec.program.env {
+            let rendered = match value {
+                ProgramEnvTemplate::Value(ts) => config::render_template_string_with_context(
                     ts,
                     component_config,
                     &runtime_template_context,
                 )?,
-            );
+                ProgramEnvTemplate::Group(group) => {
+                    let present = config_path_is_present(component_config, &group.when)?;
+                    if !present {
+                        continue;
+                    }
+                    config::render_template_string_with_context(
+                        &group.value,
+                        component_config,
+                        &runtime_template_context,
+                    )?
+                }
+            };
+            rendered_env.insert(k.clone(), rendered);
         }
 
         (entrypoint, rendered_env)
@@ -359,7 +371,7 @@ fn template_spec_requires_config(spec: &TemplateSpec) -> bool {
             .program
             .env
             .values()
-            .any(|parts| template_string_requires_config(parts))
+            .any(program_env_template_requires_config)
 }
 
 fn program_arg_template_requires_config(arg: &ProgramArgTemplate) -> bool {
@@ -371,6 +383,15 @@ fn program_arg_template_requires_config(arg: &ProgramArgTemplate) -> bool {
                     .argv
                     .iter()
                     .any(|parts| template_string_requires_config(parts))
+        }
+    }
+}
+
+fn program_env_template_requires_config(value: &ProgramEnvTemplate) -> bool {
+    match value {
+        ProgramEnvTemplate::Value(parts) => template_string_requires_config(parts),
+        ProgramEnvTemplate::Group(group) => {
+            !group.when.is_empty() || template_string_requires_config(&group.value)
         }
     }
 }
@@ -506,7 +527,10 @@ mod tests {
                         TemplatePart::config("token"),
                     ]),
                 ],
-                env: BTreeMap::from([("COUNT".to_string(), vec![TemplatePart::config("count")])]),
+                env: BTreeMap::from([(
+                    "COUNT".to_string(),
+                    ProgramEnvTemplate::Value(vec![TemplatePart::config("count")]),
+                )]),
             },
         };
 
@@ -753,7 +777,7 @@ mod tests {
                 ],
                 env: BTreeMap::from([(
                     "UPSTREAM".to_string(),
-                    vec![TemplatePart::binding(11, "upstream.url")],
+                    ProgramEnvTemplate::Value(vec![TemplatePart::binding(11, "upstream.url")]),
                 )]),
             },
         };

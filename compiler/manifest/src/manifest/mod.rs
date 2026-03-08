@@ -134,6 +134,15 @@ fn find_unsupported_program_syntax(program: &Program) -> Option<UnsupportedProgr
         }
     }
 
+    for (key, value) in program.env() {
+        if value.group().is_some() {
+            return Some(UnsupportedProgramSyntax {
+                feature: "conditional environment values",
+                pointer: format!("/program/env/{key}"),
+            });
+        }
+    }
+
     None
 }
 

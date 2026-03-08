@@ -21,7 +21,7 @@ pub use framework::{
 };
 pub use interpolation::{
     InterpolatedPart, InterpolatedString, InterpolationSource, ProgramArgGroup, ProgramArgItem,
-    ProgramArgList, ProgramEntrypoint, WhenPath,
+    ProgramArgList, ProgramEntrypoint, ProgramEnvValue, WhenPath,
 };
 pub use manifest::{ExperimentalFeature, Manifest, RawManifest};
 pub use names::{

@@ -244,6 +244,14 @@ program: {
   // ],
 
   env: {
+    // Env values may also be conditional.
+    // The whole env entry is omitted when the `when` path is absent or null.
+    // Presence is not truthiness: false, 0, and "" still count as present.
+    //
+    // PROFILE: {
+    //   when: "config.profile",
+    //   value: "${config.profile}",
+    // },
     LOG_LEVEL: "debug",
   },
   network: {
@@ -321,8 +329,10 @@ Notes:
 * Framework bindings may be **non-URL-shaped**; `${bindings.<name>.url}` is invalid for those
   bindings and is rejected by the compiler.
 * `manifest_version: "0.2.0"` or newer is required for object items in `program.entrypoint` /
-  `program.args`, such as `{ when: "config.profile", argv: [...] }`.
-* `when` is only supported in `program.entrypoint` and `program.args`.
+  `program.args` and object values in `program.env`, such as
+  `{ when: "config.profile", argv: [...] }` or
+  `{ when: "config.profile", value: "${config.profile}" }`.
+* `when` is supported in `program.entrypoint`, `program.args`, and `program.env`.
 * `when` accepts `config.<path>` or `slots.<path>`.
 * Slot `when` checks whether the referenced slot query is present. Today that means
   `slots.<slot>` and `slots.<slot>.url` are both valid.

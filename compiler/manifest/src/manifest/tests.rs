@@ -192,6 +192,74 @@ fn when_is_accepted_in_manifest_version_0_2_0() {
 }
 
 #[test]
+fn conditional_program_env_requires_manifest_version_0_2_0() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "busybox:1.36",
+            env: {
+              PROFILE: {
+                when: "config.profile",
+                value: "${config.profile}",
+              },
+            },
+          },
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::UnsupportedProgramSyntaxForManifestVersion {
+            manifest_version,
+            required_version,
+            feature,
+            pointer,
+        } => {
+            assert_eq!(*manifest_version, Version::new(0, 1, 0));
+            assert_eq!(required_version, "0.2.0");
+            assert_eq!(feature, "conditional environment values");
+            assert_eq!(pointer, "/program/env/PROFILE");
+        }
+        other => panic!("expected UnsupportedProgramSyntaxForManifestVersion error, got: {other}"),
+    }
+}
+
+#[test]
+fn conditional_program_env_is_accepted_in_manifest_version_0_2_0() {
+    let manifest: Manifest = r#"
+        {
+          manifest_version: "0.2.0",
+          program: {
+            image: "busybox:1.36",
+            entrypoint: ["env"],
+            env: {
+              PROFILE: {
+                when: "config.profile",
+                value: "${config.profile}",
+              },
+            },
+          },
+        }
+    "#
+    .parse()
+    .unwrap();
+
+    let Program::Image(program) = manifest.program().expect("program should exist") else {
+        panic!("expected image program");
+    };
+    assert!(
+        program
+            .common
+            .env
+            .get("PROFILE")
+            .is_some_and(|value| value.group().is_some())
+    );
+}
+
+#[test]
 fn program_entrypoint_string_sugar_splits() {
     let m: Manifest = r#"
         {

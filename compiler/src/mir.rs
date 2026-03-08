@@ -938,7 +938,16 @@ fn collect_program_used_slots(component: &amber_scenario::Component) -> Vec<Stri
     }
 
     for value in program.env().values() {
-        if value.visit_slot_uses(|slot| mark_slot(slot, &mut used)) {
+        if let Some(when) = value.when()
+            && when.source() == InterpolationSource::Slots
+            && collect_slot_condition_use(when.query(), |slot| mark_slot(slot, &mut used))
+        {
+            return all_slots();
+        }
+        if value
+            .value()
+            .visit_slot_uses(|slot| mark_slot(slot, &mut used))
+        {
             return all_slots();
         }
     }

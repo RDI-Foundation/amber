@@ -115,7 +115,15 @@ pub(crate) fn collect_binding_usage(scenario: &Scenario) -> BindingUsage {
                 }
             }
             for value in program.env().values() {
-                record_binding_parts(&value.parts, id, BindingUseSource::Program, id, &mut usage);
+                value.visit_values(|value| {
+                    record_binding_parts(
+                        &value.parts,
+                        id,
+                        BindingUseSource::Program,
+                        id,
+                        &mut usage,
+                    );
+                });
             }
 
             let used_paths = collect_program_used_config_paths(
@@ -197,7 +205,22 @@ fn collect_program_used_config_paths(
         }
     }
     for value in program.env().values() {
-        record_program_config_parts(&value.parts, &mut used);
+        if let Some(when) = value.when() {
+            if conditional_path_may_be_present(
+                template_opt,
+                scenario,
+                component_id,
+                when.source(),
+                when.query(),
+            ) {
+                if when.source() == InterpolationSource::Config {
+                    used.insert(when.query().to_string());
+                }
+                value.visit_values(|value| record_program_config_parts(&value.parts, &mut used));
+            }
+            continue;
+        }
+        value.visit_values(|value| record_program_config_parts(&value.parts, &mut used));
     }
     for mount in program.mounts() {
         match &mount.source {

@@ -194,7 +194,12 @@ fn collect_config_uses(manifest: &Manifest) -> ConfigUses {
             }
         }
         for value in program.env().values() {
-            collect_config_uses_from_interpolated(value, &mut uses);
+            if let Some(when) = value.when()
+                && when.source() == InterpolationSource::Config
+            {
+                uses.add_query(when.query());
+            }
+            value.visit_values(|value| collect_config_uses_from_interpolated(value, &mut uses));
         }
         for mount in program.mounts() {
             match &mount.source {
@@ -458,9 +463,18 @@ fn validate_manifest_binding_interpolations(
     }
 
     for (key, value) in program.env() {
-        let location = ProgramLocation::Env(key.as_str());
-        let span = location.span(source.as_ref(), spans);
-        validate_interpolated_string(value, &ctx, location, span, &mut diagnostics);
+        match value {
+            amber_manifest::ProgramEnvValue::Value(value) => {
+                let location = ProgramLocation::Env(key.as_str());
+                let span = location.span(source.as_ref(), spans);
+                validate_interpolated_string(value, &ctx, location, span, &mut diagnostics);
+            }
+            amber_manifest::ProgramEnvValue::Group(group) => {
+                let location = ProgramLocation::EnvValue(key.as_str());
+                let span = location.span(source.as_ref(), spans);
+                validate_interpolated_string(&group.value, &ctx, location, span, &mut diagnostics);
+            }
+        }
     }
 
     diagnostics
@@ -693,6 +707,7 @@ enum ProgramLocation<'a> {
     Args(usize),
     ArgsGroup(usize, usize),
     Env(&'a str),
+    EnvValue(&'a str),
 }
 
 impl ProgramLocation<'_> {
@@ -709,6 +724,7 @@ impl ProgramLocation<'_> {
                 format!("program.args[{idx}].argv[{group_idx}]")
             }
             ProgramLocation::Env(key) => format!("program.env.{key}"),
+            ProgramLocation::EnvValue(key) => format!("program.env.{key}.value"),
         }
     }
 
@@ -788,6 +804,20 @@ impl ProgramLocation<'_> {
             ProgramLocation::Env(key) => {
                 let pointer = PointerBuf::from_tokens(["program", "env", key]).to_string();
                 if let Some(span) = span_for_json_pointer(source, root, &pointer) {
+                    return span;
+                }
+                let fallback = span_for_json_pointer(source, root, "/program/env");
+                fallback
+                    .or_else(|| spans.program.as_ref().map(|p| p.whole))
+                    .unwrap_or_else(|| (0usize, 0usize).into())
+            }
+            ProgramLocation::EnvValue(key) => {
+                let pointer = PointerBuf::from_tokens(["program", "env", key, "value"]).to_string();
+                if let Some(span) = span_for_json_pointer(source, root, &pointer) {
+                    return span;
+                }
+                let outer = PointerBuf::from_tokens(["program", "env", key]).to_string();
+                if let Some(span) = span_for_json_pointer(source, root, &outer) {
                     return span;
                 }
                 let fallback = span_for_json_pointer(source, root, "/program/env");

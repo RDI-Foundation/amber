@@ -2,7 +2,7 @@ use std::{fs, path::Path, process::Command};
 
 use amber_compiler::reporter::direct::{DIRECT_CONTROL_SOCKET_RELATIVE_PATH, DIRECT_PLAN_VERSION};
 use amber_images::AMBER_ROUTER;
-use amber_template::{ProgramArgTemplate, TemplatePart, TemplateSpec};
+use amber_template::{ProgramArgTemplate, ProgramEnvTemplate, TemplatePart, TemplateSpec};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::Value;
 use serde_yaml::Value as YamlValue;
@@ -608,6 +608,12 @@ fn compile_compose_preserves_runtime_conditional_entrypoint_group_in_template_sp
         argv: "--profile ${config.profile}"
       }
     ],
+    env: {
+      PROFILE: {
+        when: "config.profile",
+        value: "${config.profile}"
+      }
+    },
     network: {
       endpoints: [
         { name: "http", port: 8080, protocol: "http" }
@@ -682,6 +688,16 @@ fn compile_compose_preserves_runtime_conditional_entrypoint_group_in_template_sp
                 ]
             );
         }
+    }
+    match spec.program.env.get("PROFILE") {
+        Some(ProgramEnvTemplate::Group(group)) => {
+            assert_eq!(group.when, "profile");
+            assert_eq!(group.value, vec![TemplatePart::config("profile")]);
+        }
+        Some(ProgramEnvTemplate::Value(_)) => {
+            panic!("expected runtime conditional env value in helper template spec")
+        }
+        None => panic!("expected PROFILE env template"),
     }
 }
 
@@ -853,6 +869,12 @@ fn compile_direct_preserves_runtime_conditional_program_arg_group_in_template_sp
         argv: "--profile ${config.profile}"
       }
     ],
+    env: {
+      PROFILE: {
+        when: "config.profile",
+        value: "${config.profile}"
+      }
+    },
     network: {
       endpoints: [
         { name: "http", port: 8080, protocol: "http" }
@@ -928,6 +950,16 @@ fn compile_direct_preserves_runtime_conditional_program_arg_group_in_template_sp
                 ]
             );
         }
+    }
+    match spec.program.env.get("PROFILE") {
+        Some(ProgramEnvTemplate::Group(group)) => {
+            assert_eq!(group.when, "profile");
+            assert_eq!(group.value, vec![TemplatePart::config("profile")]);
+        }
+        Some(ProgramEnvTemplate::Value(_)) => {
+            panic!("expected runtime conditional env value in helper template spec")
+        }
+        None => panic!("expected PROFILE env template"),
     }
 }
 

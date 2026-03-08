@@ -182,9 +182,29 @@ fn validate_manifest_slot_interpolations(
     }
 
     for (key, value) in program.env() {
-        let location = SlotLocation::Env(key.as_str());
-        let span = location.span(source.as_ref(), spans);
-        validate_interpolated_string(value, &ctx, location, span, &mut diagnostics);
+        match value {
+            amber_manifest::ProgramEnvValue::Value(value) => {
+                let location = SlotLocation::Env(key.as_str());
+                let span = location.span(source.as_ref(), spans);
+                validate_interpolated_string(value, &ctx, location, span, &mut diagnostics);
+            }
+            amber_manifest::ProgramEnvValue::Group(group) => {
+                if group.when.source() == InterpolationSource::Slots {
+                    let location = SlotLocation::EnvCondition(key.as_str());
+                    let span = location.span(source.as_ref(), spans);
+                    validate_slot_condition(
+                        group.when.query(),
+                        &ctx,
+                        location,
+                        span,
+                        &mut diagnostics,
+                    );
+                }
+                let location = SlotLocation::EnvValue(key.as_str());
+                let span = location.span(source.as_ref(), spans);
+                validate_interpolated_string(&group.value, &ctx, location, span, &mut diagnostics);
+            }
+        }
     }
 
     diagnostics
@@ -201,6 +221,8 @@ enum SlotLocation<'a> {
     ArgsCondition(usize),
     ArgsGroup(usize, usize),
     Env(&'a str),
+    EnvCondition(&'a str),
+    EnvValue(&'a str),
 }
 
 impl SlotLocation<'_> {
@@ -219,6 +241,8 @@ impl SlotLocation<'_> {
                 format!("program.args[{idx}].argv[{group_idx}]")
             }
             SlotLocation::Env(key) => format!("program.env.{key}"),
+            SlotLocation::EnvCondition(key) => format!("program.env.{key}.when"),
+            SlotLocation::EnvValue(key) => format!("program.env.{key}.value"),
         }
     }
 
@@ -334,6 +358,34 @@ impl SlotLocation<'_> {
             SlotLocation::Env(key) => {
                 let pointer = PointerBuf::from_tokens(["program", "env", key]).to_string();
                 if let Some(span) = span_for_json_pointer(source, root, &pointer) {
+                    return span;
+                }
+                let fallback = span_for_json_pointer(source, root, "/program/env");
+                fallback
+                    .or_else(|| spans.program.as_ref().map(|p| p.whole))
+                    .unwrap_or_else(|| (0usize, 0usize).into())
+            }
+            SlotLocation::EnvCondition(key) => {
+                let pointer = PointerBuf::from_tokens(["program", "env", key, "when"]).to_string();
+                if let Some(span) = span_for_json_pointer(source, root, &pointer) {
+                    return span;
+                }
+                let outer = PointerBuf::from_tokens(["program", "env", key]).to_string();
+                if let Some(span) = span_for_json_pointer(source, root, &outer) {
+                    return span;
+                }
+                let fallback = span_for_json_pointer(source, root, "/program/env");
+                fallback
+                    .or_else(|| spans.program.as_ref().map(|p| p.whole))
+                    .unwrap_or_else(|| (0usize, 0usize).into())
+            }
+            SlotLocation::EnvValue(key) => {
+                let pointer = PointerBuf::from_tokens(["program", "env", key, "value"]).to_string();
+                if let Some(span) = span_for_json_pointer(source, root, &pointer) {
+                    return span;
+                }
+                let outer = PointerBuf::from_tokens(["program", "env", key]).to_string();
+                if let Some(span) = span_for_json_pointer(source, root, &outer) {
                     return span;
                 }
                 let fallback = span_for_json_pointer(source, root, "/program/env");

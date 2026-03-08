@@ -17,7 +17,7 @@ use serde_with::{
 use crate::{
     config_schema_profile,
     error::Error,
-    interpolation::{InterpolatedString, ProgramEntrypoint},
+    interpolation::{InterpolatedString, ProgramEntrypoint, ProgramEnvValue},
     names::{
         BindingName, ChildName, ExportName, FrameworkCapabilityName, ProvideName, SlotName,
         ensure_name_no_dot,
@@ -56,7 +56,7 @@ impl<'de> Deserialize<'de> for Program {
             args: Option<Option<ProgramEntrypoint>>,
             #[serde_as(as = "MapPreventDuplicates<_, _>")]
             #[serde(default)]
-            env: BTreeMap<String, InterpolatedString>,
+            env: BTreeMap<String, ProgramEnvValue>,
             #[serde(default)]
             network: Option<Network>,
             #[serde(default)]
@@ -145,7 +145,7 @@ impl Program {
         }
     }
 
-    pub fn env(&self) -> &BTreeMap<String, InterpolatedString> {
+    pub fn env(&self) -> &BTreeMap<String, ProgramEnvValue> {
         match self {
             Self::Image(program) => &program.common.env,
             Self::Path(program) => &program.common.env,
@@ -222,7 +222,7 @@ pub struct ProgramCommon {
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
     #[builder(default)]
-    pub env: BTreeMap<String, InterpolatedString>,
+    pub env: BTreeMap<String, ProgramEnvValue>,
     #[serde(default)]
     pub network: Option<Network>,
     #[serde(default)]

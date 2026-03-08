@@ -1097,12 +1097,22 @@ fn validate_config_tree(
         }
 
         for (k, v) in program.env() {
-            for part in &v.parts {
+            if let Some(when) = v.when()
+                && when.source() == InterpolationSource::Config
+            {
+                validate_config_ref(format!("program.env.{k}.when"), when.query());
+            }
+            let location = if v.group().is_some() {
+                format!("program.env.{k}.value")
+            } else {
+                format!("program.env.{k}")
+            };
+            for part in &v.value().parts {
                 let InterpolatedPart::Interpolation { source, query } = part else {
                     continue;
                 };
                 if *source == InterpolationSource::Config {
-                    validate_config_ref(format!("program.env.{k}"), query);
+                    validate_config_ref(location.clone(), query);
                 }
             }
         }
@@ -2124,7 +2134,15 @@ fn collect_program_slot_uses(manifest: &Manifest) -> HashSet<String> {
     }
 
     for value in program.env().values() {
-        used_all = add_program_slot_uses(manifest, &mut uses, value);
+        if let Some(when) = value.when()
+            && when.source() == InterpolationSource::Slots
+        {
+            used_all = add_program_slot_condition_use(manifest, &mut uses, when.query());
+            if used_all {
+                return uses;
+            }
+        }
+        used_all = add_program_slot_uses(manifest, &mut uses, value.value());
         if used_all {
             return uses;
         }
