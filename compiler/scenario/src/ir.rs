@@ -170,6 +170,9 @@ pub struct ComponentIr {
     pub moniker: String,
     pub parent: Option<usize>,
     pub children: Vec<usize>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_url: Option<String>,
     pub digest: ManifestDigest,
     pub config: Option<Value>,
     #[serde(default)]
@@ -196,6 +199,7 @@ impl ComponentIr {
             moniker: component.moniker.to_string(),
             parent: component.parent.map(|id| id.0),
             children: component.children.iter().map(|id| id.0).collect(),
+            resolved_url: None,
             digest: component.digest,
             config: component.config.clone(),
             config_schema: component.config_schema.clone(),

@@ -36,6 +36,11 @@ fn internal_images() -> crate::targets::mesh::internal_images::InternalImages {
     resolve_internal_images().expect("internal images should resolve for tests")
 }
 
+fn compiled_scenario(output: &crate::CompileOutput) -> crate::reporter::CompiledScenario {
+    crate::reporter::CompiledScenario::from_compile_output(output)
+        .expect("test compiler output should convert to compiled Scenario")
+}
+
 fn use_prebuilt_images() -> bool {
     std::env::var("AMBER_TEST_USE_PREBUILT_IMAGES").is_ok()
 }
@@ -609,7 +614,9 @@ fn kubernetes_namespace_and_metadata_digest_follow_scenario_ir() {
                 disable_networkpolicy_check: true,
             },
         };
-        let artifact = reporter.emit(&output).expect("render kubernetes output");
+        let artifact = reporter
+            .emit(&compiled_scenario(&output))
+            .expect("render kubernetes output");
 
         let kustomization = artifact
             .files
@@ -727,7 +734,9 @@ fn kubernetes_emits_router_for_external_slots() {
             disable_networkpolicy_check: true,
         },
     };
-    let artifact = reporter.emit(&output).expect("render kubernetes output");
+    let artifact = reporter
+        .emit(&compiled_scenario(&output))
+        .expect("render kubernetes output");
 
     let router_deploy = artifact
         .files
@@ -899,7 +908,9 @@ fn kubernetes_emits_otelcol_and_wires_otel_env() {
             disable_networkpolicy_check: true,
         },
     };
-    let artifact = reporter.emit(&output).expect("render kubernetes output");
+    let artifact = reporter
+        .emit(&compiled_scenario(&output))
+        .expect("render kubernetes output");
 
     let otelcol_config = artifact
         .files
@@ -1041,7 +1052,9 @@ fn kubernetes_smoke_config_roundtrip() {
             disable_networkpolicy_check: true,
         },
     };
-    let artifact = reporter.emit(&output).expect("render kubernetes output");
+    let artifact = reporter
+        .emit(&compiled_scenario(&output))
+        .expect("render kubernetes output");
 
     let dir = tempdir().expect("create temp dir");
     let kubeconfig = dir.path().join("kubeconfig");
@@ -1235,7 +1248,9 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
             disable_networkpolicy_check: true,
         },
     };
-    let artifact = reporter.emit(&output).expect("render kubernetes output");
+    let artifact = reporter
+        .emit(&compiled_scenario(&output))
+        .expect("render kubernetes output");
 
     let output_dir = dir.path().join("kubernetes");
     write_kubernetes_output(&output_dir, &artifact);
@@ -1619,7 +1634,9 @@ sleep infinity
             disable_networkpolicy_check: true,
         },
     };
-    let artifact = reporter.emit(&output).expect("render kubernetes output");
+    let artifact = reporter
+        .emit(&compiled_scenario(&output))
+        .expect("render kubernetes output");
 
     let output_dir = dir.path().join("kubernetes");
     write_kubernetes_output(&output_dir, &artifact);
@@ -1883,7 +1900,9 @@ fn kubernetes_smoke_export_routes_to_host() {
             disable_networkpolicy_check: true,
         },
     };
-    let artifact = reporter.emit(&output).expect("render kubernetes output");
+    let artifact = reporter
+        .emit(&compiled_scenario(&output))
+        .expect("render kubernetes output");
 
     let output_dir = dir.path().join("kubernetes");
     write_kubernetes_output(&output_dir, &artifact);

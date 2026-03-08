@@ -18,7 +18,7 @@ use serde::Serialize;
 use crate::{
     CompileOutput,
     reporter::{
-        Reporter, ReporterError,
+        CompiledScenario, Reporter, ReporterError,
         execution_guide::{GENERATED_README_FILENAME, build_execution_guide},
     },
     targets::{
@@ -111,8 +111,8 @@ pub struct KubernetesArtifact {
 impl Reporter for KubernetesReporter {
     type Artifact = KubernetesArtifact;
 
-    fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError> {
-        render_kubernetes(output, &self.config)
+    fn emit(&self, compiled: &CompiledScenario) -> Result<Self::Artifact, ReporterError> {
+        render_kubernetes(compiled, &self.config)
     }
 }
 
@@ -161,19 +161,23 @@ pub fn render_kubernetes_with_output(
     output: &CompileOutput,
     config: &KubernetesReporterConfig,
 ) -> KubernetesResult<KubernetesArtifact> {
-    render_kubernetes(output, config)
+    let compiled = CompiledScenario::from_compile_output(output).map_err(|err| {
+        ReporterError::new(format!(
+            "failed to convert compiler output into compiled Scenario: {err}"
+        ))
+    })?;
+    render_kubernetes(&compiled, config)
 }
 
 fn render_kubernetes(
-    output: &CompileOutput,
+    compiled: &CompiledScenario,
     config: &KubernetesReporterConfig,
 ) -> KubernetesResult<KubernetesArtifact> {
-    let s = &output.scenario;
+    let s = compiled.scenario();
     let scenario_digest =
         scenario_ir_digest(s).map_err(|err| ReporterError::new(err.to_string()))?;
     let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
         s,
-        &output.store,
         MeshOptions {
             backend_label: "kubernetes reporter",
         },
@@ -208,8 +212,6 @@ fn render_kubernetes(
                 netpol: format!("{base}-netpol"),
             }
         });
-    let root_manifest = mesh_plan.root_manifest.as_ref();
-
     let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
 
     let slot_ports_by_component = allocate_slot_ports(s, program_components)
@@ -255,7 +257,6 @@ fn render_kubernetes(
     let mesh_config_plan = build_mesh_config_plan(MeshConfigBuildInput {
         scenario: s,
         mesh_plan: &mesh_plan,
-        root_manifest,
         slot_ports_by_component: &slot_ports_by_component,
         mesh_ports_by_component: &mesh_ports_by_component,
         router_ports,
@@ -648,7 +649,7 @@ fn render_kubernetes(
                 component_label(s, *id)
             ))
         })?;
-        let image_source = program_image_source(output, s, *id, image_origin);
+        let image_source = program_image_source(compiled, s, *id, image_origin);
         let (program_image, image_source_env_var) = render_kubernetes_image(
             image_plan,
             &root_leaf_by_path,
@@ -1308,7 +1309,7 @@ fn render_kubernetes(
         );
     }
 
-    let external_slot_metadata = collect_external_slot_metadata(root_manifest, &mesh_plan);
+    let external_slot_metadata = collect_external_slot_metadata(s, &mesh_plan);
 
     let scenario_metadata = ScenarioMetadata {
         version: "1",
@@ -1475,7 +1476,7 @@ fn render_kubernetes(
         files.insert(PathBuf::from(PROXY_METADATA_FILENAME), proxy_json);
     }
 
-    let execution_guide = build_execution_guide(&output.scenario, &mesh_plan, &config_plan)?;
+    let execution_guide = build_execution_guide(s, &mesh_plan, &config_plan)?;
     let mut rollout_deployments: Vec<String> =
         names.values().map(|names| names.service.clone()).collect();
     if needs_router {
@@ -1723,21 +1724,21 @@ fn render_kubernetes_image(
 }
 
 fn program_image_source(
-    output: &CompileOutput,
+    compiled: &CompiledScenario,
     scenario: &Scenario,
     component: ComponentId,
     origin: &ProgramImageOrigin,
 ) -> Option<ProgramImageSource> {
     match origin {
-        ProgramImageOrigin::ProgramImage => component_program_image_source(output, component),
+        ProgramImageOrigin::ProgramImage => component_program_image_source(compiled, component),
         ProgramImageOrigin::ComponentConfigPath(path) => {
-            component_config_image_source(output, scenario, component, path)
+            component_config_image_source(compiled, scenario, component, path)
         }
     }
 }
 
 fn component_config_image_source(
-    output: &CompileOutput,
+    compiled: &CompiledScenario,
     scenario: &Scenario,
     component: ComponentId,
     path: &str,
@@ -1746,9 +1747,10 @@ fn component_config_image_source(
     let parent = component.parent?;
     let child_name = component.moniker.local_name()?;
 
-    let provenance = output.provenance.for_component(parent);
+    let (store, provenance) = compiled.source_context()?;
+    let provenance = provenance.for_component(parent);
     let url = &provenance.resolved_url;
-    let stored = output.store.get_source(url)?;
+    let stored = store.get_source(url)?;
     let root_span: SourceSpan = (0usize, stored.source.len()).into();
     let mut config_ptr = PointerBuf::from_tokens(["components", child_name, "config"]);
     for segment in path.split('.').filter(|segment| !segment.is_empty()) {
@@ -1765,12 +1767,13 @@ fn component_config_image_source(
 }
 
 fn component_program_image_source(
-    output: &CompileOutput,
+    compiled: &CompiledScenario,
     component: ComponentId,
 ) -> Option<ProgramImageSource> {
-    let provenance = output.provenance.for_component(component);
+    let (store, provenance) = compiled.source_context()?;
+    let provenance = provenance.for_component(component);
     let url = &provenance.resolved_url;
-    let stored = output.store.get_source(url)?;
+    let stored = store.get_source(url)?;
     let program = stored.spans.program.as_ref()?;
     let root_span: SourceSpan = (0usize, stored.source.len()).into();
     let span = span_for_json_pointer(stored.source.as_ref(), root_span, "/program/image")

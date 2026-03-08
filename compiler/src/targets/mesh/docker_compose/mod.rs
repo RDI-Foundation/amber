@@ -20,9 +20,8 @@ use framework_docker_injection::{
 };
 
 use crate::{
-    CompileOutput,
     reporter::{
-        Reporter, ReporterError,
+        CompiledScenario, Reporter, ReporterError,
         execution_guide::{
             GENERATED_COMPOSE_FILENAME, GENERATED_ENV_SAMPLE_FILENAME, GENERATED_README_FILENAME,
             build_execution_guide,
@@ -140,8 +139,8 @@ impl AsRef<[u8]> for DockerComposeArtifact {
 impl Reporter for DockerComposeReporter {
     type Artifact = DockerComposeArtifact;
 
-    fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError> {
-        render_docker_compose(output)
+    fn emit(&self, compiled: &CompiledScenario) -> Result<Self::Artifact, ReporterError> {
+        render_docker_compose(compiled)
     }
 }
 
@@ -312,7 +311,7 @@ fn dc_other(err: impl ToString) -> DockerComposeError {
 }
 
 impl DockerComposeError {
-    fn into_reporter_error(self, _output: &CompileOutput) -> ReporterError {
+    fn into_reporter_error(self) -> ReporterError {
         match self {
             DockerComposeError::Other(message) => ReporterError::new(message),
         }
@@ -321,18 +320,19 @@ impl DockerComposeError {
 
 type DcResult<T> = Result<T, DockerComposeError>;
 
-fn render_docker_compose(output: &CompileOutput) -> Result<DockerComposeArtifact, ReporterError> {
-    render_docker_compose_inner(output).map_err(|err| err.into_reporter_error(output))
+fn render_docker_compose(
+    compiled: &CompiledScenario,
+) -> Result<DockerComposeArtifact, ReporterError> {
+    render_docker_compose_inner(compiled.scenario())
+        .map_err(DockerComposeError::into_reporter_error)
 }
 
-fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<DockerComposeArtifact> {
-    let transformed =
-        rewrite_framework_docker_as_injected_component(&output.scenario).map_err(dc_other)?;
+fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArtifact> {
+    let transformed = rewrite_framework_docker_as_injected_component(scenario).map_err(dc_other)?;
     let s = &transformed.scenario;
 
     let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
         s,
-        &output.store,
         MeshOptions {
             backend_label: "docker-compose reporter",
         },
@@ -354,7 +354,6 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<DockerCompose
     let docker_mount_components: BTreeSet<ComponentId> =
         docker_mount_paths_by_component.keys().copied().collect();
     let docker_gateway_component = transformed.gateway_component;
-    let root_manifest = mesh_plan.root_manifest.as_ref();
     let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
 
     let slot_ports_by_component = allocate_slot_ports(s, program_components)?;
@@ -398,7 +397,6 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<DockerCompose
     let mesh_config_plan = build_mesh_config_plan(MeshConfigBuildInput {
         scenario: s,
         mesh_plan: &mesh_plan,
-        root_manifest,
         slot_ports_by_component: &slot_ports_by_component,
         mesh_ports_by_component: &mesh_ports_by_component,
         router_ports,
@@ -416,12 +414,8 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<DockerCompose
     } else {
         None
     };
-    let proxy_metadata = needs_router.then_some(build_proxy_metadata(
-        s,
-        &mesh_plan,
-        root_manifest,
-        router_metadata,
-    ));
+    let proxy_metadata =
+        needs_router.then_some(build_proxy_metadata(s, &mesh_plan, router_metadata));
     let exports_by_name = proxy_metadata
         .as_ref()
         .map(|meta| meta.exports.clone())
@@ -857,7 +851,7 @@ fn render_docker_compose_inner(output: &CompileOutput) -> DcResult<DockerCompose
     let compose_yaml = serde_yaml::to_string(&compose).map_err(|e| {
         DockerComposeError::Other(format!("failed to serialize docker-compose yaml: {e}"))
     })?;
-    let execution_guide = build_execution_guide(&output.scenario, &mesh_plan, &config_plan)
+    let execution_guide = build_execution_guide(s, &mesh_plan, &config_plan)
         .map_err(|err: ReporterError| DockerComposeError::Other(err.to_string()))?;
     let mut files = BTreeMap::new();
     files.insert(PathBuf::from(GENERATED_COMPOSE_FILENAME), compose_yaml);

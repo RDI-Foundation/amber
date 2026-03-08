@@ -10,9 +10,8 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::{
-    CompileOutput,
     reporter::{
-        Reporter, ReporterError,
+        CompiledScenario, Reporter, ReporterError,
         execution_guide::{
             GENERATED_ENV_SAMPLE_FILENAME, GENERATED_README_FILENAME, build_execution_guide,
         },
@@ -172,20 +171,19 @@ struct DirectComponentNames {
 impl Reporter for DirectReporter {
     type Artifact = DirectArtifact;
 
-    fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError> {
-        render_direct(output)
+    fn emit(&self, compiled: &CompiledScenario) -> Result<Self::Artifact, ReporterError> {
+        render_direct(compiled)
     }
 }
 
-fn render_direct(output: &CompileOutput) -> Result<DirectArtifact, ReporterError> {
-    render_direct_inner(output).map_err(|err| ReporterError::new(err.to_string()))
+fn render_direct(compiled: &CompiledScenario) -> Result<DirectArtifact, ReporterError> {
+    render_direct_inner(compiled).map_err(|err| ReporterError::new(err.to_string()))
 }
 
-fn render_direct_inner(output: &CompileOutput) -> Result<DirectArtifact, MeshError> {
-    let scenario = &output.scenario;
+fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, MeshError> {
+    let scenario = compiled.scenario();
     let mesh_plan = build_mesh_plan(
         scenario,
-        &output.store,
         MeshOptions {
             backend_label: "direct reporter",
         },
@@ -249,7 +247,6 @@ fn render_direct_inner(output: &CompileOutput) -> Result<DirectArtifact, MeshErr
     let mesh_config_plan = build_mesh_config_plan(MeshConfigBuildInput {
         scenario,
         mesh_plan: &mesh_plan,
-        root_manifest: mesh_plan.root_manifest.as_ref(),
         slot_ports_by_component: &slot_ports_by_component,
         mesh_ports_by_component: &mesh_ports_by_component,
         router_ports,
@@ -281,18 +278,14 @@ fn render_direct_inner(output: &CompileOutput) -> Result<DirectArtifact, MeshErr
         control_socket: Some(DIRECT_CONTROL_SOCKET_RELATIVE_PATH.to_string()),
         control_socket_volume: None,
     });
-    let proxy_metadata = needs_router.then_some(build_proxy_metadata(
-        scenario,
-        &mesh_plan,
-        mesh_plan.root_manifest.as_ref(),
-        router_metadata,
-    ));
+    let proxy_metadata =
+        needs_router.then_some(build_proxy_metadata(scenario, &mesh_plan, router_metadata));
 
     let startup_order = topological_startup_order(program_components, &mesh_plan)?;
     let startup_order_ids = startup_order.iter().map(|id| id.0).collect::<Vec<_>>();
     let components = build_component_plans(
+        compiled,
         scenario,
-        &output.provenance,
         &mesh_plan,
         &config_plan,
         &component_names,
@@ -351,7 +344,7 @@ fn render_direct_inner(output: &CompileOutput) -> Result<DirectArtifact, MeshErr
         files.insert(PathBuf::from(DEFAULT_EXTERNAL_ENV_FILE), env_content);
     }
 
-    let execution_guide = build_execution_guide(&output.scenario, &mesh_plan, &config_plan)
+    let execution_guide = build_execution_guide(scenario, &mesh_plan, &config_plan)
         .map_err(|err: ReporterError| MeshError::new(err.to_string()))?;
     files.insert(
         PathBuf::from(GENERATED_ENV_SAMPLE_FILENAME),
@@ -367,8 +360,8 @@ fn render_direct_inner(output: &CompileOutput) -> Result<DirectArtifact, MeshErr
 }
 
 fn build_component_plans(
+    compiled: &CompiledScenario,
     scenario: &Scenario,
-    provenance: &crate::Provenance,
     mesh_plan: &MeshPlan,
     config_plan: &crate::targets::program_config::ConfigPlan,
     component_names: &HashMap<ComponentId, DirectComponentNames>,
@@ -413,7 +406,7 @@ fn build_component_plans(
             id: id.0,
             moniker: component.moniker.as_str().to_string(),
             log_name: names.base.clone(),
-            manifest_url: provenance.for_component(*id).resolved_url.to_string(),
+            manifest_url: compiled.resolved_url_for_component(*id).to_string(),
             depends_on,
             sidecar: DirectSidecarPlan {
                 log_name: format!("{}-sidecar", names.base),

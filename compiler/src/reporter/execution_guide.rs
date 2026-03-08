@@ -53,8 +53,8 @@ pub(crate) fn build_execution_guide(
 ) -> Result<ExecutionGuide, ReporterError> {
     let runtime_root_paths = runtime_root_paths(config_plan);
     let mut root_inputs = Vec::new();
-    if let Some(schema) = mesh_plan.root_manifest.config_schema() {
-        let mut leaves = rc::collect_leaf_paths(&schema.0).map_err(|err| {
+    if let Some(schema) = scenario.component(scenario.root).config_schema.as_ref() {
+        let mut leaves = rc::collect_leaf_paths(schema).map_err(|err| {
             ReporterError::new(format!("failed to enumerate config inputs: {err}"))
         })?;
         leaves.retain(|leaf| runtime_root_paths.contains(&leaf.path));
@@ -71,16 +71,15 @@ pub(crate) fn build_execution_guide(
     }
     root_inputs.sort_by(|left, right| left.path.cmp(&right.path));
 
-    let mut external_slots: Vec<_> =
-        collect_external_slot_metadata(&mesh_plan.root_manifest, mesh_plan)
-            .into_iter()
-            .map(|(name, meta)| GuideExternalSlot {
-                name,
-                env_var: meta.url_env,
-                required: meta.required,
-                kind: meta.kind,
-            })
-            .collect();
+    let mut external_slots: Vec<_> = collect_external_slot_metadata(scenario, mesh_plan)
+        .into_iter()
+        .map(|(name, meta)| GuideExternalSlot {
+            name,
+            env_var: meta.url_env,
+            required: meta.required,
+            kind: meta.kind,
+        })
+        .collect();
     external_slots.sort_by(|left, right| left.name.cmp(&right.name));
 
     let mut exports: Vec<_> = mesh_plan

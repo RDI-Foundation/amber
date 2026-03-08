@@ -17,11 +17,11 @@ use std::{
 };
 
 use amber_compiler::{
-    CompileOptions, CompileOutput, Compiler, ResolverRegistry,
+    CompileOptions, Compiler, ResolverRegistry,
     bundle::{BundleBuilder, BundleLoader},
     mesh::{PROXY_METADATA_FILENAME, PROXY_METADATA_VERSION, ProxyMetadata, external_slot_env_var},
     reporter::{
-        Reporter as _,
+        CompiledScenario, Reporter as _,
         direct::{
             DIRECT_PLAN_FILENAME, DIRECT_PLAN_VERSION, DirectArtifact, DirectComponentPlan,
             DirectPlan, DirectProgramExecutionPlan, DirectReporter, DirectRuntimeAddressPlan,
@@ -49,6 +49,7 @@ use amber_mesh::{
 };
 use amber_resolver::Resolver;
 use amber_router as router;
+use amber_scenario::{SCENARIO_IR_SCHEMA, ScenarioIr};
 use amber_template::{RuntimeTemplateContext, TemplatePart, TemplateSpec};
 use base64::Engine as _;
 use clap::{ArgAction, Args, Parser, Subcommand};
@@ -340,7 +341,7 @@ struct CompileArgs {
     #[arg(long = "no-opt")]
     no_opt: bool,
 
-    /// Root manifest or bundle to compile (URL or local path).
+    /// Root manifest, bundle, or Scenario IR to compile (URL or local path).
     #[arg(value_name = "MANIFEST")]
     manifest: String,
 }
@@ -707,36 +708,58 @@ async fn compile(args: CompileArgs) -> Result<()> {
     ensure_outputs_requested(&args)?;
     let outputs = resolve_output_paths(&args)?;
 
-    let resolved = resolve_input(&args.manifest).await?;
-    let compiler =
-        Compiler::new(resolved.resolver, Default::default()).with_registry(resolved.registry);
-    let mut opts = CompileOptions::default();
-    if args.no_opt {
-        opts.optimize.dce = false;
-    }
+    let mut bundle_tree = None;
+    let mut bundle_store = None;
+    let compiled = match resolve_compile_input(&args.manifest).await? {
+        CompileInput::Manifest(resolved) => {
+            let compiler = Compiler::new(resolved.resolver, Default::default())
+                .with_registry(resolved.registry);
+            let mut opts = CompileOptions::default();
+            if args.no_opt {
+                opts.optimize.dce = false;
+            }
 
-    let tree = compiler
-        .resolve_tree(resolved.manifest.clone(), opts.resolve)
-        .await
-        .wrap_err("compile failed")?;
-    let bundle_tree = args.bundle.as_ref().map(|_| tree.clone());
+            let tree = compiler
+                .resolve_tree(resolved.manifest.clone(), opts.resolve)
+                .await
+                .wrap_err("compile failed")?;
+            if args.bundle.is_some() {
+                bundle_tree = Some(tree.clone());
+                bundle_store = Some(compiler.store().clone());
+            }
 
-    let output = compiler
-        .compile_from_tree(tree, opts.optimize)
-        .wrap_err("compile failed")?;
+            let output = compiler
+                .compile_from_tree(tree, opts.optimize)
+                .wrap_err("compile failed")?;
 
-    let deny = DenySet::new(&args.deny);
-    let has_error = print_diagnostics(&output.diagnostics, &deny)?;
-    if has_error {
-        return Err(miette::miette!("compilation failed"));
-    }
+            let deny = DenySet::new(&args.deny);
+            let has_error = print_diagnostics(&output.diagnostics, &deny)?;
+            if has_error {
+                return Err(miette::miette!("compilation failed"));
+            }
+
+            CompiledScenario::from_compile_output(&output)
+                .into_diagnostic()
+                .wrap_err("failed to convert compiler output into Scenario IR")?
+        }
+        CompileInput::ScenarioIr(compiled) => {
+            if args.bundle.is_some() {
+                return Err(miette::miette!(
+                    help = "Re-run `amber compile` from a manifest or bundle when you need \
+                            `--bundle`; Scenario IR does not include manifest source bytes.",
+                    "bundle output is not supported when compiling from Scenario IR"
+                ));
+            }
+            compiled
+        }
+    };
 
     if let Some(primary) = outputs.primary.as_ref() {
-        write_primary_output(primary, &output)?;
+        write_primary_output(primary, &compiled)?;
     }
 
     if let Some(dot_dest) = outputs.dot {
-        let dot = DotReporter.emit(&output).map_err(miette::Report::new)?;
+        let dot = DotReporter.emit(&compiled).map_err(miette::Report::new)?;
         match dot_dest {
             ArtifactOutput::Stdout => print!("{dot}"),
             ArtifactOutput::File(path) => write_artifact(&path, dot.as_bytes())?,
@@ -745,7 +768,7 @@ async fn compile(args: CompileArgs) -> Result<()> {
 
     if let Some(compose_root) = outputs.docker_compose.as_ref() {
         let compose = DockerComposeReporter
-            .emit(&output)
+            .emit(&compiled)
             .map_err(miette::Report::new)?;
         write_docker_compose_output(compose_root, &compose)?;
     }
@@ -756,18 +779,20 @@ async fn compile(args: CompileArgs) -> Result<()> {
                 disable_networkpolicy_check: args.disable_networkpolicy_check,
             },
         };
-        let artifact = reporter.emit(&output).map_err(miette::Report::new)?;
+        let artifact = reporter.emit(&compiled).map_err(miette::Report::new)?;
         write_kubernetes_output(&kubernetes_dest, &artifact)?;
     }
 
     if let Some(direct_dest) = outputs.direct {
-        let artifact = DirectReporter.emit(&output).map_err(miette::Report::new)?;
+        let artifact = DirectReporter
+            .emit(&compiled)
+            .map_err(miette::Report::new)?;
         write_direct_output(&direct_dest, &artifact)?;
     }
 
     if let Some(metadata_dest) = outputs.metadata {
         let metadata = MetadataReporter
-            .emit(&output)
+            .emit(&compiled)
             .map_err(miette::Report::new)?;
         match metadata_dest {
             ArtifactOutput::Stdout => print!("{metadata}"),
@@ -776,10 +801,10 @@ async fn compile(args: CompileArgs) -> Result<()> {
     }
 
     if let Some(bundle_root) = resolve_bundle_root(&args)? {
-        let tree = bundle_tree.expect("bundle requested");
+        let tree = bundle_tree.expect("bundle requested from manifest input");
+        let store = bundle_store.expect("bundle requested from manifest input");
         prepare_bundle_dir(&bundle_root)?;
-        BundleBuilder::build(&tree, compiler.store(), &bundle_root)
-            .wrap_err("bundle generation failed")?;
+        BundleBuilder::build(&tree, &store, &bundle_root).wrap_err("bundle generation failed")?;
     }
 
     Ok(())
@@ -4630,6 +4655,21 @@ struct ResolvedInput {
     registry: ResolverRegistry,
 }
 
+enum CompileInput {
+    Manifest(ResolvedInput),
+    ScenarioIr(CompiledScenario),
+}
+
+async fn resolve_compile_input(input: &str) -> Result<CompileInput> {
+    if let Some(path) = local_input_path(input)?
+        && let Some(compiled) = load_compiled_scenario_ir(&path)?
+    {
+        return Ok(CompileInput::ScenarioIr(compiled));
+    }
+
+    resolve_input(input).await.map(CompileInput::Manifest)
+}
+
 async fn resolve_input(input: &str) -> Result<ResolvedInput> {
     if let Some(path) = local_input_path(input)?
         && let Some(loader) = BundleLoader::from_path(&path)?
@@ -4648,6 +4688,41 @@ async fn resolve_input(input: &str) -> Result<ResolvedInput> {
         resolver: Resolver::new(),
         registry: ResolverRegistry::default(),
     })
+}
+
+fn load_compiled_scenario_ir(path: &Path) -> Result<Option<CompiledScenario>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read Scenario IR input `{}`", path.display()))?;
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+
+    let Some(obj) = value.as_object() else {
+        return Ok(None);
+    };
+    let Some(schema) = obj.get("schema").and_then(serde_json::Value::as_str) else {
+        return Ok(None);
+    };
+    let Some(_) = obj.get("version") else {
+        return Ok(None);
+    };
+    if schema != SCENARIO_IR_SCHEMA {
+        return Ok(None);
+    }
+
+    let ir: ScenarioIr = serde_json::from_value(value)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("invalid Scenario IR input `{}`", path.display()))?;
+    CompiledScenario::from_ir(ir)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("invalid Scenario IR input `{}`", path.display()))
+        .map(Some)
 }
 
 fn local_input_path(input: &str) -> Result<Option<PathBuf>> {
@@ -4829,9 +4904,9 @@ fn prepare_bundle_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_primary_output(path: &Path, output: &CompileOutput) -> Result<()> {
+fn write_primary_output(path: &Path, compiled: &CompiledScenario) -> Result<()> {
     let ir = ScenarioIrReporter
-        .emit(output)
+        .emit(compiled)
         .map_err(miette::Report::new)?;
     write_artifact(path, ir.as_bytes())
         .wrap_err_with(|| format!("failed to write primary output `{}`", path.display()))

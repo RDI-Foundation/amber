@@ -3,8 +3,7 @@ use std::fmt::Write as _;
 use amber_manifest::CapabilityKind;
 use amber_scenario::{BindingFrom, Component, ComponentId, Scenario};
 
-use super::{Reporter, ReporterError};
-use crate::CompileOutput;
+use super::{CompiledScenario, Reporter, ReporterError};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DotReporter;
@@ -12,8 +11,8 @@ pub struct DotReporter;
 impl Reporter for DotReporter {
     type Artifact = String;
 
-    fn emit(&self, output: &CompileOutput) -> Result<Self::Artifact, ReporterError> {
-        Ok(render_dot_with_exports(&output.scenario))
+    fn emit(&self, compiled: &CompiledScenario) -> Result<Self::Artifact, ReporterError> {
+        Ok(render_dot_with_exports(compiled.scenario()))
     }
 }
 

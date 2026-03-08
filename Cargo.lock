@@ -107,6 +107,7 @@ dependencies = [
  "amber-mesh",
  "amber-resolver",
  "amber-router",
+ "amber-scenario",
  "amber-template",
  "base64",
  "clap",

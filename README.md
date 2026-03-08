@@ -163,7 +163,8 @@ amber compile path/to/root.json5 --output /tmp/scenario.json
 ```
 
 You can also use an existing Scenario IR as input for `amber compile` to produce other outputs
-(for example, Docker Compose or Kubernetes manifests).
+(for example, Docker Compose, Kubernetes, or direct/native runtime artifacts). Scenario IR input
+is graph-only, so `--bundle` still requires a manifest or bundle input with manifest source bytes.
 
 ### Check-only (linting + diagnostics)
 
