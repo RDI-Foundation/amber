@@ -1,0 +1,11 @@
+Error: manifest::unknown_mount_slot
+
+  × check failed
+  ╰─▶ mount source `slots.state` references unknown slot
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/storage_mount_unknown_slot.json5:7:37]
+ 6 │     mounts: [
+ 7 │       { path: "/var/lib/app", from: "slots.state" },
+   ·                                     ──────┬──────
+   ·                                           ╰── mount source here
+ 8 │     ],
+   ╰────

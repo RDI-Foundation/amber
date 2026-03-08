@@ -19,9 +19,9 @@ use crate::{
     names::{BindingName, ChildName, ExportName, ProvideName, SlotName, ensure_name_no_dot},
     refs::{ManifestDigest, ManifestRef, ManifestUrl},
     schema::{
-        Binding, BindingSource, BindingSourceRef, BindingTarget, ComponentDecl, ConfigSchema,
-        EnvironmentDecl, ExportTarget, LocalComponentRef, MountSource, Program, ProvideDecl,
-        RawBinding, RawExportTarget, SlotDecl,
+        Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityKind, ComponentDecl,
+        ConfigSchema, EnvironmentDecl, ExportTarget, LocalComponentRef, MountSource, Program,
+        ProvideDecl, RawBinding, RawExportTarget, SlotDecl,
     },
 };
 
@@ -520,6 +520,13 @@ fn validate_endpoints(
     }
 
     for (provide_name, provide) in provides {
+        if provide.decl.kind == CapabilityKind::Storage {
+            return Err(Error::UnsupportedProvideKind {
+                name: provide_name.to_string(),
+                kind: provide.decl.kind,
+            });
+        }
+
         let Some(endpoint) = provide.endpoint.as_deref() else {
             return Err(Error::MissingProvideEndpoint {
                 name: provide_name.to_string(),
@@ -539,6 +546,7 @@ fn validate_endpoints(
 fn validate_mounts(
     program: Option<&Program>,
     config_schema: Option<&ConfigSchema>,
+    slots: &BTreeMap<SlotName, SlotDecl>,
     enabled_features: &BTreeSet<ExperimentalFeature>,
 ) -> Result<(), Error> {
     let Some(program) = program else {
@@ -627,7 +635,18 @@ fn validate_mounts(
                     enabled_features,
                 )?;
             }
-            MountSource::Slot(_) | MountSource::Binding(_) => {
+            MountSource::Slot(slot) => {
+                let Some(slot_decl) = slots.get(slot.as_str()) else {
+                    return Err(Error::UnknownMountSlot { slot: slot.clone() });
+                };
+                if slot_decl.decl.kind != CapabilityKind::Storage {
+                    return Err(Error::MountSlotRequiresStorage {
+                        slot: slot.clone(),
+                        kind: slot_decl.decl.kind,
+                    });
+                }
+            }
+            MountSource::Binding(_) => {
                 return Err(Error::UnsupportedMountSource {
                     mount: mount.source.to_string(),
                 });
@@ -737,6 +756,7 @@ impl RawManifest {
         validate_mounts(
             program.as_ref(),
             config_schema.as_ref(),
+            &slots,
             &experimental_features,
         )?;
 

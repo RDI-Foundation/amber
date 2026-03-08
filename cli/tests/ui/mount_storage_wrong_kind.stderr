@@ -1,0 +1,13 @@
+Error: manifest::mount_slot_requires_storage
+
+  × check failed
+  ╰─▶ mount source `slots.api` requires a storage slot, but `api` is `http`
+    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/mount_storage_wrong_kind.json5:10:37]
+  9 │     mounts: [
+ 10 │       { path: "/var/lib/app", from: "slots.api" },
+    ·                                     ─────┬─────
+    ·                                          ╰── mount source here
+ 11 │     ],
+    ╰────
+  help: URL-shaped slots expose fields like `.url`. Storage slots are virtual
+        storage objects and are mounted with `from: "slots.<slot>"`.

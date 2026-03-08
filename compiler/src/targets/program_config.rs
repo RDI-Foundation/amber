@@ -639,6 +639,10 @@ fn build_mount_specs(
         for mount in program.mounts() {
             let query = match &mount.source {
                 MountSource::Config(path) | MountSource::Secret(path) => path,
+                MountSource::Slot(_) => {
+                    // Storage mounts are planned separately from helper-written file mounts.
+                    continue;
+                }
                 MountSource::Framework(name) => {
                     if framework_capability(name.as_str()).is_none() {
                         return Err(MeshError::new(format!(

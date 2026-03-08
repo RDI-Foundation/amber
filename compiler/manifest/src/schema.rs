@@ -450,6 +450,7 @@ pub enum CapabilityKind {
     Http,
     Docker,
     A2a,
+    Storage,
 }
 
 impl fmt::Display for CapabilityKind {
@@ -460,6 +461,7 @@ impl fmt::Display for CapabilityKind {
             CapabilityKind::Http => "http",
             CapabilityKind::Docker => "docker",
             CapabilityKind::A2a => "a2a",
+            CapabilityKind::Storage => "storage",
         };
         f.write_str(s)
     }

@@ -520,6 +520,93 @@ fn dce_keeps_program_slots_from_env() {
 }
 
 #[test]
+fn dce_keeps_storage_slots_used_by_program_mounts() {
+    let root: Manifest = r##"
+        {
+          manifest_version: "0.1.0",
+          slots: {
+            state: { kind: "storage" },
+          },
+          components: {
+            app: "file:///app.json5",
+          },
+          exports: { out: "#app.out" },
+        }
+    "##
+    .parse()
+    .unwrap();
+
+    let app: Manifest = r##"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "app",
+            entrypoint: ["app"],
+            mounts: [
+              { path: "/var/lib/app", from: "slots.state" },
+            ],
+            network: { endpoints: [{ name: "out", port: 80 }] },
+          },
+          slots: {
+            state: { kind: "storage" },
+          },
+          provides: {
+            out: { kind: "http", endpoint: "out" },
+          },
+          exports: {
+            out: "out",
+          },
+        }
+    "##
+    .parse()
+    .unwrap();
+
+    let out_decl = app
+        .provides()
+        .get("out")
+        .expect("app provides out")
+        .decl
+        .clone();
+
+    let mut components = vec![Some(component(0, "/")), Some(component(1, "/app"))];
+    apply_component_manifest(&mut components, 0, &root);
+    apply_component_manifest(&mut components, 1, &app);
+    connect_parent_child(&mut components, 0, 1);
+
+    let mut scenario = Scenario {
+        root: ComponentId(0),
+        components,
+        bindings: vec![BindingEdge {
+            name: None,
+            from: BindingFrom::External(slot(0, "state")),
+            to: slot(1, "state"),
+            weak: false,
+        }],
+        exports: vec![ScenarioExport {
+            name: "out".to_string(),
+            capability: out_decl,
+            from: provide(1, "out"),
+        }],
+    };
+    scenario.normalize_order();
+
+    let scenario = dce_only(scenario);
+
+    assert!(
+        scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|component| component.moniker.local_name() == Some("app")),
+        "app component should stay live when its program mounts storage"
+    );
+    assert!(scenario.bindings.iter().any(|edge| {
+        matches!(&edge.from, BindingFrom::External(from) if from.name == "state")
+            && edge.to.name == "state"
+    }));
+}
+
+#[test]
 fn dce_prunes_unreachable_named_binding_interpolation_subgraph() {
     let root: Manifest = r##"
         {

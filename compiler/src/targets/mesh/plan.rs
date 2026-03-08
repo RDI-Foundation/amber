@@ -1,7 +1,8 @@
 use std::collections::{BTreeSet, HashMap};
 
 use amber_manifest::{
-    FrameworkBindingShape, FrameworkCapabilityName, NetworkProtocol, framework_capability,
+    CapabilityKind, FrameworkBindingShape, FrameworkCapabilityName, Manifest, NetworkProtocol,
+    framework_capability,
 };
 use amber_scenario::{BindingFrom, ComponentId, Scenario};
 
@@ -72,6 +73,11 @@ pub(crate) fn build_mesh_plan(
         .collect();
 
     for binding in &scenario.bindings {
+        if slot_kind(scenario, binding.to.component, &binding.to.name)
+            == Some(CapabilityKind::Storage)
+        {
+            continue;
+        }
         if let BindingFrom::Component(from) = &binding.from
             && scenario.component(from.component).program.is_none()
         {
@@ -103,6 +109,11 @@ pub(crate) fn build_mesh_plan(
 
     let mut strong_deps: HashMap<ComponentId, BTreeSet<ComponentId>> = HashMap::new();
     for binding in &scenario.bindings {
+        if slot_kind(scenario, binding.to.component, &binding.to.name)
+            == Some(CapabilityKind::Storage)
+        {
+            continue;
+        }
         if binding.weak {
             continue;
         }
@@ -122,6 +133,11 @@ pub(crate) fn build_mesh_plan(
     let mut external_bindings = Vec::new();
     let mut framework_bindings = Vec::new();
     for binding in &scenario.bindings {
+        if slot_kind(scenario, binding.to.component, &binding.to.name)
+            == Some(CapabilityKind::Storage)
+        {
+            continue;
+        }
         match &binding.from {
             BindingFrom::Component(from) => {
                 let endpoint = resolve_provide_endpoint(scenario, from.component, &from.name)?;
@@ -190,6 +206,14 @@ pub(crate) fn build_mesh_plan(
         exports,
         strong_deps,
     })
+}
+
+fn slot_kind(scenario: &Scenario, component: ComponentId, slot: &str) -> Option<CapabilityKind> {
+    scenario
+        .component(component)
+        .slots
+        .get(slot)
+        .map(|decl| decl.decl.kind)
 }
 
 pub(crate) fn map_program_components<T>(

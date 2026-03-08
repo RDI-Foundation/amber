@@ -189,6 +189,7 @@ const RUN_AFTER_HELP: &str = "\
 Examples:
   amber run /tmp/amber-direct
   amber run /tmp/amber-direct/direct-plan.json
+  amber run /tmp/amber-direct --storage-root /srv/amber-state
 
 Runtime requirements:
   Linux: `bwrap` and `slirp4netns`
@@ -397,6 +398,10 @@ struct RunArgs {
     /// Direct output directory or `direct-plan.json` file from `amber compile --direct`.
     #[arg(value_name = "OUTPUT")]
     output: String,
+
+    /// Override where Amber stores persistent direct runtime state.
+    #[arg(long = "storage-root", value_name = "DIR")]
+    storage_root: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -404,6 +409,10 @@ struct RunDirectInitArgs {
     /// Path to a direct runtime plan JSON file.
     #[arg(long = "plan", value_name = "FILE")]
     plan: PathBuf,
+
+    /// Override where Amber stores persistent direct runtime state.
+    #[arg(long = "storage-root", value_name = "DIR")]
+    storage_root: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -836,7 +845,13 @@ fn docs(args: DocsArgs) -> Result<()> {
 async fn run(args: RunArgs) -> Result<()> {
     let target = load_run_target(&args.output)?;
     match target.kind {
-        RunTargetKind::Direct => run_direct_init(RunDirectInitArgs { plan: target.plan }).await,
+        RunTargetKind::Direct => {
+            run_direct_init(RunDirectInitArgs {
+                plan: target.plan,
+                storage_root: args.storage_root,
+            })
+            .await
+        }
     }
 }
 
@@ -892,6 +907,8 @@ struct ProcessSpec {
     read_only_mounts: Vec<ReadOnlyMount>,
     writable_dirs: Vec<PathBuf>,
     bind_dirs: Vec<PathBuf>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    bind_mounts: Vec<BindMount>,
     hidden_paths: Vec<PathBuf>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     network: ProcessNetwork,
@@ -899,6 +916,12 @@ struct ProcessSpec {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReadOnlyMount {
+    source: PathBuf,
+    dest: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BindMount {
     source: PathBuf,
     dest: PathBuf,
 }
@@ -938,6 +961,9 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
         .parent()
         .ok_or_else(|| miette::miette!("invalid direct plan path {}", plan_path.display()))?
         .to_path_buf();
+    let storage_root = direct_storage_root(&plan_root, args.storage_root.as_deref())
+        .into_diagnostic()
+        .wrap_err("failed to resolve direct storage root")?;
     let plan_raw = fs::read_to_string(&plan_path)
         .map_err(|err| miette::miette!("failed to read {}: {err}", plan_path.display()))?;
     let direct_plan: DirectPlan = serde_json::from_str(&plan_raw)
@@ -1112,6 +1138,7 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                 }],
                 writable_dirs: Vec::new(),
                 bind_dirs: vec![direct_control_runtime_dir.clone()],
+                bind_mounts: Vec::new(),
                 hidden_paths: Vec::new(),
                 network: ProcessNetwork::Host,
             };
@@ -1162,6 +1189,7 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                 }],
                 writable_dirs: Vec::new(),
                 bind_dirs: Vec::new(),
+                bind_mounts: Vec::new(),
                 hidden_paths: Vec::new(),
                 network: {
                     #[cfg(target_os = "linux")]
@@ -1211,6 +1239,7 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
             })?;
             let mut spec = component_program_spec(
                 &runtime_root,
+                &storage_root,
                 component,
                 &direct_plan.runtime_addresses,
                 &runtime_state,
@@ -1266,6 +1295,24 @@ fn resolve_direct_artifact_path(plan_root: &Path, path: &str) -> PathBuf {
     } else {
         plan_root.join(path)
     }
+}
+
+fn direct_storage_root(plan_root: &Path, override_root: Option<&Path>) -> std::io::Result<PathBuf> {
+    if let Some(override_root) = override_root {
+        return Ok(if override_root.is_absolute() {
+            override_root.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(override_root)
+        });
+    }
+
+    let name = plan_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("amber-direct");
+    let parent = plan_root.parent().unwrap_or_else(|| Path::new("."));
+    Ok(parent.join(format!(".{name}.amber-state")))
 }
 
 fn direct_current_control_socket_path(plan_root: &Path) -> PathBuf {
@@ -1658,6 +1705,7 @@ fn write_mesh_config_public(path: &Path, config: &MeshConfigPublic) -> Result<()
 
 fn component_program_spec(
     runtime_root: &Path,
+    storage_root: &Path,
     component: &DirectComponentPlan,
     runtime_addresses: &DirectRuntimeAddressPlan,
     runtime_state: &DirectRuntimeState,
@@ -1666,6 +1714,7 @@ fn component_program_spec(
     let work_dir = runtime_root.join(&component.program.work_dir);
     let mut writable_dirs = vec![work_dir.clone()];
     let read_only_mounts = component_program_read_only_mounts(component, source_dir.as_deref())?;
+    let bind_mounts = direct_storage_bind_mounts(storage_root, component)?;
     match &component.program.execution {
         DirectProgramExecutionPlan::Direct { entrypoint, env } => {
             let (program, args) = split_entrypoint(entrypoint)?;
@@ -1680,6 +1729,7 @@ fn component_program_spec(
                 read_only_mounts,
                 writable_dirs,
                 bind_dirs: Vec::new(),
+                bind_mounts,
                 hidden_paths: Vec::new(),
                 network: ProcessNetwork::Host,
             })
@@ -1721,11 +1771,36 @@ fn component_program_spec(
                 read_only_mounts,
                 writable_dirs,
                 bind_dirs: Vec::new(),
+                bind_mounts,
                 hidden_paths: Vec::new(),
                 network: ProcessNetwork::Host,
             })
         }
     }
+}
+
+fn direct_storage_bind_mounts(
+    storage_root: &Path,
+    component: &DirectComponentPlan,
+) -> Result<Vec<BindMount>> {
+    let mut mounts = Vec::new();
+    for mount in &component.program.storage_mounts {
+        let source = storage_root.join(&mount.state_subdir);
+        fs::create_dir_all(&source)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to create persistent storage directory {} for component {}",
+                    source.display(),
+                    component.moniker
+                )
+            })?;
+        mounts.push(BindMount {
+            source,
+            dest: PathBuf::from(&mount.mount_path),
+        });
+    }
+    Ok(mounts)
 }
 
 fn append_runtime_template_context_env(
@@ -2727,6 +2802,13 @@ impl DirectSandbox {
                     }
                     bind_dirs.insert(dir);
                 }
+                let mut bind_mounts = BTreeSet::new();
+                for mount in &spec.bind_mounts {
+                    if !mount.source.is_absolute() || !mount.dest.is_absolute() {
+                        continue;
+                    }
+                    bind_mounts.insert((mount.source.clone(), mount.dest.clone()));
+                }
 
                 let mut candidate_set = BTreeSet::new();
                 for dir in &spec.writable_dirs {
@@ -2773,6 +2855,9 @@ impl DirectSandbox {
                 for dir in &bind_dirs {
                     linux_insert_mount_dest_dirs(&mut dirs_to_create_set, dir, true);
                 }
+                for (_, dest) in &bind_mounts {
+                    linux_insert_mount_dest_dirs(&mut dirs_to_create_set, dest, true);
+                }
                 let mut dirs_to_create = dirs_to_create_set.into_iter().collect::<Vec<_>>();
                 dirs_to_create.sort_by(|a, b| {
                     linux_path_depth(a)
@@ -2814,6 +2899,11 @@ impl DirectSandbox {
                     args.push(rendered.clone());
                     args.push(rendered);
                 }
+                for (source, dest) in bind_mounts {
+                    args.push("--bind".to_string());
+                    args.push(source.display().to_string());
+                    args.push(dest.display().to_string());
+                }
                 for device in LINUX_DEFAULT_DEVICE_PATHS {
                     let device = Path::new(device);
                     if !device.exists() {
@@ -2839,6 +2929,21 @@ impl DirectSandbox {
                 profiles_dir,
                 next_profile_id,
             } => {
+                if spec
+                    .bind_mounts
+                    .iter()
+                    .any(|mount| mount.source != mount.dest)
+                {
+                    return Err(miette::miette!(
+                        "direct storage mounts require Linux bubblewrap-style bind mounts; macOS \
+                         direct output cannot remap {}",
+                        spec.bind_mounts
+                            .iter()
+                            .find(|mount| mount.source != mount.dest)
+                            .map(|mount| mount.dest.display().to_string())
+                            .unwrap_or_else(|| "storage mount".to_string())
+                    ));
+                }
                 fs::create_dir_all(profiles_dir.as_path())
                     .into_diagnostic()
                     .wrap_err_with(|| {
@@ -2867,7 +2972,23 @@ impl DirectSandbox {
                 args.extend(spec.args.iter().cloned());
                 Ok((binary.display().to_string(), args))
             }
-            Self::None => Ok((spec.program.clone(), spec.args.clone())),
+            Self::None => {
+                if spec
+                    .bind_mounts
+                    .iter()
+                    .any(|mount| mount.source != mount.dest)
+                {
+                    return Err(miette::miette!(
+                        "direct storage mounts require a runtime that can bind {} into place",
+                        spec.bind_mounts
+                            .iter()
+                            .find(|mount| mount.source != mount.dest)
+                            .map(|mount| mount.dest.display().to_string())
+                            .unwrap_or_else(|| "storage mount".to_string())
+                    ));
+                }
+                Ok((spec.program.clone(), spec.args.clone()))
+            }
         }
     }
 }
@@ -5077,6 +5198,7 @@ mod tests {
             program: amber_compiler::reporter::direct::DirectProgramPlan {
                 log_name: "app-program".to_string(),
                 work_dir: "work/components/app".to_string(),
+                storage_mounts: Vec::new(),
                 execution: DirectProgramExecutionPlan::Direct {
                     entrypoint: vec!["/workspace/scenarios/app/../bin/tool".to_string()],
                     env: BTreeMap::new(),
@@ -5198,6 +5320,26 @@ mod tests {
         assert_ne!(
             direct_runtime_control_socket_path(first.path()),
             direct_runtime_control_socket_path(second.path())
+        );
+    }
+
+    #[test]
+    fn direct_storage_root_defaults_next_to_output() {
+        let root = direct_storage_root(Path::new("/tmp/out"), None).expect("storage root");
+        assert_eq!(root, Path::new("/tmp/.out.amber-state"));
+    }
+
+    #[test]
+    fn direct_storage_root_uses_explicit_override() {
+        let root = direct_storage_root(
+            Path::new("/tmp/out"),
+            Some(Path::new("custom-storage-root")),
+        )
+        .expect("storage root");
+        assert!(
+            root.ends_with("custom-storage-root"),
+            "override should be used verbatim: {}",
+            root.display()
         );
     }
 
@@ -5438,6 +5580,7 @@ mod tests {
             read_only_mounts: Vec::new(),
             writable_dirs: Vec::new(),
             bind_dirs: Vec::new(),
+            bind_mounts: Vec::new(),
             hidden_paths: Vec::new(),
             network: ProcessNetwork::Host,
         }

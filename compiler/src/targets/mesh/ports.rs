@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use amber_manifest::CapabilityKind;
 use amber_scenario::{ComponentId, Scenario};
 
 use super::plan::{MeshError, component_label};
@@ -26,7 +27,10 @@ pub(crate) fn allocate_slot_ports(
         let mut slot_ports: BTreeMap<String, u16> = BTreeMap::new();
         let mut next = LOCAL_SLOT_PORT_BASE;
 
-        for slot_name in component.slots.keys() {
+        for (slot_name, slot_decl) in &component.slots {
+            if slot_decl.decl.kind == CapabilityKind::Storage {
+                continue;
+            }
             while reserved.contains(&next) || slot_ports.values().any(|p| *p == next) {
                 next = next.checked_add(1).ok_or_else(|| {
                     MeshError::new(format!(

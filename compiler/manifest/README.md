@@ -75,6 +75,7 @@ This crate also provides `manifest::lint::lint_manifest` for non-fatal checks:
 * Every declared **slot** should be either:
 
   * **referenced by the program** (via `${slots.<name>...}` in `program.entrypoint` or `program.env`), or
+  * **mounted by the program** (via `program.mounts: [{ from: "slots.<name>", ... }]` for storage slots), or
   * **exported** (some export target points at `self.<name>` or `<name>`), or
   * **used as a binding source from `self`** (some binding has `from: "self"` and `capability: "<name>"`)
 * Every declared **provide** should be either:
@@ -272,7 +273,8 @@ Rules:
 
 ### `program.mounts`
 
-`mounts` mounts config/secret values as files inside the container. Each entry has:
+`mounts` mounts config/secret values as files inside the container, or mounts routed storage as a
+directory. Each entry has:
 
 * `path` (required): absolute path inside the container.
 * `from` (required): source value.
@@ -282,12 +284,13 @@ Supported `from` sources (current):
 
 * `config` or `config.<path>`: mount the component config (whole object or a path).
 * `secret.<path>`: mount a config value marked `secret: true` in the component’s config schema.
+* `slots.<name>`: mount a storage slot as a directory. The referenced slot must exist and have
+  `kind: "storage"`.
 * `framework.docker`: requires `experimental_features: ["docker"]`. In Docker Compose output, this
   injects a Docker socket mount backed by the framework docker gateway.
 
 Reserved (not implemented yet):
 
-* `slots.<name>`
 * `bindings.<name>`
 * `framework.<capability>` other than `framework.docker`
 
@@ -302,6 +305,26 @@ Notes:
 * Mount paths must be absolute and must not include `..`.
 * `secret.<path>` requires the path to be secret in the component’s config schema.
 * `config.<path>` must not reference secret values.
+* `slots.<name>` mounts storage as a directory capability. Use a directory path such as
+  `/var/lib/app`, not a single file path.
+
+Example:
+
+```json5
+slots: {
+  state: { kind: "storage" },
+},
+program: {
+  image: "ghcr.io/acme/app:v1",
+  entrypoint: ["app", "--state-dir", "/var/lib/app"],
+  mounts: [
+    { path: "/var/lib/app", from: "slots.state" },
+  ],
+}
+```
+
+The important mental model is that `slots.state` is a virtual storage object, not a string and not
+a URL-shaped object. Programs consume it by mounting it into their filesystem namespace.
 
 ### Interpolation in `image`/`path`, `entrypoint`/`args`, and `env`
 
@@ -322,8 +345,10 @@ Examples:
 
 Notes:
 
-* Slots expose a virtual object. Today the only defined field is `url`; use
+* Slots expose virtual objects. URL-shaped slots expose a `url` field, so use
   `${slots.<slot>.url}` for the URL string or `${slots.<slot>}` to interpolate the object as JSON.
+* Storage slots are different virtual objects. They are not URL-shaped and cannot be interpolated
+  with `${slots...}`; mount them with `program.mounts`.
 * Bindings expose a virtual object with a single `url` field; bindings must be named to be
   referenced via `${bindings.<name>.url}`.
 * Framework bindings may be **non-URL-shaped**; `${bindings.<name>.url}` is invalid for those
@@ -443,7 +468,7 @@ config_schema: {
 
 Both slots and provides share:
 
-* `kind`: `"mcp" | "llm" | "http" | "docker" | "a2a"`
+* `kind`: `"mcp" | "llm" | "http" | "docker" | "a2a" | "storage"`
 * `profile` (optional): string qualifier (often used for `"mcp"`)
 
 Example:
@@ -460,6 +485,7 @@ Example:
 slots: {
   llm: { kind: "llm" },
   env: { kind: "mcp", profile: "openenv" },
+  state: { kind: "storage" },
 }
 ```
 
@@ -479,8 +505,15 @@ slots: {
 Optional slots can be used to break slot-forwarding cycles; if a required slot is part of a cycle,
 linking fails.
 
-Note: scenario-level slot injection is not supported yet. Required slots on the root component will
-fail to link because there is no parent to satisfy them.
+Root slots are handled differently by kind:
+
+* Root URL-shaped slots are external inputs and still require weak routing from the parent-less
+  root.
+* Root storage slots are backend-managed storage inputs. They are routed from the root into child
+  storage slots and consumed through `program.mounts`.
+* The durable backing for a root storage slot lives outside the child manifest itself. Backends
+  materialize that root storage slot as a real persistence primitive such as a Compose named
+  volume, a direct-mode host directory, or a Kubernetes PVC.
 
 ### `provides`
 
@@ -500,6 +533,8 @@ provides: {
 Notes:
 
 * This crate enforces that each provide declares an `endpoint` and that it refers to a declared endpoint name.
+* `provides` cannot declare `kind: "storage"`. Storage is routed through `slots` and `bindings`,
+  then consumed via `program.mounts`.
 * To forward a child capability, use `exports` pointing at `#child.<name>`.
 
 ### `exports`
@@ -700,7 +735,47 @@ This component:
 }
 ```
 
-### 4) Weak binding flag (non-ordering; breaks dependency cycles)
+### 4) Route root storage into a child and mount it (valid)
+
+The child declares a storage slot and mounts it. The parent owns the root storage slot, which is
+where the backend gets the durable backing from.
+
+Child:
+
+```json5
+{
+  manifest_version: "0.1.0",
+  slots: {
+    state: { kind: "storage" },
+  },
+  program: {
+    image: "ghcr.io/acme/app:v1",
+    entrypoint: ["app", "--state-dir", "/var/lib/app"],
+    mounts: [
+      { path: "/var/lib/app", from: "slots.state" },
+    ],
+  },
+}
+```
+
+Parent:
+
+```json5
+{
+  manifest_version: "0.1.0",
+  slots: {
+    app_state: { kind: "storage" },
+  },
+  components: {
+    app: "./app.json5",
+  },
+  bindings: [
+    { to: "#app.state", from: "self.app_state" },
+  ],
+}
+```
+
+### 5) Weak binding flag (non-ordering; breaks dependency cycles)
 
 In this example, `a` and `b` both bind to each other. Marking one edge as `weak: true` breaks the dependency cycle for ordering purposes while still expressing the wiring intent.
 

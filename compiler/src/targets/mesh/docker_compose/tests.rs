@@ -144,6 +144,17 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn ensure_amber_cli_binary() -> PathBuf {
+    let root = workspace_root();
+    let status = Command::new("cargo")
+        .current_dir(&root)
+        .args(["build", "-q", "-p", "amber-cli"])
+        .status()
+        .expect("run cargo build -p amber-cli");
+    assert!(status.success(), "cargo build -p amber-cli failed");
+    root.join("target").join("debug").join("amber")
+}
+
 fn use_prebuilt_images() -> bool {
     std::env::var("AMBER_TEST_USE_PREBUILT_IMAGES").is_ok()
 }
@@ -335,6 +346,81 @@ fn assert_depends_on(service: &super::Service, name: &str, condition: &str) {
     }
 }
 
+fn storage_scenario(version: &str, initial_state: &str) -> Scenario {
+    let storage_slot: SlotDecl = serde_json::from_value(json!({ "kind": "storage" })).unwrap();
+    let provide_http =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "http" })).unwrap();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: None,
+        slots: BTreeMap::from([("state".to_string(), storage_slot.clone())]),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: vec![ComponentId(1)],
+    };
+
+    let app_program = serde_json::from_value(json!({
+        "image": "busybox:1.36.1",
+        "entrypoint": [
+            "sh",
+            "-eu",
+            "-c",
+            format!(
+                "mkdir -p /var/lib/app /tmp/www\nif [ ! -f /var/lib/app/state.txt ]; then printf '%s\\n' '{initial_state}' >/var/lib/app/state.txt; fi\nprintf '%s\\n' '{version}' >/tmp/www/version.txt\ncp /var/lib/app/state.txt /tmp/www/state.txt\nexec httpd -f -p 8080 -h /tmp/www"
+            )
+        ],
+        "mounts": [
+            { "path": "/var/lib/app", "from": "slots.state" }
+        ],
+        "network": {
+            "endpoints": [
+                { "name": "http", "port": 8080, "protocol": "http" }
+            ]
+        }
+    }))
+    .unwrap();
+
+    let app = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/app"),
+        digest: digest(1),
+        config: None,
+        config_schema: None,
+        program: Some(app_program),
+        slots: BTreeMap::from([("state".to_string(), storage_slot)]),
+        provides: BTreeMap::from([("http".to_string(), provide_http)]),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(app)],
+        bindings: vec![BindingEdge {
+            name: None,
+            from: BindingFrom::External(SlotRef {
+                component: ComponentId(0),
+                name: "state".to_string(),
+            }),
+            to: SlotRef {
+                component: ComponentId(1),
+                name: "state".to_string(),
+            },
+            weak: false,
+        }],
+        exports: Vec::new(),
+    }
+}
+
 #[test]
 fn compose_artifact_emits_env_sample_and_readme() {
     let program = serde_json::from_value(json!({
@@ -375,6 +461,86 @@ fn compose_artifact_emits_env_sample_and_readme() {
         .expect("compose readme should be present");
     assert!(readme.contains("README.md"), "{readme}");
     assert!(readme.contains("docker compose up -d"), "{readme}");
+}
+
+#[test]
+fn compose_emits_storage_volume_mounts() {
+    let slot_storage: SlotDecl = serde_json::from_value(json!({ "kind": "storage" })).unwrap();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: None,
+        slots: BTreeMap::from([("state".to_string(), slot_storage.clone())]),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: vec![ComponentId(1)],
+    };
+
+    let app_program = serde_json::from_value(json!({
+        "image": "busybox:1.36.1",
+        "entrypoint": ["sh", "-lc", "sleep infinity"],
+        "mounts": [
+            { "path": "/var/lib/app", "from": "slots.state" }
+        ]
+    }))
+    .unwrap();
+
+    let app = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/app"),
+        digest: digest(1),
+        config: None,
+        config_schema: None,
+        program: Some(app_program),
+        slots: BTreeMap::from([("state".to_string(), slot_storage)]),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(app)],
+        bindings: vec![BindingEdge {
+            name: None,
+            from: BindingFrom::External(SlotRef {
+                component: ComponentId(0),
+                name: "state".to_string(),
+            }),
+            to: SlotRef {
+                component: ComponentId(1),
+                name: "state".to_string(),
+            },
+            weak: false,
+        }],
+        exports: Vec::new(),
+    };
+
+    let artifact = DockerComposeReporter
+        .emit(&compile_output(scenario))
+        .expect("compose render ok");
+    let compose = parse_compose(&artifact);
+    assert!(
+        compose.volumes.contains_key("amber-storage-app-state"),
+        "compose should declare a named volume for storage mounts"
+    );
+    let app_service = service(&compose, "c1-app");
+    assert!(
+        app_service
+            .volumes
+            .iter()
+            .any(|mount| mount == "amber-storage-app-state:/var/lib/app"),
+        "app service should mount the generated storage volume: {:?}",
+        app_service.volumes
+    );
 }
 
 #[test]
@@ -1086,6 +1252,89 @@ fn compose_emits_minimal_peer_keys() {
     assert_eq!(server1_peers, expected_server1);
     assert!(server2_peers.is_empty());
     assert_eq!(client_peers, expected_client);
+}
+
+#[test]
+fn compose_emits_named_volumes_for_storage_mounts() {
+    let storage_slot: SlotDecl = serde_json::from_value(json!({ "kind": "storage" })).unwrap();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: None,
+        slots: BTreeMap::from([("state".to_string(), storage_slot.clone())]),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: vec![ComponentId(1)],
+    };
+
+    let app_program = serde_json::from_value(json!({
+        "image": "busybox:1.36.1",
+        "entrypoint": ["sh", "-lc", "sleep 3600"],
+        "mounts": [
+            { "path": "/var/lib/app", "from": "slots.state" }
+        ]
+    }))
+    .unwrap();
+
+    let app = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/app"),
+        digest: digest(1),
+        config: None,
+        config_schema: None,
+        program: Some(app_program),
+        slots: BTreeMap::from([("state".to_string(), storage_slot)]),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(app)],
+        bindings: vec![BindingEdge {
+            name: None,
+            from: BindingFrom::External(SlotRef {
+                component: ComponentId(0),
+                name: "state".to_string(),
+            }),
+            to: SlotRef {
+                component: ComponentId(1),
+                name: "state".to_string(),
+            },
+            weak: false,
+        }],
+        exports: Vec::new(),
+    };
+
+    let artifact = DockerComposeReporter
+        .emit(&compile_output(scenario))
+        .expect("compose render should succeed");
+    let compose = parse_compose(&artifact);
+
+    assert!(
+        compose.volumes.contains_key("amber-storage-app-state"),
+        "expected named storage volume in compose file:\n{}",
+        artifact.compose_yaml()
+    );
+
+    let app_service = service(&compose, "c1-app");
+    assert!(
+        app_service
+            .volumes
+            .iter()
+            .any(|mount| mount == "amber-storage-app-state:/var/lib/app"),
+        "expected storage mount on app service:\n{}",
+        artifact.compose_yaml()
+    );
 }
 
 #[test]
@@ -2749,7 +2998,312 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
     assert_eq!(admin_port, 80);
 }
 
+#[ignore = "requires docker + docker compose; run manually"]
+fn docker_smoke_storage_persists_across_upgrade() {
+    use std::{
+        fs,
+        io::Read,
+        net::TcpListener,
+        process::{Command, Stdio},
+        thread,
+        time::Duration,
+    };
+
+    use tempfile::tempdir;
+
+    struct ComposeGuard {
+        project: std::path::PathBuf,
+        envs: Vec<(String, String)>,
+    }
+
+    impl ComposeGuard {
+        fn new(project: &std::path::Path, envs: Vec<(String, String)>) -> Self {
+            Self {
+                project: project.to_path_buf(),
+                envs,
+            }
+        }
+    }
+
+    impl Drop for ComposeGuard {
+        fn drop(&mut self) {
+            let mut cmd = Command::new("docker");
+            cmd.current_dir(&self.project).arg("compose").args([
+                "down",
+                "-v",
+                "--remove-orphans",
+                "--timeout",
+                "1",
+            ]);
+            for (key, value) in &self.envs {
+                cmd.env(key, value);
+            }
+            let _ = cmd.status();
+        }
+    }
+
+    struct ProxyGuard {
+        child: std::process::Child,
+    }
+
+    impl Drop for ProxyGuard {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn pick_free_port() -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local port");
+        let port = listener
+            .local_addr()
+            .expect("local listener address")
+            .port();
+        drop(listener);
+        port
+    }
+
+    fn drain_pipes(child: &mut std::process::Child) -> (String, String) {
+        let mut stdout = String::new();
+        if let Some(mut pipe) = child.stdout.take() {
+            let _ = pipe.read_to_string(&mut stdout);
+        }
+
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+
+        (stdout, stderr)
+    }
+
+    fn spawn_amber_proxy(
+        amber_bin: &Path,
+        project: &Path,
+        project_name: &str,
+        export_port: u16,
+    ) -> ProxyGuard {
+        let child = Command::new(amber_bin)
+            .arg("proxy")
+            .arg(project)
+            .arg("--project-name")
+            .arg(project_name)
+            .arg("--export")
+            .arg(format!("http=127.0.0.1:{export_port}"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start amber proxy");
+        ProxyGuard { child }
+    }
+
+    fn fetch_export_path(export_port: u16, path: &str) -> Option<String> {
+        let output = Command::new("curl")
+            .arg("-fsS")
+            .arg("--max-time")
+            .arg("2")
+            .arg(format!("http://127.0.0.1:{export_port}/{path}"))
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn compose_logs(project: &Path, envs: &[(&str, &str)]) -> String {
+        let mut logs_cmd = Command::new("docker");
+        logs_cmd
+            .current_dir(project)
+            .arg("compose")
+            .args(["logs", "--no-color"]);
+        for (key, value) in envs {
+            logs_cmd.env(key, value);
+        }
+        logs_cmd
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
+            .unwrap_or_else(|err| format!("failed to capture compose logs: {err}"))
+    }
+
+    fn wait_for_export_path(
+        export_port: u16,
+        path: &str,
+        expected: &str,
+        proxy: &mut ProxyGuard,
+        project: &Path,
+        envs: &[(&str, &str)],
+    ) {
+        for _ in 0..60 {
+            if fetch_export_path(export_port, path).as_deref() == Some(expected) {
+                return;
+            }
+            if let Ok(Some(status)) = proxy.child.try_wait() {
+                let (proxy_stdout, proxy_stderr) = drain_pipes(&mut proxy.child);
+                let logs = compose_logs(project, envs);
+                panic!(
+                    "amber proxy exited before {path} served {expected} (status: {status})\nproxy \
+                     stdout:\n{proxy_stdout}\nproxy stderr:\n{proxy_stderr}\ncompose logs:\n{logs}"
+                );
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+
+        let (proxy_stdout, proxy_stderr) = drain_pipes(&mut proxy.child);
+        let logs = compose_logs(project, envs);
+        panic!(
+            "export {path} never served {expected}\nproxy stdout:\n{proxy_stdout}\nproxy \
+             stderr:\n{proxy_stderr}\ncompose logs:\n{logs}"
+        );
+    }
+
+    let dir = tempdir().unwrap();
+    let project = dir.path();
+    let amber_bin = ensure_amber_cli_binary();
+    let envs_owned = vec![(
+        "COMPOSE_PROJECT_NAME".to_string(),
+        format!("amber-storage-upgrade-{}", std::process::id()),
+    )];
+    let project_name = envs_owned[0].1.clone();
+    let compose_envs = envs_owned.clone();
+    let envs = compose_envs
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    let _compose_guard = ComposeGuard::new(project, envs_owned);
+
+    let v1 = DockerComposeReporter
+        .emit(&compile_output(storage_scenario(
+            "version-v1",
+            "persisted-v1",
+        )))
+        .expect("compose render v1");
+    fs::write(project.join(super::COMPOSE_FILENAME), v1.compose_yaml()).unwrap();
+
+    let compose = |args: &[&str]| {
+        let mut cmd = Command::new("docker");
+        cmd.current_dir(project).arg("compose").args(args);
+        for (key, value) in &envs {
+            cmd.env(key, value);
+        }
+        cmd
+    };
+
+    let status = compose(&["up", "-d"]).status().unwrap();
+    assert!(status.success(), "docker compose up v1 failed");
+
+    let export_port = pick_free_port();
+    let mut proxy = spawn_amber_proxy(
+        amber_bin.as_path(),
+        project,
+        project_name.as_str(),
+        export_port,
+    );
+    wait_for_export_path(
+        export_port,
+        "version.txt",
+        "version-v1",
+        &mut proxy,
+        project,
+        &envs,
+    );
+    wait_for_export_path(
+        export_port,
+        "state.txt",
+        "persisted-v1",
+        &mut proxy,
+        project,
+        &envs,
+    );
+    drop(proxy);
+
+    let v2 = DockerComposeReporter
+        .emit(&compile_output(storage_scenario(
+            "version-v2",
+            "persisted-v2",
+        )))
+        .expect("compose render v2");
+    fs::write(project.join(super::COMPOSE_FILENAME), v2.compose_yaml()).unwrap();
+
+    let status = compose(&["up", "-d"]).status().unwrap();
+    assert!(status.success(), "docker compose up v2 failed");
+
+    let mut proxy = spawn_amber_proxy(
+        amber_bin.as_path(),
+        project,
+        project_name.as_str(),
+        export_port,
+    );
+    wait_for_export_path(
+        export_port,
+        "version.txt",
+        "version-v2",
+        &mut proxy,
+        project,
+        &envs,
+    );
+    wait_for_export_path(
+        export_port,
+        "state.txt",
+        "persisted-v1",
+        &mut proxy,
+        project,
+        &envs,
+    );
+}
+
 #[test]
+fn docker_compose_rejects_framework_bindings() {
+    let program = serde_json::from_value(json!({
+        "image": "alpine:3.20",
+        "entrypoint": ["sh", "-lc", "sleep infinity"]
+    }))
+    .unwrap();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: Some(program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root)],
+        bindings: vec![BindingEdge {
+            name: None,
+            from: BindingFrom::Framework(
+                FrameworkCapabilityName::try_from("dynamic_children").unwrap(),
+            ),
+            to: SlotRef {
+                component: ComponentId(0),
+                name: "control".to_string(),
+            },
+            weak: false,
+        }],
+        exports: Vec::new(),
+    };
+
+    let output = compile_output(scenario);
+    let err = DockerComposeReporter.emit(&output).unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("framework.dynamic_children"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("docker-compose reporter does not support unknown framework binding"),
+        "unexpected error: {message}"
+    );
+}
 #[ignore = "requires docker + docker compose; run manually"]
 fn docker_smoke_ocap_blocks_unbound_callers() {
     use std::{fs, process::Command};

@@ -576,6 +576,104 @@ fn compile_direct_rejects_program_path_without_separator() {
 }
 
 #[test]
+fn compile_direct_emits_storage_mounts_in_plan() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("direct-storage-plan-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let manifests_dir = outputs_dir.path().join("manifests");
+    fs::create_dir_all(&manifests_dir).expect("failed to create manifests directory");
+
+    let root_manifest = manifests_dir.join("scenario.json5");
+    let child_manifest = manifests_dir.join("app.json5");
+    fs::write(
+        &child_manifest,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            path: "/bin/sh",
+            args: ["-lc", "sleep 3600"],
+            mounts: [
+              { path: "/var/lib/app", from: "slots.state" },
+            ],
+            network: {
+              endpoints: [
+                { name: "http", port: 8080, protocol: "http" },
+              ],
+            },
+          },
+          slots: {
+            state: { kind: "storage" },
+          },
+          provides: {
+            http: { kind: "http", endpoint: "http" },
+          },
+          exports: {
+            http: "http",
+          },
+        }
+        "#,
+    )
+    .expect("write child manifest");
+    fs::write(
+        &root_manifest,
+        r##"
+        {
+          manifest_version: "0.1.0",
+          resources: {
+            state: { kind: "storage" },
+          },
+          components: {
+            app: "./app.json5",
+          },
+          bindings: [
+            { to: "#app.state", from: "resources.state" },
+          ],
+          exports: {
+            public: "#app.http",
+          },
+        }
+        "##,
+    )
+    .expect("write root manifest");
+
+    let direct_output = outputs_dir.path().join("direct-out");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&direct_output)
+        .arg(&root_manifest)
+        .output()
+        .expect("failed to run amber compile --direct");
+    assert!(
+        output.status.success(),
+        "amber compile --direct failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan: Value = serde_json::from_str(
+        &fs::read_to_string(direct_output.join("direct-plan.json")).expect("read direct-plan.json"),
+    )
+    .expect("parse direct-plan.json");
+
+    let mounts = plan["components"][0]["program"]["storage_mounts"]
+        .as_array()
+        .expect("storage mounts array");
+    assert_eq!(mounts.len(), 1, "{plan:#}");
+    assert_eq!(mounts[0]["mount_path"], "/var/lib/app");
+    assert_eq!(mounts[0]["state_subdir"], "root/state");
+}
+
+#[test]
 fn compile_compose_preserves_runtime_conditional_entrypoint_group_in_template_spec() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

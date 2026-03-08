@@ -19,7 +19,7 @@ use serde_json::json;
 use tempfile::tempdir;
 use url::Url;
 
-use super::{KubernetesReporter, KubernetesReporterConfig, PROVISIONER_NAME};
+use super::{KubernetesReporter, KubernetesReporterConfig};
 use crate::{
     CompileOptions, Compiler, DigestStore, OptimizeOptions, reporter::Reporter as _,
     targets::mesh::internal_images::resolve_internal_images,
@@ -30,6 +30,17 @@ fn workspace_root() -> PathBuf {
         .parent()
         .expect("compiler crate should live under the workspace root")
         .to_path_buf()
+}
+
+fn ensure_amber_cli_binary() -> PathBuf {
+    let root = workspace_root();
+    let status = Command::new("cargo")
+        .current_dir(&root)
+        .args(["build", "-q", "-p", "amber-cli"])
+        .status()
+        .expect("run cargo build -p amber-cli");
+    assert!(status.success(), "cargo build -p amber-cli failed");
+    root.join("target").join("debug").join("amber")
 }
 
 fn internal_images() -> crate::targets::mesh::internal_images::InternalImages {
@@ -268,6 +279,137 @@ fn write_kubernetes_smoke_fixture(root: &Path) -> PathBuf {
     scenario_path
 }
 
+fn write_kubernetes_counter_storage_fixture(root: &Path, version: &str) -> PathBuf {
+    let scenario_dir = root.join("kubernetes-storage");
+    fs::create_dir_all(&scenario_dir).expect("create kubernetes storage fixture directory");
+
+    fs::write(
+        scenario_dir.join("app.json5"),
+        format!(
+            r#"{{
+  manifest_version: "0.1.0",
+  program: {{
+    image: "busybox:1.36.1",
+    entrypoint: [
+      "sh",
+      "-eu",
+      "-c",
+      "mkdir -p /var/lib/app /www; count=0; if [ -f /var/lib/app/count ]; then count=$(cat /var/lib/app/count); fi; count=$((count+1)); printf '%s' \"$count\" >/var/lib/app/count; printf '{version}:%s\n' \"$count\" >/www/index.html; exec httpd -f -p 8080 -h /www"
+    ],
+    mounts: [
+      {{ path: "/var/lib/app", from: "slots.state" }},
+    ],
+    network: {{
+      endpoints: [
+        {{ name: "http", port: 8080, protocol: "http" }},
+      ],
+    }},
+  }},
+  provides: {{
+    http: {{ kind: "http", endpoint: "http" }},
+  }},
+  exports: {{
+    http: "http",
+  }},
+  slots: {{
+    state: {{ kind: "storage" }},
+  }},
+}}
+"#
+        ),
+    )
+    .expect("write kubernetes storage app manifest");
+
+    let scenario_path = scenario_dir.join("scenario.json5");
+    fs::write(
+        &scenario_path,
+        r##"
+{
+  manifest_version: "0.1.0",
+  slots: {
+    state: { kind: "storage" },
+  },
+  components: {
+    app: "./app.json5",
+  },
+  bindings: [
+    { to: "#app.state", from: "self.state" },
+  ],
+  exports: {
+    http: "#app.http",
+  },
+}
+"##,
+    )
+    .expect("write kubernetes storage root scenario");
+
+    scenario_path
+}
+
+fn write_kubernetes_storage_fixture(root: &Path, version: &str, initial_state: &str) -> PathBuf {
+    let scenario_dir = root.join("kubernetes-storage");
+    fs::create_dir_all(&scenario_dir).expect("create kubernetes storage fixture directory");
+
+    fs::write(
+        scenario_dir.join("app.json5"),
+        format!(
+            r##"{{
+  manifest_version: "0.1.0",
+  slots: {{
+    state: {{ kind: "storage" }},
+  }},
+  program: {{
+    image: "busybox:1.36.1",
+    entrypoint: [
+      "sh",
+      "-eu",
+      "-c",
+      "\
+        mkdir -p /var/lib/app /tmp/www\n\
+        if [ ! -f /var/lib/app/state.txt ]; then printf '%s\n' '{initial_state}' >/var/lib/app/state.txt; fi\n\
+        printf '%s\n' '{version}' >/tmp/www/version.txt\n\
+        cp /var/lib/app/state.txt /tmp/www/state.txt\n\
+        exec httpd -f -p 8080 -h /tmp/www\n\
+      ",
+    ],
+    mounts: [
+      {{ path: "/var/lib/app", from: "slots.state" }},
+    ],
+    network: {{
+      endpoints: [{{ name: "http", port: 8080, protocol: "http" }}],
+    }},
+  }},
+  provides: {{
+    http: {{ kind: "http", endpoint: "http" }},
+  }},
+}}
+"##,
+        ),
+    )
+    .expect("write kubernetes storage app manifest");
+
+    let scenario_path = scenario_dir.join("scenario.json5");
+    fs::write(
+        &scenario_path,
+        r##"{
+  manifest_version: "0.1.0",
+  slots: {
+    state: { kind: "storage" },
+  },
+  components: {
+    app: "./app.json5",
+  },
+  bindings: [
+    { to: "#app.state", from: "self.state" },
+  ],
+}
+"##,
+    )
+    .expect("write kubernetes storage root scenario");
+
+    scenario_path
+}
+
 fn write_kubernetes_output(root: &Path, artifact: &super::KubernetesArtifact) {
     if root.exists() {
         fs::remove_dir_all(root).expect("remove kubernetes output directory");
@@ -324,6 +466,123 @@ fn checked_status(cmd: &mut Command, context: &str) {
     if !status.success() {
         panic!("{context} failed (status: {status})");
     }
+}
+
+fn best_effort_output(cmd: &mut Command) -> String {
+    match cmd.output() {
+        Ok(output) => format!(
+            "status: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(err) => format!("failed to run command: {err}"),
+    }
+}
+
+fn kubernetes_failure_diagnostics(namespace: &str, kubeconfig: &Path) -> String {
+    let pods = best_effort_output(
+        kubectl_cmd(kubeconfig)
+            .arg("get")
+            .arg("pods")
+            .arg("-n")
+            .arg(namespace)
+            .arg("-o")
+            .arg("wide"),
+    );
+    let jobs = best_effort_output(
+        kubectl_cmd(kubeconfig)
+            .arg("get")
+            .arg("jobs")
+            .arg("-n")
+            .arg(namespace),
+    );
+    let pvc = best_effort_output(
+        kubectl_cmd(kubeconfig)
+            .arg("get")
+            .arg("pvc")
+            .arg("-n")
+            .arg(namespace),
+    );
+    let describe_job = best_effort_output(
+        kubectl_cmd(kubeconfig)
+            .arg("describe")
+            .arg("job")
+            .arg("-l")
+            .arg("amber.io/type=provisioner")
+            .arg("-n")
+            .arg(namespace),
+    );
+    let logs_job = best_effort_output(
+        kubectl_cmd(kubeconfig)
+            .arg("logs")
+            .arg("-n")
+            .arg(namespace)
+            .arg("-l")
+            .arg("amber.io/type=provisioner")
+            .arg("--all-containers=true"),
+    );
+    let events = best_effort_output(
+        kubectl_cmd(kubeconfig)
+            .arg("get")
+            .arg("events")
+            .arg("-n")
+            .arg(namespace)
+            .arg("--sort-by=.lastTimestamp"),
+    );
+    format!(
+        "pods:\n{pods}\n\njobs:\n{jobs}\n\npvc:\n{pvc}\n\ndescribe \
+         provisioner:\n{describe_job}\n\nprovisioner logs:\n{logs_job}\n\nevents:\n{events}"
+    )
+}
+
+fn kustomization_namespace(path: &Path) -> String {
+    let kustomization = fs::read_to_string(path).expect("read kustomization");
+    let kust_doc: serde_yaml::Value =
+        serde_yaml::from_str(&kustomization).expect("parse kustomization");
+    kust_doc["namespace"]
+        .as_str()
+        .expect("kustomization namespace")
+        .to_string()
+}
+
+fn provisioner_job_name(path: &Path) -> String {
+    let raw = fs::read_to_string(path).expect("read provisioner job yaml");
+    let doc: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse provisioner job yaml");
+    doc["metadata"]["name"]
+        .as_str()
+        .expect("provisioner job metadata.name")
+        .to_string()
+}
+
+fn set_kustomization_namespace(path: &Path, namespace: &str) {
+    let kustomization = fs::read_to_string(path).expect("read kustomization");
+    let mut kust_doc: serde_yaml::Value =
+        serde_yaml::from_str(&kustomization).expect("parse kustomization");
+    kust_doc["namespace"] = serde_yaml::Value::String(namespace.to_string());
+    fs::write(
+        path,
+        serde_yaml::to_string(&kust_doc).expect("serialize kustomization"),
+    )
+    .expect("write kustomization");
+}
+
+fn ensure_namespace_exists(namespace: &str, kubeconfig: &Path) {
+    let exists = kubectl_cmd(kubeconfig)
+        .arg("get")
+        .arg("namespace")
+        .arg(namespace)
+        .output()
+        .expect("run kubectl get namespace")
+        .status
+        .success();
+    if exists {
+        return;
+    }
+
+    let mut cmd = kubectl_cmd(kubeconfig);
+    cmd.arg("create").arg("namespace").arg(namespace);
+    checked_status(&mut cmd, &format!("kubectl create namespace {namespace}"));
 }
 
 fn build_helper_image() {
@@ -523,6 +782,22 @@ fn kubectl_cmd(kubeconfig: &Path) -> Command {
     let mut cmd = Command::new("kubectl");
     cmd.env("KUBECONFIG", kubeconfig);
     cmd
+}
+
+fn compile_fixture(manifest_path: &Path) -> super::KubernetesArtifact {
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let opts = CompileOptions::default();
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let output = rt
+        .block_on(compiler.compile(ManifestRef::from_url(file_url(manifest_path)), opts))
+        .expect("compile scenario");
+
+    let reporter = KubernetesReporter {
+        config: KubernetesReporterConfig {
+            disable_networkpolicy_check: true,
+        },
+    };
+    reporter.emit(&output).expect("render kubernetes output")
 }
 
 impl Drop for PortForwardGuard {
@@ -863,6 +1138,202 @@ fn kubernetes_emits_router_for_external_slots() {
 }
 
 #[test]
+fn kubernetes_storage_mounts_emit_statefulset_with_retained_claims() {
+    let fixture_dir = tempdir().expect("fixture dir");
+    let scenario_path = write_kubernetes_counter_storage_fixture(fixture_dir.path(), "v1");
+    let artifact = compile_fixture(&scenario_path);
+
+    assert!(
+        !artifact
+            .files
+            .contains_key(&PathBuf::from("00-namespace.yaml")),
+        "runtime artifact should not embed a Namespace object"
+    );
+
+    let statefulset_yaml = artifact
+        .files
+        .iter()
+        .find_map(|(path, content)| {
+            path.to_string_lossy()
+                .starts_with("03-statefulsets/")
+                .then_some(content)
+        })
+        .expect("statefulset yaml");
+    assert!(
+        statefulset_yaml.contains("kind: StatefulSet"),
+        "{statefulset_yaml}"
+    );
+    assert!(
+        statefulset_yaml.contains("volumeClaimTemplates"),
+        "{statefulset_yaml}"
+    );
+    assert!(
+        statefulset_yaml.contains("whenDeleted: Retain"),
+        "{statefulset_yaml}"
+    );
+    assert!(
+        statefulset_yaml.contains("whenScaled: Retain"),
+        "{statefulset_yaml}"
+    );
+    assert!(
+        statefulset_yaml.contains("mountPath: /var/lib/app"),
+        "{statefulset_yaml}"
+    );
+    assert!(
+        statefulset_yaml.contains("name: storage-state"),
+        "{statefulset_yaml}"
+    );
+    assert!(
+        !statefulset_yaml.contains("\n  namespace:"),
+        "{statefulset_yaml}"
+    );
+
+    let provision_plan_yaml = artifact
+        .files
+        .get(&PathBuf::from("01-configmaps/amber-mesh-provision.yaml"))
+        .expect("mesh provision configmap");
+    let provision_plan_doc: serde_yaml::Value =
+        serde_yaml::from_str(provision_plan_yaml).expect("parse mesh provision yaml");
+    let plan_json = provision_plan_doc["data"]["mesh-plan.json"]
+        .as_str()
+        .expect("mesh plan json");
+    let plan_doc: serde_json::Value =
+        serde_json::from_str(plan_json).expect("parse mesh plan json");
+    assert_eq!(
+        plan_doc["targets"][0]["output"]["namespace"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        plan_doc["targets"][1]["output"]["namespace"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        plan_doc["targets"][1]["config"]["inbound"][0]["target"]["peer_addr"],
+        serde_json::Value::String("c1-app:23000".to_string())
+    );
+
+    let readme = artifact
+        .files
+        .get(&PathBuf::from("README.md"))
+        .expect("generated readme");
+    assert!(
+        readme.contains("Open `kustomization.yaml` and choose the namespace"),
+        "{readme}"
+    );
+    assert!(
+        readme.contains("If you want this scenario's storage to persist across redeploys"),
+        "{readme}"
+    );
+    assert!(
+        readme.contains("kubectl -n YOUR_NAMESPACE delete pvc --all"),
+        "{readme}"
+    );
+}
+
+#[test]
+fn kubernetes_emits_statefulset_for_storage_mounts() {
+    let fixture_dir = tempdir().expect("create fixture temp dir");
+    let scenario_path =
+        write_kubernetes_storage_fixture(fixture_dir.path(), "version-v1", "persisted-v1");
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..Default::default()
+    };
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let output = rt
+        .block_on(compiler.compile(ManifestRef::from_url(file_url(&scenario_path)), opts))
+        .expect("compile kubernetes storage scenario");
+
+    let reporter = KubernetesReporter {
+        config: KubernetesReporterConfig {
+            disable_networkpolicy_check: true,
+        },
+    };
+    let artifact = reporter.emit(&output).expect("render kubernetes output");
+
+    assert!(
+        !artifact
+            .files
+            .contains_key(&PathBuf::from("00-namespace.yaml")),
+        "runtime output should not include a Namespace resource"
+    );
+
+    let statefulset = artifact
+        .files
+        .iter()
+        .find_map(|(path, content)| {
+            path.to_string_lossy()
+                .starts_with("03-statefulsets/")
+                .then_some(content)
+        })
+        .expect("statefulset manifest");
+    assert!(statefulset.contains("kind: StatefulSet"), "{statefulset}");
+    assert!(
+        statefulset.contains("volumeClaimTemplates"),
+        "{statefulset}"
+    );
+    assert!(
+        statefulset.contains("persistentVolumeClaimRetentionPolicy"),
+        "{statefulset}"
+    );
+    assert!(statefulset.contains("whenDeleted: Retain"), "{statefulset}");
+    assert!(statefulset.contains("whenScaled: Retain"), "{statefulset}");
+    assert!(
+        statefulset.contains("mountPath: /var/lib/app"),
+        "{statefulset}"
+    );
+    assert!(statefulset.contains("name: storage-state"), "{statefulset}");
+    assert!(statefulset.contains("storage: 1Gi"), "{statefulset}");
+    assert!(
+        !artifact
+            .files
+            .contains_key(&PathBuf::from("03-deployments/app.yaml")),
+        "storage-backed components should render as StatefulSets"
+    );
+}
+
+#[test]
+fn kubernetes_netpol_check_uses_namespace_agnostic_service_name() {
+    let fixture_dir = tempdir().expect("create fixture temp dir");
+    let scenario_path =
+        write_kubernetes_storage_fixture(fixture_dir.path(), "version-v1", "persisted-v1");
+
+    let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+    let opts = CompileOptions {
+        optimize: OptimizeOptions { dce: false },
+        ..Default::default()
+    };
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let output = rt
+        .block_on(compiler.compile(ManifestRef::from_url(file_url(&scenario_path)), opts))
+        .expect("compile kubernetes storage scenario");
+
+    let artifact = KubernetesReporter::default()
+        .emit(&output)
+        .expect("render kubernetes output");
+
+    let statefulset = artifact
+        .files
+        .iter()
+        .find_map(|(path, content)| {
+            path.to_string_lossy()
+                .starts_with("03-statefulsets/")
+                .then_some(content)
+        })
+        .expect("statefulset manifest");
+    assert!(
+        statefulset.contains("RESPONSE=$(nc amber-netpol-client 8080"),
+        "{statefulset}"
+    );
+    assert!(
+        !statefulset.contains("amber-netpol-client.scenario-"),
+        "{statefulset}"
+    );
+}
+
+#[test]
 fn kubernetes_emits_otelcol_and_wires_otel_env() {
     let dir = tempdir().expect("temp dir");
     let root_path = dir.path().join("root.json5");
@@ -1034,6 +1505,278 @@ fn kubernetes_emits_otelcol_and_wires_otel_env() {
 
 #[test]
 #[ignore = "requires docker + kind + kubectl + curl; run manually"]
+fn kubernetes_smoke_storage_upgrade_reuses_pvc() {
+    use std::{io::Read, net::TcpListener};
+
+    let fixture_dir = tempdir().expect("create fixture temp dir");
+    let scenario_path = write_kubernetes_counter_storage_fixture(fixture_dir.path(), "v1");
+
+    let dir = tempdir().expect("create temp dir");
+    let kubeconfig = dir.path().join("kubeconfig");
+    let output_dir = dir.path().join("kubernetes");
+    let amber_bin = ensure_amber_cli_binary();
+
+    let platform = docker_platform();
+    build_helper_image();
+    build_router_image();
+    build_provisioner_image();
+    ensure_image_platform("busybox:1.36.1", &platform);
+    let images = internal_images();
+
+    let cluster = KindCluster::from_env_or_create(&kubeconfig);
+    let cluster_name = cluster.name.clone();
+    let kubeconfig = cluster.kubeconfig.clone();
+
+    struct ProxyGuard {
+        child: std::process::Child,
+    }
+
+    impl Drop for ProxyGuard {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn pick_free_port() -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local port");
+        let port = listener
+            .local_addr()
+            .expect("local listener address")
+            .port();
+        drop(listener);
+        port
+    }
+
+    fn drain_pipes(child: &mut std::process::Child) -> (String, String) {
+        let mut stdout = String::new();
+        if let Some(mut pipe) = child.stdout.take() {
+            let _ = pipe.read_to_string(&mut stdout);
+        }
+
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+
+        (stdout, stderr)
+    }
+
+    for image in [
+        images.helper.as_str(),
+        images.router.as_str(),
+        images.provisioner.as_str(),
+        "busybox:1.36.1",
+    ] {
+        let mut cmd = kind_cmd(&kubeconfig);
+        cmd.arg("load")
+            .arg("docker-image")
+            .arg(image)
+            .arg("--name")
+            .arg(&cluster_name);
+        checked_status(&mut cmd, &format!("kind load {image} image"));
+    }
+
+    let namespace = format!("amber-storage-{}", std::process::id());
+    let cleanup_namespace = |ns: &str| {
+        let _ = kubectl_cmd(&kubeconfig)
+            .arg("delete")
+            .arg("namespace")
+            .arg(ns)
+            .arg("--ignore-not-found=true")
+            .arg("--wait=false")
+            .status();
+    };
+    cleanup_namespace(&namespace);
+
+    let mut create_namespace = kubectl_cmd(&kubeconfig);
+    create_namespace
+        .arg("create")
+        .arg("namespace")
+        .arg(&namespace);
+    checked_status(&mut create_namespace, "kubectl create namespace");
+
+    let wait_for_body = |expected: &str, namespace: &str| {
+        let mut get_router_pod = kubectl_cmd(&kubeconfig);
+        get_router_pod
+            .arg("get")
+            .arg("pod")
+            .arg("-n")
+            .arg(namespace)
+            .arg("-l")
+            .arg("amber.io/component=amber-router")
+            .arg("-o")
+            .arg("jsonpath={.items[0].metadata.name}");
+        let router_pod = String::from_utf8_lossy(
+            &checked_output(&mut get_router_pod, "kubectl get router pod").stdout,
+        )
+        .trim()
+        .to_string();
+        assert!(
+            !router_pod.is_empty(),
+            "expected router pod in namespace {namespace}"
+        );
+
+        let mesh_port = pick_free_port();
+        let control_port = pick_free_port();
+        let export_port = pick_free_port();
+
+        let mesh_log_path = dir.path().join(format!("router-mesh-{expected}.log"));
+        let mut mesh_forward = PortForwardGuard::new_with_ports(
+            namespace,
+            &router_pod,
+            mesh_port,
+            24000,
+            &mesh_log_path,
+            &kubeconfig,
+        );
+        mesh_forward.wait_until_ready(Duration::from_secs(30));
+
+        let control_log_path = dir.path().join(format!("router-control-{expected}.log"));
+        let mut control_forward = PortForwardGuard::new_with_ports(
+            namespace,
+            &router_pod,
+            control_port,
+            24100,
+            &control_log_path,
+            &kubeconfig,
+        );
+        control_forward.wait_until_ready(Duration::from_secs(30));
+
+        let mut proxy = ProxyGuard {
+            child: Command::new(&amber_bin)
+                .arg("proxy")
+                .arg(&output_dir)
+                .arg("--export")
+                .arg(format!("http=127.0.0.1:{export_port}"))
+                .arg("--router-addr")
+                .arg(format!("127.0.0.1:{mesh_port}"))
+                .arg("--router-control-addr")
+                .arg(format!("127.0.0.1:{control_port}"))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("start amber proxy"),
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let url = format!("http://127.0.0.1:{export_port}/");
+        let mut last_err: Option<String> = None;
+        loop {
+            let output = Command::new("curl")
+                .arg("-fsS")
+                .arg("--max-time")
+                .arg("2")
+                .arg(&url)
+                .output();
+            match output {
+                Ok(output) if output.status.success() => {
+                    let body = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if body == expected {
+                        return;
+                    }
+                    last_err = Some(format!("unexpected response body: {body:?}"));
+                }
+                Ok(output) => {
+                    last_err = Some(format!(
+                        "curl failed (status: {})\nstdout:\n{}\nstderr:\n{}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+                Err(err) => last_err = Some(format!("failed to run curl: {err}")),
+            }
+
+            if let Ok(Some(status)) = proxy.child.try_wait() {
+                let (proxy_stdout, proxy_stderr) = drain_pipes(&mut proxy.child);
+                let mesh_logs = mesh_forward.logs();
+                let control_logs = control_forward.logs();
+                let router_logs = kubectl_logs(namespace, &router_pod, &kubeconfig);
+                panic!(
+                    "amber proxy exited before export served {expected} (status: {status})\nproxy \
+                     stdout:\n{proxy_stdout}\nproxy stderr:\n{proxy_stderr}\nmesh port-forward \
+                     logs:\n{mesh_logs}\ncontrol port-forward logs:\n{control_logs}\nrouter \
+                     logs:\n{router_logs}"
+                );
+            }
+            if Instant::now() >= deadline {
+                let (proxy_stdout, proxy_stderr) = drain_pipes(&mut proxy.child);
+                let mesh_logs = mesh_forward.logs();
+                let control_logs = control_forward.logs();
+                let router_logs = kubectl_logs(namespace, &router_pod, &kubeconfig);
+                panic!(
+                    "export did not serve {expected} via amber proxy at {url}\n{}\n\nproxy \
+                     stdout:\n{proxy_stdout}\nproxy stderr:\n{proxy_stderr}\nmesh port-forward \
+                     logs:\n{mesh_logs}\ncontrol port-forward logs:\n{control_logs}\nrouter \
+                     logs:\n{router_logs}",
+                    last_err.unwrap_or_else(|| "no curl output captured".to_string())
+                );
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    };
+
+    let apply_version = |version: &str| {
+        write_kubernetes_output(&output_dir, &compile_fixture(&scenario_path));
+        set_kustomization_namespace(&output_dir.join("kustomization.yaml"), &namespace);
+        let provisioner_job =
+            provisioner_job_name(&output_dir.join("02-rbac/amber-provisioner-job.yaml"));
+        let mut apply = kubectl_cmd(&kubeconfig);
+        apply.arg("apply").arg("-k").arg(&output_dir);
+        checked_status(&mut apply, &format!("kubectl apply {version}"));
+
+        let mut wait_job = kubectl_cmd(&kubeconfig);
+        wait_job
+            .arg("wait")
+            .arg("--for=condition=complete")
+            .arg("--timeout=180s")
+            .arg("job")
+            .arg(&provisioner_job)
+            .arg("-n")
+            .arg(&namespace);
+        let wait_status = wait_job.status().unwrap_or_else(|err| {
+            panic!("failed to run kubectl wait provisioner {version}: {err}");
+        });
+        if !wait_status.success() {
+            let diagnostics = kubernetes_failure_diagnostics(&namespace, &kubeconfig);
+            panic!(
+                "kubectl wait provisioner {version} failed (status: {wait_status})\n{diagnostics}"
+            );
+        }
+
+        let mut rollout = kubectl_cmd(&kubeconfig);
+        rollout
+            .arg("rollout")
+            .arg("status")
+            .arg("statefulset/c1-app")
+            .arg("--timeout=180s")
+            .arg("-n")
+            .arg(&namespace);
+        let rollout_status = rollout.status().unwrap_or_else(|err| {
+            panic!("failed to run kubectl rollout statefulset {version}: {err}");
+        });
+        if !rollout_status.success() {
+            let diagnostics = kubernetes_failure_diagnostics(&namespace, &kubeconfig);
+            panic!(
+                "kubectl rollout statefulset {version} failed (status: \
+                 {rollout_status})\n{diagnostics}"
+            );
+        }
+    };
+
+    apply_version("v1");
+    wait_for_body("v1:1", &namespace);
+
+    write_kubernetes_counter_storage_fixture(fixture_dir.path(), "v2");
+    apply_version("v2");
+    wait_for_body("v2:2", &namespace);
+
+    cleanup_namespace(&namespace);
+}
+
+#[test]
+#[ignore = "requires docker + kind + kubectl + curl; run manually"]
 fn kubernetes_smoke_config_roundtrip() {
     let fixture_dir = tempdir().expect("create fixture temp dir");
     let scenario_path = write_kubernetes_smoke_fixture(fixture_dir.path());
@@ -1098,23 +1841,12 @@ fn kubernetes_smoke_config_roundtrip() {
         checked_status(&mut cmd, &format!("kind load {image} image"));
     }
 
+    let namespace = kustomization_namespace(&output_dir.join("kustomization.yaml"));
+    ensure_namespace_exists(&namespace, &kubeconfig);
+
     let mut cmd = kubectl_cmd(&kubeconfig);
     cmd.arg("apply").arg("-k").arg(&output_dir);
     checked_status(&mut cmd, "kubectl apply");
-
-    let namespace = {
-        let mut cmd = kubectl_cmd(&kubeconfig);
-        cmd.arg("get")
-            .arg("namespaces")
-            .arg("-l")
-            .arg("app.kubernetes.io/managed-by=amber")
-            .arg("-o")
-            .arg("jsonpath={.items[0].metadata.name}");
-        let output = checked_output(&mut cmd, "kubectl get namespace");
-        let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        assert!(!name.is_empty(), "no namespace found for amber");
-        name
-    };
 
     let mut cmd = kubectl_cmd(&kubeconfig);
     cmd.arg("wait")
@@ -1292,6 +2024,8 @@ fn kubernetes_smoke_external_slot_routes_to_outside_service() {
             .arg(&cluster_name);
         checked_status(&mut cmd, &format!("kind load {image} image"));
     }
+
+    ensure_namespace_exists(namespace, &kubeconfig);
 
     let mut cmd = kubectl_cmd(&kubeconfig);
     cmd.arg("apply").arg("-k").arg(&output_dir);
@@ -1640,6 +2374,8 @@ sleep infinity
 
     let output_dir = dir.path().join("kubernetes");
     write_kubernetes_output(&output_dir, &artifact);
+    let provisioner_job =
+        provisioner_job_name(&output_dir.join("02-rbac/amber-provisioner-job.yaml"));
 
     let kustomization =
         fs::read_to_string(output_dir.join("kustomization.yaml")).expect("read kustomization");
@@ -1673,6 +2409,8 @@ sleep infinity
         checked_status(&mut cmd, &format!("kind load {image} image"));
     }
 
+    ensure_namespace_exists(namespace, &kubeconfig);
+
     let mut cmd = kubectl_cmd(&kubeconfig);
     cmd.arg("apply").arg("-k").arg(&output_dir);
     checked_status(&mut cmd, "kubectl apply amber");
@@ -1682,7 +2420,7 @@ sleep infinity
         .arg("--for=condition=complete")
         .arg("--timeout=120s")
         .arg("job")
-        .arg(PROVISIONER_NAME)
+        .arg(&provisioner_job)
         .arg("-n")
         .arg(namespace);
     checked_status(&mut cmd, "kubectl wait for provisioner job");
@@ -1906,6 +2644,8 @@ fn kubernetes_smoke_export_routes_to_host() {
 
     let output_dir = dir.path().join("kubernetes");
     write_kubernetes_output(&output_dir, &artifact);
+    let provisioner_job =
+        provisioner_job_name(&output_dir.join("02-rbac/amber-provisioner-job.yaml"));
 
     let kustomization =
         fs::read_to_string(output_dir.join("kustomization.yaml")).expect("read kustomization");
@@ -1939,6 +2679,8 @@ fn kubernetes_smoke_export_routes_to_host() {
         checked_status(&mut cmd, &format!("kind load {image} image"));
     }
 
+    ensure_namespace_exists(namespace, &kubeconfig);
+
     let mut cmd = kubectl_cmd(&kubeconfig);
     cmd.arg("apply").arg("-k").arg(&output_dir);
     checked_status(&mut cmd, "kubectl apply amber");
@@ -1948,7 +2690,7 @@ fn kubernetes_smoke_export_routes_to_host() {
         .arg("--for=condition=complete")
         .arg("--timeout=120s")
         .arg("job")
-        .arg(PROVISIONER_NAME)
+        .arg(&provisioner_job)
         .arg("-n")
         .arg(namespace);
     checked_status(&mut cmd, "kubectl wait for provisioner job");

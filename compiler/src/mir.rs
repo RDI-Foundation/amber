@@ -952,6 +952,12 @@ fn collect_program_used_slots(component: &amber_scenario::Component) -> Vec<Stri
         }
     }
 
+    for mount in program.mounts() {
+        if let amber_manifest::MountSource::Slot(slot) = &mount.source {
+            mark_slot(slot, &mut used);
+        }
+    }
+
     used.into_iter().collect()
 }
 

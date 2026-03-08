@@ -50,13 +50,12 @@ pub struct ServiceAccount {
 }
 
 impl ServiceAccount {
-    pub fn new(name: impl Into<String>, namespace: impl Into<String>) -> Self {
+    pub fn new(name: impl Into<String>, _namespace: impl Into<String>) -> Self {
         Self {
             api_version: "v1",
             kind: "ServiceAccount",
             metadata: ObjectMeta {
                 name: name.into(),
-                namespace: Some(namespace.into()),
                 ..Default::default()
             },
         }
@@ -87,7 +86,7 @@ pub struct PolicyRule {
 impl Role {
     pub fn new(
         name: impl Into<String>,
-        namespace: impl Into<String>,
+        _namespace: impl Into<String>,
         rules: Vec<PolicyRule>,
     ) -> Self {
         Self {
@@ -95,7 +94,6 @@ impl Role {
             kind: "Role",
             metadata: ObjectMeta {
                 name: name.into(),
-                namespace: Some(namespace.into()),
                 ..Default::default()
             },
             rules,
@@ -133,7 +131,7 @@ pub struct RoleRef {
 impl RoleBinding {
     pub fn new(
         name: impl Into<String>,
-        namespace: impl Into<String>,
+        _namespace: impl Into<String>,
         subject: Subject,
         role_ref: RoleRef,
     ) -> Self {
@@ -142,7 +140,6 @@ impl RoleBinding {
             kind: "RoleBinding",
             metadata: ObjectMeta {
                 name: name.into(),
-                namespace: Some(namespace.into()),
                 ..Default::default()
             },
             subjects: vec![subject],
@@ -166,7 +163,7 @@ pub struct ConfigMap {
 impl ConfigMap {
     pub fn new(
         name: impl Into<String>,
-        namespace: impl Into<String>,
+        _namespace: impl Into<String>,
         labels: BTreeMap<String, String>,
         data: BTreeMap<String, String>,
     ) -> Self {
@@ -175,7 +172,6 @@ impl ConfigMap {
             kind: "ConfigMap",
             metadata: ObjectMeta {
                 name: name.into(),
-                namespace: Some(namespace.into()),
                 labels,
                 ..Default::default()
             },
@@ -201,7 +197,7 @@ pub struct Secret {
 impl Secret {
     pub fn new(
         name: impl Into<String>,
-        namespace: impl Into<String>,
+        _namespace: impl Into<String>,
         labels: BTreeMap<String, String>,
         string_data: BTreeMap<String, String>,
     ) -> Self {
@@ -210,7 +206,6 @@ impl Secret {
             kind: "Secret",
             metadata: ObjectMeta {
                 name: name.into(),
-                namespace: Some(namespace.into()),
                 labels,
                 ..Default::default()
             },
@@ -252,7 +247,7 @@ pub struct ServicePort {
 impl Service {
     pub fn new(
         name: impl Into<String>,
-        namespace: impl Into<String>,
+        _namespace: impl Into<String>,
         labels: BTreeMap<String, String>,
         selector: BTreeMap<String, String>,
         ports: Vec<ServicePort>,
@@ -262,7 +257,6 @@ impl Service {
             kind: "Service",
             metadata: ObjectMeta {
                 name: name.into(),
-                namespace: Some(namespace.into()),
                 labels,
                 ..Default::default()
             },
@@ -292,6 +286,59 @@ pub struct DeploymentSpec {
     pub replicas: u32,
     pub selector: LabelSelector,
     pub template: PodTemplateSpec,
+}
+
+// ---- StatefulSet ----
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatefulSet {
+    pub api_version: &'static str,
+    pub kind: &'static str,
+    pub metadata: ObjectMeta,
+    pub spec: StatefulSetSpec,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatefulSetSpec {
+    pub service_name: String,
+    pub replicas: u32,
+    pub selector: LabelSelector,
+    pub template: PodTemplateSpec,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub volume_claim_templates: Vec<PersistentVolumeClaim>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistent_volume_claim_retention_policy: Option<PersistentVolumeClaimRetentionPolicy>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistentVolumeClaimRetentionPolicy {
+    pub when_deleted: &'static str,
+    pub when_scaled: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistentVolumeClaim {
+    pub api_version: &'static str,
+    pub kind: &'static str,
+    pub metadata: ObjectMeta,
+    pub spec: PersistentVolumeClaimSpec,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistentVolumeClaimSpec {
+    pub access_modes: Vec<String>,
+    pub resources: VolumeResourceRequirements,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeResourceRequirements {
+    pub requests: BTreeMap<String, String>,
 }
 
 // ---- DaemonSet ----
@@ -436,6 +483,7 @@ impl EnvVar {
                     optional: Some(true),
                 }),
                 secret_key_ref: None,
+                field_ref: None,
             }),
         }
     }
@@ -455,6 +503,22 @@ impl EnvVar {
                     key: key.into(),
                     optional: Some(true),
                 }),
+                field_ref: None,
+            }),
+        }
+    }
+
+    pub fn from_field_ref(name: impl Into<String>, field_path: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: None,
+            value_from: Some(EnvVarSource {
+                config_map_key_ref: None,
+                secret_key_ref: None,
+                field_ref: Some(ObjectFieldSelector {
+                    api_version: Some("v1".to_string()),
+                    field_path: field_path.into(),
+                }),
             }),
         }
     }
@@ -467,6 +531,8 @@ pub struct EnvVarSource {
     pub config_map_key_ref: Option<KeyRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_key_ref: Option<KeyRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field_ref: Option<ObjectFieldSelector>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -476,6 +542,14 @@ pub struct KeyRef {
     pub key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub optional: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectFieldSelector {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
+    pub field_path: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -668,7 +742,7 @@ pub struct NetworkPolicyPort {
 impl NetworkPolicy {
     pub fn new(
         name: impl Into<String>,
-        namespace: impl Into<String>,
+        _namespace: impl Into<String>,
         labels: BTreeMap<String, String>,
         pod_selector: BTreeMap<String, String>,
     ) -> Self {
@@ -677,7 +751,6 @@ impl NetworkPolicy {
             kind: "NetworkPolicy",
             metadata: ObjectMeta {
                 name: name.into(),
-                namespace: Some(namespace.into()),
                 labels,
                 ..Default::default()
             },
@@ -720,22 +793,24 @@ pub struct Job {
 pub struct JobSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backoff_limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds_after_finished: Option<u32>,
     pub template: PodTemplateSpec,
 }
 
 impl Job {
     pub fn new(
         name: impl Into<String>,
-        namespace: impl Into<String>,
+        _namespace: impl Into<String>,
         labels: BTreeMap<String, String>,
         template: PodTemplateSpec,
     ) -> Self {
-        Self::new_with_backoff_limit(name, namespace, labels, template, Some(0))
+        Self::new_with_backoff_limit(name, "", labels, template, Some(0))
     }
 
     pub fn new_with_backoff_limit(
         name: impl Into<String>,
-        namespace: impl Into<String>,
+        _namespace: impl Into<String>,
         labels: BTreeMap<String, String>,
         template: PodTemplateSpec,
         backoff_limit: Option<u32>,
@@ -745,12 +820,12 @@ impl Job {
             kind: "Job",
             metadata: ObjectMeta {
                 name: name.into(),
-                namespace: Some(namespace.into()),
                 labels,
                 ..Default::default()
             },
             spec: JobSpec {
                 backoff_limit,
+                ttl_seconds_after_finished: None,
                 template,
             },
         }

@@ -1,0 +1,13 @@
+{
+  manifest_version: "0.1.0",
+  slots: {
+    api: { kind: "http" },
+  },
+  program: {
+    image: "x",
+    entrypoint: ["x"],
+    mounts: [
+      { path: "/var/lib/app", from: "slots.api" },
+    ],
+  },
+}

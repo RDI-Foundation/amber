@@ -1,0 +1,28 @@
+compiler::invalid_slots_interpolation
+
+  x invalid slots interpolation in / (program.env.STATE_URL): storage slot `state` is a virtual storage object, not a URL-shaped slot
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_interpolation_storage_slot.json5:10:18]
+  9 |     env: {
+ 10 |       STATE_URL: "${slots.state.url}",
+    :                  ^^^^^^^^^^|^^^^^^^^^
+    :                            `-- slot interpolation here
+ 11 |     },
+    `----
+  help: Mount the storage slot with `program.mounts: [{ from: "slots.<slot>", path: "/var/lib/app" }]` instead of using `${slots...}`.
+manifest::unused_program
+
+  ! program is never referenced by bindings or exports (in component /)
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_interpolation_storage_slot.json5:6:12]
+  5 |       },
+  6 | ,->   program: {
+  7 | |       image: "x",
+  8 | |       entrypoint: ["x"],
+  9 | |       env: {
+ 10 | |         STATE_URL: "${slots.state.url}",
+ 11 | |       },
+ 12 | |->   },
+    : `---- unused `program`
+ 13 |     }
+    `----
+  help: Remove the `program` block if it is not needed, or export/bind one of its provides.
+Error:   × check failed

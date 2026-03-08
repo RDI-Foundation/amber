@@ -8,9 +8,10 @@ use std::{
 
 use amber_config as rc;
 use amber_manifest::{
-    BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, ChildName, ExportName,
-    ExportTarget, InterpolatedPart, InterpolatedString, InterpolationSource, Manifest,
-    ManifestDigest, SlotTarget, framework_capability, parse_slot_query,
+    BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, CapabilityKind, ChildName,
+    ExportName, ExportTarget, InterpolatedPart, InterpolatedString, InterpolationSource, Manifest,
+    ManifestDigest, MountSource, SlotTarget, framework_capability, parse_slot_query,
+    span_for_json_pointer,
 };
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, ProvideRef, Scenario, ScenarioExport,
@@ -2062,6 +2063,13 @@ impl<'a> SlotResolver<'a> {
             .unwrap_or(false)
     }
 
+    fn slot_kind(&self, slot: &SlotRef) -> Option<CapabilityKind> {
+        self.components[slot.component.0]
+            .as_ref()
+            .and_then(|c| c.slots.get(slot.name.as_str()))
+            .map(|decl| decl.decl.kind)
+    }
+
     fn external_root_slots(&self) -> HashSet<String> {
         self.external_root_slots.clone()
     }
@@ -2145,6 +2153,14 @@ fn collect_program_slot_uses(manifest: &Manifest) -> HashSet<String> {
         used_all = add_program_slot_uses(manifest, &mut uses, value.value());
         if used_all {
             return uses;
+        }
+    }
+
+    for mount in program.mounts() {
+        if let MountSource::Slot(slot) = &mount.source
+            && manifest.slots().contains_key(slot.as_str())
+        {
+            uses.insert(slot.clone());
         }
     }
 
@@ -2305,6 +2321,7 @@ fn resolve_binding_edges(
 
         if let BindingFrom::External(slot_ref) = &resolved.from
             && !all_weak
+            && resolver.slot_kind(slot_ref) != Some(CapabilityKind::Storage)
         {
             let (origin, target) = nonweak.unwrap_or((&binding.origin, &binding.target));
 

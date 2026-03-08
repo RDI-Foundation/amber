@@ -143,6 +143,19 @@ pub enum Error {
     #[diagnostic(code(manifest::missing_provide_endpoint))]
     MissingProvideEndpoint { name: String },
 
+    #[error("provide `{name}` cannot use capability kind `{kind}`")]
+    #[diagnostic(
+        code(manifest::unsupported_provide_kind),
+        help(
+            "Storage is routed through `slots` and `bindings`, not `provides`. Declare \
+             `slots.{name}: {{ kind: \"storage\" }}` and bind it from the parent instead."
+        )
+    )]
+    UnsupportedProvideKind {
+        name: String,
+        kind: crate::CapabilityKind,
+    },
+
     #[error("duplicate mount name `{name}`")]
     #[diagnostic(code(manifest::duplicate_mount_name))]
     DuplicateMountName { name: String },
@@ -170,6 +183,23 @@ pub enum Error {
     #[error("secret mount path `{path}` is not secret")]
     #[diagnostic(code(manifest::mount_secret_path_is_not_secret))]
     MountSecretPathIsNotSecret { path: String },
+
+    #[error("mount source `slots.{slot}` references unknown slot")]
+    #[diagnostic(code(manifest::unknown_mount_slot))]
+    UnknownMountSlot { slot: String },
+
+    #[error("mount source `slots.{slot}` requires a storage slot, but `{slot}` is `{kind}`")]
+    #[diagnostic(
+        code(manifest::mount_slot_requires_storage),
+        help(
+            "URL-shaped slots expose fields like `.url`. Storage slots are virtual storage \
+             objects and are mounted with `from: \"slots.<slot>\"`."
+        )
+    )]
+    MountSlotRequiresStorage {
+        slot: String,
+        kind: crate::CapabilityKind,
+    },
 
     #[error("mount source `{mount}` is reserved (not implemented)")]
     #[diagnostic(code(manifest::unsupported_mount_source))]

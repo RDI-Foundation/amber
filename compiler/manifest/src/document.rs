@@ -172,6 +172,7 @@ fn labels_for_manifest_error(
         ManifestError::MissingProvideEndpoint { name } => {
             labels_for_missing_provide_endpoint(spans, name)
         }
+        ManifestError::UnsupportedProvideKind { name, .. } => labels_for_provide_kind(spans, name),
         ManifestError::DuplicateMountName { name } => {
             labels_for_mount_name(spans, name, "duplicate mount name")
         }
@@ -197,6 +198,10 @@ fn labels_for_manifest_error(
         | ManifestError::MountSecretPathIsNotSecret { path } => {
             let source = format!("secret.{path}");
             labels_for_mount_source(spans, &source, "mount source here")
+        }
+        ManifestError::UnknownMountSlot { slot }
+        | ManifestError::MountSlotRequiresStorage { slot, .. } => {
+            labels_for_mount_source(spans, &format!("slots.{slot}"), "mount source here")
         }
         ManifestError::UnsupportedMountSource { mount } => {
             labels_for_mount_source(spans, mount, "reserved mount source")
@@ -696,6 +701,18 @@ fn labels_for_missing_provide_endpoint(spans: &ManifestSpans, name: &str) -> Vec
     )]
 }
 
+fn labels_for_provide_kind(spans: &ManifestSpans, name: &str) -> Vec<LabeledSpan> {
+    let span = spans
+        .provides
+        .get(name)
+        .and_then(|provide| provide.capability.kind)
+        .unwrap_or_else(default_span);
+    vec![primary(
+        span,
+        Some("unsupported provide kind here".to_string()),
+    )]
+}
+
 fn labels_for_unknown_environment_extends(spans: &ManifestSpans, name: &str) -> Vec<LabeledSpan> {
     let span = spans.environments.get(name).and_then(|e| e.extends);
     vec![primary(
@@ -1047,5 +1064,64 @@ mod tests {
             .collect();
         assert_eq!(starts.len(), 2);
         assert_eq!(second.offset(), starts[1]);
+    }
+
+    #[test]
+    fn manifest_doc_error_mount_slot_requires_storage_points_to_mount_source() {
+        let source = r##"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [
+              { path: "/var/lib/app", from: "slots.api" },
+            ],
+          },
+          slots: {
+            api: { kind: "http" },
+          },
+        }
+        "##;
+        let source: Arc<str> = Arc::from(source);
+        let err = ParsedManifest::parse_named("<test>", Arc::clone(&source)).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            crate::Error::MountSlotRequiresStorage { .. }
+        ));
+
+        let labels: Vec<_> = err.labels().expect("labels").collect();
+        let has_mount_source = labels
+            .iter()
+            .any(|label| labeled_span_text(source.as_ref(), label).contains("\"slots.api\""));
+        assert!(has_mount_source);
+    }
+
+    #[test]
+    fn manifest_doc_error_storage_provide_points_to_kind() {
+        let source = r##"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+          },
+          provides: {
+            state: { kind: "storage", endpoint: "ignored" },
+          },
+        }
+        "##;
+        let source: Arc<str> = Arc::from(source);
+        let err = ParsedManifest::parse_named("<test>", Arc::clone(&source)).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            crate::Error::UnsupportedProvideKind { .. }
+        ));
+
+        let labels: Vec<_> = err.labels().expect("labels").collect();
+        let has_storage_kind = labels
+            .iter()
+            .any(|label| labeled_span_text(source.as_ref(), label).contains("\"storage\""));
+        assert!(has_storage_kind);
     }
 }

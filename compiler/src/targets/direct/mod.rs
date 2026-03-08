@@ -18,6 +18,7 @@ use crate::{
             GENERATED_ENV_SAMPLE_FILENAME, GENERATED_README_FILENAME, build_execution_guide,
         },
     },
+    storage_plan::{StoragePlan, build_storage_plan},
     targets::{
         common::{TargetError as MeshError, component_label},
         mesh::{
@@ -118,7 +119,15 @@ pub struct DirectSidecarPlan {
 pub struct DirectProgramPlan {
     pub log_name: String,
     pub work_dir: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage_mounts: Vec<DirectStorageMount>,
     pub execution: DirectProgramExecutionPlan,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DirectStorageMount {
+    pub mount_path: String,
+    pub state_subdir: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -241,6 +250,7 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
         &address_plan.binding_values_by_component,
         &config_plan.binding_values_by_scope,
     )?;
+    let storage_plan = build_storage_plan(scenario, program_components)?;
 
     let router_mesh_port = router_ports.map_or(0, |ports| ports.mesh);
     let mesh_addressing = LoopbackMeshAddressing {
@@ -286,15 +296,17 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
 
     let startup_order = topological_startup_order(program_components, &mesh_plan)?;
     let startup_order_ids = startup_order.iter().map(|id| id.0).collect::<Vec<_>>();
-    let components = build_component_plans(
-        compiled,
+    let components = build_component_plans(DirectComponentPlanInputs {
         scenario,
-        &mesh_plan,
-        &config_plan,
-        &component_names,
-        &mesh_ports_by_component,
+        provenance: &output.provenance,
+        mesh_plan: &mesh_plan,
+        config_plan: &config_plan,
+        storage_plan: &storage_plan,
+        component_names: &component_names,
+        mesh_ports_by_component: &mesh_ports_by_component,
+        compiled,
         program_components,
-    )?;
+    })?;
 
     let router_plan = router_ports.map(|ports| DirectRouterPlan {
         identity_id: ROUTER_IDENTITY_ID.to_string(),
@@ -347,8 +359,13 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
         files.insert(PathBuf::from(DEFAULT_EXTERNAL_ENV_FILE), env_content);
     }
 
-    let execution_guide = build_execution_guide(scenario, &mesh_plan, &config_plan)
-        .map_err(|err: ReporterError| MeshError::new(err.to_string()))?;
+    let execution_guide = build_execution_guide(
+        &output.scenario,
+        &mesh_plan,
+        &config_plan,
+        !storage_plan.is_empty(),
+    )
+    .map_err(|err: ReporterError| MeshError::new(err.to_string()))?;
     files.insert(
         PathBuf::from(GENERATED_ENV_SAMPLE_FILENAME),
         execution_guide.render_env_sample(false, "direct"),
@@ -362,15 +379,32 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
     Ok(DirectArtifact { files })
 }
 
+struct DirectComponentPlanInputs<'a> {
+    scenario: &'a Scenario,
+    provenance: &'a crate::Provenance,
+    mesh_plan: &'a MeshPlan,
+    config_plan: &'a crate::targets::program_config::ConfigPlan,
+    storage_plan: &'a StoragePlan,
+    component_names: &'a HashMap<ComponentId, DirectComponentNames>,
+    mesh_ports_by_component: &'a HashMap<ComponentId, u16>,
+    compiled: &'a CompiledScenario,
+    program_components: &'a [ComponentId],
+}
+
 fn build_component_plans(
-    compiled: &CompiledScenario,
-    scenario: &Scenario,
-    mesh_plan: &MeshPlan,
-    config_plan: &crate::targets::program_config::ConfigPlan,
-    component_names: &HashMap<ComponentId, DirectComponentNames>,
-    mesh_ports_by_component: &HashMap<ComponentId, u16>,
-    program_components: &[ComponentId],
+    inputs: DirectComponentPlanInputs<'_>,
 ) -> Result<Vec<DirectComponentPlan>, MeshError> {
+    let DirectComponentPlanInputs {
+        scenario,
+        provenance,
+        mesh_plan,
+        config_plan,
+        storage_plan,
+        component_names,
+        mesh_ports_by_component,
+        compiled,
+        program_components,
+    } = inputs;
     let mut out = Vec::with_capacity(program_components.len());
     for id in program_components {
         let component = scenario.component(*id);
@@ -428,11 +462,63 @@ fn build_component_plans(
             program: DirectProgramPlan {
                 log_name: format!("{}-program", names.base),
                 work_dir: names.work_dir.clone(),
+                storage_mounts: direct_storage_mounts(
+                    component.moniker.as_str(),
+                    storage_plan.mounts_by_component.get(id).map(Vec::as_slice),
+                ),
                 execution,
             },
         });
     }
     Ok(out)
+}
+
+fn direct_storage_mounts(
+    component_moniker: &str,
+    mounts: Option<&[crate::storage_plan::StorageMount]>,
+) -> Vec<DirectStorageMount> {
+    let mut out = Vec::new();
+    let component_slug = direct_storage_component_slug(component_moniker);
+    for mount in mounts.into_iter().flatten() {
+        out.push(DirectStorageMount {
+            mount_path: mount.mount_path.clone(),
+            state_subdir: format!(
+                "{component_slug}/{}",
+                sanitize_storage_segment(mount.identity.root_slot.as_str())
+            ),
+        });
+    }
+    out
+}
+
+fn direct_storage_component_slug(component_moniker: &str) -> String {
+    let trimmed = component_moniker.trim_matches('/');
+    if trimmed.is_empty() {
+        return "root".to_string();
+    }
+    trimmed
+        .split('/')
+        .map(sanitize_storage_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn sanitize_storage_segment(input: &str) -> String {
+    let mut out = String::new();
+    for ch in input.chars() {
+        let ch = ch.to_ascii_lowercase();
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('-');
+        }
+    }
+    let out = out.trim_matches('-');
+    if out.is_empty() {
+        "storage".to_string()
+    } else {
+        out.to_string()
+    }
 }
 
 fn direct_execution_plan(execution: ComponentExecutionPlan<'_>) -> DirectProgramExecutionPlan {
@@ -781,7 +867,10 @@ fn placeholder_slot_ports(
     let mut out = HashMap::new();
     for id in program_components {
         let mut slot_ports = BTreeMap::new();
-        for slot_name in scenario.component(*id).slots.keys() {
+        for (slot_name, slot_decl) in &scenario.component(*id).slots {
+            if slot_decl.decl.kind == amber_manifest::CapabilityKind::Storage {
+                continue;
+            }
             slot_ports.insert(slot_name.clone(), 0);
         }
         out.insert(*id, slot_ports);

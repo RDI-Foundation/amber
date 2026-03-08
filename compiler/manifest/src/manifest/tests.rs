@@ -1389,6 +1389,109 @@ fn mounts_parse_config_and_secret_sources() {
 }
 
 #[test]
+fn storage_mount_source_parses_for_storage_slots() {
+    let manifest: Manifest = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [
+              { path: "/var/lib/app", from: "slots.state" },
+            ]
+          },
+          slots: {
+            state: { kind: "storage" },
+          },
+        }
+        "#
+    .parse()
+    .unwrap();
+
+    let program = manifest.program.as_ref().expect("program");
+    assert_eq!(program.mounts().len(), 1);
+    assert_eq!(program.mounts()[0].source.to_string(), "slots.state");
+}
+
+#[test]
+fn storage_mount_rejects_unknown_slot() {
+    let err = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [
+              { path: "/var/lib/app", from: "slots.state" },
+            ]
+          }
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    match err {
+        Error::UnknownMountSlot { slot } => assert_eq!(slot, "state"),
+        other => panic!("expected UnknownMountSlot error, got: {other}"),
+    }
+}
+
+#[test]
+fn storage_mount_rejects_non_storage_slot() {
+    let err = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [
+              { path: "/var/lib/app", from: "slots.api" },
+            ]
+          },
+          slots: {
+            api: { kind: "http" },
+          },
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    match err {
+        Error::MountSlotRequiresStorage { slot, kind } => {
+            assert_eq!(slot, "api");
+            assert_eq!(kind, CapabilityKind::Http);
+        }
+        other => panic!("expected MountSlotRequiresStorage error, got: {other}"),
+    }
+}
+
+#[test]
+fn storage_provide_is_rejected() {
+    let err = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+          },
+          provides: {
+            state: { kind: "storage", endpoint: "ignored" },
+          },
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    match err {
+        Error::UnsupportedProvideKind { name, kind } => {
+            assert_eq!(name, "state");
+            assert_eq!(kind, CapabilityKind::Storage);
+        }
+        other => panic!("expected UnsupportedProvideKind error, got: {other}"),
+    }
+}
+
+#[test]
 fn framework_docker_mount_requires_experimental_feature() {
     let err = r#"
         {

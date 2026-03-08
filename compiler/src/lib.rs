@@ -30,6 +30,7 @@ mod mir;
 mod provenance;
 mod slot_query;
 mod slot_validation;
+mod storage_plan;
 mod store;
 mod targets;
 

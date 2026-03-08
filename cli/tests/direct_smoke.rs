@@ -128,6 +128,30 @@ mod linux_direct_smoke {
         false
     }
 
+    fn fetch_http_body(port: u16, path: &str) -> Option<String> {
+        let mut stream = TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port))).ok()?;
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let request =
+            format!("GET /{path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).ok()?;
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).ok()?;
+        let response = String::from_utf8_lossy(&buf);
+        let (_, body) = response.split_once("\r\n\r\n")?;
+        Some(body.trim().to_string())
+    }
+
+    fn wait_for_body(port: u16, path: &str, expected: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if fetch_http_body(port, path).as_deref() == Some(expected) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(150));
+        }
+        panic!("did not observe {path}={expected} on 127.0.0.1:{port}");
+    }
+
     fn wait_for_exit(
         child: &mut std::process::Child,
         timeout: Duration,
@@ -183,9 +207,19 @@ mod linux_direct_smoke {
         runtime_bin_dir: &Path,
         extra_env: &[(&str, &str)],
     ) -> std::process::Child {
+        spawn_amber_run_with_args(direct_out, runtime_bin_dir, &[], extra_env)
+    }
+
+    fn spawn_amber_run_with_args(
+        direct_out: &Path,
+        runtime_bin_dir: &Path,
+        extra_args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> std::process::Child {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_amber"));
         cmd.arg("run")
             .arg(direct_out)
+            .args(extra_args)
             .env("AMBER_RUNTIME_BIN_DIR", runtime_bin_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -529,6 +563,170 @@ mod linux_direct_smoke {
 
     #[test]
     #[ignore = "requires local runtime binaries and spawns direct processes"]
+    fn direct_smoke_storage_persists_across_upgrade() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let workspace_root = workspace_root();
+
+        let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+        fs::create_dir_all(&outputs_root).expect("failed to create outputs root");
+        let temp = tempfile::Builder::new()
+            .prefix("direct-storage-upgrade-smoke-")
+            .tempdir_in(&outputs_root)
+            .expect("failed to create temp test dir");
+
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("failed to create bin directory");
+        let script = bin_dir.join("serve-state.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+set -eu
+version="$1"
+initial_state="$2"
+mkdir -p /var/lib/app /tmp/www
+if [ ! -f /var/lib/app/state.txt ]; then
+  printf '%s\n' "$initial_state" >/var/lib/app/state.txt
+fi
+printf '%s\n' "$version" >/tmp/www/version.txt
+cp /var/lib/app/state.txt /tmp/www/state.txt
+exec python3 -m http.server 8080 --bind 127.0.0.1 -d /tmp/www
+"#,
+        )
+        .expect("failed to write storage script");
+        let mut perms = fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).expect("chmod script");
+
+        let child_path = temp.path().join("app.json5");
+        let root_path = temp.path().join("scenario.json5");
+        fs::write(
+            &root_path,
+            r##"{
+  manifest_version: "0.1.0",
+  slots: {
+    state: { kind: "storage" },
+  },
+  components: {
+    app: "./app.json5",
+  },
+  bindings: [
+    { to: "#app.state", from: "self.state" },
+  ],
+  exports: {
+    http: "#app.http",
+  },
+}
+"##,
+        )
+        .expect("failed to write root manifest");
+
+        let write_child = |version: &str, initial_state: &str| {
+            fs::write(
+                &child_path,
+                format!(
+                    r#"{{
+  manifest_version: "0.1.0",
+  slots: {{
+    state: {{ kind: "storage" }},
+  }},
+  program: {{
+    path: "./bin/serve-state.sh",
+    args: ["{version}", "{initial_state}"],
+    mounts: [
+      {{ path: "/var/lib/app", from: "slots.state" }},
+    ],
+    network: {{
+      endpoints: [
+        {{ name: "http", port: 8080, protocol: "http" }},
+      ],
+    }},
+  }},
+  provides: {{
+    http: {{ kind: "http", endpoint: "http" }},
+  }},
+  exports: {{
+    http: "http",
+  }},
+}}
+"#
+                ),
+            )
+            .expect("failed to write child manifest");
+        };
+
+        let direct_out = temp.path().join("out");
+        let storage_root = temp.path().join("persistent-state");
+        let runtime_bin_dir = ensure_runtime_binaries_built(&workspace_root);
+
+        write_child("version-v1", "persisted-v1");
+        compile_direct_or_panic(&direct_out, &root_path);
+
+        let storage_root_arg = storage_root.to_string_lossy().into_owned();
+        let mut amber_run = spawn_amber_run_with_args(
+            &direct_out,
+            runtime_bin_dir.as_path(),
+            &["--storage-root", storage_root_arg.as_str()],
+            &[],
+        );
+        let export_port = pick_free_port();
+        let mut proxy = spawn_amber_proxy(&direct_out, "http", export_port);
+        assert_http_reachable_or_dump(
+            &mut amber_run,
+            &mut proxy,
+            export_port,
+            "direct storage server v1",
+        );
+        wait_for_body(
+            export_port,
+            "version.txt",
+            "version-v1",
+            Duration::from_secs(20),
+        );
+        wait_for_body(
+            export_port,
+            "state.txt",
+            "persisted-v1",
+            Duration::from_secs(20),
+        );
+        shutdown_direct_runtime(&mut amber_run, &mut proxy);
+
+        write_child("version-v2", "persisted-v2");
+        compile_direct_or_panic(&direct_out, &root_path);
+
+        let mut amber_run = spawn_amber_run_with_args(
+            &direct_out,
+            runtime_bin_dir.as_path(),
+            &["--storage-root", storage_root_arg.as_str()],
+            &[],
+        );
+        let export_port = pick_free_port();
+        let mut proxy = spawn_amber_proxy(&direct_out, "http", export_port);
+        assert_http_reachable_or_dump(
+            &mut amber_run,
+            &mut proxy,
+            export_port,
+            "direct storage server v2",
+        );
+        wait_for_body(
+            export_port,
+            "version.txt",
+            "version-v2",
+            Duration::from_secs(20),
+        );
+        wait_for_body(
+            export_port,
+            "state.txt",
+            "persisted-v1",
+            Duration::from_secs(20),
+        );
+        shutdown_direct_runtime(&mut amber_run, &mut proxy);
+    }
+
+    #[test]
+    #[ignore = "requires local runtime binaries and spawns direct processes"]
     fn direct_smoke_does_not_leak_host_env_into_component() {
         let workspace_root = workspace_root();
 
@@ -724,7 +922,9 @@ fn direct_smoke_macos_via_docker_desktop_linux_vm() {
              --profile minimal >/tmp/rustup-install.log\nrustup default nightly-2025-10-30 \
              >/tmp/rustup-default.log\nrustup component add rustfmt clippy \
              >/tmp/rustup-components.log\ncargo test -p amber-cli --all-features \
-             direct_smoke_python_http_server_starts_and_stops -- --ignored --nocapture",
+             direct_smoke_python_http_server_starts_and_stops -- --ignored --nocapture\ncargo \
+             test -p amber-cli --all-features direct_smoke_storage_persists_across_upgrade -- \
+             --ignored --nocapture",
         )
         .stdin(Stdio::from(
             archive

@@ -1817,6 +1817,81 @@ async fn external_root_slot_requires_weak_binding() {
 }
 
 #[tokio::test]
+async fn external_root_storage_slot_allows_strong_binding() {
+    let dir = tmp_dir("external-root-storage-slot-strong");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "busybox:1.36.1",
+            entrypoint: ["sh", "-lc", "test -d /var/lib/app && sleep 3600"],
+            mounts: [
+              { path: "/var/lib/app", from: "slots.state" },
+            ],
+          },
+          slots: {
+            state: { kind: "storage" },
+          },
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              slots: {{ state: {{ kind: "storage" }} }},
+              components: {{ child: "{child}" }},
+              bindings: [
+                {{ to: "#child.state", from: "self.state" }}
+              ]
+            }}
+            "##,
+            child = file_url(&child_path),
+        ),
+    );
+
+    let compiler = default_compiler();
+    let root_ref = manifest_ref_for_path(&root_path);
+    let output = compiler
+        .compile(root_ref, standard_compile_options())
+        .await
+        .expect("compile storage scenario");
+
+    let scenario = &output.scenario;
+    let child_id = scenario
+        .components_iter()
+        .find(|(_, c)| c.moniker.as_str() == "/child")
+        .map(|(id, _)| id)
+        .expect("child component");
+    let binding = scenario
+        .bindings
+        .iter()
+        .find(|b| b.to.component == child_id && b.to.name == "state")
+        .expect("binding to child.state");
+
+    assert!(
+        !binding.weak,
+        "storage bindings should remain strong when routed from a root storage slot"
+    );
+    assert!(
+        matches!(
+            &binding.from,
+            BindingFrom::External(slot)
+                if slot.component == scenario.root && slot.name == "state"
+        ),
+        "expected external binding from root.state, got {:?}",
+        binding.from
+    );
+}
+
+#[tokio::test]
 async fn exporting_unbound_optional_slot_errors() {
     let dir = tmp_dir("scenario-export-unbound-slot");
     let root_path = dir.path().join("root.json5");

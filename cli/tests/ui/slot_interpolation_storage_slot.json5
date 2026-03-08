@@ -1,0 +1,13 @@
+{
+  manifest_version: "0.1.0",
+  slots: {
+    state: { kind: "storage" },
+  },
+  program: {
+    image: "x",
+    entrypoint: ["x"],
+    env: {
+      STATE_URL: "${slots.state.url}",
+    },
+  },
+}

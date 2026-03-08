@@ -21,6 +21,7 @@ use crate::{
         CompiledScenario, Reporter, ReporterError,
         execution_guide::{GENERATED_README_FILENAME, build_execution_guide},
     },
+    storage_plan::build_storage_plan,
     targets::{
         mesh::{
             addressing::{
@@ -81,6 +82,7 @@ const OTELCOL_UPSTREAM_ENV: &str = "AMBER_OTEL_UPSTREAM_OTLP_HTTP_ENDPOINT";
 const OTELCOL_DEFAULT_UPSTREAM_ENDPOINT: &str = "http://host.docker.internal:18890";
 const DEFAULT_OTELCOL_IMAGE: &str = "otel/opentelemetry-collector-contrib:0.143.0";
 const ROUTER_OTLP_ENDPOINT: &str = "http://amber-otelcol:4318";
+const DEFAULT_STORAGE_REQUEST: &str = "1Gi";
 const OTELCOL_SERVICE_ACCOUNT: &str = "amber-otelcol";
 const OTELCOL_ROLE_NAME: &str = "amber-otelcol";
 const OTELCOL_ROLE_BINDING_NAME: &str = "amber-otelcol";
@@ -212,6 +214,8 @@ fn render_kubernetes(
                 netpol: format!("{base}-netpol"),
             }
         });
+    let root_manifest = mesh_plan.root_manifest.as_ref();
+    let provisioner_job_name = provisioner_job_name(&scenario_digest);
     let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
 
     let slot_ports_by_component = allocate_slot_ports(s, program_components)
@@ -249,7 +253,7 @@ fn render_kubernetes(
         .unwrap_or(ROUTER_MESH_PORT_BASE);
     let mesh_addressing = ServiceMeshAddressing::new(
         &names,
-        Some(namespace.as_str()),
+        None,
         &mesh_ports_by_component,
         ROUTER_NAME,
         router_mesh_port,
@@ -270,11 +274,11 @@ fn render_kubernetes(
         &names,
         |cnames: &ComponentNames| MeshProvisionOutput::KubernetesSecret {
             name: mesh_secret_name(&cnames.service),
-            namespace: Some(namespace.clone()),
+            namespace: None,
         },
         || MeshProvisionOutput::KubernetesSecret {
             name: mesh_secret_name(ROUTER_NAME),
-            namespace: Some(namespace.clone()),
+            namespace: None,
         },
         |router_config| {
             if let Some(control_listen) = router_config.control_listen {
@@ -305,6 +309,9 @@ fn render_kubernetes(
         &address_plan.binding_values_by_component,
     )
     .map_err(|e| ReporterError::new(e.to_string()))?;
+    let storage_plan =
+        build_storage_plan(s, program_components).map_err(|e| ReporterError::new(e.to_string()))?;
+    let scenario_digest_label = encode_scenario_digest(&scenario_digest);
     let scenario_labels = |extra: &[(&str, &str)]| -> BTreeMap<String, String> {
         let mut labels = BTreeMap::new();
         labels.insert(
@@ -312,8 +319,8 @@ fn render_kubernetes(
             "amber".to_string(),
         );
         labels.insert(
-            "amber.io/scenario".to_string(),
-            sanitize_label_value(&namespace),
+            "amber.io/revision".to_string(),
+            sanitize_label_value(&scenario_digest_label),
         );
         for (k, v) in extra {
             labels.insert(k.to_string(), v.to_string());
@@ -349,9 +356,6 @@ fn render_kubernetes(
     // ---- Generate resources ----
 
     let mut files: BTreeMap<PathBuf, String> = BTreeMap::new();
-
-    let ns = Namespace::new(&namespace, scenario_labels(&[]));
-    files.insert(PathBuf::from("00-namespace.yaml"), to_yaml(&ns)?);
 
     let otelcol_config = ConfigMap::new(
         OTELCOL_CONFIGMAP_NAME,
@@ -390,7 +394,7 @@ fn render_kubernetes(
         Subject {
             kind: "ServiceAccount".to_string(),
             name: OTELCOL_SERVICE_ACCOUNT.to_string(),
-            namespace: Some(namespace.clone()),
+            namespace: None,
         },
         RoleRef {
             api_group: "rbac.authorization.k8s.io".to_string(),
@@ -409,7 +413,7 @@ fn render_kubernetes(
         command: Vec::new(),
         args: vec![format!("--config={OTELCOL_CONFIG_PATH}")],
         env: vec![
-            EnvVar::literal(SCENARIO_RUN_ID_ENV, &namespace),
+            EnvVar::from_field_ref(SCENARIO_RUN_ID_ENV, "metadata.namespace"),
             EnvVar::literal(OTELCOL_UPSTREAM_ENV, OTELCOL_DEFAULT_UPSTREAM_ENDPOINT),
         ],
         env_from: Vec::new(),
@@ -450,7 +454,6 @@ fn render_kubernetes(
         kind: "DaemonSet",
         metadata: ObjectMeta {
             name: OTELCOL_NAME.to_string(),
-            namespace: Some(namespace.clone()),
             labels: otelcol_labels.clone(),
             ..Default::default()
         },
@@ -553,7 +556,7 @@ fn render_kubernetes(
         if !secret_leaves.is_empty() {
             kustomization.secret_generator.push(SecretGenerator {
                 name: ROOT_CONFIG_SECRET_NAME.to_string(),
-                namespace: Some(namespace.clone()),
+                namespace: None,
                 env_files: vec!["root-config-secret.env".to_string()],
                 literals: Vec::new(),
                 options: Some(GeneratorOptions {
@@ -574,7 +577,7 @@ fn render_kubernetes(
         if !config_leaves.is_empty() {
             kustomization.config_map_generator.push(ConfigMapGenerator {
                 name: ROOT_CONFIG_CONFIGMAP_NAME.to_string(),
-                namespace: Some(namespace.clone()),
+                namespace: None,
                 env_files: vec!["root-config.env".to_string()],
                 literals: Vec::new(),
                 options: Some(GeneratorOptions {
@@ -598,7 +601,7 @@ fn render_kubernetes(
     if needs_router && !router_env_passthrough.is_empty() {
         kustomization.secret_generator.push(SecretGenerator {
             name: ROUTER_EXTERNAL_SECRET_NAME.to_string(),
-            namespace: Some(namespace.clone()),
+            namespace: None,
             env_files: vec![DEFAULT_EXTERNAL_ENV_FILE.to_string()],
             literals: Vec::new(),
             options: Some(GeneratorOptions {
@@ -632,11 +635,21 @@ fn render_kubernetes(
         let c = s.component(*id);
         let cnames = names.get(id).unwrap();
         let labels = component_labels(*id, &cnames.service);
+        let storage_mounts = storage_plan
+            .mounts_by_component
+            .get(id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let workload_kind = if storage_mounts.is_empty() {
+            "Deployment"
+        } else {
+            "StatefulSet"
+        };
         let program = c.program.as_ref().unwrap();
         let program_plan = program_plans.get(id).unwrap();
         let mesh_port = *mesh_ports_by_component.get(id).expect("mesh port missing");
         let label = component_label(s, *id);
-        let pod_annotations = component_pod_annotations(&namespace, &label);
+        let pod_annotations = component_pod_annotations(&label);
         let image_origin = program_plan.image_origin().ok_or_else(|| {
             ReporterError::new(format!(
                 "internal error: {} is missing a container image origin",
@@ -679,7 +692,7 @@ fn render_kubernetes(
             }
         }
 
-        let (container, mut volumes) = match runtime_plan.execution {
+        let (mut container, mut volumes) = match runtime_plan.execution {
             ComponentExecutionPlan::Resolved { entrypoint, env } => {
                 // Helper-free execution: entrypoint and env are already fully resolved,
                 // so we don't need AMBER_CONFIG_* env vars here.
@@ -690,12 +703,7 @@ fn render_kubernetes(
                     .component_configs
                     .get(id)
                     .and_then(|cfg| cfg.identity.mesh_scope.as_deref());
-                push_program_observability_env(
-                    &mut container_env,
-                    &label,
-                    scenario_scope,
-                    &namespace,
-                );
+                push_program_observability_env(&mut container_env, &label, scenario_scope);
 
                 let container = Container {
                     name: "main".to_string(),
@@ -760,15 +768,38 @@ fn render_kubernetes(
                     .component_configs
                     .get(id)
                     .and_then(|cfg| cfg.identity.mesh_scope.as_deref());
-                push_program_observability_env(
-                    &mut container_env,
-                    &label,
-                    scenario_scope,
-                    &namespace,
-                );
+                push_program_observability_env(&mut container_env, &label, scenario_scope);
                 build_helper_runner_container(program_image.clone(), ports, container_env)
             }
         };
+        let mut storage_claim_templates = BTreeMap::new();
+        for storage_mount in storage_mounts {
+            let claim_name = storage_claim_name(storage_mount.identity.root_slot.as_str());
+            storage_claim_templates
+                .entry(claim_name.clone())
+                .or_insert_with(|| PersistentVolumeClaim {
+                    api_version: "v1",
+                    kind: "PersistentVolumeClaim",
+                    metadata: ObjectMeta {
+                        name: claim_name.clone(),
+                        ..Default::default()
+                    },
+                    spec: PersistentVolumeClaimSpec {
+                        access_modes: vec!["ReadWriteOnce".to_string()],
+                        resources: VolumeResourceRequirements {
+                            requests: BTreeMap::from([(
+                                "storage".to_string(),
+                                DEFAULT_STORAGE_REQUEST.to_string(),
+                            )]),
+                        },
+                    },
+                });
+            container.volume_mounts.push(VolumeMount {
+                name: claim_name,
+                mount_path: storage_mount.mount_path.clone(),
+                read_only: None,
+            });
+        }
         let mesh_secret = mesh_secret_name(&cnames.service);
         volumes.push(Volume::secret(
             MESH_SECRET_VOLUME_NAME.to_string(),
@@ -784,7 +815,7 @@ fn render_kubernetes(
                 "AMBER_ROUTER_IDENTITY_PATH",
                 format!("{MESH_CONFIG_DIR}/{MESH_IDENTITY_FILENAME}"),
             ),
-            EnvVar::literal(SCENARIO_RUN_ID_ENV, &namespace),
+            EnvVar::from_field_ref(SCENARIO_RUN_ID_ENV, "metadata.namespace"),
             EnvVar::literal("OTEL_TRACES_SAMPLER", "always_on"),
             EnvVar::literal("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf"),
             EnvVar::literal("OTEL_EXPORTER_OTLP_ENDPOINT", ROUTER_OTLP_ENDPOINT),
@@ -826,7 +857,7 @@ fn render_kubernetes(
                 },
                 targets: vec![ReplacementTarget {
                     select: ReplacementSelect {
-                        kind: "Deployment".to_string(),
+                        kind: workload_kind.to_string(),
                         name: cnames.service.clone(),
                     },
                     field_paths: vec![
@@ -867,11 +898,9 @@ fn render_kubernetes(
                 command: vec![
                     "/bin/sh".to_string(),
                     "-c".to_string(),
-                    format!(
-                        "RESPONSE=$(nc amber-netpol-client.{} 8080 </dev/null 2>/dev/null); [ \
-                         \"$RESPONSE\" = \"ready\" ] && echo 'NetworkPolicy enforcement verified'",
-                        namespace
-                    ),
+                    "RESPONSE=$(nc amber-netpol-client 8080 </dev/null 2>/dev/null); [ \
+                     \"$RESPONSE\" = \"ready\" ] && echo 'NetworkPolicy enforcement verified'"
+                        .to_string(),
                 ],
                 args: Vec::new(),
                 env: Vec::new(),
@@ -891,39 +920,79 @@ fn render_kubernetes(
             restart_policy: None,
         };
 
-        let deployment = Deployment {
-            api_version: "apps/v1",
-            kind: "Deployment",
-            metadata: ObjectMeta {
-                name: cnames.service.clone(),
-                namespace: Some(namespace.clone()),
-                labels: labels.clone(),
-                ..Default::default()
-            },
-            spec: DeploymentSpec {
-                replicas: 1,
-                selector: LabelSelector {
-                    match_labels: {
-                        let mut m = BTreeMap::new();
-                        m.insert("amber.io/component".to_string(), cnames.service.clone());
-                        m
-                    },
-                },
-                template: PodTemplateSpec {
-                    metadata: ObjectMeta {
-                        labels: labels.clone(),
-                        annotations: pod_annotations,
-                        ..Default::default()
-                    },
-                    spec: pod_spec,
-                },
-            },
+        let selector = {
+            let mut m = BTreeMap::new();
+            m.insert("amber.io/component".to_string(), cnames.service.clone());
+            m
         };
 
-        files.insert(
-            PathBuf::from(format!("03-deployments/{}.yaml", cnames.service)),
-            to_yaml(&deployment)?,
-        );
+        if storage_claim_templates.is_empty() {
+            let deployment = Deployment {
+                api_version: "apps/v1",
+                kind: "Deployment",
+                metadata: ObjectMeta {
+                    name: cnames.service.clone(),
+                    labels: labels.clone(),
+                    ..Default::default()
+                },
+                spec: DeploymentSpec {
+                    replicas: 1,
+                    selector: LabelSelector {
+                        match_labels: selector,
+                    },
+                    template: PodTemplateSpec {
+                        metadata: ObjectMeta {
+                            labels: labels.clone(),
+                            annotations: pod_annotations,
+                            ..Default::default()
+                        },
+                        spec: pod_spec,
+                    },
+                },
+            };
+
+            files.insert(
+                PathBuf::from(format!("03-deployments/{}.yaml", cnames.service)),
+                to_yaml(&deployment)?,
+            );
+        } else {
+            let stateful_set = StatefulSet {
+                api_version: "apps/v1",
+                kind: "StatefulSet",
+                metadata: ObjectMeta {
+                    name: cnames.service.clone(),
+                    labels: labels.clone(),
+                    ..Default::default()
+                },
+                spec: StatefulSetSpec {
+                    service_name: cnames.service.clone(),
+                    replicas: 1,
+                    selector: LabelSelector {
+                        match_labels: selector,
+                    },
+                    template: PodTemplateSpec {
+                        metadata: ObjectMeta {
+                            labels: labels.clone(),
+                            annotations: pod_annotations,
+                            ..Default::default()
+                        },
+                        spec: pod_spec,
+                    },
+                    volume_claim_templates: storage_claim_templates.into_values().collect(),
+                    persistent_volume_claim_retention_policy: Some(
+                        PersistentVolumeClaimRetentionPolicy {
+                            when_deleted: "Retain",
+                            when_scaled: "Retain",
+                        },
+                    ),
+                },
+            };
+
+            files.insert(
+                PathBuf::from(format!("03-statefulsets/{}.yaml", cnames.service)),
+                to_yaml(&stateful_set)?,
+            );
+        }
     }
 
     if needs_router {
@@ -936,7 +1005,10 @@ fn render_kubernetes(
             "AMBER_ROUTER_IDENTITY_PATH",
             format!("{MESH_CONFIG_DIR}/{MESH_IDENTITY_FILENAME}"),
         ));
-        env.push(EnvVar::literal(SCENARIO_RUN_ID_ENV, &namespace));
+        env.push(EnvVar::from_field_ref(
+            SCENARIO_RUN_ID_ENV,
+            "metadata.namespace",
+        ));
         env.push(EnvVar::literal("OTEL_TRACES_SAMPLER", "always_on"));
         env.push(EnvVar::literal(
             "OTEL_EXPORTER_OTLP_PROTOCOL",
@@ -987,7 +1059,6 @@ fn render_kubernetes(
             kind: "Deployment",
             metadata: ObjectMeta {
                 name: ROUTER_NAME.to_string(),
-                namespace: Some(namespace.clone()),
                 labels: router_labels.clone(),
                 ..Default::default()
             },
@@ -1395,7 +1466,7 @@ fn render_kubernetes(
             Subject {
                 kind: "ServiceAccount".to_string(),
                 name: PROVISIONER_SERVICE_ACCOUNT.to_string(),
-                namespace: Some(namespace.clone()),
+                namespace: None,
             },
             RoleRef {
                 api_group: "rbac.authorization.k8s.io".to_string(),
@@ -1430,7 +1501,7 @@ fn render_kubernetes(
         };
 
         let job = Job::new_with_backoff_limit(
-            PROVISIONER_NAME,
+            &provisioner_job_name,
             &namespace,
             scenario_labels(&[("amber.io/type", "provisioner")]),
             PodTemplateSpec {
@@ -1452,6 +1523,8 @@ fn render_kubernetes(
             },
             Some(PROVISIONER_JOB_BACKOFF_LIMIT),
         );
+        let mut job = job;
+        job.spec.ttl_seconds_after_finished = Some(300);
         files.insert(
             PathBuf::from("02-rbac/amber-provisioner-job.yaml"),
             to_yaml(&job)?,
@@ -1476,16 +1549,33 @@ fn render_kubernetes(
         files.insert(PathBuf::from(PROXY_METADATA_FILENAME), proxy_json);
     }
 
-    let execution_guide = build_execution_guide(s, &mesh_plan, &config_plan)?;
-    let mut rollout_deployments: Vec<String> =
-        names.values().map(|names| names.service.clone()).collect();
+    let execution_guide = build_execution_guide(
+        &output.scenario,
+        &mesh_plan,
+        &config_plan,
+        !storage_plan.is_empty(),
+    )?;
+    let mut rollout_commands: Vec<String> = program_components
+        .iter()
+        .map(|id| {
+            let service = &names.get(id).expect("component names").service;
+            let workload = if storage_plan.mounts_by_component.contains_key(id) {
+                "statefulset"
+            } else {
+                "deploy"
+            };
+            format!("kubectl -n {namespace} rollout status {workload}/{service}")
+        })
+        .collect();
     if needs_router {
-        rollout_deployments.push(ROUTER_NAME.to_string());
+        rollout_commands.push(format!(
+            "kubectl -n {namespace} rollout status deploy/{ROUTER_NAME}"
+        ));
     }
-    rollout_deployments.sort();
+    rollout_commands.sort();
     files.insert(
         PathBuf::from(GENERATED_README_FILENAME),
-        execution_guide.render_kubernetes_readme(&namespace, &rollout_deployments, needs_router),
+        execution_guide.render_kubernetes_readme(&namespace, &rollout_commands, needs_router),
     );
 
     // Always generate kustomization.yaml for consistency, even if not using helper mode.
@@ -1618,11 +1708,11 @@ service:
     )
 }
 
-fn component_pod_annotations(namespace: &str, component_moniker: &str) -> BTreeMap<String, String> {
+fn component_pod_annotations(component_moniker: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
         (
             "resource.opentelemetry.io/service.name".to_string(),
-            kubernetes_component_service_name(namespace, component_moniker),
+            kubernetes_component_service_name(component_moniker),
         ),
         (
             "amber.io/component-moniker".to_string(),
@@ -1631,11 +1721,8 @@ fn component_pod_annotations(namespace: &str, component_moniker: &str) -> BTreeM
     ])
 }
 
-fn kubernetes_component_service_name(namespace: &str, component_moniker: &str) -> String {
-    format!(
-        "amber.{namespace}.{}",
-        sanitize_component_moniker(component_moniker)
-    )
+fn kubernetes_component_service_name(component_moniker: &str) -> String {
+    format!("amber.{}", sanitize_component_moniker(component_moniker))
 }
 
 fn sanitize_component_moniker(component_moniker: &str) -> String {
@@ -1651,9 +1738,11 @@ fn push_program_observability_env(
     env: &mut Vec<EnvVar>,
     component_moniker: &str,
     scenario_scope: Option<&str>,
-    scenario_run_id: &str,
 ) {
-    env.push(EnvVar::literal(SCENARIO_RUN_ID_ENV, scenario_run_id));
+    env.push(EnvVar::from_field_ref(
+        SCENARIO_RUN_ID_ENV,
+        "metadata.namespace",
+    ));
     env.push(EnvVar::literal("OTEL_TRACES_SAMPLER", "always_on"));
     env.push(EnvVar::literal(
         "OTEL_EXPORTER_OTLP_PROTOCOL",
@@ -1813,6 +1902,11 @@ fn encode_scenario_digest(digest: &[u8; 32]) -> String {
     format!("sha256:{encoded}")
 }
 
+fn provisioner_job_name(digest: &[u8; 32]) -> String {
+    let digest_hex: String = digest[..4].iter().map(|b| format!("{:02x}", b)).collect();
+    truncate_dns_name(&format!("{PROVISIONER_NAME}-{digest_hex}"), 63)
+}
+
 fn generate_namespace_name(s: &Scenario, scenario_digest: &[u8; 32]) -> String {
     let root = s.component(s.root);
     let short_name = root
@@ -1885,6 +1979,10 @@ fn sanitize_label_value(s: &str) -> String {
         }
     }
     truncate_dns_name(&out, 63)
+}
+
+fn storage_claim_name(root_slot: &str) -> String {
+    truncate_dns_name(&format!("storage-{}", sanitize_dns_name(root_slot)), 63)
 }
 
 fn sanitize_port_name(s: &str) -> String {
@@ -1993,7 +2091,6 @@ fn generate_netpol_enforcement_check(
         kind: "Deployment",
         metadata: ObjectMeta {
             name: "amber-netpol-server".to_string(),
-            namespace: Some(namespace.to_string()),
             labels: server_labels.clone(),
             ..Default::default()
         },
@@ -2095,7 +2192,6 @@ fn generate_netpol_enforcement_check(
         kind: "NetworkPolicy",
         metadata: ObjectMeta {
             name: "amber-netpol-deny-blocked".to_string(),
-            namespace: Some(namespace.to_string()),
             labels: check_labels.clone(),
             ..Default::default()
         },
@@ -2178,7 +2274,6 @@ while true; do echo "ready" | nc -l -p 8080 >/dev/null; done
         kind: "Deployment",
         metadata: ObjectMeta {
             name: "amber-netpol-client".to_string(),
-            namespace: Some(namespace.to_string()),
             labels: client_labels.clone(),
             ..Default::default()
         },

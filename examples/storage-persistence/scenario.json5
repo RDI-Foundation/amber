@@ -1,0 +1,22 @@
+{
+  manifest_version: "0.1.0",
+  slots: {
+    // Root storage slots are the external edge where the backend gets real persistence from.
+    app_state: { kind: "storage" },
+  },
+  components: {
+    app: {
+      manifest: "./app.json5",
+      config: {
+        version: "v1",
+        initial_state: "seeded by v1",
+      },
+    },
+  },
+  bindings: [
+    { to: "#app.state", from: "self.app_state" },
+  ],
+  exports: {
+    http: "#app.http",
+  },
+}

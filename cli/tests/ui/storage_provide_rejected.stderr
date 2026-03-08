@@ -1,0 +1,14 @@
+Error: manifest::unsupported_provide_kind
+
+  × check failed
+  ╰─▶ provide `state` cannot use capability kind `storage`
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/storage_provide_rejected.json5:8:20]
+ 7 │   provides: {
+ 8 │     state: { kind: "storage", endpoint: "ignored" },
+   ·                    ────┬────
+   ·                        ╰── unsupported provide kind here
+ 9 │   },
+   ╰────
+  help: Storage is routed through `slots` and `bindings`, not `provides`.
+        Declare `slots.state: { kind: "storage" }` and bind it from the parent
+        instead.
