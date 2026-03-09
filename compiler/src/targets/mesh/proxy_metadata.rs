@@ -70,7 +70,7 @@ pub fn collect_exports_metadata(
     router_mesh_port: u16,
 ) -> BTreeMap<String, ExportMetadata> {
     let mut exports = BTreeMap::new();
-    for ex in &mesh_plan.exports {
+    for ex in mesh_plan.exports() {
         exports.insert(
             ex.name.clone(),
             ExportMetadata {
@@ -90,7 +90,7 @@ pub fn collect_external_slot_metadata(
 ) -> BTreeMap<String, ExternalSlotMetadata> {
     let root_component = scenario.component(scenario.root);
     let mut external_slot_names = BTreeSet::new();
-    for binding in &mesh_plan.external_bindings {
+    for binding in mesh_plan.external_bindings() {
         external_slot_names.insert(binding.external_slot.clone());
     }
 

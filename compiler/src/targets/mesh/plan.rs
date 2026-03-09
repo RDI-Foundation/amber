@@ -15,16 +15,53 @@ pub(crate) struct MeshOptions {
 
 #[derive(Clone, Debug)]
 pub(crate) struct MeshPlan {
-    pub(crate) program_components: Vec<ComponentId>,
-    pub(crate) bindings: Vec<ResolvedBinding>,
-    pub(crate) external_bindings: Vec<ResolvedExternalBinding>,
-    pub(crate) framework_bindings: Vec<ResolvedFrameworkBinding>,
-    pub(crate) exports: Vec<ResolvedExport>,
-    pub(crate) strong_deps: HashMap<ComponentId, BTreeSet<ComponentId>>,
+    program_components: Vec<ComponentId>,
+    bindings: Vec<ResolvedBinding>,
+    exports: Vec<ResolvedExport>,
+    strong_deps: HashMap<ComponentId, BTreeSet<ComponentId>>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ResolvedBinding {
+pub(crate) enum ResolvedBinding {
+    Component(ResolvedComponentBinding),
+    External(ResolvedExternalBinding),
+    Framework(ResolvedFrameworkBinding),
+}
+
+impl ResolvedBinding {
+    pub(crate) fn consumer(&self) -> ComponentId {
+        match self {
+            Self::Component(binding) => binding.consumer,
+            Self::External(binding) => binding.consumer,
+            Self::Framework(binding) => binding.consumer,
+        }
+    }
+
+    pub(crate) fn slot(&self) -> &str {
+        match self {
+            Self::Component(binding) => &binding.slot,
+            Self::External(binding) => &binding.slot,
+            Self::Framework(binding) => &binding.slot,
+        }
+    }
+
+    pub(crate) fn as_component(&self) -> Option<&ResolvedComponentBinding> {
+        match self {
+            Self::Component(binding) => Some(binding),
+            Self::External(_) | Self::Framework(_) => None,
+        }
+    }
+
+    pub(crate) fn as_external(&self) -> Option<&ResolvedExternalBinding> {
+        match self {
+            Self::External(binding) => Some(binding),
+            Self::Component(_) | Self::Framework(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedComponentBinding {
     pub(crate) provider: ComponentId,
     pub(crate) consumer: ComponentId,
     pub(crate) provide: String,
@@ -58,6 +95,66 @@ pub(crate) struct ResolvedFrameworkBinding {
 pub(crate) struct EndpointInfo {
     pub(crate) port: u16,
     pub(crate) protocol: NetworkProtocol,
+}
+
+impl MeshPlan {
+    pub(crate) fn new(
+        program_components: Vec<ComponentId>,
+        bindings: Vec<ResolvedBinding>,
+        exports: Vec<ResolvedExport>,
+        strong_deps: HashMap<ComponentId, BTreeSet<ComponentId>>,
+    ) -> Self {
+        Self {
+            program_components,
+            bindings,
+            exports,
+            strong_deps,
+        }
+    }
+
+    pub(crate) fn program_components(&self) -> &[ComponentId] {
+        self.program_components.as_slice()
+    }
+
+    pub(crate) fn bindings(&self) -> &[ResolvedBinding] {
+        self.bindings.as_slice()
+    }
+
+    pub(crate) fn bindings_for_consumer(
+        &self,
+        consumer: ComponentId,
+    ) -> impl Iterator<Item = &ResolvedBinding> {
+        self.bindings
+            .iter()
+            .filter(move |binding| binding.consumer() == consumer)
+    }
+
+    pub(crate) fn component_bindings(&self) -> impl Iterator<Item = &ResolvedComponentBinding> {
+        self.bindings
+            .iter()
+            .filter_map(ResolvedBinding::as_component)
+    }
+
+    pub(crate) fn external_bindings(&self) -> impl Iterator<Item = &ResolvedExternalBinding> {
+        self.bindings
+            .iter()
+            .filter_map(ResolvedBinding::as_external)
+    }
+
+    pub(crate) fn needs_router(&self) -> bool {
+        self.bindings
+            .iter()
+            .any(|binding| binding.as_external().is_some())
+            || !self.exports.is_empty()
+    }
+
+    pub(crate) fn exports(&self) -> &[ResolvedExport] {
+        self.exports.as_slice()
+    }
+
+    pub(crate) fn strong_deps(&self) -> &HashMap<ComponentId, BTreeSet<ComponentId>> {
+        &self.strong_deps
+    }
 }
 
 pub(crate) fn build_mesh_plan(
@@ -126,9 +223,7 @@ pub(crate) fn build_mesh_plan(
             .insert(from.component);
     }
 
-    let mut bindings = Vec::new();
-    let mut external_bindings = Vec::new();
-    let mut framework_bindings = Vec::new();
+    let mut bindings = Vec::with_capacity(scenario.bindings.len());
     for binding in &scenario.bindings {
         if slot_kind(scenario, binding.to.component, &binding.to.name)
             == Some(CapabilityKind::Storage)
@@ -138,13 +233,13 @@ pub(crate) fn build_mesh_plan(
         match &binding.from {
             BindingFrom::Component(from) => {
                 let endpoint = resolve_provide_endpoint(scenario, from.component, &from.name)?;
-                bindings.push(ResolvedBinding {
+                bindings.push(ResolvedBinding::Component(ResolvedComponentBinding {
                     provider: from.component,
                     consumer: binding.to.component,
                     provide: from.name.clone(),
                     endpoint,
                     slot: binding.to.name.clone(),
-                });
+                }));
             }
             BindingFrom::Resource(resource) => {
                 return Err(MeshError::new(format!(
@@ -157,11 +252,11 @@ pub(crate) fn build_mesh_plan(
                 )));
             }
             BindingFrom::External(slot) => {
-                external_bindings.push(ResolvedExternalBinding {
+                bindings.push(ResolvedBinding::External(ResolvedExternalBinding {
                     consumer: binding.to.component,
                     slot: binding.to.name.clone(),
                     external_slot: slot.name.clone(),
-                });
+                }));
             }
             BindingFrom::Framework(name) => {
                 let Some(spec) = framework_capability(name.as_str()) else {
@@ -182,11 +277,11 @@ pub(crate) fn build_mesh_plan(
                         binding.to.name
                     )));
                 }
-                framework_bindings.push(ResolvedFrameworkBinding {
+                bindings.push(ResolvedBinding::Framework(ResolvedFrameworkBinding {
                     consumer: binding.to.component,
                     slot: binding.to.name.clone(),
                     capability: name.clone(),
-                });
+                }));
             }
         }
     }
@@ -202,14 +297,12 @@ pub(crate) fn build_mesh_plan(
         });
     }
 
-    Ok(MeshPlan {
+    Ok(MeshPlan::new(
         program_components,
         bindings,
-        external_bindings,
-        framework_bindings,
         exports,
         strong_deps,
-    })
+    ))
 }
 
 fn slot_kind(scenario: &Scenario, component: ComponentId, slot: &str) -> Option<CapabilityKind> {

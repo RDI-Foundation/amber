@@ -170,8 +170,8 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
         },
     )
     .map_err(|e| ReporterError::new(e.to_string()))?;
-    for component_id in &mesh_plan.program_components {
-        let component = s.component(*component_id);
+    for &component_id in mesh_plan.program_components() {
+        let component = s.component(component_id);
         let Some(program) = component.program.as_ref() else {
             continue;
         };
@@ -188,7 +188,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
     }
     let images = resolve_internal_images().map_err(ReporterError::new)?;
 
-    let program_components = mesh_plan.program_components.as_slice();
+    let program_components = mesh_plan.program_components();
     let namespace = generate_namespace_name(s, &scenario_digest);
 
     let names: HashMap<ComponentId, ComponentNames> =
@@ -200,7 +200,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
             }
         });
     let provisioner_job_name = provisioner_job_name(&scenario_digest);
-    let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
+    let needs_router = mesh_plan.needs_router();
 
     let route_ports =
         allocate_local_route_ports(s, &mesh_plan).map_err(|e| ReporterError::new(e.to_string()))?;
@@ -1290,7 +1290,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
             }
         }
 
-        if !mesh_plan.exports.is_empty() {
+        if !mesh_plan.exports().is_empty() {
             netpol.add_ingress_rule(NetworkPolicyIngressRule {
                 from: vec![NetworkPolicyPeer {
                     pod_selector: None,

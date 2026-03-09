@@ -7,8 +7,8 @@ use crate::{
     slot_query::{SlotObject, SlotValue},
     targets::mesh::{
         plan::{
-            MeshError, MeshPlan, ResolvedBinding, ResolvedExternalBinding,
-            ResolvedFrameworkBinding, component_label,
+            MeshError, MeshPlan, ResolvedBinding, ResolvedComponentBinding,
+            ResolvedExternalBinding, ResolvedFrameworkBinding, component_label,
         },
         ports::LocalRoutePorts,
     },
@@ -86,14 +86,19 @@ impl<'a> LocalAddressing<'a> {
         }
     }
 
-    fn local_binding_port(&self, binding: &ResolvedBinding) -> Result<u16, MeshError> {
-        self.route_ports.binding_port(binding).ok_or_else(|| {
-            MeshError::new(format!(
-                "internal error: missing local route port allocation for {}.{}",
-                component_label(self.scenario, binding.consumer),
-                binding.slot
-            ))
-        })
+    fn local_component_binding_port(
+        &self,
+        binding: &ResolvedComponentBinding,
+    ) -> Result<u16, MeshError> {
+        self.route_ports
+            .component_binding_port(binding)
+            .ok_or_else(|| {
+                MeshError::new(format!(
+                    "internal error: missing local route port allocation for {}.{}",
+                    component_label(self.scenario, binding.consumer),
+                    binding.slot
+                ))
+            })
     }
 
     fn local_external_binding_port(
@@ -137,7 +142,10 @@ impl<'a> LocalAddressing<'a> {
 pub(crate) trait Addressing {
     type Error: From<MeshError>;
 
-    fn resolve_binding_url(&mut self, binding: &ResolvedBinding) -> Result<String, Self::Error>;
+    fn resolve_component_binding_url(
+        &mut self,
+        binding: &ResolvedComponentBinding,
+    ) -> Result<String, Self::Error>;
     fn resolve_external_binding_url(
         &mut self,
         binding: &ResolvedExternalBinding,
@@ -151,8 +159,11 @@ pub(crate) trait Addressing {
 impl Addressing for LocalAddressing<'_> {
     type Error = MeshError;
 
-    fn resolve_binding_url(&mut self, binding: &ResolvedBinding) -> Result<String, Self::Error> {
-        let local_port = self.local_binding_port(binding)?;
+    fn resolve_component_binding_url(
+        &mut self,
+        binding: &ResolvedComponentBinding,
+    ) -> Result<String, Self::Error> {
+        let local_port = self.local_component_binding_port(binding)?;
         let scheme = match binding.endpoint.protocol {
             NetworkProtocol::Tcp => "tcp",
             _ => "http",
@@ -195,8 +206,8 @@ pub(crate) fn build_address_plan<A: Addressing>(
 ) -> Result<MeshAddressPlan, A::Error> {
     let mut slot_values_by_component: HashMap<ComponentId, BTreeMap<String, SlotValue>> =
         HashMap::new();
-    for id in &mesh_plan.program_components {
-        slot_values_by_component.insert(*id, BTreeMap::new());
+    for &id in mesh_plan.program_components() {
+        slot_values_by_component.insert(id, BTreeMap::new());
     }
 
     let mut insert_url = |consumer: ComponentId, slot: &str, url: String| {
@@ -218,19 +229,21 @@ pub(crate) fn build_address_plan<A: Addressing>(
         }
     };
 
-    for binding in &mesh_plan.bindings {
-        let url = addressing.resolve_binding_url(binding)?;
-        insert_url(binding.consumer, &binding.slot, url);
-    }
-
-    for binding in &mesh_plan.external_bindings {
-        let url = addressing.resolve_external_binding_url(binding)?;
-        insert_url(binding.consumer, &binding.slot, url);
-    }
-
-    for binding in &mesh_plan.framework_bindings {
-        let url = addressing.resolve_framework_binding_url(binding)?;
-        insert_url(binding.consumer, &binding.slot, url);
+    for binding in mesh_plan.bindings() {
+        match binding {
+            ResolvedBinding::Component(binding) => {
+                let url = addressing.resolve_component_binding_url(binding)?;
+                insert_url(binding.consumer, &binding.slot, url);
+            }
+            ResolvedBinding::External(binding) => {
+                let url = addressing.resolve_external_binding_url(binding)?;
+                insert_url(binding.consumer, &binding.slot, url);
+            }
+            ResolvedBinding::Framework(binding) => {
+                let url = addressing.resolve_framework_binding_url(binding)?;
+                insert_url(binding.consumer, &binding.slot, url);
+            }
+        }
     }
 
     Ok(MeshAddressPlan {
@@ -288,7 +301,7 @@ pub(crate) fn build_allow_plan(
 ) -> Result<AllowPlan, MeshError> {
     let mut allow = AllowPlan::default();
 
-    for binding in &mesh_plan.bindings {
+    for binding in mesh_plan.component_bindings() {
         let port = *mesh_ports_by_component
             .get(&binding.provider)
             .ok_or_else(|| {
@@ -304,17 +317,17 @@ pub(crate) fn build_allow_plan(
         );
     }
 
-    if !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty() {
+    if mesh_plan.needs_router() {
         let router_port =
             router_mesh_port.ok_or_else(|| MeshError::new("router mesh port missing"))?;
-        for binding in &mesh_plan.external_bindings {
+        for binding in mesh_plan.external_bindings() {
             allow.allow(
                 WorkloadId::Router,
                 WorkloadId::Component(binding.consumer),
                 router_port,
             );
         }
-        for export in &mesh_plan.exports {
+        for export in mesh_plan.exports() {
             let provider_port =
                 *mesh_ports_by_component
                     .get(&export.provider)
@@ -339,12 +352,15 @@ pub(crate) fn build_allow_plan(
 mod tests {
     use std::sync::Arc;
 
-    use amber_manifest::{ManifestDigest, NetworkProtocol};
+    use amber_manifest::{FrameworkCapabilityName, ManifestDigest, NetworkProtocol};
     use amber_scenario::{BindingEdge, Component, Moniker, Scenario};
 
     use super::*;
     use crate::targets::mesh::{
-        plan::{EndpointInfo, MeshPlan, ResolvedBinding},
+        plan::{
+            EndpointInfo, MeshPlan, ResolvedBinding, ResolvedComponentBinding,
+            ResolvedExternalBinding, ResolvedFrameworkBinding,
+        },
         ports::allocate_local_route_ports,
     };
 
@@ -399,10 +415,10 @@ mod tests {
             exports: Vec::new(),
         };
 
-        let mesh_plan = MeshPlan {
-            program_components: vec![ComponentId(0), ComponentId(1), ComponentId(2)],
-            bindings: vec![
-                ResolvedBinding {
+        let mesh_plan = MeshPlan::new(
+            vec![ComponentId(0), ComponentId(1), ComponentId(2)],
+            vec![
+                ResolvedBinding::Component(ResolvedComponentBinding {
                     provider: ComponentId(1),
                     consumer: ComponentId(0),
                     provide: "api".to_string(),
@@ -411,8 +427,8 @@ mod tests {
                         protocol: NetworkProtocol::Http,
                     },
                     slot: "upstream".to_string(),
-                },
-                ResolvedBinding {
+                }),
+                ResolvedBinding::Component(ResolvedComponentBinding {
                     provider: ComponentId(2),
                     consumer: ComponentId(0),
                     provide: "api".to_string(),
@@ -421,13 +437,11 @@ mod tests {
                         protocol: NetworkProtocol::Http,
                     },
                     slot: "upstream".to_string(),
-                },
+                }),
             ],
-            external_bindings: Vec::new(),
-            framework_bindings: Vec::new(),
-            exports: Vec::new(),
-            strong_deps: HashMap::new(),
-        };
+            Vec::new(),
+            HashMap::new(),
+        );
 
         let route_ports =
             allocate_local_route_ports(&scenario, &mesh_plan).expect("local route ports");
@@ -453,5 +467,113 @@ mod tests {
         assert_ne!(values[0].url, values[1].url);
         assert_eq!(values[0].url, "http://127.0.0.1:20000");
         assert_eq!(values[1].url, "http://127.0.0.1:20001");
+    }
+
+    #[test]
+    fn build_address_plan_preserves_authored_order_for_mixed_source_variadic_slots() {
+        let mut root = component(0, "/", "root");
+        root.slots.insert(
+            "ext".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "kind": "http",
+                "optional": true,
+            }))
+            .expect("slot decl"),
+        );
+        let mut consumer = component(1, "/consumer", "consumer");
+        consumer.slots.insert(
+            "upstream".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "kind": "http",
+                "optional": true,
+                "multiple": true,
+            }))
+            .expect("slot decl"),
+        );
+        let mut provider = component(2, "/provider", "provider");
+        provider.provides.insert(
+            "api".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "kind": "http",
+                "endpoint": "api",
+            }))
+            .expect("provide decl"),
+        );
+        provider.program = Some(
+            serde_json::from_value(serde_json::json!({
+                "image": "provider",
+                "entrypoint": ["provider"],
+                "network": { "endpoints": [{ "name": "api", "port": 80 }] },
+            }))
+            .expect("program"),
+        );
+
+        let scenario = Scenario {
+            root: ComponentId(0),
+            components: vec![Some(root), Some(consumer), Some(provider)],
+            bindings: Vec::<BindingEdge>::new(),
+            exports: Vec::new(),
+        };
+
+        let mesh_plan = MeshPlan::new(
+            vec![ComponentId(0), ComponentId(1), ComponentId(2)],
+            vec![
+                ResolvedBinding::Framework(ResolvedFrameworkBinding {
+                    consumer: ComponentId(1),
+                    slot: "upstream".to_string(),
+                    capability: FrameworkCapabilityName::try_from("docker")
+                        .expect("framework capability"),
+                }),
+                ResolvedBinding::External(ResolvedExternalBinding {
+                    consumer: ComponentId(1),
+                    slot: "upstream".to_string(),
+                    external_slot: "ext".to_string(),
+                }),
+                ResolvedBinding::Component(ResolvedComponentBinding {
+                    provider: ComponentId(2),
+                    consumer: ComponentId(1),
+                    provide: "api".to_string(),
+                    endpoint: EndpointInfo {
+                        port: 80,
+                        protocol: NetworkProtocol::Http,
+                    },
+                    slot: "upstream".to_string(),
+                }),
+            ],
+            Vec::new(),
+            HashMap::new(),
+        );
+
+        let route_ports =
+            allocate_local_route_ports(&scenario, &mesh_plan).expect("local route ports");
+        let addressing = LocalAddressing::new(
+            &scenario,
+            &route_ports,
+            LocalAddressingOptions {
+                backend_label: "test",
+                docker_binding: DockerFrameworkBindingPolicy::LoopbackTcp,
+            },
+        );
+        let plan = build_address_plan(&mesh_plan, addressing).expect("address plan");
+
+        let slot_values = plan
+            .slot_values_by_component
+            .get(&ComponentId(1))
+            .and_then(|slots| slots.get("upstream"))
+            .expect("slot values");
+        let SlotValue::Many(values) = slot_values else {
+            panic!("expected repeated slot values, got {slot_values:?}");
+        };
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.url.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "tcp://127.0.0.1:20000",
+                "http://127.0.0.1:20001",
+                "http://127.0.0.1:20002",
+            ]
+        );
     }
 }

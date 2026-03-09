@@ -132,7 +132,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
         options,
     } = input;
 
-    let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
+    let needs_router = mesh_plan.needs_router();
     if needs_router && router_ports.is_none() {
         return Err(MeshError::new("router ports missing"));
     }
@@ -140,12 +140,12 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
     let mesh_scope = scenario_mesh_scope(scenario)?;
 
     let mut identities_by_component: HashMap<ComponentId, MeshIdentityTemplate> = HashMap::new();
-    for id in &mesh_plan.program_components {
+    for &id in mesh_plan.program_components() {
         let identity = MeshIdentityTemplate {
-            id: scenario.component(*id).moniker.as_str().to_string(),
+            id: scenario.component(id).moniker.as_str().to_string(),
             mesh_scope: Some(mesh_scope.clone()),
         };
-        identities_by_component.insert(*id, identity);
+        identities_by_component.insert(id, identity);
     }
 
     let router_identity = if needs_router {
@@ -159,7 +159,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
 
     let mut consumers_by_provider: HashMap<(ComponentId, String), BTreeSet<ComponentId>> =
         HashMap::new();
-    for binding in &mesh_plan.bindings {
+    for binding in mesh_plan.component_bindings() {
         consumers_by_provider
             .entry((binding.provider, binding.provide.clone()))
             .or_default()
@@ -167,7 +167,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
     }
 
     let mut external_consumers: HashMap<String, BTreeSet<ComponentId>> = HashMap::new();
-    for binding in &mesh_plan.external_bindings {
+    for binding in mesh_plan.external_bindings() {
         external_consumers
             .entry(binding.external_slot.clone())
             .or_default()
@@ -175,35 +175,34 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
     }
 
     let mut exported_provides: BTreeSet<(ComponentId, String)> = BTreeSet::new();
-    for export in &mesh_plan.exports {
+    for export in mesh_plan.exports() {
         exported_provides.insert((export.provider, export.provide.clone()));
     }
 
     let mut component_configs: HashMap<ComponentId, MeshConfigTemplate> = HashMap::new();
-    for id in &mesh_plan.program_components {
+    for &id in mesh_plan.program_components() {
         let identity = identities_by_component
-            .get(id)
+            .get(&id)
             .expect("identity should exist")
             .clone();
-        let mesh_port = *mesh_ports_by_component.get(id).ok_or_else(|| {
+        let mesh_port = *mesh_ports_by_component.get(&id).ok_or_else(|| {
             MeshError::new(format!(
                 "mesh port missing for {}",
-                component_label(scenario, *id)
+                component_label(scenario, id)
             ))
         })?;
 
         let mut inbound = Vec::new();
-        for (provide_name, provide_decl) in &scenario.component(*id).provides {
+        for (provide_name, provide_decl) in &scenario.component(id).provides {
             let endpoint = mesh_plan
-                .bindings
-                .iter()
-                .find(|b| b.provider == *id && b.provide == *provide_name)
+                .component_bindings()
+                .find(|binding| binding.provider == id && binding.provide == *provide_name)
                 .map(|b| b.endpoint.clone())
                 .or_else(|| {
                     mesh_plan
-                        .exports
+                        .exports()
                         .iter()
-                        .find(|ex| ex.provider == *id && ex.provide == *provide_name)
+                        .find(|ex| ex.provider == id && ex.provide == *provide_name)
                         .map(|ex| ex.endpoint.clone())
                 });
             let Some(endpoint) = endpoint else {
@@ -211,7 +210,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             };
 
             let mut issuers: BTreeSet<String> = BTreeSet::new();
-            if let Some(consumers) = consumers_by_provider.get(&(*id, provide_name.clone())) {
+            if let Some(consumers) = consumers_by_provider.get(&(id, provide_name.clone())) {
                 for consumer in consumers {
                     let consumer_id = identities_by_component
                         .get(consumer)
@@ -221,7 +220,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                     issuers.insert(consumer_id);
                 }
             }
-            if exported_provides.contains(&(*id, provide_name.clone()))
+            if exported_provides.contains(&(id, provide_name.clone()))
                 && let Some(router_identity) = router_identity.as_ref()
             {
                 issuers.insert(router_identity.id.clone());
@@ -252,14 +251,14 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
         }
 
         let mut outbound = Vec::new();
-        for binding in &mesh_plan.bindings {
-            if binding.consumer != *id {
+        for binding in mesh_plan.component_bindings() {
+            if binding.consumer != id {
                 continue;
             }
-            let listen_port = route_ports.binding_port(binding).ok_or_else(|| {
+            let listen_port = route_ports.component_binding_port(binding).ok_or_else(|| {
                 MeshError::new(format!(
                     "route port missing for {}.{}",
-                    component_label(scenario, *id),
+                    component_label(scenario, id),
                     binding.slot
                 ))
             })?;
@@ -296,14 +295,14 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             });
         }
 
-        for binding in &mesh_plan.external_bindings {
-            if binding.consumer != *id {
+        for binding in mesh_plan.external_bindings() {
+            if binding.consumer != id {
                 continue;
             }
             let listen_port = route_ports.external_binding_port(binding).ok_or_else(|| {
                 MeshError::new(format!(
                     "route port missing for {}.{}",
-                    component_label(scenario, *id),
+                    component_label(scenario, id),
                     binding.slot
                 ))
             })?;
@@ -347,7 +346,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             outbound,
             transport: amber_mesh::TransportConfig::NoiseIk {},
         };
-        component_configs.insert(*id, config);
+        component_configs.insert(id, config);
     }
 
     let mut router_env_passthrough = Vec::new();
@@ -357,7 +356,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
         let router_mesh_port = router_ports.mesh;
         let mut inbound = Vec::new();
 
-        let external_slots = build_router_external_slots(scenario, &mesh_plan.external_bindings);
+        let external_slots = build_router_external_slots(scenario, mesh_plan.external_bindings());
         for slot in &external_slots {
             router_env_passthrough.push(slot.url_env.clone());
             let mut issuers = BTreeSet::new();
@@ -389,7 +388,7 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             });
         }
 
-        for export in &mesh_plan.exports {
+        for export in mesh_plan.exports() {
             let peer_addr = addressing.mesh_addr_for_component(export.provider)?;
             let peer_id = identities_by_component
                 .get(&export.provider)
@@ -504,9 +503,9 @@ struct RouterExternalSlot {
     optional: bool,
 }
 
-fn build_router_external_slots(
+fn build_router_external_slots<'a>(
     scenario: &Scenario,
-    bindings: &[ResolvedExternalBinding],
+    bindings: impl IntoIterator<Item = &'a ResolvedExternalBinding>,
 ) -> Vec<RouterExternalSlot> {
     let root_component = scenario.component(scenario.root);
     let mut slot_names = BTreeSet::new();

@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use amber_scenario::{ComponentId, Scenario};
 
 use super::plan::{
-    MeshError, MeshPlan, ResolvedBinding, ResolvedExternalBinding, ResolvedFrameworkBinding,
-    component_label,
+    MeshError, MeshPlan, ResolvedBinding, ResolvedComponentBinding, ResolvedExternalBinding,
+    ResolvedFrameworkBinding, component_label,
 };
 
 const LOCAL_SLOT_PORT_BASE: u16 = 20000;
@@ -13,7 +13,7 @@ const LOCAL_SLOT_PORT_BASE: u16 = 20000;
 pub(crate) struct LocalRoutePorts {
     slot_ports_by_component: HashMap<ComponentId, BTreeMap<String, u16>>,
     reserved_ports_by_component: HashMap<ComponentId, Vec<u16>>,
-    binding_ports: HashMap<BindingRouteKey, u16>,
+    component_binding_ports: HashMap<ComponentBindingRouteKey, u16>,
     external_binding_ports: HashMap<ExternalBindingRouteKey, u16>,
     framework_binding_ports: HashMap<FrameworkBindingRouteKey, u16>,
 }
@@ -33,9 +33,9 @@ impl LocalRoutePorts {
             .unwrap_or(&[])
     }
 
-    pub(crate) fn binding_port(&self, binding: &ResolvedBinding) -> Option<u16> {
-        self.binding_ports
-            .get(&BindingRouteKey::from(binding))
+    pub(crate) fn component_binding_port(&self, binding: &ResolvedComponentBinding) -> Option<u16> {
+        self.component_binding_ports
+            .get(&ComponentBindingRouteKey::from(binding))
             .copied()
     }
 
@@ -53,15 +53,15 @@ impl LocalRoutePorts {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct BindingRouteKey {
+struct ComponentBindingRouteKey {
     consumer: ComponentId,
     slot: String,
     provider: ComponentId,
     provide: String,
 }
 
-impl From<&ResolvedBinding> for BindingRouteKey {
-    fn from(value: &ResolvedBinding) -> Self {
+impl From<&ResolvedComponentBinding> for ComponentBindingRouteKey {
+    fn from(value: &ResolvedComponentBinding) -> Self {
         Self {
             consumer: value.consumer,
             slot: value.slot.clone(),
@@ -111,7 +111,7 @@ pub(crate) fn allocate_local_route_ports(
 ) -> Result<LocalRoutePorts, MeshError> {
     let mut out = LocalRoutePorts::default();
 
-    for id in &mesh_plan.program_components {
+    for id in mesh_plan.program_components() {
         let component = scenario.component(*id);
         let program = component.program.as_ref().unwrap();
 
@@ -150,32 +150,22 @@ pub(crate) fn allocate_local_route_ports(
             Ok(port)
         };
 
-        for binding in mesh_plan
-            .bindings
-            .iter()
-            .filter(|binding| binding.consumer == *id)
-        {
-            let port = allocate_port(&binding.slot)?;
-            out.binding_ports
-                .insert(BindingRouteKey::from(binding), port);
-        }
-        for binding in mesh_plan
-            .external_bindings
-            .iter()
-            .filter(|binding| binding.consumer == *id)
-        {
-            let port = allocate_port(&binding.slot)?;
-            out.external_binding_ports
-                .insert(ExternalBindingRouteKey::from(binding), port);
-        }
-        for binding in mesh_plan
-            .framework_bindings
-            .iter()
-            .filter(|binding| binding.consumer == *id)
-        {
-            let port = allocate_port(&binding.slot)?;
-            out.framework_binding_ports
-                .insert(FrameworkBindingRouteKey::from(binding), port);
+        for binding in mesh_plan.bindings_for_consumer(*id) {
+            let port = allocate_port(binding.slot())?;
+            match binding {
+                ResolvedBinding::Component(binding) => {
+                    out.component_binding_ports
+                        .insert(ComponentBindingRouteKey::from(binding), port);
+                }
+                ResolvedBinding::External(binding) => {
+                    out.external_binding_ports
+                        .insert(ExternalBindingRouteKey::from(binding), port);
+                }
+                ResolvedBinding::Framework(binding) => {
+                    out.framework_binding_ports
+                        .insert(FrameworkBindingRouteKey::from(binding), port);
+                }
+            }
         }
 
         let mut reserved_ports: Vec<u16> = reserved.into_iter().collect();
@@ -202,34 +192,28 @@ pub(crate) fn placeholder_local_route_ports(
 ) -> LocalRoutePorts {
     let mut out = LocalRoutePorts::default();
 
-    for id in &mesh_plan.program_components {
+    for id in mesh_plan.program_components() {
         let mut slot_ports: BTreeMap<String, Vec<u16>> = BTreeMap::new();
 
-        for binding in mesh_plan
-            .bindings
-            .iter()
-            .filter(|binding| binding.consumer == *id)
-        {
-            out.binding_ports.insert(BindingRouteKey::from(binding), 0);
-            slot_ports.entry(binding.slot.clone()).or_default().push(0);
-        }
-        for binding in mesh_plan
-            .external_bindings
-            .iter()
-            .filter(|binding| binding.consumer == *id)
-        {
-            out.external_binding_ports
-                .insert(ExternalBindingRouteKey::from(binding), 0);
-            slot_ports.entry(binding.slot.clone()).or_default().push(0);
-        }
-        for binding in mesh_plan
-            .framework_bindings
-            .iter()
-            .filter(|binding| binding.consumer == *id)
-        {
-            out.framework_binding_ports
-                .insert(FrameworkBindingRouteKey::from(binding), 0);
-            slot_ports.entry(binding.slot.clone()).or_default().push(0);
+        for binding in mesh_plan.bindings_for_consumer(*id) {
+            match binding {
+                ResolvedBinding::Component(binding) => {
+                    out.component_binding_ports
+                        .insert(ComponentBindingRouteKey::from(binding), 0);
+                }
+                ResolvedBinding::External(binding) => {
+                    out.external_binding_ports
+                        .insert(ExternalBindingRouteKey::from(binding), 0);
+                }
+                ResolvedBinding::Framework(binding) => {
+                    out.framework_binding_ports
+                        .insert(FrameworkBindingRouteKey::from(binding), 0);
+                }
+            }
+            slot_ports
+                .entry(binding.slot().to_string())
+                .or_default()
+                .push(0);
         }
 
         let mut reserved: Vec<u16> = scenario

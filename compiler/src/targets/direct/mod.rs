@@ -210,7 +210,7 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
             backend_label: "direct reporter",
         },
     )?;
-    let program_components = mesh_plan.program_components.as_slice();
+    let program_components = mesh_plan.program_components();
     ensure_direct_mount_sources_supported(scenario, program_components)?;
     ensure_no_endpoint_port_conflicts(scenario, program_components)?;
 
@@ -227,7 +227,7 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
     let route_ports = placeholder_local_route_ports(scenario, &mesh_plan);
     let mesh_ports_by_component = placeholder_mesh_ports(program_components);
 
-    let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
+    let needs_router = mesh_plan.needs_router();
     let router_ports = needs_router.then_some(RouterPorts {
         mesh: 0,
         control: 0,
@@ -432,7 +432,7 @@ fn build_component_plans(
             ))
         })?;
         let depends_on = mesh_plan
-            .strong_deps
+            .strong_deps()
             .get(id)
             .map(|deps| deps.iter().map(|dep| dep.0).collect::<Vec<_>>())
             .unwrap_or_default();
@@ -933,7 +933,7 @@ fn topological_startup_order(
         indegree.insert(*id, 0);
     }
 
-    for (consumer, deps) in &mesh_plan.strong_deps {
+    for (consumer, deps) in mesh_plan.strong_deps() {
         if !indegree.contains_key(consumer) {
             continue;
         }

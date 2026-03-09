@@ -341,9 +341,9 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
     .map_err(dc_other)?;
     let images = resolve_internal_images().map_err(DockerComposeError::Other)?;
     let docker_mount_paths_by_component =
-        collect_framework_docker_mount_paths(s, mesh_plan.program_components.as_slice());
-    let storage_plan = build_storage_plan(s, mesh_plan.program_components.as_slice());
-    let program_components = mesh_plan.program_components.as_slice();
+        collect_framework_docker_mount_paths(s, mesh_plan.program_components());
+    let program_components = mesh_plan.program_components();
+    let storage_plan = build_storage_plan(s, program_components);
     // Precompute service names (injective & stable).
     let names: HashMap<ComponentId, ServiceNames> =
         map_program_components(s, program_components, |id, local_name| {
@@ -356,7 +356,7 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
     let docker_mount_components: BTreeSet<ComponentId> =
         docker_mount_paths_by_component.keys().copied().collect();
     let docker_gateway_component = transformed.gateway_component;
-    let needs_router = !mesh_plan.external_bindings.is_empty() || !mesh_plan.exports.is_empty();
+    let needs_router = mesh_plan.needs_router();
 
     let route_ports = allocate_local_route_ports(s, &mesh_plan)?;
     let mesh_ports_by_component = allocate_mesh_ports(
@@ -744,7 +744,7 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
             ));
         }
         deps.push((svc.sidecar.clone(), "service_started"));
-        if let Some(ds) = mesh_plan.strong_deps.get(id) {
+        if let Some(ds) = mesh_plan.strong_deps().get(id) {
             for dep in ds {
                 if let Some(dep_names) = names.get(dep) {
                     deps.push((dep_names.program.clone(), "service_started"));
