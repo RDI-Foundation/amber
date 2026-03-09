@@ -1,0 +1,12 @@
+compiler::invalid_slots_interpolation
+
+  x invalid slots interpolation in / (program.args[0].argv[0]): unknown item field "blabla"
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/item_interpolation_invalid_field.json5:8:16]
+ 7 |         each: "slots.api",
+ 8 |         argv: ["${item.blabla}"],
+   :                ^^^^^^^^|^^^^^^^
+   :                        `-- item interpolation here
+ 9 |       },
+   `----
+  help: Repeated slot items are objects like `{ url: ... }`. Use `${item}` for the whole object or `${item.url}` for the URL field.
+Error:   × check failed

@@ -24,7 +24,10 @@ use crate::{
     },
     config_scope::{RuntimeConfigView, build_runtime_config_view},
     config_templates,
-    slot_query::{SlotObject, SlotValue, resolve_slot_query, slot_query_is_present},
+    slot_query::{
+        SlotObject, SlotTarget, SlotValue, parse_slot_query, resolve_slot_query,
+        slot_query_is_present,
+    },
     targets::common::{TargetError as MeshError, component_label},
 };
 
@@ -1123,6 +1126,25 @@ fn repeated_slot_items<'a>(slots: &'a BTreeMap<String, SlotValue>, slot: &str) -
     }
 }
 
+fn repeated_slot_items_for_component<'a>(
+    scenario: &'a Scenario,
+    id: ComponentId,
+    slot: &str,
+    slots: &'a BTreeMap<String, SlotValue>,
+    location: &str,
+) -> Result<&'a [SlotObject], MeshError> {
+    let component = component_label(scenario, id);
+    let slot_decl = scenario.component(id).slots.get(slot).ok_or_else(|| {
+        MeshError::new(format!("unknown slot `{slot}` in {component} {location}"))
+    })?;
+    if !slot_decl.multiple {
+        return Err(MeshError::new(format!(
+            "slot `{slot}` in {component} {location} is not declared with `multiple: true`"
+        )));
+    }
+    Ok(repeated_slot_items(slots, slot))
+}
+
 fn query_value_opt<'a>(root: &'a Value, query: &str) -> Option<&'a Value> {
     if query.is_empty() {
         return Some(root);
@@ -1186,9 +1208,53 @@ fn resolve_slot_interpolation(
 ) -> Result<Option<String>, MeshError> {
     let component = component_label(scenario, id);
     match source {
-        InterpolationSource::Slots => resolve_slot_query(slots, query).map(Some).map_err(|e| {
-            MeshError::new(format!("failed to resolve slot query in {component}: {e}"))
-        }),
+        InterpolationSource::Slots => {
+            let parsed = parse_slot_query(query).map_err(|err| {
+                let label = if query.is_empty() {
+                    "slots".to_string()
+                } else {
+                    format!("slots.{query}")
+                };
+                MeshError::new(format!(
+                    "failed to resolve slot query in {component}: invalid slots interpolation \
+                     `{label}`: {err}"
+                ))
+            })?;
+
+            match parsed.target {
+                SlotTarget::All => {
+                    if scenario
+                        .component(id)
+                        .slots
+                        .values()
+                        .any(|slot| slot.multiple)
+                    {
+                        return Err(MeshError::new(format!(
+                            "failed to resolve slot query in {component}: `${{slots}}` is not \
+                             valid when the component declares any `multiple: true` slots"
+                        )));
+                    }
+                }
+                SlotTarget::Slot(slot_name) => {
+                    if scenario
+                        .component(id)
+                        .slots
+                        .get(slot_name)
+                        .is_some_and(|slot| slot.multiple)
+                    {
+                        return Err(MeshError::new(format!(
+                            "failed to resolve slot query in {component}: slot `{slot_name}` is \
+                             declared with `multiple: true`; use `each: \"slots.{slot_name}\"` \
+                             and `${{item...}}`"
+                        )));
+                    }
+                }
+            }
+
+            resolve_slot_query(slots, query).map(Some).map_err(|e| {
+                MeshError::new(format!("failed to resolve slot query in {component}: {e}"))
+            })
+        }
         InterpolationSource::Config => Ok(None),
         InterpolationSource::Item => Err(MeshError::new(format!(
             "`item` interpolation is only valid inside repeated `each` expansions in {component} \
@@ -1396,7 +1462,13 @@ fn append_program_command_item_templates(
                 )),
                 None => None,
             };
-            let items = repeated_slot_items(slots, repeated.each.slot());
+            let items = repeated_slot_items_for_component(
+                scenario,
+                id,
+                repeated.each.slot(),
+                slots,
+                &format!("{location_prefix}[{idx}]"),
+            )?;
             if items.is_empty() {
                 return Ok(());
             }
@@ -1527,7 +1599,13 @@ fn append_program_command_item_templates(
                 )),
                 None => None,
             };
-            let items = repeated_slot_items(slots, repeated.each.slot());
+            let items = repeated_slot_items_for_component(
+                scenario,
+                id,
+                repeated.each.slot(),
+                slots,
+                &format!("{location_prefix}[{idx}]"),
+            )?;
             if items.is_empty() {
                 return Ok(());
             }
@@ -2004,7 +2082,13 @@ fn build_program_plan(
                     )),
                     None => None,
                 };
-                let items = repeated_slot_items(slots, repeated.each.slot());
+                let items = repeated_slot_items_for_component(
+                    scenario,
+                    id,
+                    repeated.each.slot(),
+                    slots,
+                    &format!("program.env.{k}"),
+                )?;
                 if items.is_empty() {
                     continue;
                 }
@@ -2178,5 +2262,105 @@ fn build_program_plan(
             entrypoint: rendered_entrypoint,
             env: rendered_env,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use amber_manifest::{Manifest, ManifestDigest};
+    use amber_scenario::{BindingEdge, Component, Moniker, Scenario};
+
+    use super::*;
+
+    fn test_scenario() -> Scenario {
+        let manifest: Manifest = r#"
+            {
+              manifest_version: "0.3.0",
+              slots: {
+                api: { kind: "http", optional: true },
+                upstream: { kind: "http", optional: true, multiple: true },
+              },
+            }
+        "#
+        .parse()
+        .expect("manifest");
+
+        Scenario {
+            root: ComponentId(0),
+            components: vec![Some(Component {
+                id: ComponentId(0),
+                parent: None,
+                moniker: Moniker::from(Arc::<str>::from("/")),
+                digest: ManifestDigest::new([0; 32]),
+                config: None,
+                config_schema: None,
+                program: None,
+                slots: manifest
+                    .slots()
+                    .iter()
+                    .map(|(name, decl)| (name.to_string(), decl.clone()))
+                    .collect(),
+                provides: BTreeMap::new(),
+                resources: BTreeMap::new(),
+                metadata: None,
+                children: Vec::new(),
+            })],
+            bindings: Vec::<BindingEdge>::new(),
+            exports: Vec::new(),
+        }
+    }
+
+    fn test_slot_values() -> BTreeMap<String, SlotValue> {
+        BTreeMap::from([
+            (
+                "api".to_string(),
+                SlotValue::One(SlotObject {
+                    url: "http://127.0.0.1:31001".to_string(),
+                }),
+            ),
+            (
+                "upstream".to_string(),
+                SlotValue::Many(vec![SlotObject {
+                    url: "http://127.0.0.1:32001".to_string(),
+                }]),
+            ),
+        ])
+    }
+
+    #[test]
+    fn resolve_slot_interpolation_rejects_whole_slots_when_component_declares_repeated_slots() {
+        let err = resolve_slot_interpolation(
+            &test_scenario(),
+            ComponentId(0),
+            "program.args[0]",
+            &InterpolationSource::Slots,
+            "",
+            &test_slot_values(),
+        )
+        .expect_err("whole-slots interpolation should fail");
+
+        let message = err.to_string();
+        assert!(message.contains("`${slots}`"), "{message}");
+        assert!(message.contains("multiple: true"), "{message}");
+    }
+
+    #[test]
+    fn resolve_slot_interpolation_rejects_singular_query_for_repeated_slot() {
+        let err = resolve_slot_interpolation(
+            &test_scenario(),
+            ComponentId(0),
+            "program.args[0]",
+            &InterpolationSource::Slots,
+            "upstream.url",
+            &test_slot_values(),
+        )
+        .expect_err("singular repeated-slot interpolation should fail");
+
+        let message = err.to_string();
+        assert!(message.contains("slot `upstream`"), "{message}");
+        assert!(message.contains("multiple: true"), "{message}");
+        assert!(message.contains("slots.upstream"), "{message}");
     }
 }

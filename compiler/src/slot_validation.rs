@@ -101,7 +101,7 @@ fn validate_manifest_slot_interpolations(
             if let Ok(image) = program.image.parse::<InterpolatedString>() {
                 let location = SlotLocation::Image;
                 let span = location.span(source.as_ref(), spans);
-                validate_interpolated_string(&image, &ctx, location, span, &mut diagnostics);
+                validate_interpolated_string(&image, &ctx, location, span, false, &mut diagnostics);
             }
 
             for (idx, item) in program.entrypoint.0.iter().enumerate() {
@@ -109,7 +109,14 @@ fn validate_manifest_slot_interpolations(
                     amber_manifest::ProgramArgItem::Arg(arg) => {
                         let location = SlotLocation::Entrypoint(idx);
                         let span = location.span(source.as_ref(), spans);
-                        validate_interpolated_string(arg, &ctx, location, span, &mut diagnostics);
+                        validate_interpolated_string(
+                            arg,
+                            &ctx,
+                            location,
+                            span,
+                            false,
+                            &mut diagnostics,
+                        );
                     }
                     amber_manifest::ProgramArgItem::Group(group) => {
                         if group.when.source() == InterpolationSource::Slots {
@@ -131,6 +138,7 @@ fn validate_manifest_slot_interpolations(
                                 &ctx,
                                 location,
                                 span,
+                                false,
                                 &mut diagnostics,
                             );
                         }
@@ -166,6 +174,7 @@ fn validate_manifest_slot_interpolations(
                                 &ctx,
                                 location,
                                 span,
+                                true,
                                 &mut diagnostics,
                             );
                         }
@@ -200,6 +209,7 @@ fn validate_manifest_slot_interpolations(
                             &ctx,
                             location,
                             span,
+                            true,
                             &mut diagnostics,
                         );
                     }
@@ -210,7 +220,7 @@ fn validate_manifest_slot_interpolations(
             if let Ok(path) = program.path.parse::<InterpolatedString>() {
                 let location = SlotLocation::Path;
                 let span = location.span(source.as_ref(), spans);
-                validate_interpolated_string(&path, &ctx, location, span, &mut diagnostics);
+                validate_interpolated_string(&path, &ctx, location, span, false, &mut diagnostics);
             }
 
             for (idx, item) in program.args.0.iter().enumerate() {
@@ -218,7 +228,14 @@ fn validate_manifest_slot_interpolations(
                     amber_manifest::ProgramArgItem::Arg(arg) => {
                         let location = SlotLocation::Args(idx);
                         let span = location.span(source.as_ref(), spans);
-                        validate_interpolated_string(arg, &ctx, location, span, &mut diagnostics);
+                        validate_interpolated_string(
+                            arg,
+                            &ctx,
+                            location,
+                            span,
+                            false,
+                            &mut diagnostics,
+                        );
                     }
                     amber_manifest::ProgramArgItem::Group(group) => {
                         if group.when.source() == InterpolationSource::Slots {
@@ -240,6 +257,7 @@ fn validate_manifest_slot_interpolations(
                                 &ctx,
                                 location,
                                 span,
+                                false,
                                 &mut diagnostics,
                             );
                         }
@@ -275,6 +293,7 @@ fn validate_manifest_slot_interpolations(
                                 &ctx,
                                 location,
                                 span,
+                                true,
                                 &mut diagnostics,
                             );
                         }
@@ -309,6 +328,7 @@ fn validate_manifest_slot_interpolations(
                             &ctx,
                             location,
                             span,
+                            true,
                             &mut diagnostics,
                         );
                     }
@@ -323,7 +343,7 @@ fn validate_manifest_slot_interpolations(
             amber_manifest::ProgramEnvValue::Value(value) => {
                 let location = SlotLocation::Env(key.as_str());
                 let span = location.span(source.as_ref(), spans);
-                validate_interpolated_string(value, &ctx, location, span, &mut diagnostics);
+                validate_interpolated_string(value, &ctx, location, span, false, &mut diagnostics);
             }
             amber_manifest::ProgramEnvValue::Group(group) => {
                 if group.when.source() == InterpolationSource::Slots {
@@ -339,7 +359,14 @@ fn validate_manifest_slot_interpolations(
                 }
                 let location = SlotLocation::EnvValue(key.as_str());
                 let span = location.span(source.as_ref(), spans);
-                validate_interpolated_string(&group.value, &ctx, location, span, &mut diagnostics);
+                validate_interpolated_string(
+                    &group.value,
+                    &ctx,
+                    location,
+                    span,
+                    false,
+                    &mut diagnostics,
+                );
             }
             amber_manifest::ProgramEnvValue::Repeated(repeated) => {
                 let location = SlotLocation::EnvEach(key.as_str());
@@ -365,6 +392,7 @@ fn validate_manifest_slot_interpolations(
                     &ctx,
                     location,
                     span,
+                    true,
                     &mut diagnostics,
                 );
             }
@@ -713,11 +741,81 @@ struct SlotValidationContext<'a> {
     src_name: &'a str,
 }
 
+#[derive(Debug)]
+enum ItemQueryError {
+    EmptySegment { query: String },
+    UnknownField { field: String },
+    UnknownPath { path: String },
+}
+
+impl std::fmt::Display for ItemQueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptySegment { query } => {
+                write!(f, "invalid item path {query:?}: empty segment")
+            }
+            Self::UnknownField { field } => write!(f, "unknown item field {field:?}"),
+            Self::UnknownPath { path } => write!(f, "unknown item path {path:?}"),
+        }
+    }
+}
+
+fn validate_item_query(query: &str) -> Result<(), ItemQueryError> {
+    if query.is_empty() {
+        return Ok(());
+    }
+
+    let mut segments = query.split('.');
+    let field = segments
+        .next()
+        .expect("split on '.' yields at least one segment");
+    let rest: Vec<&str> = segments.collect();
+    if field.is_empty() || rest.iter().any(|segment| segment.is_empty()) {
+        return Err(ItemQueryError::EmptySegment {
+            query: format!("item.{query}"),
+        });
+    }
+
+    if field != "url" {
+        return Err(if rest.is_empty() {
+            ItemQueryError::UnknownField {
+                field: field.to_string(),
+            }
+        } else {
+            ItemQueryError::UnknownPath {
+                path: query.to_string(),
+            }
+        });
+    }
+
+    if !rest.is_empty() {
+        return Err(ItemQueryError::UnknownPath {
+            path: query.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn item_query_help(err: &ItemQueryError) -> String {
+    match err {
+        ItemQueryError::EmptySegment { .. } => "Use `${item}` for the whole repeated slot item or \
+                                                `${item.url}` for the URL field."
+            .to_string(),
+        ItemQueryError::UnknownField { .. } | ItemQueryError::UnknownPath { .. } => {
+            "Repeated slot items are objects like `{ url: ... }`. Use `${item}` for the whole \
+             object or `${item.url}` for the URL field."
+                .to_string()
+        }
+    }
+}
+
 fn validate_interpolated_string(
     value: &InterpolatedString,
     ctx: &SlotValidationContext<'_>,
     location: SlotLocation<'_>,
     span: SourceSpan,
+    item_allowed: bool,
     diagnostics: &mut Vec<Report>,
 ) {
     for part in &value.parts {
@@ -728,6 +826,40 @@ fn validate_interpolated_string(
         else {
             continue;
         };
+
+        if *kind == InterpolationSource::Item {
+            if !item_allowed {
+                diagnostics.push(Report::new(InvalidSlotsInterpolation {
+                    component_path: ctx.component_path.to_string(),
+                    location: location.label(),
+                    message: "`item` interpolation is only valid inside repeated `each` expansions"
+                        .to_string(),
+                    help: "Move this interpolation inside a repeated `each` block and use \
+                           `${item}` or `${item.url}` there."
+                        .to_string(),
+                    src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source))
+                        .with_language("json5"),
+                    span,
+                    label: "item interpolation here".to_string(),
+                }));
+                continue;
+            }
+
+            if let Err(err) = validate_item_query(query) {
+                diagnostics.push(Report::new(InvalidSlotsInterpolation {
+                    component_path: ctx.component_path.to_string(),
+                    location: location.label(),
+                    message: err.to_string(),
+                    help: item_query_help(&err),
+                    src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source))
+                        .with_language("json5"),
+                    span,
+                    label: "item interpolation here".to_string(),
+                }));
+            }
+            continue;
+        }
+
         if *kind != InterpolationSource::Slots {
             continue;
         }
@@ -735,7 +867,23 @@ fn validate_interpolated_string(
         match parse_slot_query(query) {
             Ok(parsed) => match parsed.target {
                 SlotTarget::All => {
-                    if ctx
+                    if ctx.slots.values().any(|slot| slot.multiple) {
+                        diagnostics.push(Report::new(InvalidSlotsInterpolation {
+                            component_path: ctx.component_path.to_string(),
+                            location: location.label(),
+                            message: "`${slots}` cannot be used when the component declares \
+                                      repeated slots"
+                                .to_string(),
+                            help: "Use `${slots.<slot>}` / `${slots.<slot>.url}` for singular \
+                                   slots, and `each: \"slots.<slot>\"` with `${item}` or \
+                                   `${item.url}` for repeated slots."
+                                .to_string(),
+                            src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source))
+                                .with_language("json5"),
+                            span,
+                            label: "slot interpolation here".to_string(),
+                        }));
+                    } else if ctx
                         .slots
                         .values()
                         .any(|slot_decl| slot_decl.decl.kind == CapabilityKind::Storage)
@@ -784,6 +932,23 @@ fn validate_interpolated_string(
                                    \"slots.<slot>\", path: \"/var/lib/app\" }]` instead of using \
                                    `${slots...}`."
                                 .to_string(),
+                            src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source))
+                                .with_language("json5"),
+                            span,
+                            label: "slot interpolation here".to_string(),
+                        }));
+                        continue;
+                    }
+
+                    if slot_decl.multiple {
+                        diagnostics.push(Report::new(InvalidSlotsInterpolation {
+                            component_path: ctx.component_path.to_string(),
+                            location: location.label(),
+                            message: format!("slot `{slot}` is declared with `multiple: true`"),
+                            help: format!(
+                                "Use `each: \"slots.{slot}\"` with `${{item}}` or `${{item.url}}` \
+                                 instead of `${{slots.{slot}...}}`."
+                            ),
                             src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source))
                                 .with_language("json5"),
                             span,

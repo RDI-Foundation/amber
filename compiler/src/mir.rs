@@ -263,9 +263,22 @@ fn rewrite_bindings(
     mut scenario: Scenario,
     forward_map: &HashMap<(ComponentId, String), Vec<ForwardEdge>>,
 ) -> Scenario {
-    let mut rewritten: Vec<BindingEdge> = Vec::new();
+    let mut merged_indices: HashMap<(BindingFrom, SlotRef), usize> = HashMap::new();
+    let mut bindings: Vec<BindingEdge> = Vec::new();
 
     for binding in &scenario.bindings {
+        if scenario.component(binding.to.component).program.is_some() {
+            merged_indices
+                .entry((binding.from.clone(), binding.to.clone()))
+                .or_insert(bindings.len());
+            bindings.push(binding.clone());
+        }
+    }
+
+    for binding in &scenario.bindings {
+        if scenario.component(binding.to.component).program.is_some() {
+            continue;
+        }
         let mut stack = HashSet::new();
         let targets = resolve_forward_targets(&scenario, forward_map, &binding.to, &mut stack);
 
@@ -273,23 +286,17 @@ fn rewrite_bindings(
             let mut edge = binding.clone();
             edge.to = target.target;
             edge.weak = edge.weak || target.weak;
-            rewritten.push(edge);
+            let key = (edge.from.clone(), edge.to.clone());
+            if let Some(&idx) = merged_indices.get(&key) {
+                let existing = &mut bindings[idx];
+                // Multiple rewrite paths can produce the same concrete edge. If any path is
+                // strong, the canonical edge must stay strong.
+                existing.weak &= edge.weak;
+                continue;
+            }
+            merged_indices.insert(key, bindings.len());
+            bindings.push(edge);
         }
-    }
-
-    let mut merged_indices: HashMap<(BindingFrom, SlotRef), usize> = HashMap::new();
-    let mut bindings: Vec<BindingEdge> = Vec::new();
-    for binding in rewritten {
-        let key = (binding.from.clone(), binding.to.clone());
-        if let Some(&idx) = merged_indices.get(&key) {
-            let existing = &mut bindings[idx];
-            // Multiple rewrite paths can produce the same edge. If any path is strong,
-            // the merged edge must stay strong.
-            existing.weak &= binding.weak;
-            continue;
-        }
-        merged_indices.insert(key, bindings.len());
-        bindings.push(binding);
     }
 
     scenario.bindings = bindings;
@@ -810,6 +817,81 @@ fn compute_keep_set(
     }
 
     keep
+}
+
+#[cfg(test)]
+mod tests {
+    use amber_scenario::{Moniker, ProvideRef};
+
+    use super::*;
+
+    fn component(id: usize, moniker: &str) -> Component {
+        Component {
+            id: ComponentId(id),
+            parent: None,
+            moniker: Moniker::from(Arc::from(moniker)),
+            digest: amber_manifest::ManifestDigest::new([id as u8; 32]),
+            config: None,
+            config_schema: None,
+            program: None,
+            slots: BTreeMap::new(),
+            provides: BTreeMap::new(),
+            resources: BTreeMap::new(),
+            metadata: None,
+            children: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn rewrite_bindings_preserves_duplicate_authored_edges() {
+        let consumer_program = serde_json::from_value(serde_json::json!({
+            "image": "consumer",
+            "entrypoint": ["consumer"],
+        }))
+        .expect("program");
+        let mut scenario = Scenario {
+            root: ComponentId(0),
+            components: vec![
+                Some(component(0, "/")),
+                Some(Component {
+                    program: Some(consumer_program),
+                    ..component(1, "/consumer")
+                }),
+                Some(component(2, "/provider")),
+            ],
+            bindings: vec![
+                BindingEdge {
+                    from: BindingFrom::Component(ProvideRef {
+                        component: ComponentId(2),
+                        name: "api".to_string(),
+                    }),
+                    to: SlotRef {
+                        component: ComponentId(1),
+                        name: "upstream".to_string(),
+                    },
+                    weak: false,
+                },
+                BindingEdge {
+                    from: BindingFrom::Component(ProvideRef {
+                        component: ComponentId(2),
+                        name: "api".to_string(),
+                    }),
+                    to: SlotRef {
+                        component: ComponentId(1),
+                        name: "upstream".to_string(),
+                    },
+                    weak: false,
+                },
+            ],
+            exports: Vec::new(),
+        };
+        scenario.normalize_order();
+
+        let rewritten = rewrite_bindings(scenario, &HashMap::new());
+        assert_eq!(rewritten.bindings.len(), 2);
+        assert_eq!(rewritten.bindings[0].to.name, "upstream");
+        assert_eq!(rewritten.bindings[1].to.name, "upstream");
+    }
 }
 
 #[cfg(test)]

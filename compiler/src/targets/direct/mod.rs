@@ -869,7 +869,7 @@ fn placeholder_mesh_ports(program_components: &[ComponentId]) -> HashMap<Compone
 }
 
 fn build_runtime_address_plan(
-    _scenario: &Scenario,
+    scenario: &Scenario,
     slot_values_by_component: &HashMap<ComponentId, BTreeMap<String, crate::slot_query::SlotValue>>,
 ) -> Result<DirectRuntimeAddressPlan, MeshError> {
     let mut slots_by_scope = BTreeMap::new();
@@ -878,8 +878,31 @@ fn build_runtime_address_plan(
         let mut singular_entries = BTreeMap::new();
         let mut repeated_entries = BTreeMap::new();
         for (slot, value) in slots {
-            match value {
-                crate::slot_query::SlotValue::One(value) => {
+            let slot_decl = scenario
+                .component(*scope)
+                .slots
+                .get(slot.as_str())
+                .ok_or_else(|| {
+                    MeshError::new(format!(
+                        "missing slot declaration for {}.{} while building direct runtime \
+                         addresses",
+                        component_label(scenario, *scope),
+                        slot
+                    ))
+                })?;
+            match (slot_decl.multiple, value) {
+                (true, crate::slot_query::SlotValue::One(value)) => {
+                    repeated_entries.insert(
+                        slot.clone(),
+                        vec![DirectRuntimeUrlSource::SlotItem {
+                            component_id: scope.0,
+                            slot: slot.clone(),
+                            item_index: 0,
+                            scheme: url_scheme(&value.url)?,
+                        }],
+                    );
+                }
+                (false, crate::slot_query::SlotValue::One(value)) => {
                     singular_entries.insert(
                         slot.clone(),
                         DirectRuntimeUrlSource::Slot {
@@ -889,7 +912,7 @@ fn build_runtime_address_plan(
                         },
                     );
                 }
-                crate::slot_query::SlotValue::Many(values) => {
+                (_, crate::slot_query::SlotValue::Many(values)) => {
                     let mut sources = Vec::with_capacity(values.len());
                     for (item_index, value) in values.iter().enumerate() {
                         sources.push(DirectRuntimeUrlSource::SlotItem {
@@ -1002,6 +1025,7 @@ mod tests {
         sync::Arc,
     };
 
+    use amber_manifest::Manifest;
     use amber_scenario::{BindingEdge, Component, Moniker, Scenario};
 
     use super::*;
@@ -1011,6 +1035,18 @@ mod tests {
     };
 
     fn test_scenario() -> Scenario {
+        let manifest: Manifest = r#"
+            {
+              manifest_version: "0.3.0",
+              slots: {
+                api: { kind: "http", optional: true },
+                upstream: { kind: "http", optional: true, multiple: true },
+              },
+            }
+        "#
+        .parse()
+        .expect("manifest");
+
         Scenario {
             root: ComponentId(0),
             components: vec![Some(Component {
@@ -1021,7 +1057,11 @@ mod tests {
                 config: None,
                 config_schema: None,
                 program: None,
-                slots: BTreeMap::new(),
+                slots: manifest
+                    .slots()
+                    .iter()
+                    .map(|(name, decl)| (name.to_string(), decl.clone()))
+                    .collect(),
                 provides: BTreeMap::new(),
                 resources: BTreeMap::new(),
                 metadata: None,
@@ -1183,6 +1223,65 @@ mod tests {
                 item_index: 1,
                 scheme,
             } if slot == "upstream" && scheme == "http"
+        ));
+    }
+
+    #[test]
+    fn build_runtime_address_plan_emits_slot_items_for_repeated_slot_with_one_binding() {
+        let slot_values_by_component = HashMap::from([(
+            ComponentId(0),
+            BTreeMap::from([(
+                "api".to_string(),
+                SlotValue::One(SlotObject {
+                    url: "http://127.0.0.1:31001".to_string(),
+                }),
+            )]),
+        )]);
+        let mut scenario = test_scenario();
+        let manifest: amber_manifest::Manifest = r#"
+            {
+              manifest_version: "0.3.0",
+              slots: {
+                api: { kind: "http", optional: true, multiple: true },
+              },
+            }
+        "#
+        .parse()
+        .expect("manifest");
+        scenario.components[0]
+            .as_mut()
+            .expect("root component should exist")
+            .slots
+            .insert(
+                "api".to_string(),
+                manifest
+                    .slots()
+                    .get("api")
+                    .expect("slot decl should exist")
+                    .clone(),
+            );
+
+        let plan =
+            build_runtime_address_plan(&scenario, &slot_values_by_component).expect("runtime plan");
+
+        assert!(
+            !plan.slots_by_scope.contains_key(&0),
+            "repeated slots should not be exposed as singular runtime slots"
+        );
+        let slot_items = plan
+            .slot_items_by_scope
+            .get(&0)
+            .and_then(|slots| slots.get("api"))
+            .expect("slot items");
+        assert_eq!(slot_items.len(), 1);
+        assert!(matches!(
+            &slot_items[0],
+            DirectRuntimeUrlSource::SlotItem {
+                component_id: 0,
+                slot,
+                item_index: 0,
+                scheme,
+            } if slot == "api" && scheme == "http"
         ));
     }
 }
