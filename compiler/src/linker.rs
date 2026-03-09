@@ -481,6 +481,39 @@ fn mount_source_site(
     Some((src, span))
 }
 
+#[derive(Clone, Debug)]
+enum StorageMountSinkSite {
+    Binding(BindingOrigin),
+    Mount {
+        component: ComponentId,
+        mount_index: usize,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct StorageMountSink {
+    component: ComponentId,
+    sink_id: String,
+    description: String,
+    site: StorageMountSinkSite,
+}
+
+fn storage_mount_sink_site(
+    provenance: &Provenance,
+    store: &DigestStore,
+    sink: &StorageMountSinkSite,
+) -> Option<(NamedSource<Arc<str>>, SourceSpan)> {
+    match sink {
+        StorageMountSinkSite::Binding(origin) => {
+            binding_source_site(provenance, store, origin.realm, &origin.target_key)
+        }
+        StorageMountSinkSite::Mount {
+            component,
+            mount_index,
+        } => mount_source_site(provenance, store, *component, *mount_index),
+    }
+}
+
 #[allow(unused_assignments)]
 #[derive(Debug, Error, Diagnostic)]
 #[non_exhaustive]
@@ -584,7 +617,8 @@ pub enum Error {
         code(linker::storage_mount_requires_resource),
         help(
             "Declare `resources.<name>: {{ kind: \"storage\" }}` and bind it to the mounted \
-             storage slot."
+             storage slot, or mount a local resource directly with `program.mounts: [{{ from: \
+             \"resources.<name>\", path: ... }}]`."
         )
     )]
     StorageMountRequiresResource {
@@ -600,7 +634,7 @@ pub enum Error {
 
     #[error(
         "storage resource `resources.{resource}` on {owner_component_path} fans out to multiple \
-         mounted storage slots"
+         mounted storage sinks"
     )]
     #[diagnostic(
         code(linker::storage_resource_fanout),
@@ -614,7 +648,7 @@ pub enum Error {
         resource: String,
         #[source_code]
         src: NamedSource<Arc<str>>,
-        #[label(primary, "one mounted sink is bound here")]
+        #[label(primary, "one mounted sink uses this resource here")]
         span: SourceSpan,
         #[related]
         related: Vec<RelatedSpan>,
@@ -2833,104 +2867,136 @@ fn validate_storage_mounts(
             )
         })
         .collect();
-    let mut sinks_by_resource: HashMap<ResourceRef, Vec<(ComponentId, String, BindingOrigin)>> =
-        HashMap::new();
+    let mut sinks_by_resource: HashMap<ResourceRef, Vec<StorageMountSink>> = HashMap::new();
 
     for id in (0..components.len()).map(ComponentId) {
         let manifest = manifests[id.0].as_ref().expect("manifest should exist");
-        for (slot_name, slot_decl) in manifest.slots().iter() {
-            if slot_decl.decl.kind != CapabilityKind::Storage {
-                continue;
-            }
-            let Some(mount_index) = storage_mount_index(manifest, slot_name.as_str()) else {
-                continue;
-            };
-            let slot_ref = SlotRef {
-                component: id,
-                name: slot_name.to_string(),
-            };
-            let resolved = resolver.resolve_slot(&slot_ref, errors);
-            let Some(resolved) = resolved else {
-                let component_path = describe_component_path(&component_path_for(components, id));
-                let (src, span) = mount_source_site(provenance, store, id, mount_index)
-                    .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
-                let mut related: Vec<_> = component_decl_site(components, provenance, store, id)
-                    .into_iter()
-                    .collect();
-                if let Some(site) = slot_decl_related_span(
-                    components,
-                    provenance,
-                    store,
-                    &slot_ref,
-                    "storage slot",
-                    "storage slot declared here",
-                    false,
-                ) {
-                    related.push(site);
-                }
-                errors.push(Error::StorageMountRequiresResource {
-                    component_path,
-                    slot: slot_name.to_string(),
-                    src,
-                    span,
-                    related,
-                });
-                continue;
-            };
-            let BindingFrom::Resource(resource) = resolved.from else {
-                let component_path = describe_component_path(&component_path_for(components, id));
-                let (src, span) = mount_source_site(provenance, store, id, mount_index)
-                    .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
-                let mut related: Vec<_> = component_decl_site(components, provenance, store, id)
-                    .into_iter()
-                    .collect();
-                if let Some(site) = slot_decl_related_span(
-                    components,
-                    provenance,
-                    store,
-                    &slot_ref,
-                    "storage slot",
-                    "storage slot declared here",
-                    false,
-                ) {
-                    related.push(site);
-                }
-                errors.push(Error::StorageMountRequiresResource {
-                    component_path,
-                    slot: slot_name.to_string(),
-                    src,
-                    span,
-                    related,
-                });
-                continue;
-            };
+        let Some(program) = manifest.program() else {
+            continue;
+        };
+        for (mount_index, mount) in program.mounts().iter().enumerate() {
+            match &mount.source {
+                MountSource::Slot(slot_name) => {
+                    let Some(slot_decl) = manifest.slots().get(slot_name.as_str()) else {
+                        continue;
+                    };
+                    if slot_decl.decl.kind != CapabilityKind::Storage {
+                        continue;
+                    }
 
-            if let Some((realm, target_key)) = binding_origins.get(&(id, slot_name.as_str())) {
-                sinks_by_resource.entry(resource).or_default().push((
-                    id,
-                    slot_name.to_string(),
-                    BindingOrigin {
-                        realm: *realm,
-                        target_key: target_key.clone(),
-                    },
-                ));
-            } else {
-                sinks_by_resource.entry(resource).or_default().push((
-                    id,
-                    slot_name.to_string(),
-                    BindingOrigin {
-                        realm: id,
-                        target_key: BindingTargetKey::SelfSlot(slot_name.as_str().into()),
-                    },
-                ));
+                    let slot_ref = SlotRef {
+                        component: id,
+                        name: slot_name.to_string(),
+                    };
+                    let resolved = resolver.resolve_slot(&slot_ref, errors);
+                    let Some(resolved) = resolved else {
+                        let component_path =
+                            describe_component_path(&component_path_for(components, id));
+                        let (src, span) = mount_source_site(provenance, store, id, mount_index)
+                            .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                        let mut related: Vec<_> =
+                            component_decl_site(components, provenance, store, id)
+                                .into_iter()
+                                .collect();
+                        if let Some(site) = slot_decl_related_span(
+                            components,
+                            provenance,
+                            store,
+                            &slot_ref,
+                            "storage slot",
+                            "storage slot declared here",
+                            false,
+                        ) {
+                            related.push(site);
+                        }
+                        errors.push(Error::StorageMountRequiresResource {
+                            component_path,
+                            slot: slot_name.to_string(),
+                            src,
+                            span,
+                            related,
+                        });
+                        continue;
+                    };
+                    let BindingFrom::Resource(resource) = resolved.from else {
+                        let component_path =
+                            describe_component_path(&component_path_for(components, id));
+                        let (src, span) = mount_source_site(provenance, store, id, mount_index)
+                            .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                        let mut related: Vec<_> =
+                            component_decl_site(components, provenance, store, id)
+                                .into_iter()
+                                .collect();
+                        if let Some(site) = slot_decl_related_span(
+                            components,
+                            provenance,
+                            store,
+                            &slot_ref,
+                            "storage slot",
+                            "storage slot declared here",
+                            false,
+                        ) {
+                            related.push(site);
+                        }
+                        errors.push(Error::StorageMountRequiresResource {
+                            component_path,
+                            slot: slot_name.to_string(),
+                            src,
+                            span,
+                            related,
+                        });
+                        continue;
+                    };
+
+                    let site = if let Some((realm, target_key)) =
+                        binding_origins.get(&(id, slot_name.as_str()))
+                    {
+                        StorageMountSinkSite::Binding(BindingOrigin {
+                            realm: *realm,
+                            target_key: target_key.clone(),
+                        })
+                    } else {
+                        StorageMountSinkSite::Binding(BindingOrigin {
+                            realm: id,
+                            target_key: BindingTargetKey::SelfSlot(slot_name.as_str().into()),
+                        })
+                    };
+                    sinks_by_resource
+                        .entry(resource)
+                        .or_default()
+                        .push(StorageMountSink {
+                            component: id,
+                            sink_id: format!("slot:{slot_name}"),
+                            description: format!("slots.{slot_name}"),
+                            site,
+                        });
+                }
+                MountSource::Resource(resource_name) => {
+                    sinks_by_resource
+                        .entry(ResourceRef {
+                            component: id,
+                            name: resource_name.clone(),
+                        })
+                        .or_default()
+                        .push(StorageMountSink {
+                            component: id,
+                            sink_id: format!("mount:{mount_index}"),
+                            description: format!("resources.{resource_name}"),
+                            site: StorageMountSinkSite::Mount {
+                                component: id,
+                                mount_index,
+                            },
+                        });
+                }
+                _ => {}
             }
         }
     }
 
     for (resource, sinks) in sinks_by_resource {
         let mut unique_sinks = HashSet::new();
-        for (component, slot, _) in &sinks {
-            unique_sinks.insert((*component, slot.clone()));
+        for sink in &sinks {
+            unique_sinks.insert((sink.component, sink.sink_id.clone()));
         }
         if unique_sinks.len() <= 1 {
             continue;
@@ -2938,21 +3004,20 @@ fn validate_storage_mounts(
 
         let owner_component_path =
             describe_component_path(&component_path_for(components, resource.component));
-        let (src, span) =
-            binding_source_site(provenance, store, sinks[0].2.realm, &sinks[0].2.target_key)
-                .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+        let (src, span) = storage_mount_sink_site(provenance, store, &sinks[0].site)
+            .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
         let related = sinks
             .iter()
             .skip(1)
-            .filter_map(|(_, slot, origin)| {
-                binding_source_site(provenance, store, origin.realm, &origin.target_key).map(
-                    |(src, span)| RelatedSpan {
-                        message: format!("another mounted sink is bound through `slots.{slot}`"),
+            .filter_map(|sink| {
+                storage_mount_sink_site(provenance, store, &sink.site).map(|(src, span)| {
+                    RelatedSpan {
+                        message: format!("another mounted sink uses `{}`", sink.description),
                         src,
                         span,
-                        label: "another mounted sink is bound here".to_string(),
-                    },
-                )
+                        label: "another mounted sink uses this resource here".to_string(),
+                    }
+                })
             })
             .collect();
         errors.push(Error::StorageResourceFanout {

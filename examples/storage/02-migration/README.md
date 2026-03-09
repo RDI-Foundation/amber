@@ -52,6 +52,10 @@ Amber currently makes storage resources implicit. There is no separate `from: "f
 field in the manifest syntax yet. Declaring `resources.app_state: { kind: "storage", ... }` is the
 allocation step.
 
+For a simple single-component service, Amber can now mount `resources.<name>` directly in the
+program. This example intentionally keeps the routed form because the parent owner path is the
+identity that must survive the v1 to v2 refactor.
+
 ## Files
 
 - `scenario.json5`: v1 root scenario

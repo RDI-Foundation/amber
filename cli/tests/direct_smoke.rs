@@ -600,43 +600,21 @@ exec python3 -m http.server 8080 --bind 127.0.0.1 -d /tmp/www
         perms.set_mode(0o755);
         fs::set_permissions(&script, perms).expect("chmod script");
 
-        let child_path = temp.path().join("app.json5");
         let root_path = temp.path().join("scenario.json5");
-        fs::write(
-            &root_path,
-            r##"{
-  manifest_version: "0.1.0",
-  resources: {
-    state: { kind: "storage" },
-  },
-  components: {
-    app: "./app.json5",
-  },
-  bindings: [
-    { to: "#app.state", from: "resources.state" },
-  ],
-  exports: {
-    http: "#app.http",
-  },
-}
-"##,
-        )
-        .expect("failed to write root manifest");
-
-        let write_child = |version: &str, initial_state: &str| {
+        let write_manifest = |version: &str, initial_state: &str| {
             fs::write(
-                &child_path,
+                &root_path,
                 format!(
                     r#"{{
   manifest_version: "0.1.0",
-  slots: {{
+  resources: {{
     state: {{ kind: "storage" }},
   }},
   program: {{
     path: "./bin/serve-state.sh",
     args: ["{version}", "{initial_state}"],
     mounts: [
-      {{ path: "/var/lib/app", from: "slots.state" }},
+      {{ path: "/var/lib/app", from: "resources.state" }},
     ],
     network: {{
       endpoints: [
@@ -654,14 +632,14 @@ exec python3 -m http.server 8080 --bind 127.0.0.1 -d /tmp/www
 "#
                 ),
             )
-            .expect("failed to write child manifest");
+            .expect("failed to write manifest");
         };
 
         let direct_out = temp.path().join("out");
         let storage_root = temp.path().join("persistent-state");
         let runtime_bin_dir = ensure_runtime_binaries_built(&workspace_root);
 
-        write_child("version-v1", "persisted-v1");
+        write_manifest("version-v1", "persisted-v1");
         compile_direct_or_panic(&direct_out, &root_path);
 
         let storage_root_arg = storage_root.to_string_lossy().into_owned();
@@ -693,7 +671,7 @@ exec python3 -m http.server 8080 --bind 127.0.0.1 -d /tmp/www
         );
         shutdown_direct_runtime(&mut amber_run, &mut proxy);
 
-        write_child("version-v2", "persisted-v2");
+        write_manifest("version-v2", "persisted-v2");
         compile_direct_or_panic(&direct_out, &root_path);
 
         let mut amber_run = spawn_amber_run_with_args(

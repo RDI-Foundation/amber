@@ -28,7 +28,7 @@ The key idea is:
 For storage specifically, the implemented first step is:
 
 - a component can declare a managed storage resource in `resources`
-- bindings route that resource into child storage slots
+- a program can mount that resource directly, or bindings can route it into child storage slots
 - mounted storage must resolve from a resource, not from a root storage slot
 
 This keeps the capability story coherent, avoids tying persistence to consumer moniker, and
@@ -439,37 +439,10 @@ This is recommended syntax, not merely illustrative pseudocode.
     },
   },
 
-  components: {
-    app: "./app.json5",
-  },
-
-  bindings: [
-    { to: "#app.state", from: "resources.user_db" },
-  ],
-}
-```
-
-Child:
-
-```json5
-{
-  manifest_version: "0.1.0",
-
-  slots: {
-    state: {
-      kind: "storage",
-      request: {
-        min_size: "20Gi",
-        sharing: "exclusive",
-        retention: "retain",
-      },
-    },
-  },
-
   program: {
     image: "python:3.12-alpine",
     mounts: [
-      { path: "/var/lib/app", from: "slots.state" },
+      { path: "/var/lib/app", from: "resources.user_db" },
     ],
   },
 }
@@ -477,10 +450,13 @@ Child:
 
 This means:
 
-- the parent owns a framework-managed storage resource called `user_db`
-- the resource is routed into the child's `state` slot
-- the child mounts `slots.state`, not `resources.user_db`
-- the child only sees the capability boundary, not the framework object directly
+- the component owns a framework-managed storage resource called `user_db`
+- the program mounts `resources.user_db` directly
+- the resource identity is still the owner path plus resource name
+
+When the resource owner and the consuming program are different components, Amber still routes the
+resource through a child storage slot. That routed form remains useful for migration-preserving
+refactors and other cases where the owner boundary is intentional.
 
 ## External Identity-Bearing Storage Still Exists
 

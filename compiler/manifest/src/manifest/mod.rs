@@ -583,6 +583,7 @@ fn validate_endpoints(
 fn validate_mounts(
     program: Option<&Program>,
     config_schema: Option<&ConfigSchema>,
+    resources: &BTreeMap<ResourceName, ResourceDecl>,
     slots: &BTreeMap<SlotName, SlotDecl>,
     enabled_features: &BTreeSet<ExperimentalFeature>,
 ) -> Result<(), Error> {
@@ -656,6 +657,13 @@ fn validate_mounts(
                 let (any_secret, any_non_secret) = mount_secret_flags(&schema.0, path)?;
                 if !any_secret || any_non_secret {
                     return Err(Error::MountSecretPathIsNotSecret { path: path.clone() });
+                }
+            }
+            MountSource::Resource(resource) => {
+                if !resources.contains_key(resource.as_str()) {
+                    return Err(Error::UnknownMountResource {
+                        resource: resource.clone(),
+                    });
                 }
             }
             MountSource::Framework(name) => {
@@ -797,6 +805,7 @@ impl RawManifest {
         validate_mounts(
             program.as_ref(),
             config_schema.as_ref(),
+            &resources,
             &slots,
             &experimental_features,
         )?;

@@ -89,30 +89,54 @@ pub(crate) fn build_storage_plan(
 
         let mut mounts = Vec::new();
         for mount in program.mounts() {
-            let MountSource::Slot(slot) = &mount.source else {
-                continue;
-            };
-            let Some(slot_decl) = component.slots.get(slot.as_str()) else {
-                continue;
-            };
-            if slot_decl.decl.kind != CapabilityKind::Storage {
-                continue;
-            }
+            let (identity, source_name) = match &mount.source {
+                MountSource::Slot(slot) => {
+                    let Some(slot_decl) = component.slots.get(slot.as_str()) else {
+                        continue;
+                    };
+                    if slot_decl.decl.kind != CapabilityKind::Storage {
+                        continue;
+                    }
 
-            let identity = resource_by_target
-                .get(&(*component_id, slot.clone()))
-                .cloned()
-                .unwrap_or_else(|| {
-                    unreachable!(
-                        "linker should reject mounted storage without a resource binding before \
-                         storage planning: {}.{}",
-                        component.moniker, slot
+                    let identity = resource_by_target
+                        .get(&(*component_id, slot.clone()))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            unreachable!(
+                                "linker should reject mounted storage without a resource binding \
+                                 before storage planning: {}.{}",
+                                component.moniker, slot
+                            )
+                        });
+                    (identity, slot.clone())
+                }
+                MountSource::Resource(resource) => {
+                    let Some(resource_decl) = component.resources.get(resource.as_str()) else {
+                        unreachable!(
+                            "manifest validation should reject unknown mounted resource before \
+                             storage planning: {}.{}",
+                            component.moniker, resource
+                        );
+                    };
+                    if resource_decl.kind != CapabilityKind::Storage {
+                        continue;
+                    }
+
+                    (
+                        StorageIdentity {
+                            owner: *component_id,
+                            owner_moniker: component.moniker.as_str().to_string(),
+                            resource: resource.clone(),
+                        },
+                        resource.clone(),
                     )
-                });
+                }
+                _ => continue,
+            };
 
             mounts.push(StorageMount {
                 identity,
-                slot: slot.clone(),
+                slot: source_name,
                 mount_path: mount.path.clone(),
             });
         }

@@ -152,8 +152,9 @@ pub enum Error {
     #[diagnostic(
         code(manifest::unsupported_provide_kind),
         help(
-            "Storage is routed through `slots` and `bindings`, not `provides`. Declare \
-             `slots.{name}: {{ kind: \"storage\" }}` and bind it from the parent instead."
+            "Storage is declared in `resources` or received through `slots`, not `provides`. \
+             Declare `resources.{name}: {{ kind: \"storage\" }}` and mount it directly, or use \
+             `slots.{name}: {{ kind: \"storage\" }}` when the storage is bound from a parent."
         )
     )]
     UnsupportedProvideKind {
@@ -202,6 +203,10 @@ pub enum Error {
     #[error("mount source `slots.{slot}` references unknown slot")]
     #[diagnostic(code(manifest::unknown_mount_slot))]
     UnknownMountSlot { slot: String },
+
+    #[error("mount source `resources.{resource}` references unknown resource")]
+    #[diagnostic(code(manifest::unknown_mount_resource))]
+    UnknownMountResource { resource: String },
 
     #[error("mount source `slots.{slot}` requires a storage slot, but `{slot}` is `{kind}`")]
     #[diagnostic(

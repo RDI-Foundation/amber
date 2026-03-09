@@ -643,7 +643,7 @@ fn build_mount_specs(
         for mount in program.mounts() {
             let query = match &mount.source {
                 MountSource::Config(path) | MountSource::Secret(path) => path,
-                MountSource::Slot(_) => {
+                MountSource::Resource(_) | MountSource::Slot(_) => {
                     // Storage mounts are planned separately from helper-written file mounts.
                     continue;
                 }

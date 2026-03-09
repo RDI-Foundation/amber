@@ -1,43 +1,28 @@
 <!-- amber-docs
-summary: Allocate a storage resource, route it into a child, write through an exported binding, and verify that state survives redeploys.
+summary: Allocate a storage resource, mount it directly in the program, write through an exported binding, and verify that state survives redeploys.
 -->
 
 # Storage persistence
 
-This example is meant to answer one practical question: if a child mounts storage, how do you
+This example is meant to answer one practical question: if a program mounts storage directly, how do you
 prove that the data survives a redeploy without reaching into the container?
 
-The answer in Amber is: make the child expose a normal interface, then do the whole exercise
+The answer in Amber is: make the program expose a normal interface, then do the whole exercise
 through that declared binding.
 
 This scenario does three things:
 
-- the root scenario allocates `resources.app_state`
-- the child declares a storage slot, `slots.state`
-- the child mounts that slot at `/var/lib/app`
-- the child exports an HTTP interface that lets you read and replace the stored value
-- the root scenario routes `resources.app_state` into the child
+- the root component allocates `resources.app_state`
+- the root program mounts that resource at `/var/lib/app`
+- the root exports an HTTP interface that lets you read and replace the stored value
 
-The important boundary is still the same: the child does not know whether the storage becomes a
-Docker volume, a direct-mode state directory, or a Kubernetes PVC. The parent just routes a
-storage capability into the slot.
+The important boundary is still the same: the program does not know whether the storage becomes a
+Docker volume, a direct-mode state directory, or a Kubernetes PVC. It just mounts a storage
+resource at a directory path.
 
 ## The Amber model
 
-The child manifest asks for storage and mounts it:
-
-```json5
-slots: {
-  state: { kind: "storage" },
-},
-program: {
-  mounts: [
-    { path: "/var/lib/app", from: "slots.state" },
-  ],
-}
-```
-
-The root scenario allocates durable storage and routes it into the child:
+The scenario allocates durable storage and mounts it directly in the program:
 
 ```json5
 resources: {
@@ -48,17 +33,19 @@ resources: {
     },
   },
 },
-bindings: [
-  { to: "#app.state", from: "resources.app_state" },
-]
+program: {
+  mounts: [
+    { path: "/var/lib/app", from: "resources.app_state" },
+  ],
+}
 ```
 
 That is the storage story. The rest of the example is just there to make the persistence visible
 through a real export.
 
-## The child interface
+## The program interface
 
-The child app serves three HTTP paths over the exported `http` capability:
+The program serves three HTTP paths over the exported `http` capability:
 
 - `GET /version` returns the deployment version from component config
 - `GET /state` returns the current contents of `/var/lib/app/state.txt`
@@ -116,13 +103,13 @@ docker compose down
 
 At this point the containers are gone, but the named volume still exists.
 
-4. Simulate a new deployment by changing the child component config in
+4. Simulate a new deployment by changing the program env in
 `examples/storage/01-persistence/scenario.json5`:
 
 ```json5
-config: {
-  version: "v2",
-  initial_state: "seeded by v2",
+env: {
+  APP_VERSION: "v2",
+  APP_INITIAL_STATE: "seeded by v2",
 },
 ```
 
@@ -178,7 +165,7 @@ Replace the generated `namespace:` value with something stable, for example
 kubectl create namespace amber-storage-demo
 kubectl apply -k /tmp/amber-storage-k8s
 kubectl -n amber-storage-demo rollout status deploy/amber-router
-kubectl -n amber-storage-demo rollout status deploy/c1-app
+kubectl -n amber-storage-demo rollout status deploy/c0-component
 ```
 
 3. In one terminal, run the router port-forward:
@@ -203,7 +190,7 @@ amber proxy . \
 curl -fsS http://127.0.0.1:18080/version; echo
 curl -fsS http://127.0.0.1:18080/state; echo
 curl -fsS -X PUT --data-binary 'remembered from k8s v1' http://127.0.0.1:18080/state; echo
-kubectl -n amber-storage-demo delete deploy c1-app amber-router
+kubectl -n amber-storage-demo delete deploy c0-component amber-router
 ```
 
 That removes the workloads, but the PVC remains in `amber-storage-demo`.
@@ -217,7 +204,7 @@ cd /tmp/amber-storage-k8s
 $EDITOR kustomization.yaml
 kubectl apply -k /tmp/amber-storage-k8s
 kubectl -n amber-storage-demo rollout status deploy/amber-router
-kubectl -n amber-storage-demo rollout status deploy/c1-app
+kubectl -n amber-storage-demo rollout status deploy/c0-component
 kubectl -n amber-storage-demo port-forward deploy/amber-router 24000:24000 24100:24100
 cd /tmp/amber-storage-k8s
 amber proxy . \
@@ -259,7 +246,5 @@ So the runtime rejects this example on macOS today.
 
 ## Files
 
-- `scenario.json5`: root scenario that allocates the durable storage resource and sets the child
-  version
-- `app.json5`: child component that mounts storage and exposes `GET /version`, `GET /state`, and
-  `PUT /state`
+- `scenario.json5`: self-contained scenario that allocates the durable storage resource, mounts it
+  directly in the program, and exposes `GET /version`, `GET /state`, and `PUT /state`

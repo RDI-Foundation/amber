@@ -1,0 +1,11 @@
+Error: manifest::unknown_mount_resource
+
+  × check failed
+  ╰─▶ mount source `resources.state` references unknown resource
+    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/storage_mount_unknown_resource.json5:10:37]
+  9 │     mounts: [
+ 10 │       { path: "/var/lib/app", from: "resources.state" },
+    ·                                     ────────┬────────
+    ·                                             ╰── mount source here
+ 11 │     ],
+    ╰────

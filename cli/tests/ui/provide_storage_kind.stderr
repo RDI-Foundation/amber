@@ -9,6 +9,7 @@ Error: manifest::unsupported_provide_kind
    ·                        ╰── unsupported provide kind here
  5 │   },
    ╰────
-  help: Storage is routed through `slots` and `bindings`, not `provides`.
-        Declare `slots.state: { kind: "storage" }` and bind it from the parent
-        instead.
+  help: Storage is declared in `resources` or received through `slots`, not
+        `provides`. Declare `resources.state: { kind: "storage" }` and mount
+        it directly, or use `slots.state: { kind: "storage" }` when the
+        storage is bound from a parent.

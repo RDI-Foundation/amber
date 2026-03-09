@@ -303,11 +303,15 @@ fn write_kubernetes_counter_storage_fixture(root: &Path, version: &str) -> PathB
     let scenario_dir = root.join("kubernetes-storage");
     fs::create_dir_all(&scenario_dir).expect("create kubernetes storage fixture directory");
 
+    let scenario_path = scenario_dir.join("scenario.json5");
     fs::write(
-        scenario_dir.join("app.json5"),
+        &scenario_path,
         format!(
             r#"{{
   manifest_version: "0.1.0",
+  resources: {{
+    state: {{ kind: "storage" }},
+  }},
   program: {{
     image: "busybox:1.36.1",
     entrypoint: [
@@ -317,7 +321,7 @@ fn write_kubernetes_counter_storage_fixture(root: &Path, version: &str) -> PathB
       "mkdir -p /var/lib/app /www; count=0; if [ -f /var/lib/app/count ]; then count=$(cat /var/lib/app/count); fi; count=$((count+1)); printf '%s' \"$count\" >/var/lib/app/count; printf '{version}:%s\n' \"$count\" >/www/index.html; exec httpd -f -p 8080 -h /www"
     ],
     mounts: [
-      {{ path: "/var/lib/app", from: "slots.state" }},
+      {{ path: "/var/lib/app", from: "resources.state" }},
     ],
     network: {{
       endpoints: [
@@ -331,35 +335,9 @@ fn write_kubernetes_counter_storage_fixture(root: &Path, version: &str) -> PathB
   exports: {{
     http: "http",
   }},
-  slots: {{
-    state: {{ kind: "storage" }},
-  }},
 }}
 "#
         ),
-    )
-    .expect("write kubernetes storage app manifest");
-
-    let scenario_path = scenario_dir.join("scenario.json5");
-    fs::write(
-        &scenario_path,
-        r##"
-{
-  manifest_version: "0.1.0",
-  resources: {
-    state: { kind: "storage" },
-  },
-  components: {
-    app: "./app.json5",
-  },
-  bindings: [
-    { to: "#app.state", from: "resources.state" },
-  ],
-  exports: {
-    http: "#app.http",
-  },
-}
-"##,
     )
     .expect("write kubernetes storage root scenario");
 
@@ -370,12 +348,13 @@ fn write_kubernetes_storage_fixture(root: &Path, version: &str, initial_state: &
     let scenario_dir = root.join("kubernetes-storage");
     fs::create_dir_all(&scenario_dir).expect("create kubernetes storage fixture directory");
 
+    let scenario_path = scenario_dir.join("scenario.json5");
     fs::write(
-        scenario_dir.join("app.json5"),
+        &scenario_path,
         format!(
             r##"{{
   manifest_version: "0.1.0",
-  slots: {{
+  resources: {{
     state: {{ kind: "storage" }},
   }},
   program: {{
@@ -393,7 +372,7 @@ fn write_kubernetes_storage_fixture(root: &Path, version: &str, initial_state: &
       ",
     ],
     mounts: [
-      {{ path: "/var/lib/app", from: "slots.state" }},
+      {{ path: "/var/lib/app", from: "resources.state" }},
     ],
     network: {{
       endpoints: [{{ name: "http", port: 8080, protocol: "http" }}],
@@ -405,25 +384,6 @@ fn write_kubernetes_storage_fixture(root: &Path, version: &str, initial_state: &
 }}
 "##,
         ),
-    )
-    .expect("write kubernetes storage app manifest");
-
-    let scenario_path = scenario_dir.join("scenario.json5");
-    fs::write(
-        &scenario_path,
-        r##"{
-  manifest_version: "0.1.0",
-  resources: {
-    state: { kind: "storage" },
-  },
-  components: {
-    app: "./app.json5",
-  },
-  bindings: [
-    { to: "#app.state", from: "resources.state" },
-  ],
-}
-"##,
     )
     .expect("write kubernetes storage root scenario");
 
@@ -1167,7 +1127,7 @@ fn kubernetes_storage_mounts_emit_pvc_and_recreate_deployment() {
 
     let deployment_yaml = artifact
         .files
-        .get(&PathBuf::from("03-deployments/c1-app.yaml"))
+        .get(&PathBuf::from("03-deployments/c0-component.yaml"))
         .expect("deployment yaml");
     assert!(
         deployment_yaml.contains("kind: Deployment"),
@@ -1211,7 +1171,7 @@ fn kubernetes_storage_mounts_emit_pvc_and_recreate_deployment() {
     );
     assert_eq!(
         plan_doc["targets"][1]["config"]["inbound"][0]["target"]["peer_addr"],
-        serde_json::Value::String("c1-app:23000".to_string())
+        serde_json::Value::String("c0-component:23000".to_string())
     );
 
     let readme = artifact
@@ -1295,7 +1255,7 @@ fn kubernetes_emits_deployment_and_pvc_for_storage_mounts() {
 
     let deployment = artifact
         .files
-        .get(&PathBuf::from("03-deployments/c1-app.yaml"))
+        .get(&PathBuf::from("03-deployments/c0-component.yaml"))
         .expect("deployment manifest");
     assert!(deployment.contains("kind: Deployment"), "{deployment}");
     assert!(deployment.contains("type: Recreate"), "{deployment}");
@@ -1310,7 +1270,7 @@ fn kubernetes_emits_deployment_and_pvc_for_storage_mounts() {
     assert!(
         artifact
             .files
-            .contains_key(&PathBuf::from("03-deployments/c1-app.yaml")),
+            .contains_key(&PathBuf::from("03-deployments/c0-component.yaml")),
         "storage-backed components should still render as deployments"
     );
 }
@@ -1323,7 +1283,7 @@ fn kubernetes_mesh_workloads_wait_for_fresh_mesh_config() {
 
     let component_deployment = artifact
         .files
-        .get(&PathBuf::from("03-deployments/c1-app.yaml"))
+        .get(&PathBuf::from("03-deployments/c0-component.yaml"))
         .expect("component deployment yaml");
     assert!(
         component_deployment.contains("name: wait-mesh-config"),
@@ -1757,7 +1717,7 @@ fn kubernetes_smoke_storage_upgrade_reuses_pvc() {
         rollout
             .arg("rollout")
             .arg("status")
-            .arg("deployment/c1-app")
+            .arg("deployment/c0-component")
             .arg("--timeout=180s")
             .arg("-n")
             .arg(&namespace);

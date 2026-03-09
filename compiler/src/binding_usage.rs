@@ -227,6 +227,10 @@ fn collect_program_used_config_paths(
             MountSource::Config(path) | MountSource::Secret(path) => {
                 used.insert(path.clone());
             }
+            MountSource::Resource(_)
+            | MountSource::Slot(_)
+            | MountSource::Binding(_)
+            | MountSource::Framework(_) => {}
             _ => {}
         }
     }

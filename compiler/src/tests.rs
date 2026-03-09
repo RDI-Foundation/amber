@@ -1910,6 +1910,112 @@ async fn storage_resource_binding_stays_strong() {
 }
 
 #[tokio::test]
+async fn program_can_mount_local_storage_resource_directly() {
+    let dir = tmp_dir("storage-resource-direct-mount");
+    let root_path = dir.path().join("root.json5");
+
+    write_file(
+        &root_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          resources: {
+            state: { kind: "storage" },
+          },
+          program: {
+            image: "busybox:1.36.1",
+            entrypoint: ["sh", "-lc", "test -d /var/lib/app && sleep 3600"],
+            mounts: [
+              { path: "/var/lib/app", from: "resources.state" },
+            ],
+            network: {
+              endpoints: [{ name: "http", port: 8080 }],
+            },
+          },
+          provides: {
+            http: { kind: "http", endpoint: "http" },
+          },
+          exports: {
+            http: "http",
+          },
+        }
+        "#,
+    );
+
+    let output = default_compiler()
+        .compile(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .expect("compile storage scenario with direct resource mount");
+
+    let root = output.scenario.component(output.scenario.root);
+    assert!(
+        root.resources.contains_key("state"),
+        "root should retain the directly mounted storage resource"
+    );
+    assert!(
+        root.program
+            .as_ref()
+            .expect("root program")
+            .mounts()
+            .iter()
+            .any(|mount| mount.source.to_string() == "resources.state"),
+        "program should keep the direct resource mount"
+    );
+    assert!(
+        output.scenario.bindings.is_empty(),
+        "direct resource mounts should not require synthetic bindings"
+    );
+}
+
+#[tokio::test]
+async fn directly_mounted_storage_resource_fanout_is_rejected_at_link_time() {
+    let dir = tmp_dir("direct-storage-resource-fanout");
+    let root_path = dir.path().join("root.json5");
+
+    write_file(
+        &root_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          resources: {
+            state: { kind: "storage" },
+          },
+          program: {
+            image: "busybox:1.36.1",
+            entrypoint: ["sh", "-lc", "test -d /var/lib/a && test -d /var/lib/b && sleep 3600"],
+            mounts: [
+              { path: "/var/lib/a", from: "resources.state" },
+              { path: "/var/lib/b", from: "resources.state" },
+            ],
+          },
+        }
+        "#,
+    );
+
+    let err = default_compiler()
+        .compile(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .expect_err("direct storage fanout should fail during linking");
+
+    let crate::Error::Linker(crate::linker::Error::Multiple { errors, .. }) = err else {
+        panic!("expected linker error, got {err}");
+    };
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            crate::linker::Error::StorageResourceFanout { resource, .. } if resource == "state"
+        )),
+        "expected storage resource fanout linker error, got {errors:?}"
+    );
+}
+
+#[tokio::test]
 async fn mounted_storage_slot_requires_resource_binding_at_link_time() {
     let dir = tmp_dir("mounted-storage-slot-requires-resource-binding");
     let root_path = dir.path().join("root.json5");

@@ -643,7 +643,7 @@ fn collect_config_uses(manifest: &Manifest) -> ConfigUses {
         for mount in program.mounts() {
             match &mount.source {
                 MountSource::Config(path) | MountSource::Secret(path) => uses.add_query(path),
-                MountSource::Slot(_) => {}
+                MountSource::Resource(_) | MountSource::Slot(_) => {}
                 MountSource::Binding(_) | MountSource::Framework(_) => {}
             }
         }

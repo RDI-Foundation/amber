@@ -593,17 +593,19 @@ fn compile_direct_emits_storage_mounts_in_plan() {
     fs::create_dir_all(&manifests_dir).expect("failed to create manifests directory");
 
     let root_manifest = manifests_dir.join("scenario.json5");
-    let child_manifest = manifests_dir.join("app.json5");
     fs::write(
-        &child_manifest,
+        &root_manifest,
         r#"
         {
           manifest_version: "0.1.0",
+          resources: {
+            state: { kind: "storage" },
+          },
           program: {
             path: "/bin/sh",
             args: ["-lc", "sleep 3600"],
             mounts: [
-              { path: "/var/lib/app", from: "slots.state" },
+              { path: "/var/lib/app", from: "resources.state" },
             ],
             network: {
               endpoints: [
@@ -611,38 +613,14 @@ fn compile_direct_emits_storage_mounts_in_plan() {
               ],
             },
           },
-          slots: {
-            state: { kind: "storage" },
-          },
           provides: {
             http: { kind: "http", endpoint: "http" },
           },
           exports: {
-            http: "http",
+            public: "http",
           },
         }
         "#,
-    )
-    .expect("write child manifest");
-    fs::write(
-        &root_manifest,
-        r##"
-        {
-          manifest_version: "0.1.0",
-          resources: {
-            state: { kind: "storage" },
-          },
-          components: {
-            app: "./app.json5",
-          },
-          bindings: [
-            { to: "#app.state", from: "resources.state" },
-          ],
-          exports: {
-            public: "#app.http",
-          },
-        }
-        "##,
     )
     .expect("write root manifest");
 

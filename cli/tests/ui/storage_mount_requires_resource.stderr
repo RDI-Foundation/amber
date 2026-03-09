@@ -8,7 +8,7 @@ linker::storage_mount_requires_resource
     :                                           `-- storage mount declared here
  16 |     ],
     `----
-  help: Declare `resources.<name>: { kind: "storage" }` and bind it to the mounted storage slot.
+  help: Declare `resources.<name>: { kind: "storage" }` and bind it to the mounted storage slot, or mount a local resource directly with `program.mounts: [{ from: "resources.<name>", path: ... }]`.
 
 Advice: 
   > component `app` declared on root component

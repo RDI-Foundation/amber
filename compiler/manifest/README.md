@@ -306,26 +306,29 @@ Notes:
 * Mount paths must be absolute and must not include `..`.
 * `secret.<path>` requires the path to be secret in the component’s config schema.
 * `config.<path>` must not reference secret values.
-* `slots.<name>` mounts storage as a directory capability. Use a directory path such as
+* `resources.<name>` mounts a storage resource owned by the same component.
+* `slots.<name>` mounts storage routed in from another component. Use a directory path such as
   `/var/lib/app`, not a single file path.
 
 Example:
 
 ```json5
-slots: {
+resources: {
   state: { kind: "storage" },
 },
 program: {
   image: "ghcr.io/acme/app:v1",
   entrypoint: ["app", "--state-dir", "/var/lib/app"],
   mounts: [
-    { path: "/var/lib/app", from: "slots.state" },
+    { path: "/var/lib/app", from: "resources.state" },
   ],
 }
 ```
 
-The important mental model is that `slots.state` is a virtual storage object, not a string and not
-a URL-shaped object. Programs consume it by mounting it into their filesystem namespace.
+The important mental model is that storage is a directory capability, not a string and not a
+URL-shaped object. Programs consume it by mounting it into their filesystem namespace, either from
+`resources.<name>` when they own the storage locally or from `slots.<name>` when the storage is
+routed in from elsewhere.
 
 ### Interpolation in `image`/`path`, `entrypoint`/`args`, and `env`
 
@@ -529,8 +532,9 @@ resources: {
 Rules enforced:
 
 * `kind` must currently be `"storage"`.
-* Storage resources are capability sources. Bind them into storage slots with
-  `from: "resources.<name>"`, then consume the slot via `program.mounts`.
+* Storage resources are capability sources. A component can mount its own storage directly with
+  `program.mounts: [{ from: "resources.<name>", ... }]`, or bind the resource into a child storage
+  slot with `from: "resources.<name>"`.
 
 Example:
 
@@ -543,9 +547,11 @@ resources: {
     },
   },
 },
-bindings: [
-  { to: "#app.state", from: "resources.app_state" },
-]
+program: {
+  mounts: [
+    { path: "/var/lib/app", from: "resources.app_state" },
+  ],
+}
 ```
 
 ### `provides`
@@ -772,28 +778,7 @@ This component:
 
 ### 4) Allocate storage with `resources` and mount it (valid)
 
-The child declares a storage slot and mounts it. The parent allocates a storage resource and binds
-that resource into the child slot.
-
-Child:
-
-```json5
-{
-  manifest_version: "0.1.0",
-  slots: {
-    state: { kind: "storage" },
-  },
-  program: {
-    image: "ghcr.io/acme/app:v1",
-    entrypoint: ["app", "--state-dir", "/var/lib/app"],
-    mounts: [
-      { path: "/var/lib/app", from: "slots.state" },
-    ],
-  },
-}
-```
-
-Parent:
+When the program and the storage resource live on the same component, mount the resource directly:
 
 ```json5
 {
@@ -806,14 +791,18 @@ Parent:
       },
     },
   },
-  components: {
-    app: "./app.json5",
+  program: {
+    image: "ghcr.io/acme/app:v1",
+    entrypoint: ["app", "--state-dir", "/var/lib/app"],
+    mounts: [
+      { path: "/var/lib/app", from: "resources.app_state" },
+    ],
   },
-  bindings: [
-    { to: "#app.state", from: "resources.app_state" },
-  ],
 }
 ```
+
+If the storage owner and the consuming program are different components, keep using a child
+storage slot plus a binding from `resources.<name>`.
 
 ### 5) Weak binding flag (non-ordering; breaks dependency cycles)
 

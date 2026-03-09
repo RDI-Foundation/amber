@@ -1413,6 +1413,31 @@ fn storage_mount_source_parses_for_storage_slots() {
 }
 
 #[test]
+fn storage_mount_source_parses_for_local_resources() {
+    let manifest: Manifest = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [
+              { path: "/var/lib/app", from: "resources.state" },
+            ]
+          },
+          resources: {
+            state: { kind: "storage" },
+          },
+        }
+        "#
+    .parse()
+    .unwrap();
+
+    let program = manifest.program.as_ref().expect("program");
+    assert_eq!(program.mounts().len(), 1);
+    assert_eq!(program.mounts()[0].source.to_string(), "resources.state");
+}
+
+#[test]
 fn storage_resource_parses_without_source() {
     let manifest: Manifest = r#"
         {
@@ -1477,6 +1502,29 @@ fn storage_mount_rejects_unknown_slot() {
     match err {
         Error::UnknownMountSlot { slot } => assert_eq!(slot, "state"),
         other => panic!("expected UnknownMountSlot error, got: {other}"),
+    }
+}
+
+#[test]
+fn storage_mount_rejects_unknown_resource() {
+    let err = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [
+              { path: "/var/lib/app", from: "resources.state" },
+            ]
+          }
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    match err {
+        Error::UnknownMountResource { resource } => assert_eq!(resource, "state"),
+        other => panic!("expected UnknownMountResource error, got: {other}"),
     }
 }
 

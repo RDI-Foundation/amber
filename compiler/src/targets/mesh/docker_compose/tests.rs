@@ -13,8 +13,8 @@ use amber_manifest::{
 };
 use amber_mesh::{InboundTarget, MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTarget};
 use amber_scenario::{
-    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceDecl,
-    ResourceRef, Scenario, ScenarioExport, SlotRef,
+    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceDecl, Scenario,
+    ScenarioExport, SlotRef,
 };
 use base64::Engine as _;
 use serde_json::{Map, Value, json};
@@ -367,7 +367,6 @@ fn assert_depends_on(service: &super::Service, name: &str, condition: &str) {
 }
 
 fn storage_scenario(version: &str, initial_state: &str) -> Scenario {
-    let storage_slot: SlotDecl = serde_json::from_value(json!({ "kind": "storage" })).unwrap();
     let provide_http =
         serde_json::from_value(json!({ "kind": "http", "endpoint": "http" })).unwrap();
 
@@ -378,47 +377,31 @@ fn storage_scenario(version: &str, initial_state: &str) -> Scenario {
         digest: digest(0),
         config: None,
         config_schema: None,
-        program: None,
+        program: Some(
+            serde_json::from_value(json!({
+                "image": "busybox:1.36.1",
+                "entrypoint": [
+                    "sh",
+                    "-eu",
+                    "-c",
+                    format!(
+                        "mkdir -p /var/lib/app /tmp/www\nif [ ! -f /var/lib/app/state.txt ]; then printf '%s\\n' '{initial_state}' >/var/lib/app/state.txt; fi\nprintf '%s\\n' '{version}' >/tmp/www/version.txt\ncp /var/lib/app/state.txt /tmp/www/state.txt\nexec httpd -f -p 8080 -h /tmp/www"
+                    )
+                ],
+                "mounts": [
+                    { "path": "/var/lib/app", "from": "resources.state" }
+                ],
+                "network": {
+                    "endpoints": [
+                        { "name": "http", "port": 8080, "protocol": "http" }
+                    ]
+                }
+            }))
+            .unwrap(),
+        ),
         slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        resources: BTreeMap::from([("state".to_string(), storage_resource_decl(None))]),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: vec![ComponentId(1)],
-    };
-
-    let app_program = serde_json::from_value(json!({
-        "image": "busybox:1.36.1",
-        "entrypoint": [
-            "sh",
-            "-eu",
-            "-c",
-            format!(
-                "mkdir -p /var/lib/app /tmp/www\nif [ ! -f /var/lib/app/state.txt ]; then printf '%s\\n' '{initial_state}' >/var/lib/app/state.txt; fi\nprintf '%s\\n' '{version}' >/tmp/www/version.txt\ncp /var/lib/app/state.txt /tmp/www/state.txt\nexec httpd -f -p 8080 -h /tmp/www"
-            )
-        ],
-        "mounts": [
-            { "path": "/var/lib/app", "from": "slots.state" }
-        ],
-        "network": {
-            "endpoints": [
-                { "name": "http", "port": 8080, "protocol": "http" }
-            ]
-        }
-    }))
-    .unwrap();
-
-    let app = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/app"),
-        digest: digest(1),
-        config: None,
-        config_schema: None,
-        program: Some(app_program),
-        slots: BTreeMap::from([("state".to_string(), storage_slot)]),
         provides: BTreeMap::from([("http".to_string(), provide_http)]),
-        resources: BTreeMap::new(),
+        resources: BTreeMap::from([("state".to_string(), storage_resource_decl(None))]),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -426,19 +409,8 @@ fn storage_scenario(version: &str, initial_state: &str) -> Scenario {
 
     Scenario {
         root: ComponentId(0),
-        components: vec![Some(root), Some(app)],
-        bindings: vec![BindingEdge {
-            name: None,
-            from: BindingFrom::Resource(ResourceRef {
-                component: ComponentId(0),
-                name: "state".to_string(),
-            }),
-            to: SlotRef {
-                component: ComponentId(1),
-                name: "state".to_string(),
-            },
-            weak: false,
-        }],
+        components: vec![Some(root)],
+        bindings: Vec::new(),
         exports: Vec::new(),
     }
 }
@@ -488,8 +460,6 @@ fn compose_artifact_emits_env_sample_and_readme() {
 
 #[test]
 fn compose_emits_storage_volume_mounts() {
-    let slot_storage: SlotDecl = serde_json::from_value(json!({ "kind": "storage" })).unwrap();
-
     let root = Component {
         id: ComponentId(0),
         parent: None,
@@ -497,35 +467,19 @@ fn compose_emits_storage_volume_mounts() {
         digest: digest(0),
         config: None,
         config_schema: None,
-        program: None,
+        program: Some(
+            serde_json::from_value(json!({
+                "image": "busybox:1.36.1",
+                "entrypoint": ["sh", "-lc", "sleep infinity"],
+                "mounts": [
+                    { "path": "/var/lib/app", "from": "resources.state" }
+                ]
+            }))
+            .unwrap(),
+        ),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::from([("state".to_string(), storage_resource_decl(None))]),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: vec![ComponentId(1)],
-    };
-
-    let app_program = serde_json::from_value(json!({
-        "image": "busybox:1.36.1",
-        "entrypoint": ["sh", "-lc", "sleep infinity"],
-        "mounts": [
-            { "path": "/var/lib/app", "from": "slots.state" }
-        ]
-    }))
-    .unwrap();
-
-    let app = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/app"),
-        digest: digest(1),
-        config: None,
-        config_schema: None,
-        program: Some(app_program),
-        slots: BTreeMap::from([("state".to_string(), slot_storage)]),
-        provides: BTreeMap::new(),
-        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -533,19 +487,8 @@ fn compose_emits_storage_volume_mounts() {
 
     let scenario = Scenario {
         root: ComponentId(0),
-        components: vec![Some(root), Some(app)],
-        bindings: vec![BindingEdge {
-            name: None,
-            from: BindingFrom::Resource(ResourceRef {
-                component: ComponentId(0),
-                name: "state".to_string(),
-            }),
-            to: SlotRef {
-                component: ComponentId(1),
-                name: "state".to_string(),
-            },
-            weak: false,
-        }],
+        components: vec![Some(root)],
+        bindings: Vec::new(),
         exports: Vec::new(),
     };
 
@@ -560,7 +503,7 @@ fn compose_emits_storage_volume_mounts() {
         compose.volumes.contains_key(&volume_name),
         "compose should declare a named volume for storage mounts"
     );
-    let app_service = service(&compose, "c1-app");
+    let app_service = service(&compose, "c0-component");
     assert!(
         app_service
             .volumes
@@ -1315,8 +1258,6 @@ fn compose_emits_minimal_peer_keys() {
 
 #[test]
 fn compose_emits_named_volumes_for_storage_mounts() {
-    let storage_slot: SlotDecl = serde_json::from_value(json!({ "kind": "storage" })).unwrap();
-
     let root = Component {
         id: ComponentId(0),
         parent: None,
@@ -1324,35 +1265,19 @@ fn compose_emits_named_volumes_for_storage_mounts() {
         digest: digest(0),
         config: None,
         config_schema: None,
-        program: None,
+        program: Some(
+            serde_json::from_value(json!({
+                "image": "busybox:1.36.1",
+                "entrypoint": ["sh", "-lc", "sleep 3600"],
+                "mounts": [
+                    { "path": "/var/lib/app", "from": "resources.state" }
+                ]
+            }))
+            .unwrap(),
+        ),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::from([("state".to_string(), storage_resource_decl(None))]),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: vec![ComponentId(1)],
-    };
-
-    let app_program = serde_json::from_value(json!({
-        "image": "busybox:1.36.1",
-        "entrypoint": ["sh", "-lc", "sleep 3600"],
-        "mounts": [
-            { "path": "/var/lib/app", "from": "slots.state" }
-        ]
-    }))
-    .unwrap();
-
-    let app = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/app"),
-        digest: digest(1),
-        config: None,
-        config_schema: None,
-        program: Some(app_program),
-        slots: BTreeMap::from([("state".to_string(), storage_slot)]),
-        provides: BTreeMap::new(),
-        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1360,19 +1285,8 @@ fn compose_emits_named_volumes_for_storage_mounts() {
 
     let scenario = Scenario {
         root: ComponentId(0),
-        components: vec![Some(root), Some(app)],
-        bindings: vec![BindingEdge {
-            name: None,
-            from: BindingFrom::Resource(ResourceRef {
-                component: ComponentId(0),
-                name: "state".to_string(),
-            }),
-            to: SlotRef {
-                component: ComponentId(1),
-                name: "state".to_string(),
-            },
-            weak: false,
-        }],
+        components: vec![Some(root)],
+        bindings: Vec::new(),
         exports: Vec::new(),
     };
 
@@ -1391,7 +1305,7 @@ fn compose_emits_named_volumes_for_storage_mounts() {
         artifact.compose_yaml()
     );
 
-    let app_service = service(&compose, "c1-app");
+    let app_service = service(&compose, "c0-component");
     assert!(
         app_service
             .volumes

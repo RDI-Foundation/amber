@@ -209,6 +209,9 @@ fn labels_for_manifest_error(
         | ManifestError::MountSlotRequiresStorage { slot, .. } => {
             labels_for_mount_source(spans, &format!("slots.{slot}"), "mount source here")
         }
+        ManifestError::UnknownMountResource { resource } => {
+            labels_for_mount_source(spans, &format!("resources.{resource}"), "mount source here")
+        }
         ManifestError::UnsupportedMountSource { mount } => {
             labels_for_mount_source(spans, mount, "reserved mount source")
         }

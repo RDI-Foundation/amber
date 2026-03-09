@@ -251,6 +251,7 @@ pub struct ProgramMount {
 pub enum MountSource {
     Config(String),
     Secret(String),
+    Resource(String),
     Slot(String),
     Binding(String),
     Framework(FrameworkCapabilityName),
@@ -261,6 +262,7 @@ impl fmt::Display for MountSource {
         match self {
             MountSource::Config(path) => write_prefixed(f, "config", path),
             MountSource::Secret(path) => write_prefixed(f, "secret", path),
+            MountSource::Resource(name) => write_prefixed(f, "resources", name),
             MountSource::Slot(name) => write_prefixed(f, "slots", name),
             MountSource::Binding(name) => write_prefixed(f, "bindings", name),
             MountSource::Framework(name) => write!(f, "framework.{name}"),
@@ -302,6 +304,10 @@ impl FromStr for MountSource {
                 mount: input.to_string(),
                 message: "secret mounts require an explicit path (secret.<path>)".to_string(),
             });
+        }
+        if let Some(name) = input.strip_prefix("resources.") {
+            let name = ensure_path(input, name)?;
+            return Ok(MountSource::Resource(name));
         }
         if let Some(name) = input.strip_prefix("slots.") {
             let name = ensure_path(input, name)?;

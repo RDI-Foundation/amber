@@ -754,6 +754,7 @@ impl<'a> DceSolver<'a> {
     fn apply_live_program(&mut self, component: usize) {
         let component_id = ComponentId(component);
         self.mark_program_used_slots(component_id);
+        self.mark_program_used_resources(component_id);
         self.mark_binding_targets(component_id, binding_usage::BindingUseSource::Program);
         self.mark_binding_targets(component_id, binding_usage::BindingUseSource::Config);
     }
@@ -877,6 +878,12 @@ impl<'a> DceSolver<'a> {
             self.mark_slot(component.0, &slot);
         }
     }
+
+    fn mark_program_used_resources(&mut self, component: ComponentId) {
+        for resource in collect_program_used_resources(self.scenario.component(component)) {
+            self.mark_resource(component.0, &resource);
+        }
+    }
 }
 
 fn dce_with_semantics(scenario: Scenario) -> Scenario {
@@ -994,6 +1001,21 @@ fn collect_program_used_slots(component: &amber_scenario::Component) -> Vec<Stri
     for mount in program.mounts() {
         if let amber_manifest::MountSource::Slot(slot) = &mount.source {
             mark_slot(slot, &mut used);
+        }
+    }
+
+    used.into_iter().collect()
+}
+
+fn collect_program_used_resources(component: &amber_scenario::Component) -> Vec<String> {
+    let Some(program) = component.program.as_ref() else {
+        return Vec::new();
+    };
+
+    let mut used = BTreeSet::new();
+    for mount in program.mounts() {
+        if let amber_manifest::MountSource::Resource(resource) = &mount.source {
+            used.insert(resource.clone());
         }
     }
 
