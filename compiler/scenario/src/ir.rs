@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use amber_manifest::{
-    CapabilityDecl, FrameworkCapabilityName, ManifestDigest, Program, ProvideDecl, SlotDecl,
-    framework_capability,
+    CapabilityDecl, CapabilityKind, FrameworkCapabilityName, ManifestDigest, MountSource, Program,
+    ProvideDecl, SlotDecl, framework_capability,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -581,6 +581,7 @@ fn invalid_scenario(message: impl Into<String>) -> ScenarioIrError {
 fn validate_scenario(scenario: &Scenario) -> Result<(), ScenarioIrError> {
     validate_component_tree(scenario)?;
     validate_bindings(scenario)?;
+    validate_mounted_storage_slots(scenario)?;
     validate_exports(scenario)?;
     Ok(())
 }
@@ -835,6 +836,99 @@ fn validate_bindings(scenario: &Scenario) -> Result<(), ScenarioIrError> {
     }
 
     Ok(())
+}
+
+fn validate_mounted_storage_slots(scenario: &Scenario) -> Result<(), ScenarioIrError> {
+    for component in scenario.components.iter().flatten() {
+        let Some(program) = component.program.as_ref() else {
+            continue;
+        };
+
+        for mount in program.mounts() {
+            let MountSource::Slot(slot) = &mount.source else {
+                continue;
+            };
+            let Some(slot_decl) = component.slots.get(slot.as_str()) else {
+                continue;
+            };
+            if slot_decl.decl.kind != CapabilityKind::Storage {
+                continue;
+            }
+
+            let bindings: Vec<_> = scenario
+                .bindings
+                .iter()
+                .filter(|binding| binding.to.component == component.id && binding.to.name == *slot)
+                .collect();
+            let slot_label = format!("{}.{}", component.moniker.as_str(), slot);
+
+            match bindings.as_slice() {
+                [] => {
+                    return Err(invalid_scenario(format!(
+                        "mounted storage slot {slot_label} must be bound from a storage resource, \
+                         but it has no binding"
+                    )));
+                }
+                [binding] => {
+                    if let BindingFrom::Resource(_) = &binding.from {
+                        continue;
+                    }
+
+                    return Err(invalid_scenario(format!(
+                        "mounted storage slot {slot_label} must be bound from a storage resource, \
+                         but it is bound from {}",
+                        describe_binding_source(scenario, &binding.from, &binding.to.name)?
+                    )));
+                }
+                _ => {
+                    return Err(invalid_scenario(format!(
+                        "mounted storage slot {slot_label} must be bound from exactly one storage \
+                         resource, but it has {} bindings",
+                        bindings.len()
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn describe_binding_source(
+    scenario: &Scenario,
+    from: &BindingFrom,
+    target_slot: &str,
+) -> Result<String, ScenarioIrError> {
+    match from {
+        BindingFrom::Component(provide) => Ok(format!(
+            "{}.{}",
+            component_ref(&scenario.components, provide.component, || {
+                format!("binding source for {target_slot}")
+            })?
+            .moniker
+            .as_str(),
+            provide.name
+        )),
+        BindingFrom::Resource(resource) => Ok(format!(
+            "{}.resources.{}",
+            component_ref(&scenario.components, resource.component, || {
+                format!("binding source for {target_slot}")
+            })?
+            .moniker
+            .as_str(),
+            resource.name
+        )),
+        BindingFrom::Framework(name) => Ok(format!("framework.{name}")),
+        BindingFrom::External(slot) => Ok(format!(
+            "external {}.{}",
+            component_ref(&scenario.components, slot.component, || {
+                format!("binding source for {target_slot}")
+            })?
+            .moniker
+            .as_str(),
+            slot.name
+        )),
+    }
 }
 
 fn validate_exports(scenario: &Scenario) -> Result<(), ScenarioIrError> {
@@ -1532,5 +1626,63 @@ mod tests {
             message.contains("scenario export `api` declares capability mcp"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn scenario_ir_rejects_mounted_storage_slot_bound_from_external_slot() {
+        let payload = json!({
+            "schema": SCENARIO_IR_SCHEMA,
+            "version": SCENARIO_IR_VERSION,
+            "root": 0,
+            "components": [
+                {
+                    "id": 0,
+                    "moniker": "/",
+                    "parent": null,
+                    "children": [1],
+                    "digest": ManifestDigest::new([0u8; 32]).to_string(),
+                    "config": null,
+                    "slots": {
+                        "state": { "kind": "storage" }
+                    }
+                },
+                {
+                    "id": 1,
+                    "moniker": "/app",
+                    "parent": 0,
+                    "children": [],
+                    "digest": ManifestDigest::new([1u8; 32]).to_string(),
+                    "config": null,
+                    "program": {
+                        "image": "busybox:stable",
+                        "entrypoint": ["sh"],
+                        "mounts": [
+                            { "path": "/var/lib/app", "from": "slots.state" }
+                        ]
+                    },
+                    "slots": {
+                        "state": { "kind": "storage" }
+                    }
+                }
+            ],
+            "bindings": [
+                {
+                    "from": { "kind": "external", "slot": { "component": 0, "slot": "state" } },
+                    "to": { "component": 1, "slot": "state" },
+                    "weak": true
+                }
+            ],
+            "exports": []
+        });
+
+        let ir: ScenarioIr = serde_json::from_value(payload).expect("deserialize scenario IR");
+        let err = Scenario::try_from(ir).expect_err("mounted storage should require a resource");
+        let message = err.to_string();
+        assert!(
+            message
+                .contains("mounted storage slot /app.state must be bound from a storage resource"),
+            "{message}"
+        );
+        assert!(message.contains("external /.state"), "{message}");
     }
 }
