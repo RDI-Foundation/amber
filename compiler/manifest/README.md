@@ -75,6 +75,7 @@ This crate also provides `manifest::lint::lint_manifest` for non-fatal checks:
 * Every declared **slot** should be either:
 
   * **referenced by the program** (via `${slots.<name>...}` in `program.entrypoint` or `program.env`), or
+  * **mounted by the program** (via `program.mounts: [{ from: "slots.<name>", ... }]` for storage slots), or
   * **exported** (some export target points at `self.<name>` or `<name>`), or
   * **used as a binding source from `self`** (some binding has `from: "self"` and `capability: "<name>"`)
 * Every declared **provide** should be either:
@@ -113,6 +114,7 @@ Top-level object:
   components: { /* ... */ },   // optional; default {}
   config_schema: { /* ... */ },// optional
   slots: { /* ... */ },        // optional; default {}
+  resources: { /* ... */ },    // optional; default {}
   provides: { /* ... */ },      // optional; default {}
   bindings: [ /* ... */ ],      // optional; default []
   exports: { /* ... */ },       // optional; default {}
@@ -272,7 +274,8 @@ Rules:
 
 ### `program.mounts`
 
-`mounts` mounts config/secret values as files inside the container. Each entry has:
+`mounts` mounts config/secret values as files inside the container, or mounts routed storage as a
+directory. Each entry has:
 
 * `path` (required): absolute path inside the container.
 * `from` (required): source value.
@@ -282,12 +285,13 @@ Supported `from` sources (current):
 
 * `config` or `config.<path>`: mount the component config (whole object or a path).
 * `secret.<path>`: mount a config value marked `secret: true` in the component’s config schema.
+* `slots.<name>`: mount a storage slot as a directory. The referenced slot must exist and have
+  `kind: "storage"`.
 * `framework.docker`: requires `experimental_features: ["docker"]`. In Docker Compose output, this
   injects a Docker socket mount backed by the framework docker gateway.
 
 Reserved (not implemented yet):
 
-* `slots.<name>`
 * `bindings.<name>`
 * `framework.<capability>` other than `framework.docker`
 
@@ -302,6 +306,29 @@ Notes:
 * Mount paths must be absolute and must not include `..`.
 * `secret.<path>` requires the path to be secret in the component’s config schema.
 * `config.<path>` must not reference secret values.
+* `resources.<name>` mounts a storage resource owned by the same component.
+* `slots.<name>` mounts storage routed in from another component. Use a directory path such as
+  `/var/lib/app`, not a single file path.
+
+Example:
+
+```json5
+resources: {
+  state: { kind: "storage" },
+},
+program: {
+  image: "ghcr.io/acme/app:v1",
+  entrypoint: ["app", "--state-dir", "/var/lib/app"],
+  mounts: [
+    { path: "/var/lib/app", from: "resources.state" },
+  ],
+}
+```
+
+The important mental model is that storage is a directory capability, not a string and not a
+URL-shaped object. Programs consume it by mounting it into their filesystem namespace, either from
+`resources.<name>` when they own the storage locally or from `slots.<name>` when the storage is
+routed in from elsewhere.
 
 ### Interpolation in `image`/`path`, `entrypoint`/`args`, and `env`
 
@@ -322,8 +349,10 @@ Examples:
 
 Notes:
 
-* Slots expose a virtual object. Today the only defined field is `url`; use
+* Slots expose virtual objects. URL-shaped slots expose a `url` field, so use
   `${slots.<slot>.url}` for the URL string or `${slots.<slot>}` to interpolate the object as JSON.
+* Storage slots are different virtual objects. They are not URL-shaped and cannot be interpolated
+  with `${slots...}`; mount them with `program.mounts`.
 * Bindings expose a virtual object with a single `url` field; bindings must be named to be
   referenced via `${bindings.<name>.url}`.
 * Framework bindings may be **non-URL-shaped**; `${bindings.<name>.url}` is invalid for those
@@ -437,13 +466,13 @@ config_schema: {
 
 ---
 
-## Capabilities: `slots`, `provides`, `exports`
+## Capabilities: `slots`, `resources`, `provides`, `exports`
 
 ### Capability declaration shape
 
 Both slots and provides share:
 
-* `kind`: `"mcp" | "llm" | "http" | "docker" | "a2a"`
+* `kind`: `"mcp" | "llm" | "http" | "docker" | "a2a" | "storage"`
 * `profile` (optional): string qualifier (often used for `"mcp"`)
 
 Example:
@@ -460,6 +489,7 @@ Example:
 slots: {
   llm: { kind: "llm" },
   env: { kind: "mcp", profile: "openenv" },
+  state: { kind: "storage" },
 }
 ```
 
@@ -479,8 +509,50 @@ slots: {
 Optional slots can be used to break slot-forwarding cycles; if a required slot is part of a cycle,
 linking fails.
 
-Note: scenario-level slot injection is not supported yet. Required slots on the root component will
-fail to link because there is no parent to satisfy them.
+Root URL-shaped slots are still external inputs. Storage is different: mounted storage must
+ultimately come from a `resources.<name>` binding, not from a root storage slot.
+
+### `resources`
+
+`resources` declares framework-managed objects owned by the component.
+
+Today the only supported resource kind is storage:
+
+```json5
+resources: {
+  app_state: {
+    kind: "storage",
+    params: {
+      size: "1Gi",
+    },
+  },
+}
+```
+
+Rules enforced:
+
+* `kind` must currently be `"storage"`.
+* Storage resources are capability sources. A component can mount its own storage directly with
+  `program.mounts: [{ from: "resources.<name>", ... }]`, or bind the resource into a child storage
+  slot with `from: "resources.<name>"`.
+
+Example:
+
+```json5
+resources: {
+  app_state: {
+    kind: "storage",
+    params: {
+      size: "1Gi",
+    },
+  },
+},
+program: {
+  mounts: [
+    { path: "/var/lib/app", from: "resources.app_state" },
+  ],
+}
+```
 
 ### `provides`
 
@@ -500,6 +572,8 @@ provides: {
 Notes:
 
 * This crate enforces that each provide declares an `endpoint` and that it refers to a declared endpoint name.
+* `provides` cannot declare `kind: "storage"`. Storage is routed through `slots` and `bindings`,
+  then consumed via `program.mounts`.
 * To forward a child capability, use `exports` pointing at `#child.<name>`.
 
 ### `exports`
@@ -530,8 +604,8 @@ Rules enforced:
 
 ## `bindings`
 
-A binding wires a **target slot** to a **source capability** (provide, slot, child export, or
-framework):
+A binding wires a **target slot** to a **source capability** (provide, slot, resource, child
+export, or framework):
 
 `(<to>.<slot>) <- (<from>.<capability>)`
 
@@ -549,7 +623,8 @@ Framework refs (binding sources only):
 normal child ref.
 
 To satisfy a child slot, create a binding with `to: "#<child>.<slot>"` and a source capability
-(`from: "self.<provide>"`, `from: "self.<slot>"`, or `from: "#<other>.<export>"`).
+(`from: "self.<provide>"`, `from: "self.<slot>"`, `from: "resources.<name>"`, or
+`from: "#<other>.<export>"`).
 
 Forwarding a slot to a child:
 
@@ -588,6 +663,7 @@ Rules enforced by this crate:
 * Binding names (if present) must be unique within the manifest and follow child name rules (no `.`).
 * `to` must reference a child (`#<child>`).
 * `from: "self"` requires `capability` exist in `slots` or `provides`.
+* `from: "resources"` requires the named resource exist in `resources`.
 * `from: "framework"` requires a known framework capability name (see below).
 * `framework` is only valid as a binding source; it cannot appear in `to` or `exports`.
 * Any `#child` referenced in `to` or `from` must exist in `components`.
@@ -700,7 +776,35 @@ This component:
 }
 ```
 
-### 4) Weak binding flag (non-ordering; breaks dependency cycles)
+### 4) Allocate storage with `resources` and mount it (valid)
+
+When the program and the storage resource live on the same component, mount the resource directly:
+
+```json5
+{
+  manifest_version: "0.1.0",
+  resources: {
+    app_state: {
+      kind: "storage",
+      params: {
+        size: "1Gi",
+      },
+    },
+  },
+  program: {
+    image: "ghcr.io/acme/app:v1",
+    entrypoint: ["app", "--state-dir", "/var/lib/app"],
+    mounts: [
+      { path: "/var/lib/app", from: "resources.app_state" },
+    ],
+  },
+}
+```
+
+If the storage owner and the consuming program are different components, keep using a child
+storage slot plus a binding from `resources.<name>`.
+
+### 5) Weak binding flag (non-ordering; breaks dependency cycles)
 
 In this example, `a` and `b` both bind to each other. Marking one edge as `weak: true` breaks the dependency cycle for ordering purposes while still expressing the wiring intent.
 

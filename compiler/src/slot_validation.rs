@@ -3,8 +3,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use amber_manifest::{
-    InterpolatedPart, InterpolatedString, InterpolationSource, Manifest, ManifestSpans, Program,
-    SlotDecl, SlotName, span_for_json_pointer, validate_slot_query_for_slot,
+    CapabilityKind, InterpolatedPart, InterpolatedString, InterpolationSource, Manifest,
+    ManifestSpans, Program, SlotDecl, SlotName, span_for_json_pointer,
+    validate_slot_query_for_slot,
 };
 use jsonptr::PointerBuf;
 use miette::{Diagnostic, NamedSource, Report, SourceSpan};
@@ -481,7 +482,28 @@ fn validate_interpolated_string(
 
         match parse_slot_query(query) {
             Ok(parsed) => match parsed.target {
-                SlotTarget::All => {}
+                SlotTarget::All => {
+                    if ctx
+                        .slots
+                        .values()
+                        .any(|slot_decl| slot_decl.decl.kind == CapabilityKind::Storage)
+                    {
+                        diagnostics.push(Report::new(InvalidSlotsInterpolation {
+                            component_path: ctx.component_path.to_string(),
+                            location: location.label(),
+                            message: "storage slots are virtual storage objects and cannot be \
+                                      interpolated through `${slots}`"
+                                .to_string(),
+                            help: "Reference a specific URL-shaped slot like `slots.api.url`, or \
+                                   mount a storage slot with `program.mounts`."
+                                .to_string(),
+                            src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source))
+                                .with_language("json5"),
+                            span,
+                            label: "slot interpolation here".to_string(),
+                        }));
+                    }
+                }
                 SlotTarget::Slot(slot) => {
                     let Some(slot_decl) = ctx.slots.get(slot) else {
                         let help = unknown_slot_help(ctx.component_path, ctx.slots);
@@ -497,6 +519,26 @@ fn validate_interpolated_string(
                         }));
                         continue;
                     };
+
+                    if slot_decl.decl.kind == CapabilityKind::Storage {
+                        diagnostics.push(Report::new(InvalidSlotsInterpolation {
+                            component_path: ctx.component_path.to_string(),
+                            location: location.label(),
+                            message: format!(
+                                "storage slot `{slot}` is a virtual storage object, not a \
+                                 URL-shaped slot"
+                            ),
+                            help: "Mount the storage slot with `program.mounts: [{ from: \
+                                   \"slots.<slot>\", path: \"/var/lib/app\" }]` instead of using \
+                                   `${slots...}`."
+                                .to_string(),
+                            src: NamedSource::new(ctx.src_name, Arc::clone(ctx.source))
+                                .with_language("json5"),
+                            span,
+                            label: "slot interpolation here".to_string(),
+                        }));
+                        continue;
+                    }
 
                     if let Err(err) = validate_slot_query_for_slot(slot_decl, &parsed) {
                         let help = slot_query_help(Some(slot), &err);

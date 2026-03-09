@@ -9,14 +9,18 @@ mod example_catalog;
 
 #[test]
 fn examples_check_deny_warnings() {
-    let manifests: Vec<PathBuf> = collect_examples()
+    let examples_dir = examples_dir();
+    let mut manifests: Vec<PathBuf> = collect_examples()
         .into_iter()
         .map(|example| example.root_manifest)
         .collect();
+    manifests.extend(collect_scenario_variants(&examples_dir));
+    manifests.sort();
+    manifests.dedup();
     assert!(
         !manifests.is_empty(),
         "no root example manifests found in {}",
-        examples_dir().display()
+        examples_dir.display()
     );
 
     let amber = env!("CARGO_BIN_EXE_amber");
@@ -54,8 +58,9 @@ fn examples_compile_from_ir_matches_manifest_outputs() {
             continue;
         }
 
+        let safe_name = example.name.replace('/', "-");
         let temp = tempfile::Builder::new()
-            .prefix(&format!("example-ir-{}-", example.name))
+            .prefix(&format!("example-ir-{safe_name}-"))
             .tempdir_in(&outputs_root)
             .expect("failed to create temp output directory");
         let manifest_outputs = temp.path().join("manifest");
@@ -243,4 +248,35 @@ fn relative_files(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     walk(root, root, &mut files);
     files
+}
+
+fn collect_scenario_variants(dir: &Path) -> Vec<PathBuf> {
+    let mut stack = vec![dir.to_path_buf()];
+    let mut manifests = Vec::new();
+
+    while let Some(path) = stack.pop() {
+        let entries = fs::read_dir(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        for entry in entries {
+            let entry = entry
+                .unwrap_or_else(|err| panic!("failed to read {} entry: {err}", path.display()));
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                stack.push(entry_path);
+                continue;
+            }
+            let Some(name) = entry_path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(ext) = entry_path.extension().and_then(|ext| ext.to_str()) else {
+                continue;
+            };
+            if matches!(ext, "json" | "json5") && name.starts_with("scenario-") {
+                manifests.push(entry_path);
+            }
+        }
+    }
+
+    manifests.sort();
+    manifests
 }

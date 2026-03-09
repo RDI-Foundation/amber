@@ -1,0 +1,20 @@
+{
+  manifest_version: "0.1.0",
+  resources: {
+    app_state: {
+      kind: "storage",
+      params: {
+        size: "1Gi",
+      },
+    },
+  },
+  components: {
+    stack: "./stack-v2.json5",
+  },
+  bindings: [
+    { to: "#stack.state", from: "resources.app_state" },
+  ],
+  exports: {
+    http: "#stack.http",
+  },
+}

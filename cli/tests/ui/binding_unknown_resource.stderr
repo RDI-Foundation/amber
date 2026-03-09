@@ -1,0 +1,11 @@
+Error: manifest::unknown_binding_resource
+
+  × check failed
+  ╰─▶ binding source `resources.state` references unknown resource
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/binding_unknown_resource.json5:7:33]
+ 6 │   bindings: [
+ 7 │     { to: "#child.state", from: "resources.state" },
+   ·                                 ────────┬────────
+   ·                                         ╰── unknown resource referenced here
+ 8 │   ],
+   ╰────

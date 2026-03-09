@@ -19,8 +19,8 @@ use crate::{
     error::Error,
     interpolation::{InterpolatedString, ProgramEntrypoint, ProgramEnvValue},
     names::{
-        BindingName, ChildName, ExportName, FrameworkCapabilityName, ProvideName, SlotName,
-        ensure_name_no_dot,
+        BindingName, ChildName, ExportName, FrameworkCapabilityName, ProvideName, ResourceName,
+        SlotName, ensure_name_no_dot,
     },
     refs::ManifestRef,
     spans::BindingTargetKey,
@@ -251,6 +251,7 @@ pub struct ProgramMount {
 pub enum MountSource {
     Config(String),
     Secret(String),
+    Resource(String),
     Slot(String),
     Binding(String),
     Framework(FrameworkCapabilityName),
@@ -261,6 +262,7 @@ impl fmt::Display for MountSource {
         match self {
             MountSource::Config(path) => write_prefixed(f, "config", path),
             MountSource::Secret(path) => write_prefixed(f, "secret", path),
+            MountSource::Resource(name) => write_prefixed(f, "resources", name),
             MountSource::Slot(name) => write_prefixed(f, "slots", name),
             MountSource::Binding(name) => write_prefixed(f, "bindings", name),
             MountSource::Framework(name) => write!(f, "framework.{name}"),
@@ -302,6 +304,10 @@ impl FromStr for MountSource {
                 mount: input.to_string(),
                 message: "secret mounts require an explicit path (secret.<path>)".to_string(),
             });
+        }
+        if let Some(name) = input.strip_prefix("resources.") {
+            let name = ensure_path(input, name)?;
+            return Ok(MountSource::Resource(name));
         }
         if let Some(name) = input.strip_prefix("slots.") {
             let name = ensure_path(input, name)?;
@@ -450,6 +456,7 @@ pub enum CapabilityKind {
     Http,
     Docker,
     A2a,
+    Storage,
 }
 
 impl fmt::Display for CapabilityKind {
@@ -460,6 +467,7 @@ impl fmt::Display for CapabilityKind {
             CapabilityKind::Http => "http",
             CapabilityKind::Docker => "docker",
             CapabilityKind::A2a => "a2a",
+            CapabilityKind::Storage => "storage",
         };
         f.write_str(s)
     }
@@ -498,6 +506,43 @@ pub struct SlotDecl {
     #[serde(default)]
     #[builder(default)]
     pub optional: bool,
+}
+
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    bon::Builder,
+)]
+#[builder(on(String, into))]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct StorageResourceParams {
+    #[serde(default)]
+    pub size: Option<InterpolatedString>,
+    #[serde(default)]
+    pub retention: Option<InterpolatedString>,
+    #[serde(default)]
+    pub sharing: Option<InterpolatedString>,
+}
+
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, bon::Builder,
+)]
+#[builder(on(String, into))]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ResourceDecl {
+    pub kind: CapabilityKind,
+    #[serde(default)]
+    pub params: StorageResourceParams,
 }
 
 #[derive(
@@ -545,6 +590,7 @@ impl FromStr for LocalComponentRef {
 pub enum BindingSourceRef {
     Component(LocalComponentRef),
     Framework,
+    Resources,
 }
 
 impl fmt::Display for BindingSourceRef {
@@ -552,6 +598,7 @@ impl fmt::Display for BindingSourceRef {
         match self {
             Self::Component(component) => component.fmt(f),
             Self::Framework => f.write_str("framework"),
+            Self::Resources => f.write_str("resources"),
         }
     }
 }
@@ -1031,11 +1078,15 @@ fn is_framework_ref(input: &str) -> bool {
     input == "framework"
 }
 
+fn is_resources_ref(input: &str) -> bool {
+    input == "resources"
+}
+
 fn parse_binding_target_ref(input: &str) -> Result<LocalComponentRef, Error> {
-    if is_framework_ref(input) {
+    if is_framework_ref(input) || is_resources_ref(input) {
         return Err(Error::InvalidBinding {
             input: input.to_string(),
-            message: "framework cannot be a binding target".to_string(),
+            message: format!("{input} cannot be a binding target"),
         });
     }
     parse_component_ref(input).map_err(|err| Error::InvalidBinding {
@@ -1047,6 +1098,9 @@ fn parse_binding_target_ref(input: &str) -> Result<LocalComponentRef, Error> {
 fn parse_binding_source_ref(input: &str) -> Result<BindingSourceRef, Error> {
     if is_framework_ref(input) {
         return Ok(BindingSourceRef::Framework);
+    }
+    if is_resources_ref(input) {
+        return Ok(BindingSourceRef::Resources);
     }
     let component = parse_component_ref(input).map_err(|err| Error::InvalidBinding {
         input: err.input,
@@ -1118,6 +1172,7 @@ pub enum BindingTarget {
 pub enum BindingSource {
     SelfProvide(ProvideName),
     SelfSlot(SlotName),
+    Resource(ResourceName),
     ChildExport {
         child: ChildName,
         export: ExportName,

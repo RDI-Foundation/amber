@@ -1,15 +1,15 @@
 use std::collections::BTreeMap;
 
 use amber_manifest::{
-    CapabilityDecl, FrameworkCapabilityName, ManifestDigest, Program, ProvideDecl, SlotDecl,
-    framework_capability,
+    CapabilityDecl, CapabilityKind, FrameworkCapabilityName, ManifestDigest, MountSource, Program,
+    ProvideDecl, SlotDecl, framework_capability,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
-    ScenarioExport, SlotRef,
+    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceDecl,
+    ResourceRef, Scenario, ScenarioExport, SlotRef,
 };
 
 pub const SCENARIO_IR_SCHEMA: &str = "amber.scenario.ir";
@@ -77,9 +77,106 @@ impl TryFrom<ScenarioIr> for Scenario {
             if components[id].is_some() {
                 return Err(ScenarioIrError::DuplicateComponentId { id });
             }
+            for name in component.slots.keys() {
+                ensure_name_no_dot(name)?;
+            }
+            for name in component.provides.keys() {
+                ensure_name_no_dot(name)?;
+            }
+            for name in component.resources.keys() {
+                ensure_name_no_dot(name)?;
+            }
             components[id] = Some(component.into_component());
         }
 
+        ensure_component(&components, ir.root, || "root".to_string())?;
+
+        for component in components.iter().flatten() {
+            if let Some(parent) = component.parent {
+                ensure_component(&components, parent.0, || {
+                    format!("parent of component {}", component.id.0)
+                })?;
+            }
+            for child in &component.children {
+                ensure_component(&components, child.0, || {
+                    format!("child of component {}", component.id.0)
+                })?;
+            }
+        }
+
+        for component in components.iter().flatten() {
+            for (name, slot) in &component.binding_decls {
+                ensure_name_no_dot(name)?;
+                ensure_name_no_dot(&slot.name)?;
+                let context = format!(
+                    "binding declaration `{name}` in component {} (id {})",
+                    component.moniker.as_str(),
+                    component.id.0
+                );
+                ensure_component(&components, slot.component.0, || context.clone())?;
+                ensure_slot(&components, slot.component, &slot.name, || context.clone())?;
+            }
+        }
+
+        for binding in &ir.bindings {
+            if let Some(name) = binding.name.as_deref() {
+                ensure_name_no_dot(name)?;
+            }
+            ensure_name_no_dot(&binding.to.slot)?;
+            match &binding.from {
+                BindingFromIr::Component { provide, .. } => {
+                    ensure_name_no_dot(provide)?;
+                }
+                BindingFromIr::Resource { resource, .. } => {
+                    ensure_name_no_dot(resource)?;
+                }
+                BindingFromIr::Framework { capability } => {
+                    ensure_name_no_dot(capability)?;
+                }
+                BindingFromIr::External { slot } => {
+                    ensure_name_no_dot(&slot.slot)?;
+                    ensure_component(&components, slot.component, || {
+                        format!("external slot source for {}", binding.to.slot)
+                    })?;
+                }
+            }
+            if let BindingFromIr::Component { component, .. } = &binding.from {
+                ensure_component(&components, *component, || {
+                    format!("binding source for {}", binding.to.slot)
+                })?;
+            }
+            if let BindingFromIr::Resource {
+                component,
+                resource,
+                ..
+            } = &binding.from
+            {
+                ensure_component(&components, *component, || {
+                    format!("binding resource source for {}", binding.to.slot)
+                })?;
+                let owner = components[*component]
+                    .as_ref()
+                    .expect("resource owner component should exist");
+                if !owner.resources.contains_key(resource) {
+                    return Err(ScenarioIrError::MissingResource {
+                        component: *component,
+                        component_moniker: owner.moniker.to_string(),
+                        resource: resource.clone(),
+                        context: format!("binding source for {}", binding.to.slot),
+                    });
+                }
+            }
+            ensure_component(&components, binding.to.component, || {
+                format!("binding target for {}", binding.to.slot)
+            })?;
+        }
+        for export in &ir.exports {
+            ensure_name_no_dot(&export.name)?;
+            ensure_name_no_dot(&export.from.provide)?;
+            ensure_component(&components, export.from.component, || {
+                format!("export source for {}", export.name)
+            })?;
+        }
         let mut scenario = Scenario {
             root: ComponentId(ir.root),
             components,
@@ -118,6 +215,9 @@ pub struct ComponentIr {
     pub provides: BTreeMap<String, ProvideDecl>,
     #[serde(default)]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub resources: BTreeMap<String, ResourceDecl>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub binding_decls: BTreeMap<String, SlotRefIr>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -138,6 +238,7 @@ impl ComponentIr {
             program: component.program.clone(),
             slots: component.slots.clone(),
             provides: component.provides.clone(),
+            resources: component.resources.clone(),
             binding_decls: component
                 .binding_decls
                 .iter()
@@ -158,6 +259,7 @@ impl ComponentIr {
             program: self.program,
             slots: self.slots,
             provides: self.provides,
+            resources: self.resources,
             binding_decls: self
                 .binding_decls
                 .into_iter()
@@ -173,6 +275,7 @@ impl ComponentIr {
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BindingFromIr {
     Component { component: usize, provide: String },
+    Resource { component: usize, resource: String },
     Framework { capability: String },
     External { slot: SlotRefIr },
 }
@@ -216,6 +319,10 @@ impl From<&BindingFrom> for BindingFromIr {
                 component: provide.component.0,
                 provide: provide.name.clone(),
             },
+            BindingFrom::Resource(resource) => Self::Resource {
+                component: resource.component.0,
+                resource: resource.name.clone(),
+            },
             BindingFrom::Framework(name) => Self::Framework {
                 capability: name.to_string(),
             },
@@ -235,6 +342,13 @@ impl BindingFromIr {
                     name: provide,
                 }))
             }
+            BindingFromIr::Resource {
+                component,
+                resource,
+            } => Ok(BindingFrom::Resource(ResourceRef {
+                component: ComponentId(component),
+                name: resource,
+            })),
             BindingFromIr::Framework { capability } => {
                 let name =
                     FrameworkCapabilityName::try_from(capability.as_str()).map_err(|_| {
@@ -356,6 +470,16 @@ pub enum ScenarioIrError {
         provide: String,
         context: String,
     },
+    #[error(
+        "{context} references missing resource {resource:?} on component {component_moniker} (id \
+         {component})"
+    )]
+    MissingResource {
+        component: usize,
+        component_moniker: String,
+        resource: String,
+        context: String,
+    },
     #[error("scenario IR has invalid name {name:?}: dots are reserved")]
     InvalidName { name: String },
     #[error("scenario IR is invalid: {message}")]
@@ -457,6 +581,7 @@ fn invalid_scenario(message: impl Into<String>) -> ScenarioIrError {
 fn validate_scenario(scenario: &Scenario) -> Result<(), ScenarioIrError> {
     validate_component_tree(scenario)?;
     validate_bindings(scenario)?;
+    validate_mounted_storage_slots(scenario)?;
     validate_exports(scenario)?;
     Ok(())
 }
@@ -631,6 +756,28 @@ fn validate_bindings(scenario: &Scenario) -> Result<(), ScenarioIrError> {
                     provide_decl.decl.clone(),
                 )
             }
+            BindingFrom::Resource(resource) => {
+                ensure_name_no_dot(&resource.name)?;
+                let component = component_ref(&scenario.components, resource.component, || {
+                    format!("binding source for {}", binding.to.name)
+                })?;
+                let resource_decl =
+                    component
+                        .resources
+                        .get(resource.name.as_str())
+                        .ok_or_else(|| {
+                            invalid_scenario(format!(
+                                "binding into {target_label} references missing resource \
+                                 {}.resources.{}",
+                                component.moniker.as_str(),
+                                resource.name
+                            ))
+                        })?;
+                (
+                    format!("{}.resources.{}", component.moniker.as_str(), resource.name),
+                    CapabilityDecl::builder().kind(resource_decl.kind).build(),
+                )
+            }
             BindingFrom::Framework(name) => {
                 let spec = framework_capability(name.as_str()).ok_or_else(|| {
                     invalid_scenario(format!(
@@ -689,6 +836,99 @@ fn validate_bindings(scenario: &Scenario) -> Result<(), ScenarioIrError> {
     }
 
     Ok(())
+}
+
+fn validate_mounted_storage_slots(scenario: &Scenario) -> Result<(), ScenarioIrError> {
+    for component in scenario.components.iter().flatten() {
+        let Some(program) = component.program.as_ref() else {
+            continue;
+        };
+
+        for mount in program.mounts() {
+            let MountSource::Slot(slot) = &mount.source else {
+                continue;
+            };
+            let Some(slot_decl) = component.slots.get(slot.as_str()) else {
+                continue;
+            };
+            if slot_decl.decl.kind != CapabilityKind::Storage {
+                continue;
+            }
+
+            let bindings: Vec<_> = scenario
+                .bindings
+                .iter()
+                .filter(|binding| binding.to.component == component.id && binding.to.name == *slot)
+                .collect();
+            let slot_label = format!("{}.{}", component.moniker.as_str(), slot);
+
+            match bindings.as_slice() {
+                [] => {
+                    return Err(invalid_scenario(format!(
+                        "mounted storage slot {slot_label} must be bound from a storage resource, \
+                         but it has no binding"
+                    )));
+                }
+                [binding] => {
+                    if let BindingFrom::Resource(_) = &binding.from {
+                        continue;
+                    }
+
+                    return Err(invalid_scenario(format!(
+                        "mounted storage slot {slot_label} must be bound from a storage resource, \
+                         but it is bound from {}",
+                        describe_binding_source(scenario, &binding.from, &binding.to.name)?
+                    )));
+                }
+                _ => {
+                    return Err(invalid_scenario(format!(
+                        "mounted storage slot {slot_label} must be bound from exactly one storage \
+                         resource, but it has {} bindings",
+                        bindings.len()
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn describe_binding_source(
+    scenario: &Scenario,
+    from: &BindingFrom,
+    target_slot: &str,
+) -> Result<String, ScenarioIrError> {
+    match from {
+        BindingFrom::Component(provide) => Ok(format!(
+            "{}.{}",
+            component_ref(&scenario.components, provide.component, || {
+                format!("binding source for {target_slot}")
+            })?
+            .moniker
+            .as_str(),
+            provide.name
+        )),
+        BindingFrom::Resource(resource) => Ok(format!(
+            "{}.resources.{}",
+            component_ref(&scenario.components, resource.component, || {
+                format!("binding source for {target_slot}")
+            })?
+            .moniker
+            .as_str(),
+            resource.name
+        )),
+        BindingFrom::Framework(name) => Ok(format!("framework.{name}")),
+        BindingFrom::External(slot) => Ok(format!(
+            "external {}.{}",
+            component_ref(&scenario.components, slot.component, || {
+                format!("binding source for {target_slot}")
+            })?
+            .moniker
+            .as_str(),
+            slot.name
+        )),
+    }
 }
 
 fn validate_exports(scenario: &Scenario) -> Result<(), ScenarioIrError> {
@@ -757,6 +997,7 @@ mod tests {
                 program: None,
                 slots: BTreeMap::new(),
                 provides: BTreeMap::new(),
+                resources: BTreeMap::new(),
                 binding_decls: BTreeMap::new(),
                 metadata: None,
                 children: vec![ComponentId(1)],
@@ -798,6 +1039,7 @@ mod tests {
                     }))
                     .expect("deserialize provide decl"),
                 )]),
+                resources: BTreeMap::new(),
                 binding_decls: BTreeMap::new(),
                 metadata: None,
                 children: Vec::new(),
@@ -995,6 +1237,7 @@ mod tests {
             program: None,
             slots: BTreeMap::from([("docker".to_string(), slot_decl("docker"))]),
             provides: BTreeMap::new(),
+            resources: BTreeMap::new(),
             binding_decls: BTreeMap::new(),
             metadata: None,
             children: Vec::new(),
@@ -1033,6 +1276,9 @@ mod tests {
         match &binding.from {
             BindingFrom::Framework(name) => assert_eq!(name.as_str(), "docker"),
             BindingFrom::Component(_) => panic!("expected framework binding"),
+            BindingFrom::Resource(resource) => {
+                panic!("unexpected resource binding resources.{}", resource.name)
+            }
             BindingFrom::External(slot) => {
                 panic!("unexpected external binding slots.{}", slot.name)
             }
@@ -1380,5 +1626,63 @@ mod tests {
             message.contains("scenario export `api` declares capability mcp"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn scenario_ir_rejects_mounted_storage_slot_bound_from_external_slot() {
+        let payload = json!({
+            "schema": SCENARIO_IR_SCHEMA,
+            "version": SCENARIO_IR_VERSION,
+            "root": 0,
+            "components": [
+                {
+                    "id": 0,
+                    "moniker": "/",
+                    "parent": null,
+                    "children": [1],
+                    "digest": ManifestDigest::new([0u8; 32]).to_string(),
+                    "config": null,
+                    "slots": {
+                        "state": { "kind": "storage" }
+                    }
+                },
+                {
+                    "id": 1,
+                    "moniker": "/app",
+                    "parent": 0,
+                    "children": [],
+                    "digest": ManifestDigest::new([1u8; 32]).to_string(),
+                    "config": null,
+                    "program": {
+                        "image": "busybox:stable",
+                        "entrypoint": ["sh"],
+                        "mounts": [
+                            { "path": "/var/lib/app", "from": "slots.state" }
+                        ]
+                    },
+                    "slots": {
+                        "state": { "kind": "storage" }
+                    }
+                }
+            ],
+            "bindings": [
+                {
+                    "from": { "kind": "external", "slot": { "component": 0, "slot": "state" } },
+                    "to": { "component": 1, "slot": "state" },
+                    "weak": true
+                }
+            ],
+            "exports": []
+        });
+
+        let ir: ScenarioIr = serde_json::from_value(payload).expect("deserialize scenario IR");
+        let err = Scenario::try_from(ir).expect_err("mounted storage should require a resource");
+        let message = err.to_string();
+        assert!(
+            message
+                .contains("mounted storage slot /app.state must be bound from a storage resource"),
+            "{message}"
+        );
+        assert!(message.contains("external /.state"), "{message}");
     }
 }

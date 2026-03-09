@@ -85,6 +85,7 @@ pub(crate) fn rewrite_framework_docker_as_injected_component(
         program: Some(gateway_program),
         slots: BTreeMap::new(),
         provides: gateway_provides,
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),

@@ -17,6 +17,7 @@ pub struct ManifestSpans {
     pub slots: HashMap<Arc<str>, CapabilityDeclSpans>,
     pub slots_section: Option<SourceSpan>,
     pub provides: HashMap<Arc<str>, ProvideDeclSpans>,
+    pub resources: HashMap<Arc<str>, ResourceDeclSpans>,
     pub bindings: HashMap<BindingTargetKey, BindingSpans>,
     pub bindings_by_index: Vec<BindingSpans>,
     pub exports: HashMap<Arc<str>, ExportSpans>,
@@ -78,6 +79,22 @@ pub struct ProvideDeclSpans {
     pub capability: CapabilityDeclSpans,
     pub endpoint: Option<SourceSpan>,
     pub endpoint_value: Option<Arc<str>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResourceDeclSpans {
+    pub name: SourceSpan,
+    pub whole: SourceSpan,
+    pub kind: Option<SourceSpan>,
+    pub params: Option<ResourceParamsSpans>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResourceParamsSpans {
+    pub whole: SourceSpan,
+    pub size: Option<SourceSpan>,
+    pub retention: Option<SourceSpan>,
+    pub sharing: Option<SourceSpan>,
 }
 
 #[derive(Clone, Debug)]
@@ -262,6 +279,7 @@ pub(crate) fn parse_manifest_spans(source: &str) -> Option<ManifestSpans> {
     collect_environments(&root, root_obj, &mut out);
     collect_slots(&root, root_obj, &mut out);
     collect_provides(&root, root_obj, &mut out);
+    collect_resources(&root, root_obj, &mut out);
     collect_bindings(&root, root_obj, &mut out);
     collect_exports(&root, root_obj, &mut out);
 
@@ -393,6 +411,58 @@ fn collect_provides(root: &SpanCursor<'_>, root_obj: &Map<String, Value>, out: &
         }
 
         out.provides.insert(provide_name.as_str().into(), provide);
+    }
+}
+
+fn collect_resources(
+    root: &SpanCursor<'_>,
+    root_obj: &Map<String, Value>,
+    out: &mut ManifestSpans,
+) {
+    let Some((resources, resources_obj)) = object_section(root, root_obj, "resources") else {
+        return;
+    };
+
+    for (resource_name, resource_value) in resources_obj {
+        let name = key_span(root.source, resources.span, resource_name);
+        let whole = span_or_default(resources.child_span(resource_name));
+        let mut resource = ResourceDeclSpans {
+            name,
+            whole,
+            kind: None,
+            params: None,
+        };
+
+        if let Value::Object(obj) = resource_value {
+            let decl = SpanCursor::new(root.source, whole);
+            if obj.contains_key("kind") {
+                resource.kind = decl.child_span("kind");
+            }
+            if let Some(params_span) = decl.child_span("params") {
+                let mut params = ResourceParamsSpans {
+                    whole: params_span,
+                    size: None,
+                    retention: None,
+                    sharing: None,
+                };
+                if let Some(Value::Object(params_obj)) = obj.get("params") {
+                    let params_cursor = SpanCursor::new(root.source, params_span);
+                    if params_obj.contains_key("size") {
+                        params.size = params_cursor.child_span("size");
+                    }
+                    if params_obj.contains_key("retention") {
+                        params.retention = params_cursor.child_span("retention");
+                    }
+                    if params_obj.contains_key("sharing") {
+                        params.sharing = params_cursor.child_span("sharing");
+                    }
+                }
+                resource.params = Some(params);
+            }
+        }
+
+        out.resources
+            .insert(resource_name.as_str().into(), resource);
     }
 }
 

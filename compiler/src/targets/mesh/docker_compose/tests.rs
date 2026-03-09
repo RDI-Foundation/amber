@@ -13,7 +13,7 @@ use amber_manifest::{
 };
 use amber_mesh::{InboundTarget, MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTarget};
 use amber_scenario::{
-    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
+    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceDecl, Scenario,
     ScenarioExport, SlotRef,
 };
 use base64::Engine as _;
@@ -21,7 +21,10 @@ use serde_json::{Map, Value, json};
 use url::Url;
 
 use super::DockerComposeReporter;
-use crate::{reporter::Reporter as _, targets::mesh::internal_images::resolve_internal_images};
+use crate::{
+    reporter::Reporter as _, storage_plan::StorageIdentity,
+    targets::mesh::internal_images::resolve_internal_images,
+};
 
 fn digest(byte: u8) -> ManifestDigest {
     ManifestDigest::new([byte; 32])
@@ -75,6 +78,12 @@ fn compile_output_with_manifest_overrides(
             manifest.insert(
                 "provides".to_string(),
                 serde_json::to_value(&component.provides).unwrap(),
+            );
+        }
+        if !component.resources.is_empty() {
+            manifest.insert(
+                "resources".to_string(),
+                serde_json::to_value(&component.resources).unwrap(),
             );
         }
         if let Some(extra) = overrides.get(&component.id) {
@@ -137,11 +146,33 @@ fn error_contains(err: &crate::Error, needle: &str) -> bool {
     }
 }
 
+fn storage_resource_decl(size: Option<&str>) -> ResourceDecl {
+    let value = match size {
+        Some(size) => json!({
+            "kind": "storage",
+            "params": { "size": size },
+        }),
+        None => json!({ "kind": "storage" }),
+    };
+    serde_json::from_value(value).expect("storage resource decl")
+}
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("compiler crate should live under the workspace root")
         .to_path_buf()
+}
+
+fn ensure_amber_cli_binary() -> PathBuf {
+    let root = workspace_root();
+    let status = Command::new("cargo")
+        .current_dir(&root)
+        .args(["build", "-q", "-p", "amber-cli"])
+        .status()
+        .expect("run cargo build -p amber-cli");
+    assert!(status.success(), "cargo build -p amber-cli failed");
+    root.join("target").join("debug").join("amber")
 }
 
 fn use_prebuilt_images() -> bool {
@@ -335,6 +366,55 @@ fn assert_depends_on(service: &super::Service, name: &str, condition: &str) {
     }
 }
 
+fn storage_scenario(version: &str, initial_state: &str) -> Scenario {
+    let provide_http =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "http" })).unwrap();
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: Some(
+            serde_json::from_value(json!({
+                "image": "busybox:1.36.1",
+                "entrypoint": [
+                    "sh",
+                    "-eu",
+                    "-c",
+                    format!(
+                        "mkdir -p /var/lib/app /tmp/www\nif [ ! -f /var/lib/app/state.txt ]; then printf '%s\\n' '{initial_state}' >/var/lib/app/state.txt; fi\nprintf '%s\\n' '{version}' >/tmp/www/version.txt\ncp /var/lib/app/state.txt /tmp/www/state.txt\nexec httpd -f -p 8080 -h /tmp/www"
+                    )
+                ],
+                "mounts": [
+                    { "path": "/var/lib/app", "from": "resources.state" }
+                ],
+                "network": {
+                    "endpoints": [
+                        { "name": "http", "port": 8080, "protocol": "http" }
+                    ]
+                }
+            }))
+            .unwrap(),
+        ),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::from([("http".to_string(), provide_http)]),
+        resources: BTreeMap::from([("state".to_string(), storage_resource_decl(None))]),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root)],
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    }
+}
+
 #[test]
 fn compose_artifact_emits_env_sample_and_readme() {
     let program = serde_json::from_value(json!({
@@ -354,6 +434,7 @@ fn compose_artifact_emits_env_sample_and_readme() {
         program: Some(program),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -378,6 +459,83 @@ fn compose_artifact_emits_env_sample_and_readme() {
 }
 
 #[test]
+fn compose_emits_storage_volume_mounts() {
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: Some(
+            serde_json::from_value(json!({
+                "image": "busybox:1.36.1",
+                "entrypoint": ["sh", "-lc", "sleep infinity"],
+                "mounts": [
+                    { "path": "/var/lib/app", "from": "resources.state" }
+                ]
+            }))
+            .unwrap(),
+        ),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        resources: BTreeMap::from([("state".to_string(), storage_resource_decl(None))]),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root)],
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    };
+
+    let artifact = render_compose(&compile_output(scenario)).expect("compose render ok");
+    let compose = parse_compose(&artifact);
+    let volume_name = super::compose_storage_volume_name(&StorageIdentity {
+        owner: ComponentId(0),
+        owner_moniker: "/".to_string(),
+        resource: "state".to_string(),
+    });
+    assert!(
+        compose.volumes.contains_key(&volume_name),
+        "compose should declare a named volume for storage mounts"
+    );
+    let app_service = service(&compose, "c0-component");
+    assert!(
+        app_service
+            .volumes
+            .iter()
+            .any(|mount| mount == &format!("{volume_name}:/var/lib/app")),
+        "app service should mount the generated storage volume: {:?}",
+        app_service.volumes
+    );
+}
+
+#[test]
+fn compose_storage_volume_names_include_identity_hash() {
+    let root_identity = StorageIdentity {
+        owner: ComponentId(0),
+        owner_moniker: "/".to_string(),
+        resource: "state".to_string(),
+    };
+    let child_identity = StorageIdentity {
+        owner: ComponentId(1),
+        owner_moniker: "/root".to_string(),
+        resource: "state".to_string(),
+    };
+
+    let root_name = super::compose_storage_volume_name(&root_identity);
+    let child_name = super::compose_storage_volume_name(&child_identity);
+
+    assert_ne!(root_name, child_name);
+    assert!(root_name.starts_with("amber-storage-root-state-"));
+    assert!(child_name.starts_with("amber-storage-root-state-"));
+}
+
+#[test]
 fn compose_emits_otelcol_agent_and_wires_router_otel_env() {
     let program = serde_json::from_value(json!({
         "image": "alpine:3.20",
@@ -396,6 +554,7 @@ fn compose_emits_otelcol_agent_and_wires_router_otel_env() {
         program: Some(program),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -614,6 +773,7 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
         program: Some(program),
         slots: BTreeMap::from([("docker".to_string(), slot_docker)]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -703,6 +863,7 @@ fn docker_compose_emits_framework_docker_mount_proxy_wiring() {
         program: Some(program),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -806,6 +967,7 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(2), ComponentId(1)],
@@ -821,6 +983,7 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -836,6 +999,7 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -984,6 +1148,7 @@ fn compose_emits_minimal_peer_keys() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1), ComponentId(2), ComponentId(3)],
@@ -999,6 +1164,7 @@ fn compose_emits_minimal_peer_keys() {
         program: Some(server1_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api1".to_string(), provide_api1)]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1014,6 +1180,7 @@ fn compose_emits_minimal_peer_keys() {
         program: Some(server2_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api2".to_string(), provide_api2)]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1029,6 +1196,7 @@ fn compose_emits_minimal_peer_keys() {
         program: Some(client_program),
         slots: BTreeMap::from([("api1".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1089,6 +1257,66 @@ fn compose_emits_minimal_peer_keys() {
 }
 
 #[test]
+fn compose_emits_named_volumes_for_storage_mounts() {
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: Some(
+            serde_json::from_value(json!({
+                "image": "busybox:1.36.1",
+                "entrypoint": ["sh", "-lc", "sleep 3600"],
+                "mounts": [
+                    { "path": "/var/lib/app", "from": "resources.state" }
+                ]
+            }))
+            .unwrap(),
+        ),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        resources: BTreeMap::from([("state".to_string(), storage_resource_decl(None))]),
+        binding_decls: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root)],
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    };
+
+    let artifact =
+        render_compose(&compile_output(scenario)).expect("compose render should succeed");
+    let compose = parse_compose(&artifact);
+    let volume_name = super::compose_storage_volume_name(&StorageIdentity {
+        owner: ComponentId(0),
+        owner_moniker: "/".to_string(),
+        resource: "state".to_string(),
+    });
+
+    assert!(
+        compose.volumes.contains_key(&volume_name),
+        "expected named storage volume in compose file:\n{}",
+        artifact.compose_yaml()
+    );
+
+    let app_service = service(&compose, "c0-component");
+    assert!(
+        app_service
+            .volumes
+            .iter()
+            .any(|mount| mount == &format!("{volume_name}:/var/lib/app")),
+        "expected storage mount on app service:\n{}",
+        artifact.compose_yaml()
+    );
+}
+
+#[test]
 fn compose_escapes_entrypoint_dollars() {
     let program = serde_json::from_value(json!({
         "image": "alpine:3.20",
@@ -1106,6 +1334,7 @@ fn compose_escapes_entrypoint_dollars() {
         program: Some(program),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1188,6 +1417,7 @@ fn compose_resolves_binding_urls_in_child_config() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::from([(
             "bind".to_string(),
             SlotRef {
@@ -1209,6 +1439,7 @@ fn compose_resolves_binding_urls_in_child_config() {
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1224,6 +1455,7 @@ fn compose_resolves_binding_urls_in_child_config() {
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1241,6 +1473,7 @@ fn compose_resolves_binding_urls_in_child_config() {
         program: Some(observer_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1367,6 +1600,7 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::from([(
             "bind".to_string(),
             SlotRef {
@@ -1388,6 +1622,7 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1403,6 +1638,7 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1420,6 +1656,7 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(4)],
@@ -1437,6 +1674,7 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(5)],
@@ -1454,6 +1692,7 @@ fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
         program: Some(child_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1567,6 +1806,7 @@ fn compose_emits_export_metadata_and_labels() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1)],
@@ -1582,6 +1822,7 @@ fn compose_emits_export_metadata_and_labels() {
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1708,6 +1949,7 @@ fn compose_routes_external_slots_through_router() {
         program: None,
         slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1)],
@@ -1723,6 +1965,7 @@ fn compose_routes_external_slots_through_router() {
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -1907,6 +2150,7 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
         program: None,
         slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1)],
@@ -1922,6 +2166,7 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -2165,6 +2410,7 @@ sleep infinity
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1), ComponentId(2), ComponentId(3)],
@@ -2179,6 +2425,7 @@ sleep infinity
         program: Some(agent_a_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("agent".to_string(), provide_a2a.clone())]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -2193,6 +2440,7 @@ sleep infinity
         program: Some(agent_b_program),
         slots: BTreeMap::from([("agent_a".to_string(), slot_a2a.clone())]),
         provides: BTreeMap::from([("agent".to_string(), provide_a2a)]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -2210,6 +2458,7 @@ sleep infinity
             ("z_agent_a".to_string(), slot_a2a),
         ]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -2444,6 +2693,7 @@ fn docker_smoke_sidecar_restart_rejoins_mesh() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1), ComponentId(2)],
@@ -2459,6 +2709,7 @@ fn docker_smoke_sidecar_restart_rejoins_mesh() {
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -2474,6 +2725,7 @@ fn docker_smoke_sidecar_restart_rejoins_mesh() {
         program: Some(client_program),
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -2631,6 +2883,7 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(2), ComponentId(1)],
@@ -2649,6 +2902,7 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
             ("v1".to_string(), provide_v1),
             ("admin".to_string(), provide_admin),
         ]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -2667,6 +2921,7 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
             ("admin".to_string(), slot_http),
         ]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -2747,6 +3002,259 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
         .expect("admin inbound local target");
     assert_eq!(v1_port, 80);
     assert_eq!(admin_port, 80);
+}
+
+#[test]
+#[ignore = "requires docker + docker compose; run manually"]
+fn docker_smoke_storage_persists_across_upgrade() {
+    use std::{
+        fs,
+        io::Read,
+        net::TcpListener,
+        process::{Command, Stdio},
+        thread,
+        time::Duration,
+    };
+
+    use tempfile::tempdir;
+
+    struct ComposeGuard {
+        project: std::path::PathBuf,
+        envs: Vec<(String, String)>,
+    }
+
+    impl ComposeGuard {
+        fn new(project: &std::path::Path, envs: Vec<(String, String)>) -> Self {
+            Self {
+                project: project.to_path_buf(),
+                envs,
+            }
+        }
+    }
+
+    impl Drop for ComposeGuard {
+        fn drop(&mut self) {
+            let mut cmd = Command::new("docker");
+            cmd.current_dir(&self.project).arg("compose").args([
+                "down",
+                "-v",
+                "--remove-orphans",
+                "--timeout",
+                "1",
+            ]);
+            for (key, value) in &self.envs {
+                cmd.env(key, value);
+            }
+            let _ = cmd.status();
+        }
+    }
+
+    struct ProxyGuard {
+        child: std::process::Child,
+    }
+
+    impl Drop for ProxyGuard {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn pick_free_port() -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local port");
+        let port = listener
+            .local_addr()
+            .expect("local listener address")
+            .port();
+        drop(listener);
+        port
+    }
+
+    fn drain_pipes(child: &mut std::process::Child) -> (String, String) {
+        let mut stdout = String::new();
+        if let Some(mut pipe) = child.stdout.take() {
+            let _ = pipe.read_to_string(&mut stdout);
+        }
+
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+
+        (stdout, stderr)
+    }
+
+    fn spawn_amber_proxy(
+        amber_bin: &Path,
+        project: &Path,
+        project_name: &str,
+        export_port: u16,
+    ) -> ProxyGuard {
+        let child = Command::new(amber_bin)
+            .arg("proxy")
+            .arg(project)
+            .arg("--project-name")
+            .arg(project_name)
+            .arg("--export")
+            .arg(format!("http=127.0.0.1:{export_port}"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start amber proxy");
+        ProxyGuard { child }
+    }
+
+    fn fetch_export_path(export_port: u16, path: &str) -> Option<String> {
+        let output = Command::new("curl")
+            .arg("-fsS")
+            .arg("--max-time")
+            .arg("2")
+            .arg(format!("http://127.0.0.1:{export_port}/{path}"))
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn compose_logs(project: &Path, envs: &[(&str, &str)]) -> String {
+        let mut logs_cmd = Command::new("docker");
+        logs_cmd
+            .current_dir(project)
+            .arg("compose")
+            .args(["logs", "--no-color"]);
+        for (key, value) in envs {
+            logs_cmd.env(key, value);
+        }
+        logs_cmd
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
+            .unwrap_or_else(|err| format!("failed to capture compose logs: {err}"))
+    }
+
+    fn wait_for_export_path(
+        export_port: u16,
+        path: &str,
+        expected: &str,
+        proxy: &mut ProxyGuard,
+        project: &Path,
+        envs: &[(&str, &str)],
+    ) {
+        for _ in 0..60 {
+            if fetch_export_path(export_port, path).as_deref() == Some(expected) {
+                return;
+            }
+            if let Ok(Some(status)) = proxy.child.try_wait() {
+                let (proxy_stdout, proxy_stderr) = drain_pipes(&mut proxy.child);
+                let logs = compose_logs(project, envs);
+                panic!(
+                    "amber proxy exited before {path} served {expected} (status: {status})\nproxy \
+                     stdout:\n{proxy_stdout}\nproxy stderr:\n{proxy_stderr}\ncompose logs:\n{logs}"
+                );
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+
+        let (proxy_stdout, proxy_stderr) = drain_pipes(&mut proxy.child);
+        let logs = compose_logs(project, envs);
+        panic!(
+            "export {path} never served {expected}\nproxy stdout:\n{proxy_stdout}\nproxy \
+             stderr:\n{proxy_stderr}\ncompose logs:\n{logs}"
+        );
+    }
+
+    let dir = tempdir().unwrap();
+    let project = dir.path();
+    let amber_bin = ensure_amber_cli_binary();
+    let envs_owned = vec![(
+        "COMPOSE_PROJECT_NAME".to_string(),
+        format!("amber-storage-upgrade-{}", std::process::id()),
+    )];
+    let project_name = envs_owned[0].1.clone();
+    let compose_envs = envs_owned.clone();
+    let envs = compose_envs
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    let _compose_guard = ComposeGuard::new(project, envs_owned);
+
+    let v1 = render_compose(&compile_output(storage_scenario(
+        "version-v1",
+        "persisted-v1",
+    )))
+    .expect("compose render v1");
+    fs::write(project.join(super::COMPOSE_FILENAME), v1.compose_yaml()).unwrap();
+
+    let compose = |args: &[&str]| {
+        let mut cmd = Command::new("docker");
+        cmd.current_dir(project).arg("compose").args(args);
+        for (key, value) in &envs {
+            cmd.env(key, value);
+        }
+        cmd
+    };
+
+    let status = compose(&["up", "-d"]).status().unwrap();
+    assert!(status.success(), "docker compose up v1 failed");
+
+    let export_port = pick_free_port();
+    let mut proxy = spawn_amber_proxy(
+        amber_bin.as_path(),
+        project,
+        project_name.as_str(),
+        export_port,
+    );
+    wait_for_export_path(
+        export_port,
+        "version.txt",
+        "version-v1",
+        &mut proxy,
+        project,
+        &envs,
+    );
+    wait_for_export_path(
+        export_port,
+        "state.txt",
+        "persisted-v1",
+        &mut proxy,
+        project,
+        &envs,
+    );
+    drop(proxy);
+
+    let v2 = render_compose(&compile_output(storage_scenario(
+        "version-v2",
+        "persisted-v2",
+    )))
+    .expect("compose render v2");
+    fs::write(project.join(super::COMPOSE_FILENAME), v2.compose_yaml()).unwrap();
+
+    let status = compose(&["up", "-d"]).status().unwrap();
+    assert!(status.success(), "docker compose up v2 failed");
+
+    let mut proxy = spawn_amber_proxy(
+        amber_bin.as_path(),
+        project,
+        project_name.as_str(),
+        export_port,
+    );
+    wait_for_export_path(
+        export_port,
+        "version.txt",
+        "version-v2",
+        &mut proxy,
+        project,
+        &envs,
+    );
+    wait_for_export_path(
+        export_port,
+        "state.txt",
+        "persisted-v1",
+        &mut proxy,
+        project,
+        &envs,
+    );
 }
 
 #[test]
@@ -2836,6 +3344,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(2), ComponentId(3), ComponentId(1)],
@@ -2851,6 +3360,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         program: Some(server_program),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -2866,6 +3376,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         program: Some(sleeper_program(json!({ "URL": "${slots.api.url}" }))),
         slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -2881,6 +3392,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         program: Some(sleeper_program(json!({}))),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),

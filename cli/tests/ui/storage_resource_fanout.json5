@@ -1,0 +1,18 @@
+{
+  manifest_version: "0.1.0",
+  resources: {
+    state: { kind: "storage" },
+  },
+  components: {
+    a: "./storage_resource_fanout_child.json5",
+    b: "./storage_resource_fanout_child.json5",
+  },
+  bindings: [
+    { to: "#a.state", from: "resources.state" },
+    { to: "#b.state", from: "resources.state" },
+  ],
+  exports: {
+    http_a: "#a.http",
+    http_b: "#b.http",
+  },
+}

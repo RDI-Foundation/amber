@@ -4,7 +4,8 @@ use std::{
 };
 
 use amber_manifest::{
-    CapabilityDecl, FrameworkCapabilityName, ManifestDigest, Program, ProvideDecl, SlotDecl,
+    CapabilityDecl, CapabilityKind, FrameworkCapabilityName, ManifestDigest, Program, ProvideDecl,
+    SlotDecl,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -172,6 +173,13 @@ impl Scenario {
                 BindingFrom::Component(provide) => {
                     let _ = self.component(provide.component);
                 }
+                BindingFrom::Resource(resource) => {
+                    let component = self.component(resource.component);
+                    debug_assert!(
+                        component.resources.contains_key(resource.name.as_str()),
+                        "resource missing from component"
+                    );
+                }
                 BindingFrom::External(slot) => {
                     let _ = self.component(slot.component);
                 }
@@ -216,6 +224,9 @@ pub struct Component {
     /// Declared output provides (capability outputs).
     pub provides: BTreeMap<String, ProvideDecl>,
 
+    /// Named framework-managed resources owned by this component.
+    pub resources: BTreeMap<String, ResourceDecl>,
+
     /// Named bindings declared by this component (binding name -> target slot).
     pub binding_decls: BTreeMap<String, SlotRef>,
 
@@ -226,6 +237,25 @@ pub struct Component {
     pub children: Vec<ComponentId>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageResourceParams {
+    #[serde(default)]
+    pub size: Option<String>,
+    #[serde(default)]
+    pub retention: Option<String>,
+    #[serde(default)]
+    pub sharing: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceDecl {
+    pub kind: CapabilityKind,
+    #[serde(default)]
+    pub params: StorageResourceParams,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProvideRef {
     pub component: ComponentId,
@@ -233,8 +263,15 @@ pub struct ProvideRef {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ResourceRef {
+    pub component: ComponentId,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BindingFrom {
     Component(ProvideRef),
+    Resource(ResourceRef),
     Framework(FrameworkCapabilityName),
     External(SlotRef),
 }

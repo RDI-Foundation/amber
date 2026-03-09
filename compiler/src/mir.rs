@@ -391,8 +391,9 @@ fn rewrite_bindings(
 fn binding_sort_key(binding: &BindingEdge) -> (u8, usize, &str, usize, &str, bool, bool, &str) {
     let (from_kind, from_component, from_name) = match &binding.from {
         BindingFrom::Component(provide) => (0, provide.component.0, provide.name.as_str()),
-        BindingFrom::External(slot) => (1, slot.component.0, slot.name.as_str()),
-        BindingFrom::Framework(name) => (2, 0, name.as_str()),
+        BindingFrom::Resource(resource) => (1, resource.component.0, resource.name.as_str()),
+        BindingFrom::External(slot) => (2, slot.component.0, slot.name.as_str()),
+        BindingFrom::Framework(name) => (3, 0, name.as_str()),
     };
     let (name_present, name) = match binding.name.as_deref() {
         Some(name) => (true, name),
@@ -469,6 +470,9 @@ fn is_pure_routing(
     if !component.provides.is_empty() {
         return false;
     }
+    if !component.resources.is_empty() {
+        return false;
+    }
     if component.children.is_empty() {
         return false;
     }
@@ -504,6 +508,9 @@ fn flatten_pure_routing_with_graph(scenario: Scenario, graph: &BindingGraph) -> 
     let mut referenced_by_binding = vec![false; n];
     for b in &scenario.bindings {
         if let BindingFrom::Component(from) = &b.from {
+            referenced_by_binding[from.component.0] = true;
+        }
+        if let BindingFrom::Resource(from) = &b.from {
             referenced_by_binding[from.component.0] = true;
         }
         referenced_by_binding[b.to.component.0] = true;
@@ -635,6 +642,11 @@ fn prune_and_rebuild_scenario(
         {
             continue;
         }
+        if let BindingFrom::Resource(from) = &binding.from
+            && removed[from.component.0]
+        {
+            continue;
+        }
         new_bindings.push(binding);
     }
 
@@ -659,6 +671,7 @@ enum DceWorkItem {
     LiveProgram(usize),
     Slot(CapKey),
     Provide(CapKey),
+    Resource(CapKey),
 }
 
 struct DceResults {
@@ -666,6 +679,7 @@ struct DceResults {
     live_programs: Vec<bool>,
     live_slots: HashSet<CapKey>,
     live_provides: HashSet<CapKey>,
+    live_resources: HashSet<CapKey>,
     live_bindings: Vec<bool>,
 }
 
@@ -678,6 +692,7 @@ struct DceSolver<'a> {
     live_programs: Vec<bool>,
     live_slots: HashSet<CapKey>,
     live_provides: HashSet<CapKey>,
+    live_resources: HashSet<CapKey>,
     live_bindings: Vec<bool>,
     work: VecDeque<DceWorkItem>,
 }
@@ -688,6 +703,9 @@ impl<'a> DceSolver<'a> {
         for (idx, binding) in scenario.bindings.iter().enumerate() {
             let _ = scenario.component(binding.to.component);
             if let BindingFrom::Component(from) = &binding.from {
+                let _ = scenario.component(from.component);
+            }
+            if let BindingFrom::Resource(from) = &binding.from {
                 let _ = scenario.component(from.component);
             }
             incoming[binding.to.component.0].push(idx);
@@ -703,6 +721,7 @@ impl<'a> DceSolver<'a> {
             live_programs: vec![false; n],
             live_slots: HashSet::new(),
             live_provides: HashSet::new(),
+            live_resources: HashSet::new(),
             live_bindings: vec![false; scenario.bindings.len()],
             work: VecDeque::new(),
         }
@@ -718,6 +737,7 @@ impl<'a> DceSolver<'a> {
                 DceWorkItem::LiveProgram(component) => self.apply_live_program(component),
                 DceWorkItem::Slot(key) => self.apply_slot(key),
                 DceWorkItem::Provide(key) => self.apply_provide(key),
+                DceWorkItem::Resource(key) => self.apply_resource(key),
             }
         }
 
@@ -726,6 +746,7 @@ impl<'a> DceSolver<'a> {
             live_programs: self.live_programs,
             live_slots: self.live_slots,
             live_provides: self.live_provides,
+            live_resources: self.live_resources,
             live_bindings: self.live_bindings,
         }
     }
@@ -733,6 +754,7 @@ impl<'a> DceSolver<'a> {
     fn apply_live_program(&mut self, component: usize) {
         let component_id = ComponentId(component);
         self.mark_program_used_slots(component_id);
+        self.mark_program_used_resources(component_id);
         self.mark_binding_targets(component_id, binding_usage::BindingUseSource::Program);
         self.mark_binding_targets(component_id, binding_usage::BindingUseSource::Config);
     }
@@ -753,6 +775,9 @@ impl<'a> DceSolver<'a> {
                 BindingFrom::Component(from) => {
                     self.mark_provide(from.component.0, &from.name);
                 }
+                BindingFrom::Resource(from) => {
+                    self.mark_resource(from.component.0, &from.name);
+                }
                 BindingFrom::External(from) => {
                     // Keep the external root slot declaration when a live binding depends on it.
                     self.mark_slot(from.component.0, &from.name);
@@ -765,6 +790,10 @@ impl<'a> DceSolver<'a> {
     fn apply_provide(&mut self, key: CapKey) {
         self.mark_component_and_ancestors(key.component);
         self.mark_program_live(key.component);
+    }
+
+    fn apply_resource(&mut self, key: CapKey) {
+        self.mark_component_and_ancestors(key.component);
     }
 
     fn mark_component_and_ancestors(&mut self, component: usize) {
@@ -812,6 +841,16 @@ impl<'a> DceSolver<'a> {
         }
     }
 
+    fn mark_resource(&mut self, component: usize, resource: &str) {
+        let key = CapKey {
+            component,
+            name: Arc::from(resource),
+        };
+        if self.live_resources.insert(key.clone()) {
+            self.work.push_back(DceWorkItem::Resource(key));
+        }
+    }
+
     fn mark_binding_targets(
         &mut self,
         component: ComponentId,
@@ -839,6 +878,12 @@ impl<'a> DceSolver<'a> {
             self.mark_slot(component.0, &slot);
         }
     }
+
+    fn mark_program_used_resources(&mut self, component: ComponentId) {
+        for resource in collect_program_used_resources(self.scenario.component(component)) {
+            self.mark_resource(component.0, &resource);
+        }
+    }
 }
 
 fn dce_with_semantics(scenario: Scenario) -> Scenario {
@@ -850,6 +895,7 @@ fn dce_with_semantics(scenario: Scenario) -> Scenario {
         &results.keep_components,
         &results.live_slots,
         &results.live_provides,
+        &results.live_resources,
     );
     let scenario = prune_and_rebuild_scenario(
         scenario,
@@ -952,6 +998,27 @@ fn collect_program_used_slots(component: &amber_scenario::Component) -> Vec<Stri
         }
     }
 
+    for mount in program.mounts() {
+        if let amber_manifest::MountSource::Slot(slot) = &mount.source {
+            mark_slot(slot, &mut used);
+        }
+    }
+
+    used.into_iter().collect()
+}
+
+fn collect_program_used_resources(component: &amber_scenario::Component) -> Vec<String> {
+    let Some(program) = component.program.as_ref() else {
+        return Vec::new();
+    };
+
+    let mut used = BTreeSet::new();
+    for mount in program.mounts() {
+        if let amber_manifest::MountSource::Resource(resource) = &mount.source {
+            used.insert(resource.clone());
+        }
+    }
+
     used.into_iter().collect()
 }
 
@@ -960,6 +1027,7 @@ fn compute_keep_set(
     keep_components: &[bool],
     live_slots: &HashSet<CapKey>,
     live_provides: &HashSet<CapKey>,
+    live_resources: &HashSet<CapKey>,
 ) -> Vec<bool> {
     let n = scenario.components.len();
     let mut keep = vec![false; n];
@@ -972,6 +1040,9 @@ fn compute_keep_set(
         keep[key.component] = true;
     }
     for key in live_provides {
+        keep[key.component] = true;
+    }
+    for key in live_resources {
         keep[key.component] = true;
     }
 

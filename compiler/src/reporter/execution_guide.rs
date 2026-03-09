@@ -21,6 +21,7 @@ pub(crate) struct ExecutionGuide {
     root_inputs: Vec<GuideRootInput>,
     external_slots: Vec<GuideExternalSlot>,
     exports: Vec<GuideExport>,
+    has_storage: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +51,7 @@ pub(crate) fn build_execution_guide(
     scenario: &Scenario,
     mesh_plan: &MeshPlan,
     config_plan: &ConfigPlan,
+    has_storage: bool,
 ) -> Result<ExecutionGuide, ReporterError> {
     let runtime_root_paths = runtime_root_paths(config_plan);
     let mut root_inputs = Vec::new();
@@ -97,6 +99,7 @@ pub(crate) fn build_execution_guide(
         root_inputs,
         external_slots,
         exports,
+        has_storage,
     })
 }
 
@@ -250,7 +253,18 @@ impl ExecutionGuide {
             out.push_str("\n```\n");
         }
 
-        out.push_str("\n## Teardown\n\n```sh\ndocker compose down -v\n```\n");
+        out.push_str("\n## Teardown\n\n```sh\ndocker compose down\n```\n");
+        if self.has_storage {
+            out.push_str(
+                "\nThis scenario declares persistent storage. `docker compose down` keeps the \
+                 named volumes so the next `up` can reuse them. Use `docker compose down -v` only \
+                 when you want to delete stored data too.\n",
+            );
+        } else {
+            out.push_str(
+                "\nIf you want to remove anonymous volumes too, run `docker compose down -v`.\n",
+            );
+        }
         out
     }
 
@@ -348,13 +362,23 @@ impl ExecutionGuide {
             "\n## Teardown\n\nStop the direct runtime with `Ctrl-C` in the terminal running \
              `./run.sh`.\n",
         );
+        if self.has_storage {
+            out.push_str(
+                "This scenario declares storage. By default, Amber stores direct persistent data \
+                 in a hidden sibling directory next to the compiled output, named like \
+                 `../.your-output.amber-state`.\n\nIf you want that data somewhere else, start \
+                 the runtime with an explicit storage root:\n\n```sh\n./run.sh --storage-root \
+                 /path/to/state\n```\n\nRemove the storage directory only when you want to \
+                 destroy stored data too.\n",
+            );
+        }
         out
     }
 
     pub(crate) fn render_kubernetes_readme(
         &self,
         namespace: &str,
-        deployments: &[String],
+        rollout_commands: &[String],
         needs_router: bool,
     ) -> String {
         let mut out = String::new();
@@ -365,7 +389,8 @@ impl ExecutionGuide {
              generated Kubernetes runtime.\n",
         );
         out.push_str("\n## Quickstart\n\n");
-        let apply_step = if self.has_root_inputs() { 2 } else { 1 };
+        let namespace_step = if self.has_root_inputs() { 2 } else { 1 };
+        let apply_step = namespace_step + 1;
         let port_forward_step = apply_step + 1;
         let proxy_step = apply_step + 2;
         if self.has_root_inputs() {
@@ -382,14 +407,40 @@ impl ExecutionGuide {
             out.push_str("```\n\n");
         }
         out.push_str(&format!(
-            "{apply_step}. Apply the manifests and wait for the deployments:\n\n"
+            "{namespace_step}. Open `kustomization.yaml` and choose the namespace for this \
+             deployment.\n\n"
+        ));
+        if self.has_storage {
+            out.push_str(&format!(
+                "Amber generated a unique namespace for an isolated, disposable deployment. This \
+                 scenario also declares storage, so that default is usually not what you want for \
+                 a long-lived install.\n\nIf you want this scenario's storage to persist across \
+                 redeploys, replace the generated namespace with a stable one before the first \
+                 `kubectl apply -k .`.\n\nAmber rewrites `kustomization.yaml` on every fresh \
+                 compile, so if you choose a stable namespace you need to set it again after each \
+                 recompile and before each apply.\n\nFor example, change:\n\n```yaml\nnamespace: \
+                 {namespace}\n```\n\nto something stable such as:\n\n```yaml\nnamespace: \
+                 my-scenario\n```\n\nUse the namespace you chose in the commands below. The \
+                 examples use `YOUR_NAMESPACE`.\n\n",
+            ));
+        } else {
+            out.push_str(
+                "If you keep the generated namespace, this deployment stays isolated and easy to \
+                 throw away. If you replace it with a stable namespace, future applies will keep \
+                 targeting the same installation. Use the namespace you chose in the commands \
+                 below. The examples use `YOUR_NAMESPACE`.\n\n",
+            );
+        }
+        out.push_str("Create the namespace once before the first apply:\n\n```sh\n");
+        out.push_str("kubectl create namespace YOUR_NAMESPACE\n");
+        out.push_str("```\n\n");
+        out.push_str(&format!(
+            "{apply_step}. Apply the manifests and wait for the workloads:\n\n"
         ));
         out.push_str("```sh\nkubectl apply -k .\n");
-        for deployment in deployments {
-            out.push_str(&format!(
-                "kubectl -n {} rollout status deploy/{}\n",
-                namespace, deployment
-            ));
+        for command in rollout_commands {
+            out.push_str(&command.replace(namespace, "YOUR_NAMESPACE"));
+            out.push('\n');
         }
         out.push_str("```\n");
 
@@ -398,10 +449,10 @@ impl ExecutionGuide {
                 "\n{port_forward_step}. Keep this port-forward running in one terminal:\n\n"
             ));
             out.push_str("```sh\n");
-            out.push_str(&format!(
-                "kubectl -n {} port-forward deploy/amber-router 24000:24000 24100:24100\n",
-                namespace
-            ));
+            out.push_str(
+                "kubectl -n YOUR_NAMESPACE port-forward deploy/amber-router 24000:24000 \
+                 24100:24100\n",
+            );
             out.push_str("```\n\n");
 
             out.push_str(&format!("{proxy_step}. In another terminal, run:\n\n"));
@@ -473,6 +524,16 @@ impl ExecutionGuide {
         }
 
         out.push_str("\n## Teardown\n\n```sh\nkubectl delete -k .\n```\n");
+        if self.has_storage {
+            out.push_str(
+                "\nThat command tears down the recreateable workload objects but keeps the \
+                 retained PVCs.\n\nIf you also want to destroy stored data, choose one of these \
+                 paths:\n\n- delete the retained PVCs in the namespace you \
+                 chose:\n\n```sh\nkubectl -n YOUR_NAMESPACE delete pvc --all\n```\n\n- or, if \
+                 this namespace is dedicated to this scenario, delete the namespace \
+                 itself:\n\n```sh\nkubectl delete namespace YOUR_NAMESPACE\n```\n",
+            );
+        }
         out
     }
 }
@@ -622,6 +683,7 @@ mod tests {
                 component: "/green".to_string(),
                 protocol: "http".to_string(),
             }],
+            has_storage: false,
         }
     }
 
@@ -687,11 +749,16 @@ mod tests {
     fn kubernetes_readme_mentions_port_forward_and_proxy_flags() {
         let readme = sample_guide().render_kubernetes_readme(
             "scenario-test",
-            &["amber-router".to_string(), "c0-component".to_string()],
+            &[
+                "kubectl -n scenario-test rollout status deploy/amber-router".to_string(),
+                "kubectl -n scenario-test rollout status deploy/c0-component".to_string(),
+            ],
             true,
         );
         assert!(readme.contains("Generated by Amber. Do not edit by hand."));
-        assert!(readme.contains("kubectl -n scenario-test port-forward deploy/amber-router"));
+        assert!(readme.contains("kubectl create namespace YOUR_NAMESPACE"));
+        assert!(readme.contains("kubectl -n YOUR_NAMESPACE port-forward deploy/amber-router"));
+        assert!(readme.contains("The examples use `YOUR_NAMESPACE`."));
         assert!(readme.contains("--router-control-addr 127.0.0.1:24100"));
         assert!(readme.contains("--mesh-addr \"${MESH_HOST}:25000\""));
         assert!(
@@ -701,6 +768,42 @@ mod tests {
         assert!(
             readme
                 .contains("- `public`: forwards to `/green` (`http`). Example: `127.0.0.1:18080`")
+        );
+    }
+
+    #[test]
+    fn storage_readmes_explain_persistence_behavior() {
+        let mut guide = sample_guide();
+        guide.has_storage = true;
+
+        let compose = guide.render_compose_readme();
+        assert!(compose.contains("docker compose down -v"), "{compose}");
+        assert!(compose.contains("keeps the named volumes"), "{compose}");
+
+        let direct = guide.render_direct_readme(true);
+        assert!(direct.contains("--storage-root /path/to/state"), "{direct}");
+        assert!(direct.contains("../.your-output.amber-state"), "{direct}");
+
+        let kubernetes = guide.render_kubernetes_readme(
+            "scenario-test",
+            &["kubectl -n scenario-test rollout status deploy/c0-component".to_string()],
+            true,
+        );
+        assert!(
+            kubernetes.contains("If you want this scenario's storage to persist across redeploys"),
+            "{kubernetes}"
+        );
+        assert!(
+            kubernetes.contains("namespace: scenario-test"),
+            "{kubernetes}"
+        );
+        assert!(
+            kubernetes.contains("Amber rewrites `kustomization.yaml` on every fresh compile"),
+            "{kubernetes}"
+        );
+        assert!(
+            kubernetes.contains("kubectl -n YOUR_NAMESPACE delete pvc --all"),
+            "{kubernetes}"
         );
     }
 }

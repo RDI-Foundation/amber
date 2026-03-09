@@ -16,12 +16,14 @@ use crate::{
     error::Error,
     framework::{framework_capabilities, framework_capability},
     interpolation::ProgramArgItem,
-    names::{BindingName, ChildName, ExportName, ProvideName, SlotName, ensure_name_no_dot},
+    names::{
+        BindingName, ChildName, ExportName, ProvideName, ResourceName, SlotName, ensure_name_no_dot,
+    },
     refs::{ManifestDigest, ManifestRef, ManifestUrl},
     schema::{
-        Binding, BindingSource, BindingSourceRef, BindingTarget, ComponentDecl, ConfigSchema,
-        EnvironmentDecl, ExportTarget, LocalComponentRef, MountSource, Program, ProvideDecl,
-        RawBinding, RawExportTarget, SlotDecl,
+        Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityKind, ComponentDecl,
+        ConfigSchema, EnvironmentDecl, ExportTarget, LocalComponentRef, MountSource, Program,
+        ProvideDecl, RawBinding, RawExportTarget, ResourceDecl, SlotDecl,
     },
 };
 
@@ -53,6 +55,9 @@ pub struct RawManifest {
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
     pub provides: BTreeMap<String, ProvideDecl>,
+    #[serde_as(as = "MapPreventDuplicates<_, _>")]
+    #[serde(default)]
+    pub resources: BTreeMap<String, ResourceDecl>,
     #[serde(default)]
     pub bindings: BTreeSet<RawBinding>,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
@@ -150,6 +155,7 @@ struct ValidateCtx<'a> {
     components: &'a BTreeMap<ChildName, ComponentDecl>,
     slots: &'a BTreeMap<SlotName, SlotDecl>,
     provides: &'a BTreeMap<ProvideName, ProvideDecl>,
+    resources: &'a BTreeMap<ResourceName, ResourceDecl>,
 }
 
 fn validate_manifest_ref(reference: &ManifestRef) -> Result<(), Error> {
@@ -203,6 +209,28 @@ fn convert_provides(
         .into_iter()
         .map(|(name, decl)| Ok((ProvideName::try_from(name)?, decl)))
         .collect::<Result<BTreeMap<_, _>, Error>>()
+}
+
+fn convert_resources(
+    resources: BTreeMap<String, ResourceDecl>,
+) -> Result<BTreeMap<ResourceName, ResourceDecl>, Error> {
+    resources
+        .into_iter()
+        .map(|(name, decl)| Ok((ResourceName::try_from(name)?, decl)))
+        .collect::<Result<BTreeMap<_, _>, Error>>()
+}
+
+fn validate_resource_decls(resources: &BTreeMap<ResourceName, ResourceDecl>) -> Result<(), Error> {
+    for (name, resource) in resources {
+        if resource.kind != CapabilityKind::Storage {
+            return Err(Error::UnsupportedResourceKind {
+                name: name.to_string(),
+                kind: resource.kind,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_environment_extends(
@@ -354,6 +382,15 @@ fn resolve_binding_source(
                 return Ok(BindingSource::SelfProvide(provide_name.clone()));
             }
             Err(Error::UnknownBindingSource { capability })
+        }
+        BindingSourceRef::Resources => {
+            let (resource_name, _) = ctx
+                .resources
+                .get_key_value(capability.as_str())
+                .ok_or_else(|| Error::UnknownBindingResource {
+                    resource: capability.clone(),
+                })?;
+            Ok(BindingSource::Resource(resource_name.clone()))
         }
         BindingSourceRef::Component(LocalComponentRef::Child(child)) => {
             let (child_name, _) = ctx
@@ -520,6 +557,13 @@ fn validate_endpoints(
     }
 
     for (provide_name, provide) in provides {
+        if provide.decl.kind == CapabilityKind::Storage {
+            return Err(Error::UnsupportedProvideKind {
+                name: provide_name.to_string(),
+                kind: provide.decl.kind,
+            });
+        }
+
         let Some(endpoint) = provide.endpoint.as_deref() else {
             return Err(Error::MissingProvideEndpoint {
                 name: provide_name.to_string(),
@@ -539,6 +583,8 @@ fn validate_endpoints(
 fn validate_mounts(
     program: Option<&Program>,
     config_schema: Option<&ConfigSchema>,
+    resources: &BTreeMap<ResourceName, ResourceDecl>,
+    slots: &BTreeMap<SlotName, SlotDecl>,
     enabled_features: &BTreeSet<ExperimentalFeature>,
 ) -> Result<(), Error> {
     let Some(program) = program else {
@@ -613,6 +659,13 @@ fn validate_mounts(
                     return Err(Error::MountSecretPathIsNotSecret { path: path.clone() });
                 }
             }
+            MountSource::Resource(resource) => {
+                if !resources.contains_key(resource.as_str()) {
+                    return Err(Error::UnknownMountResource {
+                        resource: resource.clone(),
+                    });
+                }
+            }
             MountSource::Framework(name) => {
                 let capability = name.as_str();
                 let Some(spec) = framework_capability(capability) else {
@@ -627,7 +680,18 @@ fn validate_mounts(
                     enabled_features,
                 )?;
             }
-            MountSource::Slot(_) | MountSource::Binding(_) => {
+            MountSource::Slot(slot) => {
+                let Some(slot_decl) = slots.get(slot.as_str()) else {
+                    return Err(Error::UnknownMountSlot { slot: slot.clone() });
+                };
+                if slot_decl.decl.kind != CapabilityKind::Storage {
+                    return Err(Error::MountSlotRequiresStorage {
+                        slot: slot.clone(),
+                        kind: slot_decl.decl.kind,
+                    });
+                }
+            }
+            MountSource::Binding(_) => {
                 return Err(Error::UnsupportedMountSource {
                     mount: mount.source.to_string(),
                 });
@@ -703,6 +767,7 @@ impl RawManifest {
             config_schema,
             slots,
             provides,
+            resources,
             bindings,
             exports,
             metadata,
@@ -719,16 +784,19 @@ impl RawManifest {
         let components = convert_components(components)?;
         let slots = convert_slots(slots)?;
         let provides = convert_provides(provides)?;
+        let resources = convert_resources(resources)?;
 
         validate_environment_extends(&environments)?;
         validate_environment_cycles(&environments)?;
         validate_component_environments(&components, &environments)?;
         validate_no_ambiguous_capability(&slots, &provides)?;
+        validate_resource_decls(&resources)?;
 
         let ctx = ValidateCtx {
             components: &components,
             slots: &slots,
             provides: &provides,
+            resources: &resources,
         };
 
         let bindings_out = build_bindings(bindings, &ctx, &experimental_features)?;
@@ -737,6 +805,8 @@ impl RawManifest {
         validate_mounts(
             program.as_ref(),
             config_schema.as_ref(),
+            &resources,
+            &slots,
             &experimental_features,
         )?;
 
@@ -761,6 +831,7 @@ impl RawManifest {
             config_schema,
             slots,
             provides,
+            resources,
             bindings: bindings_out,
             exports: exports_out,
             metadata,
@@ -780,6 +851,7 @@ pub struct Manifest {
     config_schema: Option<ConfigSchema>,
     slots: BTreeMap<SlotName, SlotDecl>,
     provides: BTreeMap<ProvideName, ProvideDecl>,
+    resources: BTreeMap<ResourceName, ResourceDecl>,
     bindings: BTreeMap<BindingTarget, Binding>,
     exports: BTreeMap<ExportName, ExportTarget>,
     metadata: Option<Value>,
@@ -823,6 +895,10 @@ impl Manifest {
         &self.provides
     }
 
+    pub fn resources(&self) -> &BTreeMap<ResourceName, ResourceDecl> {
+        &self.resources
+    }
+
     pub fn bindings(&self) -> &BTreeMap<BindingTarget, Binding> {
         &self.bindings
     }
@@ -841,6 +917,7 @@ impl Manifest {
             config_schema: None,
             slots: BTreeMap::new(),
             provides: BTreeMap::new(),
+            resources: BTreeMap::new(),
             bindings: BTreeSet::new(),
             exports: BTreeMap::new(),
             metadata: None,
@@ -870,6 +947,7 @@ impl Manifest {
         config_schema: Option<Value>,
         #[builder(default)] slots: BTreeMap<String, SlotDecl>,
         #[builder(default)] provides: BTreeMap<String, ProvideDecl>,
+        #[builder(default)] resources: BTreeMap<String, ResourceDecl>,
         #[builder(default)] bindings: BTreeSet<RawBinding>,
         #[builder(default)] exports: BTreeMap<String, RawExportTarget>,
         metadata: Option<Value>,
@@ -885,6 +963,7 @@ impl Manifest {
             config_schema,
             slots,
             provides,
+            resources,
             bindings,
             exports,
             metadata,
@@ -927,6 +1006,12 @@ impl From<&Manifest> for RawManifest {
             .map(|(name, decl)| (name.to_string(), decl.clone()))
             .collect();
 
+        let resources = manifest
+            .resources
+            .iter()
+            .map(|(name, decl)| (name.to_string(), decl.clone()))
+            .collect();
+
         let bindings = manifest
             .bindings
             .iter()
@@ -948,6 +1033,9 @@ impl From<&Manifest> for RawManifest {
                         BindingSourceRef::Component(LocalComponentRef::Self_),
                         name.to_string(),
                     ),
+                    BindingSource::Resource(name) => {
+                        (BindingSourceRef::Resources, name.to_string())
+                    }
                     BindingSource::ChildExport { child, export } => (
                         BindingSourceRef::Component(LocalComponentRef::Child(child.to_string())),
                         export.to_string(),
@@ -1003,6 +1091,7 @@ impl From<&Manifest> for RawManifest {
             config_schema: manifest.config_schema.clone(),
             slots,
             provides,
+            resources,
             bindings,
             exports,
             metadata: manifest.metadata.clone(),

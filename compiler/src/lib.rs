@@ -18,6 +18,7 @@ use thiserror::Error;
 mod binding_query;
 mod binding_usage;
 mod binding_validation;
+mod config_resolution;
 pub(crate) mod config_scope;
 mod config_template;
 mod config_templates;
@@ -30,6 +31,7 @@ mod mir;
 mod provenance;
 mod slot_query;
 mod slot_validation;
+mod storage_plan;
 mod store;
 mod targets;
 

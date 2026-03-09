@@ -105,8 +105,9 @@ pub enum Error {
     #[diagnostic(
         code(manifest::binding_target_self),
         help(
-            "Bind child slots with `to: \"#<child>.<slot>\"`. Use `from: \"self.<slot>\"` to \
-             forward a slot, or reference it in the program via `${{slots.<slot>...}}`."
+            "Bind child slots with `to: \"#<child>.<slot>\"`. If the current component needs an \
+             internally bound capability, move that program into an explicit child and bind the \
+             child slot instead."
         )
     )]
     BindingTargetSelfSlot { slot: String },
@@ -114,6 +115,10 @@ pub enum Error {
     #[error("binding source `self.{capability}` references unknown slot or provide")]
     #[diagnostic(code(manifest::unknown_binding_source))]
     UnknownBindingSource { capability: String },
+
+    #[error("binding source `resources.{resource}` references unknown resource")]
+    #[diagnostic(code(manifest::unknown_binding_resource))]
+    UnknownBindingResource { resource: String },
 
     #[error("unknown framework capability `{capability}`")]
     #[diagnostic(code(manifest::unknown_framework_capability), help("{help}"))]
@@ -143,9 +148,33 @@ pub enum Error {
     #[diagnostic(code(manifest::missing_provide_endpoint))]
     MissingProvideEndpoint { name: String },
 
+    #[error("provide `{name}` cannot use capability kind `{kind}`")]
+    #[diagnostic(
+        code(manifest::unsupported_provide_kind),
+        help(
+            "Storage is declared in `resources` or received through `slots`, not `provides`. \
+             Declare `resources.{name}: {{ kind: \"storage\" }}` and mount it directly, or use \
+             `slots.{name}: {{ kind: \"storage\" }}` when the storage is bound from a parent."
+        )
+    )]
+    UnsupportedProvideKind {
+        name: String,
+        kind: crate::CapabilityKind,
+    },
+
     #[error("duplicate mount name `{name}`")]
     #[diagnostic(code(manifest::duplicate_mount_name))]
     DuplicateMountName { name: String },
+
+    #[error("resource `{name}` cannot use capability kind `{kind}`")]
+    #[diagnostic(
+        code(manifest::unsupported_resource_kind),
+        help("Only `kind: \"storage\"` resources are supported today.")
+    )]
+    UnsupportedResourceKind {
+        name: String,
+        kind: crate::CapabilityKind,
+    },
 
     #[error("duplicate mount path `{path}`")]
     #[diagnostic(code(manifest::duplicate_mount_path))]
@@ -170,6 +199,27 @@ pub enum Error {
     #[error("secret mount path `{path}` is not secret")]
     #[diagnostic(code(manifest::mount_secret_path_is_not_secret))]
     MountSecretPathIsNotSecret { path: String },
+
+    #[error("mount source `slots.{slot}` references unknown slot")]
+    #[diagnostic(code(manifest::unknown_mount_slot))]
+    UnknownMountSlot { slot: String },
+
+    #[error("mount source `resources.{resource}` references unknown resource")]
+    #[diagnostic(code(manifest::unknown_mount_resource))]
+    UnknownMountResource { resource: String },
+
+    #[error("mount source `slots.{slot}` requires a storage slot, but `{slot}` is `{kind}`")]
+    #[diagnostic(
+        code(manifest::mount_slot_requires_storage),
+        help(
+            "URL-shaped slots expose fields like `.url`. Storage slots are virtual storage \
+             objects and are mounted with `from: \"slots.<slot>\"`."
+        )
+    )]
+    MountSlotRequiresStorage {
+        slot: String,
+        kind: crate::CapabilityKind,
+    },
 
     #[error("mount source `{mount}` is reserved (not implemented)")]
     #[diagnostic(code(manifest::unsupported_mount_source))]

@@ -1,0 +1,29 @@
+compiler::invalid_slots_interpolation
+
+  x invalid slots interpolation in / (program.entrypoint[2]): storage slot `state` is a virtual storage object, not a URL-shaped slot
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_interpolation_storage.json5:8:7]
+ 7 |       "-lc",
+ 8 |       "echo ${slots.state.url}",
+   :       ^^^^^^^^^^^^|^^^^^^^^^^^^
+   :                   `-- slot interpolation here
+ 9 |     ],
+   `----
+  help: Mount the storage slot with `program.mounts: [{ from: "slots.<slot>", path: "/var/lib/app" }]` instead of using `${slots...}`.
+manifest::unused_program
+
+  ! program is never referenced by bindings or exports (in component /)
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_interpolation_storage.json5:3:12]
+  2 |       manifest_version: "0.1.0",
+  3 | ,->   program: {
+  4 | |       image: "busybox:1.36.1",
+  5 | |       entrypoint: [
+  6 | |         "sh",
+  7 | |         "-lc",
+  8 | |         "echo ${slots.state.url}",
+  9 | |       ],
+ 10 | |->   },
+    : `---- unused `program`
+ 11 |       slots: {
+    `----
+  help: Remove the `program` block if it is not needed, or export/bind one of its provides.
+Error:   × check failed

@@ -643,7 +643,8 @@ fn collect_config_uses(manifest: &Manifest) -> ConfigUses {
         for mount in program.mounts() {
             match &mount.source {
                 MountSource::Config(path) | MountSource::Secret(path) => uses.add_query(path),
-                MountSource::Slot(_) | MountSource::Binding(_) | MountSource::Framework(_) => {}
+                MountSource::Resource(_) | MountSource::Slot(_) => {}
+                MountSource::Binding(_) | MountSource::Framework(_) => {}
             }
         }
     }
@@ -732,6 +733,13 @@ pub fn lint_manifest(
         let _ = visit_program_interpolated(program, |value| {
             add_program_slot_uses(manifest, &mut program_used_slots, value)
         });
+        for mount in program.mounts() {
+            if let MountSource::Slot(slot) = &mount.source
+                && let Some((slot_key, _)) = manifest.slots().get_key_value(slot.as_str())
+            {
+                program_used_slots.insert(slot_key);
+            }
+        }
     }
 
     let mut exported_provides = BTreeSet::new();
@@ -1081,6 +1089,28 @@ mod tests {
         assert!(!lints.iter().any(|lint| matches!(
             lint,
             crate::lint::ManifestLint::UnusedSlot { name, .. } if name == "llm"
+        )));
+    }
+
+    #[test]
+    fn storage_slot_mounted_by_program_is_not_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { state: { kind: "storage" } },
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [{ path: "/var/lib/app", from: "slots.state" }],
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedSlot { name, .. } if name == "state"
         )));
     }
 

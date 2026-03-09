@@ -8,13 +8,15 @@ use std::{
 
 use amber_config as rc;
 use amber_manifest::{
-    BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, ChildName, ExportName,
-    ExportTarget, InterpolatedPart, InterpolatedString, InterpolationSource, Manifest,
-    ManifestDigest, SlotTarget, framework_capability, parse_slot_query,
+    BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, CapabilityKind, ChildName,
+    ExportName, ExportTarget, InterpolatedPart, InterpolatedString, InterpolationSource, Manifest,
+    ManifestDigest, MountSource, SlotTarget, framework_capability, parse_slot_query,
+    span_for_json_pointer,
 };
 use amber_scenario::{
-    BindingEdge, BindingFrom, Component, ComponentId, ProvideRef, Scenario, ScenarioExport,
-    SlotRef, graph::component_path_for,
+    BindingEdge, BindingFrom, Component, ComponentId, ProvideRef,
+    ResourceDecl as ScenarioResourceDecl, ResourceRef, Scenario, ScenarioExport, SlotRef,
+    StorageResourceParams as ScenarioStorageResourceParams, graph::component_path_for,
 };
 use jsonschema::Validator;
 use miette::{Diagnostic, NamedSource, SourceSpan};
@@ -22,7 +24,10 @@ use serde_json::Value;
 use thiserror::Error;
 
 use super::frontend::{ResolvedNode, ResolvedTree};
-use crate::{ComponentProvenance, DigestStore, Provenance, config_templates};
+use crate::{
+    ComponentProvenance, DigestStore, Provenance, config_resolution::render_static_config_string,
+    config_templates, store::display_url,
+};
 
 #[allow(unused_assignments)]
 #[derive(Debug, Error, Diagnostic)]
@@ -245,6 +250,27 @@ impl<'a> ConfigErrorSite<'a> {
             None
         }
     }
+
+    fn resource_param_site(&self, resource: &str, param: &str) -> Option<ConfigSite> {
+        let (src, spans) = source_for_component(self.provenance, self.store, self.id)?;
+        let resource_spans = spans.resources.get(resource)?;
+        let span = resource_spans
+            .params
+            .as_ref()
+            .and_then(|params| match param {
+                "size" => params.size,
+                "retention" => params.retention,
+                "sharing" => params.sharing,
+                _ => None,
+            })
+            .or_else(|| resource_spans.params.as_ref().map(|params| params.whole))
+            .unwrap_or(resource_spans.whole);
+        Some(ConfigSite {
+            src,
+            span,
+            label: "resource param here".to_string(),
+        })
+    }
 }
 
 fn config_site_for_component(
@@ -424,6 +450,70 @@ fn slot_decl_related_span(
     })
 }
 
+fn storage_mount_index(manifest: &Manifest, slot: &str) -> Option<usize> {
+    let program = manifest.program()?;
+    program.mounts().iter().position(|mount| {
+        matches!(
+            &mount.source,
+            MountSource::Slot(mount_slot) if mount_slot.as_str() == slot
+        )
+    })
+}
+
+fn mount_source_site(
+    provenance: &Provenance,
+    store: &DigestStore,
+    id: ComponentId,
+    mount_index: usize,
+) -> Option<(NamedSource<Arc<str>>, SourceSpan)> {
+    let prov = provenance.for_component(id);
+    let stored = store.get_source(&prov.resolved_url)?;
+    let src = NamedSource::new(display_url(&prov.resolved_url), Arc::clone(&stored.source))
+        .with_language("json5");
+    let root = (0usize, stored.source.len()).into();
+    let pointer = format!("/program/mounts/{mount_index}/from");
+    let whole_mount_pointer = format!("/program/mounts/{mount_index}");
+    let span = span_for_json_pointer(stored.source.as_ref(), root, &pointer)
+        .or_else(|| span_for_json_pointer(stored.source.as_ref(), root, &whole_mount_pointer))
+        .or_else(|| span_for_json_pointer(stored.source.as_ref(), root, "/program/mounts"))
+        .or_else(|| stored.spans.program.as_ref().map(|program| program.whole))
+        .unwrap_or((0usize, 0usize).into());
+    Some((src, span))
+}
+
+#[derive(Clone, Debug)]
+enum StorageMountSinkSite {
+    Binding(BindingOrigin),
+    Mount {
+        component: ComponentId,
+        mount_index: usize,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct StorageMountSink {
+    component: ComponentId,
+    sink_id: String,
+    description: String,
+    site: StorageMountSinkSite,
+}
+
+fn storage_mount_sink_site(
+    provenance: &Provenance,
+    store: &DigestStore,
+    sink: &StorageMountSinkSite,
+) -> Option<(NamedSource<Arc<str>>, SourceSpan)> {
+    match sink {
+        StorageMountSinkSite::Binding(origin) => {
+            binding_source_site(provenance, store, origin.realm, &origin.target_key)
+        }
+        StorageMountSinkSite::Mount {
+            component,
+            mount_index,
+        } => mount_source_site(provenance, store, *component, *mount_index),
+    }
+}
+
 #[allow(unused_assignments)]
 #[derive(Debug, Error, Diagnostic)]
 #[non_exhaustive]
@@ -515,6 +605,50 @@ pub enum Error {
         #[source_code]
         src: NamedSource<Arc<str>>,
         #[label(primary, "binding provides `{got}` to slot expecting `{expected}`")]
+        span: SourceSpan,
+        #[related]
+        related: Vec<RelatedSpan>,
+    },
+
+    #[error(
+        "storage mount `slots.{slot}` on {component_path} must resolve from a storage resource"
+    )]
+    #[diagnostic(
+        code(linker::storage_mount_requires_resource),
+        help(
+            "Declare `resources.<name>: {{ kind: \"storage\" }}` and bind it to the mounted \
+             storage slot, or mount a local resource directly with `program.mounts: [{{ from: \
+             \"resources.<name>\", path: ... }}]`."
+        )
+    )]
+    StorageMountRequiresResource {
+        component_path: String,
+        slot: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label(primary, "storage mount declared here")]
+        span: SourceSpan,
+        #[related]
+        related: Vec<RelatedSpan>,
+    },
+
+    #[error(
+        "storage resource `resources.{resource}` on {owner_component_path} fans out to multiple \
+         mounted storage sinks"
+    )]
+    #[diagnostic(
+        code(linker::storage_resource_fanout),
+        help(
+            "Allocated storage is exclusive today. Route a distinct storage resource to each \
+             mounted sink."
+        )
+    )]
+    StorageResourceFanout {
+        owner_component_path: String,
+        resource: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label(primary, "one mounted sink uses this resource here")]
         span: SourceSpan,
         #[related]
         related: Vec<RelatedSpan>,
@@ -658,6 +792,7 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
             .iter()
             .map(|(name, decl)| (name.as_str().to_string(), decl.clone()))
             .collect();
+        c.resources.clear();
         c.config_schema = m.config_schema().map(|schema| schema.0.clone());
         c.binding_decls = collect_binding_decls(ComponentId(id), m, &link_index[id]);
         c.metadata = m.metadata().cloned();
@@ -666,13 +801,21 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
     let mut schema_cache: HashMap<ManifestDigest, Arc<Validator>> = HashMap::new();
     let mut errors = Vec::new();
 
-    validate_config_tree(
+    let composed = validate_config_tree(
         root,
         &components,
         &manifests,
         &provenance,
         store,
         &mut schema_cache,
+        &mut errors,
+    );
+    resolve_resource_params(
+        &mut components,
+        &manifests,
+        &composed,
+        &provenance,
+        store,
         &mut errors,
     );
     for id in (0..components.len()).map(ComponentId) {
@@ -721,6 +864,15 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         store,
         &mut errors,
     );
+    validate_storage_mounts(
+        &components,
+        &manifests,
+        &bindings,
+        &mut resolver,
+        &provenance,
+        store,
+        &mut errors,
+    );
 
     if !errors.is_empty() {
         return Err(Error::Multiple {
@@ -742,6 +894,26 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
                 match resolved {
                     Some(resolved) => match resolved.from {
                         BindingFrom::Component(provide) => Some(provide),
+                        BindingFrom::Resource(resource) => {
+                            let (src, span) = export_site(&provenance, store, root, export_name);
+                            errors.push(Error::InvalidExport {
+                                component_path: describe_component_path(&component_path_for(
+                                    &components,
+                                    root,
+                                )),
+                                name: export_name.to_string(),
+                                message: format!(
+                                    "target resolves to resource `resources.{}`, which cannot be \
+                                     exported",
+                                    resource.name
+                                ),
+                                help: "Export a component provide or child export instead."
+                                    .to_string(),
+                                src,
+                                span,
+                            });
+                            None
+                        }
                         BindingFrom::Framework(name) => {
                             let (src, span) = export_site(&provenance, store, root, export_name);
                             errors.push(Error::InvalidExport {
@@ -897,6 +1069,7 @@ fn flatten(
         program: None,
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
         binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
@@ -941,7 +1114,7 @@ fn validate_config_tree(
     store: &DigestStore,
     schema_cache: &mut HashMap<ManifestDigest, Arc<Validator>>,
     errors: &mut Vec<Error>,
-) {
+) -> config_templates::ComposedTemplates {
     fn invalid_config_error(
         component_path: String,
         site: &ConfigSite,
@@ -1118,6 +1291,115 @@ fn validate_config_tree(
         }
     }
 
+    fn validate_resource_config_refs(
+        id: ComponentId,
+        components: &[Option<Component>],
+        manifests: &[Option<Arc<Manifest>>],
+        provenance: &Provenance,
+        store: &DigestStore,
+        schema: Option<&Value>,
+        errors: &mut Vec<Error>,
+    ) {
+        let m = manifests[id.0].as_ref().expect("manifest should exist");
+        let component_path = component_path_for(components, id);
+        let site = ConfigErrorSite::new(components, provenance, store, id);
+
+        let mut validate_config_ref =
+            |resource_name: &str, param_name: &str, value: &InterpolatedString| {
+                for part in &value.parts {
+                    let InterpolatedPart::Interpolation { source, query } = part else {
+                        continue;
+                    };
+
+                    let Some(param_site) = site.resource_param_site(resource_name, param_name)
+                    else {
+                        continue;
+                    };
+
+                    match source {
+                        InterpolationSource::Config => {
+                            let interp_suffix = if query.is_empty() {
+                                "".to_string()
+                            } else {
+                                format!(".{query}")
+                            };
+                            let Some(schema) = schema else {
+                                errors.push(invalid_config_error(
+                                    component_path.clone(),
+                                    &param_site,
+                                    format!(
+                                        "resources.{resource_name}.params.{param_name} references \
+                                         ${{config{interp_suffix}}}, but this component does not \
+                                         declare `config_schema`"
+                                    ),
+                                    Some("config definition required".to_string()),
+                                    Vec::new(),
+                                ));
+                                continue;
+                            };
+                            match rc::schema_lookup(schema, query) {
+                                Ok(rc::SchemaLookup::Found) | Ok(rc::SchemaLookup::Unknown) => {}
+                                Err(err) => errors.push(invalid_config_error(
+                                    component_path.clone(),
+                                    &param_site,
+                                    format!(
+                                        "invalid ${{config{interp_suffix}}} reference in \
+                                         resources.{resource_name}.params.{param_name}: {err}"
+                                    ),
+                                    Some("invalid config reference".to_string()),
+                                    Vec::new(),
+                                )),
+                            }
+                        }
+                        InterpolationSource::Slots => errors.push(invalid_config_error(
+                            component_path.clone(),
+                            &param_site,
+                            format!(
+                                "resources.{resource_name}.params.{param_name} uses \
+                                 ${{slots...}}, but resource params only support literal strings \
+                                 and ${{config...}}"
+                            ),
+                            Some("invalid interpolation here".to_string()),
+                            Vec::new(),
+                        )),
+                        InterpolationSource::Bindings => errors.push(invalid_config_error(
+                            component_path.clone(),
+                            &param_site,
+                            format!(
+                                "resources.{resource_name}.params.{param_name} uses \
+                                 ${{bindings...}}, but resource params only support literal \
+                                 strings and ${{config...}}"
+                            ),
+                            Some("invalid interpolation here".to_string()),
+                            Vec::new(),
+                        )),
+                        other => errors.push(invalid_config_error(
+                            component_path.clone(),
+                            &param_site,
+                            format!(
+                                "resources.{resource_name}.params.{param_name} uses unsupported \
+                                 interpolation source `{other}`"
+                            ),
+                            Some("invalid interpolation here".to_string()),
+                            Vec::new(),
+                        )),
+                    }
+                }
+            };
+
+        for (resource_name, resource) in m.resources() {
+            if let Some(size) = resource.params.size.as_ref() {
+                validate_config_ref(resource_name.as_str(), "size", size);
+            }
+            if let Some(retention) = resource.params.retention.as_ref() {
+                validate_config_ref(resource_name.as_str(), "retention", retention);
+            }
+            if let Some(sharing) = resource.params.sharing.as_ref() {
+                validate_config_ref(resource_name.as_str(), "sharing", sharing);
+            }
+        }
+    }
+
     fn required_strings(schema: &Value) -> Vec<String> {
         schema
             .get("required")
@@ -1287,6 +1569,7 @@ fn validate_config_tree(
         let m = manifests[id.0].as_ref().expect("manifest should exist");
         let schema = m.config_schema().map(|s| &s.0);
         validate_program_config_refs(id, components, manifests, provenance, store, schema, errors);
+        validate_resource_config_refs(id, components, manifests, provenance, store, schema, errors);
     }
 
     let composed = config_templates::compose_root_config_templates(root, components);
@@ -1394,6 +1677,105 @@ fn validate_config_tree(
             }
         }
     }
+    composed
+}
+
+fn resolve_resource_params(
+    components: &mut [Option<Component>],
+    manifests: &[Option<Arc<Manifest>>],
+    composed: &config_templates::ComposedTemplates,
+    provenance: &Provenance,
+    store: &DigestStore,
+    errors: &mut Vec<Error>,
+) {
+    let components_with_template_errors: HashSet<ComponentId> =
+        composed.errors.iter().map(|err| err.component).collect();
+
+    for id in (0..components.len()).map(ComponentId) {
+        if components[id.0].is_none() {
+            continue;
+        }
+        let manifest = manifests[id.0].as_ref().expect("manifest should exist");
+        let component_path = component_path_for(components, id);
+        let site = ConfigErrorSite::new(components, provenance, store, id);
+        let template = (!components_with_template_errors.contains(&id))
+            .then(|| {
+                composed
+                    .templates
+                    .get(&id)
+                    .and_then(rc::RootConfigTemplate::node)
+            })
+            .flatten();
+        let mut resolved_resources = BTreeMap::new();
+
+        for (resource_name, resource) in manifest.resources() {
+            let mut resolved = ScenarioResourceDecl {
+                kind: resource.kind,
+                params: ScenarioStorageResourceParams::default(),
+            };
+
+            let mut resolve_param =
+                |param_name: &str, value: &Option<InterpolatedString>, out: &mut Option<String>| {
+                    let Some(value) = value.as_ref() else {
+                        return;
+                    };
+                    if components_with_template_errors.contains(&id)
+                        && value.parts.iter().any(|part| {
+                            matches!(
+                                part,
+                                InterpolatedPart::Interpolation {
+                                    source: InterpolationSource::Config,
+                                    ..
+                                }
+                            )
+                        })
+                    {
+                        return;
+                    }
+                    match render_static_config_string(value, template) {
+                        Ok(rendered) => *out = Some(rendered),
+                        Err(err) => {
+                            let param_site = site
+                                .resource_param_site(resource_name.as_str(), param_name)
+                                .unwrap_or_else(|| ConfigSite {
+                                    src: unknown_source(),
+                                    span: (0usize, 0usize).into(),
+                                    label: "resource param here".to_string(),
+                                });
+                            errors.push(Error::InvalidConfig {
+                                component_path: component_path.clone(),
+                                message: format!(
+                                    "failed to resolve \
+                                     resources.{resource_name}.params.{param_name}: {err}"
+                                ),
+                                src: param_site.src,
+                                span: param_site.span,
+                                label: param_site.label,
+                                related: Vec::new(),
+                            });
+                        }
+                    }
+                };
+
+            resolve_param("size", &resource.params.size, &mut resolved.params.size);
+            resolve_param(
+                "retention",
+                &resource.params.retention,
+                &mut resolved.params.retention,
+            );
+            resolve_param(
+                "sharing",
+                &resource.params.sharing,
+                &mut resolved.params.sharing,
+            );
+            resolved_resources.insert(resource_name.as_str().to_string(), resolved);
+        }
+
+        components[id.0]
+            .as_mut()
+            .expect("component should exist")
+            .resources = resolved_resources;
+    }
 }
 
 fn validate_exports(
@@ -1500,6 +1882,7 @@ struct ResolvedBindingTarget {
 #[derive(Clone, Debug)]
 enum CapabilitySource {
     Provide(ProvideRef),
+    Resource(ResourceRef),
     Slot(SlotRef),
     Framework(amber_manifest::FrameworkCapabilityName),
 }
@@ -1594,6 +1977,23 @@ fn resolve_binding_source(
                 decl: slot_decl.decl.clone(),
             })
         }
+        BindingSource::Resource(resource_name) => {
+            let from_id = site.realm;
+            let from_manifest = manifests[from_id.0]
+                .as_ref()
+                .expect("manifest should exist");
+            let resource_decl = from_manifest
+                .resources()
+                .get(resource_name)
+                .expect("manifest invariant: resource exists");
+            Ok(ResolvedBindingSource {
+                source: CapabilitySource::Resource(ResourceRef {
+                    component: from_id,
+                    name: resource_name.to_string(),
+                }),
+                decl: CapabilityDecl::builder().kind(resource_decl.kind).build(),
+            })
+        }
         BindingSource::ChildExport { child, export } => {
             let from_id = child_component_id(link_index, site.realm, child);
             let resolved = resolve_export(site.components, manifests, link_index, from_id, export)
@@ -1660,9 +2060,9 @@ fn type_mismatch_error(
     let ResolvedBindingSource { source, decl } = source;
     let (src, span) = match &source {
         CapabilitySource::Framework(_) => binding_source_site(provenance, store, realm, target_key),
-        CapabilitySource::Provide(_) | CapabilitySource::Slot(_) => {
-            binding_site(provenance, store, realm, target_key)
-        }
+        CapabilitySource::Provide(_)
+        | CapabilitySource::Resource(_)
+        | CapabilitySource::Slot(_) => binding_site(provenance, store, realm, target_key),
     }
     .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
 
@@ -1699,6 +2099,22 @@ fn type_mismatch_error(
                         label: "provide type declared here".to_string(),
                     });
                 }
+            }
+        }
+        CapabilitySource::Resource(resource_ref) => {
+            if let Some((resource_src, _)) =
+                source_for_component(provenance, store, resource_ref.component)
+            {
+                related.push(RelatedSpan {
+                    message: format!(
+                        "resource `resources.{}` declared on {}",
+                        resource_ref.name,
+                        component_path_for(components, resource_ref.component)
+                    ),
+                    src: resource_src,
+                    span: (0usize, 0usize).into(),
+                    label: "resource declared here".to_string(),
+                });
             }
         }
         CapabilitySource::Slot(slot_ref) => {
@@ -1928,6 +2344,12 @@ impl<'a> SlotResolver<'a> {
                 all_weak: true,
                 nonweak: None,
             }),
+            CapabilitySource::Resource(resource) => Some(ResolvedBindingFrom {
+                from: BindingFrom::Resource(resource.clone()),
+                weak: false,
+                all_weak: true,
+                nonweak: None,
+            }),
             CapabilitySource::Framework(name) => Some(ResolvedBindingFrom {
                 from: BindingFrom::Framework(name.clone()),
                 weak: false,
@@ -2062,6 +2484,13 @@ impl<'a> SlotResolver<'a> {
             .unwrap_or(false)
     }
 
+    fn slot_kind(&self, slot: &SlotRef) -> Option<CapabilityKind> {
+        self.components[slot.component.0]
+            .as_ref()
+            .and_then(|c| c.slots.get(slot.name.as_str()))
+            .map(|decl| decl.decl.kind)
+    }
+
     fn external_root_slots(&self) -> HashSet<String> {
         self.external_root_slots.clone()
     }
@@ -2145,6 +2574,14 @@ fn collect_program_slot_uses(manifest: &Manifest) -> HashSet<String> {
         used_all = add_program_slot_uses(manifest, &mut uses, value.value());
         if used_all {
             return uses;
+        }
+    }
+
+    for mount in program.mounts() {
+        if let MountSource::Slot(slot) = &mount.source
+            && manifest.slots().contains_key(slot.as_str())
+        {
+            uses.insert(slot.clone());
         }
     }
 
@@ -2305,6 +2742,7 @@ fn resolve_binding_edges(
 
         if let BindingFrom::External(slot_ref) = &resolved.from
             && !all_weak
+            && resolver.slot_kind(slot_ref) != Some(CapabilityKind::Storage)
         {
             let (origin, target) = nonweak.unwrap_or((&binding.origin, &binding.target));
 
@@ -2374,6 +2812,11 @@ fn validate_all_slots_bound(
             if slot_decl.optional {
                 continue;
             }
+            if slot_decl.decl.kind == CapabilityKind::Storage
+                && storage_mount_index(m, slot_name.as_str()).is_some()
+            {
+                continue;
+            }
             if id == root && external_root_slots.contains(slot_name.as_str()) {
                 continue;
             }
@@ -2402,6 +2845,188 @@ fn validate_all_slots_bound(
                 related,
             });
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_storage_mounts(
+    components: &[Option<Component>],
+    manifests: &[Option<Arc<Manifest>>],
+    binding_specs: &[BindingSpec],
+    resolver: &mut SlotResolver<'_>,
+    provenance: &Provenance,
+    store: &DigestStore,
+    errors: &mut Vec<Error>,
+) {
+    let binding_origins: HashMap<_, _> = binding_specs
+        .iter()
+        .map(|binding| {
+            (
+                (binding.target.component, binding.target.name.as_str()),
+                (binding.origin.realm, binding.origin.target_key.clone()),
+            )
+        })
+        .collect();
+    let mut sinks_by_resource: HashMap<ResourceRef, Vec<StorageMountSink>> = HashMap::new();
+
+    for id in (0..components.len()).map(ComponentId) {
+        let manifest = manifests[id.0].as_ref().expect("manifest should exist");
+        let Some(program) = manifest.program() else {
+            continue;
+        };
+        for (mount_index, mount) in program.mounts().iter().enumerate() {
+            match &mount.source {
+                MountSource::Slot(slot_name) => {
+                    let Some(slot_decl) = manifest.slots().get(slot_name.as_str()) else {
+                        continue;
+                    };
+                    if slot_decl.decl.kind != CapabilityKind::Storage {
+                        continue;
+                    }
+
+                    let slot_ref = SlotRef {
+                        component: id,
+                        name: slot_name.to_string(),
+                    };
+                    let resolved = resolver.resolve_slot(&slot_ref, errors);
+                    let Some(resolved) = resolved else {
+                        let component_path =
+                            describe_component_path(&component_path_for(components, id));
+                        let (src, span) = mount_source_site(provenance, store, id, mount_index)
+                            .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                        let mut related: Vec<_> =
+                            component_decl_site(components, provenance, store, id)
+                                .into_iter()
+                                .collect();
+                        if let Some(site) = slot_decl_related_span(
+                            components,
+                            provenance,
+                            store,
+                            &slot_ref,
+                            "storage slot",
+                            "storage slot declared here",
+                            false,
+                        ) {
+                            related.push(site);
+                        }
+                        errors.push(Error::StorageMountRequiresResource {
+                            component_path,
+                            slot: slot_name.to_string(),
+                            src,
+                            span,
+                            related,
+                        });
+                        continue;
+                    };
+                    let BindingFrom::Resource(resource) = resolved.from else {
+                        let component_path =
+                            describe_component_path(&component_path_for(components, id));
+                        let (src, span) = mount_source_site(provenance, store, id, mount_index)
+                            .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                        let mut related: Vec<_> =
+                            component_decl_site(components, provenance, store, id)
+                                .into_iter()
+                                .collect();
+                        if let Some(site) = slot_decl_related_span(
+                            components,
+                            provenance,
+                            store,
+                            &slot_ref,
+                            "storage slot",
+                            "storage slot declared here",
+                            false,
+                        ) {
+                            related.push(site);
+                        }
+                        errors.push(Error::StorageMountRequiresResource {
+                            component_path,
+                            slot: slot_name.to_string(),
+                            src,
+                            span,
+                            related,
+                        });
+                        continue;
+                    };
+
+                    let site = if let Some((realm, target_key)) =
+                        binding_origins.get(&(id, slot_name.as_str()))
+                    {
+                        StorageMountSinkSite::Binding(BindingOrigin {
+                            realm: *realm,
+                            target_key: target_key.clone(),
+                        })
+                    } else {
+                        StorageMountSinkSite::Binding(BindingOrigin {
+                            realm: id,
+                            target_key: BindingTargetKey::SelfSlot(slot_name.as_str().into()),
+                        })
+                    };
+                    sinks_by_resource
+                        .entry(resource)
+                        .or_default()
+                        .push(StorageMountSink {
+                            component: id,
+                            sink_id: format!("slot:{slot_name}"),
+                            description: format!("slots.{slot_name}"),
+                            site,
+                        });
+                }
+                MountSource::Resource(resource_name) => {
+                    sinks_by_resource
+                        .entry(ResourceRef {
+                            component: id,
+                            name: resource_name.clone(),
+                        })
+                        .or_default()
+                        .push(StorageMountSink {
+                            component: id,
+                            sink_id: format!("mount:{mount_index}"),
+                            description: format!("resources.{resource_name}"),
+                            site: StorageMountSinkSite::Mount {
+                                component: id,
+                                mount_index,
+                            },
+                        });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for (resource, sinks) in sinks_by_resource {
+        let mut unique_sinks = HashSet::new();
+        for sink in &sinks {
+            unique_sinks.insert((sink.component, sink.sink_id.clone()));
+        }
+        if unique_sinks.len() <= 1 {
+            continue;
+        }
+
+        let owner_component_path =
+            describe_component_path(&component_path_for(components, resource.component));
+        let (src, span) = storage_mount_sink_site(provenance, store, &sinks[0].site)
+            .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+        let related = sinks
+            .iter()
+            .skip(1)
+            .filter_map(|sink| {
+                storage_mount_sink_site(provenance, store, &sink.site).map(|(src, span)| {
+                    RelatedSpan {
+                        message: format!("another mounted sink uses `{}`", sink.description),
+                        src,
+                        span,
+                        label: "another mounted sink uses this resource here".to_string(),
+                    }
+                })
+            })
+            .collect();
+        errors.push(Error::StorageResourceFanout {
+            owner_component_path,
+            resource: resource.name,
+            src,
+            span,
+            related,
+        });
     }
 }
 

@@ -64,6 +64,7 @@ mod tests {
             program: None,
             slots: BTreeMap::new(),
             provides: BTreeMap::new(),
+            resources: BTreeMap::new(),
             binding_decls: BTreeMap::new(),
             metadata: None,
             children: Vec::new(),

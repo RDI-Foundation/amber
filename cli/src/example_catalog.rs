@@ -5,8 +5,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use amber_manifest::{ComponentDecl, Manifest, ManifestUrl};
-
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct Example {
@@ -19,13 +17,6 @@ pub(crate) struct Example {
 
 pub(crate) fn collect_examples(examples_dir: &Path) -> Result<Vec<Example>, String> {
     let root_manifests = collect_root_manifests(examples_dir)?;
-    let workspace_root = examples_dir.parent().ok_or_else(|| {
-        format!(
-            "examples directory `{}` has no parent",
-            examples_dir.display()
-        )
-    })?;
-
     let mut examples = Vec::with_capacity(root_manifests.len());
     let mut names = HashSet::new();
 
@@ -37,10 +28,16 @@ pub(crate) fn collect_examples(examples_dir: &Path) -> Result<Vec<Example>, Stri
             )
         })?;
         let name = dir
-            .file_name()
-            .and_then(OsStr::to_str)
-            .ok_or_else(|| format!("invalid example directory name `{}`", dir.display()))?
-            .to_owned();
+            .strip_prefix(examples_dir)
+            .map_err(|err| {
+                format!(
+                    "example directory `{}` does not live under `{}`: {err}",
+                    dir.display(),
+                    examples_dir.display()
+                )
+            })?
+            .to_string_lossy()
+            .replace('\\', "/");
 
         if !names.insert(name.clone()) {
             return Err(format!(
@@ -50,12 +47,8 @@ pub(crate) fn collect_examples(examples_dir: &Path) -> Result<Vec<Example>, Stri
         }
 
         let files = collect_example_files(dir)?;
-        let summary = read_example_summary(dir)?.unwrap_or_else(|| {
-            let relative_root = root_manifest
-                .strip_prefix(workspace_root)
-                .unwrap_or(&root_manifest);
-            format!("Example rooted at `{}`.", relative_root.display())
-        });
+        let summary =
+            read_example_summary(dir)?.unwrap_or_else(|| format!("Example rooted at `{name}`."));
 
         examples.push(Example {
             name,
@@ -114,11 +107,23 @@ fn collect_example_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-fn collect_example_manifests(dir: &Path) -> Result<Vec<PathBuf>, String> {
+fn collect_root_manifests(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut stack = vec![dir.to_path_buf()];
-    let mut manifests = Vec::new();
+    let mut roots = Vec::new();
 
     while let Some(path) = stack.pop() {
+        let scenario_json5 = path.join("scenario.json5");
+        if scenario_json5.is_file() {
+            roots.push(scenario_json5);
+            continue;
+        }
+
+        let scenario_json = path.join("scenario.json");
+        if scenario_json.is_file() {
+            roots.push(scenario_json);
+            continue;
+        }
+
         let entries = fs::read_dir(&path).map_err(|err| {
             format!(
                 "failed to read examples directory `{}`: {err}",
@@ -135,88 +140,12 @@ fn collect_example_manifests(dir: &Path) -> Result<Vec<PathBuf>, String> {
             let entry_path = entry.path();
             if entry_path.is_dir() {
                 stack.push(entry_path);
-                continue;
-            }
-
-            let ext = entry_path.extension().and_then(OsStr::to_str);
-            if matches!(ext, Some("json5") | Some("json")) {
-                manifests.push(entry_path);
             }
         }
     }
 
-    manifests.sort();
-    Ok(manifests)
-}
-
-fn collect_root_manifests(dir: &Path) -> Result<Vec<PathBuf>, String> {
-    let manifests = collect_example_manifests(dir)?;
-    let manifest_set: HashSet<PathBuf> =
-        manifests.iter().map(|path| canonicalize_or(path)).collect();
-
-    let mut referenced = HashSet::new();
-
-    for path in &manifests {
-        let contents = fs::read_to_string(path)
-            .map_err(|err| format!("failed to read `{}`: {err}", path.display()))?;
-        let manifest: Manifest = contents
-            .parse()
-            .map_err(|err| format!("failed to parse `{}`: {err}", path.display()))?;
-        let base_dir = path.parent().unwrap_or(dir);
-
-        for component in manifest.components().values() {
-            let Some(manifest_ref) = (match component {
-                ComponentDecl::Reference(reference) => Some(reference),
-                ComponentDecl::Object(obj) => Some(&obj.manifest),
-                _ => None,
-            }) else {
-                continue;
-            };
-
-            let Some(resolved) = resolve_manifest_ref(base_dir, manifest_ref) else {
-                continue;
-            };
-            let resolved = canonicalize_or(&resolved);
-            if manifest_set.contains(&resolved) {
-                referenced.insert(resolved);
-            }
-        }
-    }
-
-    let mut roots: Vec<PathBuf> = manifests
-        .into_iter()
-        .filter(|path| !referenced.contains(&canonicalize_or(path)))
-        .collect();
     roots.sort();
     Ok(roots)
-}
-
-fn resolve_manifest_ref(
-    base_dir: &Path,
-    reference: &amber_manifest::ManifestRef,
-) -> Option<PathBuf> {
-    match &reference.url {
-        ManifestUrl::Absolute(url) => {
-            if url.scheme() == "file" {
-                url.to_file_path().ok()
-            } else {
-                None
-            }
-        }
-        ManifestUrl::Relative(rel) => {
-            let rel_path = Path::new(rel.as_ref());
-            if rel_path.is_absolute() {
-                Some(rel_path.to_path_buf())
-            } else {
-                Some(base_dir.join(rel_path))
-            }
-        }
-        _ => None,
-    }
-}
-
-fn canonicalize_or(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn read_example_summary(dir: &Path) -> Result<Option<String>, String> {

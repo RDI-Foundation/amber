@@ -1,0 +1,22 @@
+linker::storage_resource_fanout
+
+  x storage resource `resources.state` on root component fans out to multiple mounted storage sinks
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/storage_resource_fanout.json5:11:29]
+ 10 |   bindings: [
+ 11 |     { to: "#a.state", from: "resources.state" },
+    :                             ^^^^^^^^|^^^^^^^^
+    :                                     `-- one mounted sink uses this resource here
+ 12 |     { to: "#b.state", from: "resources.state" },
+    `----
+  help: Allocated storage is exclusive today. Route a distinct storage resource to each mounted sink.
+
+Advice: 
+  > another mounted sink uses `slots.state`
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/storage_resource_fanout.json5:12:29]
+ 11 |     { to: "#a.state", from: "resources.state" },
+ 12 |     { to: "#b.state", from: "resources.state" },
+    :                             ^^^^^^^^|^^^^^^^^
+    :                                     `-- another mounted sink uses this resource here
+ 13 |   ],
+    `----
+Error:   × check failed

@@ -1,5 +1,7 @@
 use std::{borrow::Borrow, fmt, sync::Arc};
 
+use serde_with::{DeserializeFromStr, SerializeDisplay};
+
 use crate::error::Error;
 
 pub(crate) fn ensure_name_no_dot(name: &str, kind: &'static str) -> Result<(), Error> {
@@ -14,7 +16,9 @@ pub(crate) fn ensure_name_no_dot(name: &str, kind: &'static str) -> Result<(), E
 
 macro_rules! name_type {
     ($name:ident, $kind:expr) => {
-        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(
+            Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, DeserializeFromStr, SerializeDisplay,
+        )]
         pub struct $name(Arc<str>);
 
         impl $name {
@@ -74,12 +78,21 @@ macro_rules! name_type {
                 &self.0
             }
         }
+
+        impl std::str::FromStr for $name {
+            type Err = Error;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::try_from(value)
+            }
+        }
     };
 }
 
 name_type!(ChildName, "child");
 name_type!(SlotName, "slot");
 name_type!(ProvideName, "provide");
+name_type!(ResourceName, "resource");
 name_type!(ExportName, "export");
 name_type!(BindingName, "binding");
 name_type!(FrameworkCapabilityName, "framework capability");

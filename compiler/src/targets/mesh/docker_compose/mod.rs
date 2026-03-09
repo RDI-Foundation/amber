@@ -27,6 +27,7 @@ use crate::{
             build_execution_guide,
         },
     },
+    storage_plan::{StorageIdentity, build_storage_plan},
     targets::{
         mesh::{
             addressing::{
@@ -341,6 +342,7 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
     let images = resolve_internal_images().map_err(DockerComposeError::Other)?;
     let docker_mount_paths_by_component =
         collect_framework_docker_mount_paths(s, mesh_plan.program_components.as_slice());
+    let storage_plan = build_storage_plan(s, mesh_plan.program_components.as_slice());
     let program_components = mesh_plan.program_components.as_slice();
     // Precompute service names (injective & stable).
     let names: HashMap<ComponentId, ServiceNames> =
@@ -473,6 +475,15 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
     let any_helper = config_plan.needs_helper || !docker_mount_components.is_empty();
 
     let mut compose = DockerComposeFile::default();
+
+    for mounts in storage_plan.mounts_by_component.values() {
+        for mount in mounts {
+            compose
+                .volumes
+                .entry(compose_storage_volume_name(&mount.identity))
+                .or_insert_with(EmptyMap::default);
+        }
+    }
 
     if any_helper {
         compose
@@ -709,6 +720,11 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
         let mut program_service = Service::new(image);
         program_service.network_mode = Some(format!("service:{}", svc.sidecar));
         let label = component_label(s, *id);
+        let storage_mounts = storage_plan
+            .mounts_by_component
+            .get(id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let scenario_scope = mesh_config_plan
             .component_configs
             .get(id)
@@ -826,6 +842,13 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
         if Some(*id) == docker_gateway_component {
             configure_injected_docker_gateway_service(&mut program_service, s, *id, svc)?;
         }
+        for storage_mount in storage_mounts {
+            program_service.volumes.push(format!(
+                "{}:{}",
+                compose_storage_volume_name(&storage_mount.identity),
+                storage_mount.mount_path
+            ));
+        }
         configure_program_log_shipping(
             &mut program_service,
             &label,
@@ -851,8 +874,9 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
     let compose_yaml = serde_yaml::to_string(&compose).map_err(|e| {
         DockerComposeError::Other(format!("failed to serialize docker-compose yaml: {e}"))
     })?;
-    let execution_guide = build_execution_guide(s, &mesh_plan, &config_plan)
-        .map_err(|err: ReporterError| DockerComposeError::Other(err.to_string()))?;
+    let execution_guide =
+        build_execution_guide(scenario, &mesh_plan, &config_plan, !storage_plan.is_empty())
+            .map_err(|err: ReporterError| DockerComposeError::Other(err.to_string()))?;
     let mut files = BTreeMap::new();
     files.insert(PathBuf::from(GENERATED_COMPOSE_FILENAME), compose_yaml);
     files.insert(
@@ -1042,6 +1066,15 @@ fn compose_component_service_name(component_moniker: &str) -> String {
     format!(
         "amber.${{{COMPOSE_PROJECT_NAME_ENV}:-default}}.{}",
         sanitize_component_moniker(component_moniker)
+    )
+}
+
+fn compose_storage_volume_name(identity: &StorageIdentity) -> String {
+    format!(
+        "amber-storage-{}-{}-{}",
+        sanitize_component_moniker(identity.owner_moniker.as_str()),
+        sanitize_component_moniker(identity.resource.as_str()),
+        identity.hash_suffix(),
     )
 }
 

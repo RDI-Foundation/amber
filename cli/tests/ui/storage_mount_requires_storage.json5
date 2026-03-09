@@ -1,0 +1,13 @@
+{
+  manifest_version: "0.1.0",
+  program: {
+    image: "busybox:1.36.1",
+    entrypoint: ["sh", "-lc", "sleep 3600"],
+    mounts: [
+      { path: "/var/lib/app", from: "slots.api" },
+    ],
+  },
+  slots: {
+    api: { kind: "http" },
+  },
+}

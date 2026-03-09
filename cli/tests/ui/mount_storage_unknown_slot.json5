@@ -1,0 +1,10 @@
+{
+  manifest_version: "0.1.0",
+  program: {
+    image: "x",
+    entrypoint: ["x"],
+    mounts: [
+      { path: "/var/lib/app", from: "slots.state" },
+    ],
+  },
+}

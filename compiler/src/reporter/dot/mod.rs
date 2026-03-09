@@ -51,6 +51,7 @@ fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
     let root_has_program = s.component(root).program.is_some();
     let root_has_binding = s.bindings.iter().any(|b| {
         matches!(&b.from, BindingFrom::Component(from) if from.component == root)
+            || matches!(&b.from, BindingFrom::Resource(from) if from.component == root)
             || b.to.component == root
     });
     let root_needs_node =
@@ -96,6 +97,7 @@ fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
     for b in &s.bindings {
         let from_component = match &b.from {
             BindingFrom::Component(from) => Some(from.component),
+            BindingFrom::Resource(from) => Some(from.component),
             BindingFrom::Framework(_) => None,
             BindingFrom::External(_) => None,
         };
@@ -112,6 +114,14 @@ fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
                     from.component.0, b.to.component.0
                 );
                 write_escaped_label(&mut out, &from.name);
+            }
+            BindingFrom::Resource(from) => {
+                let _ = write!(
+                    out,
+                    "c{} -> c{} [label=\"",
+                    from.component.0, b.to.component.0
+                );
+                write_escaped_label(&mut out, &format!("resources.{}", from.name));
             }
             BindingFrom::Framework(name) => {
                 let _ = write!(out, "framework -> c{} [label=\"", b.to.component.0);

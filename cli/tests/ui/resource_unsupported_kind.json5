@@ -1,0 +1,6 @@
+{
+  manifest_version: "0.1.0",
+  resources: {
+    api: { kind: "http" },
+  },
+}

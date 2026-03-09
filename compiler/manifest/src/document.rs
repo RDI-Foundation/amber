@@ -158,6 +158,9 @@ fn labels_for_manifest_error(
         ManifestError::UnknownBindingSource { capability } => {
             labels_for_unknown_binding_source(spans, capability)
         }
+        ManifestError::UnknownBindingResource { resource } => {
+            labels_for_unknown_binding_resource(spans, resource)
+        }
         ManifestError::UnknownBindingChild { child } => {
             labels_for_unknown_binding_child(spans, child)
         }
@@ -171,6 +174,10 @@ fn labels_for_manifest_error(
         ManifestError::UnknownEndpoint { name } => labels_for_unknown_endpoint(spans, name),
         ManifestError::MissingProvideEndpoint { name } => {
             labels_for_missing_provide_endpoint(spans, name)
+        }
+        ManifestError::UnsupportedProvideKind { name, .. } => labels_for_provide_kind(spans, name),
+        ManifestError::UnsupportedResourceKind { name, .. } => {
+            labels_for_resource_decl(spans, name, "unsupported resource kind here")
         }
         ManifestError::DuplicateMountName { name } => {
             labels_for_mount_name(spans, name, "duplicate mount name")
@@ -197,6 +204,13 @@ fn labels_for_manifest_error(
         | ManifestError::MountSecretPathIsNotSecret { path } => {
             let source = format!("secret.{path}");
             labels_for_mount_source(spans, &source, "mount source here")
+        }
+        ManifestError::UnknownMountSlot { slot }
+        | ManifestError::MountSlotRequiresStorage { slot, .. } => {
+            labels_for_mount_source(spans, &format!("slots.{slot}"), "mount source here")
+        }
+        ManifestError::UnknownMountResource { resource } => {
+            labels_for_mount_source(spans, &format!("resources.{resource}"), "mount source here")
         }
         ManifestError::UnsupportedMountSource { mount } => {
             labels_for_mount_source(spans, mount, "reserved mount source")
@@ -553,6 +567,29 @@ fn labels_for_unknown_binding_source(spans: &ManifestSpans, capability: &str) ->
     )]
 }
 
+fn labels_for_unknown_binding_resource(spans: &ManifestSpans, resource: &str) -> Vec<LabeledSpan> {
+    let span = binding_span_or_default(spans, |binding| {
+        if binding.capability_value.as_deref() == Some(resource)
+            && binding.from_value.as_deref() == Some("resources")
+        {
+            return binding.capability.or(binding.from).or(Some(binding.whole));
+        }
+        if binding
+            .from_value
+            .as_deref()
+            .and_then(|from| from.strip_prefix("resources."))
+            .is_some_and(|name| name == resource)
+        {
+            return binding.from.or(Some(binding.whole));
+        }
+        None
+    });
+    vec![primary(
+        span,
+        Some("unknown resource referenced here".to_string()),
+    )]
+}
+
 fn labels_for_binding_target_self(spans: &ManifestSpans, slot: &str) -> Vec<LabeledSpan> {
     let span = binding_span_or_default(spans, |binding| {
         if binding.slot_value.as_deref() == Some(slot)
@@ -694,6 +731,27 @@ fn labels_for_missing_provide_endpoint(spans: &ManifestSpans, name: &str) -> Vec
         span,
         Some("missing endpoint for this provide".to_string()),
     )]
+}
+
+fn labels_for_provide_kind(spans: &ManifestSpans, name: &str) -> Vec<LabeledSpan> {
+    let span = spans
+        .provides
+        .get(name)
+        .and_then(|provide| provide.capability.kind)
+        .unwrap_or_else(default_span);
+    vec![primary(
+        span,
+        Some("unsupported provide kind here".to_string()),
+    )]
+}
+
+fn labels_for_resource_decl(spans: &ManifestSpans, name: &str, label: &str) -> Vec<LabeledSpan> {
+    let span = spans
+        .resources
+        .get(name)
+        .and_then(|resource| resource.kind.or(Some(resource.name)))
+        .unwrap_or_else(default_span);
+    vec![primary(span, Some(label.to_string()))]
 }
 
 fn labels_for_unknown_environment_extends(spans: &ManifestSpans, name: &str) -> Vec<LabeledSpan> {
@@ -1047,5 +1105,88 @@ mod tests {
             .collect();
         assert_eq!(starts.len(), 2);
         assert_eq!(second.offset(), starts[1]);
+    }
+
+    #[test]
+    fn manifest_doc_error_mount_slot_requires_storage_points_to_mount_source() {
+        let source = r##"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [
+              { path: "/var/lib/app", from: "slots.api" },
+            ],
+          },
+          slots: {
+            api: { kind: "http" },
+          },
+        }
+        "##;
+        let source: Arc<str> = Arc::from(source);
+        let err = ParsedManifest::parse_named("<test>", Arc::clone(&source)).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            crate::Error::MountSlotRequiresStorage { .. }
+        ));
+
+        let labels: Vec<_> = err.labels().expect("labels").collect();
+        let has_mount_source = labels
+            .iter()
+            .any(|label| labeled_span_text(source.as_ref(), label).contains("\"slots.api\""));
+        assert!(has_mount_source);
+    }
+
+    #[test]
+    fn manifest_doc_error_storage_provide_points_to_kind() {
+        let source = r##"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+          },
+          provides: {
+            state: { kind: "storage", endpoint: "ignored" },
+          },
+        }
+        "##;
+        let source: Arc<str> = Arc::from(source);
+        let err = ParsedManifest::parse_named("<test>", Arc::clone(&source)).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            crate::Error::UnsupportedProvideKind { .. }
+        ));
+
+        let labels: Vec<_> = err.labels().expect("labels").collect();
+        let has_storage_kind = labels
+            .iter()
+            .any(|label| labeled_span_text(source.as_ref(), label).contains("\"storage\""));
+        assert!(has_storage_kind);
+    }
+
+    #[test]
+    fn manifest_doc_error_binding_target_self_points_to_self_target() {
+        let source = r##"
+        {
+          manifest_version: "0.1.0",
+          bindings: [
+            { to: "self.api", from: "self.api" },
+          ],
+        }
+        "##;
+        let source: Arc<str> = Arc::from(source);
+        let err = ParsedManifest::parse_named("<test>", Arc::clone(&source)).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            crate::Error::BindingTargetSelfSlot { .. }
+        ));
+
+        let labels: Vec<_> = err.labels().expect("labels").collect();
+        let has_self_target = labels
+            .iter()
+            .any(|label| labeled_span_text(source.as_ref(), label).contains("\"self.api\""));
+        assert!(has_self_target);
     }
 }

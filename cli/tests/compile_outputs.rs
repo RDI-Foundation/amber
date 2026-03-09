@@ -2,6 +2,7 @@ use std::{fs, path::Path, process::Command};
 
 use amber_compiler::reporter::direct::{DIRECT_CONTROL_SOCKET_RELATIVE_PATH, DIRECT_PLAN_VERSION};
 use amber_images::AMBER_ROUTER;
+use amber_manifest::ManifestDigest;
 use amber_template::{ProgramArgTemplate, ProgramEnvTemplate, TemplatePart, TemplateSpec};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::Value;
@@ -573,6 +574,85 @@ fn compile_direct_rejects_program_path_without_separator() {
         stderr.contains("does not search PATH"),
         "expected PATH rejection in stderr, got:\n{stderr}"
     );
+}
+
+#[test]
+fn compile_direct_emits_storage_mounts_in_plan() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("direct-storage-plan-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let manifests_dir = outputs_dir.path().join("manifests");
+    fs::create_dir_all(&manifests_dir).expect("failed to create manifests directory");
+
+    let root_manifest = manifests_dir.join("scenario.json5");
+    fs::write(
+        &root_manifest,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          resources: {
+            state: { kind: "storage" },
+          },
+          program: {
+            path: "/bin/sh",
+            args: ["-lc", "sleep 3600"],
+            mounts: [
+              { path: "/var/lib/app", from: "resources.state" },
+            ],
+            network: {
+              endpoints: [
+                { name: "http", port: 8080, protocol: "http" },
+              ],
+            },
+          },
+          provides: {
+            http: { kind: "http", endpoint: "http" },
+          },
+          exports: {
+            public: "http",
+          },
+        }
+        "#,
+    )
+    .expect("write root manifest");
+
+    let direct_output = outputs_dir.path().join("direct-out");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&direct_output)
+        .arg(&root_manifest)
+        .output()
+        .expect("failed to run amber compile --direct");
+    assert!(
+        output.status.success(),
+        "amber compile --direct failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan: Value = serde_json::from_str(
+        &fs::read_to_string(direct_output.join("direct-plan.json")).expect("read direct-plan.json"),
+    )
+    .expect("parse direct-plan.json");
+
+    let mounts = plan["components"][0]["program"]["storage_mounts"]
+        .as_array()
+        .expect("storage mounts array");
+    assert_eq!(mounts.len(), 1, "{plan:#}");
+    assert_eq!(mounts[0]["mount_path"], "/var/lib/app");
+    let state_subdir = mounts[0]["state_subdir"]
+        .as_str()
+        .expect("state_subdir should be a string");
+    assert!(state_subdir.starts_with("root/state-"), "{state_subdir}");
 }
 
 #[test]
@@ -1316,6 +1396,94 @@ fn compile_direct_rejects_scenario_ir_missing_version() {
     assert!(
         stderr.contains("invalid Scenario IR input") && stderr.contains("missing field `version`"),
         "expected missing version Scenario IR rejection in stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn compile_direct_rejects_scenario_ir_with_non_resource_storage_mount_binding() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("direct-ir-storage-binding-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let ir_path = outputs_dir.path().join("scenario-ir.json");
+    fs::write(
+        &ir_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "amber.scenario.ir",
+            "version": 2,
+            "root": 0,
+            "components": [
+                {
+                    "id": 0,
+                    "moniker": "/",
+                    "parent": null,
+                    "children": [1],
+                    "resolved_url": "file:///tmp/root.json5",
+                    "digest": ManifestDigest::new([0u8; 32]).to_string(),
+                    "config": null,
+                    "slots": {
+                        "state": { "kind": "storage" }
+                    }
+                },
+                {
+                    "id": 1,
+                    "moniker": "/app",
+                    "parent": 0,
+                    "children": [],
+                    "resolved_url": "file:///tmp/app.json5",
+                    "digest": ManifestDigest::new([1u8; 32]).to_string(),
+                    "config": null,
+                    "program": {
+                        "image": "busybox:stable",
+                        "entrypoint": ["sh"],
+                        "mounts": [
+                            { "path": "/var/lib/app", "from": "slots.state" }
+                        ]
+                    },
+                    "slots": {
+                        "state": { "kind": "storage" }
+                    }
+                }
+            ],
+            "bindings": [
+                {
+                    "from": { "kind": "external", "slot": { "component": 0, "slot": "state" } },
+                    "to": { "component": 1, "slot": "state" },
+                    "weak": true
+                }
+            ],
+            "exports": []
+        }))
+        .expect("Scenario IR should serialize"),
+    )
+    .expect("failed to write Scenario IR");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(outputs_dir.path().join("direct"))
+        .arg(&ir_path)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    assert!(
+        !output.status.success(),
+        "amber compile --direct unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid Scenario IR input")
+            && stderr.contains("mounted storage slot /app.state must be bound")
+            && stderr.contains("from a storage resource")
+            && stderr.contains("external /.state"),
+        "expected mounted storage Scenario IR rejection in stderr, got:\n{stderr}"
     );
 }
 

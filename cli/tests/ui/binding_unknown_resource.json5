@@ -1,0 +1,9 @@
+{
+  manifest_version: "0.1.0",
+  components: {
+    child: "./storage_mount_requires_resource_child.json5",
+  },
+  bindings: [
+    { to: "#child.state", from: "resources.state" },
+  ],
+}
