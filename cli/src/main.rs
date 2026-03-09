@@ -5446,6 +5446,7 @@ mod tests {
                 program: amber_compiler::reporter::direct::DirectProgramPlan {
                     log_name: "app-program".to_string(),
                     work_dir: "work/components/app".to_string(),
+                    storage_mounts: Vec::new(),
                     execution: DirectProgramExecutionPlan::Direct {
                         entrypoint: vec!["/bin/echo".to_string()],
                         env: BTreeMap::new(),
