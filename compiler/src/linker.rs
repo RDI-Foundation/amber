@@ -60,34 +60,6 @@ impl LinkIndex {
     }
 }
 
-fn collect_binding_decls(
-    id: ComponentId,
-    manifest: &Manifest,
-    link_index: &LinkIndex,
-) -> BTreeMap<String, SlotRef> {
-    let mut out = BTreeMap::new();
-    for binding_decl in manifest.bindings() {
-        let target = &binding_decl.target;
-        let binding = &binding_decl.binding;
-        let Some(name) = binding.name.as_ref() else {
-            continue;
-        };
-        let (target_component, slot_name) = match target {
-            BindingTarget::SelfSlot(slot) => (id, slot.as_str()),
-            BindingTarget::ChildSlot { child, slot } => (link_index.child_id(child), slot.as_str()),
-            _ => continue,
-        };
-        out.insert(
-            name.to_string(),
-            SlotRef {
-                component: target_component,
-                name: slot_name.to_string(),
-            },
-        );
-    }
-    out
-}
-
 fn component(components: &[Option<Component>], id: ComponentId) -> &Component {
     components[id.0].as_ref().expect("component should exist")
 }
@@ -846,7 +818,7 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
             }
         })?;
 
-    for (id, (c, m)) in components.iter_mut().zip(&manifests).enumerate() {
+    for (c, m) in components.iter_mut().zip(&manifests) {
         let (Some(c), Some(m)) = (c.as_mut(), m.as_ref()) else {
             continue;
         };
@@ -863,7 +835,6 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
             .collect();
         c.resources.clear();
         c.config_schema = m.config_schema().map(|schema| schema.0.clone());
-        c.binding_decls = collect_binding_decls(ComponentId(id), m, &link_index[id]);
         c.metadata = m.metadata().cloned();
     }
 
@@ -1103,7 +1074,6 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
                 name: slot.clone(),
             };
             binding_edges.push(BindingEdge {
-                name: None,
                 from: BindingFrom::External(slot_ref.clone()),
                 to: slot_ref,
                 weak: true,
@@ -1158,7 +1128,6 @@ fn flatten(
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     }));
@@ -1449,17 +1418,6 @@ fn validate_config_tree(
                                 "resources.{resource_name}.params.{param_name} uses \
                                  ${{slots...}}, but resource params only support literal strings \
                                  and ${{config...}}"
-                            ),
-                            Some("invalid interpolation here".to_string()),
-                            Vec::new(),
-                        )),
-                        InterpolationSource::Bindings => errors.push(invalid_config_error(
-                            component_path.clone(),
-                            &param_site,
-                            format!(
-                                "resources.{resource_name}.params.{param_name} uses \
-                                 ${{bindings...}}, but resource params only support literal \
-                                 strings and ${{config...}}"
                             ),
                             Some("invalid interpolation here".to_string()),
                             Vec::new(),
@@ -1958,7 +1916,6 @@ struct BindingOrigin {
 
 #[derive(Clone, Debug)]
 struct BindingSpec {
-    name: Option<String>,
     target: SlotRef,
     source: CapabilitySource,
     weak: bool,
@@ -2137,6 +2094,7 @@ fn resolve_binding_source(
                     name: resource_name.to_string(),
                 }),
                 decl: CapabilityDecl::builder().kind(resource_decl.kind).build(),
+                range: SlotCardinality::EXACTLY_ONE,
             })
         }
         BindingSource::ChildExport { child, export } => {
@@ -2476,7 +2434,6 @@ fn collect_bindings(
             }
 
             specs.push(BindingSpec {
-                name: binding.name.as_ref().map(|name| name.to_string()),
                 target: target.slot_ref,
                 source: source.source,
                 weak: binding.weak,
@@ -2928,7 +2885,6 @@ fn resolve_binding_edges(
         let Some(resolved_sources) = resolver.resolve_source(&binding.source, errors) else {
             continue;
         };
-        let keep_name = binding.name.is_some() && resolved_sources.len() == 1;
         for resolved in resolved_sources {
             let weak = binding.weak || resolved.weak;
             let first_nonweak = if binding.weak {
@@ -2983,13 +2939,6 @@ fn resolve_binding_edges(
             }
 
             edges.push(BindingEdge {
-                name: keep_name.then(|| {
-                    binding
-                        .name
-                        .as_ref()
-                        .expect("binding name should exist when keep_name is true")
-                        .clone()
-                }),
                 from: resolved.from,
                 to: binding.target.clone(),
                 weak,
@@ -3127,7 +3076,36 @@ fn validate_storage_mounts(
                         });
                         continue;
                     };
-                    let BindingFrom::Resource(resource) = resolved.from else {
+                    let [resolved] = resolved.as_slice() else {
+                        let component_path =
+                            describe_component_path(&component_path_for(components, id));
+                        let (src, span) = mount_source_site(provenance, store, id, mount_index)
+                            .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                        let mut related: Vec<_> =
+                            component_decl_site(components, provenance, store, id)
+                                .into_iter()
+                                .collect();
+                        if let Some(site) = slot_decl_related_span(
+                            components,
+                            provenance,
+                            store,
+                            &slot_ref,
+                            "storage slot",
+                            "storage slot declared here",
+                            false,
+                        ) {
+                            related.push(site);
+                        }
+                        errors.push(Error::StorageMountRequiresResource {
+                            component_path,
+                            slot: slot_name.to_string(),
+                            src,
+                            span,
+                            related,
+                        });
+                        continue;
+                    };
+                    let BindingFrom::Resource(resource) = &resolved.from else {
                         let component_path =
                             describe_component_path(&component_path_for(components, id));
                         let (src, span) = mount_source_site(provenance, store, id, mount_index)
@@ -3171,7 +3149,7 @@ fn validate_storage_mounts(
                         })
                     };
                     sinks_by_resource
-                        .entry(resource)
+                        .entry(resource.clone())
                         .or_default()
                         .push(StorageMountSink {
                             component: id,

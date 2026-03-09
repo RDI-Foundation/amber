@@ -459,7 +459,6 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
         },
         crate::targets::program_config::RuntimeAddressResolution::Static,
         &address_plan.slot_values_by_component,
-        &address_plan.binding_values_by_component,
     )
     .map_err(dc_other)?;
 

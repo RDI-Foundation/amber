@@ -49,14 +49,12 @@ This crate **parses JSON5**, deserializes into Rust types, and validates:
 * No dots (`.`) in:
 
   * child instance names (`components` keys)
-  * binding names (`bindings[].name`)
   * capability names (`slots`/`provides` keys, binding slot/capability names, and export target names)
   * export names (keys in `exports`)
   * child refs (`#<name>`) in bindings and export targets
 * A name cannot be declared in **both** `slots` and `provides`.
 * `exports` targets that point at `self` must refer to something declared in `slots` or `provides`.
 * `exports` targets that point at `#child` must refer to a declared child.
-* Binding names (when present) must be unique within a manifest.
 * Binding references must be locally well-formed:
 
   * `to` must reference a child component (`#<child>`)
@@ -293,7 +291,6 @@ Supported `from` sources (current):
 
 Reserved (not implemented yet):
 
-* `bindings.<name>`
 * `framework.<capability>` other than `framework.docker`
 
 Mount value formatting:
@@ -339,7 +336,6 @@ Supported sources:
 
 * `${config.<path>}` reads from the component’s config value.
 * `${slots.<path>}` reads from resolved slot values.
-* `${bindings.<name>.url}` reads the URL for a named binding that targets this component.
 * `${item.<path>}` reads the current item inside a repeated `each` expansion.
 
 `<path>` is dot-separated for nested objects.
@@ -359,10 +355,6 @@ Notes:
   `${slots.<slot>}` and `${slots.<slot>.url}` are rejected for repeated slots.
 * Repeated slots declared with `multiple: true` must be expanded through `each`; plain
   `${slots.<slot>}` and `${slots.<slot>.url}` are rejected for repeated slots.
-* Bindings expose a virtual object with a single `url` field; bindings must be named to be
-  referenced via `${bindings.<name>.url}`.
-* Framework bindings may be **non-URL-shaped**; `${bindings.<name>.url}` is invalid for those
-  bindings and is rejected by the compiler.
 * `manifest_version: "0.2.0"` or newer is required for object items in `program.entrypoint` /
   `program.args` and object values in `program.env`, such as
   `{ when: "config.profile", argv: [...] }` or
@@ -382,10 +374,8 @@ Notes:
   value is guaranteed to be present after linking.
 * This crate **parses** interpolation syntax but does **not** validate that the referenced paths
   exist. The compiler validates `${config.*}` against `config_schema` and `${slots.*}` against
-  declared slots and supported fields. `${bindings.*}` is validated against named bindings that
-  target the component. `${item.*}` is only valid inside repeated `each` expansions.
-* `${bindings.*}` is for introspection only: seeing the URL does not grant access. Only the binding
-  `to` component can reach the binding `from`, even if another component has the URL.
+  declared slots and supported fields. `${item.*}` is only valid inside repeated `each`
+  expansions.
 
 ---
 
@@ -672,7 +662,6 @@ Bindings forms:
 
 ```json5
 {
-  name: "route_llm", // optional; must be unique within the manifest; used by `${bindings.<name>.url}`
   to: "#evaluator",
   slot: "llm",
   from: "#router",
@@ -689,7 +678,6 @@ Bindings forms:
 
 Rules enforced by this crate:
 
-* Binding names (if present) must be unique within the manifest and follow child name rules (no `.`).
 * `to` must reference a child (`#<child>`).
 * `from: "self"` requires `capability` exist in `slots` or `provides`.
 * `from: "resources"` requires the named resource exist in `resources`.

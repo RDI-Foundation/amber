@@ -45,7 +45,7 @@ use crate::{
     },
 };
 
-pub const DIRECT_PLAN_VERSION: &str = "2";
+pub const DIRECT_PLAN_VERSION: &str = "3";
 pub const DIRECT_PLAN_FILENAME: &str = "direct-plan.json";
 pub const RUN_SCRIPT_FILENAME: &str = "run.sh";
 pub const MESH_PROVISION_PLAN_FILENAME: &str = "mesh-provision-plan.json";
@@ -80,15 +80,11 @@ pub struct DirectRuntimeAddressPlan {
     pub slots_by_scope: BTreeMap<usize, BTreeMap<String, DirectRuntimeUrlSource>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub slot_items_by_scope: BTreeMap<usize, BTreeMap<String, Vec<DirectRuntimeUrlSource>>>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub bindings_by_scope: BTreeMap<usize, BTreeMap<String, DirectRuntimeUrlSource>>,
 }
 
 impl DirectRuntimeAddressPlan {
     fn is_empty(&self) -> bool {
-        self.slots_by_scope.is_empty()
-            && self.slot_items_by_scope.is_empty()
-            && self.bindings_by_scope.is_empty()
+        self.slots_by_scope.is_empty() && self.slot_items_by_scope.is_empty()
     }
 }
 
@@ -104,11 +100,6 @@ pub enum DirectRuntimeUrlSource {
         component_id: usize,
         slot: String,
         item_index: usize,
-        scheme: String,
-    },
-    Binding {
-        component_id: usize,
-        binding: String,
         scheme: String,
     },
 }
@@ -261,15 +252,10 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
         },
         crate::targets::program_config::RuntimeAddressResolution::Deferred,
         &address_plan.slot_values_by_component,
-        &address_plan.binding_values_by_component,
-    )?;
-    let runtime_addresses = build_runtime_address_plan(
-        scenario,
-        &address_plan.slot_values_by_component,
-        &address_plan.binding_values_by_component,
-        &config_plan.binding_values_by_scope,
     )?;
     let storage_plan = build_storage_plan(scenario, program_components);
+    let runtime_addresses =
+        build_runtime_address_plan(scenario, &address_plan.slot_values_by_component)?;
 
     let router_mesh_port = router_ports.map_or(0, |ports| ports.mesh);
     let mesh_addressing = LoopbackMeshAddressing {
@@ -718,12 +704,6 @@ fn render_template_string_literal(parts: &[TemplatePart]) -> Result<String, Mesh
                     "internal error: unresolved slot interpolation `{slot}` in direct program path"
                 )));
             }
-            TemplatePart::Binding { binding, .. } => {
-                return Err(MeshError::new(format!(
-                    "internal error: unresolved binding interpolation `{binding}` in direct \
-                     program path"
-                )));
-            }
             TemplatePart::Item { item, .. } => {
                 return Err(MeshError::new(format!(
                     "internal error: unresolved repeated item interpolation `{item}` in direct \
@@ -891,11 +871,6 @@ fn placeholder_mesh_ports(program_components: &[ComponentId]) -> HashMap<Compone
 fn build_runtime_address_plan(
     _scenario: &Scenario,
     slot_values_by_component: &HashMap<ComponentId, BTreeMap<String, crate::slot_query::SlotValue>>,
-    binding_values_by_component: &HashMap<
-        ComponentId,
-        BTreeMap<String, crate::binding_query::BindingObject>,
-    >,
-    binding_values_by_scope: &HashMap<u64, BTreeMap<String, crate::binding_query::BindingObject>>,
 ) -> Result<DirectRuntimeAddressPlan, MeshError> {
     let mut slots_by_scope = BTreeMap::new();
     let mut slot_items_by_scope = BTreeMap::new();
@@ -936,43 +911,9 @@ fn build_runtime_address_plan(
         }
     }
 
-    let mut bindings_by_scope = BTreeMap::new();
-    for (scope, bindings) in binding_values_by_component {
-        let scope_entries = bindings_by_scope
-            .entry(scope.0)
-            .or_insert_with(BTreeMap::new);
-        for (binding_name, binding) in bindings {
-            scope_entries.insert(
-                binding_name.clone(),
-                DirectRuntimeUrlSource::Binding {
-                    component_id: scope.0,
-                    binding: binding_name.clone(),
-                    scheme: url_scheme(&binding.url)?,
-                },
-            );
-        }
-    }
-
-    for (&scope, bindings) in binding_values_by_scope {
-        let scope_entries = bindings_by_scope
-            .entry(scope as usize)
-            .or_insert_with(BTreeMap::new);
-        for (binding_name, binding) in bindings {
-            scope_entries.insert(
-                binding_name.clone(),
-                DirectRuntimeUrlSource::Binding {
-                    component_id: scope as usize,
-                    binding: binding_name.clone(),
-                    scheme: url_scheme(&binding.url)?,
-                },
-            );
-        }
-    }
-
     Ok(DirectRuntimeAddressPlan {
         slots_by_scope,
         slot_items_by_scope,
-        bindings_by_scope,
     })
 }
 
@@ -1064,10 +1005,9 @@ mod tests {
     use amber_scenario::{BindingEdge, Component, Moniker, Scenario};
 
     use super::*;
-    use crate::storage_plan::{StorageIdentity, StorageMount};
     use crate::{
-        binding_query::BindingObject,
         slot_query::{SlotObject, SlotValue},
+        storage_plan::{StorageIdentity, StorageMount},
     };
 
     fn test_scenario() -> Scenario {
@@ -1084,7 +1024,6 @@ mod tests {
                 slots: BTreeMap::new(),
                 provides: BTreeMap::new(),
                 resources: BTreeMap::new(),
-                binding_decls: BTreeMap::new(),
                 metadata: None,
                 children: Vec::new(),
             })],
@@ -1187,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn build_runtime_address_plan_preserves_slot_item_order_and_binding_sources() {
+    fn build_runtime_address_plan_preserves_slot_item_order() {
         let slot_values_by_component = HashMap::from([(
             ComponentId(0),
             BTreeMap::from([
@@ -1210,23 +1149,8 @@ mod tests {
                 ),
             ]),
         )]);
-        let binding_values_by_component = HashMap::from([(
-            ComponentId(0),
-            BTreeMap::from([(
-                "primary".to_string(),
-                BindingObject {
-                    url: "http://127.0.0.1:33003".to_string(),
-                },
-            )]),
-        )]);
-
-        let plan = build_runtime_address_plan(
-            &test_scenario(),
-            &slot_values_by_component,
-            &binding_values_by_component,
-            &HashMap::new(),
-        )
-        .expect("runtime address plan");
+        let plan = build_runtime_address_plan(&test_scenario(), &slot_values_by_component)
+            .expect("runtime address plan");
 
         assert!(matches!(
             plan.slots_by_scope.get(&0).and_then(|slots| slots.get("api")),
@@ -1236,17 +1160,6 @@ mod tests {
                 scheme
             }) if slot == "api" && scheme == "http"
         ));
-        assert!(matches!(
-            plan.bindings_by_scope
-                .get(&0)
-                .and_then(|bindings| bindings.get("primary")),
-            Some(DirectRuntimeUrlSource::Binding {
-                component_id: 0,
-                binding,
-                scheme
-            }) if binding == "primary" && scheme == "http"
-        ));
-
         let slot_items = plan
             .slot_items_by_scope
             .get(&0)

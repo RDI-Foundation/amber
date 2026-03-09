@@ -402,7 +402,6 @@ fn storage_scenario(version: &str, initial_state: &str) -> Scenario {
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("http".to_string(), provide_http)]),
         resources: BTreeMap::from([("state".to_string(), storage_resource_decl(None))]),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -435,7 +434,6 @@ fn compose_artifact_emits_env_sample_and_readme() {
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -480,7 +478,6 @@ fn compose_emits_storage_volume_mounts() {
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::from([("state".to_string(), storage_resource_decl(None))]),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -555,7 +552,6 @@ fn compose_emits_otelcol_agent_and_wires_router_otel_env() {
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -774,7 +770,6 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
         slots: BTreeMap::from([("docker".to_string(), slot_docker)]),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -782,7 +777,6 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: vec![BindingEdge {
-            name: None,
             from: BindingFrom::Framework(FrameworkCapabilityName::try_from("docker").unwrap()),
             to: SlotRef {
                 component: ComponentId(0),
@@ -864,7 +858,6 @@ fn docker_compose_emits_framework_docker_mount_proxy_wiring() {
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -968,7 +961,6 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(2), ComponentId(1)],
     };
@@ -984,7 +976,6 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -1000,7 +991,6 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -1009,7 +999,6 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         root: ComponentId(0),
         components: vec![Some(root), Some(server), Some(client)],
         bindings: vec![BindingEdge {
-            name: None,
             from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(1),
                 name: "api".to_string(),
@@ -1149,7 +1138,6 @@ fn compose_emits_minimal_peer_keys() {
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1), ComponentId(2), ComponentId(3)],
     };
@@ -1165,7 +1153,6 @@ fn compose_emits_minimal_peer_keys() {
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api1".to_string(), provide_api1)]),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -1181,7 +1168,6 @@ fn compose_emits_minimal_peer_keys() {
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api2".to_string(), provide_api2)]),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -1197,7 +1183,6 @@ fn compose_emits_minimal_peer_keys() {
         slots: BTreeMap::from([("api1".to_string(), slot_http)]),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -1206,7 +1191,6 @@ fn compose_emits_minimal_peer_keys() {
         root: ComponentId(0),
         components: vec![Some(root), Some(server1), Some(server2), Some(client)],
         bindings: vec![BindingEdge {
-            name: None,
             from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(1),
                 name: "api1".to_string(),
@@ -1278,7 +1262,6 @@ fn compose_emits_named_volumes_for_storage_mounts() {
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::from([("state".to_string(), storage_resource_decl(None))]),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -1335,7 +1318,6 @@ fn compose_escapes_entrypoint_dollars() {
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -1361,421 +1343,6 @@ fn compose_escapes_entrypoint_dollars() {
         .as_ref()
         .expect("entrypoint should exist");
     assert!(entrypoint.iter().any(|arg| arg == "echo $$API_URL"));
-}
-
-#[test]
-fn compose_resolves_binding_urls_in_child_config() {
-    let server_program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["server"],
-        "env": {},
-        "network": {
-            "endpoints": [
-                { "name": "api", "port": 8080, "protocol": "http" }
-            ]
-        }
-    }))
-    .unwrap();
-
-    let client_program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["client"],
-        "env": {
-            "BIND_URL": "${slots.api.url}"
-        }
-    }))
-    .unwrap();
-
-    let observer_program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["observer"],
-        "env": {
-            "UPSTREAM_URL": "${config.upstream_url}"
-        }
-    }))
-    .unwrap();
-
-    let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
-    let provide_http: ProvideDecl =
-        serde_json::from_value(json!({ "kind": "http", "endpoint": "api" })).unwrap();
-    let upstream_schema = json!({
-        "type": "object",
-        "properties": {
-            "upstream_url": { "type": "string" }
-        },
-        "required": ["upstream_url"],
-        "additionalProperties": false
-    });
-
-    let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        resources: BTreeMap::new(),
-        binding_decls: BTreeMap::from([(
-            "bind".to_string(),
-            SlotRef {
-                component: ComponentId(2),
-                name: "api".to_string(),
-            },
-        )]),
-        metadata: None,
-        children: vec![ComponentId(3), ComponentId(2), ComponentId(1)],
-    };
-
-    let server = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/server"),
-        digest: digest(1),
-        config: None,
-        config_schema: None,
-        program: Some(server_program),
-        slots: BTreeMap::new(),
-        provides: BTreeMap::from([("api".to_string(), provide_http)]),
-        resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
-    };
-
-    let client = Component {
-        id: ComponentId(2),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/client"),
-        digest: digest(2),
-        config: None,
-        config_schema: None,
-        program: Some(client_program),
-        slots: BTreeMap::from([("api".to_string(), slot_http)]),
-        provides: BTreeMap::new(),
-        resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
-    };
-
-    let observer = Component {
-        id: ComponentId(3),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/observer"),
-        digest: digest(3),
-        config: Some(json!({
-            "upstream_url": "${bindings.bind.url}"
-        })),
-        config_schema: Some(upstream_schema),
-        program: Some(observer_program),
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
-    };
-
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![Some(root), Some(server), Some(client), Some(observer)],
-        bindings: vec![BindingEdge {
-            name: Some("bind".to_string()),
-            from: BindingFrom::Component(ProvideRef {
-                component: ComponentId(1),
-                name: "api".to_string(),
-            }),
-            to: SlotRef {
-                component: ComponentId(2),
-                name: "api".to_string(),
-            },
-            weak: false,
-        }],
-        exports: vec![],
-    };
-
-    let mut overrides = BTreeMap::new();
-    let mut root_overrides = Map::new();
-    root_overrides.insert(
-        "components".to_string(),
-        json!({
-            "server": "file:///server.json5",
-            "client": "file:///client.json5",
-            "observer": "file:///observer.json5",
-        }),
-    );
-    root_overrides.insert(
-        "bindings".to_string(),
-        json!([
-            { "name": "bind", "to": "#client.api", "from": "#server.api" }
-        ]),
-    );
-    overrides.insert(ComponentId(0), root_overrides);
-
-    let mut observer_overrides = Map::new();
-    observer_overrides.insert(
-        "config_schema".to_string(),
-        json!({
-            "type": "object",
-            "properties": {
-                "upstream_url": { "type": "string" }
-            },
-            "required": ["upstream_url"],
-            "additionalProperties": false
-        }),
-    );
-    overrides.insert(ComponentId(3), observer_overrides);
-
-    let output = compile_output_with_manifest_overrides(scenario, overrides);
-    let yaml = render_compose(&output).expect("compose render ok");
-    let compose = parse_compose(&yaml);
-
-    assert!(
-        compose
-            .services
-            .values()
-            .any(|svc| { env_value(svc, "BIND_URL").as_deref() == Some("http://127.0.0.1:20000") })
-    );
-    assert!(compose.services.values().any(|svc| {
-        env_value(svc, "UPSTREAM_URL").as_deref() == Some("http://127.0.0.1:20000")
-    }));
-    assert!(
-        !yaml.contains("AMBER_COMPONENT_CONFIG_TEMPLATE_B64"),
-        "{yaml}"
-    );
-}
-
-#[test]
-fn compose_resolves_binding_urls_from_grandparent_parent_child_config() {
-    let server_program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["server"],
-        "env": {},
-        "network": {
-            "endpoints": [
-                { "name": "api", "port": 8080, "protocol": "http" }
-            ]
-        }
-    }))
-    .unwrap();
-
-    let client_program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["client"],
-        "env": {}
-    }))
-    .unwrap();
-
-    let child_program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["child"],
-        "env": {
-            "UPSTREAM_URL": "${config.upstream_url}"
-        }
-    }))
-    .unwrap();
-
-    let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
-    let provide_http: ProvideDecl =
-        serde_json::from_value(json!({ "kind": "http", "endpoint": "api" })).unwrap();
-    let upstream_schema = json!({
-        "type": "object",
-        "properties": {
-            "upstream_url": { "type": "string" }
-        },
-        "required": ["upstream_url"],
-        "additionalProperties": false
-    });
-
-    let root = Component {
-        id: ComponentId(0),
-        parent: None,
-        moniker: moniker("/"),
-        digest: digest(0),
-        config: None,
-        config_schema: None,
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        resources: BTreeMap::new(),
-        binding_decls: BTreeMap::from([(
-            "bind".to_string(),
-            SlotRef {
-                component: ComponentId(2),
-                name: "api".to_string(),
-            },
-        )]),
-        metadata: None,
-        children: vec![ComponentId(3), ComponentId(2), ComponentId(1)],
-    };
-
-    let server = Component {
-        id: ComponentId(1),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/server"),
-        digest: digest(1),
-        config: None,
-        config_schema: None,
-        program: Some(server_program),
-        slots: BTreeMap::new(),
-        provides: BTreeMap::from([("api".to_string(), provide_http)]),
-        resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
-    };
-
-    let client = Component {
-        id: ComponentId(2),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/client"),
-        digest: digest(2),
-        config: None,
-        config_schema: None,
-        program: Some(client_program),
-        slots: BTreeMap::from([("api".to_string(), slot_http)]),
-        provides: BTreeMap::new(),
-        resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
-    };
-
-    let grandparent = Component {
-        id: ComponentId(3),
-        parent: Some(ComponentId(0)),
-        moniker: moniker("/grandparent"),
-        digest: digest(3),
-        config: Some(json!({
-            "upstream_url": "${bindings.bind.url}"
-        })),
-        config_schema: Some(upstream_schema.clone()),
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: vec![ComponentId(4)],
-    };
-
-    let parent = Component {
-        id: ComponentId(4),
-        parent: Some(ComponentId(3)),
-        moniker: moniker("/grandparent/parent"),
-        digest: digest(4),
-        config: Some(json!({
-            "upstream_url": "${config.upstream_url}"
-        })),
-        config_schema: Some(upstream_schema.clone()),
-        program: None,
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: vec![ComponentId(5)],
-    };
-
-    let child = Component {
-        id: ComponentId(5),
-        parent: Some(ComponentId(4)),
-        moniker: moniker("/grandparent/parent/child"),
-        digest: digest(5),
-        config: Some(json!({
-            "upstream_url": "${config.upstream_url}"
-        })),
-        config_schema: Some(upstream_schema.clone()),
-        program: Some(child_program),
-        slots: BTreeMap::new(),
-        provides: BTreeMap::new(),
-        resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
-        metadata: None,
-        children: Vec::new(),
-    };
-
-    let scenario = Scenario {
-        root: ComponentId(0),
-        components: vec![
-            Some(root),
-            Some(server),
-            Some(client),
-            Some(grandparent),
-            Some(parent),
-            Some(child),
-        ],
-        bindings: vec![BindingEdge {
-            name: Some("bind".to_string()),
-            from: BindingFrom::Component(ProvideRef {
-                component: ComponentId(1),
-                name: "api".to_string(),
-            }),
-            to: SlotRef {
-                component: ComponentId(2),
-                name: "api".to_string(),
-            },
-            weak: false,
-        }],
-        exports: vec![],
-    };
-
-    let mut overrides = BTreeMap::new();
-    let mut root_overrides = Map::new();
-    root_overrides.insert(
-        "components".to_string(),
-        json!({
-            "server": "file:///server.json5",
-            "client": "file:///client.json5",
-            "grandparent": "file:///grandparent.json5",
-        }),
-    );
-    root_overrides.insert(
-        "bindings".to_string(),
-        json!([
-            { "name": "bind", "to": "#client.api", "from": "#server.api" }
-        ]),
-    );
-    overrides.insert(ComponentId(0), root_overrides);
-
-    let mut grandparent_overrides = Map::new();
-    grandparent_overrides.insert(
-        "components".to_string(),
-        json!({
-            "parent": "file:///parent.json5"
-        }),
-    );
-    grandparent_overrides.insert("config_schema".to_string(), upstream_schema.clone());
-    overrides.insert(ComponentId(3), grandparent_overrides);
-
-    let mut parent_overrides = Map::new();
-    parent_overrides.insert(
-        "components".to_string(),
-        json!({
-            "child": "file:///child.json5"
-        }),
-    );
-    parent_overrides.insert("config_schema".to_string(), upstream_schema.clone());
-    overrides.insert(ComponentId(4), parent_overrides);
-
-    let mut child_overrides = Map::new();
-    child_overrides.insert("config_schema".to_string(), upstream_schema);
-    overrides.insert(ComponentId(5), child_overrides);
-
-    let output = compile_output_with_manifest_overrides(scenario, overrides);
-    let yaml = render_compose(&output).expect("compose render ok");
-    let compose = parse_compose(&yaml);
-
-    assert!(compose.services.values().any(|svc| {
-        env_value(svc, "UPSTREAM_URL").as_deref() == Some("http://127.0.0.1:20000")
-    }));
-    assert!(
-        !yaml.contains("AMBER_COMPONENT_CONFIG_TEMPLATE_B64"),
-        "{yaml}"
-    );
 }
 
 #[test]
@@ -1807,7 +1374,6 @@ fn compose_emits_export_metadata_and_labels() {
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1)],
     };
@@ -1823,7 +1389,6 @@ fn compose_emits_export_metadata_and_labels() {
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -1950,7 +1515,6 @@ fn compose_routes_external_slots_through_router() {
         slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1)],
     };
@@ -1966,7 +1530,6 @@ fn compose_routes_external_slots_through_router() {
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -1975,7 +1538,6 @@ fn compose_routes_external_slots_through_router() {
         root: ComponentId(0),
         components: vec![Some(root), Some(client)],
         bindings: vec![BindingEdge {
-            name: None,
             from: BindingFrom::External(SlotRef {
                 component: ComponentId(0),
                 name: "api".to_string(),
@@ -2151,7 +1713,6 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
         slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1)],
     };
@@ -2167,7 +1728,6 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -2176,7 +1736,6 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
         root: ComponentId(0),
         components: vec![Some(root), Some(client)],
         bindings: vec![BindingEdge {
-            name: None,
             from: BindingFrom::External(SlotRef {
                 component: ComponentId(0),
                 name: "api".to_string(),
@@ -2411,7 +1970,6 @@ sleep infinity
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1), ComponentId(2), ComponentId(3)],
     };
@@ -2426,7 +1984,6 @@ sleep infinity
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("agent".to_string(), provide_a2a.clone())]),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -2441,7 +1998,6 @@ sleep infinity
         slots: BTreeMap::from([("agent_a".to_string(), slot_a2a.clone())]),
         provides: BTreeMap::from([("agent".to_string(), provide_a2a)]),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -2459,7 +2015,6 @@ sleep infinity
         ]),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -2469,7 +2024,6 @@ sleep infinity
         components: vec![Some(root), Some(agent_a), Some(agent_b), Some(client_c)],
         bindings: vec![
             BindingEdge {
-                name: None,
                 from: BindingFrom::Component(ProvideRef {
                     component: ComponentId(1),
                     name: "agent".to_string(),
@@ -2481,7 +2035,6 @@ sleep infinity
                 weak: false,
             },
             BindingEdge {
-                name: None,
                 from: BindingFrom::Component(ProvideRef {
                     component: ComponentId(1),
                     name: "agent".to_string(),
@@ -2493,7 +2046,6 @@ sleep infinity
                 weak: false,
             },
             BindingEdge {
-                name: None,
                 from: BindingFrom::Component(ProvideRef {
                     component: ComponentId(2),
                     name: "agent".to_string(),
@@ -2694,7 +2246,6 @@ fn docker_smoke_sidecar_restart_rejoins_mesh() {
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(1), ComponentId(2)],
     };
@@ -2710,7 +2261,6 @@ fn docker_smoke_sidecar_restart_rejoins_mesh() {
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -2726,7 +2276,6 @@ fn docker_smoke_sidecar_restart_rejoins_mesh() {
         slots: BTreeMap::from([("api".to_string(), slot_http)]),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -2735,7 +2284,6 @@ fn docker_smoke_sidecar_restart_rejoins_mesh() {
         root: ComponentId(0),
         components: vec![Some(root), Some(server), Some(client)],
         bindings: vec![BindingEdge {
-            name: None,
             from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(1),
                 name: "api".to_string(),
@@ -2884,7 +2432,6 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(2), ComponentId(1)],
     };
@@ -2903,7 +2450,6 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
             ("admin".to_string(), provide_admin),
         ]),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -2922,7 +2468,6 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
         ]),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -2932,7 +2477,6 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
         components: vec![Some(root), Some(server), Some(client)],
         bindings: vec![
             BindingEdge {
-                name: None,
                 from: BindingFrom::Component(ProvideRef {
                     component: ComponentId(1),
                     name: "v1".to_string(),
@@ -2944,7 +2488,6 @@ fn docker_compose_allows_shared_port_with_different_endpoints() {
                 weak: false,
             },
             BindingEdge {
-                name: None,
                 from: BindingFrom::Component(ProvideRef {
                     component: ComponentId(1),
                     name: "admin".to_string(),
@@ -3345,7 +2888,6 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: vec![ComponentId(2), ComponentId(3), ComponentId(1)],
     };
@@ -3361,7 +2903,6 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -3377,7 +2918,6 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -3393,7 +2933,6 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     };
@@ -3402,7 +2941,6 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         root: ComponentId(0),
         components: vec![Some(root), Some(server), Some(allowed), Some(denied)],
         bindings: vec![BindingEdge {
-            name: None,
             from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(1),
                 name: "api".to_string(),

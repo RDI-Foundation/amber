@@ -16,9 +16,7 @@ use crate::{
     error::Error,
     framework::{framework_capabilities, framework_capability},
     interpolation::ProgramArgItem,
-    names::{
-        BindingName, ChildName, ExportName, ProvideName, ResourceName, SlotName, ensure_name_no_dot,
-    },
+    names::{ChildName, ExportName, ProvideName, ResourceName, SlotName, ensure_name_no_dot},
     refs::{ManifestDigest, ManifestRef, ManifestUrl},
     schema::{
         Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityKind, ComponentDecl,
@@ -455,11 +453,9 @@ fn build_bindings(
     enabled_features: &BTreeSet<ExperimentalFeature>,
 ) -> Result<Vec<ManifestBinding>, Error> {
     let mut bindings_out = Vec::with_capacity(bindings.len());
-    let mut binding_names = BTreeSet::new();
 
     for binding in bindings {
         let RawBinding {
-            name,
             to,
             slot,
             from,
@@ -477,29 +473,12 @@ fn build_bindings(
             });
         }
 
-        let name = match name {
-            Some(name) => {
-                let name = BindingName::try_from(name)?;
-                if !binding_names.insert(name.clone()) {
-                    return Err(Error::DuplicateBindingName {
-                        name: name.to_string(),
-                    });
-                }
-                Some(name)
-            }
-            None => None,
-        };
-
         let target = resolve_binding_target(ctx, to, slot)?;
         let source = resolve_binding_source(ctx, from, capability, enabled_features)?;
 
         bindings_out.push(ManifestBinding {
             target,
-            binding: Binding {
-                name,
-                from: source,
-                weak,
-            },
+            binding: Binding { from: source, weak },
         });
     }
 
@@ -707,11 +686,6 @@ fn validate_mounts(
                         kind: slot_decl.decl.kind,
                     });
                 }
-            }
-            MountSource::Binding(_) => {
-                return Err(Error::UnsupportedMountSource {
-                    mount: mount.source.to_string(),
-                });
             }
         }
     }
@@ -1063,11 +1037,6 @@ impl From<&Manifest> for RawManifest {
                 };
 
                 RawBinding {
-                    name: manifest_binding
-                        .binding
-                        .name
-                        .as_ref()
-                        .map(ToString::to_string),
                     to,
                     slot,
                     from,

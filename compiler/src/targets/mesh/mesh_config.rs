@@ -234,7 +234,6 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             inbound.push(InboundRoute {
                 route_id: component_route_id(&identity.id, provide_name, protocol),
                 capability: provide_name.clone(),
-                binding_name: None,
                 capability_kind: Some(provide_decl.decl.kind.to_string()),
                 capability_profile: provide_decl.decl.profile.clone(),
                 protocol,
@@ -279,7 +278,6 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             outbound.push(OutboundRoute {
                 route_id: component_route_id(&peer_id, &binding.provide, protocol),
                 slot: binding.slot.clone(),
-                binding_name: binding.binding_name.clone(),
                 capability_kind: Some(provide_decl.decl.kind.to_string()),
                 capability_profile: provide_decl.decl.profile.clone(),
                 listen_port,
@@ -322,7 +320,6 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             outbound.push(OutboundRoute {
                 route_id: router_external_route_id(&binding.external_slot),
                 slot: binding.slot.clone(),
-                binding_name: binding.binding_name.clone(),
                 capability_kind: Some(slot_decl.decl.kind.to_string()),
                 capability_profile: slot_decl.decl.profile.clone(),
                 listen_port,
@@ -380,7 +377,6 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             inbound.push(InboundRoute {
                 route_id: router_external_route_id(&slot.name),
                 capability: slot.name.clone(),
-                binding_name: None,
                 capability_kind: Some(slot.decl.kind.to_string()),
                 capability_profile: slot.decl.profile.clone(),
                 protocol: MeshProtocol::Http,
@@ -410,7 +406,6 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
             inbound.push(InboundRoute {
                 route_id: router_export_route_id(&export.name, protocol),
                 capability: export.name.clone(),
-                binding_name: Some(export.name.clone()),
                 capability_kind: Some(provide_decl.decl.kind.to_string()),
                 capability_profile: provide_decl.decl.profile.clone(),
                 protocol,

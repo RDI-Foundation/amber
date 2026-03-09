@@ -18,7 +18,6 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
-    binding_query::{BindingObject, parse_binding_query, resolve_binding_query},
     config_resolution::{
         QueryResolution, parse_query_segments, resolve_config_query_node,
         validate_config_query_syntax,
@@ -34,7 +33,6 @@ pub(crate) struct ConfigPlan {
     pub(crate) root_leaves: Vec<rc::SchemaLeaf>,
     pub(crate) program_plans: HashMap<ComponentId, ProgramPlan>,
     pub(crate) mount_specs: HashMap<ComponentId, Vec<MountSpec>>,
-    pub(crate) binding_values_by_scope: HashMap<u64, BTreeMap<String, BindingObject>>,
     pub(crate) needs_helper: bool,
     pub(crate) needs_runtime_config: bool,
     pub(crate) runtime_views: HashMap<ComponentId, RuntimeConfigView>,
@@ -199,7 +197,6 @@ pub(crate) fn build_config_plan(
     program_support: ProgramSupport,
     runtime_address_resolution: RuntimeAddressResolution,
     slot_values_by_component: &HashMap<ComponentId, BTreeMap<String, SlotValue>>,
-    binding_values_by_component: &HashMap<ComponentId, BTreeMap<String, BindingObject>>,
 ) -> Result<ConfigPlan, MeshError> {
     let composed =
         config_templates::compose_root_config_templates(scenario.root, &scenario.components);
@@ -233,26 +230,7 @@ pub(crate) fn build_config_plan(
         }
     }
 
-    let required_bindings_by_scope =
-        collect_required_bindings_by_scope(&used_config_paths_by_component, &composed.templates)?;
-    let binding_urls_by_scope = binding_urls_by_scope(
-        scenario,
-        binding_values_by_component,
-        &required_bindings_by_scope,
-    )?;
-    let resolved_templates = if matches!(
-        runtime_address_resolution,
-        RuntimeAddressResolution::Deferred
-    ) {
-        composed.templates
-    } else {
-        resolve_binding_templates(
-            composed.templates,
-            &binding_urls_by_scope,
-            &used_config_paths_by_component,
-            scenario,
-        )?
-    };
+    let resolved_templates = composed.templates;
 
     let root_schema = scenario
         .component(scenario.root)
@@ -286,13 +264,6 @@ pub(crate) fn build_config_plan(
                 component_label(scenario, *id)
             ))
         })?;
-        let bindings = binding_values_by_component.get(id).ok_or_else(|| {
-            MeshError::new(format!(
-                "internal error: missing binding values for {}",
-                component_label(scenario, *id)
-            ))
-        })?;
-
         let component_template = resolved_templates.get(id).ok_or_else(|| {
             MeshError::new(format!(
                 "no config template for component {}",
@@ -310,7 +281,6 @@ pub(crate) fn build_config_plan(
             program_support,
             runtime_address_resolution,
             slots,
-            bindings,
             template_opt,
             component_schema.as_ref(),
         )?;
@@ -402,7 +372,6 @@ pub(crate) fn build_config_plan(
         root_leaves,
         program_plans,
         mount_specs,
-        binding_values_by_scope: binding_urls_by_scope,
         needs_helper,
         needs_runtime_config,
         runtime_views,
@@ -694,72 +663,6 @@ fn build_mount_specs(
     Ok(out)
 }
 
-fn binding_urls_by_scope(
-    scenario: &Scenario,
-    binding_values_by_component: &HashMap<ComponentId, BTreeMap<String, BindingObject>>,
-    required_bindings_by_scope: &HashMap<u64, BTreeSet<String>>,
-) -> Result<HashMap<u64, BTreeMap<String, BindingObject>>, MeshError> {
-    let mut out: HashMap<u64, BTreeMap<String, BindingObject>> = HashMap::new();
-
-    for (&scope, required_names) in required_bindings_by_scope {
-        let realm = ComponentId(scope as usize);
-        let Some(component) = scenario.components.get(realm.0).and_then(|c| c.as_ref()) else {
-            return Err(MeshError::new(format!(
-                "internal error: missing bindings scope component id {scope}"
-            )));
-        };
-        let mut by_name = BTreeMap::new();
-
-        for name in required_names {
-            let slot_ref = component.binding_decls.get(name).ok_or_else(|| {
-                MeshError::new(format!(
-                    "internal error: missing binding declaration `{name}` in {}",
-                    component.moniker.as_str()
-                ))
-            })?;
-            let binding = binding_values_by_component
-                .get(&slot_ref.component)
-                .and_then(|bindings| bindings.get(name.as_str()))
-                .ok_or_else(|| {
-                    MeshError::new(format!(
-                        "internal error: missing binding value `{name}` for {}.{} while lowering \
-                         {}",
-                        component_label(scenario, slot_ref.component),
-                        slot_ref.name,
-                        component.moniker.as_str()
-                    ))
-                })?;
-            by_name.insert(
-                name.clone(),
-                BindingObject {
-                    url: binding.url.clone(),
-                },
-            );
-        }
-
-        out.insert(scope, by_name);
-    }
-
-    Ok(out)
-}
-
-fn collect_required_bindings_by_scope(
-    used_paths_by_component: &HashMap<ComponentId, BTreeSet<String>>,
-    templates: &HashMap<ComponentId, rc::RootConfigTemplate>,
-) -> Result<HashMap<u64, BTreeSet<String>>, MeshError> {
-    let mut out: HashMap<u64, BTreeSet<String>> = HashMap::new();
-    for (id, used_paths) in used_paths_by_component {
-        let Some(template) = templates.get(id) else {
-            continue;
-        };
-        let Some(node) = template.node() else {
-            continue;
-        };
-        collect_required_bindings_in_paths(node, used_paths, &mut out)?;
-    }
-    Ok(out)
-}
-
 fn program_used_config_paths(
     program: &amber_manifest::Program,
     template_opt: Option<&rc::ConfigNode>,
@@ -945,9 +848,6 @@ fn resolve_condition_presence_for_program(
                 ConfigPresence::Absent
             },
         ),
-        InterpolationSource::Bindings => Err(MeshError::new(format!(
-            "unsupported conditional interpolation source bindings.{query}"
-        ))),
         _ => Err(MeshError::new(format!(
             "unsupported conditional interpolation source for `{source}.{query}`"
         ))),
@@ -985,232 +885,6 @@ fn resolve_optional_config_query_node<'a>(
         }
     }
     Ok(Some(QueryResolution::Node(current)))
-}
-
-fn collect_required_bindings_in_paths(
-    node: &rc::ConfigNode,
-    used_paths: &BTreeSet<String>,
-    out: &mut HashMap<u64, BTreeSet<String>>,
-) -> Result<(), MeshError> {
-    for path in used_paths {
-        let Some(target) = config_node_for_path(node, path) else {
-            continue;
-        };
-        collect_required_bindings_in_node(target, out)?;
-    }
-    Ok(())
-}
-
-fn config_node_for_path<'a>(node: &'a rc::ConfigNode, path: &str) -> Option<&'a rc::ConfigNode> {
-    if path.is_empty() {
-        return Some(node);
-    }
-
-    let mut current = node;
-    for segment in path.split('.') {
-        if segment.is_empty() {
-            return None;
-        }
-        match current {
-            rc::ConfigNode::Object(map) => {
-                current = map.get(segment)?;
-            }
-            rc::ConfigNode::ConfigRef(_) => return None,
-            _ => return None,
-        }
-    }
-
-    Some(current)
-}
-
-fn collect_required_bindings_in_node(
-    node: &rc::ConfigNode,
-    out: &mut HashMap<u64, BTreeSet<String>>,
-) -> Result<(), MeshError> {
-    match node {
-        rc::ConfigNode::StringTemplate(parts) => {
-            for part in parts {
-                let TemplatePart::Binding { binding, scope } = part else {
-                    continue;
-                };
-                let parsed = parse_binding_query(binding).map_err(|err| {
-                    let label = if binding.is_empty() {
-                        "bindings".to_string()
-                    } else {
-                        format!("bindings.{binding}")
-                    };
-                    MeshError::new(format!(
-                        "internal error: invalid binding query `{label}` in composed config \
-                         template: {err}"
-                    ))
-                })?;
-                out.entry(*scope)
-                    .or_default()
-                    .insert(parsed.name.to_string());
-            }
-        }
-        rc::ConfigNode::Array(values) => {
-            for value in values {
-                collect_required_bindings_in_node(value, out)?;
-            }
-        }
-        rc::ConfigNode::Object(map) => {
-            for value in map.values() {
-                collect_required_bindings_in_node(value, out)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn resolve_binding_templates(
-    templates: HashMap<ComponentId, rc::RootConfigTemplate>,
-    bindings_by_scope: &HashMap<u64, BTreeMap<String, BindingObject>>,
-    used_paths_by_component: &HashMap<ComponentId, BTreeSet<String>>,
-    scenario: &Scenario,
-) -> Result<HashMap<ComponentId, rc::RootConfigTemplate>, MeshError> {
-    let mut out = HashMap::with_capacity(templates.len());
-    for (id, template) in templates {
-        let resolved = match template {
-            rc::RootConfigTemplate::Root => rc::RootConfigTemplate::Root,
-            rc::RootConfigTemplate::Node(node) => {
-                let resolved = if let Some(used_paths) = used_paths_by_component.get(&id) {
-                    resolve_binding_parts_in_paths(node, used_paths, bindings_by_scope).map_err(
-                        |err| {
-                            MeshError::new(format!(
-                                "failed to resolve binding interpolation in config for {}: {err}",
-                                component_label(scenario, id)
-                            ))
-                        },
-                    )?
-                } else {
-                    node
-                };
-                rc::RootConfigTemplate::Node(resolved)
-            }
-        };
-        out.insert(id, resolved);
-    }
-    Ok(out)
-}
-
-fn resolve_binding_parts_in_paths(
-    node: rc::ConfigNode,
-    used_paths: &BTreeSet<String>,
-    bindings_by_scope: &HashMap<u64, BTreeMap<String, BindingObject>>,
-) -> Result<rc::ConfigNode, MeshError> {
-    if used_paths.contains("") {
-        return resolve_binding_parts_in_config(&node, bindings_by_scope);
-    }
-    resolve_binding_parts_in_paths_at(node, "", used_paths, bindings_by_scope)
-}
-
-fn resolve_binding_parts_in_paths_at(
-    node: rc::ConfigNode,
-    path: &str,
-    used_paths: &BTreeSet<String>,
-    bindings_by_scope: &HashMap<u64, BTreeMap<String, BindingObject>>,
-) -> Result<rc::ConfigNode, MeshError> {
-    if used_paths.contains(path) {
-        return resolve_binding_parts_in_config(&node, bindings_by_scope);
-    }
-    if !has_used_descendant(path, used_paths) {
-        return Ok(node);
-    }
-
-    let map = match node {
-        rc::ConfigNode::Object(map) => map,
-        other => return Ok(other),
-    };
-
-    let mut out = BTreeMap::new();
-    for (key, value) in map {
-        let child_path = if path.is_empty() {
-            key.clone()
-        } else {
-            format!("{path}.{key}")
-        };
-        if used_paths.contains(&child_path) || has_used_descendant(&child_path, used_paths) {
-            out.insert(
-                key,
-                resolve_binding_parts_in_paths_at(
-                    value,
-                    &child_path,
-                    used_paths,
-                    bindings_by_scope,
-                )?,
-            );
-        } else {
-            out.insert(key, value);
-        }
-    }
-    Ok(rc::ConfigNode::Object(out))
-}
-
-fn has_used_descendant(path: &str, used_paths: &BTreeSet<String>) -> bool {
-    if path.is_empty() {
-        return !used_paths.is_empty();
-    }
-    let prefix = format!("{path}.");
-    used_paths
-        .iter()
-        .any(|used_path| used_path.starts_with(&prefix))
-}
-
-fn resolve_binding_parts_in_config(
-    node: &rc::ConfigNode,
-    bindings_by_scope: &HashMap<u64, BTreeMap<String, BindingObject>>,
-) -> Result<rc::ConfigNode, MeshError> {
-    match node {
-        rc::ConfigNode::StringTemplate(parts) => {
-            let mut out = Vec::with_capacity(parts.len());
-            for part in parts {
-                match part {
-                    TemplatePart::Lit { lit } => out.push(TemplatePart::lit(lit)),
-                    TemplatePart::Config { config } => out.push(TemplatePart::config(config)),
-                    TemplatePart::Slot { slot, .. } => {
-                        return Err(MeshError::new(format!(
-                            "internal error: unexpected runtime slot interpolation slots.{slot} \
-                             in config template"
-                        )));
-                    }
-                    TemplatePart::Binding { binding, scope } => {
-                        let bindings = bindings_by_scope.get(scope).ok_or_else(|| {
-                            MeshError::new(format!("bindings scope {scope} is missing"))
-                        })?;
-                        let url = resolve_binding_query(bindings, binding)?;
-                        out.push(TemplatePart::lit(url));
-                    }
-                    TemplatePart::Item { item, .. } => {
-                        return Err(MeshError::new(format!(
-                            "internal error: unexpected repeated item interpolation item.{item} \
-                             in config template"
-                        )));
-                    }
-                }
-            }
-            Ok(rc::ConfigNode::StringTemplate(out).simplify())
-        }
-        rc::ConfigNode::Array(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                out.push(resolve_binding_parts_in_config(item, bindings_by_scope)?);
-            }
-            Ok(rc::ConfigNode::Array(out))
-        }
-        rc::ConfigNode::Object(map) => {
-            let mut out = BTreeMap::new();
-            for (k, v) in map {
-                out.insert(
-                    k.clone(),
-                    resolve_binding_parts_in_config(v, bindings_by_scope)?,
-                );
-            }
-            Ok(rc::ConfigNode::Object(out))
-        }
-        other => Ok(other.clone()),
-    }
 }
 
 #[derive(Debug)]
@@ -1293,12 +967,6 @@ fn resolve_program_image_runtime_node(
                         return Err(MeshError::new(format!(
                             "failed to resolve runtime image template: unresolved slots.{slot} \
                              interpolation"
-                        )));
-                    }
-                    TemplatePart::Binding { binding, .. } => {
-                        return Err(MeshError::new(format!(
-                            "failed to resolve runtime image template: unresolved \
-                             bindings.{binding} interpolation"
                         )));
                     }
                     TemplatePart::Item { item, .. } => {
@@ -1394,7 +1062,6 @@ fn render_template_string_static(ts: &TemplateString) -> Result<String, MeshErro
             TemplatePart::Lit { lit } => out.push_str(lit),
             TemplatePart::Config { .. } => unreachable!(),
             TemplatePart::Slot { .. } => unreachable!(),
-            TemplatePart::Binding { .. } => unreachable!(),
             TemplatePart::Item { .. } => unreachable!(),
         }
     }
@@ -1509,29 +1176,19 @@ fn join_template_strings(values: Vec<TemplateString>, separator: &str) -> Templa
     out
 }
 
-fn resolve_slot_or_binding_interpolation(
+fn resolve_slot_interpolation(
     scenario: &Scenario,
     id: ComponentId,
     location: &str,
     source: &InterpolationSource,
     query: &str,
     slots: &BTreeMap<String, SlotValue>,
-    bindings: &BTreeMap<String, BindingObject>,
 ) -> Result<Option<String>, MeshError> {
     let component = component_label(scenario, id);
     match source {
         InterpolationSource::Slots => resolve_slot_query(slots, query).map(Some).map_err(|e| {
             MeshError::new(format!("failed to resolve slot query in {component}: {e}"))
         }),
-        InterpolationSource::Bindings => {
-            resolve_binding_query(bindings, query)
-                .map(Some)
-                .map_err(|e| {
-                    MeshError::new(format!(
-                        "failed to resolve binding query in {component}: {e}"
-                    ))
-                })
-        }
         InterpolationSource::Config => Ok(None),
         InterpolationSource::Item => Err(MeshError::new(format!(
             "`item` interpolation is only valid inside repeated `each` expansions in {component} \
@@ -1551,7 +1208,6 @@ fn resolve_program_template_string(
     value: &amber_manifest::InterpolatedString,
     runtime_address_resolution: RuntimeAddressResolution,
     slots: &BTreeMap<String, SlotValue>,
-    bindings: &BTreeMap<String, BindingObject>,
     template_opt: Option<&rc::ConfigNode>,
     item_resolution: ItemResolution<'_>,
     needs_helper_for_program_templates: &mut bool,
@@ -1601,21 +1257,11 @@ fn resolve_program_template_string(
                         *needs_helper_for_program_templates = true;
                         continue;
                     }
-                    InterpolationSource::Bindings
-                        if matches!(
-                            runtime_address_resolution,
-                            RuntimeAddressResolution::Deferred
-                        ) =>
-                    {
-                        ts.push(TemplatePart::binding(id.0 as u64, query.clone()));
-                        *needs_helper_for_program_templates = true;
-                        continue;
-                    }
                     _ => {}
                 }
-                if let Some(value) = resolve_slot_or_binding_interpolation(
-                    scenario, id, location, source, query, slots, bindings,
-                )? {
+                if let Some(value) =
+                    resolve_slot_interpolation(scenario, id, location, source, query, slots)?
+                {
                     ts.push(TemplatePart::lit(value));
                     continue;
                 }
@@ -1652,7 +1298,6 @@ fn append_program_command_item_templates(
     item: &ProgramArgItem,
     runtime_address_resolution: RuntimeAddressResolution,
     slots: &BTreeMap<String, SlotValue>,
-    bindings: &BTreeMap<String, BindingObject>,
     template_opt: Option<&rc::ConfigNode>,
     needs_helper_for_program_templates: &mut bool,
     needs_runtime_config_for_program_templates: &mut bool,
@@ -1668,7 +1313,6 @@ fn append_program_command_item_templates(
                 arg,
                 runtime_address_resolution,
                 slots,
-                bindings,
                 template_opt,
                 ItemResolution::NotAllowed,
                 needs_helper_for_program_templates,
@@ -1694,7 +1338,6 @@ fn append_program_command_item_templates(
                         arg,
                         runtime_address_resolution,
                         slots,
-                        bindings,
                         template_opt,
                         ItemResolution::NotAllowed,
                         needs_helper_for_program_templates,
@@ -1722,7 +1365,6 @@ fn append_program_command_item_templates(
                         arg,
                         runtime_address_resolution,
                         slots,
-                        bindings,
                         template_opt,
                         ItemResolution::NotAllowed,
                         needs_helper_for_program_templates,
@@ -1780,7 +1422,6 @@ fn append_program_command_item_templates(
                                 arg,
                                 runtime_address_resolution,
                                 slots,
-                                bindings,
                                 template_opt,
                                 ItemResolution::RuntimeTemplate {
                                     scope,
@@ -1829,7 +1470,6 @@ fn append_program_command_item_templates(
                                 arg,
                                 runtime_address_resolution,
                                 slots,
-                                bindings,
                                 template_opt,
                                 ItemResolution::Static(item),
                                 needs_helper_for_program_templates,
@@ -1860,7 +1500,6 @@ fn append_program_command_item_templates(
                                 arg,
                                 runtime_address_resolution,
                                 slots,
-                                bindings,
                                 template_opt,
                                 ItemResolution::Static(item),
                                 needs_helper_for_program_templates,
@@ -1914,7 +1553,6 @@ fn append_program_command_item_templates(
                                 &repeated.arg,
                                 runtime_address_resolution,
                                 slots,
-                                bindings,
                                 template_opt,
                                 ItemResolution::RuntimeTemplate {
                                     scope,
@@ -1952,7 +1590,6 @@ fn append_program_command_item_templates(
                                 &repeated.arg,
                                 runtime_address_resolution,
                                 slots,
-                                bindings,
                                 template_opt,
                                 ItemResolution::RuntimeTemplate {
                                     scope,
@@ -2001,7 +1638,6 @@ fn append_program_command_item_templates(
                                 &repeated.arg,
                                 runtime_address_resolution,
                                 slots,
-                                bindings,
                                 template_opt,
                                 ItemResolution::Static(item),
                                 needs_helper_for_program_templates,
@@ -2025,7 +1661,6 @@ fn append_program_command_item_templates(
                                 &repeated.arg,
                                 runtime_address_resolution,
                                 slots,
-                                bindings,
                                 template_opt,
                                 ItemResolution::Static(item),
                                 needs_helper_for_program_templates,
@@ -2054,7 +1689,6 @@ fn append_program_command_item_templates(
                                 &repeated.arg,
                                 runtime_address_resolution,
                                 slots,
-                                bindings,
                                 template_opt,
                                 ItemResolution::Static(item),
                                 needs_helper_for_program_templates,
@@ -2074,7 +1708,6 @@ fn append_program_command_item_templates(
                                 &repeated.arg,
                                 runtime_address_resolution,
                                 slots,
-                                bindings,
                                 template_opt,
                                 ItemResolution::Static(item),
                                 needs_helper_for_program_templates,
@@ -2098,7 +1731,6 @@ fn build_program_plan(
     program_support: ProgramSupport,
     runtime_address_resolution: RuntimeAddressResolution,
     slots: &BTreeMap<String, SlotValue>,
-    bindings: &BTreeMap<String, BindingObject>,
     template_opt: Option<&rc::ConfigNode>,
     component_schema: Option<&Value>,
 ) -> Result<ProgramPlan, MeshError> {
@@ -2142,14 +1774,13 @@ fn build_program_plan(
                         push_image_literal(&mut image_parts, lit.clone())
                     }
                     InterpolatedPart::Interpolation { source, query } => {
-                        if let Some(value) = resolve_slot_or_binding_interpolation(
+                        if let Some(value) = resolve_slot_interpolation(
                             scenario,
                             id,
                             "program.image",
                             source,
                             query,
                             slots,
-                            bindings,
                         )? {
                             push_image_literal(&mut image_parts, value);
                             continue;
@@ -2200,7 +1831,6 @@ fn build_program_plan(
                     item,
                     runtime_address_resolution,
                     slots,
-                    bindings,
                     template_opt,
                     &mut needs_helper_for_program_templates,
                     &mut needs_runtime_config_for_program_templates,
@@ -2239,7 +1869,6 @@ fn build_program_plan(
                 &path,
                 runtime_address_resolution,
                 slots,
-                bindings,
                 template_opt,
                 ItemResolution::NotAllowed,
                 &mut needs_helper_for_program_templates,
@@ -2264,7 +1893,6 @@ fn build_program_plan(
                     item,
                     runtime_address_resolution,
                     slots,
-                    bindings,
                     template_opt,
                     &mut needs_helper_for_program_templates,
                     &mut needs_runtime_config_for_program_templates,
@@ -2294,7 +1922,6 @@ fn build_program_plan(
                     value,
                     runtime_address_resolution,
                     slots,
-                    bindings,
                     template_opt,
                     ItemResolution::NotAllowed,
                     &mut needs_helper_for_program_templates,
@@ -2320,7 +1947,6 @@ fn build_program_plan(
                             &group.value,
                             runtime_address_resolution,
                             slots,
-                            bindings,
                             template_opt,
                             ItemResolution::NotAllowed,
                             &mut needs_helper_for_program_templates,
@@ -2345,7 +1971,6 @@ fn build_program_plan(
                             &group.value,
                             runtime_address_resolution,
                             slots,
-                            bindings,
                             template_opt,
                             ItemResolution::NotAllowed,
                             &mut needs_helper_for_program_templates,
@@ -2401,7 +2026,6 @@ fn build_program_plan(
                                 &repeated.value,
                                 runtime_address_resolution,
                                 slots,
-                                bindings,
                                 template_opt,
                                 ItemResolution::RuntimeTemplate {
                                     scope,
@@ -2447,7 +2071,6 @@ fn build_program_plan(
                                 &repeated.value,
                                 runtime_address_resolution,
                                 slots,
-                                bindings,
                                 template_opt,
                                 ItemResolution::Static(item),
                                 &mut needs_helper_for_program_templates,
@@ -2481,7 +2104,6 @@ fn build_program_plan(
                                 &repeated.value,
                                 runtime_address_resolution,
                                 slots,
-                                bindings,
                                 template_opt,
                                 ItemResolution::Static(item),
                                 &mut needs_helper_for_program_templates,

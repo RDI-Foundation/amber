@@ -834,18 +834,14 @@ mod tests {
     }
 
     #[test]
-    fn build_run_plan_renders_slot_and_binding_templates_without_config_payload() {
+    fn build_run_plan_renders_slot_templates_without_config_payload() {
         let template_spec = TemplateSpec {
             program: amber_template::ProgramTemplateSpec {
                 entrypoint: vec![
                     ProgramArgTemplate::Arg(vec![TemplatePart::lit("/app/bin/server")]),
                     ProgramArgTemplate::Arg(vec![TemplatePart::slot(7, "api.url")]),
-                    ProgramArgTemplate::Arg(vec![TemplatePart::binding(11, "upstream.url")]),
                 ],
-                env: BTreeMap::from([(
-                    "UPSTREAM".to_string(),
-                    ProgramEnvTemplate::Value(vec![TemplatePart::binding(11, "upstream.url")]),
-                )]),
+                env: BTreeMap::new(),
             },
         };
         let runtime_context = RuntimeTemplateContext {
@@ -854,13 +850,6 @@ mod tests {
                 BTreeMap::from([("api.url".to_string(), "http://127.0.0.1:31001".to_string())]),
             )]),
             slot_items_by_scope: BTreeMap::new(),
-            bindings_by_scope: BTreeMap::from([(
-                11,
-                BTreeMap::from([(
-                    "upstream.url".to_string(),
-                    "tcp://127.0.0.1:32002".to_string(),
-                )]),
-            )]),
         };
 
         let env = BTreeMap::from([
@@ -880,11 +869,6 @@ mod tests {
         let plan = build_run_plan(os_env).expect("run plan should build");
 
         assert_eq!(plan.entrypoint[1], "http://127.0.0.1:31001");
-        assert_eq!(plan.entrypoint[2], "tcp://127.0.0.1:32002");
-        assert_eq!(
-            plan.env.get(&OsString::from("UPSTREAM")),
-            Some(&OsString::from("tcp://127.0.0.1:32002"))
-        );
     }
 
     #[test]
@@ -922,7 +906,6 @@ mod tests {
                     ],
                 )]),
             )]),
-            bindings_by_scope: BTreeMap::new(),
         };
 
         let env = BTreeMap::from([

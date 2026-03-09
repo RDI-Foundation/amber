@@ -290,7 +290,6 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
         },
         crate::targets::program_config::RuntimeAddressResolution::Static,
         &address_plan.slot_values_by_component,
-        &address_plan.binding_values_by_component,
     )
     .map_err(|e| ReporterError::new(e.to_string()))?;
     let storage_plan = build_storage_plan(s, program_components);

@@ -94,5 +94,4 @@ name_type!(SlotName, "slot");
 name_type!(ProvideName, "provide");
 name_type!(ResourceName, "resource");
 name_type!(ExportName, "export");
-name_type!(BindingName, "binding");
 name_type!(FrameworkCapabilityName, "framework capability");

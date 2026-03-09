@@ -507,7 +507,6 @@ fn binding_sugar_forms_parse() {
                 slot: SlotName::try_from("s").unwrap(),
             },
             binding: Binding {
-                name: None,
                 from: BindingSource::ChildExport {
                     child: ChildName::try_from("b").unwrap(),
                     export: ExportName::try_from("c").unwrap(),
@@ -521,7 +520,6 @@ fn binding_sugar_forms_parse() {
                 slot: SlotName::try_from("s").unwrap(),
             },
             binding: Binding {
-                name: None,
                 from: BindingSource::ChildExport {
                     child: ChildName::try_from("b").unwrap(),
                     export: ExportName::try_from("c").unwrap(),
@@ -535,7 +533,6 @@ fn binding_sugar_forms_parse() {
                 slot: SlotName::try_from("t").unwrap(),
             },
             binding: Binding {
-                name: None,
                 from: BindingSource::SelfProvide(ProvideName::try_from("d").unwrap()),
                 weak: false,
             },
@@ -546,7 +543,6 @@ fn binding_sugar_forms_parse() {
                 slot: SlotName::try_from("t").unwrap(),
             },
             binding: Binding {
-                name: None,
                 from: BindingSource::SelfProvide(ProvideName::try_from("d").unwrap()),
                 weak: false,
             },
@@ -554,34 +550,6 @@ fn binding_sugar_forms_parse() {
     ];
 
     assert_eq!(m.bindings, expected);
-}
-
-#[test]
-fn binding_name_is_parsed() {
-    let m: Manifest = r##"
-        {
-          manifest_version: "0.1.0",
-          components: {
-            a: "https://example.com/a",
-            b: "https://example.com/b",
-          },
-          bindings: [
-            { name: "link", to: "#a.s", from: "#b.c" },
-          ],
-        }
-        "##
-    .parse()
-    .unwrap();
-
-    let target = BindingTarget::ChildSlot {
-        child: ChildName::try_from("a").unwrap(),
-        slot: SlotName::try_from("s").unwrap(),
-    };
-    let binding = find_binding(&m, &target);
-    assert_eq!(
-        binding.name.as_ref().map(|name| name.as_str()),
-        Some("link")
-    );
 }
 
 #[test]
@@ -655,64 +623,6 @@ fn binding_missing_capability_errors() {
 }
 
 #[test]
-fn binding_dot_names_are_rejected_in_dot_form() {
-    let err = r#"
-        {
-          manifest_version: "0.1.0",
-          bindings: [
-            { to: "\#a.s", from: "self.c.d" },
-          ],
-        }
-        "#
-    .parse::<Manifest>()
-    .unwrap_err();
-
-    assert!(err.to_string().contains("binding names cannot contain `.`"));
-}
-
-#[test]
-fn binding_dot_names_are_rejected_in_explicit_form() {
-    let err = r#"
-        {
-          manifest_version: "0.1.0",
-          bindings: [
-            { to: "\#a", slot: "s.t", from: "self", capability: "c" },
-          ],
-        }
-        "#
-    .parse::<Manifest>()
-    .unwrap_err();
-
-    assert!(err.to_string().contains("binding names cannot contain `.`"));
-}
-
-#[test]
-fn binding_name_cannot_contain_dots() {
-    let err = r##"
-        {
-          manifest_version: "0.1.0",
-          components: {
-            a: "https://example.com/a",
-            b: "https://example.com/b",
-          },
-          bindings: [
-            { name: "bad.name", to: "#a.s", from: "#b.c" },
-          ],
-        }
-        "##
-    .parse::<Manifest>()
-    .unwrap_err();
-
-    match err {
-        Error::InvalidName { kind, name } => {
-            assert_eq!(kind, "binding");
-            assert_eq!(name, "bad.name");
-        }
-        other => panic!("expected InvalidName error, got: {other}"),
-    }
-}
-
-#[test]
 fn binding_mixed_form_is_rejected() {
     let err = r##"
         {
@@ -751,7 +661,7 @@ fn binding_round_trip_through_canonical_json_parses() {
             c: { kind: "http", endpoint: "endpoint" },
           },
           bindings: [
-            { name: "link", to: "#a.s", from: "self.c" },
+            { to: "#a.s", from: "self.c" },
           ],
         }
         "##
@@ -2003,31 +1913,6 @@ fn binding_target_cannot_be_multiplexed() {
 }
 
 #[test]
-fn binding_name_must_be_unique() {
-    let raw = parse_raw(
-        r##"
-        {
-          manifest_version: "0.1.0",
-          components: {
-            a: "https://example.com/a",
-            b: "https://example.com/b",
-          },
-          bindings: [
-            { name: "dup", to: "#a.s", from: "#b.c" },
-            { name: "dup", to: "#a.t", from: "#b.d" },
-          ],
-        }
-        "##,
-    );
-    let err = raw.validate().unwrap_err();
-
-    match err {
-        Error::DuplicateBindingName { name } => assert_eq!(name, "dup"),
-        other => panic!("expected DuplicateBindingName error, got: {other}"),
-    }
-}
-
-#[test]
 fn binding_source_can_be_multiplexed() {
     let raw = parse_raw(
         r##"
@@ -2054,7 +1939,6 @@ fn binding_source_can_be_multiplexed() {
                 slot: SlotName::try_from("s1").unwrap(),
             },
             binding: Binding {
-                name: None,
                 from: BindingSource::ChildExport {
                     child: ChildName::try_from("b").unwrap(),
                     export: ExportName::try_from("c").unwrap(),
@@ -2068,7 +1952,6 @@ fn binding_source_can_be_multiplexed() {
                 slot: SlotName::try_from("s2").unwrap(),
             },
             binding: Binding {
-                name: None,
                 from: BindingSource::ChildExport {
                     child: ChildName::try_from("b").unwrap(),
                     export: ExportName::try_from("c").unwrap(),

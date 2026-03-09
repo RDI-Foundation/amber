@@ -4,7 +4,7 @@
     image: "busybox:1.36",
     env: {
       API_URL: {
-        when: "bindings.api.url",
+        when: "foo.api.url",
         value: "https://example.test",
       },
     },

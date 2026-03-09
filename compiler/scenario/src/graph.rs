@@ -183,7 +183,6 @@ mod tests {
             slots: BTreeMap::new(),
             provides: BTreeMap::new(),
             resources: BTreeMap::new(),
-            binding_decls: BTreeMap::new(),
             metadata: None,
             children: Vec::new(),
         }
@@ -194,7 +193,6 @@ mod tests {
         let components = vec![Some(component(0, "/a")), Some(component(1, "/b"))];
         let bindings = vec![
             BindingEdge {
-                name: None,
                 from: BindingFrom::Component(ProvideRef {
                     component: ComponentId(0),
                     name: "api".to_string(),
@@ -206,7 +204,6 @@ mod tests {
                 weak: false,
             },
             BindingEdge {
-                name: None,
                 from: BindingFrom::Component(ProvideRef {
                     component: ComponentId(1),
                     name: "api".to_string(),
@@ -238,7 +235,6 @@ mod tests {
         ];
         let bindings = vec![
             BindingEdge {
-                name: None,
                 from: BindingFrom::Component(ProvideRef {
                     component: ComponentId(0),
                     name: "p".to_string(),
@@ -250,7 +246,6 @@ mod tests {
                 weak: false,
             },
             BindingEdge {
-                name: None,
                 from: BindingFrom::Component(ProvideRef {
                     component: ComponentId(1),
                     name: "p".to_string(),
@@ -262,7 +257,6 @@ mod tests {
                 weak: false,
             },
             BindingEdge {
-                name: None,
                 from: BindingFrom::Component(ProvideRef {
                     component: ComponentId(2),
                     name: "p".to_string(),
@@ -305,7 +299,6 @@ mod tests {
     fn topo_order_ignores_framework_bindings() {
         let components = vec![Some(component(0, "/a")), Some(component(1, "/b"))];
         let bindings = vec![BindingEdge {
-            name: None,
             from: BindingFrom::Framework(
                 FrameworkCapabilityName::try_from("dynamic_children").unwrap(),
             ),

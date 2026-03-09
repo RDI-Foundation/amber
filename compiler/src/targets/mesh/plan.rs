@@ -30,7 +30,6 @@ pub(crate) struct ResolvedBinding {
     pub(crate) provide: String,
     pub(crate) endpoint: EndpointInfo,
     pub(crate) slot: String,
-    pub(crate) binding_name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -46,7 +45,6 @@ pub(crate) struct ResolvedExternalBinding {
     pub(crate) consumer: ComponentId,
     pub(crate) slot: String,
     pub(crate) external_slot: String,
-    pub(crate) binding_name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -54,7 +52,6 @@ pub(crate) struct ResolvedFrameworkBinding {
     pub(crate) consumer: ComponentId,
     pub(crate) slot: String,
     pub(crate) capability: FrameworkCapabilityName,
-    pub(crate) binding_name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -147,7 +144,6 @@ pub(crate) fn build_mesh_plan(
                     provide: from.name.clone(),
                     endpoint,
                     slot: binding.to.name.clone(),
-                    binding_name: binding.name.clone(),
                 });
             }
             BindingFrom::Resource(resource) => {
@@ -165,7 +161,6 @@ pub(crate) fn build_mesh_plan(
                     consumer: binding.to.component,
                     slot: binding.to.name.clone(),
                     external_slot: slot.name.clone(),
-                    binding_name: binding.name.clone(),
                 });
             }
             BindingFrom::Framework(name) => {
@@ -191,7 +186,6 @@ pub(crate) fn build_mesh_plan(
                     consumer: binding.to.component,
                     slot: binding.to.name.clone(),
                     capability: name.clone(),
-                    binding_name: binding.name.clone(),
                 });
             }
         }

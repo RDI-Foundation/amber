@@ -13,7 +13,7 @@ enum MissingConfigBehavior {
 
 pub fn template_string_is_runtime(ts: &TemplateString) -> bool {
     ts.iter()
-        .any(|p| p.is_config() || p.is_slot() || p.is_binding() || p.is_item())
+        .any(|p| p.is_config() || p.is_slot() || p.is_item())
 }
 
 pub fn stringify_for_interpolation(v: &Value) -> Result<String> {
@@ -243,19 +243,6 @@ fn render_template_string_with_behavior(
                         ConfigError::interp(format!(
                             "slot interpolation slots.{slot} cannot be rendered at runtime for \
                              scope {scope}"
-                        ))
-                    })?;
-                out.push_str(value);
-            }
-            TemplatePart::Binding { binding, scope } => {
-                let value = runtime_context
-                    .bindings_by_scope
-                    .get(scope)
-                    .and_then(|bindings| bindings.get(binding))
-                    .ok_or_else(|| {
-                        ConfigError::interp(format!(
-                            "binding interpolation bindings.{binding} cannot be rendered at \
-                             runtime for scope {scope}"
                         ))
                     })?;
                 out.push_str(value);

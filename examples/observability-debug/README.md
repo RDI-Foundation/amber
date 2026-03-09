@@ -3,13 +3,13 @@
 This example is for debugging an Amber scenario as a user thinks about it:
 
 - components: `client`, `server`
-- authored bindings: `client_server_api`, `client_external_api`, `public`
+- user-facing edge refs: `/client.server_api -> /server.api`, `/client.ext_api -> external.ext_api`, `public`
 
 The dashboard should not force you to think about Amber's internal mesh. Instead, it gives you three resources:
 
 - `amber.<run>.client`: the client program's stdout/stderr
 - `amber.<run>.server`: the server program's stdout/stderr
-- `amber.<run>.bindings`: structured request/response telemetry for the scenario's authored edges
+- `amber.<run>.bindings`: structured request/response telemetry for the scenario's routed edges
 
 `<run>` is the Compose project name. If you do not set one, it defaults to `default`.
 
@@ -77,8 +77,8 @@ Expected response:
 The `client` also generates traffic in a loop, so after this call you have all three stories in the dashboard:
 
 - `public -> /server`
-- `/client -> /server` via `client_server_api`
-- `/client -> ext_api` via `client_external_api`, including SSE
+- `/client.server_api -> /server.api`
+- `/client.ext_api -> external.ext_api`, including SSE
 
 ## 6) Read the telemetry
 
@@ -98,15 +98,15 @@ Open `http://127.0.0.1:18888`.
 - `[server] received GET /rpc x-amber-tutorial=host-export`
 - `[server] responded 200 /rpc id=server-static`
 
-### Binding resource
+### Edge resource
 
-`amber.amberdemo.bindings` is the important one. It contains the request/response lifecycle for authored edges.
+`amber.amberdemo.bindings` is the important one. It contains the request/response lifecycle for user-facing edges.
 
 Look for these edge refs:
 
 - `public`
-- `/client.client_server_api`
-- `/client.client_external_api`
+- `/client.server_api -> /server.api`
+- `/client.ext_api -> external.ext_api`
 
 A novice should be able to read the logs as a story.
 
@@ -114,15 +114,15 @@ Examples you should see:
 
 - `request received from public by /server [headers]`
 - `response sent from /server to public: tools/list result (id=server-static) [body]`
-- `request sent from /client to /server via /client.client_server_api [headers]`
-- `response received by /client from /server via /client.client_server_api: tools/list result (id=server-static) [body]`
-- `request sent from /client to external slot ext_api via /client.client_external_api: tools/call (id=external-1) [body]`
-- `response received by /client from external slot ext_api via /client.client_external_api: notifications/progress response (id=sse-2) [stream event]`
+- `request sent from /client.server_api to /server.api [headers]`
+- `response received by /client.server_api from /server.api: tools/list result (id=server-static) [body]`
+- `request sent from /client.ext_api to external.ext_api: tools/call (id=external-1) [body]`
+- `response received by /client.ext_api from external.ext_api: notifications/progress response (id=sse-2) [stream event]`
 
 Important details:
 
 - the same request/response chain shares a `traceId`
-- request and response logs live under the authored binding, not under mesh/router names
+- request and response logs use slot/capability edge refs instead of mesh/router route ids
 - protocol-aware fields are extracted when Amber can understand them: JSON-RPC method/id, MCP tool/progress fields, SSE event ids, and so on
 
 ## API checks
@@ -148,13 +148,13 @@ curl -sS 'http://127.0.0.1:18888/api/telemetry/logs?resource=amber.amberdemo.bin
   | rg 'public|host-export'
 ```
 
-Show the internal client/server binding story:
+Show the internal client/server edge story:
 
 ```sh
 curl -sS 'http://127.0.0.1:18888/api/telemetry/traces?resource=amber.amberdemo.bindings&limit=200' \
   | jq -r '
       .data.resourceSpans[]?.scopeSpans[]?.spans[]?
-      | select((.attributes[]? | select(.key == "amber_edge_ref") | .value.stringValue) == "/client.client_server_api")
+      | select((.attributes[]? | select(.key == "amber_edge_ref") | .value.stringValue) == "/client.server_api -> /server.api")
       | [.traceId, .name, ([.events[]?.name] | join(" | "))]
       | @tsv'
 ```

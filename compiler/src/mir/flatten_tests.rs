@@ -25,7 +25,6 @@ fn component(id: usize, moniker: &str) -> Component {
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     }
@@ -147,7 +146,6 @@ fn flatten_removes_pure_routing_nodes_and_preserves_debug_data() {
         root: ComponentId(0),
         components,
         bindings: vec![BindingEdge {
-            name: None,
             from: BindingFrom::Component(ProvideRef {
                 component: ComponentId(2),
                 name: "cap".to_string(),
@@ -317,7 +315,6 @@ fn flatten_keeps_resource_owners() {
         root: ComponentId(0),
         components,
         bindings: vec![BindingEdge {
-            name: None,
             from: BindingFrom::Resource(ResourceRef {
                 component: ComponentId(1),
                 name: "state".to_string(),

@@ -97,10 +97,6 @@ pub enum Error {
     #[diagnostic(code(manifest::duplicate_binding_target))]
     DuplicateBindingTarget { to: String, slot: String },
 
-    #[error("binding name `{name}` is used more than once")]
-    #[diagnostic(code(manifest::duplicate_binding_name))]
-    DuplicateBindingName { name: String },
-
     #[error("binding references unknown child `#{child}`")]
     #[diagnostic(code(manifest::unknown_binding_child))]
     UnknownBindingChild { child: String },

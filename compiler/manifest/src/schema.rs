@@ -19,8 +19,8 @@ use crate::{
     error::Error,
     interpolation::{InterpolatedString, ProgramEntrypoint, ProgramEnvValue},
     names::{
-        BindingName, ChildName, ExportName, FrameworkCapabilityName, ProvideName, ResourceName,
-        SlotName, ensure_name_no_dot,
+        ChildName, ExportName, FrameworkCapabilityName, ProvideName, ResourceName, SlotName,
+        ensure_name_no_dot,
     },
     refs::ManifestRef,
     spans::BindingTargetKey,
@@ -276,7 +276,6 @@ pub enum MountSource {
     Secret(String),
     Resource(String),
     Slot(String),
-    Binding(String),
     Framework(FrameworkCapabilityName),
 }
 
@@ -287,7 +286,6 @@ impl fmt::Display for MountSource {
             MountSource::Secret(path) => write_prefixed(f, "secret", path),
             MountSource::Resource(name) => write_prefixed(f, "resources", name),
             MountSource::Slot(name) => write_prefixed(f, "slots", name),
-            MountSource::Binding(name) => write_prefixed(f, "bindings", name),
             MountSource::Framework(name) => write!(f, "framework.{name}"),
         }
     }
@@ -335,10 +333,6 @@ impl FromStr for MountSource {
         if let Some(name) = input.strip_prefix("slots.") {
             let name = ensure_path(input, name)?;
             return Ok(MountSource::Slot(name));
-        }
-        if let Some(name) = input.strip_prefix("bindings.") {
-            let name = ensure_path(input, name)?;
-            return Ok(MountSource::Binding(name));
         }
         if let Some(name) = input.strip_prefix("framework.") {
             let name = ensure_path(input, name)?;
@@ -837,9 +831,6 @@ impl<'de> Deserialize<'de> for ConfigSchema {
 #[non_exhaustive]
 /// A binding wires a target slot to a source capability.
 pub struct RawBinding {
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
     pub to: LocalComponentRef,
     pub slot: String,
     pub from: BindingSourceRef,
@@ -857,8 +848,7 @@ pub struct RawBinding {
 
 impl PartialEq for RawBinding {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-            && self.to == other.to
+        self.to == other.to
             && self.slot == other.slot
             && self.from == other.from
             && self.capability == other.capability
@@ -877,7 +867,6 @@ impl PartialOrd for RawBinding {
 impl Ord for RawBinding {
     fn cmp(&self, other: &Self) -> Ordering {
         (
-            &self.name,
             &self.to,
             &self.slot,
             &self.from,
@@ -885,7 +874,6 @@ impl Ord for RawBinding {
             &self.weak,
         )
             .cmp(&(
-                &other.name,
                 &other.to,
                 &other.slot,
                 &other.from,
@@ -897,7 +885,6 @@ impl Ord for RawBinding {
 
 impl Hash for RawBinding {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.name.hash(state);
         self.to.hash(state);
         self.slot.hash(state);
         self.from.hash(state);
@@ -915,8 +902,6 @@ impl<'de> Deserialize<'de> for RawBinding {
         #[serde(deny_unknown_fields)]
         struct BindingInput {
             #[serde(default)]
-            name: Option<String>,
-            #[serde(default)]
             to: Option<String>,
             #[serde(default)]
             slot: Option<String>,
@@ -929,7 +914,6 @@ impl<'de> Deserialize<'de> for RawBinding {
         }
 
         let BindingInput {
-            name,
             to,
             slot,
             from,
@@ -946,7 +930,6 @@ impl<'de> Deserialize<'de> for RawBinding {
             (Some(slot), Some(capability)) => {
                 if to.contains('.') || from.contains('.') {
                     return Ok(RawBinding {
-                        name,
                         to: LocalComponentRef::Self_,
                         slot,
                         from: BindingSourceRef::Component(LocalComponentRef::Self_),
@@ -957,12 +940,11 @@ impl<'de> Deserialize<'de> for RawBinding {
                         raw_from: Some(from),
                     });
                 }
-                ensure_binding_name_no_dot(&slot, slot.as_str())
+                ensure_binding_ref_name_no_dot(&slot, slot.as_str())
                     .map_err(serde::de::Error::custom)?;
-                ensure_binding_name_no_dot(&capability, capability.as_str())
+                ensure_binding_ref_name_no_dot(&capability, capability.as_str())
                     .map_err(serde::de::Error::custom)?;
                 Ok(RawBinding {
-                    name,
                     to: parse_binding_target_ref(&to).map_err(serde::de::Error::custom)?,
                     slot,
                     from: parse_binding_source_ref(&from).map_err(serde::de::Error::custom)?,
@@ -978,7 +960,6 @@ impl<'de> Deserialize<'de> for RawBinding {
                 let (from, capability) =
                     split_binding_source(&from).map_err(serde::de::Error::custom)?;
                 Ok(RawBinding {
-                    name,
                     to,
                     slot,
                     from,
@@ -1005,18 +986,16 @@ impl<'de> Deserialize<'de> for RawBinding {
 impl RawBinding {
     #[builder(on(String, into))]
     pub fn new(
-        name: Option<String>,
         to: String,
         slot: String,
         from: String,
         capability: String,
         #[builder(default)] weak: bool,
     ) -> Result<Self, Error> {
-        ensure_binding_name_no_dot(&slot, slot.as_str())?;
-        ensure_binding_name_no_dot(&capability, capability.as_str())?;
+        ensure_binding_ref_name_no_dot(&slot, slot.as_str())?;
+        ensure_binding_ref_name_no_dot(&capability, capability.as_str())?;
 
         Ok(Self {
-            name,
             to: parse_binding_target_ref(&to)?,
             slot,
             from: parse_binding_source_ref(&from)?,
@@ -1090,11 +1069,11 @@ pub(crate) fn binding_target_key_for_binding(
     Some(binding_target_key_for_component_ref(&component, &slot))
 }
 
-fn ensure_binding_name_no_dot(name: &str, input: &str) -> Result<(), Error> {
+fn ensure_binding_ref_name_no_dot(name: &str, input: &str) -> Result<(), Error> {
     if name.contains('.') {
         return Err(Error::InvalidBinding {
             input: input.to_string(),
-            message: "binding names cannot contain `.`".to_string(),
+            message: "names cannot contain `.`".to_string(),
         });
     }
     Ok(())
@@ -1151,7 +1130,7 @@ fn split_binding_target(input: &str) -> Result<(LocalComponentRef, String), Erro
     }
 
     let component = parse_binding_target_ref(left)?;
-    ensure_binding_name_no_dot(right, input)?;
+    ensure_binding_ref_name_no_dot(right, input)?;
     Ok((component, right.to_string()))
 }
 
@@ -1171,7 +1150,7 @@ fn split_binding_source(input: &str) -> Result<(BindingSourceRef, String), Error
     }
 
     let source = parse_binding_source_ref(left)?;
-    ensure_binding_name_no_dot(right, input)?;
+    ensure_binding_ref_name_no_dot(right, input)?;
     Ok((source, right.to_string()))
 }
 
@@ -1209,7 +1188,6 @@ pub enum BindingSource {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct Binding {
-    pub name: Option<BindingName>,
     pub from: BindingSource,
     pub weak: bool,
 }

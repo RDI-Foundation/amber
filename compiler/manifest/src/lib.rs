@@ -26,8 +26,7 @@ pub use interpolation::{
 };
 pub use manifest::{ExperimentalFeature, Manifest, RawManifest};
 pub use names::{
-    BindingName, ChildName, ExportName, FrameworkCapabilityName, ProvideName, ResourceName,
-    SlotName,
+    ChildName, ExportName, FrameworkCapabilityName, ProvideName, ResourceName, SlotName,
 };
 pub use refs::{ManifestDigest, ManifestRef, ManifestUrl};
 // Keep this available at crate root for internal helpers (spans/document).

@@ -104,7 +104,6 @@ impl FromStr for InterpolatedPart {
         let source = match prefix {
             "config" => InterpolationSource::Config,
             "slots" => InterpolationSource::Slots,
-            "bindings" => InterpolationSource::Bindings,
             "item" => InterpolationSource::Item,
             _ => return Err(Error::InvalidInterpolation(inner.to_string())),
         };
@@ -122,7 +121,6 @@ impl FromStr for InterpolatedPart {
 pub enum InterpolationSource {
     Config,
     Slots,
-    Bindings,
     Item,
 }
 
@@ -131,7 +129,6 @@ impl fmt::Display for InterpolationSource {
         let s = match self {
             InterpolationSource::Config => "config",
             InterpolationSource::Slots => "slots",
-            InterpolationSource::Bindings => "bindings",
             InterpolationSource::Item => "item",
         };
         f.write_str(s)
@@ -241,7 +238,7 @@ impl FromStr for WhenPath {
         match source {
             InterpolationSource::Config => validate_config_when_path(input, &query)?,
             InterpolationSource::Slots => validate_slot_when_path(input, &query)?,
-            InterpolationSource::Bindings | InterpolationSource::Item => {
+            InterpolationSource::Item => {
                 return Err(Error::InvalidWhenPath {
                     input: input.to_string(),
                     message: "expected `config.<path>` or `slots.<path>`".to_string(),
@@ -845,18 +842,6 @@ mod tests {
     }
 
     #[test]
-    fn interpolation_parsing_supports_bindings() {
-        let parsed: InterpolatedString = "${bindings.route.url}".parse().unwrap();
-        assert_eq!(
-            parsed.parts,
-            vec![InterpolatedPart::Interpolation {
-                source: InterpolationSource::Bindings,
-                query: "route.url".to_string()
-            }]
-        );
-    }
-
-    #[test]
     fn interpolation_unknown_source_errors() {
         assert!("${foo.bar}".parse::<InterpolatedString>().is_err());
     }
@@ -883,7 +868,7 @@ mod tests {
         assert!("config".parse::<WhenPath>().is_err());
         assert!("slots".parse::<WhenPath>().is_err());
         assert!("slots.backend..url".parse::<WhenPath>().is_err());
-        assert!("bindings.route.url".parse::<WhenPath>().is_err());
+        assert!("foo.route.url".parse::<WhenPath>().is_err());
     }
 
     #[test]

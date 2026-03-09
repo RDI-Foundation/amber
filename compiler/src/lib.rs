@@ -15,9 +15,6 @@ use amber_scenario::{ComponentId, Scenario};
 use miette::{Diagnostic, Report};
 use thiserror::Error;
 
-mod binding_query;
-mod binding_usage;
-mod binding_validation;
 mod config_resolution;
 pub(crate) mod config_scope;
 mod config_template;
@@ -142,20 +139,11 @@ impl Compiler {
     ) -> Result<CompileOutput, Error> {
         let mut diagnostics =
             slot_validation::collect_slot_interpolation_diagnostics_from_tree(&tree, &self.store);
-        let binding_validation::BindingInterpolationDiagnostics {
-            diagnostics: binding_reports,
-            suppressed_unused_config_lints,
-        } = binding_validation::collect_binding_interpolation_diagnostics_from_tree(
-            &tree,
-            &self.store,
-        );
-        diagnostics.extend(binding_reports);
         let (scenario, provenance) = linker::link(tree, &self.store)?;
         diagnostics.extend(collect_manifest_diagnostics(
             &scenario,
             &provenance,
             &self.store,
-            &suppressed_unused_config_lints,
         ));
 
         let (scenario, provenance) = mir::optimize_linked_scenario(
@@ -177,14 +165,6 @@ impl Compiler {
     pub fn check_from_tree(&self, tree: ResolvedTree) -> Result<CheckOutput, Error> {
         let mut diagnostics =
             slot_validation::collect_slot_interpolation_diagnostics_from_tree(&tree, &self.store);
-        let binding_validation::BindingInterpolationDiagnostics {
-            diagnostics: binding_reports,
-            suppressed_unused_config_lints,
-        } = binding_validation::collect_binding_interpolation_diagnostics_from_tree(
-            &tree,
-            &self.store,
-        );
-        diagnostics.extend(binding_reports);
         let mut has_errors = false;
         let tree_for_manifest_lints = tree.clone();
 
@@ -193,14 +173,12 @@ impl Compiler {
                 &scenario,
                 &provenance,
                 &self.store,
-                &suppressed_unused_config_lints,
             )),
             Err(err) => {
                 has_errors = true;
                 diagnostics.extend(collect_manifest_diagnostics_from_tree(
                     &tree_for_manifest_lints,
                     &self.store,
-                    &suppressed_unused_config_lints,
                 ));
                 let mut link_errors = Vec::new();
                 match err {
@@ -273,7 +251,6 @@ fn collect_manifest_diagnostics(
     scenario: &Scenario,
     provenance: &Provenance,
     store: &DigestStore,
-    suppressed_unused_config_lints: &binding_validation::SuppressedUnusedConfigLints,
 ) -> Vec<Report> {
     let mut diagnostics = Vec::new();
     let optional_slots = effective_optional_slots_by_component(scenario, provenance);
@@ -297,10 +274,7 @@ fn collect_manifest_diagnostics(
         diagnostics.extend(
             lints
                 .into_iter()
-                .filter(|lint| {
-                    !suppress_manifest_unused_config_lint(lint, suppressed_unused_config_lints)
-                        && !suppress_manifest_unused_slot_lint(lint, &optional_slots)
-                })
+                .filter(|lint| !suppress_manifest_unused_slot_lint(lint, &optional_slots))
                 .map(Report::new),
         );
     }
@@ -311,16 +285,9 @@ fn collect_manifest_diagnostics(
 fn collect_manifest_diagnostics_from_tree(
     tree: &frontend::ResolvedTree,
     store: &DigestStore,
-    suppressed_unused_config_lints: &binding_validation::SuppressedUnusedConfigLints,
 ) -> Vec<Report> {
     let mut diagnostics = Vec::new();
-    collect_tree_node_diagnostics(
-        &tree.root,
-        "/",
-        store,
-        &mut diagnostics,
-        suppressed_unused_config_lints,
-    );
+    collect_tree_node_diagnostics(&tree.root, "/", store, &mut diagnostics);
     diagnostics
 }
 
@@ -329,7 +296,6 @@ fn collect_tree_node_diagnostics(
     component_path: &str,
     store: &DigestStore,
     diagnostics: &mut Vec<Report>,
-    suppressed_unused_config_lints: &binding_validation::SuppressedUnusedConfigLints,
 ) {
     let Some(manifest) = store.get(&node.digest) else {
         return;
@@ -340,14 +306,7 @@ fn collect_tree_node_diagnostics(
         return;
     };
     let lints = lint_manifest(manifest.as_ref(), component_path, src, spans.as_ref());
-    diagnostics.extend(
-        lints
-            .into_iter()
-            .filter(|lint| {
-                !suppress_manifest_unused_config_lint(lint, suppressed_unused_config_lints)
-            })
-            .map(Report::new),
-    );
+    diagnostics.extend(lints.into_iter().map(Report::new));
 
     for (child_name, child_node) in &node.children {
         let child_path = if component_path == "/" {
@@ -355,29 +314,8 @@ fn collect_tree_node_diagnostics(
         } else {
             format!("{component_path}/{child_name}")
         };
-        collect_tree_node_diagnostics(
-            child_node,
-            &child_path,
-            store,
-            diagnostics,
-            suppressed_unused_config_lints,
-        );
+        collect_tree_node_diagnostics(child_node, &child_path, store, diagnostics);
     }
-}
-
-fn suppress_manifest_unused_config_lint(
-    lint: &ManifestLint,
-    suppressed_unused_config_lints: &binding_validation::SuppressedUnusedConfigLints,
-) -> bool {
-    let ManifestLint::UnusedConfig {
-        path, component, ..
-    } = lint
-    else {
-        return false;
-    };
-    suppressed_unused_config_lints
-        .get(component)
-        .is_some_and(|paths| paths.contains(path))
 }
 
 fn suppress_manifest_unused_slot_lint(

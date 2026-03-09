@@ -98,8 +98,6 @@ struct OpenFrame {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     slot: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    binding_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     capability_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     capability_profile: Option<String>,
@@ -128,14 +126,12 @@ struct HttpExchangeLabels {
     emit_telemetry: bool,
     slot: Option<Arc<str>>,
     capability: Arc<str>,
-    binding_name: Option<Arc<str>>,
     capability_kind: Option<Arc<str>>,
     capability_profile: Option<Arc<str>>,
     source_component: Option<Arc<str>>,
     source_endpoint: Arc<str>,
     destination_component: Option<Arc<str>>,
     destination_endpoint: Arc<str>,
-    edge_owner_component: Option<Arc<str>>,
 }
 
 impl HttpExchangeLabels {
@@ -146,11 +142,6 @@ impl HttpExchangeLabels {
         open: &OpenFrame,
     ) -> Self {
         let slot = open.slot.as_deref().map(Arc::<str>::from);
-        let binding_name = route
-            .binding_name
-            .clone()
-            .or_else(|| open.binding_name.clone())
-            .map(Arc::<str>::from);
         let capability = Arc::<str>::from(route.capability.as_str());
         let capability_kind = route
             .capability_kind
@@ -163,8 +154,7 @@ impl HttpExchangeLabels {
             .or_else(|| open.capability_profile.clone())
             .map(Arc::<str>::from);
         let source_from_open = source_endpoint_from_open(open);
-        let router_forwarded_export = remote_id.as_ref() == "/router"
-            && (binding_name.is_some() || source_from_open.is_some());
+        let router_forwarded_export = remote_id.as_ref() == "/router" && source_from_open.is_some();
 
         let (
             kind,
@@ -173,7 +163,6 @@ impl HttpExchangeLabels {
             source_endpoint,
             destination_component,
             destination_endpoint,
-            edge_owner_component,
         ) = match &route.target {
             InboundTarget::Local { .. } => {
                 if router_forwarded_export {
@@ -181,13 +170,11 @@ impl HttpExchangeLabels {
                         HttpEdgeKind::Export,
                         false,
                         None,
-                        binding_name
+                        source_from_open
                             .clone()
-                            .or_else(|| source_from_open.clone())
                             .unwrap_or_else(|| capability.clone()),
                         Some(local_id.clone()),
                         capability.clone(),
-                        None,
                     )
                 } else {
                     (
@@ -197,7 +184,6 @@ impl HttpExchangeLabels {
                         source_from_open.unwrap_or_else(|| capability.clone()),
                         Some(local_id.clone()),
                         capability.clone(),
-                        binding_name.as_ref().map(|_| remote_id.clone()),
                     )
                 }
             }
@@ -208,7 +194,6 @@ impl HttpExchangeLabels {
                 source_from_open.unwrap_or_else(|| capability.clone()),
                 None,
                 capability.clone(),
-                binding_name.as_ref().map(|_| remote_id.clone()),
             ),
             InboundTarget::MeshForward {
                 peer_id,
@@ -218,13 +203,9 @@ impl HttpExchangeLabels {
                 HttpEdgeKind::Export,
                 true,
                 None,
-                binding_name
-                    .clone()
-                    .or(source_from_open)
-                    .unwrap_or_else(|| capability.clone()),
+                source_from_open.unwrap_or_else(|| capability.clone()),
                 Some(Arc::<str>::from(peer_id.as_str())),
                 Arc::<str>::from(forward_capability.as_str()),
-                None,
             ),
         };
 
@@ -233,14 +214,12 @@ impl HttpExchangeLabels {
             emit_telemetry,
             slot,
             capability,
-            binding_name,
             capability_kind,
             capability_profile,
             source_component,
             source_endpoint,
             destination_component,
             destination_endpoint,
-            edge_owner_component,
         }
     }
 
@@ -261,26 +240,20 @@ impl HttpExchangeLabels {
             emit_telemetry: true,
             slot: Some(Arc::<str>::from(route.slot.as_str())),
             capability: Arc::<str>::from(route.capability.as_str()),
-            binding_name: route.binding_name.as_deref().map(Arc::<str>::from),
             capability_kind: route.capability_kind.as_deref().map(Arc::<str>::from),
             capability_profile: route.capability_profile.as_deref().map(Arc::<str>::from),
             source_component: Some(local_id.clone()),
             source_endpoint: Arc::<str>::from(route.slot.as_str()),
             destination_component,
             destination_endpoint: Arc::<str>::from(route.capability.as_str()),
-            edge_owner_component: route.binding_name.as_ref().map(|_| local_id),
         }
     }
 }
 
 fn source_endpoint_from_open(open: &OpenFrame) -> Option<Arc<str>> {
-    open.slot
-        .as_deref()
-        .map(Arc::<str>::from)
-        .or_else(|| open.binding_name.as_deref().map(Arc::<str>::from))
-        .or_else(|| {
-            (!open.capability.is_empty()).then(|| Arc::<str>::from(open.capability.as_str()))
-        })
+    open.slot.as_deref().map(Arc::<str>::from).or_else(|| {
+        (!open.capability.is_empty()).then(|| Arc::<str>::from(open.capability.as_str()))
+    })
 }
 
 #[derive(Clone)]
@@ -388,14 +361,12 @@ struct HttpExchangeTelemetryContext {
     edge_kind: HttpEdgeKind,
     capability: Arc<str>,
     slot: Option<Arc<str>>,
-    binding_name: Option<Arc<str>>,
     capability_kind: Option<Arc<str>>,
     capability_profile: Option<Arc<str>>,
     source_component: Option<Arc<str>>,
     source_endpoint: Arc<str>,
     destination_component: Option<Arc<str>>,
     destination_endpoint: Arc<str>,
-    edge_owner_component: Option<Arc<str>>,
     source_ref: Arc<str>,
     destination_ref: Arc<str>,
     edge_ref: Arc<str>,
@@ -418,14 +389,12 @@ impl HttpExchangeTelemetryContext {
             edge_kind: labels.kind,
             capability: labels.capability.clone(),
             slot: labels.slot.clone(),
-            binding_name: labels.binding_name.clone(),
             capability_kind: labels.capability_kind.clone(),
             capability_profile: labels.capability_profile.clone(),
             source_component: labels.source_component.clone(),
             source_endpoint: labels.source_endpoint.clone(),
             destination_component: labels.destination_component.clone(),
             destination_endpoint: labels.destination_endpoint.clone(),
-            edge_owner_component: labels.edge_owner_component.clone(),
             source_ref,
             destination_ref,
             edge_ref,
@@ -435,10 +404,6 @@ impl HttpExchangeTelemetryContext {
 
     fn slot(&self) -> &str {
         self.slot.as_deref().unwrap_or("")
-    }
-
-    fn binding_name(&self) -> &str {
-        self.binding_name.as_deref().unwrap_or("")
     }
 
     fn capability_kind(&self) -> &str {
@@ -485,10 +450,6 @@ impl HttpExchangeTelemetryContext {
 
     fn destination_endpoint(&self) -> &str {
         self.destination_endpoint.as_ref()
-    }
-
-    fn edge_owner_component(&self) -> &str {
-        self.edge_owner_component.as_deref().unwrap_or("")
     }
 
     fn source_ref(&self) -> &str {
@@ -575,21 +536,10 @@ fn edge_ref_for(
     destination_ref: &str,
 ) -> String {
     match labels.kind {
-        HttpEdgeKind::Export => labels
-            .binding_name
-            .as_deref()
-            .unwrap_or(labels.source_endpoint.as_ref())
-            .to_string(),
+        HttpEdgeKind::Export => labels.source_endpoint.to_string(),
         HttpEdgeKind::Binding | HttpEdgeKind::ExternalSlot => {
-            if let (Some(binding_name), Some(owner)) = (
-                labels.binding_name.as_deref(),
-                labels.edge_owner_component.as_deref(),
-            ) {
-                format!("{owner}.{binding_name}")
-            } else {
-                let _ = flow;
-                format!("{source_ref} -> {destination_ref}")
-            }
+            let _ = flow;
+            format!("{source_ref} -> {destination_ref}")
         }
     }
 }
@@ -1052,10 +1002,6 @@ async fn handle_inbound(
                 capability: capability.clone(),
                 protocol: route.protocol,
                 slot: open.slot.clone(),
-                binding_name: route
-                    .binding_name
-                    .clone()
-                    .or_else(|| open.binding_name.clone()),
                 capability_kind: route
                     .capability_kind
                     .clone()
@@ -1103,7 +1049,6 @@ async fn maybe_proxy_mesh_external(
         capability: capability.to_string(),
         protocol,
         slot: None,
-        binding_name: None,
         capability_kind: None,
         capability_profile: None,
     };
@@ -1176,7 +1121,6 @@ async fn handle_outbound(
         capability: route.capability.clone(),
         protocol: route.protocol,
         slot: Some(route.slot.clone()),
-        binding_name: route.binding_name.clone(),
         capability_kind: route.capability_kind.clone(),
         capability_profile: route.capability_profile.clone(),
     };
@@ -2239,7 +2183,6 @@ fn start_http_exchange_span(
         amber_entity_kind = "binding",
         amber_edge_kind = telemetry.edge_kind(),
         amber_edge_ref = telemetry.edge_ref(),
-        amber_edge_owner_component = telemetry.edge_owner_component(),
         amber_source_ref = telemetry.source_ref(),
         amber_source_component = telemetry.source_component(),
         amber_source_endpoint = telemetry.source_endpoint(),
@@ -2260,7 +2203,6 @@ fn start_http_exchange_span(
         amber_rpc_id = tracing::field::Empty,
         amber_capability = telemetry.capability.as_ref(),
         amber_slot = telemetry.slot(),
-        amber_binding_name = telemetry.binding_name(),
         amber_capability_kind = telemetry.capability_kind(),
         amber_capability_profile = telemetry.capability_profile(),
         "http.request.method" = %req.method(),
@@ -2789,11 +2731,6 @@ fn binding_log_attributes(
     push_log_attr(&mut attributes, "amber_entity_kind", "binding");
     push_log_attr(&mut attributes, "amber_edge_kind", telemetry.edge_kind());
     push_nonempty_log_attr(&mut attributes, "amber_edge_ref", telemetry.edge_ref());
-    push_nonempty_log_attr(
-        &mut attributes,
-        "amber_edge_owner_component",
-        telemetry.edge_owner_component(),
-    );
     push_nonempty_log_attr(&mut attributes, "amber_source_ref", telemetry.source_ref());
     push_nonempty_log_attr(
         &mut attributes,
@@ -2838,11 +2775,6 @@ fn binding_log_attributes(
         telemetry.capability.as_ref(),
     );
     push_nonempty_log_attr(&mut attributes, "amber_slot", telemetry.slot());
-    push_nonempty_log_attr(
-        &mut attributes,
-        "amber_binding_name",
-        telemetry.binding_name(),
-    );
     push_nonempty_log_attr(
         &mut attributes,
         "amber_capability_kind",
@@ -5303,7 +5235,6 @@ mod tests {
         InboundRoute {
             route_id: route_id.to_string(),
             capability: capability.to_string(),
-            binding_name: None,
             capability_kind: None,
             capability_profile: None,
             protocol,
@@ -5350,7 +5281,6 @@ mod tests {
             inbound: vec![InboundRoute {
                 route_id: "bad-route".to_string(),
                 capability: "cap".to_string(),
-                binding_name: None,
                 capability_kind: None,
                 capability_profile: None,
                 protocol: MeshProtocol::Tcp,
@@ -5377,7 +5307,6 @@ mod tests {
             inbound: vec![InboundRoute {
                 route_id: "bad-route".to_string(),
                 capability: "cap".to_string(),
-                binding_name: None,
                 capability_kind: None,
                 capability_profile: None,
                 protocol: MeshProtocol::Http,
@@ -5407,7 +5336,6 @@ mod tests {
             outbound: vec![OutboundRoute {
                 route_id: "bad-route".to_string(),
                 slot: "slot".to_string(),
-                binding_name: None,
                 capability_kind: None,
                 capability_profile: None,
                 listen_port: 20000,
@@ -5534,7 +5462,6 @@ mod tests {
         config.outbound.push(amber_mesh::OutboundRoute {
             route_id: "route".to_string(),
             slot: "test-outbound".to_string(),
-            binding_name: None,
             capability_kind: None,
             capability_profile: None,
             listen_port: occupied_addr.port(),
@@ -5584,7 +5511,6 @@ mod tests {
             capability: "shared".to_string(),
             protocol: MeshProtocol::Http,
             slot: None,
-            binding_name: None,
             capability_kind: None,
             capability_profile: None,
         };
@@ -5631,7 +5557,6 @@ mod tests {
             capability: "shared".to_string(),
             protocol: MeshProtocol::Http,
             slot: None,
-            binding_name: None,
             capability_kind: None,
             capability_profile: None,
         };
@@ -5678,7 +5603,6 @@ mod tests {
             capability: "shared".to_string(),
             protocol: MeshProtocol::Http,
             slot: None,
-            binding_name: None,
             capability_kind: None,
             capability_profile: None,
         };
@@ -5798,7 +5722,6 @@ mod tests {
         let route = InboundRoute {
             route_id: "route".to_string(),
             capability: "cap".to_string(),
-            binding_name: None,
             capability_kind: None,
             capability_profile: None,
             protocol: MeshProtocol::Http,
@@ -5811,7 +5734,6 @@ mod tests {
             capability: "cap".to_string(),
             protocol: MeshProtocol::Http,
             slot: Some("slot".to_string()),
-            binding_name: Some("route_llm".to_string()),
             capability_kind: Some("mcp".to_string()),
             capability_profile: Some("v1".to_string()),
         };
@@ -5823,7 +5745,6 @@ mod tests {
             &open,
         );
         assert_eq!(labels.slot.as_deref(), Some("slot"));
-        assert_eq!(labels.binding_name.as_deref(), Some("route_llm"));
         assert_eq!(labels.capability_kind.as_deref(), Some("mcp"));
         assert_eq!(labels.capability_profile.as_deref(), Some("v1"));
     }
@@ -5833,7 +5754,6 @@ mod tests {
         let route = InboundRoute {
             route_id: "component:/server:api:http".to_string(),
             capability: "api".to_string(),
-            binding_name: None,
             capability_kind: Some("mcp".to_string()),
             capability_profile: Some("debug-jsonrpc".to_string()),
             protocol: MeshProtocol::Http,
@@ -5846,7 +5766,6 @@ mod tests {
             capability: "public".to_string(),
             protocol: MeshProtocol::Http,
             slot: Some("public".to_string()),
-            binding_name: Some("public".to_string()),
             capability_kind: Some("mcp".to_string()),
             capability_profile: Some("debug-jsonrpc".to_string()),
         };
@@ -5869,7 +5788,6 @@ mod tests {
         let route = InboundRoute {
             route_id: "component:/server:api:http".to_string(),
             capability: "api".to_string(),
-            binding_name: None,
             capability_kind: Some("mcp".to_string()),
             capability_profile: Some("debug-jsonrpc".to_string()),
             protocol: MeshProtocol::Http,
@@ -5882,7 +5800,6 @@ mod tests {
             capability: "public".to_string(),
             protocol: MeshProtocol::Http,
             slot: Some("public".to_string()),
-            binding_name: None,
             capability_kind: Some("mcp".to_string()),
             capability_profile: Some("debug-jsonrpc".to_string()),
         };
@@ -5905,7 +5822,6 @@ mod tests {
         let route = OutboundRoute {
             route_id: "router:external:ext_api:http".to_string(),
             slot: "ext_api".to_string(),
-            binding_name: Some("client_external_api".to_string()),
             capability_kind: Some("http".to_string()),
             capability_profile: Some("debug-external".to_string()),
             listen_port: 20000,
@@ -5926,7 +5842,7 @@ mod tests {
                 "/client.ext_api",
                 "external.ext_api"
             ),
-            "/client.client_external_api"
+            "/client.ext_api -> external.ext_api"
         );
     }
 
@@ -5935,7 +5851,6 @@ mod tests {
         let route = InboundRoute {
             route_id: "router:export:public:http".to_string(),
             capability: "public".to_string(),
-            binding_name: Some("public".to_string()),
             capability_kind: Some("mcp".to_string()),
             capability_profile: Some("debug-jsonrpc".to_string()),
             protocol: MeshProtocol::Http,
@@ -5953,7 +5868,6 @@ mod tests {
             capability: "public".to_string(),
             protocol: MeshProtocol::Http,
             slot: Some("public".to_string()),
-            binding_name: Some("public".to_string()),
             capability_kind: Some("mcp".to_string()),
             capability_profile: Some("debug-jsonrpc".to_string()),
         };

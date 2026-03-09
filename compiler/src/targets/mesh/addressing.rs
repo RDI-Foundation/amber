@@ -4,7 +4,6 @@ use amber_manifest::NetworkProtocol;
 use amber_scenario::{ComponentId, Scenario};
 
 use crate::{
-    binding_query::BindingObject,
     slot_query::{SlotObject, SlotValue},
     targets::mesh::{
         plan::{
@@ -54,7 +53,6 @@ impl AllowPlan {
 #[derive(Clone, Debug)]
 pub(crate) struct MeshAddressPlan {
     pub(crate) slot_values_by_component: HashMap<ComponentId, BTreeMap<String, SlotValue>>,
-    pub(crate) binding_values_by_component: HashMap<ComponentId, BTreeMap<String, BindingObject>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,76 +195,46 @@ pub(crate) fn build_address_plan<A: Addressing>(
 ) -> Result<MeshAddressPlan, A::Error> {
     let mut slot_values_by_component: HashMap<ComponentId, BTreeMap<String, SlotValue>> =
         HashMap::new();
-    let mut binding_values_by_component: HashMap<ComponentId, BTreeMap<String, BindingObject>> =
-        HashMap::new();
     for id in &mesh_plan.program_components {
         slot_values_by_component.insert(*id, BTreeMap::new());
-        binding_values_by_component.insert(*id, BTreeMap::new());
     }
 
-    let mut insert_url =
-        |consumer: ComponentId, slot: &str, binding_name: Option<&str>, url: String| {
-            let slot_values = slot_values_by_component.entry(consumer).or_default();
-            match slot_values.get_mut(slot) {
-                Some(SlotValue::One(existing)) => {
-                    let existing = existing.clone();
-                    slot_values.insert(
-                        slot.to_string(),
-                        SlotValue::Many(vec![existing, SlotObject { url: url.clone() }]),
-                    );
-                }
-                Some(SlotValue::Many(values)) => {
-                    values.push(SlotObject { url: url.clone() });
-                }
-                None => {
-                    slot_values.insert(
-                        slot.to_string(),
-                        SlotValue::One(SlotObject { url: url.clone() }),
-                    );
-                }
+    let mut insert_url = |consumer: ComponentId, slot: &str, url: String| {
+        let slot_values = slot_values_by_component.entry(consumer).or_default();
+        match slot_values.get_mut(slot) {
+            Some(SlotValue::One(existing)) => {
+                let existing = existing.clone();
+                slot_values.insert(
+                    slot.to_string(),
+                    SlotValue::Many(vec![existing, SlotObject { url }]),
+                );
             }
-
-            if let Some(name) = binding_name {
-                binding_values_by_component
-                    .entry(consumer)
-                    .or_default()
-                    .insert(name.to_string(), BindingObject { url });
+            Some(SlotValue::Many(values)) => {
+                values.push(SlotObject { url });
             }
-        };
+            None => {
+                slot_values.insert(slot.to_string(), SlotValue::One(SlotObject { url }));
+            }
+        }
+    };
 
     for binding in &mesh_plan.bindings {
         let url = addressing.resolve_binding_url(binding)?;
-        insert_url(
-            binding.consumer,
-            &binding.slot,
-            binding.binding_name.as_deref(),
-            url,
-        );
+        insert_url(binding.consumer, &binding.slot, url);
     }
 
     for binding in &mesh_plan.external_bindings {
         let url = addressing.resolve_external_binding_url(binding)?;
-        insert_url(
-            binding.consumer,
-            &binding.slot,
-            binding.binding_name.as_deref(),
-            url,
-        );
+        insert_url(binding.consumer, &binding.slot, url);
     }
 
     for binding in &mesh_plan.framework_bindings {
         let url = addressing.resolve_framework_binding_url(binding)?;
-        insert_url(
-            binding.consumer,
-            &binding.slot,
-            binding.binding_name.as_deref(),
-            url,
-        );
+        insert_url(binding.consumer, &binding.slot, url);
     }
 
     Ok(MeshAddressPlan {
         slot_values_by_component,
-        binding_values_by_component,
     })
 }
 
@@ -401,7 +369,7 @@ mod tests {
             ),
             slots: BTreeMap::new(),
             provides: BTreeMap::new(),
-            binding_decls: BTreeMap::new(),
+            resources: BTreeMap::new(),
             metadata: None,
             children: Vec::new(),
         }
@@ -443,7 +411,6 @@ mod tests {
                         protocol: NetworkProtocol::Http,
                     },
                     slot: "upstream".to_string(),
-                    binding_name: None,
                 },
                 ResolvedBinding {
                     provider: ComponentId(2),
@@ -454,7 +421,6 @@ mod tests {
                         protocol: NetworkProtocol::Http,
                     },
                     slot: "upstream".to_string(),
-                    binding_name: None,
                 },
             ],
             external_bindings: Vec::new(),

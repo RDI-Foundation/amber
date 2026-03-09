@@ -58,7 +58,6 @@ struct BindingRouteKey {
     slot: String,
     provider: ComponentId,
     provide: String,
-    binding_name: Option<String>,
 }
 
 impl From<&ResolvedBinding> for BindingRouteKey {
@@ -68,7 +67,6 @@ impl From<&ResolvedBinding> for BindingRouteKey {
             slot: value.slot.clone(),
             provider: value.provider,
             provide: value.provide.clone(),
-            binding_name: value.binding_name.clone(),
         }
     }
 }
@@ -78,7 +76,6 @@ struct ExternalBindingRouteKey {
     consumer: ComponentId,
     slot: String,
     external_slot: String,
-    binding_name: Option<String>,
 }
 
 impl From<&ResolvedExternalBinding> for ExternalBindingRouteKey {
@@ -87,7 +84,6 @@ impl From<&ResolvedExternalBinding> for ExternalBindingRouteKey {
             consumer: value.consumer,
             slot: value.slot.clone(),
             external_slot: value.external_slot.clone(),
-            binding_name: value.binding_name.clone(),
         }
     }
 }
@@ -97,7 +93,6 @@ struct FrameworkBindingRouteKey {
     consumer: ComponentId,
     slot: String,
     capability: String,
-    binding_name: Option<String>,
 }
 
 impl From<&ResolvedFrameworkBinding> for FrameworkBindingRouteKey {
@@ -106,7 +101,6 @@ impl From<&ResolvedFrameworkBinding> for FrameworkBindingRouteKey {
             consumer: value.consumer,
             slot: value.slot.clone(),
             capability: value.capability.to_string(),
-            binding_name: value.binding_name.clone(),
         }
     }
 }

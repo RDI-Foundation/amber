@@ -1,12 +1,12 @@
-Error: manifest::invalid_when_path
+Error: manifest::deserialize_error
 
   × check failed
-  ╰─▶ invalid `when` path `bindings.api.url`: `when` must use `config.<path>`
-      or `slots.<path>`
+  ╰─▶ json5 deserialize error at program.args[0]: invalid interpolation
+      `foo.api.url`
    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/program_when_invalid_source.json5:7:15]
  6 │       {
- 7 │         when: "bindings.api.url",
-   ·               ─────────┬────────
-   ·                        ╰── `when` must use `config.<path>` or `slots.<path>`
+ 7 │         when: "foo.api.url",
+   ·               ──────┬──────
+   ·                     ╰── invalid interpolation `foo.api.url`
  8 │         argv: ["--api", "${slots.api.url}"],
    ╰────

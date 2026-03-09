@@ -279,9 +279,6 @@ pub fn compose_config_template(
                         TemplatePart::Slot { slot, scope } => {
                             out.push(TemplatePart::slot(scope, slot));
                         }
-                        TemplatePart::Binding { binding, scope } => {
-                            out.push(TemplatePart::binding(scope, binding));
-                        }
                         TemplatePart::Item {
                             item,
                             scope,

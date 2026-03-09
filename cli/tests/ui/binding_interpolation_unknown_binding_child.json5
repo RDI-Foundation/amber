@@ -1,9 +1,0 @@
-{
-  manifest_version: "0.1.0",
-  slots: {
-    backend: { kind: "http" },
-  },
-  exports: {
-    backend: "backend",
-  },
-}

@@ -17,10 +17,6 @@ pub enum TemplatePart {
         slot: String,
         scope: u64,
     },
-    Binding {
-        binding: String,
-        scope: u64,
-    },
     Item {
         item: String,
         scope: u64,
@@ -47,13 +43,6 @@ impl TemplatePart {
         }
     }
 
-    pub fn binding(scope: u64, value: impl Into<String>) -> Self {
-        Self::Binding {
-            binding: value.into(),
-            scope,
-        }
-    }
-
     pub fn item(
         scope: u64,
         slot: impl Into<String>,
@@ -73,7 +62,6 @@ impl TemplatePart {
             Self::Lit { lit } => Some(lit.as_str()),
             Self::Config { .. } => None,
             Self::Slot { .. } => None,
-            Self::Binding { .. } => None,
             Self::Item { .. } => None,
         }
     }
@@ -84,10 +72,6 @@ impl TemplatePart {
 
     pub fn is_slot(&self) -> bool {
         matches!(self, Self::Slot { .. })
-    }
-
-    pub fn is_binding(&self) -> bool {
-        matches!(self, Self::Binding { .. })
     }
 
     pub fn is_item(&self) -> bool {
@@ -137,8 +121,6 @@ pub struct RuntimeTemplateContext {
     pub slots_by_scope: BTreeMap<u64, BTreeMap<String, String>>,
     #[serde(default)]
     pub slot_items_by_scope: BTreeMap<u64, BTreeMap<String, Vec<RuntimeSlotObject>>>,
-    #[serde(default)]
-    pub bindings_by_scope: BTreeMap<u64, BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
