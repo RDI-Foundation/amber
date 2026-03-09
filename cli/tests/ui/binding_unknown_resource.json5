@@ -1,9 +1,9 @@
 {
   manifest_version: "0.1.0",
-  slots: {
-    state: { kind: "storage" },
+  components: {
+    child: "./storage_mount_requires_resource_child.json5",
   },
   bindings: [
-    { to: "self.state", from: "resources.state" },
+    { to: "#child.state", from: "resources.state" },
   ],
 }

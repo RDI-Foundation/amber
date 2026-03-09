@@ -1071,9 +1071,10 @@ fn compose_component_service_name(component_moniker: &str) -> String {
 
 fn compose_storage_volume_name(identity: &StorageIdentity) -> String {
     format!(
-        "amber-storage-{}-{}",
+        "amber-storage-{}-{}-{}",
         sanitize_component_moniker(identity.owner_moniker.as_str()),
         sanitize_component_moniker(identity.resource.as_str()),
+        identity.hash_suffix(),
     )
 }
 

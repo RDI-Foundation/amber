@@ -21,7 +21,10 @@ use serde_json::{Map, Value, json};
 use url::Url;
 
 use super::DockerComposeReporter;
-use crate::{reporter::Reporter as _, targets::mesh::internal_images::resolve_internal_images};
+use crate::{
+    reporter::Reporter as _, storage_plan::StorageIdentity,
+    targets::mesh::internal_images::resolve_internal_images,
+};
 
 fn digest(byte: u8) -> ManifestDigest {
     ManifestDigest::new([byte; 32])
@@ -548,8 +551,13 @@ fn compose_emits_storage_volume_mounts() {
 
     let artifact = render_compose(&compile_output(scenario)).expect("compose render ok");
     let compose = parse_compose(&artifact);
+    let volume_name = super::compose_storage_volume_name(&StorageIdentity {
+        owner: ComponentId(0),
+        owner_moniker: "/".to_string(),
+        resource: "state".to_string(),
+    });
     assert!(
-        compose.volumes.contains_key("amber-storage-root-state"),
+        compose.volumes.contains_key(&volume_name),
         "compose should declare a named volume for storage mounts"
     );
     let app_service = service(&compose, "c1-app");
@@ -557,10 +565,31 @@ fn compose_emits_storage_volume_mounts() {
         app_service
             .volumes
             .iter()
-            .any(|mount| mount == "amber-storage-root-state:/var/lib/app"),
+            .any(|mount| mount == &format!("{volume_name}:/var/lib/app")),
         "app service should mount the generated storage volume: {:?}",
         app_service.volumes
     );
+}
+
+#[test]
+fn compose_storage_volume_names_include_identity_hash() {
+    let root_identity = StorageIdentity {
+        owner: ComponentId(0),
+        owner_moniker: "/".to_string(),
+        resource: "state".to_string(),
+    };
+    let child_identity = StorageIdentity {
+        owner: ComponentId(1),
+        owner_moniker: "/root".to_string(),
+        resource: "state".to_string(),
+    };
+
+    let root_name = super::compose_storage_volume_name(&root_identity);
+    let child_name = super::compose_storage_volume_name(&child_identity);
+
+    assert_ne!(root_name, child_name);
+    assert!(root_name.starts_with("amber-storage-root-state-"));
+    assert!(child_name.starts_with("amber-storage-root-state-"));
 }
 
 #[test]
@@ -1350,9 +1379,14 @@ fn compose_emits_named_volumes_for_storage_mounts() {
     let artifact =
         render_compose(&compile_output(scenario)).expect("compose render should succeed");
     let compose = parse_compose(&artifact);
+    let volume_name = super::compose_storage_volume_name(&StorageIdentity {
+        owner: ComponentId(0),
+        owner_moniker: "/".to_string(),
+        resource: "state".to_string(),
+    });
 
     assert!(
-        compose.volumes.contains_key("amber-storage-root-state"),
+        compose.volumes.contains_key(&volume_name),
         "expected named storage volume in compose file:\n{}",
         artifact.compose_yaml()
     );
@@ -1362,7 +1396,7 @@ fn compose_emits_named_volumes_for_storage_mounts() {
         app_service
             .volumes
             .iter()
-            .any(|mount| mount == "amber-storage-root-state:/var/lib/app"),
+            .any(|mount| mount == &format!("{volume_name}:/var/lib/app")),
         "expected storage mount on app service:\n{}",
         artifact.compose_yaml()
     );

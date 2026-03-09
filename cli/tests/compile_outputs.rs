@@ -670,7 +670,10 @@ fn compile_direct_emits_storage_mounts_in_plan() {
         .expect("storage mounts array");
     assert_eq!(mounts.len(), 1, "{plan:#}");
     assert_eq!(mounts[0]["mount_path"], "/var/lib/app");
-    assert_eq!(mounts[0]["state_subdir"], "root/state");
+    let state_subdir = mounts[0]["state_subdir"]
+        .as_str()
+        .expect("state_subdir should be a string");
+    assert!(state_subdir.starts_with("root/state-"), "{state_subdir}");
 }
 
 #[test]

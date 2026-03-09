@@ -2,12 +2,28 @@ use std::collections::{BTreeMap, HashMap};
 
 use amber_manifest::{CapabilityKind, MountSource};
 use amber_scenario::{BindingFrom, ComponentId, Scenario};
+use sha2::Digest as _;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(crate) struct StorageIdentity {
     pub(crate) owner: ComponentId,
     pub(crate) owner_moniker: String,
     pub(crate) resource: String,
+}
+
+impl StorageIdentity {
+    pub(crate) fn hash_suffix(&self) -> String {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(self.owner_moniker.as_bytes());
+        hasher.update([0]);
+        hasher.update(self.resource.as_bytes());
+
+        let digest = hasher.finalize();
+        digest[..8]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

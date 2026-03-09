@@ -739,14 +739,11 @@ fn binding_round_trip_through_canonical_json_parses() {
 }
 
 #[test]
-fn binding_to_self_slot_is_allowed() {
+fn binding_to_self_is_disallowed_because_slots_are_parent_inputs() {
     let raw = parse_raw(
         r#"
         {
           manifest_version: "0.1.0",
-          slots: {
-            needs: { kind: "http" },
-          },
           components: {
             child: "https://example.com/child",
           },
@@ -756,14 +753,11 @@ fn binding_to_self_slot_is_allowed() {
         }
         "#,
     );
-    let manifest = raw.validate().expect("manifest should validate");
-    let binding = manifest
-        .bindings()
-        .get(&BindingTarget::SelfSlot(
-            SlotName::try_from("needs").unwrap(),
-        ))
-        .expect("binding should target self.needs");
-    assert!(matches!(binding.from, BindingSource::ChildExport { .. }));
+    let err = raw.validate().unwrap_err();
+    match err {
+        Error::BindingTargetSelfSlot { slot } => assert_eq!(slot, "needs"),
+        other => panic!("expected BindingTargetSelfSlot error, got: {other}"),
+    }
 }
 
 #[test]

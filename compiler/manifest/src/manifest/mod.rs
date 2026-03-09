@@ -321,13 +321,7 @@ fn resolve_binding_target(
     slot: String,
 ) -> Result<BindingTarget, Error> {
     match to {
-        LocalComponentRef::Self_ => {
-            let (slot_name, _) = ctx
-                .slots
-                .get_key_value(slot.as_str())
-                .ok_or_else(|| Error::UnknownBindingTargetSlot { slot: slot.clone() })?;
-            Ok(BindingTarget::SelfSlot(slot_name.clone()))
-        }
+        LocalComponentRef::Self_ => Err(Error::BindingTargetSelfSlot { slot }),
         LocalComponentRef::Child(child) => {
             let (child_name, _) = ctx
                 .components

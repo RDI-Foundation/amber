@@ -14,6 +14,7 @@ use amber_mesh::{
 };
 use amber_resolver::Resolver;
 use amber_router as router;
+use amber_scenario::ComponentId;
 use base64::Engine as _;
 use serde_json::json;
 use tempfile::tempdir;
@@ -22,7 +23,7 @@ use url::Url;
 use super::KubernetesReporter;
 use crate::{
     CompileOptions, Compiler, DigestStore, OptimizeOptions, reporter::Reporter as _,
-    targets::mesh::internal_images::resolve_internal_images,
+    storage_plan::StorageIdentity, targets::mesh::internal_images::resolve_internal_images,
 };
 
 fn workspace_root() -> PathBuf {
@@ -56,6 +57,19 @@ fn render_artifact(output: &crate::CompileOutput) -> super::KubernetesArtifact {
     KubernetesReporter
         .emit(&compiled_scenario(output))
         .expect("render kubernetes output")
+}
+
+fn storage_claim_name_for_prefix(
+    artifact: &super::KubernetesArtifact,
+    prefix: &str,
+) -> Option<String> {
+    artifact.files.keys().find_map(|path| {
+        let path = path.to_str()?;
+        let name = path
+            .strip_prefix("03-persistentvolumeclaims/")?
+            .strip_suffix(".yaml")?;
+        name.starts_with(prefix).then(|| name.to_string())
+    })
 }
 
 fn use_prebuilt_images() -> bool {
@@ -1135,11 +1149,14 @@ fn kubernetes_storage_mounts_emit_pvc_and_recreate_deployment() {
         "runtime artifact should not embed a Namespace object"
     );
 
+    let claim_name = storage_claim_name_for_prefix(&artifact, "storage-component-state-")
+        .expect("storage pvc claim name");
+
     let pvc_yaml = artifact
         .files
-        .get(&PathBuf::from(
-            "03-persistentvolumeclaims/storage-component-state.yaml",
-        ))
+        .get(&PathBuf::from(format!(
+            "03-persistentvolumeclaims/{claim_name}.yaml"
+        )))
         .expect("pvc yaml");
     assert!(
         pvc_yaml.contains("kind: PersistentVolumeClaim"),
@@ -1161,7 +1178,7 @@ fn kubernetes_storage_mounts_emit_pvc_and_recreate_deployment() {
         "{deployment_yaml}"
     );
     assert!(
-        deployment_yaml.contains("claimName: storage-component-state"),
+        deployment_yaml.contains(&format!("claimName: {claim_name}")),
         "{deployment_yaml}"
     );
     assert!(
@@ -1216,6 +1233,29 @@ fn kubernetes_storage_mounts_emit_pvc_and_recreate_deployment() {
 }
 
 #[test]
+fn kubernetes_storage_claim_names_include_identity_hash() {
+    let upper = StorageIdentity {
+        owner: ComponentId(0),
+        owner_moniker: "/Component".to_string(),
+        resource: "state".to_string(),
+    };
+    let lower = StorageIdentity {
+        owner: ComponentId(1),
+        owner_moniker: "/component".to_string(),
+        resource: "state".to_string(),
+    };
+
+    let upper_name = super::storage_claim_name(&upper);
+    let lower_name = super::storage_claim_name(&lower);
+
+    assert_ne!(upper_name, lower_name);
+    assert!(upper_name.starts_with("storage-component-state-"));
+    assert!(lower_name.starts_with("storage-component-state-"));
+    assert!(upper_name.len() <= 63);
+    assert!(lower_name.len() <= 63);
+}
+
+#[test]
 fn kubernetes_emits_deployment_and_pvc_for_storage_mounts() {
     let fixture_dir = tempdir().expect("create fixture temp dir");
     let scenario_path =
@@ -1240,11 +1280,14 @@ fn kubernetes_emits_deployment_and_pvc_for_storage_mounts() {
         "runtime output should not include a Namespace resource"
     );
 
+    let claim_name = storage_claim_name_for_prefix(&artifact, "storage-component-state-")
+        .expect("storage pvc claim name");
+
     let pvc = artifact
         .files
-        .get(&PathBuf::from(
-            "03-persistentvolumeclaims/storage-component-state.yaml",
-        ))
+        .get(&PathBuf::from(format!(
+            "03-persistentvolumeclaims/{claim_name}.yaml"
+        )))
         .expect("persistentvolumeclaim manifest");
     assert!(pvc.contains("kind: PersistentVolumeClaim"), "{pvc}");
     assert!(pvc.contains("ReadWriteOnce"), "{pvc}");
@@ -1257,7 +1300,7 @@ fn kubernetes_emits_deployment_and_pvc_for_storage_mounts() {
     assert!(deployment.contains("kind: Deployment"), "{deployment}");
     assert!(deployment.contains("type: Recreate"), "{deployment}");
     assert!(
-        deployment.contains("claimName: storage-component-state"),
+        deployment.contains(&format!("claimName: {claim_name}")),
         "{deployment}"
     );
     assert!(

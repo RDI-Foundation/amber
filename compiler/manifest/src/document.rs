@@ -152,7 +152,7 @@ fn labels_for_manifest_error(
         ManifestError::DuplicateBindingName { name } => {
             labels_for_duplicate_binding_name(spans, name)
         }
-        ManifestError::UnknownBindingTargetSlot { slot } => {
+        ManifestError::BindingTargetSelfSlot { slot } => {
             labels_for_binding_target_self(spans, slot)
         }
         ManifestError::UnknownBindingSource { capability } => {
@@ -1161,5 +1161,29 @@ mod tests {
             .iter()
             .any(|label| labeled_span_text(source.as_ref(), label).contains("\"storage\""));
         assert!(has_storage_kind);
+    }
+
+    #[test]
+    fn manifest_doc_error_binding_target_self_points_to_self_target() {
+        let source = r##"
+        {
+          manifest_version: "0.1.0",
+          bindings: [
+            { to: "self.api", from: "self.api" },
+          ],
+        }
+        "##;
+        let source: Arc<str> = Arc::from(source);
+        let err = ParsedManifest::parse_named("<test>", Arc::clone(&source)).unwrap_err();
+        assert!(matches!(
+            err.kind,
+            crate::Error::BindingTargetSelfSlot { .. }
+        ));
+
+        let labels: Vec<_> = err.labels().expect("labels").collect();
+        let has_self_target = labels
+            .iter()
+            .any(|label| labeled_span_text(source.as_ref(), label).contains("\"self.api\""));
+        assert!(has_self_target);
     }
 }

@@ -18,7 +18,7 @@ use crate::{
             GENERATED_ENV_SAMPLE_FILENAME, GENERATED_README_FILENAME, build_execution_guide,
         },
     },
-    storage_plan::{StoragePlan, build_storage_plan},
+    storage_plan::{StorageIdentity, StoragePlan, build_storage_plan},
     targets::{
         common::{TargetError as MeshError, component_label},
         mesh::{
@@ -472,14 +472,19 @@ fn direct_storage_mounts(
     for mount in mounts.into_iter().flatten() {
         out.push(DirectStorageMount {
             mount_path: mount.mount_path.clone(),
-            state_subdir: format!(
-                "{}/{}",
-                direct_storage_component_slug(mount.identity.owner_moniker.as_str()),
-                sanitize_storage_segment(mount.identity.resource.as_str())
-            ),
+            state_subdir: direct_storage_state_subdir(&mount.identity),
         });
     }
     out
+}
+
+fn direct_storage_state_subdir(identity: &StorageIdentity) -> String {
+    format!(
+        "{}/{}-{}",
+        direct_storage_component_slug(identity.owner_moniker.as_str()),
+        sanitize_storage_segment(identity.resource.as_str()),
+        identity.hash_suffix()
+    )
 }
 
 fn direct_storage_component_slug(component_moniker: &str) -> String {
@@ -1068,6 +1073,7 @@ mod tests {
     use std::{collections::BTreeMap, path::Path};
 
     use super::*;
+    use crate::storage_plan::{StorageIdentity, StorageMount};
 
     #[test]
     fn resolve_helper_entrypoint_payload_rewrites_relative_program() {
@@ -1131,5 +1137,34 @@ mod tests {
             "{}",
             err
         );
+    }
+
+    #[test]
+    fn direct_storage_state_subdir_includes_identity_hash() {
+        let mounts = vec![
+            StorageMount {
+                identity: StorageIdentity {
+                    owner: ComponentId(0),
+                    owner_moniker: "/Db".to_string(),
+                    resource: "state".to_string(),
+                },
+                slot: "state".to_string(),
+                mount_path: "/var/lib/db".to_string(),
+            },
+            StorageMount {
+                identity: StorageIdentity {
+                    owner: ComponentId(1),
+                    owner_moniker: "/db".to_string(),
+                    resource: "state".to_string(),
+                },
+                slot: "state".to_string(),
+                mount_path: "/var/lib/db".to_string(),
+            },
+        ];
+
+        let mounts = direct_storage_mounts(Some(&mounts));
+        assert_ne!(mounts[0].state_subdir, mounts[1].state_subdir);
+        assert!(mounts[0].state_subdir.starts_with("db/state-"));
+        assert!(mounts[1].state_subdir.starts_with("db/state-"));
     }
 }

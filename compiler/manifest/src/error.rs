@@ -101,9 +101,16 @@ pub enum Error {
     #[diagnostic(code(manifest::unknown_binding_child))]
     UnknownBindingChild { child: String },
 
-    #[error("binding target `self.{slot}` references unknown slot")]
-    #[diagnostic(code(manifest::unknown_binding_target_slot))]
-    UnknownBindingTargetSlot { slot: String },
+    #[error("binding target `self.{slot}` is invalid: slots are inputs supplied by the parent")]
+    #[diagnostic(
+        code(manifest::binding_target_self),
+        help(
+            "Bind child slots with `to: \"#<child>.<slot>\"`. If the current component needs an \
+             internally bound capability, move that program into an explicit child and bind the \
+             child slot instead."
+        )
+    )]
+    BindingTargetSelfSlot { slot: String },
 
     #[error("binding source `self.{capability}` references unknown slot or provide")]
     #[diagnostic(code(manifest::unknown_binding_source))]

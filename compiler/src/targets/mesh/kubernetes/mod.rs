@@ -1957,14 +1957,18 @@ fn storage_request_for(
 }
 
 fn storage_claim_name(identity: &crate::storage_plan::StorageIdentity) -> String {
-    truncate_dns_name(
-        &format!(
-            "storage-{}-{}",
-            sanitize_dns_name(identity.owner_moniker.as_str()),
-            sanitize_dns_name(identity.resource.as_str())
-        ),
-        63,
-    )
+    let prefix = format!(
+        "storage-{}-{}",
+        sanitize_dns_name(identity.owner_moniker.as_str()),
+        sanitize_dns_name(identity.resource.as_str())
+    );
+    truncate_dns_name_with_hash(&prefix, &identity.hash_suffix(), 63)
+}
+
+fn truncate_dns_name_with_hash(prefix: &str, hash: &str, max_len: usize) -> String {
+    let max_prefix_len = max_len.saturating_sub(hash.len() + 1);
+    let prefix = truncate_dns_name(prefix, max_prefix_len);
+    format!("{prefix}-{hash}")
 }
 
 fn sanitize_port_name(s: &str) -> String {
