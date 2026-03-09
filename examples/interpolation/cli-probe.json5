@@ -1,0 +1,65 @@
+{
+  manifest_version: "0.3.0",
+
+  config_schema: {
+    type: "object",
+    properties: {
+      name: { type: "string" },
+    },
+    required: ["name"],
+    additionalProperties: false,
+  },
+
+  slots: {
+    upstream: { kind: "http", optional: true, multiple: true },
+  },
+
+  program: {
+    image: "busybox:1.36",
+    entrypoint: [
+      "sh",
+      "-ceu",
+      "mkdir -p /www; upstreams_csv=$(printenv AMBER_UPSTREAMS_CSV 2>/dev/null || printf unset); printf 'name=%s\\nargv=%s\\nupstreams_csv=%s\\n' \"$AMBER_NAME\" \"$*\" \"$upstreams_csv\" >/www/index.html; exec httpd -f -p 8080 -h /www",
+      "--",
+      "--name",
+      "${config.name}",
+      {
+        when: "slots.upstream",
+        argv: "--has-upstreams",
+      },
+      {
+        each: "slots.upstream",
+        argv: ["--upstream", "${item.url}"],
+      },
+      {
+        when: "slots.upstream",
+        argv: "--targets",
+      },
+      {
+        each: "slots.upstream",
+        arg: "${item.url}",
+      },
+    ],
+    env: {
+      AMBER_NAME: "${config.name}",
+      AMBER_UPSTREAMS_CSV: {
+        each: "slots.upstream",
+        value: "${item.url}",
+        join: ",",
+      },
+    },
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" },
+      ],
+    },
+  },
+
+  provides: {
+    http: { kind: "http", endpoint: "http" },
+  },
+
+  exports: {
+    http: "http",
+  },
+}

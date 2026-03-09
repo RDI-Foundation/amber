@@ -3,14 +3,12 @@ use std::{
     sync::Arc,
 };
 
-use amber_manifest::{
-    BindingSource, BindingTarget, InterpolationSource, Manifest, SlotTarget, parse_slot_query,
-};
+use amber_manifest::{BindingSource, BindingTarget, Manifest};
 use amber_scenario::{BindingEdge, BindingFrom, Component, ComponentId, Scenario, SlotRef};
 use miette::Diagnostic;
 use thiserror::Error;
 
-use crate::{DigestStore, Provenance, binding_usage, manifest_table};
+use crate::{DigestStore, Provenance, manifest_table};
 
 #[derive(Debug, Error, Diagnostic)]
 #[non_exhaustive]
@@ -37,7 +35,6 @@ pub(crate) fn optimize_linked_scenario(
         mir.flatten_pure_routing();
         mir.prune_dead_code();
     }
-    mir.verify_binding_interpolations()?;
     Ok(mir.into_parts())
 }
 
@@ -58,107 +55,30 @@ pub(crate) fn dce_only(scenario: Scenario) -> Scenario {
     dce_with_semantics(scenario)
 }
 
-pub(crate) fn verify_binding_interpolations(scenario: &Scenario) -> Result<(), Error> {
-    let usage = binding_usage::collect_binding_usage(scenario);
-    let declared_bindings = declared_bindings_by_scope(scenario);
-    let targets = binding_targets_by_name(scenario);
-    let incoming_slots = incoming_slot_set(scenario);
-    let mut failures = Vec::new();
-
-    for (&scope, names) in usage.iter() {
-        let scope_label = scenario
-            .components
-            .get(scope.0)
-            .and_then(|component| component.as_ref())
-            .map(|component| component.moniker.as_str().to_string())
-            .unwrap_or_else(|| format!("#{}", scope.0));
-
-        for name in names {
-            let declaration_missing = declared_bindings
-                .get(&scope)
-                .is_none_or(|declared_names| !declared_names.contains(name));
-            if declaration_missing {
-                failures.push(format!(
-                    "{scope_label}: bindings.{name}.url has no binding declaration in this scope"
-                ));
-                continue;
-            }
-
-            let key = (scope, name.clone());
-            let Some(bound_targets) = targets.get(&key) else {
-                failures.push(format!(
-                    "{scope_label}: bindings.{name}.url has no binding declaration"
-                ));
-                continue;
-            };
-
-            let reachable = bound_targets
-                .iter()
-                .any(|slot| incoming_slots.contains(&(slot.component, slot.name.clone())));
-            if reachable {
-                continue;
-            }
-
-            let target = &bound_targets[0];
-            let target_component = scenario
-                .components
-                .get(target.component.0)
-                .and_then(|component| component.as_ref())
-                .map(|component| component.moniker.as_str().to_string())
-                .unwrap_or_else(|| format!("#{}", target.component.0));
-            failures.push(format!(
-                "{scope_label}: bindings.{name}.url resolves to {target_component}.{}, but no \
-                 binding edge reaches that slot",
-                target.name
-            ));
-        }
-    }
-
-    if failures.is_empty() {
-        return Ok(());
-    }
-
-    Err(Error::Failed {
-        pass: "binding_invariant",
-        message: format!(
-            "unresolvable bindings interpolation paths after MIR pipeline: {}",
-            failures.join("; ")
-        ),
-    })
-}
-
-struct MirScenario<'a> {
+struct MirScenario {
     scenario: Scenario,
     provenance: Provenance,
-    store: &'a DigestStore,
     graph: BindingGraph,
 }
 
-impl<'a> MirScenario<'a> {
+impl MirScenario {
     fn lower(
         scenario: Scenario,
         provenance: Provenance,
-        store: &'a DigestStore,
+        store: &DigestStore,
     ) -> Result<Self, Error> {
         scenario.assert_invariants();
         let graph = BindingGraph::build(&scenario, store, "mir_lower")?;
         Ok(Self {
             scenario,
             provenance,
-            store,
             graph,
         })
     }
 
-    fn rebuild_graph(&mut self, pass: &'static str) -> Result<(), Error> {
-        self.graph = BindingGraph::build(&self.scenario, self.store, pass)?;
-        Ok(())
-    }
-
     fn canonicalize_bindings(&mut self) {
         let scenario = take_scenario(&mut self.scenario);
-        let scenario = rewrite_bindings(scenario, &self.graph.forward_map);
-        self.scenario = rewrite_binding_decls(scenario, &self.graph.forward_map);
+        self.scenario = rewrite_bindings(scenario, &self.graph.forward_map);
         self.scenario.assert_invariants();
     }
 
@@ -172,12 +92,6 @@ impl<'a> MirScenario<'a> {
         self.scenario = dce_with_semantics(take_scenario(&mut self.scenario));
         self.scenario.assert_invariants();
     }
-
-    fn verify_binding_interpolations(&mut self) -> Result<(), Error> {
-        self.rebuild_graph("mir_verify")?;
-        verify_binding_interpolations(&self.scenario)
-    }
-
     fn into_parts(self) -> (Scenario, Provenance) {
         (self.scenario, self.provenance)
     }
@@ -273,7 +187,9 @@ fn build_forward_map(
         };
         let child_by_name = &child_index[id.0];
 
-        for (target, binding) in manifest.bindings() {
+        for binding_decl in manifest.bindings() {
+            let target = &binding_decl.target;
+            let binding = &binding_decl.binding;
             let BindingTarget::ChildSlot { child, slot } = target else {
                 continue;
             };
@@ -347,111 +263,44 @@ fn rewrite_bindings(
     mut scenario: Scenario,
     forward_map: &HashMap<(ComponentId, String), Vec<ForwardEdge>>,
 ) -> Scenario {
-    let mut rewritten: Vec<BindingEdge> = Vec::new();
+    let mut merged_indices: HashMap<(BindingFrom, SlotRef), usize> = HashMap::new();
+    let mut bindings: Vec<BindingEdge> = Vec::new();
 
     for binding in &scenario.bindings {
+        if scenario.component(binding.to.component).program.is_some() {
+            merged_indices
+                .entry((binding.from.clone(), binding.to.clone()))
+                .or_insert(bindings.len());
+            bindings.push(binding.clone());
+        }
+    }
+
+    for binding in &scenario.bindings {
+        if scenario.component(binding.to.component).program.is_some() {
+            continue;
+        }
         let mut stack = HashSet::new();
         let targets = resolve_forward_targets(&scenario, forward_map, &binding.to, &mut stack);
 
-        let keep_name = targets.len() == 1;
         for target in targets {
             let mut edge = binding.clone();
             edge.to = target.target;
             edge.weak = edge.weak || target.weak;
-            if !keep_name {
-                edge.name = None;
+            let key = (edge.from.clone(), edge.to.clone());
+            if let Some(&idx) = merged_indices.get(&key) {
+                let existing = &mut bindings[idx];
+                // Multiple rewrite paths can produce the same concrete edge. If any path is
+                // strong, the canonical edge must stay strong.
+                existing.weak &= edge.weak;
+                continue;
             }
-            rewritten.push(edge);
+            merged_indices.insert(key, bindings.len());
+            bindings.push(edge);
         }
     }
 
-    let mut merged: HashMap<(BindingFrom, SlotRef, Option<String>), BindingEdge> = HashMap::new();
-    for binding in rewritten {
-        let key = (
-            binding.from.clone(),
-            binding.to.clone(),
-            binding.name.clone(),
-        );
-        if let Some(existing) = merged.get_mut(&key) {
-            // Multiple rewrite paths can produce the same edge. If any path is strong,
-            // the merged edge must stay strong.
-            existing.weak &= binding.weak;
-            continue;
-        }
-        merged.insert(key, binding);
-    }
-
-    let mut bindings: Vec<BindingEdge> = merged.into_values().collect();
-    bindings.sort_by(|a, b| binding_sort_key(a).cmp(&binding_sort_key(b)));
     scenario.bindings = bindings;
     scenario.normalize_order();
-    scenario
-}
-
-fn binding_sort_key(binding: &BindingEdge) -> (u8, usize, &str, usize, &str, bool, bool, &str) {
-    let (from_kind, from_component, from_name) = match &binding.from {
-        BindingFrom::Component(provide) => (0, provide.component.0, provide.name.as_str()),
-        BindingFrom::Resource(resource) => (1, resource.component.0, resource.name.as_str()),
-        BindingFrom::External(slot) => (2, slot.component.0, slot.name.as_str()),
-        BindingFrom::Framework(name) => (3, 0, name.as_str()),
-    };
-    let (name_present, name) = match binding.name.as_deref() {
-        Some(name) => (true, name),
-        None => (false, ""),
-    };
-    (
-        from_kind,
-        from_component,
-        from_name,
-        binding.to.component.0,
-        binding.to.name.as_str(),
-        binding.weak,
-        name_present,
-        name,
-    )
-}
-
-fn rewrite_binding_decls(
-    mut scenario: Scenario,
-    forward_map: &HashMap<(ComponentId, String), Vec<ForwardEdge>>,
-) -> Scenario {
-    let mut updates: Vec<Option<BTreeMap<String, SlotRef>>> =
-        Vec::with_capacity(scenario.components.len());
-
-    for component in &scenario.components {
-        let Some(component) = component.as_ref() else {
-            updates.push(None);
-            continue;
-        };
-        if component.binding_decls.is_empty() {
-            updates.push(None);
-            continue;
-        }
-        let mut updated = BTreeMap::new();
-        for (name, slot_ref) in &component.binding_decls {
-            let mut stack = HashSet::new();
-            let mut targets = resolve_forward_targets(&scenario, forward_map, slot_ref, &mut stack);
-            targets.sort_by(|a, b| {
-                (a.target.component, &a.target.name).cmp(&(b.target.component, &b.target.name))
-            });
-            let chosen = targets
-                .first()
-                .map(|t| t.target.clone())
-                .unwrap_or_else(|| slot_ref.clone());
-            updated.insert(name.clone(), chosen);
-        }
-        updates.push(Some(updated));
-    }
-
-    for (component, update) in scenario.components.iter_mut().zip(updates) {
-        let Some(component) = component.as_mut() else {
-            continue;
-        };
-        if let Some(updated) = update {
-            component.binding_decls = updated;
-        }
-    }
-
     scenario
 }
 
@@ -487,7 +336,9 @@ fn is_pure_routing(
         }
     }
 
-    for (target, binding) in manifest.bindings() {
+    for binding_decl in manifest.bindings() {
+        let target = &binding_decl.target;
+        let binding = &binding_decl.binding;
         match (target, &binding.from) {
             (BindingTarget::ChildSlot { .. }, BindingSource::SelfSlot(_)) => {}
             _ => return false,
@@ -499,11 +350,6 @@ fn is_pure_routing(
 
 fn flatten_pure_routing_with_graph(scenario: Scenario, graph: &BindingGraph) -> Scenario {
     let n = scenario.components.len();
-    let binding_usage = binding_usage::collect_binding_usage(&scenario);
-    let scopes_with_binding_usage: HashSet<ComponentId> = binding_usage
-        .iter()
-        .filter_map(|(scope, names)| (!names.is_empty()).then_some(*scope))
-        .collect();
 
     let mut referenced_by_binding = vec![false; n];
     for b in &scenario.bindings {
@@ -531,9 +377,6 @@ fn flatten_pure_routing_with_graph(scenario: Scenario, graph: &BindingGraph) -> 
             .as_ref()
             .expect("manifest should exist");
         if referenced_by_binding[idx] {
-            continue;
-        }
-        if scopes_with_binding_usage.contains(&id) {
             continue;
         }
         if is_pure_routing(component, manifest, &graph.forward_map) {
@@ -686,8 +529,6 @@ struct DceResults {
 struct DceSolver<'a> {
     scenario: &'a Scenario,
     incoming: Vec<Vec<usize>>,
-    usage: binding_usage::BindingUsage,
-    targets_by_name: HashMap<(ComponentId, String), Vec<SlotRef>>,
     keep_components: Vec<bool>,
     live_programs: Vec<bool>,
     live_slots: HashSet<CapKey>,
@@ -715,8 +556,6 @@ impl<'a> DceSolver<'a> {
         Self {
             scenario,
             incoming,
-            usage: binding_usage::collect_binding_usage(scenario),
-            targets_by_name: binding_targets_by_name(scenario),
             keep_components: vec![false; n],
             live_programs: vec![false; n],
             live_slots: HashSet::new(),
@@ -755,8 +594,6 @@ impl<'a> DceSolver<'a> {
         let component_id = ComponentId(component);
         self.mark_program_used_slots(component_id);
         self.mark_program_used_resources(component_id);
-        self.mark_binding_targets(component_id, binding_usage::BindingUseSource::Program);
-        self.mark_binding_targets(component_id, binding_usage::BindingUseSource::Config);
     }
 
     fn apply_slot(&mut self, key: CapKey) {
@@ -840,7 +677,6 @@ impl<'a> DceSolver<'a> {
             self.work.push_back(DceWorkItem::Provide(key));
         }
     }
-
     fn mark_resource(&mut self, component: usize, resource: &str) {
         let key = CapKey {
             component,
@@ -850,29 +686,6 @@ impl<'a> DceSolver<'a> {
             self.work.push_back(DceWorkItem::Resource(key));
         }
     }
-
-    fn mark_binding_targets(
-        &mut self,
-        component: ComponentId,
-        source: binding_usage::BindingUseSource,
-    ) {
-        let uses: Vec<(ComponentId, String)> = self
-            .usage
-            .for_component_with_source(component, source)
-            .map(|binding_use| (binding_use.scope, binding_use.name.clone()))
-            .collect();
-
-        for (scope, name) in uses {
-            let key = (scope, name);
-            let Some(target_slots) = self.targets_by_name.get(&key).cloned() else {
-                continue;
-            };
-            for target in target_slots {
-                self.mark_slot(target.component.0, &target.name);
-            }
-        }
-    }
-
     fn mark_program_used_slots(&mut self, component: ComponentId) {
         for slot in collect_program_used_slots(self.scenario.component(component)) {
             self.mark_slot(component.0, &slot);
@@ -927,83 +740,26 @@ fn is_live_capability(live: &HashSet<CapKey>, component: usize, name: &str) -> b
     })
 }
 
-fn collect_slot_condition_use(query: &str, mut mark_slot: impl FnMut(&str)) -> bool {
-    match parse_slot_query(query) {
-        Ok(parsed) => match parsed.target {
-            SlotTarget::All => true,
-            SlotTarget::Slot(slot) => {
-                mark_slot(slot);
-                false
-            }
-        },
-        Err(_) => query.is_empty(),
-    }
-}
-
 fn collect_program_used_slots(component: &amber_scenario::Component) -> Vec<String> {
     let Some(program) = component.program.as_ref() else {
         return Vec::new();
     };
 
     let mut used = BTreeSet::new();
-    let mark_slot = |slot: &str, used: &mut BTreeSet<String>| {
+    let mut mark_slot = |slot: &str| {
         used.insert(slot.to_string());
     };
     let all_slots = || component.slots.keys().cloned().collect();
 
-    if let Some(executable) = program.path_ref().or_else(|| program.image_ref())
-        && let Ok(parsed) = executable.parse::<amber_manifest::InterpolatedString>()
-        && parsed.visit_slot_uses(|slot| mark_slot(slot, &mut used))
-    {
+    if program.visit_slot_uses(&mut mark_slot) {
         return all_slots();
-    }
-
-    for group in program.command().groups() {
-        if group.when.source() == InterpolationSource::Slots
-            && collect_slot_condition_use(group.when.query(), |slot| mark_slot(slot, &mut used))
-        {
-            return all_slots();
-        }
-    }
-
-    for item in &program.command().0 {
-        match item {
-            amber_manifest::ProgramArgItem::Arg(arg) => {
-                if arg.visit_slot_uses(|slot| mark_slot(slot, &mut used)) {
-                    return all_slots();
-                }
-            }
-            amber_manifest::ProgramArgItem::Group(group) => {
-                for arg in &group.argv.0 {
-                    if arg.visit_slot_uses(|slot| mark_slot(slot, &mut used)) {
-                        return all_slots();
-                    }
-                }
-            }
-        }
-    }
-
-    for value in program.env().values() {
-        if let Some(when) = value.when()
-            && when.source() == InterpolationSource::Slots
-            && collect_slot_condition_use(when.query(), |slot| mark_slot(slot, &mut used))
-        {
-            return all_slots();
-        }
-        if value
-            .value()
-            .visit_slot_uses(|slot| mark_slot(slot, &mut used))
-        {
-            return all_slots();
-        }
     }
 
     for mount in program.mounts() {
         if let amber_manifest::MountSource::Slot(slot) = &mount.source {
-            mark_slot(slot, &mut used);
+            mark_slot(slot);
         }
     }
-
     used.into_iter().collect()
 }
 
@@ -1063,58 +819,79 @@ fn compute_keep_set(
     keep
 }
 
-fn declared_bindings_by_scope(scenario: &Scenario) -> HashMap<ComponentId, BTreeSet<String>> {
-    let mut out: HashMap<ComponentId, BTreeSet<String>> = HashMap::new();
-    for (id, component) in scenario.components_iter() {
-        for name in component.binding_decls.keys() {
-            out.entry(id).or_default().insert(name.clone());
+#[cfg(test)]
+mod tests {
+    use amber_scenario::{Moniker, ProvideRef};
+
+    use super::*;
+
+    fn component(id: usize, moniker: &str) -> Component {
+        Component {
+            id: ComponentId(id),
+            parent: None,
+            moniker: Moniker::from(Arc::from(moniker)),
+            digest: amber_manifest::ManifestDigest::new([id as u8; 32]),
+            config: None,
+            config_schema: None,
+            program: None,
+            slots: BTreeMap::new(),
+            provides: BTreeMap::new(),
+            resources: BTreeMap::new(),
+            metadata: None,
+            children: Vec::new(),
         }
     }
-    for binding in &scenario.bindings {
-        let Some(name) = binding.name.as_ref() else {
-            continue;
+
+    #[test]
+    fn rewrite_bindings_preserves_duplicate_authored_edges() {
+        let consumer_program = serde_json::from_value(serde_json::json!({
+            "image": "consumer",
+            "entrypoint": ["consumer"],
+        }))
+        .expect("program");
+        let mut scenario = Scenario {
+            root: ComponentId(0),
+            components: vec![
+                Some(component(0, "/")),
+                Some(Component {
+                    program: Some(consumer_program),
+                    ..component(1, "/consumer")
+                }),
+                Some(component(2, "/provider")),
+            ],
+            bindings: vec![
+                BindingEdge {
+                    from: BindingFrom::Component(ProvideRef {
+                        component: ComponentId(2),
+                        name: "api".to_string(),
+                    }),
+                    to: SlotRef {
+                        component: ComponentId(1),
+                        name: "upstream".to_string(),
+                    },
+                    weak: false,
+                },
+                BindingEdge {
+                    from: BindingFrom::Component(ProvideRef {
+                        component: ComponentId(2),
+                        name: "api".to_string(),
+                    }),
+                    to: SlotRef {
+                        component: ComponentId(1),
+                        name: "upstream".to_string(),
+                    },
+                    weak: false,
+                },
+            ],
+            exports: Vec::new(),
         };
-        out.entry(binding.to.component)
-            .or_default()
-            .insert(name.clone());
-    }
-    out
-}
+        scenario.normalize_order();
 
-fn binding_targets_by_name(scenario: &Scenario) -> HashMap<(ComponentId, String), Vec<SlotRef>> {
-    let mut out: HashMap<(ComponentId, String), Vec<SlotRef>> = HashMap::new();
-
-    for (id, component) in scenario.components_iter() {
-        for (name, slot_ref) in &component.binding_decls {
-            let values = out.entry((id, name.clone())).or_default();
-            if !values.contains(slot_ref) {
-                values.push(slot_ref.clone());
-            }
-        }
+        let rewritten = rewrite_bindings(scenario, &HashMap::new());
+        assert_eq!(rewritten.bindings.len(), 2);
+        assert_eq!(rewritten.bindings[0].to.name, "upstream");
+        assert_eq!(rewritten.bindings[1].to.name, "upstream");
     }
-    for binding in &scenario.bindings {
-        let Some(name) = binding.name.as_ref() else {
-            continue;
-        };
-        let values = out.entry((binding.to.component, name.clone())).or_default();
-        if !values.contains(&binding.to) {
-            values.push(binding.to.clone());
-        }
-    }
-
-    for values in out.values_mut() {
-        values.sort_by(|a, b| (a.component, a.name.as_str()).cmp(&(b.component, b.name.as_str())));
-    }
-
-    out
-}
-
-fn incoming_slot_set(scenario: &Scenario) -> HashSet<(ComponentId, String)> {
-    let mut out = HashSet::with_capacity(scenario.bindings.len());
-    for binding in &scenario.bindings {
-        out.insert((binding.to.component, binding.to.name.clone()));
-    }
-    out
 }
 
 #[cfg(test)]

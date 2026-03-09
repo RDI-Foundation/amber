@@ -1,0 +1,12 @@
+compiler::invalid_slots_interpolation
+
+  x invalid slots interpolation in / (program.args[0]): `item` interpolation is only valid inside repeated `each` expansions
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/item_interpolation_outside_repeated.json5:6:7]
+ 5 |     args: [
+ 6 |       "${item.url}",
+   :       ^^^^^^|^^^^^^
+   :             `-- item interpolation here
+ 7 |     ],
+   `----
+  help: Move this interpolation inside a repeated `each` block and use `${item}` or `${item.url}` there.
+Error:   × check failed

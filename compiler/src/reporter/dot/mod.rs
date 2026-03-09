@@ -132,11 +132,6 @@ fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
                 write_escaped_label(&mut out, &format!("slots.{}", slot.name));
             }
         }
-        if let Some(name) = b.name.as_ref() {
-            let _ = write!(out, " (");
-            write_escaped_label(&mut out, name);
-            let _ = write!(out, ")");
-        }
         if b.weak {
             let _ = writeln!(out, "\", style=dashed, constraint=false];");
         } else {

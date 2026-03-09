@@ -5,11 +5,24 @@ use serde_json::{Map, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
+#[serde(deny_unknown_fields)]
 pub enum TemplatePart {
-    Lit { lit: String },
-    Config { config: String },
-    Slot { slot: String, scope: u64 },
-    Binding { binding: String, scope: u64 },
+    Lit {
+        lit: String,
+    },
+    Config {
+        config: String,
+    },
+    Slot {
+        slot: String,
+        scope: u64,
+    },
+    Item {
+        item: String,
+        scope: u64,
+        slot: String,
+        index: usize,
+    },
 }
 
 impl TemplatePart {
@@ -30,10 +43,17 @@ impl TemplatePart {
         }
     }
 
-    pub fn binding(scope: u64, value: impl Into<String>) -> Self {
-        Self::Binding {
-            binding: value.into(),
+    pub fn item(
+        scope: u64,
+        slot: impl Into<String>,
+        index: usize,
+        value: impl Into<String>,
+    ) -> Self {
+        Self::Item {
+            item: value.into(),
             scope,
+            slot: slot.into(),
+            index,
         }
     }
 
@@ -42,7 +62,7 @@ impl TemplatePart {
             Self::Lit { lit } => Some(lit.as_str()),
             Self::Config { .. } => None,
             Self::Slot { .. } => None,
-            Self::Binding { .. } => None,
+            Self::Item { .. } => None,
         }
     }
 
@@ -54,8 +74,8 @@ impl TemplatePart {
         matches!(self, Self::Slot { .. })
     }
 
-    pub fn is_binding(&self) -> bool {
-        matches!(self, Self::Binding { .. })
+    pub fn is_item(&self) -> bool {
+        matches!(self, Self::Item { .. })
     }
 }
 
@@ -89,12 +109,18 @@ pub enum ProgramEnvTemplate {
     Group(ConditionalProgramEnvTemplate),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSlotObject {
+    pub url: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeTemplateContext {
     #[serde(default)]
     pub slots_by_scope: BTreeMap<u64, BTreeMap<String, String>>,
     #[serde(default)]
-    pub bindings_by_scope: BTreeMap<u64, BTreeMap<String, String>>,
+    pub slot_items_by_scope: BTreeMap<u64, BTreeMap<String, Vec<RuntimeSlotObject>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

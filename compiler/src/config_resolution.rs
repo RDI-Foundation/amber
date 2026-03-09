@@ -118,11 +118,6 @@ pub(crate) fn render_static_config_string(
                 InterpolationSource::Slots => {
                     return Err("slot interpolation is not allowed in resource params".to_string());
                 }
-                InterpolationSource::Bindings => {
-                    return Err(
-                        "binding interpolation is not allowed in resource params".to_string()
-                    );
-                }
                 other => {
                     return Err(format!(
                         "unsupported interpolation source {other} in resource params"

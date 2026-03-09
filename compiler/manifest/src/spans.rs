@@ -106,8 +106,6 @@ pub struct ExportSpans {
 #[derive(Clone, Debug)]
 pub struct BindingSpans {
     pub whole: SourceSpan,
-    pub name: Option<SourceSpan>,
-    pub name_value: Option<Arc<str>>,
     pub to: Option<SourceSpan>,
     pub to_value: Option<Arc<str>>,
     pub from: Option<SourceSpan>,
@@ -123,8 +121,6 @@ impl Default for BindingSpans {
     fn default() -> Self {
         Self {
             whole: (0usize, 0usize).into(),
-            name: None,
-            name_value: None,
             to: None,
             to_value: None,
             from: None,
@@ -494,9 +490,6 @@ fn collect_bindings(root: &SpanCursor<'_>, root_obj: &Map<String, Value>, out: &
 
         spans.to = span_for("to");
         spans.to_value = get_string("to");
-
-        spans.name = span_for("name");
-        spans.name_value = get_string("name");
 
         spans.from = span_for("from");
         spans.from_value = get_string("from");

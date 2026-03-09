@@ -1,0 +1,12 @@
+compiler::invalid_slots_interpolation
+
+  x invalid slots interpolation in / (program.args[0]): `${slots}` cannot be used when the component declares repeated slots
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_interpolation_whole_slots_repeated.json5:6:7]
+ 5 |     args: [
+ 6 |       "${slots}",
+   :       ^^^^^|^^^^
+   :            `-- slot interpolation here
+ 7 |     ],
+   `----
+  help: Use `${slots.<slot>}` / `${slots.<slot>.url}` for singular slots, and `each: "slots.<slot>"` with `${item}` or `${item.url}` for repeated slots.
+Error:   × check failed

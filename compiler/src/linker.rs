@@ -10,8 +10,7 @@ use amber_config as rc;
 use amber_manifest::{
     BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, CapabilityKind, ChildName,
     ExportName, ExportTarget, InterpolatedPart, InterpolatedString, InterpolationSource, Manifest,
-    ManifestDigest, MountSource, SlotTarget, framework_capability, parse_slot_query,
-    span_for_json_pointer,
+    ManifestDigest, MountSource, framework_capability, span_for_json_pointer,
 };
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, ProvideRef,
@@ -59,32 +58,6 @@ impl LinkIndex {
     fn child_id(&self, child: &ChildName) -> ComponentId {
         *self.child_by_name.get(child).expect("child should exist")
     }
-}
-
-fn collect_binding_decls(
-    id: ComponentId,
-    manifest: &Manifest,
-    link_index: &LinkIndex,
-) -> BTreeMap<String, SlotRef> {
-    let mut out = BTreeMap::new();
-    for (target, binding) in manifest.bindings() {
-        let Some(name) = binding.name.as_ref() else {
-            continue;
-        };
-        let (target_component, slot_name) = match target {
-            BindingTarget::SelfSlot(slot) => (id, slot.as_str()),
-            BindingTarget::ChildSlot { child, slot } => (link_index.child_id(child), slot.as_str()),
-            _ => continue,
-        };
-        out.insert(
-            name.to_string(),
-            SlotRef {
-                component: target_component,
-                name: slot_name.to_string(),
-            },
-        );
-    }
-    out
 }
 
 fn component(components: &[Option<Component>], id: ComponentId) -> &Component {
@@ -147,6 +120,22 @@ fn binding_site_with(
     Some((src, span))
 }
 
+fn binding_site_with_index(
+    provenance: &Provenance,
+    store: &DigestStore,
+    realm: ComponentId,
+    binding_index: usize,
+    select: impl FnOnce(&amber_manifest::BindingSpans) -> SourceSpan,
+) -> Option<(NamedSource<Arc<str>>, SourceSpan)> {
+    let (src, spans) = source_for_component(provenance, store, realm)?;
+    let span = spans
+        .bindings_by_index
+        .get(binding_index)
+        .map(select)
+        .unwrap_or((0usize, 0usize).into());
+    Some((src, span))
+}
+
 fn binding_target_site(
     provenance: &Provenance,
     store: &DigestStore,
@@ -176,6 +165,15 @@ fn binding_site(
     target_key: &BindingTargetKey,
 ) -> Option<(NamedSource<Arc<str>>, SourceSpan)> {
     binding_site_with(provenance, store, realm, target_key, |b| b.whole)
+}
+
+fn binding_site_index(
+    provenance: &Provenance,
+    store: &DigestStore,
+    realm: ComponentId,
+    binding_index: usize,
+) -> Option<(NamedSource<Arc<str>>, SourceSpan)> {
+    binding_site_with_index(provenance, store, realm, binding_index, |b| b.whole)
 }
 
 struct ConfigSite {
@@ -611,6 +609,49 @@ pub enum Error {
     },
 
     #[error(
+        "slot range mismatch for `{to_component_path}.{slot}`: target accepts {target_range}, \
+         source may provide {source_range}"
+    )]
+    #[diagnostic(
+        code(linker::slot_range_mismatch),
+        help(
+            "The target slot range must cover the source slot range. Adjust `optional`/`multiple` \
+             on the source or target slot so the forwarded fan-in is always valid."
+        )
+    )]
+    SlotRangeMismatch {
+        to_component_path: String,
+        slot: String,
+        target_range: String,
+        source_range: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label(
+            primary,
+            "binding forwards {source_range} into slot accepting {target_range}"
+        )]
+        span: SourceSpan,
+        #[related]
+        related: Vec<RelatedSpan>,
+    },
+
+    #[error("slot `{slot}` on {component_path} is bound more than once")]
+    #[diagnostic(
+        code(linker::duplicate_binding_target),
+        help("Declare the slot with `multiple: true` or remove the duplicate binding.")
+    )]
+    DuplicateBindingTarget {
+        component_path: String,
+        slot: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label(primary, "duplicate binding here")]
+        span: SourceSpan,
+        #[related]
+        related: Vec<RelatedSpan>,
+    },
+
+    #[error(
         "storage mount `slots.{slot}` on {component_path} must resolve from a storage resource"
     )]
     #[diagnostic(
@@ -777,7 +818,7 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
             }
         })?;
 
-    for (id, (c, m)) in components.iter_mut().zip(&manifests).enumerate() {
+    for (c, m) in components.iter_mut().zip(&manifests) {
         let (Some(c), Some(m)) = (c.as_mut(), m.as_ref()) else {
             continue;
         };
@@ -794,7 +835,6 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
             .collect();
         c.resources.clear();
         c.config_schema = m.config_schema().map(|schema| schema.0.clone());
-        c.binding_decls = collect_binding_decls(ComponentId(id), m, &link_index[id]);
         c.metadata = m.metadata().cloned();
     }
 
@@ -892,67 +932,86 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
             ResolvedExportSource::Slot(slot) => {
                 let resolved = resolver.resolve_slot(&slot, &mut errors);
                 match resolved {
-                    Some(resolved) => match resolved.from {
-                        BindingFrom::Component(provide) => Some(provide),
-                        BindingFrom::Resource(resource) => {
-                            let (src, span) = export_site(&provenance, store, root, export_name);
-                            errors.push(Error::InvalidExport {
-                                component_path: describe_component_path(&component_path_for(
-                                    &components,
-                                    root,
-                                )),
-                                name: export_name.to_string(),
-                                message: format!(
-                                    "target resolves to resource `resources.{}`, which cannot be \
-                                     exported",
-                                    resource.name
-                                ),
-                                help: "Export a component provide or child export instead."
-                                    .to_string(),
-                                src,
-                                span,
-                            });
-                            None
+                    Some(resolved) => {
+                        let (src, span) = export_site(&provenance, store, root, export_name);
+                        match resolved.as_slice() {
+                            [resolved] => match &resolved.from {
+                                BindingFrom::Component(provide) => Some(provide.clone()),
+                                BindingFrom::Resource(resource) => {
+                                    errors.push(Error::InvalidExport {
+                                        component_path: describe_component_path(
+                                            &component_path_for(&components, root),
+                                        ),
+                                        name: export_name.to_string(),
+                                        message: format!(
+                                            "target resolves to resource `resources.{}`, which \
+                                             cannot be exported",
+                                            resource.name
+                                        ),
+                                        help: "Export a component provide or child export instead."
+                                            .to_string(),
+                                        src,
+                                        span,
+                                    });
+                                    None
+                                }
+                                BindingFrom::Framework(name) => {
+                                    errors.push(Error::InvalidExport {
+                                        component_path: describe_component_path(
+                                            &component_path_for(&components, root),
+                                        ),
+                                        name: export_name.to_string(),
+                                        message: format!(
+                                            "target resolves to framework.{name}, which cannot be \
+                                             exported"
+                                        ),
+                                        help: "Export a component provide or child export instead."
+                                            .to_string(),
+                                        src,
+                                        span,
+                                    });
+                                    None
+                                }
+                                BindingFrom::External(slot) => {
+                                    errors.push(Error::InvalidExport {
+                                        component_path: describe_component_path(
+                                            &component_path_for(&components, root),
+                                        ),
+                                        name: export_name.to_string(),
+                                        message: format!(
+                                            "target resolves to external slot `{}`, which cannot \
+                                             be exported",
+                                            slot.name
+                                        ),
+                                        help: "Export a component provide or child export instead."
+                                            .to_string(),
+                                        src,
+                                        span,
+                                    });
+                                    None
+                                }
+                            },
+                            _ => {
+                                errors.push(Error::InvalidExport {
+                                    component_path: describe_component_path(&component_path_for(
+                                        &components,
+                                        root,
+                                    )),
+                                    name: export_name.to_string(),
+                                    message: format!(
+                                        "target resolves to multiple capabilities via slot `{}`",
+                                        slot.name
+                                    ),
+                                    help: "Export a single component provide or child export \
+                                           instead."
+                                        .to_string(),
+                                    src,
+                                    span,
+                                });
+                                None
+                            }
                         }
-                        BindingFrom::Framework(name) => {
-                            let (src, span) = export_site(&provenance, store, root, export_name);
-                            errors.push(Error::InvalidExport {
-                                component_path: describe_component_path(&component_path_for(
-                                    &components,
-                                    root,
-                                )),
-                                name: export_name.to_string(),
-                                message: format!(
-                                    "target resolves to framework.{name}, which cannot be exported"
-                                ),
-                                help: "Export a component provide or child export instead."
-                                    .to_string(),
-                                src,
-                                span,
-                            });
-                            None
-                        }
-                        BindingFrom::External(slot) => {
-                            let (src, span) = export_site(&provenance, store, root, export_name);
-                            errors.push(Error::InvalidExport {
-                                component_path: describe_component_path(&component_path_for(
-                                    &components,
-                                    root,
-                                )),
-                                name: export_name.to_string(),
-                                message: format!(
-                                    "target resolves to external slot `{}`, which cannot be \
-                                     exported",
-                                    slot.name
-                                ),
-                                help: "Export a component provide or child export instead."
-                                    .to_string(),
-                                src,
-                                span,
-                            });
-                            None
-                        }
-                    },
+                    }
                     None => {
                         let (src, span) = export_site(&provenance, store, root, export_name);
                         let related = slot_decl_related_span(
@@ -1015,7 +1074,6 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
                 name: slot.clone(),
             };
             binding_edges.push(BindingEdge {
-                name: None,
                 from: BindingFrom::External(slot_ref.clone()),
                 to: slot_ref,
                 weak: true,
@@ -1070,7 +1128,6 @@ fn flatten(
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     }));
@@ -1234,35 +1291,38 @@ fn validate_config_tree(
             "program.args"
         };
         for (arg_idx, item) in program.command().0.iter().enumerate() {
-            match item {
-                amber_manifest::ProgramArgItem::Arg(arg) => {
+            if let Some(when) = item.when()
+                && when.source() == InterpolationSource::Config
+            {
+                validate_config_ref(format!("{command_location}[{arg_idx}].when"), when.query());
+            }
+            item.visit_values(|arg| {
+                for part in &arg.parts {
+                    let InterpolatedPart::Interpolation { source, query } = part else {
+                        continue;
+                    };
+                    if *source == InterpolationSource::Config {
+                        validate_config_ref(format!("{command_location}[{arg_idx}]"), query);
+                    }
+                }
+            });
+            let repeated_argv = match item {
+                amber_manifest::ProgramArgItem::Group(group) => Some(&group.argv.0),
+                amber_manifest::ProgramArgItem::RepeatedArgv(repeated) => Some(&repeated.argv.0),
+                amber_manifest::ProgramArgItem::Arg(_)
+                | amber_manifest::ProgramArgItem::RepeatedArg(_) => None,
+            };
+            if let Some(group) = repeated_argv {
+                for (group_idx, arg) in group.iter().enumerate() {
                     for part in &arg.parts {
                         let InterpolatedPart::Interpolation { source, query } = part else {
                             continue;
                         };
-                        if *source == InterpolationSource::Config {
-                            validate_config_ref(format!("{command_location}[{arg_idx}]"), query);
-                        }
-                    }
-                }
-                amber_manifest::ProgramArgItem::Group(group) => {
-                    if group.when.source() == InterpolationSource::Config {
-                        validate_config_ref(
-                            format!("{command_location}[{arg_idx}].when"),
-                            group.when.query(),
-                        );
-                    }
-                    for (group_idx, arg) in group.argv.0.iter().enumerate() {
-                        for part in &arg.parts {
-                            let InterpolatedPart::Interpolation { source, query } = part else {
-                                continue;
-                            };
-                            if *source == InterpolationSource::Config {
-                                validate_config_ref(
-                                    format!("{command_location}[{arg_idx}].argv[{group_idx}]"),
-                                    query,
-                                );
-                            }
+                        if source == &InterpolationSource::Config {
+                            validate_config_ref(
+                                format!("{command_location}[{arg_idx}].argv[{group_idx}]"),
+                                query,
+                            );
                         }
                     }
                 }
@@ -1358,17 +1418,6 @@ fn validate_config_tree(
                                 "resources.{resource_name}.params.{param_name} uses \
                                  ${{slots...}}, but resource params only support literal strings \
                                  and ${{config...}}"
-                            ),
-                            Some("invalid interpolation here".to_string()),
-                            Vec::new(),
-                        )),
-                        InterpolationSource::Bindings => errors.push(invalid_config_error(
-                            component_path.clone(),
-                            &param_site,
-                            format!(
-                                "resources.{resource_name}.params.{param_name} uses \
-                                 ${{bindings...}}, but resource params only support literal \
-                                 strings and ${{config...}}"
                             ),
                             Some("invalid interpolation here".to_string()),
                             Vec::new(),
@@ -1867,7 +1916,6 @@ struct BindingOrigin {
 
 #[derive(Clone, Debug)]
 struct BindingSpec {
-    name: Option<String>,
     target: SlotRef,
     source: CapabilitySource,
     weak: bool,
@@ -1877,6 +1925,7 @@ struct BindingSpec {
 struct ResolvedBindingTarget {
     slot_ref: SlotRef,
     slot_decl: CapabilityDecl,
+    slot_range: SlotCardinality,
 }
 
 #[derive(Clone, Debug)]
@@ -1890,6 +1939,56 @@ enum CapabilitySource {
 struct ResolvedBindingSource {
     source: CapabilitySource,
     decl: CapabilityDecl,
+    range: SlotCardinality,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SlotCardinality {
+    min: usize,
+    max: Option<usize>,
+}
+
+impl SlotCardinality {
+    const EXACTLY_ONE: Self = Self {
+        min: 1,
+        max: Some(1),
+    };
+
+    fn from_slot_decl(slot: &amber_manifest::SlotDecl) -> Self {
+        let min = usize::from(!slot.optional);
+        let max = if slot.multiple { None } else { Some(1) };
+        Self { min, max }
+    }
+
+    fn accepts(self, source: Self) -> bool {
+        self.min <= source.min
+            && match (self.max, source.max) {
+                (None, _) => true,
+                (Some(_), None) => false,
+                (Some(target_max), Some(source_max)) => target_max >= source_max,
+            }
+    }
+
+    fn with_weak_binding(self) -> Self {
+        Self {
+            min: 0,
+            max: self.max,
+        }
+    }
+}
+
+impl std::fmt::Display for SlotCardinality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.min, self.max) {
+            (0, Some(1)) => f.write_str("0..1"),
+            (1, Some(1)) => f.write_str("1"),
+            (0, None) => f.write_str("0..*"),
+            (1, None) => f.write_str("1..*"),
+            (min, Some(max)) if min == max => write!(f, "{min}"),
+            (min, Some(max)) => write!(f, "{min}..{max}"),
+            (min, None) => write!(f, "{min}..*"),
+        }
+    }
 }
 
 fn push_error<T>(errors: &mut Vec<Error>, res: Result<T, Error>) -> Option<T> {
@@ -1927,6 +2026,7 @@ fn resolve_binding_target(
                     name: slot_name.clone(),
                 },
                 slot_decl: slot_decl.decl.clone(),
+                slot_range: SlotCardinality::from_slot_decl(slot_decl),
             })
         }
         _ => Err(Error::UnsupportedManifestFeature {
@@ -1958,6 +2058,7 @@ fn resolve_binding_source(
                     name: provide_name.to_string(),
                 }),
                 decl: provide_decl.decl.clone(),
+                range: SlotCardinality::EXACTLY_ONE,
             })
         }
         BindingSource::SelfSlot(slot_name) => {
@@ -1975,6 +2076,7 @@ fn resolve_binding_source(
                     name: slot_name.to_string(),
                 }),
                 decl: slot_decl.decl.clone(),
+                range: SlotCardinality::from_slot_decl(slot_decl),
             })
         }
         BindingSource::Resource(resource_name) => {
@@ -1992,6 +2094,7 @@ fn resolve_binding_source(
                     name: resource_name.to_string(),
                 }),
                 decl: CapabilityDecl::builder().kind(resource_decl.kind).build(),
+                range: SlotCardinality::EXACTLY_ONE,
             })
         }
         BindingSource::ChildExport { child, export } => {
@@ -2021,12 +2124,29 @@ fn resolve_binding_source(
                     }
                     other => other,
                 })?;
+            let (source, range) = match resolved.source {
+                ResolvedExportSource::Provide(provide) => (
+                    CapabilitySource::Provide(provide),
+                    SlotCardinality::EXACTLY_ONE,
+                ),
+                ResolvedExportSource::Slot(slot) => {
+                    let manifest = manifests[slot.component.0]
+                        .as_ref()
+                        .expect("manifest should exist");
+                    let slot_decl = manifest
+                        .slots()
+                        .get(slot.name.as_str())
+                        .expect("exported slot should exist");
+                    (
+                        CapabilitySource::Slot(slot),
+                        SlotCardinality::from_slot_decl(slot_decl),
+                    )
+                }
+            };
             Ok(ResolvedBindingSource {
-                source: match resolved.source {
-                    ResolvedExportSource::Provide(provide) => CapabilitySource::Provide(provide),
-                    ResolvedExportSource::Slot(slot) => CapabilitySource::Slot(slot),
-                },
+                source,
                 decl: resolved.decl,
+                range,
             })
         }
         BindingSource::Framework(name) => {
@@ -2035,6 +2155,7 @@ fn resolve_binding_source(
             Ok(ResolvedBindingSource {
                 source: CapabilitySource::Framework(spec.name.clone()),
                 decl: spec.decl.clone(),
+                range: SlotCardinality::EXACTLY_ONE,
             })
         }
         _ => Err(Error::UnsupportedManifestFeature {
@@ -2056,8 +2177,13 @@ fn type_mismatch_error(
     let ResolvedBindingTarget {
         slot_ref,
         slot_decl,
+        slot_range: _,
     } = target;
-    let ResolvedBindingSource { source, decl } = source;
+    let ResolvedBindingSource {
+        source,
+        decl,
+        range: _,
+    } = source;
     let (src, span) = match &source {
         CapabilitySource::Framework(_) => binding_source_site(provenance, store, realm, target_key),
         CapabilitySource::Provide(_)
@@ -2144,6 +2270,84 @@ fn type_mismatch_error(
     }
 }
 
+fn slot_range_mismatch_error(
+    site: BindingErrorSite<'_>,
+    target: &ResolvedBindingTarget,
+    accepted_target_range: SlotCardinality,
+    source: &ResolvedBindingSource,
+) -> Error {
+    let (src, span) = binding_site(site.provenance, site.store, site.realm, site.target_key)
+        .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+    let mut related = Vec::new();
+    if let Some(site) = slot_decl_related_span(
+        site.components,
+        site.provenance,
+        site.store,
+        &target.slot_ref,
+        "target slot",
+        "target slot declared here",
+        true,
+    ) {
+        related.push(site);
+    }
+    if let CapabilitySource::Slot(slot_ref) = &source.source
+        && let Some(site) = slot_decl_related_span(
+            site.components,
+            site.provenance,
+            site.store,
+            slot_ref,
+            "source slot",
+            "source slot declared here",
+            true,
+        )
+    {
+        related.push(site);
+    }
+
+    Error::SlotRangeMismatch {
+        to_component_path: component_path_for(site.components, target.slot_ref.component),
+        slot: target.slot_ref.name.clone(),
+        target_range: accepted_target_range.to_string(),
+        source_range: source.range.to_string(),
+        src,
+        span,
+        related,
+    }
+}
+
+fn duplicate_binding_target_error(
+    components: &[Option<Component>],
+    provenance: &Provenance,
+    store: &DigestStore,
+    target: &SlotRef,
+    first_site: (ComponentId, usize),
+    second_site: (ComponentId, usize),
+) -> Error {
+    let component_path = component_path_for(components, target.component);
+    let (src, span) = binding_site_index(provenance, store, second_site.0, second_site.1)
+        .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+
+    let mut related = Vec::new();
+    if let Some((first_src, first_span)) =
+        binding_site_index(provenance, store, first_site.0, first_site.1)
+    {
+        related.push(RelatedSpan {
+            message: format!("first binding for `{}` on {}", target.name, component_path),
+            src: first_src,
+            span: first_span,
+            label: "first binding here".to_string(),
+        });
+    }
+
+    Error::DuplicateBindingTarget {
+        component_path,
+        slot: target.name.clone(),
+        src,
+        span,
+        related,
+    }
+}
+
 fn collect_bindings(
     components: &[Option<Component>],
     manifests: &[Option<Arc<Manifest>>],
@@ -2153,11 +2357,14 @@ fn collect_bindings(
     errors: &mut Vec<Error>,
 ) -> Vec<BindingSpec> {
     let mut specs = Vec::new();
+    let mut seen_singular_targets: HashMap<SlotRef, (ComponentId, usize)> = HashMap::new();
 
     for realm in (0..components.len()).map(ComponentId) {
         let realm_manifest = manifests[realm.0].as_ref().expect("manifest should exist");
 
-        for (target, binding) in realm_manifest.bindings().iter() {
+        for (binding_index, binding_decl) in realm_manifest.bindings().iter().enumerate() {
+            let target = &binding_decl.target;
+            let binding = &binding_decl.binding;
             let target_key = BindingTargetKey::from(target);
             let site = BindingErrorSite {
                 components,
@@ -2173,6 +2380,22 @@ fn collect_bindings(
                 Some(target) => target,
                 None => continue,
             };
+            if target.slot_range.max == Some(1) {
+                if let Some((first_realm, first_binding_index)) =
+                    seen_singular_targets.get(&target.slot_ref)
+                {
+                    errors.push(duplicate_binding_target_error(
+                        components,
+                        provenance,
+                        store,
+                        &target.slot_ref,
+                        (*first_realm, *first_binding_index),
+                        (realm, binding_index),
+                    ));
+                    continue;
+                }
+                seen_singular_targets.insert(target.slot_ref.clone(), (realm, binding_index));
+            }
             let source = match push_error(
                 errors,
                 resolve_binding_source(manifests, link_index, site, &binding.from),
@@ -2194,8 +2417,23 @@ fn collect_bindings(
                 continue;
             }
 
+            let accepted_target_range = if binding.weak {
+                target.slot_range.with_weak_binding()
+            } else {
+                target.slot_range
+            };
+
+            if !accepted_target_range.accepts(source.range) {
+                errors.push(slot_range_mismatch_error(
+                    site,
+                    &target,
+                    accepted_target_range,
+                    &source,
+                ));
+                continue;
+            }
+
             specs.push(BindingSpec {
-                name: binding.name.as_ref().map(|name| name.to_string()),
                 target: target.slot_ref,
                 source: source.source,
                 weak: binding.weak,
@@ -2278,20 +2516,19 @@ fn resolve_export(
 struct ResolvedBindingFrom {
     from: BindingFrom,
     weak: bool,
-    all_weak: bool,
-    nonweak: Option<NonWeakBinding>,
+    first_nonweak: Option<NonWeakBinding>,
 }
 
 #[derive(Clone, Debug)]
 enum ResolveState {
     Resolving,
-    Resolved(Option<ResolvedBindingFrom>),
+    Resolved(Option<Vec<ResolvedBindingFrom>>),
 }
 
 struct SlotResolver<'a> {
     components: &'a [Option<Component>],
     bindings: &'a [BindingSpec],
-    binding_by_target: HashMap<SlotRef, usize>,
+    binding_by_target: HashMap<SlotRef, Vec<usize>>,
     provenance: &'a Provenance,
     store: &'a DigestStore,
     states: HashMap<SlotRef, ResolveState>,
@@ -2317,7 +2554,10 @@ impl<'a> SlotResolver<'a> {
     ) -> Self {
         let mut binding_by_target = HashMap::new();
         for (idx, binding) in bindings.iter().enumerate() {
-            binding_by_target.insert(binding.target.clone(), idx);
+            binding_by_target
+                .entry(binding.target.clone())
+                .or_insert_with(Vec::new)
+                .push(idx);
         }
         Self {
             components,
@@ -2336,26 +2576,23 @@ impl<'a> SlotResolver<'a> {
         &mut self,
         source: &CapabilitySource,
         errors: &mut Vec<Error>,
-    ) -> Option<ResolvedBindingFrom> {
+    ) -> Option<Vec<ResolvedBindingFrom>> {
         match source {
-            CapabilitySource::Provide(provide) => Some(ResolvedBindingFrom {
+            CapabilitySource::Provide(provide) => Some(vec![ResolvedBindingFrom {
                 from: BindingFrom::Component(provide.clone()),
                 weak: false,
-                all_weak: true,
-                nonweak: None,
-            }),
-            CapabilitySource::Resource(resource) => Some(ResolvedBindingFrom {
+                first_nonweak: None,
+            }]),
+            CapabilitySource::Resource(resource) => Some(vec![ResolvedBindingFrom {
                 from: BindingFrom::Resource(resource.clone()),
                 weak: false,
-                all_weak: true,
-                nonweak: None,
-            }),
-            CapabilitySource::Framework(name) => Some(ResolvedBindingFrom {
+                first_nonweak: None,
+            }]),
+            CapabilitySource::Framework(name) => Some(vec![ResolvedBindingFrom {
                 from: BindingFrom::Framework(name.clone()),
                 weak: false,
-                all_weak: true,
-                nonweak: None,
-            }),
+                first_nonweak: None,
+            }]),
             CapabilitySource::Slot(slot) => self.resolve_slot(slot, errors),
         }
     }
@@ -2364,7 +2601,7 @@ impl<'a> SlotResolver<'a> {
         &mut self,
         slot: &SlotRef,
         errors: &mut Vec<Error>,
-    ) -> Option<ResolvedBindingFrom> {
+    ) -> Option<Vec<ResolvedBindingFrom>> {
         if let Some(state) = self.states.get(slot) {
             return match state {
                 ResolveState::Resolving => self.handle_cycle(slot, errors),
@@ -2379,35 +2616,40 @@ impl<'a> SlotResolver<'a> {
             None => {
                 if slot.component == self.root {
                     self.external_root_slots.insert(slot.name.clone());
-                    Some(ResolvedBindingFrom {
+                    Some(vec![ResolvedBindingFrom {
                         from: BindingFrom::External(slot.clone()),
                         weak: false,
-                        all_weak: true,
-                        nonweak: None,
-                    })
+                        first_nonweak: None,
+                    }])
                 } else {
                     None
                 }
             }
-            Some(&idx) => {
-                let binding = &self.bindings[idx];
-                let upstream = self.resolve_source(&binding.source, errors);
-                upstream.map(|resolved| {
-                    let nonweak = if binding.weak {
-                        resolved.nonweak
-                    } else {
-                        Some(NonWeakBinding {
-                            origin: binding.origin.clone(),
-                            target: binding.target.clone(),
-                        })
+            Some(indices) => {
+                let indices = indices.clone();
+                let mut resolved = Vec::new();
+                for idx in indices {
+                    let binding = &self.bindings[idx];
+                    let Some(upstreams) = self.resolve_source(&binding.source, errors) else {
+                        continue;
                     };
-                    ResolvedBindingFrom {
-                        from: resolved.from,
-                        weak: resolved.weak || binding.weak,
-                        all_weak: resolved.all_weak && binding.weak,
-                        nonweak,
+                    for upstream in upstreams {
+                        let first_nonweak = if binding.weak {
+                            upstream.first_nonweak
+                        } else {
+                            Some(NonWeakBinding {
+                                origin: binding.origin.clone(),
+                                target: binding.target.clone(),
+                            })
+                        };
+                        resolved.push(ResolvedBindingFrom {
+                            from: upstream.from,
+                            weak: upstream.weak || binding.weak,
+                            first_nonweak,
+                        });
                     }
-                })
+                }
+                (!resolved.is_empty()).then_some(resolved)
             }
         };
 
@@ -2421,7 +2663,7 @@ impl<'a> SlotResolver<'a> {
         &mut self,
         slot: &SlotRef,
         errors: &mut Vec<Error>,
-    ) -> Option<ResolvedBindingFrom> {
+    ) -> Option<Vec<ResolvedBindingFrom>> {
         let start = self.stack.iter().position(|s| s == slot)?;
         let cycle_slots = self.stack[start..].to_vec();
 
@@ -2434,6 +2676,7 @@ impl<'a> SlotResolver<'a> {
                 .stack
                 .last()
                 .and_then(|current| self.binding_by_target.get(current))
+                .and_then(|indices| indices.first())
                 .map(|&idx| {
                     let origin = &self.bindings[idx].origin;
                     binding_site(
@@ -2524,57 +2767,12 @@ fn collect_program_slot_uses(manifest: &Manifest) -> HashSet<String> {
         return uses;
     };
 
-    let mut used_all = false;
-    if let Some(executable) = program.path_ref().or_else(|| program.image_ref())
-        && let Ok(parsed) = executable.parse::<InterpolatedString>()
-    {
-        used_all = add_program_slot_uses(manifest, &mut uses, &parsed);
-        if used_all {
-            return uses;
+    if program.visit_slot_uses(|slot| {
+        if manifest.slots().contains_key(slot) {
+            uses.insert(slot.to_string());
         }
-    }
-
-    for group in program.command().groups() {
-        if group.when.source() == InterpolationSource::Slots {
-            used_all = add_program_slot_condition_use(manifest, &mut uses, group.when.query());
-            if used_all {
-                return uses;
-            }
-        }
-    }
-
-    for item in &program.command().0 {
-        match item {
-            amber_manifest::ProgramArgItem::Arg(arg) => {
-                used_all = add_program_slot_uses(manifest, &mut uses, arg);
-                if used_all {
-                    return uses;
-                }
-            }
-            amber_manifest::ProgramArgItem::Group(group) => {
-                for arg in &group.argv.0 {
-                    used_all = add_program_slot_uses(manifest, &mut uses, arg);
-                    if used_all {
-                        return uses;
-                    }
-                }
-            }
-        }
-    }
-
-    for value in program.env().values() {
-        if let Some(when) = value.when()
-            && when.source() == InterpolationSource::Slots
-        {
-            used_all = add_program_slot_condition_use(manifest, &mut uses, when.query());
-            if used_all {
-                return uses;
-            }
-        }
-        used_all = add_program_slot_uses(manifest, &mut uses, value.value());
-        if used_all {
-            return uses;
-        }
+    }) {
+        uses.extend(manifest.slots().keys().map(|s| s.to_string()));
     }
 
     for mount in program.mounts() {
@@ -2586,48 +2784,6 @@ fn collect_program_slot_uses(manifest: &Manifest) -> HashSet<String> {
     }
 
     uses
-}
-
-fn add_program_slot_condition_use(
-    manifest: &Manifest,
-    uses: &mut HashSet<String>,
-    query: &str,
-) -> bool {
-    match parse_slot_query(query) {
-        Ok(parsed) => match parsed.target {
-            SlotTarget::All => {
-                uses.extend(manifest.slots().keys().map(|slot| slot.to_string()));
-                true
-            }
-            SlotTarget::Slot(slot) => {
-                if manifest.slots().contains_key(slot) {
-                    uses.insert(slot.to_string());
-                }
-                false
-            }
-        },
-        Err(_) if query.is_empty() => {
-            uses.extend(manifest.slots().keys().map(|slot| slot.to_string()));
-            true
-        }
-        Err(_) => false,
-    }
-}
-
-fn add_program_slot_uses(
-    manifest: &Manifest,
-    uses: &mut HashSet<String>,
-    value: &InterpolatedString,
-) -> bool {
-    let used_all = value.visit_slot_uses(|slot| {
-        if manifest.slots().contains_key(slot) {
-            uses.insert(slot.to_string());
-        }
-    });
-    if used_all {
-        uses.extend(manifest.slots().keys().map(|s| s.to_string()));
-    }
-    used_all
 }
 
 fn dependency_cycle_error(
@@ -2726,66 +2882,68 @@ fn resolve_binding_edges(
 ) -> Vec<BindingEdge> {
     let mut edges = Vec::new();
     for binding in bindings {
-        let Some(resolved) = resolver.resolve_source(&binding.source, errors) else {
+        let Some(resolved_sources) = resolver.resolve_source(&binding.source, errors) else {
             continue;
         };
+        for resolved in resolved_sources {
+            let weak = binding.weak || resolved.weak;
+            let first_nonweak = if binding.weak {
+                resolved.first_nonweak
+            } else {
+                Some(NonWeakBinding {
+                    origin: binding.origin.clone(),
+                    target: binding.target.clone(),
+                })
+            };
 
-        let all_weak = resolved.all_weak && binding.weak;
-        let nonweak = if binding.weak {
-            resolved
-                .nonweak
-                .as_ref()
-                .map(|entry| (&entry.origin, &entry.target))
-        } else {
-            Some((&binding.origin, &binding.target))
-        };
+            if let BindingFrom::External(slot_ref) = &resolved.from
+                && !weak
+                && resolver.slot_kind(slot_ref) != Some(CapabilityKind::Storage)
+            {
+                let (origin, target) = first_nonweak
+                    .as_ref()
+                    .map(|entry| (&entry.origin, &entry.target))
+                    .unwrap_or((&binding.origin, &binding.target));
+                let (src, span) = binding_target_site(
+                    resolver.provenance,
+                    resolver.store,
+                    origin.realm,
+                    &origin.target_key,
+                )
+                .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
 
-        if let BindingFrom::External(slot_ref) = &resolved.from
-            && !all_weak
-            && resolver.slot_kind(slot_ref) != Some(CapabilityKind::Storage)
-        {
-            let (origin, target) = nonweak.unwrap_or((&binding.origin, &binding.target));
-
-            let (src, span) = binding_target_site(
-                resolver.provenance,
-                resolver.store,
-                origin.realm,
-                &origin.target_key,
-            )
-            .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
-
-            let related = slot_decl_related_span(
-                resolver.components,
-                resolver.provenance,
-                resolver.store,
-                slot_ref,
-                "external slot",
-                "slot declared here",
-                false,
-            )
-            .into_iter()
-            .collect();
-
-            errors.push(Error::ExternalSlotRequiresWeakBinding {
-                component_path: describe_component_path(&component_path_for(
+                let related = slot_decl_related_span(
                     resolver.components,
-                    target.component,
-                )),
-                slot: target.name.clone(),
-                external: slot_ref.name.clone(),
-                src,
-                span,
-                related,
-            });
-            continue;
-        }
+                    resolver.provenance,
+                    resolver.store,
+                    slot_ref,
+                    "external slot",
+                    "slot declared here",
+                    false,
+                )
+                .into_iter()
+                .collect();
 
-        edges.push(BindingEdge {
-            name: binding.name.clone(),
-            from: resolved.from,
-            to: binding.target.clone(),
-            weak: binding.weak || resolved.weak,
-        });
+                errors.push(Error::ExternalSlotRequiresWeakBinding {
+                    component_path: describe_component_path(&component_path_for(
+                        resolver.components,
+                        target.component,
+                    )),
+                    slot: target.name.clone(),
+                    external: slot_ref.name.clone(),
+                    src,
+                    span,
+                    related,
+                });
+                continue;
+            }
+
+            edges.push(BindingEdge {
+                from: resolved.from,
+                to: binding.target.clone(),
+                weak,
+            });
+        }
     }
     edges
 }
@@ -2918,7 +3076,36 @@ fn validate_storage_mounts(
                         });
                         continue;
                     };
-                    let BindingFrom::Resource(resource) = resolved.from else {
+                    let [resolved] = resolved.as_slice() else {
+                        let component_path =
+                            describe_component_path(&component_path_for(components, id));
+                        let (src, span) = mount_source_site(provenance, store, id, mount_index)
+                            .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                        let mut related: Vec<_> =
+                            component_decl_site(components, provenance, store, id)
+                                .into_iter()
+                                .collect();
+                        if let Some(site) = slot_decl_related_span(
+                            components,
+                            provenance,
+                            store,
+                            &slot_ref,
+                            "storage slot",
+                            "storage slot declared here",
+                            false,
+                        ) {
+                            related.push(site);
+                        }
+                        errors.push(Error::StorageMountRequiresResource {
+                            component_path,
+                            slot: slot_name.to_string(),
+                            src,
+                            span,
+                            related,
+                        });
+                        continue;
+                    };
+                    let BindingFrom::Resource(resource) = &resolved.from else {
                         let component_path =
                             describe_component_path(&component_path_for(components, id));
                         let (src, span) = mount_source_site(provenance, store, id, mount_index)
@@ -2962,7 +3149,7 @@ fn validate_storage_mounts(
                         })
                     };
                     sinks_by_resource
-                        .entry(resource)
+                        .entry(resource.clone())
                         .or_default()
                         .push(StorageMountSink {
                             component: id,

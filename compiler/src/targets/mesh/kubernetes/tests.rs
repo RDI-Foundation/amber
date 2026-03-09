@@ -2800,7 +2800,6 @@ fn kubernetes_smoke_export_routes_to_host() {
         outbound: vec![OutboundRoute {
             route_id: router_export_route_id(export_name, MeshProtocol::Http),
             slot: export_name.to_string(),
-            binding_name: None,
             capability_kind: None,
             capability_profile: None,
             listen_port: proxy_listen.port(),

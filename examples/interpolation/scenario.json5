@@ -1,150 +1,34 @@
 {
-  manifest_version: "0.2.0",
-
-  config_schema: {
-    type: "object",
-    properties: {
-      profile: { type: "string" },
-      region: { type: "string" },
-      tier: { type: "string" },
-      workers: { type: "integer" },
-      disabled: { type: "boolean" },
-      empty_label: { type: "string" },
-      api_token: { type: "string", secret: true },
-    },
-    additionalProperties: false,
-  },
+  manifest_version: "0.3.0",
 
   components: {
-    upstream: "./upstream.json5",
+    alpha: "./upstream.json5",
+    beta: "./upstream.json5",
+    gamma: "./upstream.json5",
 
-    app_with_peer: {
-      manifest: "./app.json5",
+    with_upstreams: {
+      manifest: "./cli-probe.json5",
       config: {
-        name: "app-with-peer",
-        zero_one: "${config.profile}",
-        copy_zero: "${config.workers}",
-        copy_false: "${config.disabled}",
-        copy_empty: "${config.empty_label}",
-        one_many: [
-          "base",
-          "profile=${config.profile}",
-          "region=${config.region}",
-          "tier=${config.tier}",
-        ],
-        zero_many: [
-          "profile=${config.profile}",
-          "region=${config.region}",
-          "tier=${config.tier}",
-        ],
-        flags: [
-          "--profile=${config.profile}",
-          "--workers=${config.workers}",
-          "--disabled=${config.disabled}",
-          "--label=${config.empty_label}",
-        ],
-        joins: {
-          pair: "${config.region}:${config.tier}",
-          auth: "Bearer ${config.api_token}",
-          route: "https://${config.region}.${config.tier}.example.test",
-        },
-        nested: {
-          profile_flag: "--profile=${config.profile}",
-          region: "${config.region}",
-          tier: "${config.tier}",
-          auth: "Bearer ${config.api_token}",
-        },
+        name: "with-upstreams",
       },
     },
 
-    app_without_peer: {
-      manifest: "./app.json5",
+    without_upstreams: {
+      manifest: "./cli-probe.json5",
       config: {
-        name: "app-without-peer",
-        zero_one: "${config.profile}",
-        copy_zero: "${config.workers}",
-        copy_false: "${config.disabled}",
-        copy_empty: "${config.empty_label}",
-        one_many: [
-          "base",
-          "profile=${config.profile}",
-          "region=${config.region}",
-          "tier=${config.tier}",
-        ],
-        zero_many: [
-          "profile=${config.profile}",
-          "region=${config.region}",
-          "tier=${config.tier}",
-        ],
-        flags: [
-          "--profile=${config.profile}",
-          "--workers=${config.workers}",
-          "--disabled=${config.disabled}",
-          "--label=${config.empty_label}",
-        ],
-        joins: {
-          pair: "${config.region}:${config.tier}",
-          auth: "Bearer ${config.api_token}",
-          route: "https://${config.region}.${config.tier}.example.test",
-        },
-        nested: {
-          profile_flag: "--profile=${config.profile}",
-          region: "${config.region}",
-          tier: "${config.tier}",
-          auth: "Bearer ${config.api_token}",
-        },
-      },
-    },
-
-    native_probe: {
-      manifest: "./native-probe.json5",
-      config: {
-        name: "native-probe",
-        zero_one: "${config.profile}",
-        copy_zero: "${config.workers}",
-        copy_false: "${config.disabled}",
-        copy_empty: "${config.empty_label}",
-        one_many: [
-          "base",
-          "profile=${config.profile}",
-          "region=${config.region}",
-          "tier=${config.tier}",
-        ],
-        zero_many: [
-          "profile=${config.profile}",
-          "region=${config.region}",
-          "tier=${config.tier}",
-        ],
-        flags: [
-          "--profile=${config.profile}",
-          "--workers=${config.workers}",
-          "--disabled=${config.disabled}",
-          "--label=${config.empty_label}",
-        ],
-        joins: {
-          pair: "${config.region}:${config.tier}",
-          auth: "Bearer ${config.api_token}",
-          route: "https://${config.region}.${config.tier}.example.test",
-        },
-        nested: {
-          profile_flag: "--profile=${config.profile}",
-          region: "${config.region}",
-          tier: "${config.tier}",
-          auth: "Bearer ${config.api_token}",
-        },
+        name: "without-upstreams",
       },
     },
   },
 
   bindings: [
-    { to: "#app_with_peer.peer", from: "#upstream.api" },
-    { to: "#native_probe.peer", from: "#upstream.api" },
+    { to: "#with_upstreams.upstream", from: "#alpha.api" },
+    { to: "#with_upstreams.upstream", from: "#beta.api" },
+    { to: "#with_upstreams.upstream", from: "#gamma.api" },
   ],
 
   exports: {
-    upstream: "#upstream.api",
-    app_with_peer: "#app_with_peer.http",
-    app_without_peer: "#app_without_peer.http",
-    native_probe: "#native_probe.http",
+    with_upstreams: "#with_upstreams.http",
+    without_upstreams: "#without_upstreams.http",
   },
 }

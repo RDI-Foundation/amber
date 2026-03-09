@@ -149,9 +149,6 @@ fn labels_for_manifest_error(
         ManifestError::DuplicateBindingTarget { to, slot } => {
             labels_for_duplicate_binding_target(spans, to, slot)
         }
-        ManifestError::DuplicateBindingName { name } => {
-            labels_for_duplicate_binding_name(spans, name)
-        }
         ManifestError::BindingTargetSelfSlot { slot } => {
             labels_for_binding_target_self(spans, slot)
         }
@@ -354,24 +351,17 @@ fn labels_for_invalid_name(
     kind: &'static str,
     name: &str,
 ) -> Vec<LabeledSpan> {
-    let span =
-        match kind {
-            "environment" => spans.environments.get(name).map(|s| s.name),
-            "child" => spans.components.get(name).map(|s| s.name),
-            "slot" => spans.slots.get(name).map(|s| s.name),
-            "provide" => spans.provides.get(name).map(|s| s.capability.name),
-            "export" => spans.exports.get(name).map(|s| s.name),
-            "mount" => {
-                return labels_for_mount_name(spans, name, "invalid mount name");
-            }
-            "binding" => spans.bindings_by_index.iter().find_map(|binding| {
-                match binding.name_value.as_deref() {
-                    Some(value) if value == name => binding.name.or(Some(binding.whole)),
-                    _ => None,
-                }
-            }),
-            _ => None,
-        };
+    let span = match kind {
+        "environment" => spans.environments.get(name).map(|s| s.name),
+        "child" => spans.components.get(name).map(|s| s.name),
+        "slot" => spans.slots.get(name).map(|s| s.name),
+        "provide" => spans.provides.get(name).map(|s| s.capability.name),
+        "export" => spans.exports.get(name).map(|s| s.name),
+        "mount" => {
+            return labels_for_mount_name(spans, name, "invalid mount name");
+        }
+        _ => None,
+    };
     vec![primary(
         span_or_default(span),
         Some("invalid name".to_string()),
@@ -511,26 +501,6 @@ fn labels_for_duplicate_binding_target(
         "duplicate binding target",
         "second binding here",
         Some("first binding here"),
-        false,
-    )
-}
-
-fn labels_for_duplicate_binding_name(spans: &ManifestSpans, name: &str) -> Vec<LabeledSpan> {
-    let matches: Vec<_> = spans
-        .bindings_by_index
-        .iter()
-        .filter_map(|binding| match binding.name_value.as_deref() {
-            Some(value) if value == name => binding.name.or(Some(binding.whole)),
-            _ => None,
-        })
-        .collect();
-
-    labels_for_duplicate_values(
-        &matches,
-        Some("duplicate binding name"),
-        "duplicate binding name",
-        "second binding name here",
-        Some("first binding name here"),
         false,
     )
 }
@@ -1020,17 +990,15 @@ mod tests {
         }
         "##;
 
-        let err = ParsedManifest::parse_named("test", Arc::from(source)).unwrap_err();
-        let labels: Vec<_> = err.labels().unwrap().collect();
-        assert!(labels.len() >= 2);
-
+        let parsed = ParsedManifest::parse_named("test", Arc::from(source)).expect("manifest");
         let starts: Vec<_> = source
             .match_indices("{ to: \"#a.s\"")
             .map(|(idx, _)| idx)
             .collect();
         assert_eq!(starts.len(), 2);
-        assert!(labels.iter().any(|l| l.offset() == starts[0]));
-        assert!(labels.iter().any(|l| l.offset() == starts[1]));
+        assert_eq!(parsed.spans.bindings_by_index.len(), 2);
+        assert_eq!(parsed.spans.bindings_by_index[0].whole.offset(), starts[0]);
+        assert_eq!(parsed.spans.bindings_by_index[1].whole.offset(), starts[1]);
     }
 
     #[test]
@@ -1057,54 +1025,14 @@ mod tests {
         }
         "##;
         let source: Arc<str> = Arc::from(source);
-        let err = ParsedManifest::parse_named("<test>", Arc::clone(&source)).unwrap_err();
-        assert!(matches!(
-            err.kind,
-            crate::Error::DuplicateBindingTarget { .. }
-        ));
-
-        let labels: Vec<_> = err.labels().expect("labels").collect();
-        let second = labels
-            .iter()
-            .find(|label| label.label() == Some("second binding here"))
-            .expect("second binding label");
-        let second_text = labeled_span_text(source.as_ref(), second);
+        let parsed = ParsedManifest::parse_named("<test>", Arc::clone(&source)).expect("manifest");
+        let second = parsed
+            .spans
+            .bindings_by_index
+            .get(1)
+            .expect("second binding span");
+        let second_text = &source[second.whole.offset()..][..second.whole.len()];
         assert!(second_text.contains("self.b"));
-    }
-
-    #[test]
-    fn manifest_doc_error_duplicate_binding_name_marks_second_binding() {
-        let source = r##"
-        {
-          manifest_version: "0.1.0",
-          components: {
-            a: "https://example.com/a",
-            b: "https://example.com/b",
-          },
-          bindings: [
-            { name: "dup", to: "#a.s", from: "#b.c" },
-            { name: "dup", to: "#a.t", from: "#b.d" },
-          ],
-        }
-        "##;
-        let source: Arc<str> = Arc::from(source);
-        let err = ParsedManifest::parse_named("<test>", Arc::clone(&source)).unwrap_err();
-        assert!(matches!(
-            err.kind,
-            crate::Error::DuplicateBindingName { .. }
-        ));
-
-        let labels: Vec<_> = err.labels().expect("labels").collect();
-        let second = labels
-            .iter()
-            .find(|label| label.label() == Some("second binding name here"))
-            .expect("second binding name label");
-        let starts: Vec<_> = source
-            .match_indices("\"dup\"")
-            .map(|(idx, _)| idx)
-            .collect();
-        assert_eq!(starts.len(), 2);
-        assert_eq!(second.offset(), starts[1]);
     }
 
     #[test]

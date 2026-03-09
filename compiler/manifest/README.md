@@ -44,20 +44,17 @@ Minimal leaf component exporting an HTTP API:
 This crate **parses JSON5**, deserializes into Rust types, and validates:
 
 * `manifest_version` must be valid SemVer and **satisfy `>=0.1.0, <1.0.0`**.
-  New manifests should use `0.2.0`; older pre-1.0 manifests are still accepted.
+  New manifests should use `0.3.0`; older pre-1.0 manifests are still accepted.
 * `experimental_features` entries must be known feature names.
 * No dots (`.`) in:
 
   * child instance names (`components` keys)
-  * binding names (`bindings[].name`)
   * capability names (`slots`/`provides` keys, binding slot/capability names, and export target names)
   * export names (keys in `exports`)
   * child refs (`#<name>`) in bindings and export targets
 * A name cannot be declared in **both** `slots` and `provides`.
 * `exports` targets that point at `self` must refer to something declared in `slots` or `provides`.
 * `exports` targets that point at `#child` must refer to a declared child.
-* Each binding target `(<to>.<slot>)` may appear **only once**.
-* Binding names (when present) must be unique within a manifest.
 * Binding references must be locally well-formed:
 
   * `to` must reference a child component (`#<child>`)
@@ -93,6 +90,7 @@ This crate does **not** fetch child manifests and therefore does not validate cr
 * Whether an `exports` target like `#child.<name>` resolves to something actually exported by the child.
 * Whether kinds/profiles match across bindings or forwarded exports.
 * Whether a child has exported the capability you’re trying to bind from.
+* Whether multiple bindings target a child slot that is not declared with `multiple: true`.
 * Validation of `components.<name>.config` against `config_schema`.
 * Whether every parent manifest has enabled the experimental features required by each child
   manifest (`child.experimental_features ⊆ parent.experimental_features`).
@@ -140,10 +138,11 @@ Rules:
 Notes:
 
 * Duplicate keys are rejected in: `program.env`, `components`, `slots`, `provides`, `exports`.
-* `bindings` are treated as **sets** internally:
+* `bindings` are an ordered list:
 
-  * order is not meaningful
-  * exact duplicates may be deduplicated
+  * declaration order is preserved
+  * repeated bindings to the same child slot are preserved so `multiple: true` slots can fan in
+    more than one source
 * `exports` is a map (order is not meaningful; duplicate keys are rejected).
 
 Unknown fields:
@@ -292,7 +291,6 @@ Supported `from` sources (current):
 
 Reserved (not implemented yet):
 
-* `bindings.<name>`
 * `framework.<capability>` other than `framework.docker`
 
 Mount value formatting:
@@ -338,7 +336,7 @@ Supported sources:
 
 * `${config.<path>}` reads from the component’s config value.
 * `${slots.<path>}` reads from resolved slot values.
-* `${bindings.<name>.url}` reads the URL for a named binding that targets this component.
+* `${item.<path>}` reads the current item inside a repeated `each` expansion.
 
 `<path>` is dot-separated for nested objects.
 
@@ -353,27 +351,31 @@ Notes:
   `${slots.<slot>.url}` for the URL string or `${slots.<slot>}` to interpolate the object as JSON.
 * Storage slots are different virtual objects. They are not URL-shaped and cannot be interpolated
   with `${slots...}`; mount them with `program.mounts`.
-* Bindings expose a virtual object with a single `url` field; bindings must be named to be
-  referenced via `${bindings.<name>.url}`.
-* Framework bindings may be **non-URL-shaped**; `${bindings.<name>.url}` is invalid for those
-  bindings and is rejected by the compiler.
+* Repeated slots declared with `multiple: true` must be expanded through `each`; plain
+  `${slots.<slot>}` and `${slots.<slot>.url}` are rejected for repeated slots.
+* Repeated slots declared with `multiple: true` must be expanded through `each`; plain
+  `${slots.<slot>}` and `${slots.<slot>.url}` are rejected for repeated slots.
 * `manifest_version: "0.2.0"` or newer is required for object items in `program.entrypoint` /
   `program.args` and object values in `program.env`, such as
   `{ when: "config.profile", argv: [...] }` or
   `{ when: "config.profile", value: "${config.profile}" }`.
+* `manifest_version: "0.3.0"` or newer is required for repeated slot expansion objects:
+
+  * `{ each: "slots.<slot>", argv: [...] }`
+  * `{ each: "slots.<slot>", arg: "..." }`
+  * `{ each: "slots.<slot>", value: "...", join: "," }`
 * `when` is supported in `program.entrypoint`, `program.args`, and `program.env`.
 * `when` accepts `config.<path>` or `slots.<path>`.
 * Slot `when` checks whether the referenced slot query is present. Today that means
   `slots.<slot>` and `slots.<slot>.url` are both valid.
 * `when: "slots.<slot>"` and `when: "slots.<slot>.url"` are mainly useful for `optional: true`
-  slots. Amber lints conditions on required slots when the queried value is guaranteed to be
-  present after linking.
+  slots and `multiple: true` fan-in slots. For repeated slots, `when: "slots.<slot>"` means
+  "the fan-in is non-empty". Amber lints conditions on required singular slots when the queried
+  value is guaranteed to be present after linking.
 * This crate **parses** interpolation syntax but does **not** validate that the referenced paths
   exist. The compiler validates `${config.*}` against `config_schema` and `${slots.*}` against
-  declared slots and supported fields. `${bindings.*}` is validated against named bindings that
-  target the component.
-* `${bindings.*}` is for introspection only: seeing the URL does not grant access. Only the binding
-  `to` component can reach the binding `from`, even if another component has the URL.
+  declared slots and supported fields. `${item.*}` is only valid inside repeated `each`
+  expansions.
 
 ---
 
@@ -512,6 +514,24 @@ linking fails.
 Root URL-shaped slots are still external inputs. Storage is different: mounted storage must
 ultimately come from a `resources.<name>` binding, not from a root storage slot.
 
+`multiple` (default `false`) allows the same slot to be bound more than once:
+
+```json5
+slots: {
+  upstream: { kind: "http", optional: true, multiple: true },
+}
+```
+
+This is Amber's fan-in shape for repeated slots:
+
+* `multiple: true` means one or more bindings when `optional` is false.
+* `optional: true, multiple: true` means zero or more bindings.
+* Binding declaration order is preserved and becomes the expansion order for repeated `each`
+  interpolation in program args and env values.
+
+Note: scenario-level slot injection is not supported yet. Required slots on the root component will
+fail to link because there is no parent to satisfy them.
+
 ### `resources`
 
 `resources` declares framework-managed objects owned by the component.
@@ -642,7 +662,6 @@ Bindings forms:
 
 ```json5
 {
-  name: "route_llm", // optional; must be unique within the manifest; used by `${bindings.<name>.url}`
   to: "#evaluator",
   slot: "llm",
   from: "#router",
@@ -659,8 +678,6 @@ Bindings forms:
 
 Rules enforced by this crate:
 
-* Target uniqueness: you cannot bind the same `(<to>.<slot>)` more than once.
-* Binding names (if present) must be unique within the manifest and follow child name rules (no `.`).
 * `to` must reference a child (`#<child>`).
 * `from: "self"` requires `capability` exist in `slots` or `provides`.
 * `from: "resources"` requires the named resource exist in `resources`.
@@ -668,6 +685,14 @@ Rules enforced by this crate:
 * `framework` is only valid as a binding source; it cannot appear in `to` or `exports`.
 * Any `#child` referenced in `to` or `from` must exist in `components`.
 * Slot/capability names must not contain `.`.
+
+Multiplicity note:
+
+* This crate preserves repeated bindings to the same `(<to>.<slot>)`.
+* The linker later checks the resolved child slot declaration:
+
+  * singular slots reject repeated bindings
+  * `multiple: true` slots accept repeated bindings and preserve their declaration order
 
 Framework capabilities are a fixed compiler-known list.
 

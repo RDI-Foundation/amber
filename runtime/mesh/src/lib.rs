@@ -167,7 +167,7 @@ pub struct MeshConfigTemplate {
     pub transport: TransportConfig,
 }
 
-pub const MESH_PROVISION_PLAN_VERSION: &str = "1";
+pub const MESH_PROVISION_PLAN_VERSION: &str = "2";
 pub const MESH_CONFIG_FILENAME: &str = "mesh-config.json";
 pub const MESH_IDENTITY_FILENAME: &str = "mesh-identity.json";
 
@@ -211,8 +211,6 @@ pub struct InboundRoute {
     pub route_id: String,
     pub capability: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub binding_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_profile: Option<String>,
@@ -234,8 +232,6 @@ pub enum HttpRoutePlugin {
 pub struct OutboundRoute {
     pub route_id: String,
     pub slot: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub binding_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

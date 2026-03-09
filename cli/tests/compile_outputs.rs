@@ -76,7 +76,7 @@ fn compile_writes_primary_output_and_dot_artifact() {
     let primary_json: Value =
         serde_json::from_str(&primary_contents).expect("primary output did not contain valid JSON");
     assert_eq!(primary_json["schema"], "amber.scenario.ir");
-    assert_eq!(primary_json["version"], 2);
+    assert_eq!(primary_json["version"], 3);
     assert_eq!(primary_json["root"], 0);
 
     let components = primary_json["components"]
@@ -237,200 +237,6 @@ fn compile_writes_primary_output_and_dot_artifact() {
         .and_then(YamlValue::as_str)
         .expect("plan config missing content");
     serde_json::from_str::<Value>(plan_json).expect("plan config content should be JSON");
-}
-
-#[test]
-fn compile_with_binding_interpolation() {
-    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("cli crate should live under the workspace root");
-
-    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
-    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
-    let outputs_dir = tempfile::Builder::new()
-        .prefix("outputs-")
-        .tempdir_in(&outputs_root)
-        .expect("failed to create outputs directory");
-
-    let manifests_dir = outputs_dir.path().join("manifests");
-    fs::create_dir_all(&manifests_dir).expect("failed to create manifests directory");
-
-    let root_manifest = manifests_dir.join("scenario.json5");
-    let server_manifest = manifests_dir.join("server.json5");
-    let client_manifest = manifests_dir.join("client.json5");
-    let observer_manifest = manifests_dir.join("observer.json5");
-
-    fs::write(
-        &root_manifest,
-        r##"{
-  "manifest_version": "0.1.0",
-  "components": {
-    "server": "./server.json5",
-    "client": "./client.json5",
-    "observer": {
-      "manifest": "./observer.json5",
-      "config": {
-        "upstream_url": "${bindings.bind.url}"
-      }
-    }
-  },
-  "bindings": [
-    { "name": "bind", "from": "#server.api", "to": "#client.api" }
-  ]
-}
-"##,
-    )
-    .expect("failed to write root manifest");
-
-    fs::write(
-        &server_manifest,
-        r#"{
-  "manifest_version": "0.1.0",
-  "program": {
-    "image": "alpine:3.20",
-    "entrypoint": ["server"],
-    "env": {},
-    "network": {
-      "endpoints": [
-        { "name": "api", "port": 8080, "protocol": "http" }
-      ]
-    }
-  },
-  "provides": {
-    "api": { "kind": "http", "endpoint": "api" }
-  },
-  "exports": {
-    "api": "api"
-  }
-}
-"#,
-    )
-    .expect("failed to write server manifest");
-
-    fs::write(
-        &client_manifest,
-        r#"{
-  "manifest_version": "0.1.0",
-  "program": {
-    "image": "alpine:3.20",
-    "entrypoint": ["client"],
-    "env": {
-      "BIND_URL": "${slots.api.url}"
-    },
-    "network": {
-      "endpoints": [
-        { "name": "health", "port": 9101, "protocol": "http" }
-      ]
-    }
-  },
-  "slots": {
-    "api": { "kind": "http" }
-  },
-  "provides": {
-    "health": { "kind": "http", "endpoint": "health" }
-  },
-  "exports": {
-    "health": "health"
-  }
-}
-"#,
-    )
-    .expect("failed to write client manifest");
-
-    fs::write(
-        &observer_manifest,
-        r#"{
-  "manifest_version": "0.1.0",
-  "config_schema": {
-    "type": "object",
-    "properties": {
-      "upstream_url": { "type": "string" }
-    },
-    "required": ["upstream_url"],
-    "additionalProperties": false
-  },
-  "program": {
-    "image": "alpine:3.20",
-    "entrypoint": ["observer"],
-    "env": {
-      "UPSTREAM_URL": "${config.upstream_url}"
-    },
-    "network": {
-      "endpoints": [
-        { "name": "health", "port": 9102, "protocol": "http" }
-      ]
-    }
-  },
-  "provides": {
-    "health": { "kind": "http", "endpoint": "health" }
-  },
-  "exports": {
-    "health": "health"
-  }
-}
-"#,
-    )
-    .expect("failed to write observer manifest");
-
-    let compose_output_dir = outputs_dir.path().join("scenario.compose");
-
-    let compose_compile = Command::new(env!("CARGO_BIN_EXE_amber"))
-        .arg("compile")
-        .arg("--no-opt")
-        .arg("--docker-compose")
-        .arg(&compose_output_dir)
-        .arg(&root_manifest)
-        .output()
-        .unwrap_or_else(|err| panic!("failed to run amber compile: {err}"));
-    if !compose_compile.status.success() {
-        panic!(
-            "amber compile (compose) failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-            compose_compile.status,
-            String::from_utf8_lossy(&compose_compile.stdout),
-            String::from_utf8_lossy(&compose_compile.stderr)
-        );
-    }
-
-    let compose_output = compose_output_dir.join("compose.yaml");
-    assert!(
-        compose_output.is_file(),
-        "expected docker compose output file at {}",
-        compose_output.display()
-    );
-    let compose_contents =
-        fs::read_to_string(&compose_output).expect("failed to read docker compose output file");
-    let compose_yaml: YamlValue =
-        serde_yaml::from_str(&compose_contents).expect("docker compose output invalid yaml");
-    let services = compose_yaml
-        .get("services")
-        .and_then(YamlValue::as_mapping)
-        .expect("compose services should be a map");
-
-    let bind_url = services
-        .values()
-        .find_map(|service| env_value(service, "BIND_URL"));
-    assert_eq!(
-        bind_url.as_deref(),
-        Some("http://127.0.0.1:20000"),
-        "expected client BIND_URL to resolve in docker compose output"
-    );
-
-    let upstream_url = services
-        .values()
-        .find_map(|service| env_value(service, "UPSTREAM_URL"));
-    assert_eq!(
-        upstream_url.as_deref(),
-        Some("http://127.0.0.1:20000"),
-        "expected observer UPSTREAM_URL to resolve in docker compose output"
-    );
-
-    let provisioner = services
-        .get("amber-provisioner")
-        .expect("compose missing provisioner service");
-    assert_eq!(
-        env_value(provisioner, "AMBER_MESH_PROVISION_PLAN_PATH").as_deref(),
-        Some("/amber/plan/mesh-provision-plan.json")
-    );
 }
 
 #[test]
@@ -1044,6 +850,864 @@ fn compile_direct_preserves_runtime_conditional_program_arg_group_in_template_sp
 }
 
 #[test]
+fn compile_direct_lowers_singular_slot_queries_for_runtime_resolution() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("direct-singular-slot-queries-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let root_manifest = outputs_dir.path().join("root.json5");
+    let consumer_manifest = outputs_dir.path().join("consumer.json5");
+    let provider_manifest = outputs_dir.path().join("provider.json5");
+
+    fs::write(
+        &consumer_manifest,
+        r#"{
+  manifest_version: "0.3.0",
+  program: {
+    path: "/usr/bin/env",
+    args: ["consumer", "--api-url", "${slots.api.url}"],
+    env: {
+      API_JSON: "${slots.api}"
+    },
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  slots: {
+    api: { kind: "http", optional: true }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"#,
+    )
+    .expect("failed to write consumer manifest");
+    fs::write(
+        &provider_manifest,
+        r#"{
+  manifest_version: "0.3.0",
+  program: {
+    path: "/usr/bin/env",
+    args: ["provider"],
+    network: {
+      endpoints: [
+        { name: "api", port: 8081, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    api: { kind: "http", endpoint: "api" }
+  },
+  exports: {
+    api: "api"
+  }
+}
+"#,
+    )
+    .expect("failed to write provider manifest");
+    fs::write(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  components: {
+    consumer: "./consumer.json5",
+    provider: "./provider.json5"
+  },
+  bindings: [
+    { to: "#consumer.api", from: "#provider.api" }
+  ],
+  exports: {
+    http: "#consumer.http"
+  }
+}
+"##,
+    )
+    .expect("failed to write root manifest");
+
+    let direct_out = outputs_dir.path().join("direct");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&direct_out)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    assert!(
+        output.status.success(),
+        "amber compile --direct failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan_path = direct_out.join("direct-plan.json");
+    let plan: Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("failed to read direct plan"))
+            .expect("direct plan should contain valid JSON");
+    let components = plan["components"]
+        .as_array()
+        .expect("direct plan components should be an array");
+    let consumer = components
+        .iter()
+        .find(|component| component["moniker"].as_str() == Some("/consumer"))
+        .expect("consumer component should exist");
+    let consumer_scope = consumer["id"]
+        .as_u64()
+        .expect("consumer component id should be present") as u64;
+    let execution = &consumer["program"]["execution"];
+    let template_spec_b64 = execution["template_spec_b64"]
+        .as_str()
+        .expect("helper plan should include a template spec");
+    let spec_bytes = STANDARD
+        .decode(template_spec_b64)
+        .expect("template spec should be valid base64");
+    let spec: TemplateSpec =
+        serde_json::from_slice(&spec_bytes).expect("template spec should be valid JSON");
+
+    assert_eq!(
+        spec.program.entrypoint,
+        vec![
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("/usr/bin/env")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("consumer")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("--api-url")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::slot(consumer_scope, "api.url")]),
+        ]
+    );
+    assert_eq!(
+        spec.program.env.get("API_JSON"),
+        Some(&ProgramEnvTemplate::Value(vec![TemplatePart::slot(
+            consumer_scope,
+            "api",
+        )]))
+    );
+    assert!(
+        plan["runtime_addresses"]["slots_by_scope"][consumer_scope.to_string().as_str()]
+            .get("api")
+            .is_some(),
+        "direct runtime addresses should publish the singular slot source"
+    );
+}
+
+#[test]
+fn compile_direct_lowers_repeated_slot_expansion_to_slot_items() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("direct-repeated-slot-items-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let root_manifest = outputs_dir.path().join("root.json5");
+    let consumer_manifest = outputs_dir.path().join("consumer.json5");
+    let provider_a_manifest = outputs_dir.path().join("provider-a.json5");
+    let provider_b_manifest = outputs_dir.path().join("provider-b.json5");
+
+    fs::write(
+        &consumer_manifest,
+        r#"{
+  manifest_version: "0.3.0",
+  program: {
+    path: "/usr/bin/env",
+    args: [
+      "consumer",
+      {
+        each: "slots.upstream",
+        argv: ["--upstream", "${item.url}"]
+      }
+    ],
+    env: {
+      UPSTREAMS: {
+        each: "slots.upstream",
+        value: "${item.url}",
+        join: ","
+      }
+    },
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  slots: {
+    upstream: { kind: "http", optional: true, multiple: true }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"#,
+    )
+    .expect("failed to write consumer manifest");
+    fs::write(
+        &provider_a_manifest,
+        r#"{
+  manifest_version: "0.3.0",
+  program: {
+    path: "/usr/bin/env",
+    args: ["provider-a"],
+    network: {
+      endpoints: [
+        { name: "api", port: 8081, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    api: { kind: "http", endpoint: "api" }
+  },
+  exports: {
+    api: "api"
+  }
+}
+"#,
+    )
+    .expect("failed to write provider-a manifest");
+    fs::write(
+        &provider_b_manifest,
+        r#"{
+  manifest_version: "0.3.0",
+  program: {
+    path: "/usr/bin/env",
+    args: ["provider-b"],
+    network: {
+      endpoints: [
+        { name: "api", port: 8082, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    api: { kind: "http", endpoint: "api" }
+  },
+  exports: {
+    api: "api"
+  }
+}
+"#,
+    )
+    .expect("failed to write provider-b manifest");
+    fs::write(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  components: {
+    consumer: "./consumer.json5",
+    provider_a: "./provider-a.json5",
+    provider_b: "./provider-b.json5"
+  },
+  bindings: [
+    { to: "#consumer.upstream", from: "#provider_a.api" },
+    { to: "#consumer.upstream", from: "#provider_b.api" }
+  ],
+  exports: {
+    http: "#consumer.http"
+  }
+}
+"##,
+    )
+    .expect("failed to write root manifest");
+
+    let direct_out = outputs_dir.path().join("direct");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&direct_out)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    if !output.status.success() {
+        panic!(
+            "amber compile --direct failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let plan_path = direct_out.join("direct-plan.json");
+    let plan: Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("failed to read direct plan"))
+            .expect("direct plan should contain valid JSON");
+    let components = plan["components"]
+        .as_array()
+        .expect("direct plan components should be an array");
+    let consumer = components
+        .iter()
+        .find(|component| component["moniker"].as_str() == Some("/consumer"))
+        .expect("consumer component should exist");
+    let consumer_scope = consumer["id"]
+        .as_u64()
+        .expect("consumer component id should be present") as u64;
+    let execution = &consumer["program"]["execution"];
+    let template_spec_b64 = execution["template_spec_b64"]
+        .as_str()
+        .expect("helper plan should include a template spec");
+    let spec_bytes = STANDARD
+        .decode(template_spec_b64)
+        .expect("template spec should be valid base64");
+    let spec: TemplateSpec =
+        serde_json::from_slice(&spec_bytes).expect("template spec should be valid JSON");
+
+    assert_eq!(
+        spec.program.entrypoint,
+        vec![
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("/usr/bin/env")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("consumer")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("--upstream")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::item(
+                consumer_scope,
+                "upstream",
+                0,
+                "url",
+            )]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("--upstream")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::item(
+                consumer_scope,
+                "upstream",
+                1,
+                "url",
+            )]),
+        ]
+    );
+    assert_eq!(
+        spec.program.env.get("UPSTREAMS"),
+        Some(&ProgramEnvTemplate::Value(vec![
+            TemplatePart::item(consumer_scope, "upstream", 0, "url"),
+            TemplatePart::lit(","),
+            TemplatePart::item(consumer_scope, "upstream", 1, "url"),
+        ]))
+    );
+
+    let scope_key = consumer_scope.to_string();
+    let slot_items = plan["runtime_addresses"]["slot_items_by_scope"][scope_key.as_str()]
+        ["upstream"]
+        .as_array()
+        .expect("slot items should be present");
+    assert_eq!(slot_items.len(), 2);
+}
+
+#[test]
+fn compile_direct_lowers_single_binding_repeated_slot_to_one_runtime_item() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("direct-single-repeated-slot-item-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let root_manifest = outputs_dir.path().join("root.json5");
+    let consumer_manifest = outputs_dir.path().join("consumer.json5");
+    let provider_manifest = outputs_dir.path().join("provider.json5");
+
+    fs::write(
+        &consumer_manifest,
+        r#"{
+  manifest_version: "0.3.0",
+  program: {
+    path: "/usr/bin/env",
+    args: [
+      "consumer",
+      {
+        each: "slots.upstream",
+        argv: ["--upstream", "${item.url}"]
+      }
+    ],
+    env: {
+      UPSTREAMS: {
+        each: "slots.upstream",
+        value: "${item.url}",
+        join: ","
+      }
+    },
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  slots: {
+    upstream: { kind: "http", optional: true, multiple: true }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"#,
+    )
+    .expect("failed to write consumer manifest");
+    fs::write(
+        &provider_manifest,
+        r#"{
+  manifest_version: "0.3.0",
+  program: {
+    path: "/usr/bin/env",
+    args: ["provider"],
+    network: {
+      endpoints: [
+        { name: "api", port: 8081, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    api: { kind: "http", endpoint: "api" }
+  },
+  exports: {
+    api: "api"
+  }
+}
+"#,
+    )
+    .expect("failed to write provider manifest");
+    fs::write(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  components: {
+    consumer: "./consumer.json5",
+    provider: "./provider.json5"
+  },
+  bindings: [
+    { to: "#consumer.upstream", from: "#provider.api" }
+  ],
+  exports: {
+    http: "#consumer.http"
+  }
+}
+"##,
+    )
+    .expect("failed to write root manifest");
+
+    let direct_out = outputs_dir.path().join("direct");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&direct_out)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    assert!(
+        output.status.success(),
+        "amber compile --direct failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan_path = direct_out.join("direct-plan.json");
+    let plan: Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("failed to read direct plan"))
+            .expect("direct plan should contain valid JSON");
+    let components = plan["components"]
+        .as_array()
+        .expect("direct plan components should be an array");
+    let consumer = components
+        .iter()
+        .find(|component| component["moniker"].as_str() == Some("/consumer"))
+        .expect("consumer component should exist");
+    let consumer_scope = consumer["id"]
+        .as_u64()
+        .expect("consumer component id should be present") as u64;
+    let execution = &consumer["program"]["execution"];
+    let template_spec_b64 = execution["template_spec_b64"]
+        .as_str()
+        .expect("helper plan should include a template spec");
+    let spec_bytes = STANDARD
+        .decode(template_spec_b64)
+        .expect("template spec should be valid base64");
+    let spec: TemplateSpec =
+        serde_json::from_slice(&spec_bytes).expect("template spec should be valid JSON");
+
+    assert_eq!(
+        spec.program.entrypoint,
+        vec![
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("/usr/bin/env")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("consumer")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("--upstream")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::item(
+                consumer_scope,
+                "upstream",
+                0,
+                "url",
+            )]),
+        ]
+    );
+    assert_eq!(
+        spec.program.env.get("UPSTREAMS"),
+        Some(&ProgramEnvTemplate::Value(vec![TemplatePart::item(
+            consumer_scope,
+            "upstream",
+            0,
+            "url",
+        )]))
+    );
+
+    let scope_key = consumer_scope.to_string();
+    let slot_items = plan["runtime_addresses"]["slot_items_by_scope"][scope_key.as_str()]
+        ["upstream"]
+        .as_array()
+        .expect("slot items should be present");
+    assert_eq!(slot_items.len(), 1);
+}
+
+#[test]
+fn compile_direct_preserves_authored_order_signal_for_mixed_source_repeated_slots() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("direct-mixed-source-repeated-slot-order-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let root_manifest = outputs_dir.path().join("root.json5");
+    let consumer_manifest = outputs_dir.path().join("consumer.json5");
+    let provider_manifest = outputs_dir.path().join("provider.json5");
+
+    fs::write(
+        &consumer_manifest,
+        r#"{
+  manifest_version: "0.3.0",
+  program: {
+    path: "/usr/bin/env",
+    args: [
+      {
+        each: "slots.upstream",
+        argv: ["--upstream", "${item.url}"]
+      }
+    ],
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  slots: {
+    upstream: { kind: "http", optional: true, multiple: true }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"#,
+    )
+    .expect("failed to write consumer manifest");
+    fs::write(
+        &provider_manifest,
+        r#"{
+  manifest_version: "0.3.0",
+  program: {
+    path: "/usr/bin/env",
+    args: ["provider"],
+    network: {
+      endpoints: [
+        { name: "api", port: 8081, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    api: { kind: "http", endpoint: "api" }
+  },
+  exports: {
+    api: "api"
+  }
+}
+"#,
+    )
+    .expect("failed to write provider manifest");
+    fs::write(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  components: {
+    consumer: "./consumer.json5",
+    provider: "./provider.json5"
+  },
+  slots: {
+    upstream: { kind: "http", optional: true }
+  },
+  bindings: [
+    { to: "#consumer.upstream", from: "self.upstream", weak: true },
+    { to: "#consumer.upstream", from: "#provider.api" }
+  ],
+  exports: {
+    http: "#consumer.http"
+  }
+}
+"##,
+    )
+    .expect("failed to write root manifest");
+
+    let direct_out = outputs_dir.path().join("direct");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&direct_out)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    assert!(
+        output.status.success(),
+        "amber compile --direct failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan_path = direct_out.join("direct-plan.json");
+    let plan: Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("failed to read direct plan"))
+            .expect("direct plan should contain valid JSON");
+    let provision_plan_path = direct_out.join(
+        plan["mesh_provision_plan"]
+            .as_str()
+            .expect("mesh provision plan path should exist"),
+    );
+    let provision_plan: Value = serde_json::from_str(
+        &fs::read_to_string(&provision_plan_path).expect("failed to read mesh provision plan"),
+    )
+    .expect("mesh provision plan should be valid JSON");
+    let consumer_target = provision_plan["targets"]
+        .as_array()
+        .expect("mesh provision targets should be present")
+        .iter()
+        .find(|target| {
+            target["kind"].as_str() == Some("component")
+                && target["config"]["identity"]["id"].as_str() == Some("/consumer")
+        })
+        .expect("consumer provision target should exist");
+    let outbound = consumer_target["config"]["outbound"]
+        .as_array()
+        .expect("outbound routes should be present");
+    let component_route = outbound
+        .iter()
+        .find(|route| {
+            route["slot"].as_str() == Some("upstream")
+                && route["peer_id"].as_str() == Some("/provider")
+        })
+        .expect("component route should exist");
+    let external_route = outbound
+        .iter()
+        .find(|route| {
+            route["slot"].as_str() == Some("upstream")
+                && route["peer_id"].as_str() == Some("/router/direct")
+        })
+        .expect("external route should exist");
+    let component_port = component_route["listen_port"]
+        .as_u64()
+        .expect("component route listen_port should exist");
+    let external_port = external_route["listen_port"]
+        .as_u64()
+        .expect("external route listen_port should exist");
+    assert!(
+        external_port < component_port,
+        "authored external binding should keep the first placeholder port, got external={} \
+         component={}",
+        external_port,
+        component_port
+    );
+}
+
+#[test]
+fn compile_direct_assigns_distinct_ports_to_duplicate_repeated_bindings() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("direct-duplicate-repeated-bindings-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let root_manifest = outputs_dir.path().join("root.json5");
+    let consumer_manifest = outputs_dir.path().join("consumer.json5");
+    let provider_manifest = outputs_dir.path().join("provider.json5");
+
+    fs::write(
+        &consumer_manifest,
+        r#"{
+  manifest_version: "0.3.0",
+  program: {
+    path: "/usr/bin/env",
+    args: [
+      {
+        each: "slots.upstream",
+        argv: ["--upstream", "${item.url}"]
+      }
+    ],
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  slots: {
+    upstream: { kind: "http", optional: true, multiple: true }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"#,
+    )
+    .expect("failed to write consumer manifest");
+    fs::write(
+        &provider_manifest,
+        r#"{
+  manifest_version: "0.3.0",
+  program: {
+    path: "/usr/bin/env",
+    args: ["provider"],
+    network: {
+      endpoints: [
+        { name: "api", port: 8081, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    api: { kind: "http", endpoint: "api" }
+  },
+  exports: {
+    api: "api"
+  }
+}
+"#,
+    )
+    .expect("failed to write provider manifest");
+    fs::write(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  components: {
+    consumer: "./consumer.json5",
+    provider: "./provider.json5"
+  },
+  bindings: [
+    { to: "#consumer.upstream", from: "#provider.api" },
+    { to: "#consumer.upstream", from: "#provider.api" }
+  ],
+  exports: {
+    http: "#consumer.http"
+  }
+}
+"##,
+    )
+    .expect("failed to write root manifest");
+
+    let direct_out = outputs_dir.path().join("direct");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&direct_out)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    assert!(
+        output.status.success(),
+        "amber compile --direct failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan_path = direct_out.join("direct-plan.json");
+    let plan: Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).expect("failed to read direct plan"))
+            .expect("direct plan should contain valid JSON");
+    let components = plan["components"]
+        .as_array()
+        .expect("direct plan components should be an array");
+    let consumer = components
+        .iter()
+        .find(|component| component["moniker"].as_str() == Some("/consumer"))
+        .expect("consumer component should exist");
+    let provision_plan_path = direct_out.join(
+        plan["mesh_provision_plan"]
+            .as_str()
+            .expect("mesh provision plan path should exist"),
+    );
+    let provision_plan: Value = serde_json::from_str(
+        &fs::read_to_string(&provision_plan_path).expect("failed to read mesh provision plan"),
+    )
+    .expect("mesh provision plan should be valid JSON");
+    let consumer_target = provision_plan["targets"]
+        .as_array()
+        .expect("mesh provision targets should be present")
+        .iter()
+        .find(|target| {
+            target["kind"].as_str() == Some("component")
+                && target["config"]["identity"]["id"].as_str() == Some("/consumer")
+        })
+        .expect("consumer provision target should exist");
+    let ports: Vec<u64> = consumer_target["config"]["outbound"]
+        .as_array()
+        .expect("outbound routes should be present")
+        .iter()
+        .filter(|route| route["slot"].as_str() == Some("upstream"))
+        .map(|route| {
+            route["listen_port"]
+                .as_u64()
+                .expect("outbound listen_port should exist")
+        })
+        .collect();
+    assert_eq!(ports.len(), 2);
+    assert_ne!(
+        ports[0], ports[1],
+        "duplicate repeated bindings need distinct ports"
+    );
+
+    let consumer_scope = consumer["id"]
+        .as_u64()
+        .expect("consumer component id should be present")
+        .to_string();
+    let slot_items = plan["runtime_addresses"]["slot_items_by_scope"][consumer_scope.as_str()]
+        ["upstream"]
+        .as_array()
+        .expect("slot items should be present");
+    assert_eq!(slot_items.len(), 2);
+}
+
+#[test]
 fn compile_direct_resolves_relative_program_path_into_direct_plan() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1350,6 +2014,151 @@ fn compile_direct_rejects_invalid_scenario_ir_before_backend_lowering() {
             && stderr.contains("external slot source")
             && stderr.contains("targets missing slot"),
         "expected invalid Scenario IR rejection in stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn compile_direct_rejects_scenario_ir_repeated_each_on_singular_slot() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("direct-ir-singular-each-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let root_manifest = outputs_dir.path().join("root.json5");
+    let consumer_manifest = outputs_dir.path().join("consumer.json5");
+    let provider_manifest = outputs_dir.path().join("provider.json5");
+
+    fs::write(
+        &consumer_manifest,
+        r#"{
+  manifest_version: "0.3.0",
+  program: {
+    path: "/usr/bin/env",
+    args: ["consumer"],
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  slots: {
+    api: { kind: "http", optional: true }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"#,
+    )
+    .expect("failed to write consumer manifest");
+    fs::write(
+        &provider_manifest,
+        r#"{
+  manifest_version: "0.3.0",
+  program: {
+    path: "/usr/bin/env",
+    args: ["provider"],
+    network: {
+      endpoints: [
+        { name: "api", port: 8081, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    api: { kind: "http", endpoint: "api" }
+  },
+  exports: {
+    api: "api"
+  }
+}
+"#,
+    )
+    .expect("failed to write provider manifest");
+    fs::write(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  components: {
+    consumer: "./consumer.json5",
+    provider: "./provider.json5"
+  },
+  bindings: [
+    { to: "#consumer.api", from: "#provider.api" }
+  ],
+  exports: {
+    http: "#consumer.http"
+  }
+}
+"##,
+    )
+    .expect("failed to write root manifest");
+
+    let ir_path = outputs_dir.path().join("scenario.json");
+    let ir_compile = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--output")
+        .arg(&ir_path)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to compile Scenario IR: {err}"));
+    assert!(
+        ir_compile.status.success(),
+        "amber compile --output failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        ir_compile.status,
+        String::from_utf8_lossy(&ir_compile.stdout),
+        String::from_utf8_lossy(&ir_compile.stderr)
+    );
+
+    let mut ir: Value =
+        serde_json::from_str(&fs::read_to_string(&ir_path).expect("failed to read Scenario IR"))
+            .expect("Scenario IR should be valid JSON");
+    let components = ir["components"]
+        .as_array_mut()
+        .expect("Scenario IR components should be an array");
+    let consumer = components
+        .iter_mut()
+        .find(|component| component["moniker"].as_str() == Some("/consumer"))
+        .expect("consumer component should exist");
+    consumer["program"]["args"] = serde_json::json!([
+        {
+            "each": "slots.api",
+            "arg": "${item.url}"
+        }
+    ]);
+    let invalid_ir_path = outputs_dir.path().join("scenario-invalid-each.json");
+    fs::write(
+        &invalid_ir_path,
+        serde_json::to_vec_pretty(&ir).expect("Scenario IR should serialize"),
+    )
+    .expect("failed to write invalid Scenario IR");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(outputs_dir.path().join("direct"))
+        .arg(&invalid_ir_path)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    assert!(
+        !output.status.success(),
+        "amber compile --direct unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("slot `api`")
+            && stderr.contains("not declared with `multiple")
+            && stderr.contains("/consumer"),
+        "expected singular repeated-each rejection in stderr, got:\n{stderr}"
     );
 }
 

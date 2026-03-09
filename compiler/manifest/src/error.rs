@@ -35,6 +35,10 @@ pub enum Error {
     #[diagnostic(code(manifest::invalid_when_path))]
     InvalidWhenPath { input: String, message: String },
 
+    #[error("invalid `each` path `{input}`: {message}")]
+    #[diagnostic(code(manifest::invalid_each_path))]
+    InvalidEachPath { input: String, message: String },
+
     #[error("invalid component ref `{input}`: {message}")]
     #[diagnostic(code(manifest::invalid_component_ref))]
     InvalidComponentRef { input: String, message: String },
@@ -92,10 +96,6 @@ pub enum Error {
     #[error("binding target `{to}.{slot}` is bound more than once")]
     #[diagnostic(code(manifest::duplicate_binding_target))]
     DuplicateBindingTarget { to: String, slot: String },
-
-    #[error("binding name `{name}` is used more than once")]
-    #[diagnostic(code(manifest::duplicate_binding_name))]
-    DuplicateBindingName { name: String },
 
     #[error("binding references unknown child `#{child}`")]
     #[diagnostic(code(manifest::unknown_binding_child))]

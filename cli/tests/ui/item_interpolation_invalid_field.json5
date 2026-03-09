@@ -1,0 +1,26 @@
+{
+  manifest_version: "0.3.0",
+  program: {
+    path: "/bin/echo",
+    args: [
+      {
+        each: "slots.api",
+        argv: ["${item.blabla}"],
+      },
+    ],
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" },
+      ],
+    },
+  },
+  slots: {
+    api: { kind: "http", optional: true, multiple: true },
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" },
+  },
+  exports: {
+    http: "http",
+  },
+}

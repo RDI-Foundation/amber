@@ -500,63 +500,56 @@ fn binding_sugar_forms_parse() {
     .parse()
     .unwrap();
 
-    let expected = BTreeMap::from([
-        (
-            BindingTarget::ChildSlot {
+    let expected = vec![
+        ManifestBinding {
+            target: BindingTarget::ChildSlot {
                 child: ChildName::try_from("a").unwrap(),
                 slot: SlotName::try_from("s").unwrap(),
             },
-            Binding {
-                name: None,
+            binding: Binding {
                 from: BindingSource::ChildExport {
                     child: ChildName::try_from("b").unwrap(),
                     export: ExportName::try_from("c").unwrap(),
                 },
                 weak: false,
             },
-        ),
-        (
-            BindingTarget::ChildSlot {
+        },
+        ManifestBinding {
+            target: BindingTarget::ChildSlot {
+                child: ChildName::try_from("a").unwrap(),
+                slot: SlotName::try_from("s").unwrap(),
+            },
+            binding: Binding {
+                from: BindingSource::ChildExport {
+                    child: ChildName::try_from("b").unwrap(),
+                    export: ExportName::try_from("c").unwrap(),
+                },
+                weak: false,
+            },
+        },
+        ManifestBinding {
+            target: BindingTarget::ChildSlot {
                 child: ChildName::try_from("a").unwrap(),
                 slot: SlotName::try_from("t").unwrap(),
             },
-            Binding {
-                name: None,
+            binding: Binding {
                 from: BindingSource::SelfProvide(ProvideName::try_from("d").unwrap()),
                 weak: false,
             },
-        ),
-    ]);
+        },
+        ManifestBinding {
+            target: BindingTarget::ChildSlot {
+                child: ChildName::try_from("a").unwrap(),
+                slot: SlotName::try_from("t").unwrap(),
+            },
+            binding: Binding {
+                from: BindingSource::SelfProvide(ProvideName::try_from("d").unwrap()),
+                weak: false,
+            },
+        },
+    ];
 
     assert_eq!(m.bindings, expected);
-}
-
-#[test]
-fn binding_name_is_parsed() {
-    let m: Manifest = r##"
-        {
-          manifest_version: "0.1.0",
-          components: {
-            a: "https://example.com/a",
-            b: "https://example.com/b",
-          },
-          bindings: [
-            { name: "link", to: "#a.s", from: "#b.c" },
-          ],
-        }
-        "##
-    .parse()
-    .unwrap();
-
-    let target = BindingTarget::ChildSlot {
-        child: ChildName::try_from("a").unwrap(),
-        slot: SlotName::try_from("s").unwrap(),
-    };
-    let binding = m.bindings.get(&target).expect("binding");
-    assert_eq!(
-        binding.name.as_ref().map(|name| name.as_str()),
-        Some("link")
-    );
 }
 
 #[test]
@@ -630,64 +623,6 @@ fn binding_missing_capability_errors() {
 }
 
 #[test]
-fn binding_dot_names_are_rejected_in_dot_form() {
-    let err = r#"
-        {
-          manifest_version: "0.1.0",
-          bindings: [
-            { to: "\#a.s", from: "self.c.d" },
-          ],
-        }
-        "#
-    .parse::<Manifest>()
-    .unwrap_err();
-
-    assert!(err.to_string().contains("binding names cannot contain `.`"));
-}
-
-#[test]
-fn binding_dot_names_are_rejected_in_explicit_form() {
-    let err = r#"
-        {
-          manifest_version: "0.1.0",
-          bindings: [
-            { to: "\#a", slot: "s.t", from: "self", capability: "c" },
-          ],
-        }
-        "#
-    .parse::<Manifest>()
-    .unwrap_err();
-
-    assert!(err.to_string().contains("binding names cannot contain `.`"));
-}
-
-#[test]
-fn binding_name_cannot_contain_dots() {
-    let err = r##"
-        {
-          manifest_version: "0.1.0",
-          components: {
-            a: "https://example.com/a",
-            b: "https://example.com/b",
-          },
-          bindings: [
-            { name: "bad.name", to: "#a.s", from: "#b.c" },
-          ],
-        }
-        "##
-    .parse::<Manifest>()
-    .unwrap_err();
-
-    match err {
-        Error::InvalidName { kind, name } => {
-            assert_eq!(kind, "binding");
-            assert_eq!(name, "bad.name");
-        }
-        other => panic!("expected InvalidName error, got: {other}"),
-    }
-}
-
-#[test]
 fn binding_mixed_form_is_rejected() {
     let err = r##"
         {
@@ -726,7 +661,7 @@ fn binding_round_trip_through_canonical_json_parses() {
             c: { kind: "http", endpoint: "endpoint" },
           },
           bindings: [
-            { name: "link", to: "#a.s", from: "self.c" },
+            { to: "#a.s", from: "self.c" },
           ],
         }
         "##
@@ -807,7 +742,7 @@ fn binding_from_self_slot_is_allowed() {
         child: ChildName::try_from("child").unwrap(),
         slot: SlotName::try_from("api").unwrap(),
     };
-    let binding = manifest.bindings().get(&target).expect("binding");
+    let binding = find_binding(&manifest, &target);
     assert!(matches!(binding.from, BindingSource::SelfSlot(_)));
 }
 
@@ -913,7 +848,7 @@ fn binding_from_framework_docker_is_allowed_with_experimental_feature() {
         child: ChildName::try_from("child").unwrap(),
         slot: SlotName::try_from("worker").unwrap(),
     };
-    let binding = manifest.bindings().get(&target).expect("binding");
+    let binding = find_binding(&manifest, &target);
     let BindingSource::Framework(name) = &binding.from else {
         panic!("expected framework binding source");
     };
@@ -1961,40 +1896,20 @@ fn binding_target_cannot_be_multiplexed() {
         }
         "##,
     );
-    let err = raw.validate().unwrap_err();
-
-    match err {
-        Error::DuplicateBindingTarget { to, slot } => {
-            assert_eq!(to, "#a");
-            assert_eq!(slot, "s");
-        }
-        other => panic!("expected DuplicateBindingTarget error, got: {other}"),
-    }
-}
-
-#[test]
-fn binding_name_must_be_unique() {
-    let raw = parse_raw(
-        r##"
-        {
-          manifest_version: "0.1.0",
-          components: {
-            a: "https://example.com/a",
-            b: "https://example.com/b",
-          },
-          bindings: [
-            { name: "dup", to: "#a.s", from: "#b.c" },
-            { name: "dup", to: "#a.t", from: "#b.d" },
-          ],
-        }
-        "##,
+    let manifest = raw
+        .validate()
+        .expect("manifest should preserve duplicate targets");
+    assert_eq!(manifest.bindings().len(), 2);
+    let target = BindingTarget::ChildSlot {
+        child: ChildName::try_from("a").unwrap(),
+        slot: SlotName::try_from("s").unwrap(),
+    };
+    assert!(
+        manifest
+            .bindings()
+            .iter()
+            .all(|binding| binding.target == target)
     );
-    let err = raw.validate().unwrap_err();
-
-    match err {
-        Error::DuplicateBindingName { name } => assert_eq!(name, "dup"),
-        other => panic!("expected DuplicateBindingName error, got: {other}"),
-    }
 }
 
 #[test]
@@ -2017,40 +1932,47 @@ fn binding_source_can_be_multiplexed() {
 
     let m = raw.validate().unwrap();
 
-    let expected = BTreeMap::from([
-        (
-            BindingTarget::ChildSlot {
+    let expected = vec![
+        ManifestBinding {
+            target: BindingTarget::ChildSlot {
                 child: ChildName::try_from("a").unwrap(),
                 slot: SlotName::try_from("s1").unwrap(),
             },
-            Binding {
-                name: None,
+            binding: Binding {
                 from: BindingSource::ChildExport {
                     child: ChildName::try_from("b").unwrap(),
                     export: ExportName::try_from("c").unwrap(),
                 },
                 weak: false,
             },
-        ),
-        (
-            BindingTarget::ChildSlot {
+        },
+        ManifestBinding {
+            target: BindingTarget::ChildSlot {
                 child: ChildName::try_from("a").unwrap(),
                 slot: SlotName::try_from("s2").unwrap(),
             },
-            Binding {
-                name: None,
+            binding: Binding {
                 from: BindingSource::ChildExport {
                     child: ChildName::try_from("b").unwrap(),
                     export: ExportName::try_from("c").unwrap(),
                 },
                 weak: false,
             },
-        ),
-    ]);
+        },
+    ];
 
     assert_eq!(m.bindings, expected);
 }
 
 fn parse_raw(input: &str) -> RawManifest {
     amber_json5::parse(input).unwrap()
+}
+
+fn find_binding<'a>(manifest: &'a Manifest, target: &BindingTarget) -> &'a Binding {
+    manifest
+        .bindings()
+        .iter()
+        .find(|binding| &binding.target == target)
+        .map(|binding| &binding.binding)
+        .expect("binding")
 }

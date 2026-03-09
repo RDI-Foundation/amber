@@ -13,7 +13,7 @@ enum MissingConfigBehavior {
 
 pub fn template_string_is_runtime(ts: &TemplateString) -> bool {
     ts.iter()
-        .any(|p| p.is_config() || p.is_slot() || p.is_binding())
+        .any(|p| p.is_config() || p.is_slot() || p.is_item())
 }
 
 pub fn stringify_for_interpolation(v: &Value) -> Result<String> {
@@ -247,20 +247,53 @@ fn render_template_string_with_behavior(
                     })?;
                 out.push_str(value);
             }
-            TemplatePart::Binding { binding, scope } => {
-                let value = runtime_context
-                    .bindings_by_scope
+            TemplatePart::Item {
+                item: path,
+                scope,
+                slot,
+                index,
+            } => {
+                let item = runtime_context
+                    .slot_items_by_scope
                     .get(scope)
-                    .and_then(|bindings| bindings.get(binding))
+                    .and_then(|slots| slots.get(slot))
+                    .and_then(|items| items.get(*index))
                     .ok_or_else(|| {
                         ConfigError::interp(format!(
-                            "binding interpolation bindings.{binding} cannot be rendered at \
-                             runtime for scope {scope}"
+                            "item interpolation item.{path} cannot be rendered at runtime for \
+                             scope {scope}, slot {slot}, item {index}"
                         ))
                     })?;
-                out.push_str(value);
+                let item = serde_json::to_value(item).map_err(|err| {
+                    ConfigError::interp(format!(
+                        "failed to serialize runtime slot item for scope {scope}, slot {slot}, \
+                         item {index}: {err}"
+                    ))
+                })?;
+                let value = query_value_opt(&item, path).ok_or_else(|| {
+                    ConfigError::interp(format!(
+                        "item.{path} not found in runtime slot item for scope {scope}, slot \
+                         {slot}, item {index}"
+                    ))
+                })?;
+                out.push_str(&stringify_for_interpolation(value)?);
             }
         }
     }
     Ok(Some(out))
+}
+
+fn query_value_opt<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
+    if path.is_empty() {
+        return Some(root);
+    }
+
+    let mut current = root;
+    for segment in path.split('.') {
+        match current {
+            Value::Object(map) => current = map.get(segment)?,
+            _ => return None,
+        }
+    }
+    Some(current)
 }

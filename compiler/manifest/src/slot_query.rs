@@ -168,6 +168,7 @@ mod tests {
                 profile: None,
             },
             optional: false,
+            multiple: false,
         };
 
         let query = parse_slot_query("api.url").unwrap();

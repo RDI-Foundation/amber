@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, HashSet},
     fs,
     future::Future,
     io::{Read as _, Write as _},
@@ -15,7 +15,7 @@ use std::{
 
 use amber_manifest::{Manifest, ManifestRef};
 use amber_resolver::{Backend, RemoteResolver, Resolution, Resolver};
-use amber_scenario::{BindingFrom, ComponentId, graph};
+use amber_scenario::{BindingFrom, graph};
 use base64::Engine as _;
 use miette::{Diagnostic, Severity};
 use tempfile::TempDir;
@@ -27,9 +27,7 @@ use crate::{
         BUNDLE_INDEX_NAME, BUNDLE_SCHEMA, BUNDLE_VERSION, BundleBuilder, BundleIndex, BundleLoader,
         BundleRequest,
     },
-    reporter::{
-        Reporter as _, docker_compose::DockerComposeReporter, scenario_ir::ScenarioIrReporter,
-    },
+    reporter::{Reporter as _, scenario_ir::ScenarioIrReporter},
 };
 
 fn error_contains(err: &crate::Error, needle: &str) -> bool {
@@ -73,80 +71,6 @@ fn optimized_compile_options() -> CompileOptions {
 fn compiled_scenario(output: &crate::CompileOutput) -> crate::reporter::CompiledScenario {
     crate::reporter::CompiledScenario::from_compile_output(output)
         .expect("test compiler output should convert to compiled Scenario")
-}
-
-fn component_moniker(scenario: &amber_scenario::Scenario, id: ComponentId) -> String {
-    scenario
-        .components
-        .get(id.0)
-        .and_then(|component| component.as_ref())
-        .map(|component| component.moniker.as_str().to_string())
-        .unwrap_or_else(|| format!("#{}", id.0))
-}
-
-fn binding_source_label(scenario: &amber_scenario::Scenario, from: &BindingFrom) -> String {
-    match from {
-        BindingFrom::Component(provide) => {
-            format!(
-                "{}.{}",
-                component_moniker(scenario, provide.component),
-                provide.name
-            )
-        }
-        BindingFrom::Resource(resource) => {
-            format!(
-                "resources:{}:{}",
-                component_moniker(scenario, resource.component),
-                resource.name
-            )
-        }
-        BindingFrom::External(slot) => {
-            format!(
-                "external:{}.{}",
-                component_moniker(scenario, slot.component),
-                slot.name
-            )
-        }
-        BindingFrom::Framework(name) => format!("framework.{name}"),
-    }
-}
-
-fn binding_resolution_signature(scenario: &amber_scenario::Scenario) -> BTreeMap<String, String> {
-    let usage = crate::binding_usage::collect_binding_usage(scenario);
-    let mut out = BTreeMap::new();
-
-    for (&scope, names) in usage.iter() {
-        let scope_label = component_moniker(scenario, scope);
-        for name in names {
-            let mut sources: BTreeSet<String> = BTreeSet::new();
-
-            for binding in &scenario.bindings {
-                if binding.to.component == scope && binding.name.as_deref() == Some(name.as_str()) {
-                    sources.insert(binding_source_label(scenario, &binding.from));
-                }
-            }
-
-            if sources.is_empty()
-                && let Some(component) = scenario.components.get(scope.0).and_then(|c| c.as_ref())
-                && let Some(slot_ref) = component.binding_decls.get(name)
-            {
-                for binding in &scenario.bindings {
-                    if binding.to == *slot_ref {
-                        sources.insert(binding_source_label(scenario, &binding.from));
-                    }
-                }
-            }
-
-            let value = if sources.is_empty() {
-                "<missing>".to_string()
-            } else {
-                sources.into_iter().collect::<Vec<_>>().join(",")
-            };
-            out.insert(format!("{scope_label}::{name}"), value);
-        }
-    }
-
-    out
 }
 
 fn has_diagnostic_code(diagnostics: &[miette::Report], code: &str) -> bool {
@@ -667,6 +591,79 @@ async fn binding_rejects_missing_child_slot() {
 }
 
 #[tokio::test]
+async fn binding_rejects_duplicate_target_for_singular_child_slot() {
+    let dir = tmp_dir("scenario-duplicate-singular-binding");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+    let provider_a_path = dir.path().join("provider-a.json5");
+    let provider_b_path = dir.path().join("provider-b.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "child",
+            entrypoint: ["child"],
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          slots: { api: { kind: "http" } },
+        }
+        "#,
+    );
+    for provider_path in [&provider_a_path, &provider_b_path] {
+        write_file(
+            provider_path,
+            r#"
+            {
+              manifest_version: "0.1.0",
+              program: {
+                image: "provider",
+                entrypoint: ["provider"],
+                network: { endpoints: [{ name: "api", port: 80 }] },
+              },
+              provides: { api: { kind: "http", endpoint: "api" } },
+              exports: { api: "api" },
+            }
+            "#,
+        );
+    }
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              components: {{
+                child: "{child}",
+                provider_a: "{provider_a}",
+                provider_b: "{provider_b}",
+              }},
+              bindings: [
+                {{ to: "#child.api", from: "#provider_a.api" }},
+                {{ to: "#child.api", from: "#provider_b.api" }},
+              ],
+            }}
+            "##,
+            child = file_url(&child_path),
+            provider_a = file_url(&provider_a_path),
+            provider_b = file_url(&provider_b_path),
+        ),
+    );
+
+    let compiler = default_compiler();
+    let root_ref = manifest_ref_for_path(&root_path);
+
+    let err = compiler
+        .compile(root_ref, standard_compile_options())
+        .await
+        .unwrap_err();
+
+    assert!(error_contains(&err, "bound more than once"));
+}
+
+#[tokio::test]
 async fn config_validation_error_points_to_invalid_value() {
     use miette::Diagnostic;
 
@@ -739,744 +736,6 @@ async fn config_validation_error_points_to_invalid_value() {
     let offset = root_source.find("\"bad\"").unwrap();
     assert_eq!(label.offset(), offset);
     assert_eq!(label.len(), "\"bad\"".len());
-}
-
-#[tokio::test]
-async fn binding_interpolation_error_points_to_config_value() {
-    use miette::Diagnostic;
-
-    let dir = tmp_dir("scenario-binding-config-span");
-    let root_path = dir.path().join("root.json5");
-    let child_path = dir.path().join("child.json5");
-
-    write_file(
-        &child_path,
-        r#"
-        {
-          manifest_version: "0.1.0",
-          config_schema: {
-            type: "object",
-            properties: {
-              url: { type: "string" },
-            },
-            required: ["url"],
-            additionalProperties: false,
-          },
-          program: {
-            image: "alpine:3.20",
-            entrypoint: ["child"],
-            env: {
-              URL: "${config.url}",
-            },
-          },
-        }
-        "#,
-    );
-
-    let root_source = format!(
-        r##"
-        {{
-          manifest_version: "0.1.0",
-          components: {{
-            child: {{
-              manifest: "{child}",
-              config: {{ url: "${{bindings.missing.url}}" }},
-            }},
-          }},
-        }}
-        "##,
-        child = file_url(&child_path),
-    );
-    write_file(&root_path, &root_source);
-
-    let compiler = default_compiler();
-    let root_ref = manifest_ref_for_path(&root_path);
-    let output = compiler
-        .check(root_ref, standard_compile_options())
-        .await
-        .unwrap();
-
-    let report = output
-        .diagnostics
-        .iter()
-        .find(|report| {
-            let diag: &dyn Diagnostic = &***report;
-            diag.code()
-                .is_some_and(|c| c.to_string() == "compiler::invalid_bindings_interpolation")
-        })
-        .expect("expected invalid_bindings_interpolation diagnostic");
-    let diag: &dyn Diagnostic = &**report;
-    let labels: Vec<_> = diag
-        .labels()
-        .expect("binding interpolation diagnostic should include a label")
-        .collect();
-    assert_eq!(labels.len(), 1);
-
-    let label = &labels[0];
-    let needle = "\"${bindings.missing.url}\"";
-    let offset = root_source.find(needle).unwrap();
-    assert_eq!(label.offset(), offset);
-    assert_eq!(label.len(), needle.len());
-}
-
-#[tokio::test]
-async fn named_binding_resolution_is_stable_across_opt_modes() {
-    let cases = [("program-binding", true), ("config-binding", false)];
-
-    for (label, is_program_case) in cases {
-        let dir = tmp_dir(&format!("binding-opt-parity-{label}"));
-        let root_path = dir.path().join("root.json5");
-        let provider_path = dir.path().join("provider.json5");
-        let consumer_path = dir.path().join("consumer.json5");
-
-        if is_program_case {
-            let program_path = dir.path().join("program.json5");
-            write_file(
-                &program_path,
-                r#"
-                {
-                  manifest_version: "0.1.0",
-                  program: {
-                    image: "alpine:3.20",
-                    entrypoint: ["sleep", "infinity"],
-                    env: {
-                      AGENT_URL: "${bindings.agent.url}",
-                    },
-                    network: {
-                      endpoints: [{ name: "app", port: 8080 }],
-                    },
-                  },
-                  slots: {
-                    agent: { kind: "a2a" },
-                  },
-                  provides: {
-                    app: { kind: "http", endpoint: "app" },
-                  },
-                  exports: {
-                    app: "app",
-                  },
-                }
-                "#,
-            );
-            write_file(
-                &consumer_path,
-                &format!(
-                    r##"
-                    {{
-                      manifest_version: "0.1.0",
-                      components: {{
-                        program: "{program}",
-                      }},
-                      slots: {{
-                        agent: {{ kind: "a2a" }},
-                      }},
-                      bindings: [
-                        {{ name: "agent", to: "#program.agent", from: "self.agent" }},
-                      ],
-                      exports: {{
-                        app: "#program.app",
-                      }},
-                    }}
-                    "##,
-                    program = file_url(&program_path),
-                ),
-            );
-            write_file(
-                &provider_path,
-                r#"
-                {
-                  manifest_version: "0.1.0",
-                  program: {
-                    image: "alpine:3.20",
-                    entrypoint: ["sleep", "infinity"],
-                    network: {
-                      endpoints: [{ name: "a2a", port: 9000 }],
-                    },
-                  },
-                  provides: {
-                    a2a: { kind: "a2a", endpoint: "a2a" },
-                  },
-                  exports: {
-                    a2a: "a2a",
-                  },
-                }
-                "#,
-            );
-            write_file(
-                &root_path,
-                &format!(
-                    r##"
-                    {{
-                      manifest_version: "0.1.0",
-                      components: {{
-                        green: "{green}",
-                        agent: "{agent}",
-                      }},
-                      bindings: [
-                        {{ name: "agent", to: "#green.agent", from: "#agent.a2a" }},
-                      ],
-                      exports: {{
-                        app: "#green.app",
-                      }},
-                    }}
-                    "##,
-                    green = file_url(&consumer_path),
-                    agent = file_url(&provider_path),
-                ),
-            );
-        } else {
-            write_file(
-                &provider_path,
-                r#"
-                {
-                  manifest_version: "0.1.0",
-                  program: {
-                    image: "provider",
-                    entrypoint: ["provider"],
-                    network: {
-                      endpoints: [{ name: "api", port: 8080 }],
-                    },
-                  },
-                  provides: {
-                    api: { kind: "http", endpoint: "api" },
-                  },
-                  exports: {
-                    api: "api",
-                  },
-                }
-                "#,
-            );
-            write_file(
-                &consumer_path,
-                r#"
-                {
-                  manifest_version: "0.1.0",
-                  config_schema: {
-                    type: "object",
-                    properties: { url: { type: "string" } },
-                    required: ["url"],
-                    additionalProperties: false,
-                  },
-                  program: {
-                    image: "consumer",
-                    entrypoint: ["consumer"],
-                    env: {
-                      UPSTREAM_URL: "${config.url}",
-                    },
-                    network: {
-                      endpoints: [{ name: "app", port: 8081 }],
-                    },
-                  },
-                  slots: {
-                    api: { kind: "http" },
-                  },
-                  provides: {
-                    app: { kind: "http", endpoint: "app" },
-                  },
-                  exports: {
-                    app: "app",
-                  },
-                }
-                "#,
-            );
-            write_file(
-                &root_path,
-                &format!(
-                    r##"
-                    {{
-                      manifest_version: "0.1.0",
-                      components: {{
-                        provider: "{provider}",
-                        consumer: {{
-                          manifest: "{consumer}",
-                          config: {{
-                            url: "${{bindings.upstream.url}}",
-                          }},
-                        }},
-                      }},
-                      bindings: [
-                        {{ name: "upstream", to: "#consumer.api", from: "#provider.api" }},
-                      ],
-                      exports: {{
-                        app: "#consumer.app",
-                      }},
-                    }}
-                    "##,
-                    provider = file_url(&provider_path),
-                    consumer = file_url(&consumer_path),
-                ),
-            );
-        }
-
-        let compiler = default_compiler();
-        let root_ref = manifest_ref_for_path(&root_path);
-
-        let with_opt = compiler
-            .compile(root_ref.clone(), optimized_compile_options())
-            .await
-            .expect("compile with optimizations");
-        let without_opt = compiler
-            .compile(root_ref, standard_compile_options())
-            .await
-            .expect("compile without optimizations");
-
-        let with_opt_sig = binding_resolution_signature(&with_opt.scenario);
-        let without_opt_sig = binding_resolution_signature(&without_opt.scenario);
-        assert_eq!(
-            with_opt_sig, without_opt_sig,
-            "binding resolution signature changed across opt modes for {label}"
-        );
-        assert!(
-            with_opt_sig.values().all(|value| value != "<missing>"),
-            "missing binding resolution in opt mode for {label}: {with_opt_sig:?}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn non_program_config_binding_resolution_is_stable_across_opt_modes() {
-    let dir = tmp_dir("binding-opt-parity-non-program-config");
-    let root_path = dir.path().join("root.json5");
-    let provider_path = dir.path().join("provider.json5");
-    let realm_path = dir.path().join("realm.json5");
-    let leaf_path = dir.path().join("leaf.json5");
-
-    write_file(
-        &provider_path,
-        r#"
-        {
-          manifest_version: "0.1.0",
-          program: {
-            image: "provider",
-            entrypoint: ["provider"],
-            network: {
-              endpoints: [{ name: "api", port: 8080 }],
-            },
-          },
-          provides: {
-            api: { kind: "http", endpoint: "api" },
-          },
-          exports: {
-            api: "api",
-          },
-        }
-        "#,
-    );
-
-    write_file(
-        &leaf_path,
-        r#"
-        {
-          manifest_version: "0.1.0",
-          config_schema: {
-            type: "object",
-            properties: { upstream_url: { type: "string" } },
-            required: ["upstream_url"],
-            additionalProperties: false,
-          },
-          program: {
-            image: "leaf",
-            entrypoint: ["leaf"],
-            env: {
-              UPSTREAM_URL: "${config.upstream_url}",
-            },
-            network: {
-              endpoints: [{ name: "app", port: 8081 }],
-            },
-          },
-          provides: {
-            app: { kind: "http", endpoint: "app" },
-          },
-          exports: {
-            app: "app",
-          },
-        }
-        "#,
-    );
-
-    write_file(
-        &realm_path,
-        &format!(
-            r##"
-            {{
-              manifest_version: "0.1.0",
-              config_schema: {{
-                type: "object",
-                properties: {{ upstream_url: {{ type: "string" }} }},
-                required: ["upstream_url"],
-                additionalProperties: false,
-              }},
-              components: {{
-                leaf: {{
-                  manifest: "{leaf}",
-                  config: {{
-                    upstream_url: "${{config.upstream_url}}",
-                  }},
-                }},
-              }},
-              slots: {{
-                api: {{ kind: "http" }},
-              }},
-              exports: {{
-                app: "#leaf.app",
-              }},
-            }}
-            "##,
-            leaf = file_url(&leaf_path),
-        ),
-    );
-
-    write_file(
-        &root_path,
-        &format!(
-            r##"
-            {{
-              manifest_version: "0.1.0",
-              components: {{
-                provider: "{provider}",
-                realm: {{
-                  manifest: "{realm}",
-                  config: {{
-                    upstream_url: "${{bindings.upstream.url}}",
-                  }},
-                }},
-              }},
-              bindings: [
-                {{ name: "upstream", to: "#realm.api", from: "#provider.api" }},
-              ],
-              exports: {{
-                app: "#realm.app",
-              }},
-            }}
-            "##,
-            provider = file_url(&provider_path),
-            realm = file_url(&realm_path),
-        ),
-    );
-
-    let compiler = default_compiler();
-    let root_ref = manifest_ref_for_path(&root_path);
-
-    let with_opt = compiler
-        .compile(root_ref.clone(), optimized_compile_options())
-        .await
-        .expect("compile with optimizations");
-    let without_opt = compiler
-        .compile(root_ref, standard_compile_options())
-        .await
-        .expect("compile without optimizations");
-
-    let with_opt_sig = binding_resolution_signature(&with_opt.scenario);
-    let without_opt_sig = binding_resolution_signature(&without_opt.scenario);
-    assert_eq!(
-        with_opt_sig, without_opt_sig,
-        "binding resolution signature changed across opt modes for non-program config holder"
-    );
-    assert!(
-        with_opt_sig.values().all(|value| value != "<missing>"),
-        "missing binding resolution in opt mode for non-program config holder: {with_opt_sig:?}"
-    );
-}
-
-#[tokio::test]
-async fn routing_scope_named_binding_survives_optimization_for_compose_lowering() {
-    let dir = tmp_dir("binding-opt-routing-scope-unnamed-upstream");
-    let root_path = dir.path().join("root.json5");
-    let relay_path = dir.path().join("relay.json5");
-    let leaf_path = dir.path().join("leaf.json5");
-    let provider_path = dir.path().join("provider.json5");
-
-    write_file(
-        &leaf_path,
-        r#"
-        {
-          manifest_version: "0.1.0",
-          config_schema: {
-            type: "object",
-            properties: { upstream_url: { type: "string" } },
-            required: ["upstream_url"],
-            additionalProperties: false,
-          },
-          program: {
-            image: "leaf",
-            entrypoint: ["leaf"],
-            env: {
-              UPSTREAM_URL: "${config.upstream_url}",
-            },
-            network: {
-              endpoints: [{ name: "app", port: 8081 }],
-            },
-          },
-          slots: {
-            up: { kind: "http" },
-          },
-          provides: {
-            app: { kind: "http", endpoint: "app" },
-          },
-          exports: {
-            app: "app",
-          },
-        }
-        "#,
-    );
-
-    write_file(
-        &relay_path,
-        &format!(
-            r##"
-            {{
-              manifest_version: "0.1.0",
-              components: {{
-                leaf: {{
-                  manifest: "{leaf}",
-                  config: {{
-                    upstream_url: "${{bindings.upstream.url}}",
-                  }},
-                }},
-              }},
-              slots: {{
-                up: {{ kind: "http" }},
-              }},
-              bindings: [
-                {{ name: "upstream", to: "#leaf.up", from: "self.up" }},
-              ],
-              exports: {{
-                app: "#leaf.app",
-              }},
-            }}
-            "##,
-            leaf = file_url(&leaf_path),
-        ),
-    );
-
-    write_file(
-        &provider_path,
-        r#"
-        {
-          manifest_version: "0.1.0",
-          program: {
-            image: "provider",
-            entrypoint: ["provider"],
-            network: {
-              endpoints: [{ name: "api", port: 8080 }],
-            },
-          },
-          provides: {
-            api: { kind: "http", endpoint: "api" },
-          },
-          exports: {
-            api: "api",
-          },
-        }
-        "#,
-    );
-
-    write_file(
-        &root_path,
-        &format!(
-            r##"
-            {{
-              manifest_version: "0.1.0",
-              components: {{
-                relay: "{relay}",
-                provider: "{provider}",
-              }},
-              bindings: [
-                {{ to: "#relay.up", from: "#provider.api" }},
-              ],
-              exports: {{
-                app: "#relay.app",
-              }},
-            }}
-            "##,
-            relay = file_url(&relay_path),
-            provider = file_url(&provider_path),
-        ),
-    );
-
-    let compiler = default_compiler();
-    let root_ref = manifest_ref_for_path(&root_path);
-
-    let with_opt = compiler
-        .compile(root_ref.clone(), optimized_compile_options())
-        .await
-        .expect("compile with optimizations");
-    let without_opt = compiler
-        .compile(root_ref, standard_compile_options())
-        .await
-        .expect("compile without optimizations");
-
-    let with_opt_sig = binding_resolution_signature(&with_opt.scenario);
-    let without_opt_sig = binding_resolution_signature(&without_opt.scenario);
-    assert_eq!(
-        with_opt_sig, without_opt_sig,
-        "binding resolution signature changed across opt modes for routing-scope named binding"
-    );
-    assert!(
-        with_opt_sig.values().all(|value| value != "<missing>"),
-        "missing binding resolution in opt mode for routing-scope named binding: {with_opt_sig:?}"
-    );
-
-    DockerComposeReporter
-        .emit(&compiled_scenario(&with_opt))
-        .expect("compose lowering with optimizations");
-    DockerComposeReporter
-        .emit(&compiled_scenario(&without_opt))
-        .expect("compose lowering without optimizations");
-}
-
-#[tokio::test]
-async fn renamed_binding_chain_is_stable_across_opt_modes() {
-    let dir = tmp_dir("binding-opt-parity-rename-chain");
-    let root_path = dir.path().join("root.json5");
-    let middle_path = dir.path().join("middle.json5");
-    let leaf_path = dir.path().join("leaf.json5");
-    let provider_path = dir.path().join("provider.json5");
-
-    write_file(
-        &leaf_path,
-        r#"
-        {
-          manifest_version: "0.1.0",
-          program: {
-            image: "alpine:3.20",
-            entrypoint: ["sleep", "infinity"],
-            env: {
-              AGENT_URL: "${bindings.agent.url}",
-            },
-            network: {
-              endpoints: [{ name: "app", port: 8080 }],
-            },
-          },
-          slots: {
-            up: { kind: "http" },
-          },
-          provides: {
-            app: { kind: "http", endpoint: "app" },
-          },
-          exports: {
-            app: "app",
-          },
-        }
-        "#,
-    );
-
-    write_file(
-        &middle_path,
-        &format!(
-            r##"
-            {{
-              manifest_version: "0.1.0",
-              components: {{
-                leaf: "{leaf}",
-              }},
-              slots: {{
-                up: {{ kind: "http" }},
-              }},
-              bindings: [
-                {{ name: "agent", to: "#leaf.up", from: "self.up" }},
-              ],
-              exports: {{
-                app: "#leaf.app",
-              }},
-            }}
-            "##,
-            leaf = file_url(&leaf_path),
-        ),
-    );
-
-    write_file(
-        &provider_path,
-        r#"
-        {
-          manifest_version: "0.1.0",
-          program: {
-            image: "alpine:3.20",
-            entrypoint: ["sleep", "infinity"],
-            network: {
-              endpoints: [{ name: "api", port: 9000 }],
-            },
-          },
-          provides: {
-            api: { kind: "http", endpoint: "api" },
-          },
-          exports: {
-            api: "api",
-          },
-        }
-        "#,
-    );
-
-    write_file(
-        &root_path,
-        &format!(
-            r##"
-            {{
-              manifest_version: "0.1.0",
-              components: {{
-                middle: "{middle}",
-                provider: "{provider}",
-              }},
-              bindings: [
-                {{ name: "upstream", to: "#middle.up", from: "#provider.api" }},
-              ],
-              exports: {{
-                app: "#middle.app",
-              }},
-            }}
-            "##,
-            middle = file_url(&middle_path),
-            provider = file_url(&provider_path),
-        ),
-    );
-
-    let compiler = default_compiler();
-    let root_ref = manifest_ref_for_path(&root_path);
-
-    let with_opt = compiler
-        .compile(root_ref.clone(), optimized_compile_options())
-        .await
-        .expect("compile with optimizations");
-    let without_opt = compiler
-        .compile(root_ref, standard_compile_options())
-        .await
-        .expect("compile without optimizations");
-
-    assert!(
-        !has_diagnostic_code(
-            &with_opt.diagnostics,
-            "compiler::invalid_bindings_interpolation"
-        ),
-        "invalid bindings interpolation diagnostic in opt mode: {:?}",
-        with_opt
-            .diagnostics
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        !has_diagnostic_code(
-            &without_opt.diagnostics,
-            "compiler::invalid_bindings_interpolation"
-        ),
-        "invalid bindings interpolation diagnostic in non-opt mode: {:?}",
-        without_opt
-            .diagnostics
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-    );
-
-    let with_opt_sig = binding_resolution_signature(&with_opt.scenario);
-    let without_opt_sig = binding_resolution_signature(&without_opt.scenario);
-    assert_eq!(
-        with_opt_sig, without_opt_sig,
-        "binding resolution signature changed across opt modes for renamed binding chain"
-    );
-    assert!(
-        with_opt_sig.values().all(|value| value != "<missing>"),
-        "missing binding resolution in opt mode for renamed chain: {with_opt_sig:?}"
-    );
 }
 
 #[tokio::test]
@@ -1644,6 +903,159 @@ async fn slot_forwarding_and_export_chain_resolve_to_provider() {
         ),
         "expected consumer.api bound from root.api, got {:?}",
         binding.from
+    );
+}
+
+#[tokio::test]
+async fn variadic_slot_forwarding_preserves_all_sources_and_authored_order() {
+    let dir = tmp_dir("scenario-variadic-slot-forwarding");
+    let root_path = dir.path().join("root.json5");
+    let relay_path = dir.path().join("relay.json5");
+    let consumer_path = dir.path().join("consumer.json5");
+    let provider_a_path = dir.path().join("provider-a.json5");
+    let provider_b_path = dir.path().join("provider-b.json5");
+
+    write_file(
+        &provider_a_path,
+        r#"
+        {
+          manifest_version: "0.3.0",
+          program: {
+            image: "provider-a",
+            entrypoint: ["provider-a"],
+            network: { endpoints: [{ name: "api", port: 80 }] },
+          },
+          provides: { api: { kind: "http", endpoint: "api" } },
+          exports: { api: "api" },
+        }
+        "#,
+    );
+    write_file(
+        &provider_b_path,
+        r#"
+        {
+          manifest_version: "0.3.0",
+          program: {
+            image: "provider-b",
+            entrypoint: ["provider-b"],
+            network: { endpoints: [{ name: "api", port: 80 }] },
+          },
+          provides: { api: { kind: "http", endpoint: "api" } },
+          exports: { api: "api" },
+        }
+        "#,
+    );
+    write_file(
+        &consumer_path,
+        r#"
+        {
+          manifest_version: "0.3.0",
+          program: {
+            image: "consumer",
+            entrypoint: [
+              "consumer",
+              {
+                each: "slots.upstream",
+                argv: ["--upstream", "${item.url}"],
+              },
+            ],
+            network: { endpoints: [{ name: "http", port: 80 }] },
+          },
+          slots: {
+            upstream: { kind: "http", optional: true, multiple: true },
+          },
+          provides: { http: { kind: "http", endpoint: "http" } },
+          exports: { http: "http" },
+        }
+        "#,
+    );
+    write_file(
+        &relay_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.3.0",
+              slots: {{
+                upstream: {{ kind: "http", optional: true, multiple: true }},
+              }},
+              components: {{
+                consumer: "{consumer}",
+              }},
+              bindings: [
+                {{ to: "#consumer.upstream", from: "self.upstream" }},
+              ],
+              exports: {{ http: "#consumer.http" }},
+            }}
+            "##,
+            consumer = file_url(&consumer_path),
+        ),
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.3.0",
+              components: {{
+                relay: "{relay}",
+                provider_a: "{provider_a}",
+                provider_b: "{provider_b}",
+              }},
+              bindings: [
+                {{ to: "#relay.upstream", from: "#provider_a.api" }},
+                {{ to: "#relay.upstream", from: "#provider_b.api" }},
+              ],
+              exports: {{ http: "#relay.http" }},
+            }}
+            "##,
+            relay = file_url(&relay_path),
+            provider_a = file_url(&provider_a_path),
+            provider_b = file_url(&provider_b_path),
+        ),
+    );
+
+    let compiler = default_compiler();
+    let root_ref = manifest_ref_for_path(&root_path);
+
+    let with_opt = compiler
+        .compile(root_ref.clone(), optimized_compile_options())
+        .await
+        .expect("compile with optimizations");
+    let without_opt = compiler
+        .compile(root_ref, standard_compile_options())
+        .await
+        .expect("compile without optimizations");
+
+    let binding_order = |scenario: &amber_scenario::Scenario| {
+        let consumer_id = scenario
+            .components_iter()
+            .find(|(_, c)| c.moniker.local_name() == Some("consumer"))
+            .map(|(id, _)| id)
+            .expect("consumer component");
+
+        scenario
+            .bindings
+            .iter()
+            .filter(|binding| binding.to.component == consumer_id && binding.to.name == "upstream")
+            .map(|binding| match &binding.from {
+                BindingFrom::Component(provide) => scenario
+                    .component(provide.component)
+                    .moniker
+                    .local_name()
+                    .expect("provider local name")
+                    .to_string(),
+                other => panic!("expected component binding, got {other:?}"),
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        binding_order(&with_opt.scenario),
+        vec!["provider_a", "provider_b"]
+    );
+    assert_eq!(
+        binding_order(&without_opt.scenario),
+        vec!["provider_a", "provider_b"]
     );
 }
 

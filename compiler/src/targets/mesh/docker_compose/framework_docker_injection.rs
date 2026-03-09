@@ -86,7 +86,6 @@ pub(crate) fn rewrite_framework_docker_as_injected_component(
         slots: BTreeMap::new(),
         provides: gateway_provides,
         resources: BTreeMap::new(),
-        binding_decls: BTreeMap::new(),
         metadata: None,
         children: Vec::new(),
     }));
@@ -125,7 +124,6 @@ pub(crate) fn rewrite_framework_docker_as_injected_component(
             FRAMEWORK_DOCKER_GATEWAY_INTERNAL_SLOT.to_string(),
         );
         scenario.bindings.push(BindingEdge {
-            name: None,
             from: BindingFrom::Component(gateway_provide.clone()),
             to: SlotRef {
                 component: *consumer,

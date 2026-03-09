@@ -113,7 +113,7 @@ mod tests {
     }
 
     #[test]
-    fn component_config_template_renders_runtime_slot_and_binding_values() {
+    fn component_config_template_renders_runtime_slot_values() {
         let root = json!({
             "api": { "token": "secret" }
         });
@@ -122,16 +122,11 @@ mod tests {
             "slot_url": { "$template": [
                 { "slot": "api.url", "scope": 7 }
             ] },
-            "binding_url": { "$template": [
-                { "binding": "upstream.url", "scope": 11 }
-            ] },
             "label": { "$template": [
                 { "lit": "token=" },
                 { "config": "api.token" },
                 { "lit": "@" },
-                TemplatePart::slot(7, "api.url"),
-                { "lit": "->" },
-                TemplatePart::binding(11, "upstream.url")
+                TemplatePart::slot(7, "api.url")
             ] }
         });
 
@@ -145,13 +140,7 @@ mod tests {
                     "http://127.0.0.1:31001".to_string(),
                 )]),
             )]),
-            bindings_by_scope: std::collections::BTreeMap::from([(
-                11,
-                std::collections::BTreeMap::from([(
-                    "upstream.url".to_string(),
-                    "http://127.0.0.1:32002".to_string(),
-                )]),
-            )]),
+            slot_items_by_scope: std::collections::BTreeMap::new(),
         };
         let config = eval_config_template_with_context(&template, &root, &runtime_context)
             .expect("config should resolve");
@@ -160,8 +149,7 @@ mod tests {
             config,
             json!({
                 "slot_url": "http://127.0.0.1:31001",
-                "binding_url": "http://127.0.0.1:32002",
-                "label": "token=secret@http://127.0.0.1:31001->http://127.0.0.1:32002"
+                "label": "token=secret@http://127.0.0.1:31001"
             })
         );
     }

@@ -1,0 +1,20 @@
+{
+  manifest_version: "0.3.0",
+  program: {
+    path: "/bin/echo",
+    args: [
+      "${item.url}",
+    ],
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" },
+      ],
+    },
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" },
+  },
+  exports: {
+    http: "http",
+  },
+}

@@ -20,10 +20,10 @@ pub fn mesh_exports(
     let plan =
         build_mesh_plan(scenario, MeshOptions { backend_label }).map_err(|err| err.to_string())?;
     Ok(plan
-        .exports
-        .into_iter()
+        .exports()
+        .iter()
         .map(|ex| MeshExportInfo {
-            name: ex.name,
+            name: ex.name.clone(),
             protocol: ex.endpoint.protocol,
         })
         .collect())

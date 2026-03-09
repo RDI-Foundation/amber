@@ -85,7 +85,7 @@ pub(crate) fn build_execution_guide(
     external_slots.sort_by(|left, right| left.name.cmp(&right.name));
 
     let mut exports: Vec<_> = mesh_plan
-        .exports
+        .exports()
         .iter()
         .map(|export| GuideExport {
             name: export.name.clone(),

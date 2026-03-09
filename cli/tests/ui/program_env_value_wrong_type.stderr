@@ -1,13 +1,12 @@
 Error: manifest::deserialize_error
 
   × check failed
-  ╰─▶ json5 deserialize error at program.env.PROFILE: invalid type: integer
-      `123`, expected an interpolation string or an object with `when` and
-      `value`
+  ╰─▶ json5 deserialize error at program.env.PROFILE: expected an
+      interpolation string or an object with `when`/`value` or `each`
    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/program_env_value_wrong_type.json5:6:16]
  5 │     env: {
  6 │       PROFILE: 123,
    ·                ─┬─
-   ·                 ╰── expected an interpolation string or an object with `when` and `value`
+   ·                 ╰── expected an interpolation string or an object with `when`/`value` or `each`
  7 │     },
    ╰────

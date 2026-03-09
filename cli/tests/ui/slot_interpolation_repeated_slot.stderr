@@ -1,0 +1,12 @@
+compiler::invalid_slots_interpolation
+
+  x invalid slots interpolation in / (program.args[0]): slot `api` is declared with `multiple: true`
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_interpolation_repeated_slot.json5:5:12]
+ 4 |     path: "/bin/echo",
+ 5 |     args: ["${slots.api.url}"],
+   :            ^^^^^^^^^|^^^^^^^^
+   :                     `-- slot interpolation here
+ 6 |     network: {
+   `----
+  help: Use `each: "slots.api"` with `${item}` or `${item.url}` instead of `${slots.api...}`.
+Error:   × check failed

@@ -13,7 +13,7 @@ use crate::{
 };
 
 pub const SCENARIO_IR_SCHEMA: &str = "amber.scenario.ir";
-pub const SCENARIO_IR_VERSION: u32 = 2;
+pub const SCENARIO_IR_VERSION: u32 = 3;
 const MIN_SCENARIO_IR_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -101,20 +101,6 @@ impl TryFrom<ScenarioIr> for Scenario {
                 ensure_component(&components, child.0, || {
                     format!("child of component {}", component.id.0)
                 })?;
-            }
-        }
-
-        for component in components.iter().flatten() {
-            for (name, slot) in &component.binding_decls {
-                ensure_name_no_dot(name)?;
-                ensure_name_no_dot(&slot.name)?;
-                let context = format!(
-                    "binding declaration `{name}` in component {} (id {})",
-                    component.moniker.as_str(),
-                    component.id.0
-                );
-                ensure_component(&components, slot.component.0, || context.clone())?;
-                ensure_slot(&components, slot.component, &slot.name, || context.clone())?;
             }
         }
 
@@ -216,10 +202,6 @@ pub struct ComponentIr {
     #[serde(default)]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub resources: BTreeMap<String, ResourceDecl>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub binding_decls: BTreeMap<String, SlotRefIr>,
-    #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
 }
@@ -239,11 +221,6 @@ impl ComponentIr {
             slots: component.slots.clone(),
             provides: component.provides.clone(),
             resources: component.resources.clone(),
-            binding_decls: component
-                .binding_decls
-                .iter()
-                .map(|(name, slot)| (name.clone(), SlotRefIr::from(slot)))
-                .collect(),
             metadata: component.metadata.clone(),
         }
     }
@@ -260,11 +237,6 @@ impl ComponentIr {
             slots: self.slots,
             provides: self.provides,
             resources: self.resources,
-            binding_decls: self
-                .binding_decls
-                .into_iter()
-                .map(|(name, slot)| (name, slot.into_slot_ref()))
-                .collect(),
             metadata: self.metadata,
             children: self.children.into_iter().map(ComponentId).collect(),
         }
@@ -293,7 +265,7 @@ pub struct BindingIr {
 impl From<&BindingEdge> for BindingIr {
     fn from(binding: &BindingEdge) -> Self {
         Self {
-            name: binding.name.clone(),
+            name: None,
             from: BindingFromIr::from(&binding.from),
             to: SlotRefIr::from(&binding.to),
             weak: binding.weak,
@@ -304,7 +276,6 @@ impl From<&BindingEdge> for BindingIr {
 impl BindingIr {
     fn into_binding(self) -> Result<BindingEdge, ScenarioIrError> {
         Ok(BindingEdge {
-            name: self.name,
             from: self.from.into_binding_from()?,
             to: self.to.into_slot_ref(),
             weak: self.weak,
@@ -616,18 +587,6 @@ fn validate_component_tree(scenario: &Scenario) -> Result<(), ScenarioIrError> {
         for name in component.provides.keys() {
             ensure_name_no_dot(name)?;
         }
-        for (name, slot) in &component.binding_decls {
-            ensure_name_no_dot(name)?;
-            ensure_name_no_dot(&slot.name)?;
-            let context = format!(
-                "binding declaration `{name}` in component {} (id {})",
-                component.moniker.as_str(),
-                component.id.0
-            );
-            ensure_slot(&scenario.components, slot.component, &slot.name, || {
-                context.clone()
-            })?;
-        }
 
         if component.id != scenario.root {
             let Some(parent) = component.parent else {
@@ -716,9 +675,6 @@ fn validate_component_tree(scenario: &Scenario) -> Result<(), ScenarioIrError> {
 
 fn validate_bindings(scenario: &Scenario) -> Result<(), ScenarioIrError> {
     for binding in &scenario.bindings {
-        if let Some(name) = binding.name.as_deref() {
-            ensure_name_no_dot(name)?;
-        }
         ensure_name_no_dot(&binding.to.name)?;
 
         let target_label = format!(
@@ -998,7 +954,6 @@ mod tests {
                 slots: BTreeMap::new(),
                 provides: BTreeMap::new(),
                 resources: BTreeMap::new(),
-                binding_decls: BTreeMap::new(),
                 metadata: None,
                 children: vec![ComponentId(1)],
             }),
@@ -1040,7 +995,6 @@ mod tests {
                     .expect("deserialize provide decl"),
                 )]),
                 resources: BTreeMap::new(),
-                binding_decls: BTreeMap::new(),
                 metadata: None,
                 children: Vec::new(),
             }),
@@ -1050,7 +1004,6 @@ mod tests {
             root: ComponentId(0),
             components,
             bindings: vec![BindingEdge {
-                name: Some("bind_api".to_string()),
                 from: BindingFrom::Component(ProvideRef {
                     component: ComponentId(1),
                     name: "api".to_string(),
@@ -1120,7 +1073,8 @@ mod tests {
                         "input": {
                             "kind": "mcp",
                             "profile": null,
-                            "optional": false
+                            "optional": false,
+                            "multiple": false
                         }
                     },
                     "provides": {
@@ -1134,7 +1088,6 @@ mod tests {
             ],
             "bindings": [
                 {
-                    "name": "bind_api",
                     "from": {
                         "kind": "component",
                         "component": 1,
@@ -1238,7 +1191,6 @@ mod tests {
             slots: BTreeMap::from([("docker".to_string(), slot_decl("docker"))]),
             provides: BTreeMap::new(),
             resources: BTreeMap::new(),
-            binding_decls: BTreeMap::new(),
             metadata: None,
             children: Vec::new(),
         })];
@@ -1247,7 +1199,6 @@ mod tests {
             root: ComponentId(0),
             components,
             bindings: vec![BindingEdge {
-                name: None,
                 from: BindingFrom::Framework(FrameworkCapabilityName::try_from("docker").unwrap()),
                 to: SlotRef {
                     component: ComponentId(0),
@@ -1319,130 +1270,6 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("invalid name"), "{message}");
         assert!(message.contains("dots are reserved"), "{message}");
-    }
-
-    #[test]
-    fn scenario_ir_rejects_binding_name_with_dot() {
-        let payload = json!({
-            "schema": SCENARIO_IR_SCHEMA,
-            "version": SCENARIO_IR_VERSION,
-            "root": 0,
-            "components": [
-                {
-                    "id": 0,
-                    "moniker": "/",
-                    "parent": null,
-                    "children": [],
-                    "digest": ManifestDigest::new([0u8; 32]).to_string(),
-                    "config": null,
-                    "slots": {
-                        "needs": { "kind": "http" }
-                    },
-                    "provides": {
-                        "api": { "kind": "http", "endpoint": "api" }
-                    }
-                }
-            ],
-            "bindings": [
-                {
-                    "name": "bad.name",
-                    "from": { "kind": "component", "component": 0, "provide": "api" },
-                    "to": { "component": 0, "slot": "needs" },
-                    "weak": false
-                }
-            ],
-            "exports": []
-        });
-
-        let ir: ScenarioIr = serde_json::from_value(payload).expect("deserialize scenario IR");
-        let err = Scenario::try_from(ir).expect_err("invalid name");
-        let message = err.to_string();
-        assert!(message.contains("invalid name"), "{message}");
-        assert!(message.contains("dots are reserved"), "{message}");
-    }
-
-    #[test]
-    fn scenario_ir_rejects_binding_decl_missing_slot() {
-        let payload = json!({
-            "schema": SCENARIO_IR_SCHEMA,
-            "version": SCENARIO_IR_VERSION,
-            "root": 0,
-            "components": [
-                {
-                    "id": 0,
-                    "moniker": "/",
-                    "parent": null,
-                    "children": [1],
-                    "digest": ManifestDigest::new([0u8; 32]).to_string(),
-                    "config": null,
-                    "binding_decls": {
-                        "bind": { "component": 1, "slot": "api" }
-                    }
-                },
-                {
-                    "id": 1,
-                    "moniker": "/child",
-                    "parent": 0,
-                    "children": [],
-                    "digest": ManifestDigest::new([1u8; 32]).to_string(),
-                    "config": null
-                }
-            ],
-            "bindings": [],
-            "exports": []
-        });
-
-        let ir: ScenarioIr = serde_json::from_value(payload).expect("deserialize scenario IR");
-        let err = Scenario::try_from(ir).expect_err("invalid binding decl");
-        let message = err.to_string();
-        assert!(message.contains("binding declaration"), "{message}");
-        assert!(message.contains("targets missing slot"), "{message}");
-    }
-
-    #[test]
-    fn scenario_ir_binding_name_round_trip() {
-        let payload = json!({
-            "schema": SCENARIO_IR_SCHEMA,
-            "version": SCENARIO_IR_VERSION,
-            "root": 0,
-            "components": [
-                {
-                    "id": 0,
-                    "moniker": "/",
-                    "parent": null,
-                    "children": [1],
-                    "digest": ManifestDigest::new([0u8; 32]).to_string(),
-                    "config": null,
-                    "slots": {
-                        "needs": { "kind": "http" }
-                    }
-                },
-                {
-                    "id": 1,
-                    "moniker": "/child",
-                    "parent": 0,
-                    "children": [],
-                    "digest": ManifestDigest::new([1u8; 32]).to_string(),
-                    "config": null,
-                    "provides": {
-                        "api": { "kind": "http", "endpoint": "api" }
-                    }
-                }
-            ],
-            "bindings": [
-                {
-                    "name": "route",
-                    "from": { "kind": "component", "component": 1, "provide": "api" },
-                    "to": { "component": 0, "slot": "needs" },
-                    "weak": false
-                }
-            ],
-            "exports": []
-        });
-
-        let ir: ScenarioIr = serde_json::from_value(payload).expect("deserialize scenario IR");
-        let scenario: Scenario = ir.try_into().expect("convert scenario IR");
-        assert_eq!(scenario.bindings[0].name.as_deref(), Some("route"));
     }
 
     #[test]

@@ -1,0 +1,13 @@
+{
+  manifest_version: "0.3.0",
+  program: {
+    image: "child",
+    entrypoint: ["child"],
+    env: {
+      API_URL: "${slots.api.url}",
+    },
+  },
+  slots: {
+    api: { kind: "http", optional: true },
+  },
+}

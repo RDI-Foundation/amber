@@ -9,12 +9,10 @@
   },
   bindings: [
     {
-      name: "client_server_api",
       to: "#client.server_api",
       from: "#server.api",
     },
     {
-      name: "client_external_api",
       to: "#client.ext_api",
       from: "self.ext_api",
       weak: true,

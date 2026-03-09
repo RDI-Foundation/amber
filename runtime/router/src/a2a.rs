@@ -806,7 +806,6 @@ mod tests {
         OutboundRoute {
             route_id: route_id.to_string(),
             slot: "slot".to_string(),
-            binding_name: None,
             capability_kind: Some("a2a".to_string()),
             capability_profile: None,
             listen_port,
@@ -823,7 +822,6 @@ mod tests {
         InboundRoute {
             route_id: route_id.to_string(),
             capability: "agent".to_string(),
-            binding_name: None,
             capability_kind: Some("a2a".to_string()),
             capability_profile: None,
             protocol: MeshProtocol::Http,

@@ -2,11 +2,9 @@ use std::{fmt, str::FromStr};
 
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
-    de::{
-        SeqAccess, Visitor,
-        value::{MapAccessDeserializer, SeqAccessDeserializer},
-    },
+    de::{SeqAccess, Visitor, value::SeqAccessDeserializer},
 };
+use serde_json::Value;
 use serde_with::{DeserializeFromStr, SerializeDisplay};
 
 use crate::{Error, SlotTarget, parse_slot_query};
@@ -106,7 +104,7 @@ impl FromStr for InterpolatedPart {
         let source = match prefix {
             "config" => InterpolationSource::Config,
             "slots" => InterpolationSource::Slots,
-            "bindings" => InterpolationSource::Bindings,
+            "item" => InterpolationSource::Item,
             _ => return Err(Error::InvalidInterpolation(inner.to_string())),
         };
 
@@ -123,7 +121,7 @@ impl FromStr for InterpolatedPart {
 pub enum InterpolationSource {
     Config,
     Slots,
-    Bindings,
+    Item,
 }
 
 impl fmt::Display for InterpolationSource {
@@ -131,7 +129,7 @@ impl fmt::Display for InterpolationSource {
         let s = match self {
             InterpolationSource::Config => "config",
             InterpolationSource::Slots => "slots",
-            InterpolationSource::Bindings => "bindings",
+            InterpolationSource::Item => "item",
         };
         f.write_str(s)
     }
@@ -240,7 +238,7 @@ impl FromStr for WhenPath {
         match source {
             InterpolationSource::Config => validate_config_when_path(input, &query)?,
             InterpolationSource::Slots => validate_slot_when_path(input, &query)?,
-            InterpolationSource::Bindings => {
+            InterpolationSource::Item => {
                 return Err(Error::InvalidWhenPath {
                     input: input.to_string(),
                     message: "expected `config.<path>` or `slots.<path>`".to_string(),
@@ -260,6 +258,48 @@ fn validate_config_when_path(input: &str, query: &str) -> Result<(), Error> {
         input: input.to_string(),
         message: "expected `config.<path>` or `slots.<path>`".to_string(),
     })
+}
+
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, DeserializeFromStr, SerializeDisplay,
+)]
+pub struct EachPath {
+    slot: String,
+}
+
+impl EachPath {
+    pub fn slot(&self) -> &str {
+        &self.slot
+    }
+}
+
+impl fmt::Display for EachPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "slots.{}", self.slot)
+    }
+}
+
+impl FromStr for EachPath {
+    type Err = Error;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let Some(slot) = input.strip_prefix("slots.") else {
+            return Err(Error::InvalidEachPath {
+                input: input.to_string(),
+                message: "expected `slots.<slot>`".to_string(),
+            });
+        };
+        if slot.is_empty() || slot.contains('.') {
+            return Err(Error::InvalidEachPath {
+                input: input.to_string(),
+                message: "expected `slots.<slot>`".to_string(),
+            });
+        }
+
+        Ok(Self {
+            slot: slot.to_string(),
+        })
+    }
 }
 
 fn validate_slot_when_path(input: &str, query: &str) -> Result<(), Error> {
@@ -308,6 +348,26 @@ pub struct ProgramArgGroup {
     pub argv: ProgramArgList,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepeatedProgramArgv {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<WhenPath>,
+    pub each: EachPath,
+    pub argv: ProgramArgList,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepeatedProgramArg {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<WhenPath>,
+    pub each: EachPath,
+    pub arg: InterpolatedString,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<String>,
+}
+
 impl ProgramArgGroup {
     pub fn visit_values(&self, mut visit: impl FnMut(&InterpolatedString)) {
         for arg in &self.argv.0 {
@@ -320,13 +380,15 @@ impl ProgramArgGroup {
 pub enum ProgramArgItem {
     Arg(InterpolatedString),
     Group(ProgramArgGroup),
+    RepeatedArgv(RepeatedProgramArgv),
+    RepeatedArg(RepeatedProgramArg),
 }
 
 impl ProgramArgItem {
     pub fn arg(&self) -> Option<&InterpolatedString> {
         match self {
             Self::Arg(arg) => Some(arg),
-            Self::Group(_) => None,
+            Self::Group(_) | Self::RepeatedArgv(_) | Self::RepeatedArg(_) => None,
         }
     }
 
@@ -334,17 +396,66 @@ impl ProgramArgItem {
         match self {
             Self::Arg(_) => None,
             Self::Group(group) => Some(group),
+            Self::RepeatedArgv(_) | Self::RepeatedArg(_) => None,
+        }
+    }
+
+    pub fn repeated_argv(&self) -> Option<&RepeatedProgramArgv> {
+        match self {
+            Self::RepeatedArgv(repeated) => Some(repeated),
+            Self::Arg(_) | Self::Group(_) | Self::RepeatedArg(_) => None,
+        }
+    }
+
+    pub fn repeated_arg(&self) -> Option<&RepeatedProgramArg> {
+        match self {
+            Self::RepeatedArg(repeated) => Some(repeated),
+            Self::Arg(_) | Self::Group(_) | Self::RepeatedArgv(_) => None,
         }
     }
 
     pub fn when(&self) -> Option<&WhenPath> {
-        self.group().map(|group| &group.when)
+        match self {
+            Self::Arg(_) => None,
+            Self::Group(group) => Some(&group.when),
+            Self::RepeatedArgv(repeated) => repeated.when.as_ref(),
+            Self::RepeatedArg(repeated) => repeated.when.as_ref(),
+        }
     }
 
     pub fn visit_values(&self, mut visit: impl FnMut(&InterpolatedString)) {
         match self {
             Self::Arg(arg) => visit(arg),
             Self::Group(group) => group.visit_values(visit),
+            Self::RepeatedArgv(repeated) => {
+                for arg in &repeated.argv.0 {
+                    visit(arg);
+                }
+            }
+            Self::RepeatedArg(repeated) => visit(&repeated.arg),
+        }
+    }
+
+    /// Visit slot names referenced by this program arg item, including `when` conditions and
+    /// repeated `each` selectors. Returns `true` if the item references all slots.
+    pub fn visit_slot_uses(&self, mut visit: impl FnMut(&str)) -> bool {
+        if let Some(when) = self.when()
+            && visit_when_slot_uses(when, &mut visit)
+        {
+            return true;
+        }
+
+        match self {
+            Self::Arg(arg) => arg.visit_slot_uses(visit),
+            Self::Group(group) => visit_program_arg_list_slot_uses(&group.argv, &mut visit),
+            Self::RepeatedArgv(repeated) => {
+                visit(repeated.each.slot());
+                visit_program_arg_list_slot_uses(&repeated.argv, &mut visit)
+            }
+            Self::RepeatedArg(repeated) => {
+                visit(repeated.each.slot());
+                repeated.arg.visit_slot_uses(visit)
+            }
         }
     }
 }
@@ -363,6 +474,8 @@ impl Serialize for ProgramArgItem {
         match self {
             Self::Arg(arg) => arg.serialize(serializer),
             Self::Group(group) => group.serialize(serializer),
+            Self::RepeatedArgv(repeated) => repeated.serialize(serializer),
+            Self::RepeatedArg(repeated) => repeated.serialize(serializer),
         }
     }
 }
@@ -372,42 +485,37 @@ impl<'de> Deserialize<'de> for ProgramArgItem {
     where
         D: Deserializer<'de>,
     {
-        struct ProgramArgItemVisitor;
-
-        impl<'de> Visitor<'de> for ProgramArgItemVisitor {
-            type Value = ProgramArgItem;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a string or an object with `when` and `argv`")
+        match Value::deserialize(deserializer)? {
+            Value::String(value) => value
+                .parse::<InterpolatedString>()
+                .map(ProgramArgItem::Arg)
+                .map_err(serde::de::Error::custom),
+            Value::Object(map) => {
+                let value = Value::Object(map.clone());
+                if map.contains_key("each") {
+                    if map.contains_key("argv") {
+                        serde_json::from_value::<RepeatedProgramArgv>(value)
+                            .map(ProgramArgItem::RepeatedArgv)
+                            .map_err(serde::de::Error::custom)
+                    } else if map.contains_key("arg") {
+                        serde_json::from_value::<RepeatedProgramArg>(value)
+                            .map(ProgramArgItem::RepeatedArg)
+                            .map_err(serde::de::Error::custom)
+                    } else {
+                        Err(serde::de::Error::custom(
+                            "expected an object with `each` and one of `argv` or `arg`",
+                        ))
+                    }
+                } else {
+                    serde_json::from_value::<ProgramArgGroup>(value)
+                        .map(ProgramArgItem::Group)
+                        .map_err(serde::de::Error::custom)
+                }
             }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                value
-                    .parse::<InterpolatedString>()
-                    .map(ProgramArgItem::Arg)
-                    .map_err(E::custom)
-            }
-
-            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                self.visit_str(&value)
-            }
-
-            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::MapAccess<'de>,
-            {
-                ProgramArgGroup::deserialize(MapAccessDeserializer::new(map))
-                    .map(ProgramArgItem::Group)
-            }
+            _ => Err(serde::de::Error::custom(
+                "expected a string or an object with `when`/`argv` or `each`",
+            )),
         }
-
-        deserializer.deserialize_any(ProgramArgItemVisitor)
     }
 }
 
@@ -428,6 +536,17 @@ impl ProgramEntrypoint {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Visit slot names referenced anywhere in the command. Returns `true` if the command
+    /// references all slots.
+    pub fn visit_slot_uses(&self, mut visit: impl FnMut(&str)) -> bool {
+        for item in &self.0 {
+            if item.visit_slot_uses(&mut visit) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -483,10 +602,21 @@ pub struct ProgramEnvGroup {
     pub value: InterpolatedString,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepeatedProgramEnv {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<WhenPath>,
+    pub each: EachPath,
+    pub value: InterpolatedString,
+    pub join: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ProgramEnvValue {
     Value(InterpolatedString),
     Group(ProgramEnvGroup),
+    Repeated(RepeatedProgramEnv),
 }
 
 impl ProgramEnvValue {
@@ -494,6 +624,7 @@ impl ProgramEnvValue {
         match self {
             Self::Value(value) => value,
             Self::Group(group) => &group.value,
+            Self::Repeated(repeated) => &repeated.value,
         }
     }
 
@@ -501,15 +632,69 @@ impl ProgramEnvValue {
         match self {
             Self::Value(_) => None,
             Self::Group(group) => Some(group),
+            Self::Repeated(_) => None,
+        }
+    }
+
+    pub fn repeated(&self) -> Option<&RepeatedProgramEnv> {
+        match self {
+            Self::Repeated(repeated) => Some(repeated),
+            Self::Value(_) | Self::Group(_) => None,
         }
     }
 
     pub fn when(&self) -> Option<&WhenPath> {
-        self.group().map(|group| &group.when)
+        match self {
+            Self::Value(_) => None,
+            Self::Group(group) => Some(&group.when),
+            Self::Repeated(repeated) => repeated.when.as_ref(),
+        }
     }
 
     pub fn visit_values(&self, mut visit: impl FnMut(&InterpolatedString)) {
         visit(self.value());
+    }
+
+    /// Visit slot names referenced by this env value, including `when` conditions and repeated
+    /// `each` selectors. Returns `true` if the value references all slots.
+    pub fn visit_slot_uses(&self, mut visit: impl FnMut(&str)) -> bool {
+        if let Some(when) = self.when()
+            && visit_when_slot_uses(when, &mut visit)
+        {
+            return true;
+        }
+
+        if let Some(repeated) = self.repeated() {
+            visit(repeated.each.slot());
+        }
+
+        self.value().visit_slot_uses(visit)
+    }
+}
+
+fn visit_program_arg_list_slot_uses(args: &ProgramArgList, visit: &mut impl FnMut(&str)) -> bool {
+    for arg in &args.0 {
+        if arg.visit_slot_uses(&mut *visit) {
+            return true;
+        }
+    }
+    false
+}
+
+fn visit_when_slot_uses(when: &WhenPath, visit: &mut impl FnMut(&str)) -> bool {
+    if when.source() != InterpolationSource::Slots {
+        return false;
+    }
+
+    match parse_slot_query(when.query()) {
+        Ok(parsed) => match parsed.target {
+            SlotTarget::All => true,
+            SlotTarget::Slot(slot) => {
+                visit(slot);
+                false
+            }
+        },
+        Err(_) => when.query().is_empty(),
     }
 }
 
@@ -527,6 +712,7 @@ impl Serialize for ProgramEnvValue {
         match self {
             Self::Value(value) => value.serialize(serializer),
             Self::Group(group) => group.serialize(serializer),
+            Self::Repeated(repeated) => repeated.serialize(serializer),
         }
     }
 }
@@ -536,42 +722,27 @@ impl<'de> Deserialize<'de> for ProgramEnvValue {
     where
         D: Deserializer<'de>,
     {
-        struct ProgramEnvValueVisitor;
-
-        impl<'de> Visitor<'de> for ProgramEnvValueVisitor {
-            type Value = ProgramEnvValue;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("an interpolation string or an object with `when` and `value`")
+        match Value::deserialize(deserializer)? {
+            Value::String(value) => value
+                .parse::<InterpolatedString>()
+                .map(ProgramEnvValue::Value)
+                .map_err(serde::de::Error::custom),
+            Value::Object(map) => {
+                let value = Value::Object(map.clone());
+                if map.contains_key("each") {
+                    serde_json::from_value::<RepeatedProgramEnv>(value)
+                        .map(ProgramEnvValue::Repeated)
+                        .map_err(serde::de::Error::custom)
+                } else {
+                    serde_json::from_value::<ProgramEnvGroup>(value)
+                        .map(ProgramEnvValue::Group)
+                        .map_err(serde::de::Error::custom)
+                }
             }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                value
-                    .parse::<InterpolatedString>()
-                    .map(ProgramEnvValue::Value)
-                    .map_err(E::custom)
-            }
-
-            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                self.visit_str(&value)
-            }
-
-            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::MapAccess<'de>,
-            {
-                ProgramEnvGroup::deserialize(MapAccessDeserializer::new(map))
-                    .map(ProgramEnvValue::Group)
-            }
+            _ => Err(serde::de::Error::custom(
+                "expected an interpolation string or an object with `when`/`value` or `each`",
+            )),
         }
-
-        deserializer.deserialize_any(ProgramEnvValueVisitor)
     }
 }
 
@@ -671,18 +842,6 @@ mod tests {
     }
 
     #[test]
-    fn interpolation_parsing_supports_bindings() {
-        let parsed: InterpolatedString = "${bindings.route.url}".parse().unwrap();
-        assert_eq!(
-            parsed.parts,
-            vec![InterpolatedPart::Interpolation {
-                source: InterpolationSource::Bindings,
-                query: "route.url".to_string()
-            }]
-        );
-    }
-
-    #[test]
     fn interpolation_unknown_source_errors() {
         assert!("${foo.bar}".parse::<InterpolatedString>().is_err());
     }
@@ -709,7 +868,7 @@ mod tests {
         assert!("config".parse::<WhenPath>().is_err());
         assert!("slots".parse::<WhenPath>().is_err());
         assert!("slots.backend..url".parse::<WhenPath>().is_err());
-        assert!("bindings.route.url".parse::<WhenPath>().is_err());
+        assert!("foo.route.url".parse::<WhenPath>().is_err());
     }
 
     #[test]

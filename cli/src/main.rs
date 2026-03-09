@@ -50,7 +50,9 @@ use amber_mesh::{
 use amber_resolver::Resolver;
 use amber_router as router;
 use amber_scenario::{SCENARIO_IR_SCHEMA, ScenarioIr};
-use amber_template::{ProgramArgTemplate, RuntimeTemplateContext, TemplatePart, TemplateSpec};
+use amber_template::{
+    ProgramArgTemplate, RuntimeSlotObject, RuntimeTemplateContext, TemplatePart, TemplateSpec,
+};
 use base64::Engine as _;
 use clap::{ArgAction, Args, Parser, Subcommand};
 use miette::{
@@ -1405,6 +1407,8 @@ struct DirectRuntimeState {
     #[serde(default)]
     slot_ports_by_component: BTreeMap<usize, BTreeMap<String, u16>>,
     #[serde(default)]
+    slot_route_ports_by_component: BTreeMap<usize, BTreeMap<String, Vec<u16>>>,
+    #[serde(default)]
     component_mesh_port_by_id: BTreeMap<usize, u16>,
     #[serde(default)]
     router_mesh_port: Option<u16>,
@@ -1432,17 +1436,39 @@ fn assign_direct_runtime_ports(
         mesh_port_by_peer_id.insert(config.identity.id.clone(), mesh_port);
         config.mesh_listen = SocketAddr::new(config.mesh_listen.ip(), mesh_port);
 
-        let mut slot_ports = BTreeMap::new();
+        let mut slot_route_ports: BTreeMap<String, Vec<(u16, u16)>> = BTreeMap::new();
         for route in &mut config.outbound {
-            let port = if let Some(port) = slot_ports.get(route.slot.as_str()).copied() {
-                port
-            } else {
-                let port = allocate_direct_runtime_port(&mut reserved)?;
-                slot_ports.insert(route.slot.clone(), port);
-                port
-            };
+            let authored_port = route.listen_port;
+            let port = allocate_direct_runtime_port(&mut reserved)?;
             route.listen_port = port;
+            slot_route_ports
+                .entry(route.slot.clone())
+                .or_default()
+                .push((authored_port, port));
         }
+        for ports in slot_route_ports.values_mut() {
+            // Placeholder listen ports are allocated in authored binding order during compile.
+            // Preserve that order when assigning ephemeral direct-runtime ports so `${item...}`
+            // continues to match the compiled item indices.
+            ports.sort_unstable_by_key(|(authored_port, _)| *authored_port);
+        }
+        let slot_route_ports: BTreeMap<String, Vec<u16>> = slot_route_ports
+            .into_iter()
+            .map(|(slot, ports)| {
+                (
+                    slot,
+                    ports
+                        .into_iter()
+                        .map(|(_, runtime_port)| runtime_port)
+                        .collect(),
+                )
+            })
+            .collect();
+
+        let slot_ports = slot_route_ports
+            .iter()
+            .filter_map(|(slot, ports)| (ports.len() == 1).then_some((slot.clone(), ports[0])))
+            .collect();
 
         state
             .component_mesh_port_by_id
@@ -1450,6 +1476,9 @@ fn assign_direct_runtime_ports(
         state
             .slot_ports_by_component
             .insert(component.id, slot_ports);
+        state
+            .slot_route_ports_by_component
+            .insert(component.id, slot_route_ports);
         component_configs.push((path, config));
     }
 
@@ -1801,7 +1830,8 @@ fn append_runtime_template_context_env(
     runtime_addresses: &DirectRuntimeAddressPlan,
     runtime_state: &DirectRuntimeState,
 ) -> Result<()> {
-    if runtime_addresses.slots_by_scope.is_empty() && runtime_addresses.bindings_by_scope.is_empty()
+    if runtime_addresses.slots_by_scope.is_empty()
+        && runtime_addresses.slot_items_by_scope.is_empty()
     {
         return Ok(());
     }
@@ -1824,20 +1854,38 @@ fn build_runtime_template_context(
     for (scope, entries) in &runtime_addresses.slots_by_scope {
         let mut urls = BTreeMap::new();
         for (name, source) in entries {
-            urls.insert(name.clone(), runtime_url_for_source(source, runtime_state)?);
+            let url = runtime_url_for_source(source, runtime_state)?;
+            urls.insert(
+                name.clone(),
+                serde_json::to_string(&RuntimeSlotObject { url: url.clone() }).map_err(|err| {
+                    miette::miette!(
+                        "failed to serialize direct runtime slot object for scope {} slot {}: \
+                         {err}",
+                        scope,
+                        name
+                    )
+                })?,
+            );
+            urls.insert(format!("{name}.url"), url);
         }
         if !urls.is_empty() {
             context.slots_by_scope.insert(*scope as u64, urls);
         }
     }
 
-    for (scope, entries) in &runtime_addresses.bindings_by_scope {
+    for (scope, entries) in &runtime_addresses.slot_items_by_scope {
         let mut urls = BTreeMap::new();
-        for (name, source) in entries {
-            urls.insert(name.clone(), runtime_url_for_source(source, runtime_state)?);
+        for (name, sources) in entries {
+            let mut items = Vec::with_capacity(sources.len());
+            for source in sources {
+                items.push(RuntimeSlotObject {
+                    url: runtime_url_for_source(source, runtime_state)?,
+                });
+            }
+            urls.insert(name.clone(), items);
         }
         if !urls.is_empty() {
-            context.bindings_by_scope.insert(*scope as u64, urls);
+            context.slot_items_by_scope.insert(*scope as u64, urls);
         }
     }
 
@@ -1848,19 +1896,49 @@ fn runtime_url_for_source(
     source: &DirectRuntimeUrlSource,
     runtime_state: &DirectRuntimeState,
 ) -> Result<String> {
-    let port = runtime_state
-        .slot_ports_by_component
-        .get(&source.component_id)
-        .and_then(|slots| slots.get(source.slot.as_str()))
-        .copied()
-        .ok_or_else(|| {
-            miette::miette!(
-                "missing runtime slot port for component {} slot {}",
-                source.component_id,
-                source.slot
-            )
-        })?;
-    Ok(format!("{}://127.0.0.1:{port}", source.scheme))
+    match source {
+        DirectRuntimeUrlSource::Slot {
+            component_id,
+            slot,
+            scheme,
+        } => {
+            let port = runtime_state
+                .slot_ports_by_component
+                .get(component_id)
+                .and_then(|slots| slots.get(slot.as_str()))
+                .copied()
+                .ok_or_else(|| {
+                    miette::miette!(
+                        "missing runtime slot port for component {} slot {}",
+                        component_id,
+                        slot
+                    )
+                })?;
+            Ok(format!("{scheme}://127.0.0.1:{port}"))
+        }
+        DirectRuntimeUrlSource::SlotItem {
+            component_id,
+            slot,
+            item_index,
+            scheme,
+        } => {
+            let port = runtime_state
+                .slot_route_ports_by_component
+                .get(component_id)
+                .and_then(|slots| slots.get(slot.as_str()))
+                .and_then(|ports| ports.get(*item_index))
+                .copied()
+                .ok_or_else(|| {
+                    miette::miette!(
+                        "missing runtime slot item {} for component {} slot {}",
+                        item_index,
+                        component_id,
+                        slot
+                    )
+                })?;
+            Ok(format!("{scheme}://127.0.0.1:{port}"))
+        }
+    }
 }
 
 fn append_runtime_config_env(
@@ -2014,9 +2092,9 @@ fn render_template_string_literal(parts: &[TemplatePart]) -> Result<String> {
                     "internal error: unresolved slot interpolation `{slot}` in direct program path"
                 ));
             }
-            TemplatePart::Binding { binding, .. } => {
+            TemplatePart::Item { item, .. } => {
                 return Err(miette::miette!(
-                    "internal error: unresolved binding interpolation `{binding}` in direct \
+                    "internal error: unresolved repeated item interpolation `{item}` in direct \
                      program path"
                 ));
             }
@@ -3490,7 +3568,6 @@ async fn proxy(args: ProxyArgs, verbose: u8) -> Result<()> {
         outbound.push(OutboundRoute {
             route_id: router_export_route_id(export, protocol),
             slot: export.to_string(),
-            binding_name: None,
             capability_kind: None,
             capability_profile: None,
             listen_port: binding.listen.port(),
@@ -3522,7 +3599,6 @@ async fn proxy(args: ProxyArgs, verbose: u8) -> Result<()> {
             inbound.push(InboundRoute {
                 route_id: component_route_id(&proxy_identity.id, slot, MeshProtocol::Http),
                 capability: slot.to_string(),
-                binding_name: None,
                 capability_kind: Some(slot_meta.kind.clone()),
                 capability_profile: None,
                 protocol: MeshProtocol::Http,
@@ -5223,31 +5299,44 @@ mod tests {
             slots_by_scope: BTreeMap::from([(
                 3,
                 BTreeMap::from([(
-                    "api.url".to_string(),
-                    DirectRuntimeUrlSource {
+                    "api".to_string(),
+                    DirectRuntimeUrlSource::Slot {
                         component_id: 7,
                         slot: "api".to_string(),
                         scheme: "http".to_string(),
                     },
                 )]),
             )]),
-            bindings_by_scope: BTreeMap::from([(
-                11,
+            slot_items_by_scope: BTreeMap::from([(
+                5,
                 BTreeMap::from([(
-                    "upstream.url".to_string(),
-                    DirectRuntimeUrlSource {
-                        component_id: 9,
-                        slot: "db".to_string(),
-                        scheme: "tcp".to_string(),
-                    },
+                    "upstream".to_string(),
+                    vec![
+                        DirectRuntimeUrlSource::SlotItem {
+                            component_id: 8,
+                            slot: "upstream".to_string(),
+                            item_index: 0,
+                            scheme: "http".to_string(),
+                        },
+                        DirectRuntimeUrlSource::SlotItem {
+                            component_id: 8,
+                            slot: "upstream".to_string(),
+                            item_index: 1,
+                            scheme: "http".to_string(),
+                        },
+                    ],
                 )]),
             )]),
         };
         let runtime_state = DirectRuntimeState {
-            slot_ports_by_component: BTreeMap::from([
-                (7, BTreeMap::from([("api".to_string(), 31001)])),
-                (9, BTreeMap::from([("db".to_string(), 32002)])),
-            ]),
+            slot_ports_by_component: BTreeMap::from([(
+                7,
+                BTreeMap::from([("api".to_string(), 31001)]),
+            )]),
+            slot_route_ports_by_component: BTreeMap::from([(
+                8,
+                BTreeMap::from([("upstream".to_string(), vec![32001, 32002])]),
+            )]),
             component_mesh_port_by_id: BTreeMap::new(),
             router_mesh_port: None,
         };
@@ -5259,15 +5348,173 @@ mod tests {
             context
                 .slots_by_scope
                 .get(&3)
+                .and_then(|values| values.get("api")),
+            Some(&r#"{"url":"http://127.0.0.1:31001"}"#.to_string())
+        );
+        assert_eq!(
+            context
+                .slots_by_scope
+                .get(&3)
                 .and_then(|values| values.get("api.url")),
             Some(&"http://127.0.0.1:31001".to_string())
         );
         assert_eq!(
             context
-                .bindings_by_scope
-                .get(&11)
-                .and_then(|values| values.get("upstream.url")),
-            Some(&"tcp://127.0.0.1:32002".to_string())
+                .slot_items_by_scope
+                .get(&5)
+                .and_then(|values| values.get("upstream"))
+                .map(|items| items
+                    .iter()
+                    .map(|item| item.url.as_str())
+                    .collect::<Vec<_>>()),
+            Some(vec!["http://127.0.0.1:32001", "http://127.0.0.1:32002"])
+        );
+    }
+
+    #[test]
+    fn assign_direct_runtime_ports_preserves_repeated_slot_item_order() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let mesh_config_rel = PathBuf::from("mesh/components/app/mesh-config.json");
+        let mesh_config_path = temp.path().join(&mesh_config_rel);
+        fs::create_dir_all(
+            mesh_config_path
+                .parent()
+                .expect("mesh config should have a parent"),
+        )
+        .expect("mesh config dir should be created");
+
+        let config = MeshConfigPublic {
+            identity: MeshIdentityPublic {
+                id: "/app".to_string(),
+                public_key: [7; 32],
+                mesh_scope: None,
+            },
+            mesh_listen: "127.0.0.1:19000".parse().expect("mesh listen"),
+            control_listen: None,
+            control_allow: None,
+            peers: Vec::new(),
+            inbound: Vec::new(),
+            outbound: vec![
+                OutboundRoute {
+                    route_id: "route-b".to_string(),
+                    slot: "upstream".to_string(),
+                    capability_kind: Some("http".to_string()),
+                    capability_profile: None,
+                    listen_port: 20001,
+                    listen_addr: None,
+                    protocol: MeshProtocol::Http,
+                    http_plugins: Vec::new(),
+                    peer_addr: "127.0.0.1:18081".to_string(),
+                    peer_id: "/app".to_string(),
+                    capability: "api".to_string(),
+                },
+                OutboundRoute {
+                    route_id: "route-a".to_string(),
+                    slot: "upstream".to_string(),
+                    capability_kind: Some("http".to_string()),
+                    capability_profile: None,
+                    listen_port: 20000,
+                    listen_addr: None,
+                    protocol: MeshProtocol::Http,
+                    http_plugins: Vec::new(),
+                    peer_addr: "127.0.0.1:18080".to_string(),
+                    peer_id: "/app".to_string(),
+                    capability: "api".to_string(),
+                },
+            ],
+            transport: TransportConfig::NoiseIk {},
+        };
+        write_mesh_config_public(&mesh_config_path, &config)
+            .expect("mesh config should be written");
+
+        let direct_plan = DirectPlan {
+            version: DIRECT_PLAN_VERSION.to_string(),
+            mesh_provision_plan: "{}".to_string(),
+            startup_order: vec![7],
+            components: vec![DirectComponentPlan {
+                id: 7,
+                moniker: "/app".to_string(),
+                log_name: "app".to_string(),
+                source_dir: None,
+                depends_on: Vec::new(),
+                sidecar: amber_compiler::reporter::direct::DirectSidecarPlan {
+                    log_name: "app-sidecar".to_string(),
+                    mesh_port: 0,
+                    mesh_config_path: mesh_config_rel.display().to_string(),
+                    mesh_identity_path: "mesh/components/app/mesh-identity.json".to_string(),
+                },
+                program: amber_compiler::reporter::direct::DirectProgramPlan {
+                    log_name: "app-program".to_string(),
+                    work_dir: "work/components/app".to_string(),
+                    storage_mounts: Vec::new(),
+                    execution: DirectProgramExecutionPlan::Direct {
+                        entrypoint: vec!["/bin/echo".to_string()],
+                        env: BTreeMap::new(),
+                    },
+                },
+            }],
+            runtime_addresses: DirectRuntimeAddressPlan {
+                slots_by_scope: BTreeMap::new(),
+                slot_items_by_scope: BTreeMap::from([(
+                    7,
+                    BTreeMap::from([(
+                        "upstream".to_string(),
+                        vec![
+                            DirectRuntimeUrlSource::SlotItem {
+                                component_id: 7,
+                                slot: "upstream".to_string(),
+                                item_index: 0,
+                                scheme: "http".to_string(),
+                            },
+                            DirectRuntimeUrlSource::SlotItem {
+                                component_id: 7,
+                                slot: "upstream".to_string(),
+                                item_index: 1,
+                                scheme: "http".to_string(),
+                            },
+                        ],
+                    )]),
+                )]),
+            },
+            router: None,
+        };
+
+        let runtime_state =
+            assign_direct_runtime_ports(temp.path(), &direct_plan).expect("ports should assign");
+        let rewritten =
+            read_mesh_config_public(&mesh_config_path).expect("mesh config should be rewritten");
+        let runtime_ports = runtime_state
+            .slot_route_ports_by_component
+            .get(&7)
+            .and_then(|slots| slots.get("upstream"))
+            .expect("runtime slot ports should exist");
+        let route_ports: Vec<u16> = rewritten
+            .outbound
+            .iter()
+            .map(|route| route.listen_port)
+            .collect();
+
+        assert_eq!(runtime_ports.len(), 2);
+        assert_eq!(route_ports.len(), 2);
+        assert_eq!(runtime_ports[0], route_ports[1]);
+        assert_eq!(runtime_ports[1], route_ports[0]);
+
+        let context =
+            build_runtime_template_context(&direct_plan.runtime_addresses, &runtime_state)
+                .expect("context should build");
+        let item_urls = context
+            .slot_items_by_scope
+            .get(&7)
+            .and_then(|slots| slots.get("upstream"))
+            .expect("runtime item urls should exist");
+        assert_eq!(item_urls.len(), 2);
+        assert_eq!(
+            item_urls[0].url,
+            format!("http://127.0.0.1:{}", runtime_ports[0])
+        );
+        assert_eq!(
+            item_urls[1].url,
+            format!("http://127.0.0.1:{}", runtime_ports[1])
         );
     }
 
@@ -5347,6 +5594,7 @@ mod tests {
                 sleep(Duration::from_millis(100)).await;
                 let state = DirectRuntimeState {
                     slot_ports_by_component: BTreeMap::new(),
+                    slot_route_ports_by_component: BTreeMap::new(),
                     component_mesh_port_by_id: BTreeMap::new(),
                     router_mesh_port: Some(32123),
                 };
