@@ -9,7 +9,8 @@ use std::{
 };
 
 use amber_manifest::{
-    FrameworkCapabilityName, Manifest, ManifestDigest, ManifestRef, ProvideDecl, SlotDecl,
+    CapabilityKind, FrameworkCapabilityName, Manifest, ManifestDigest, ManifestRef, ProvideDecl,
+    SlotDecl,
 };
 use amber_mesh::{InboundTarget, MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTarget};
 use amber_scenario::{
@@ -1577,7 +1578,7 @@ fn compose_routes_external_slots_through_router() {
         .external_slots
         .get("api")
         .expect("external slot metadata missing");
-    assert_eq!(external_meta.kind, "http");
+    assert_eq!(external_meta.kind, CapabilityKind::Http);
     assert_eq!(external_meta.url_env, "AMBER_EXTERNAL_SLOT_API_URL");
 
     let plan = provision_plan(&compose);

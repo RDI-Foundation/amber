@@ -33,9 +33,9 @@ pub use refs::{ManifestDigest, ManifestRef, ManifestUrl};
 pub(crate) use schema::binding_target_key_for_binding;
 pub use schema::{
     Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityDecl, CapabilityKind,
-    ComponentDecl, ComponentRef, ConfigSchema, Endpoint, EnvironmentDecl, ExportTarget,
-    LocalComponentRef, ManifestBinding, MountSource, Network, NetworkProtocol, Program,
-    ProgramCommon, ProgramImage, ProgramMount, ProgramPath, ProvideDecl, RawBinding,
+    CapabilityTransport, ComponentDecl, ComponentRef, ConfigSchema, Endpoint, EnvironmentDecl,
+    ExportTarget, LocalComponentRef, ManifestBinding, MountSource, Network, NetworkProtocol,
+    Program, ProgramCommon, ProgramImage, ProgramMount, ProgramPath, ProvideDecl, RawBinding,
     RawExportTarget, ResourceDecl, SlotDecl,
 };
 pub use slot_query::{

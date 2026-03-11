@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use amber_manifest::CapabilityKind;
 use amber_scenario::Scenario;
 use serde::{Deserialize, Serialize};
 
@@ -41,7 +42,7 @@ pub struct ExportMetadata {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExternalSlotMetadata {
     pub required: bool,
-    pub kind: String,
+    pub kind: CapabilityKind,
     pub url_env: String,
 }
 
@@ -104,7 +105,7 @@ pub fn collect_external_slot_metadata(
             slot_name.clone(),
             ExternalSlotMetadata {
                 required: !decl.optional,
-                kind: format!("{}", decl.decl.kind),
+                kind: decl.decl.kind,
                 url_env: external_slot_env_var(&slot_name),
             },
         );

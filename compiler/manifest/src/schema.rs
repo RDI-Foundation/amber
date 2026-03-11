@@ -490,6 +490,22 @@ impl fmt::Display for CapabilityKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum CapabilityTransport {
+    Http,
+    NonNetwork,
+}
+
+impl CapabilityKind {
+    pub const fn transport(self) -> CapabilityTransport {
+        match self {
+            Self::Mcp | Self::Llm | Self::Http | Self::A2a => CapabilityTransport::Http,
+            Self::Docker | Self::Storage => CapabilityTransport::NonNetwork,
+        }
+    }
+}
+
 #[derive(
     Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, bon::Builder,
 )]

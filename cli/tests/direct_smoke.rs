@@ -3,8 +3,11 @@ use std::{
     net::{SocketAddr, TcpListener},
     path::Path,
     process::{Command, Stdio},
+    thread,
+    time::Duration,
 };
 
+use amber_mesh::{MeshConfig, MeshIdentity, TransportConfig, encode_config_b64};
 use serde_json::Value;
 
 fn pick_free_port() -> u16 {
@@ -17,6 +20,20 @@ fn workspace_root() -> std::path::PathBuf {
         .parent()
         .expect("cli crate should live under the workspace root")
         .to_path_buf()
+}
+
+fn router_config_b64() -> String {
+    encode_config_b64(&MeshConfig {
+        identity: MeshIdentity::generate("/router", None),
+        mesh_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        control_listen: None,
+        control_allow: None,
+        peers: Vec::new(),
+        inbound: Vec::new(),
+        outbound: Vec::new(),
+        transport: TransportConfig::NoiseIk {},
+    })
+    .expect("router config should encode")
 }
 
 #[test]
@@ -94,6 +111,117 @@ fn run_rejects_unsupported_direct_plan_version() {
         stderr.contains("unsupported direct plan version"),
         "expected version error in stderr, got:\n{stderr}"
     );
+}
+
+#[test]
+fn proxy_accepts_llm_external_slot_bindings() {
+    let workspace_root = workspace_root();
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs root");
+    let temp = tempfile::Builder::new()
+        .prefix("proxy-llm-slot-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create temp output directory");
+    let direct_out = temp.path().join("out");
+    let child_manifest = temp.path().join("consumer.json5");
+    let root_manifest = temp.path().join("scenario.json5");
+    fs::write(
+        &child_manifest,
+        r#"{
+  manifest_version: "0.3.0",
+  program: {
+    path: "/usr/bin/env",
+    args: ["sh", "-c", "sleep 30"],
+    env: {
+      LLM_URL: "${slots.llm.url}"
+    },
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  slots: {
+    llm: { kind: "llm" }
+  },
+  provides: {
+    status: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    status: "status"
+  }
+}
+"#,
+    )
+    .expect("failed to write child manifest");
+    fs::write(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  slots: {
+    llm: { kind: "llm" }
+  },
+  components: {
+    consumer: "./consumer.json5"
+  },
+  bindings: [
+    { to: "#consumer.llm", from: "self.llm", weak: true }
+  ],
+  exports: {
+    status: "#consumer.status"
+  }
+}
+"##,
+    )
+    .expect("failed to write root manifest");
+
+    let compile = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&direct_out)
+        .arg(&root_manifest)
+        .output()
+        .expect("failed to run amber compile --direct");
+    assert!(
+        compile.status.success(),
+        "amber compile --direct failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let upstream_port = pick_free_port();
+    let control_port = pick_free_port();
+    let mut proxy = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("proxy")
+        .arg(&direct_out)
+        .arg("--slot")
+        .arg(format!("llm=127.0.0.1:{upstream_port}"))
+        .arg("--router-control-addr")
+        .arg(format!("127.0.0.1:{control_port}"))
+        .arg("--router-config-b64")
+        .arg(router_config_b64())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start amber proxy");
+
+    for _ in 0..10 {
+        if let Some(status) = proxy.try_wait().expect("failed to poll amber proxy") {
+            let output = proxy
+                .wait_with_output()
+                .expect("failed to capture amber proxy output");
+            panic!(
+                "amber proxy exited while binding llm slot\nstatus: \
+                 {status}\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let _ = proxy.kill();
+    let _ = proxy.wait();
 }
 
 #[cfg(target_os = "linux")]
