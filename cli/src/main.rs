@@ -34,7 +34,7 @@ use amber_compiler::{
         scenario_ir::ScenarioIrReporter,
     },
 };
-use amber_manifest::ManifestRef;
+use amber_manifest::{CapabilityTransport, ManifestRef};
 use amber_mesh::{
     InboundRoute, InboundTarget, MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME,
     MESH_PROVISION_PLAN_VERSION, MeshConfig, MeshConfigPublic, MeshIdentity, MeshIdentityPublic,
@@ -3461,6 +3461,36 @@ fn output_dir_for_target(root: &Path, target: &MeshProvisionTarget) -> Result<Pa
     }
 }
 
+fn validate_proxy_bindings(
+    metadata: &ProxyMetadata,
+    slot_bindings: &[SlotBinding],
+    export_bindings: &[ExportBinding],
+) -> Result<()> {
+    for binding in export_bindings {
+        let export = binding.export.as_str();
+        let export_meta = metadata
+            .exports
+            .get(export)
+            .ok_or_else(|| miette::miette!("export {export} not found in output"))?;
+        let _ = mesh_protocol_from_metadata(&export_meta.protocol)?;
+    }
+    for binding in slot_bindings {
+        let slot = binding.slot.as_str();
+        let slot_meta = metadata
+            .external_slots
+            .get(slot)
+            .ok_or_else(|| miette::miette!("slot {slot} not found in output"))?;
+        if slot_meta.kind.transport() != CapabilityTransport::Http {
+            return Err(miette::miette!(
+                "slot {slot} uses {} but amber proxy only supports HTTP-transport slots",
+                slot_meta.kind
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 async fn proxy(args: ProxyArgs, verbose: u8) -> Result<()> {
     let slot_bindings = parse_slot_bindings(&args)?;
     let export_bindings = parse_export_bindings(&args)?;
@@ -3471,29 +3501,7 @@ async fn proxy(args: ProxyArgs, verbose: u8) -> Result<()> {
     }
 
     let target = load_proxy_target(&args.output)?;
-    for binding in &export_bindings {
-        let export = binding.export.as_str();
-        let export_meta = target
-            .metadata
-            .exports
-            .get(export)
-            .ok_or_else(|| miette::miette!("export {export} not found in output"))?;
-        let _ = mesh_protocol_from_metadata(&export_meta.protocol)?;
-    }
-    for binding in &slot_bindings {
-        let slot = binding.slot.as_str();
-        let slot_meta = target
-            .metadata
-            .external_slots
-            .get(slot)
-            .ok_or_else(|| miette::miette!("slot {slot} not found in output"))?;
-        if !matches!(slot_meta.kind.as_str(), "http" | "https") {
-            return Err(miette::miette!(
-                "slot {slot} uses {} but amber proxy only supports http slots",
-                slot_meta.kind
-            ));
-        }
-    }
+    validate_proxy_bindings(&target.metadata, &slot_bindings, &export_bindings)?;
 
     let control_endpoint = resolve_control_endpoint(&args, &target)?;
     let router_identity = resolve_router_identity(&args, &control_endpoint).await?;
@@ -3599,7 +3607,7 @@ async fn proxy(args: ProxyArgs, verbose: u8) -> Result<()> {
             inbound.push(InboundRoute {
                 route_id: component_route_id(&proxy_identity.id, slot, MeshProtocol::Http),
                 capability: slot.to_string(),
-                capability_kind: Some(slot_meta.kind.clone()),
+                capability_kind: Some(slot_meta.kind.to_string()),
                 capability_profile: None,
                 protocol: MeshProtocol::Http,
                 http_plugins: Vec::new(),
@@ -5550,6 +5558,60 @@ mod tests {
             "direct control alias should stay well below unix socket path limits: {}",
             path.display()
         );
+    }
+
+    #[test]
+    fn validate_proxy_bindings_accepts_http_transport_slot_kinds() {
+        let metadata: ProxyMetadata = serde_json::from_value(serde_json::json!({
+            "version": PROXY_METADATA_VERSION,
+            "external_slots": {
+                "http_slot": { "required": true, "kind": "http", "url_env": "HTTP_SLOT_URL" },
+                "mcp_slot": { "required": true, "kind": "mcp", "url_env": "MCP_SLOT_URL" },
+                "llm_slot": { "required": true, "kind": "llm", "url_env": "LLM_SLOT_URL" },
+                "a2a_slot": { "required": true, "kind": "a2a", "url_env": "A2A_SLOT_URL" }
+            }
+        }))
+        .expect("proxy metadata should deserialize");
+        let slot_bindings = vec![
+            SlotBinding {
+                slot: "http_slot".to_string(),
+                upstream: "127.0.0.1:18080".parse().expect("socket address"),
+            },
+            SlotBinding {
+                slot: "mcp_slot".to_string(),
+                upstream: "127.0.0.1:18081".parse().expect("socket address"),
+            },
+            SlotBinding {
+                slot: "llm_slot".to_string(),
+                upstream: "127.0.0.1:18082".parse().expect("socket address"),
+            },
+            SlotBinding {
+                slot: "a2a_slot".to_string(),
+                upstream: "127.0.0.1:18083".parse().expect("socket address"),
+            },
+        ];
+
+        validate_proxy_bindings(&metadata, &slot_bindings, &[])
+            .expect("HTTP-transport slots should be accepted");
+    }
+
+    #[test]
+    fn validate_proxy_bindings_rejects_non_http_transport_slot_kinds() {
+        let metadata: ProxyMetadata = serde_json::from_value(serde_json::json!({
+            "version": PROXY_METADATA_VERSION,
+            "external_slots": {
+                "state": { "required": true, "kind": "storage", "url_env": "STATE_URL" }
+            }
+        }))
+        .expect("proxy metadata should deserialize");
+        let slot_bindings = vec![SlotBinding {
+            slot: "state".to_string(),
+            upstream: "127.0.0.1:18080".parse().expect("socket address"),
+        }];
+
+        let err = validate_proxy_bindings(&metadata, &slot_bindings, &[])
+            .expect_err("non-HTTP transports should be rejected");
+        assert!(err.to_string().contains("HTTP-transport slots"), "{}", err);
     }
 
     #[test]

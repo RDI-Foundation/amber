@@ -79,7 +79,7 @@ pub(crate) fn build_execution_guide(
             name,
             env_var: meta.url_env,
             required: meta.required,
-            kind: meta.kind,
+            kind: meta.kind.to_string(),
         })
         .collect();
     external_slots.sort_by(|left, right| left.name.cmp(&right.name));
