@@ -188,6 +188,90 @@ like `./bin/server`; it does not search `PATH`.
 amber compile path/to/root.json5 --bundle /tmp/amber-bundle
 ```
 
+## Porting agentbeats agents to Amber
+
+### Examples
+
+Here are some examples of popular green agents (with corresponding purple agents) that have been ported:
+- [Minecraft](https://github.com/RDI-Foundation/Minecraft-agentbeats/tree/main/amber)
+- [OfficeQA](https://github.com/RDI-Foundation/officeqa-agentbeats/tree/main/amber)
+- [Entropic CRMArenaPro](https://github.com/RDI-Foundation/DeoGaze-agentbeats/tree/main/amber)
+- [build_what_i_mean](https://github.com/RDI-Foundation/build_what_i_mean-agentbeats/tree/main/amber)
+
+### File Structure
+
+### Core Files
+
+- **`amber-scenario.json5`** - Main orchestration file that defines the complete application workflow
+- **`amber-manifest-*.json5`** - Individual component manifests that define how each agent runs
+- **`sample.env`** - Template environment file for configuration values
+
+#### amber-scenario.json5
+
+This is the main orchestration file. It is responsible for passing configuration parameters (like secrets)
+to both green and purple agents. Fixed strings (like task config) go in `components.gateway.config.assessment_config`.
+Secrets that come from the environment are defined in the `config_schema`.
+
+
+#### amber-manifest-*.json5
+
+To port an agent, provide the docker image under `program.image` and the corresponding entrypoint (usually defined
+in the Dockerfile) under `program.entrypoint`. API keys usually go in the `program.env` section. Remember to also list
+them under `config_schema` and mark secrets as such. Finally, provide and export an `a2a` interface.
+
+### Configuration Steps
+
+#### 1. Environment Setup
+```bash
+cp sample.env .env
+```
+Edit .env with your actual configuration values.
+
+#### 2. Compile Scenario
+```bash
+./amber compile amber-scenario.json5 --docker-compose output.yml
+```
+
+This generates a Docker Compose file from your Amber configuration.
+
+#### 3. Run Application
+```bash
+export $(grep -v '^#' .env | xargs) && docker compose -f output.yml up
+```
+
+### Testing Your Configuration
+
+#### Quick Validation
+Check if compilation works:
+```bash
+./amber check amber-scenario.json5
+
+# Validate generated Docker Compose
+docker compose -f output.yml config
+```
+
+#### Component Testing
+```bash
+# Start services
+docker compose -f output.yml up
+
+# Check container health
+docker compose -f output.yml ps
+
+# View logs
+docker compose -f output.yml logs [service-name]
+
+# Cleanup
+docker compose -f output.yml down
+```
+
+### Troubleshooting
+
+- **ENV variables not detected**: Check if variables are available
+- **Container startup issues**: Verify image availability and environment variables
+- **Network connectivity**: Check component bindings and port configurations
+- **Configuration validation**: Ensure config_schema matches provided values
+
 ## CLI reference
 
 Every command has its own help page:
