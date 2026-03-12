@@ -152,11 +152,14 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
       AMBER_VM_FORCE_TCG: "1"
-      AMBER_VM_SMOKE_BASE_IMAGE: ${{ runner.temp }}/ubuntu-24.04-minimal-cloudimg-amd64.img
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure VM smoke image path
+        run: |
+          set -euo pipefail
+          echo "AMBER_VM_SMOKE_BASE_IMAGE=${RUNNER_TEMP}/ubuntu-24.04-minimal-cloudimg-amd64.img" >> "$GITHUB_ENV"
       - name: Ensure VM runtime packages are available
         run: |
           set -euo pipefail
