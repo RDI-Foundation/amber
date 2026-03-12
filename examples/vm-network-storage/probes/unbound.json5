@@ -1,4 +1,6 @@
 {
+  // This probe is intentionally unbound. It hardcodes a guessed guest-side URL to show that
+  // guessing an address does not give the VM access.
   manifest_version: "0.1.0",
   config_schema: {
     type: "object",

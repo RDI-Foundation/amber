@@ -1,4 +1,6 @@
 {
+  // Same API shape as v1, with different guest bootstrap data so `/version` and the boot-time
+  // ephemeral value change in v2.
   manifest_version: "0.1.0",
   config_schema: {
     type: "object",

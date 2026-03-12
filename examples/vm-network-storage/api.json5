@@ -1,4 +1,6 @@
 {
+  // Reusable API VM: it takes storage from its parent, serves HTTP, and keeps guest boot setup in
+  // a separate cloud-init file so the Amber structure stays easy to scan.
   manifest_version: "0.1.0",
   config_schema: {
     type: "object",

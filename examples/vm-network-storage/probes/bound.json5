@@ -1,4 +1,6 @@
 {
+  // This probe shows the allowed path: Amber gives it `${slots.api.url}`, and the guest uses that
+  // value to call the API.
   manifest_version: "0.1.0",
   config_schema: {
     type: "object",

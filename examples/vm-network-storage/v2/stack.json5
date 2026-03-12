@@ -1,4 +1,6 @@
 {
+  // v2 inserts this wrapper component between the root and the original VMs. The API still
+  // receives the same storage slot, but the parent-child structure is different.
   manifest_version: "0.1.0",
   config_schema: {
     type: "object",

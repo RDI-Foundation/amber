@@ -1,4 +1,6 @@
 {
+  // v2 changes the graph shape at the root: it now points at `stack`, but the durable storage
+  // resource is still owned here.
   manifest_version: "0.1.0",
   config_schema: {
     type: "object",
