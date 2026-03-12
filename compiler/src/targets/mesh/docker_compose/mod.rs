@@ -624,11 +624,10 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
         router_service
             .networks
             .insert(MESH_NETWORK_NAME.to_string(), EmptyMap::default());
-        router_service
-            .ports
-            .push(format!("127.0.0.1:{router_mesh_port}:{router_mesh_port}"));
-
         if !exports_by_name.is_empty() {
+            router_service
+                .ports
+                .push(format!("127.0.0.1::{router_mesh_port}"));
             let labels_json = serde_json::to_string(&exports_by_name)
                 .map_err(|err| format!("failed to serialize router export labels: {err}"))?;
             router_service
