@@ -2283,6 +2283,559 @@ async fn compile_emits_manifest_lints() {
 }
 
 #[tokio::test]
+async fn optimized_compile_keeps_externally_rooted_child_without_exports() {
+    let dir = tmp_dir("external-rooted-child-dce");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "child",
+            entrypoint: ["child"],
+            env: { API_URL: "${slots.api.url}" }
+          },
+          slots: { api: { kind: "http" } }
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              slots: {{ api: {{ kind: "http" }} }},
+              components: {{ child: "{child}" }},
+              bindings: [
+                {{ to: "#child.api", from: "self.api", weak: true }}
+              ]
+            }}
+            "##,
+            child = file_url(&child_path),
+        ),
+    );
+
+    let compiler = default_compiler();
+    let root_ref = manifest_ref_for_path(&root_path);
+    let output = compiler
+        .compile(root_ref, optimized_compile_options())
+        .await
+        .unwrap();
+
+    assert!(
+        output
+            .scenario
+            .components_iter()
+            .any(|(_, component)| component.moniker.as_str() == "/child"),
+        "optimized compile should retain the externally rooted child"
+    );
+    let root = output.scenario.component(output.scenario.root);
+    assert!(
+        root.slots.contains_key("api"),
+        "optimized compile should retain the external root slot"
+    );
+    assert!(output.scenario.bindings.iter().any(|binding| {
+        matches!(
+            &binding.from,
+            BindingFrom::External(slot)
+                if slot.component == output.scenario.root && slot.name == "api"
+        ) && binding.to.name == "api"
+    }));
+}
+
+#[tokio::test]
+async fn optimized_compile_keeps_root_program_driven_by_external_slot_without_exports() {
+    let dir = tmp_dir("external-rooted-root-dce");
+    let root_path = dir.path().join("root.json5");
+
+    write_file(
+        &root_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { api: { kind: "http" } },
+          program: {
+            image: "root",
+            entrypoint: ["root"],
+            env: { API_URL: "${slots.api.url}" }
+          }
+        }
+        "#,
+    );
+
+    let compiler = default_compiler();
+    let root_ref = manifest_ref_for_path(&root_path);
+    let output = compiler
+        .compile(root_ref, optimized_compile_options())
+        .await
+        .unwrap();
+
+    let root = output.scenario.component(output.scenario.root);
+    assert!(
+        root.program.is_some(),
+        "optimized compile should retain the root program when it consumes an external slot"
+    );
+    assert!(
+        root.slots.contains_key("api"),
+        "optimized compile should retain the root external slot"
+    );
+    assert!(output.scenario.bindings.iter().any(|binding| {
+        matches!(
+            &binding.from,
+            BindingFrom::External(slot)
+                if slot.component == output.scenario.root && slot.name == "api"
+        ) && binding.to.component == output.scenario.root
+            && binding.to.name == "api"
+    }));
+}
+
+#[tokio::test]
+async fn optimized_compile_keeps_externally_rooted_child_with_repeated_each_without_exports() {
+    let dir = tmp_dir("external-rooted-repeated-each-dce");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.3.0",
+          program: {
+            image: "child",
+            entrypoint: [
+              "child",
+              { each: "slots.api", argv: ["--api", "${item.url}"] }
+            ]
+          },
+          slots: { api: { kind: "http", optional: true, multiple: true } }
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.3.0",
+              slots: {{ api: {{ kind: "http", optional: true, multiple: true }} }},
+              components: {{ child: "{child}" }},
+              bindings: [
+                {{ to: "#child.api", from: "self.api", weak: true }}
+              ]
+            }}
+            "##,
+            child = file_url(&child_path),
+        ),
+    );
+
+    let compiler = default_compiler();
+    let root_ref = manifest_ref_for_path(&root_path);
+    let output = compiler
+        .compile(root_ref, optimized_compile_options())
+        .await
+        .unwrap();
+
+    assert!(
+        output
+            .scenario
+            .components_iter()
+            .any(|(_, component)| component.moniker.as_str() == "/child"),
+        "optimized compile should retain the externally rooted child when it uses repeated `each`"
+    );
+    let root = output.scenario.component(output.scenario.root);
+    assert!(
+        root.slots.contains_key("api"),
+        "optimized compile should retain the external root slot for repeated `each`"
+    );
+    assert!(output.scenario.bindings.iter().any(|binding| {
+        matches!(
+            &binding.from,
+            BindingFrom::External(slot)
+                if slot.component == output.scenario.root && slot.name == "api"
+        ) && binding.to.name == "api"
+    }));
+}
+
+#[tokio::test]
+async fn optimized_compile_keeps_root_program_that_references_all_slots_without_exports() {
+    let dir = tmp_dir("external-rooted-all-slots-dce");
+    let root_path = dir.path().join("root.json5");
+
+    write_file(
+        &root_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: {
+            admin: { kind: "http" },
+            api: { kind: "http" }
+          },
+          program: {
+            image: "root",
+            entrypoint: ["root"],
+            env: { ALL_SLOTS: "${slots}" }
+          }
+        }
+        "#,
+    );
+
+    let compiler = default_compiler();
+    let root_ref = manifest_ref_for_path(&root_path);
+    let output = compiler
+        .compile(root_ref, optimized_compile_options())
+        .await
+        .unwrap();
+
+    let root = output.scenario.component(output.scenario.root);
+    assert!(
+        root.program.is_some(),
+        "optimized compile should retain a root program that references all slots"
+    );
+    assert!(
+        root.slots.contains_key("admin") && root.slots.contains_key("api"),
+        "optimized compile should retain every root slot referenced by `${{slots}}`"
+    );
+    assert!(output.scenario.bindings.iter().any(|binding| {
+        matches!(
+            &binding.from,
+            BindingFrom::External(slot)
+                if slot.component == output.scenario.root && slot.name == "admin"
+        ) && binding.to.component == output.scenario.root
+            && binding.to.name == "admin"
+    }));
+    assert!(output.scenario.bindings.iter().any(|binding| {
+        matches!(
+            &binding.from,
+            BindingFrom::External(slot)
+                if slot.component == output.scenario.root && slot.name == "api"
+        ) && binding.to.component == output.scenario.root
+            && binding.to.name == "api"
+    }));
+}
+
+#[tokio::test]
+async fn check_suppresses_unused_program_for_externally_rooted_child() {
+    let dir = tmp_dir("external-rooted-child-lint");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "child",
+            entrypoint: ["child"],
+            env: { API_URL: "${slots.api.url}" }
+          },
+          slots: { api: { kind: "http" } }
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              slots: {{ api: {{ kind: "http" }} }},
+              components: {{ child: "{child}" }},
+              bindings: [
+                {{ to: "#child.api", from: "self.api", weak: true }}
+              ]
+            }}
+            "##,
+            child = file_url(&child_path),
+        ),
+    );
+
+    let compiler = default_compiler();
+    let root_ref = manifest_ref_for_path(&root_path);
+    let output = compiler
+        .check(root_ref, standard_compile_options())
+        .await
+        .unwrap();
+
+    assert!(!output.has_errors);
+    assert!(
+        !has_diagnostic_code(&output.diagnostics, "manifest::unused_program"),
+        "unexpected manifest::unused_program diagnostics: {:?}",
+        output
+            .diagnostics
+            .iter()
+            .map(|diag| diag.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn check_suppresses_unused_program_for_root_program_driven_by_external_slot() {
+    let dir = tmp_dir("external-rooted-root-lint");
+    let root_path = dir.path().join("root.json5");
+
+    write_file(
+        &root_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { api: { kind: "http" } },
+          program: {
+            image: "root",
+            entrypoint: ["root"],
+            env: { API_URL: "${slots.api.url}" }
+          }
+        }
+        "#,
+    );
+
+    let compiler = default_compiler();
+    let root_ref = manifest_ref_for_path(&root_path);
+    let output = compiler
+        .check(root_ref, standard_compile_options())
+        .await
+        .unwrap();
+
+    assert!(!output.has_errors);
+    assert!(
+        !has_diagnostic_code(&output.diagnostics, "manifest::unused_program"),
+        "unexpected manifest::unused_program diagnostics: {:?}",
+        output
+            .diagnostics
+            .iter()
+            .map(|diag| diag.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn check_suppresses_unused_program_for_externally_rooted_child_with_repeated_each() {
+    let dir = tmp_dir("external-rooted-repeated-each-lint");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.3.0",
+          program: {
+            image: "child",
+            entrypoint: [
+              "child",
+              { each: "slots.api", argv: ["--api", "${item.url}"] }
+            ]
+          },
+          slots: { api: { kind: "http", optional: true, multiple: true } }
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.3.0",
+              slots: {{ api: {{ kind: "http", optional: true, multiple: true }} }},
+              components: {{ child: "{child}" }},
+              bindings: [
+                {{ to: "#child.api", from: "self.api", weak: true }}
+              ]
+            }}
+            "##,
+            child = file_url(&child_path),
+        ),
+    );
+
+    let compiler = default_compiler();
+    let root_ref = manifest_ref_for_path(&root_path);
+    let output = compiler
+        .check(root_ref, standard_compile_options())
+        .await
+        .unwrap();
+
+    assert!(!output.has_errors);
+    assert!(
+        !has_diagnostic_code(&output.diagnostics, "manifest::unused_program"),
+        "unexpected manifest::unused_program diagnostics: {:?}",
+        output
+            .diagnostics
+            .iter()
+            .map(|diag| diag.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn check_keeps_unused_program_for_external_binding_to_unused_slot() {
+    let dir = tmp_dir("external-binding-unused-program-lint");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "child",
+            entrypoint: ["child"]
+          },
+          slots: { api: { kind: "http" } }
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              slots: {{ api: {{ kind: "http" }} }},
+              components: {{ child: "{child}" }},
+              bindings: [
+                {{ to: "#child.api", from: "self.api", weak: true }}
+              ]
+            }}
+            "##,
+            child = file_url(&child_path),
+        ),
+    );
+
+    let compiler = default_compiler();
+    let root_ref = manifest_ref_for_path(&root_path);
+    let output = compiler
+        .check(root_ref, standard_compile_options())
+        .await
+        .unwrap();
+
+    assert!(!output.has_errors);
+    assert!(
+        has_diagnostic_code(&output.diagnostics, "manifest::unused_program"),
+        "expected manifest::unused_program diagnostics, got {:?}",
+        output
+            .diagnostics
+            .iter()
+            .map(|diag| diag.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn check_suppresses_unused_program_but_not_unused_provide_for_externally_rooted_child() {
+    let dir = tmp_dir("external-rooted-narrow-lint");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "child",
+            entrypoint: ["child"],
+            env: { API_URL: "${slots.api.url}" },
+            network: { endpoints: [{ name: "out", port: 8080 }] }
+          },
+          slots: { api: { kind: "http" } },
+          provides: {
+            out: { kind: "http", endpoint: "out" }
+          }
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              slots: {{ api: {{ kind: "http" }} }},
+              components: {{ child: "{child}" }},
+              bindings: [
+                {{ to: "#child.api", from: "self.api", weak: true }}
+              ]
+            }}
+            "##,
+            child = file_url(&child_path),
+        ),
+    );
+
+    let compiler = default_compiler();
+    let root_ref = manifest_ref_for_path(&root_path);
+    let output = compiler
+        .check(root_ref, standard_compile_options())
+        .await
+        .unwrap();
+    let diagnostics: Vec<_> = output
+        .diagnostics
+        .iter()
+        .map(|diag| diag.to_string())
+        .collect();
+
+    assert!(!output.has_errors);
+    assert!(
+        !has_diagnostic_code(&output.diagnostics, "manifest::unused_program"),
+        "unexpected manifest::unused_program diagnostics: {:?}",
+        diagnostics
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diag| diag == "provide `out` is never used or exported (in component /child)"),
+        "expected the child unused-provide warning to remain: {:?}",
+        diagnostics
+    );
+}
+
+#[tokio::test]
+async fn check_suppresses_unused_program_for_root_program_that_references_all_slots() {
+    let dir = tmp_dir("external-rooted-all-slots-lint");
+    let root_path = dir.path().join("root.json5");
+
+    write_file(
+        &root_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: {
+            admin: { kind: "http" },
+            api: { kind: "http" }
+          },
+          program: {
+            image: "root",
+            entrypoint: ["root"],
+            env: { ALL_SLOTS: "${slots}" }
+          }
+        }
+        "#,
+    );
+
+    let compiler = default_compiler();
+    let root_ref = manifest_ref_for_path(&root_path);
+    let output = compiler
+        .check(root_ref, standard_compile_options())
+        .await
+        .unwrap();
+
+    assert!(!output.has_errors);
+    assert!(
+        !has_diagnostic_code(&output.diagnostics, "manifest::unused_program"),
+        "unexpected manifest::unused_program diagnostics: {:?}",
+        output
+            .diagnostics
+            .iter()
+            .map(|diag| diag.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn check_treats_weak_binding_targets_as_optional_for_unused_slot_lint() {
     let dir = tmp_dir("scenario-optional-slot-downstream-lint");
     let root_path = dir.path().join("root.json5");

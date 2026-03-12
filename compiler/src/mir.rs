@@ -529,6 +529,7 @@ struct DceResults {
 struct DceSolver<'a> {
     scenario: &'a Scenario,
     incoming: Vec<Vec<usize>>,
+    program_used_slots: Vec<HashSet<String>>,
     keep_components: Vec<bool>,
     live_programs: Vec<bool>,
     live_slots: HashSet<CapKey>,
@@ -551,11 +552,22 @@ impl<'a> DceSolver<'a> {
             }
             incoming[binding.to.component.0].push(idx);
         }
+        let program_used_slots = scenario
+            .components
+            .iter()
+            .map(|component| {
+                component
+                    .as_ref()
+                    .map(|component| collect_program_used_slots(component).into_iter().collect())
+                    .unwrap_or_default()
+            })
+            .collect();
 
         let n = scenario.components.len();
         Self {
             scenario,
             incoming,
+            program_used_slots,
             keep_components: vec![false; n],
             live_programs: vec![false; n],
             live_slots: HashSet::new(),
@@ -570,6 +582,7 @@ impl<'a> DceSolver<'a> {
         for export in &self.scenario.exports {
             self.mark_provide(export.from.component.0, &export.from.name);
         }
+        self.seed_externally_rooted_programs();
 
         while let Some(item) = self.work.pop_front() {
             match item {
@@ -587,6 +600,17 @@ impl<'a> DceSolver<'a> {
             live_provides: self.live_provides,
             live_resources: self.live_resources,
             live_bindings: self.live_bindings,
+        }
+    }
+
+    fn seed_externally_rooted_programs(&mut self) {
+        for binding in &self.scenario.bindings {
+            let BindingFrom::External(_) = &binding.from else {
+                continue;
+            };
+            if self.program_used_slots[binding.to.component.0].contains(binding.to.name.as_str()) {
+                self.mark_program_live(binding.to.component.0);
+            }
         }
     }
 
@@ -740,7 +764,7 @@ fn is_live_capability(live: &HashSet<CapKey>, component: usize, name: &str) -> b
     })
 }
 
-fn collect_program_used_slots(component: &amber_scenario::Component) -> Vec<String> {
+pub(crate) fn collect_program_used_slots(component: &amber_scenario::Component) -> Vec<String> {
     let Some(program) = component.program.as_ref() else {
         return Vec::new();
     };
@@ -821,6 +845,7 @@ fn compute_keep_set(
 
 #[cfg(test)]
 mod tests {
+    use amber_manifest::SlotDecl;
     use amber_scenario::{Moniker, ProvideRef};
 
     use super::*;
@@ -891,6 +916,103 @@ mod tests {
         assert_eq!(rewritten.bindings.len(), 2);
         assert_eq!(rewritten.bindings[0].to.name, "upstream");
         assert_eq!(rewritten.bindings[1].to.name, "upstream");
+    }
+
+    fn slot_decl(kind: &str, optional: bool, multiple: bool) -> SlotDecl {
+        let mut value = serde_json::json!({ "kind": kind });
+        if optional {
+            value["optional"] = serde_json::Value::Bool(true);
+        }
+        if multiple {
+            value["multiple"] = serde_json::Value::Bool(true);
+        }
+        serde_json::from_value(value).expect("slot decl")
+    }
+
+    #[test]
+    fn collect_program_used_slots_covers_program_surface() {
+        let program = serde_json::from_value(serde_json::json!({
+            "path": "${slots.runner.path}",
+            "args": [
+                "${slots.api.url}",
+                { "when": "slots.gate", "argv": ["--gate"] },
+                { "each": "slots.peers", "argv": ["--peer", "${item.url}"] },
+            ],
+            "env": {
+                "HEADERS_URL": "${slots.headers.url}",
+                "PEERS": {
+                    "each": "slots.peers",
+                    "value": "${item.url}",
+                    "join": ","
+                }
+            },
+            "mounts": [
+                { "path": "/var/lib/state", "from": "slots.state" }
+            ]
+        }))
+        .expect("program");
+
+        let mut component = component(0, "/");
+        component.program = Some(program);
+        component
+            .slots
+            .insert("api".to_string(), slot_decl("http", false, false));
+        component
+            .slots
+            .insert("gate".to_string(), slot_decl("http", true, false));
+        component
+            .slots
+            .insert("headers".to_string(), slot_decl("http", false, false));
+        component
+            .slots
+            .insert("peers".to_string(), slot_decl("http", true, true));
+        component
+            .slots
+            .insert("runner".to_string(), slot_decl("storage", false, false));
+        component
+            .slots
+            .insert("state".to_string(), slot_decl("storage", false, false));
+        component
+            .slots
+            .insert("unused".to_string(), slot_decl("http", false, false));
+
+        assert_eq!(
+            collect_program_used_slots(&component),
+            vec![
+                "api".to_string(),
+                "gate".to_string(),
+                "headers".to_string(),
+                "peers".to_string(),
+                "runner".to_string(),
+                "state".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_program_used_slots_returns_all_slots_for_whole_slots_interpolation() {
+        let program = serde_json::from_value(serde_json::json!({
+            "image": "runner",
+            "entrypoint": ["runner"],
+            "env": {
+                "ALL_SLOTS": "${slots}"
+            }
+        }))
+        .expect("program");
+
+        let mut component = component(0, "/");
+        component.program = Some(program);
+        component
+            .slots
+            .insert("admin".to_string(), slot_decl("http", false, false));
+        component
+            .slots
+            .insert("api".to_string(), slot_decl("http", false, false));
+
+        assert_eq!(
+            collect_program_used_slots(&component),
+            vec!["admin".to_string(), "api".to_string()]
+        );
     }
 }
 

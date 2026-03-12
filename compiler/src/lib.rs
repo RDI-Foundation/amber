@@ -11,7 +11,7 @@ use amber_manifest::{
     lint::{ManifestLint, lint_manifest},
 };
 use amber_resolver::Resolver;
-use amber_scenario::{ComponentId, Scenario};
+use amber_scenario::{BindingFrom, ComponentId, Scenario};
 use miette::{Diagnostic, Report};
 use thiserror::Error;
 
@@ -254,6 +254,7 @@ fn collect_manifest_diagnostics(
 ) -> Vec<Report> {
     let mut diagnostics = Vec::new();
     let optional_slots = effective_optional_slots_by_component(scenario, provenance);
+    let externally_rooted_programs = externally_rooted_programs_by_component(scenario, provenance);
 
     for (_, component) in scenario.components_iter() {
         let manifest = store
@@ -274,7 +275,9 @@ fn collect_manifest_diagnostics(
         diagnostics.extend(
             lints
                 .into_iter()
-                .filter(|lint| !suppress_manifest_unused_slot_lint(lint, &optional_slots))
+                .filter(|lint| {
+                    !suppress_manifest_lint(lint, &optional_slots, &externally_rooted_programs)
+                })
                 .map(Report::new),
         );
     }
@@ -318,20 +321,22 @@ fn collect_tree_node_diagnostics(
     }
 }
 
-fn suppress_manifest_unused_slot_lint(
+fn suppress_manifest_lint(
     lint: &ManifestLint,
     optional_slots_by_component: &BTreeMap<String, BTreeSet<String>>,
+    externally_rooted_programs: &BTreeSet<String>,
 ) -> bool {
-    let ManifestLint::UnusedSlot {
-        name, component, ..
-    } = lint
-    else {
-        return false;
-    };
-
-    optional_slots_by_component
-        .get(component)
-        .is_some_and(|slots| slots.contains(name))
+    match lint {
+        ManifestLint::UnusedSlot {
+            name, component, ..
+        } => optional_slots_by_component
+            .get(component)
+            .is_some_and(|slots| slots.contains(name)),
+        ManifestLint::UnusedProgram { component, .. } => {
+            externally_rooted_programs.contains(component)
+        }
+        _ => false,
+    }
 }
 
 fn effective_optional_slots_by_component(
@@ -364,6 +369,43 @@ fn effective_optional_slots_by_component(
         out.entry(component_path)
             .or_insert_with(BTreeSet::new)
             .insert(binding.to.name.clone());
+    }
+
+    out
+}
+
+fn externally_rooted_programs_by_component(
+    scenario: &Scenario,
+    provenance: &Provenance,
+) -> BTreeSet<String> {
+    let used_slots_by_component: Vec<BTreeSet<String>> = scenario
+        .components
+        .iter()
+        .map(|component| {
+            component
+                .as_ref()
+                .map(|component| {
+                    mir::collect_program_used_slots(component)
+                        .into_iter()
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+
+    let mut out = BTreeSet::new();
+    for binding in &scenario.bindings {
+        let BindingFrom::External(_) = &binding.from else {
+            continue;
+        };
+        if used_slots_by_component[binding.to.component.0].contains(binding.to.name.as_str()) {
+            out.insert(
+                provenance
+                    .for_component(binding.to.component)
+                    .authored_moniker
+                    .to_string(),
+            );
+        }
     }
 
     out
