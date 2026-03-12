@@ -8,7 +8,7 @@ linker::external_slot_requires_weak
     :                 `-- binding must be weak here
  11 |   ],
     `----
-  help: Make this binding weak or insert a weak binding upstream.
+  help: Any route that depends on an external slot must be weak overall. Make this binding weak or insert a weak binding upstream.
 
 Advice: 
   > external slot `api` declared on /

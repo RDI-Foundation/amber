@@ -714,7 +714,10 @@ pub enum Error {
     )]
     #[diagnostic(
         code(linker::external_slot_requires_weak),
-        help("Make this binding weak or insert a weak binding upstream.")
+        help(
+            "Any route that depends on an external slot must be weak overall. Make this binding \
+             weak or insert a weak binding upstream."
+        )
     )]
     ExternalSlotRequiresWeakBinding {
         component_path: String,
