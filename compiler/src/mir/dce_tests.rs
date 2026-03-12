@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use amber_manifest::{FrameworkCapabilityName, Manifest, ProvideDecl};
+use amber_manifest::{FrameworkCapabilityName, Manifest, Program, ProvideDecl, SlotDecl};
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceDecl,
     ResourceRef, Scenario, ScenarioExport, SlotRef, StorageResourceParams,
@@ -123,6 +123,48 @@ fn storage_resource_decl(size: Option<&str>) -> ResourceDecl {
         None => json!({ "kind": "storage" }),
     };
     serde_json::from_value(value).expect("storage resource decl")
+}
+
+fn manifest_slot(kind: &str, optional: bool, multiple: bool) -> SlotDecl {
+    let mut value = json!({ "kind": kind });
+    if optional {
+        value["optional"] = serde_json::Value::Bool(true);
+    }
+    if multiple {
+        value["multiple"] = serde_json::Value::Bool(true);
+    }
+    serde_json::from_value(value).expect("slot decl")
+}
+
+fn externally_rooted_child_scenario(
+    slot_name: &str,
+    slot_decl: SlotDecl,
+    child_program: Program,
+) -> Scenario {
+    let mut root = component(0, "/");
+    root.slots.insert(slot_name.to_string(), slot_decl.clone());
+    root.children.push(ComponentId(1));
+
+    let mut child = component(1, "/child");
+    child.parent = Some(ComponentId(0));
+    child.program = Some(child_program);
+    child.slots.insert(slot_name.to_string(), slot_decl);
+
+    let mut scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(child)],
+        bindings: vec![external_binding(0, slot_name, 1, slot_name, true)],
+        exports: Vec::new(),
+    };
+    scenario.normalize_order();
+    scenario
+}
+
+fn assert_dce_idempotent(scenario: Scenario) -> Scenario {
+    let once = dce_only(scenario);
+    let twice = dce_only(once.clone());
+    assert_eq!(once, twice, "dce changed the scenario on a second pass");
+    once
 }
 
 fn external_binding(
@@ -1218,4 +1260,492 @@ fn dce_keeps_live_external_root_slot_used_in_env_when_condition() {
         ),
         "expected external binding from root.white to remain"
     );
+}
+
+#[test]
+fn dce_keeps_externally_rooted_child_program_without_exports() {
+    let slot_decl = manifest_slot("http", false, false);
+    let child_program = serde_json::from_value(json!({
+        "image": "child",
+        "entrypoint": ["child"],
+        "env": { "API_URL": "${slots.api.url}" },
+    }))
+    .expect("program");
+
+    let mut root = component(0, "/");
+    root.slots.insert("api".to_string(), slot_decl.clone());
+    root.children.push(ComponentId(1));
+
+    let mut child = component(1, "/child");
+    child.parent = Some(ComponentId(0));
+    child.program = Some(child_program);
+    child.slots.insert("api".to_string(), slot_decl);
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(child)],
+        bindings: vec![external_binding(0, "api", 1, "api", true)],
+        exports: Vec::new(),
+    };
+
+    let scenario = assert_dce_idempotent(scenario);
+    let root_after = scenario.component(ComponentId(0));
+    let child_after = scenario
+        .components
+        .get(1)
+        .and_then(|component| component.as_ref())
+        .expect("child should remain live");
+
+    assert!(
+        child_after.program.is_some(),
+        "externally rooted child program must remain"
+    );
+    assert!(
+        root_after.slots.contains_key("api"),
+        "external root slot must remain when it roots a child program"
+    );
+    assert_eq!(scenario.bindings.len(), 1, "external binding should remain");
+    assert!(
+        matches!(
+            &scenario.bindings[0].from,
+            BindingFrom::External(slot) if slot.component == ComponentId(0) && slot.name == "api"
+        ),
+        "expected external binding from root.api to remain"
+    );
+}
+
+#[test]
+fn dce_keeps_externally_rooted_root_program_without_exports() {
+    let slot_decl = manifest_slot("http", false, false);
+    let root_program = serde_json::from_value(json!({
+        "image": "root",
+        "entrypoint": ["root"],
+        "env": { "API_URL": "${slots.api.url}" },
+    }))
+    .expect("program");
+
+    let mut root = component(0, "/");
+    root.program = Some(root_program);
+    root.slots.insert("api".to_string(), slot_decl);
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root)],
+        bindings: vec![external_binding(0, "api", 0, "api", true)],
+        exports: Vec::new(),
+    };
+
+    let scenario = assert_dce_idempotent(scenario);
+    let root_after = scenario.component(ComponentId(0));
+
+    assert!(
+        root_after.program.is_some(),
+        "externally rooted root program must remain"
+    );
+    assert!(
+        root_after.slots.contains_key("api"),
+        "root external slot must remain when the root program consumes it"
+    );
+    assert_eq!(
+        scenario.bindings.len(),
+        1,
+        "synthetic self external binding should remain"
+    );
+    assert!(
+        matches!(
+            &scenario.bindings[0].from,
+            BindingFrom::External(slot) if slot.component == ComponentId(0) && slot.name == "api"
+        ),
+        "expected self external binding from root.api to remain"
+    );
+}
+
+#[test]
+fn dce_prunes_unused_external_binding_without_exports() {
+    let slot_decl = manifest_slot("http", false, false);
+    let child_program = serde_json::from_value(json!({
+        "image": "child",
+        "entrypoint": ["child"],
+    }))
+    .expect("program");
+
+    let mut root = component(0, "/");
+    root.slots.insert("api".to_string(), slot_decl.clone());
+    root.children.push(ComponentId(1));
+
+    let mut child = component(1, "/child");
+    child.parent = Some(ComponentId(0));
+    child.program = Some(child_program);
+    child.slots.insert("api".to_string(), slot_decl);
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(child)],
+        bindings: vec![external_binding(0, "api", 1, "api", true)],
+        exports: Vec::new(),
+    };
+
+    let scenario = assert_dce_idempotent(scenario);
+    let root_after = scenario.component(ComponentId(0));
+
+    assert!(
+        scenario.components[1].is_none(),
+        "child should be pruned when the external-bound slot is never used by its program"
+    );
+    assert!(
+        !root_after.slots.contains_key("api"),
+        "dead external root slot should be pruned when nothing live consumes it"
+    );
+    assert!(
+        scenario.bindings.is_empty(),
+        "dead external binding should be removed"
+    );
+}
+
+#[test]
+fn dce_keeps_internal_dependencies_of_externally_rooted_program_without_exports() {
+    let slot_http = manifest_slot("http", false, false);
+    let provide_http: amber_manifest::ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "admin" }))
+            .expect("provide decl");
+    let consumer_program = serde_json::from_value(json!({
+        "image": "consumer",
+        "entrypoint": ["consumer"],
+        "env": {
+            "API_URL": "${slots.api.url}",
+            "ADMIN_URL": "${slots.admin.url}",
+        },
+    }))
+    .expect("program");
+    let provider_program = serde_json::from_value(json!({
+        "image": "provider",
+        "entrypoint": ["provider"],
+        "network": { "endpoints": [{ "name": "admin", "port": 9000 }] },
+    }))
+    .expect("program");
+
+    let mut root = component(0, "/");
+    root.slots.insert("api".to_string(), slot_http.clone());
+    root.children.extend([ComponentId(1), ComponentId(2)]);
+
+    let mut consumer = component(1, "/consumer");
+    consumer.parent = Some(ComponentId(0));
+    consumer.program = Some(consumer_program);
+    consumer.slots.insert("api".to_string(), slot_http.clone());
+    consumer
+        .slots
+        .insert("admin".to_string(), slot_http.clone());
+
+    let mut provider = component(2, "/provider");
+    provider.parent = Some(ComponentId(0));
+    provider.program = Some(provider_program);
+    provider.provides.insert("admin".to_string(), provide_http);
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(consumer), Some(provider)],
+        bindings: vec![
+            external_binding(0, "api", 1, "api", true),
+            component_binding(2, "admin", 1, "admin"),
+        ],
+        exports: Vec::new(),
+    };
+
+    let scenario = assert_dce_idempotent(scenario);
+
+    assert!(
+        scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|component| component.moniker.local_name() == Some("consumer")),
+        "externally rooted consumer must remain"
+    );
+    assert!(
+        scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|component| component.moniker.local_name() == Some("provider")),
+        "provider needed by an externally rooted consumer must remain"
+    );
+    assert!(scenario.bindings.iter().any(|edge| {
+        matches!(
+            &edge.from,
+            BindingFrom::External(slot)
+                if slot.component == ComponentId(0) && slot.name == "api"
+        ) && edge.to.component == ComponentId(1)
+            && edge.to.name == "api"
+    }));
+    assert!(scenario.bindings.iter().any(|edge| {
+        matches!(&edge.from, BindingFrom::Component(from) if from.component == ComponentId(2) && from.name == "admin")
+            && edge.to.component == ComponentId(1)
+            && edge.to.name == "admin"
+    }));
+}
+
+#[test]
+fn dce_keeps_externally_rooted_program_when_slot_is_only_used_in_when_without_exports() {
+    let slot_decl = manifest_slot("http", true, false);
+    let child_program = serde_json::from_value(json!({
+        "image": "child",
+        "entrypoint": [
+            "child",
+            { "when": "slots.api", "argv": ["--api"] }
+        ],
+    }))
+    .expect("program");
+
+    let mut root = component(0, "/");
+    root.slots.insert("api".to_string(), slot_decl.clone());
+    root.children.push(ComponentId(1));
+
+    let mut child = component(1, "/child");
+    child.parent = Some(ComponentId(0));
+    child.program = Some(child_program);
+    child.slots.insert("api".to_string(), slot_decl);
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(child)],
+        bindings: vec![external_binding(0, "api", 1, "api", true)],
+        exports: Vec::new(),
+    };
+
+    let scenario = assert_dce_idempotent(scenario);
+
+    assert!(
+        scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|component| component.moniker.local_name() == Some("child")),
+        "slot use in `when` should be enough to root the child program from an external slot"
+    );
+    assert_eq!(scenario.bindings.len(), 1, "external binding should remain");
+}
+
+#[test]
+fn dce_keeps_externally_rooted_program_when_slot_is_only_used_in_repeated_entrypoint_each_without_exports()
+ {
+    let child_program = serde_json::from_value(json!({
+        "image": "child",
+        "entrypoint": [
+            "child",
+            {
+                "each": "slots.api",
+                "argv": ["--api", "${item.url}"]
+            }
+        ],
+    }))
+    .expect("program");
+
+    let scenario =
+        externally_rooted_child_scenario("api", manifest_slot("http", true, true), child_program);
+    let scenario = assert_dce_idempotent(scenario);
+
+    assert!(
+        scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|component| component.moniker.local_name() == Some("child")),
+        "repeated `each` slot use should root the child program from an external slot"
+    );
+    assert_eq!(scenario.bindings.len(), 1, "external binding should remain");
+}
+
+#[test]
+fn dce_keeps_externally_rooted_program_when_slot_is_only_used_in_repeated_env_each_without_exports()
+{
+    let child_program = serde_json::from_value(json!({
+        "image": "child",
+        "entrypoint": ["child"],
+        "env": {
+            "API_URLS": {
+                "each": "slots.api",
+                "value": "${item.url}",
+                "join": ","
+            }
+        },
+    }))
+    .expect("program");
+
+    let scenario =
+        externally_rooted_child_scenario("api", manifest_slot("http", true, true), child_program);
+    let scenario = assert_dce_idempotent(scenario);
+
+    assert!(
+        scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|component| component.moniker.local_name() == Some("child")),
+        "repeated env `each` slot use should root the child program from an external slot"
+    );
+    assert_eq!(scenario.bindings.len(), 1, "external binding should remain");
+}
+
+#[test]
+fn dce_keeps_all_slot_dependencies_for_externally_rooted_program_without_exports() {
+    let slot_http = manifest_slot("http", true, false);
+    let provide_http: amber_manifest::ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "admin" }))
+            .expect("provide decl");
+    let consumer_program = serde_json::from_value(json!({
+        "image": "consumer",
+        "entrypoint": ["consumer"],
+        "env": { "ALL_SLOTS": "${slots}" },
+    }))
+    .expect("program");
+    let provider_program = serde_json::from_value(json!({
+        "image": "provider",
+        "entrypoint": ["provider"],
+        "network": { "endpoints": [{ "name": "admin", "port": 9000 }] },
+    }))
+    .expect("program");
+
+    let mut root = component(0, "/");
+    root.slots.insert("api".to_string(), slot_http.clone());
+    root.children.extend([ComponentId(1), ComponentId(2)]);
+
+    let mut consumer = component(1, "/consumer");
+    consumer.parent = Some(ComponentId(0));
+    consumer.program = Some(consumer_program);
+    consumer.slots.insert("api".to_string(), slot_http.clone());
+    consumer
+        .slots
+        .insert("admin".to_string(), slot_http.clone());
+
+    let mut provider = component(2, "/provider");
+    provider.parent = Some(ComponentId(0));
+    provider.program = Some(provider_program);
+    provider.provides.insert("admin".to_string(), provide_http);
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(consumer), Some(provider)],
+        bindings: vec![
+            external_binding(0, "api", 1, "api", true),
+            component_binding(2, "admin", 1, "admin"),
+        ],
+        exports: Vec::new(),
+    };
+
+    let scenario = assert_dce_idempotent(scenario);
+
+    assert!(
+        scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|component| component.moniker.local_name() == Some("consumer")),
+        "consumer should remain live when any external binding roots an all-slots program"
+    );
+    assert!(
+        scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|component| component.moniker.local_name() == Some("provider")),
+        "all-slots use should retain internal dependencies of the rooted program"
+    );
+    assert!(scenario.bindings.iter().any(|edge| {
+        matches!(
+            &edge.from,
+            BindingFrom::Component(from)
+                if from.component == ComponentId(2) && from.name == "admin"
+        ) && edge.to.component == ComponentId(1)
+            && edge.to.name == "admin"
+    }));
+}
+
+#[test]
+fn dce_prunes_dead_incoming_edges_of_live_externally_rooted_program() {
+    let slot_http = manifest_slot("http", true, false);
+    let provide_http: amber_manifest::ProvideDecl =
+        serde_json::from_value(json!({ "kind": "http", "endpoint": "admin" }))
+            .expect("provide decl");
+    let consumer_program = serde_json::from_value(json!({
+        "image": "consumer",
+        "entrypoint": ["consumer"],
+        "env": { "API_URL": "${slots.api.url}" },
+    }))
+    .expect("program");
+    let provider_program = serde_json::from_value(json!({
+        "image": "provider",
+        "entrypoint": ["provider"],
+        "network": { "endpoints": [{ "name": "admin", "port": 9000 }] },
+    }))
+    .expect("program");
+
+    let mut root = component(0, "/");
+    root.slots.insert("api".to_string(), slot_http.clone());
+    root.slots.insert("shadow".to_string(), slot_http.clone());
+    root.children.extend([ComponentId(1), ComponentId(2)]);
+
+    let mut consumer = component(1, "/consumer");
+    consumer.parent = Some(ComponentId(0));
+    consumer.program = Some(consumer_program);
+    consumer.slots.insert("api".to_string(), slot_http.clone());
+    consumer
+        .slots
+        .insert("admin".to_string(), slot_http.clone());
+    consumer
+        .slots
+        .insert("shadow".to_string(), slot_http.clone());
+
+    let mut provider = component(2, "/provider");
+    provider.parent = Some(ComponentId(0));
+    provider.program = Some(provider_program);
+    provider.provides.insert("admin".to_string(), provide_http);
+
+    let mut scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(consumer), Some(provider)],
+        bindings: vec![
+            external_binding(0, "api", 1, "api", true),
+            component_binding(2, "admin", 1, "admin"),
+            external_binding(0, "shadow", 1, "shadow", true),
+        ],
+        exports: Vec::new(),
+    };
+    scenario.normalize_order();
+
+    let scenario = assert_dce_idempotent(scenario);
+    let root_after = scenario.component(ComponentId(0));
+
+    assert!(
+        scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|component| component.moniker.local_name() == Some("consumer")),
+        "the consumer should remain live when it is externally rooted through api"
+    );
+    assert!(
+        !scenario
+            .components
+            .iter()
+            .flatten()
+            .any(|component| component.moniker.local_name() == Some("provider")),
+        "unused internal dependencies should still be pruned from a live consumer"
+    );
+    assert!(
+        !root_after.slots.contains_key("shadow"),
+        "unused external root slots should not survive just because the program is live"
+    );
+    assert_eq!(
+        scenario.bindings.len(),
+        1,
+        "only the binding for the actually used external slot should remain"
+    );
+    assert!(scenario.bindings.iter().all(|edge| {
+        matches!(
+            &edge.from,
+            BindingFrom::External(slot)
+                if slot.component == ComponentId(0) && slot.name == "api"
+        ) && edge.to.component == ComponentId(1)
+            && edge.to.name == "api"
+    }));
 }

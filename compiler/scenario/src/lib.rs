@@ -67,7 +67,7 @@ impl AsRef<str> for Moniker {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Scenario {
     pub root: ComponentId,
     pub components: Vec<Option<Component>>,
@@ -199,7 +199,7 @@ impl Scenario {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Component {
     pub id: ComponentId,
     pub parent: Option<ComponentId>,
@@ -278,7 +278,7 @@ pub struct SlotRef {
     pub name: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BindingEdge {
     pub from: BindingFrom,
     pub to: SlotRef,
