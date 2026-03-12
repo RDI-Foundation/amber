@@ -247,7 +247,7 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
     let config_plan = build_config_plan(
         scenario,
         program_components,
-        ProgramSupport::PathOnly {
+        ProgramSupport::Path {
             backend_label: "direct output",
         },
         crate::targets::program_config::RuntimeAddressResolution::Deferred,
@@ -417,6 +417,7 @@ fn build_component_plans(
             program_plan,
             config_plan.mount_specs.get(id).map(Vec::as_slice),
             config_plan.runtime_views.get(id),
+            false,
             false,
         )?;
         let names = component_names.get(id).ok_or_else(|| {
@@ -835,7 +836,7 @@ fn ensure_no_endpoint_port_conflicts(
         let Some(network) = program.network() else {
             continue;
         };
-        for endpoint in &network.endpoints {
+        for endpoint in network.endpoints() {
             by_port.entry(endpoint.port).or_default().push(format!(
                 "{}:{}",
                 component.moniker.as_str(),

@@ -95,6 +95,9 @@ fn examples_compile_from_ir_matches_manifest_outputs() {
             ExampleBackend::Direct => {
                 assert_same_dir(&manifest_outputs.join("direct"), &ir_outputs.join("direct"));
             }
+            ExampleBackend::Vm => {
+                assert_same_dir(&manifest_outputs.join("vm"), &ir_outputs.join("vm"));
+            }
             ExampleBackend::CheckOnly => unreachable!("check-only examples are skipped above"),
         }
     }
@@ -119,12 +122,15 @@ fn collect_examples() -> Vec<example_catalog::Example> {
 enum ExampleBackend {
     DockerCompose,
     Direct,
+    Vm,
     CheckOnly,
 }
 
 fn example_backend(example: &example_catalog::Example) -> ExampleBackend {
     if example.name == "direct-security" {
         ExampleBackend::Direct
+    } else if example.name == "vm-network-storage" {
+        ExampleBackend::Vm
     } else if example.name == "interpolation" {
         ExampleBackend::CheckOnly
     } else {
@@ -160,6 +166,9 @@ fn compile_example_outputs(
         }
         ExampleBackend::Direct => {
             command.arg("--direct").arg(output_root.join("direct"));
+        }
+        ExampleBackend::Vm => {
+            command.arg("--vm").arg(output_root.join("vm"));
         }
         ExampleBackend::CheckOnly => {
             panic!(

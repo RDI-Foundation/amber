@@ -285,7 +285,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
     let config_plan = build_config_plan(
         s,
         program_components,
-        ProgramSupport::ImageOnly {
+        ProgramSupport::Image {
             backend_label: "kubernetes output",
         },
         crate::targets::program_config::RuntimeAddressResolution::Static,
@@ -687,13 +687,14 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
             mount_specs,
             config_plan.runtime_views.get(id),
             false,
+            false,
         )
         .map_err(|e| ReporterError::new(e.to_string()))?;
         let needs_helper_for_component = runtime_plan.needs_helper;
 
         let mut ports: Vec<ContainerPort> = Vec::new();
         if let Some(network) = program.network() {
-            for ep in &network.endpoints {
+            for ep in network.endpoints() {
                 ports.push(ContainerPort {
                     name: sanitize_port_name(&ep.name),
                     container_port: ep.port,

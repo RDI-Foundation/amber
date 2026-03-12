@@ -1,0 +1,117 @@
+{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      base_image: { type: "string" },
+    },
+    required: ["base_image"],
+    additionalProperties: false,
+  },
+  slots: {
+    state: { kind: "storage" },
+  },
+  program: {
+    vm: {
+      image: "${config.base_image}",
+      cpus: 4,
+      memory_mib: 1024,
+      mounts: [
+        { path: "/var/lib/app", from: "slots.state" },
+      ],
+      cloud_init: {
+        user_data: "\
+#cloud-config\n\
+write_files:\n\
+  - path: /usr/local/bin/amber-api.py\n\
+    permissions: '0755'\n\
+    content: |\n\
+      from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n\
+      from pathlib import Path\n\
+      \n\
+      STATE_PATH = Path('/var/lib/app/storage.txt')\n\
+      STATE_PATH.parent.mkdir(parents=True, exist_ok=True)\n\
+      if not STATE_PATH.exists():\n\
+          STATE_PATH.write_text('seeded by v2', encoding='utf-8')\n\
+      \n\
+      EPHEMERAL_PATH = Path('/tmp/amber-api-ephemeral.txt')\n\
+      if not EPHEMERAL_PATH.exists():\n\
+          EPHEMERAL_PATH.write_text('boot:v2', encoding='utf-8')\n\
+      \n\
+      def read_text(path: Path) -> str:\n\
+          return path.read_text(encoding='utf-8')\n\
+      \n\
+      def write_text(path: Path, value: str) -> str:\n\
+          path.parent.mkdir(parents=True, exist_ok=True)\n\
+          path.write_text(value, encoding='utf-8')\n\
+          return read_text(path)\n\
+      \n\
+      def send(handler: BaseHTTPRequestHandler, status: int, body: str) -> None:\n\
+          payload = body.encode('utf-8')\n\
+          handler.send_response(status)\n\
+          handler.send_header('content-type', 'text/plain; charset=utf-8')\n\
+          handler.send_header('content-length', str(len(payload)))\n\
+          handler.end_headers()\n\
+          handler.wfile.write(payload)\n\
+      \n\
+      class Handler(BaseHTTPRequestHandler):\n\
+          def do_GET(self) -> None:\n\
+              if self.path == '/':\n\
+                  send(self, 200, 'GET /identity\\nGET /version\\nGET /storage\\nGET /ephemeral\\nPUT /storage\\nPUT /ephemeral\\n')\n\
+              elif self.path == '/identity':\n\
+                  send(self, 200, 'api')\n\
+              elif self.path == '/version':\n\
+                  send(self, 200, 'v2')\n\
+              elif self.path == '/storage':\n\
+                  send(self, 200, read_text(STATE_PATH))\n\
+              elif self.path == '/ephemeral':\n\
+                  send(self, 200, read_text(EPHEMERAL_PATH))\n\
+              else:\n\
+                  send(self, 404, 'not found')\n\
+      \n\
+          def do_PUT(self) -> None:\n\
+              length = int(self.headers.get('content-length', '0'))\n\
+              body = self.rfile.read(length).decode('utf-8')\n\
+              if self.path == '/storage':\n\
+                  send(self, 200, write_text(STATE_PATH, body))\n\
+              elif self.path == '/ephemeral':\n\
+                  send(self, 200, write_text(EPHEMERAL_PATH, body))\n\
+              else:\n\
+                  send(self, 404, 'not found')\n\
+      \n\
+          def log_message(self, _format: str, *_args: object) -> None:\n\
+              pass\n\
+      \n\
+      ThreadingHTTPServer(('0.0.0.0', 8080), Handler).serve_forever()\n\
+  - path: /etc/systemd/system/amber-api.service\n\
+    permissions: '0644'\n\
+    content: |\n\
+      [Unit]\n\
+      Description=Amber VM API demo\n\
+      \n\
+      [Service]\n\
+      ExecStart=/usr/bin/python3 /usr/local/bin/amber-api.py\n\
+      Restart=always\n\
+      \n\
+      [Install]\n\
+      WantedBy=multi-user.target\n\
+runcmd:\n\
+  - [systemctl, daemon-reload]\n\
+  - [systemctl, enable, --now, amber-api.service]\n\
+        ",
+      },
+      network: {
+        endpoints: [
+          { name: "http", port: 8080, protocol: "http" },
+        ],
+        egress: "none",
+      },
+    },
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" },
+  },
+  exports: {
+    http: "http",
+  },
+}

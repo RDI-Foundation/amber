@@ -1,0 +1,48 @@
+{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      base_image: { type: "string" },
+    },
+    required: ["base_image"],
+    additionalProperties: false,
+  },
+  resources: {
+    app_state: {
+      kind: "storage",
+      params: {
+        size: "1Gi",
+      },
+    },
+  },
+  components: {
+    api: {
+      manifest: "./api.json5",
+      config: {
+        base_image: "${config.base_image}",
+      },
+    },
+    bound: {
+      manifest: "./probes/bound.json5",
+      config: {
+        base_image: "${config.base_image}",
+      },
+    },
+    unbound: {
+      manifest: "./probes/unbound.json5",
+      config: {
+        base_image: "${config.base_image}",
+      },
+    },
+  },
+  bindings: [
+    { to: "#api.state", from: "resources.app_state" },
+    { to: "#bound.api", from: "#api.http" },
+  ],
+  exports: {
+    api: "#api.http",
+    bound: "#bound.http",
+    unbound: "#unbound.http",
+  },
+}

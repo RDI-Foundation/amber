@@ -168,7 +168,7 @@ fn endpoint_label_for_provide(component: &Component, provide_name: &str) -> Stri
         .expect("scenario invariant: provide declares an endpoint");
 
     let endpoint = network
-        .endpoints
+        .endpoints()
         .iter()
         .find(|e| e.name == endpoint_name)
         .expect("scenario invariant: endpoint exists");

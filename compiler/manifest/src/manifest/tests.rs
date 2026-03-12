@@ -359,7 +359,7 @@ fn program_requires_exactly_one_source_field() {
     .unwrap_err();
     assert!(
         both.to_string()
-            .contains("exactly one of `image` or `path`")
+            .contains("exactly one of `image`, `path`, or `vm`")
     );
 
     let neither = r#"
@@ -372,7 +372,11 @@ fn program_requires_exactly_one_source_field() {
         "#
     .parse::<Manifest>()
     .unwrap_err();
-    assert!(neither.to_string().contains("either `image` or `path`"));
+    assert!(
+        neither
+            .to_string()
+            .contains("either `image`, `path`, or `vm`")
+    );
 }
 
 #[test]
@@ -1249,8 +1253,8 @@ fn endpoint_validation_passes_for_defined_reference() {
     assert_eq!(program.image_ref(), Some("x"));
 
     let network = program.network().expect("network");
-    assert_eq!(network.endpoints.len(), 1);
-    assert!(network.endpoints.contains(&Endpoint {
+    assert_eq!(network.endpoints().len(), 1);
+    assert!(network.endpoints().contains(&Endpoint {
         name: "endpoint".to_string(),
         port: 80,
         protocol: NetworkProtocol::Http,

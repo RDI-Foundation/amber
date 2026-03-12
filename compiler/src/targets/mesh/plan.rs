@@ -370,7 +370,7 @@ fn resolve_provide_endpoint(
     })?;
 
     let endpoint = network
-        .endpoints
+        .endpoints()
         .iter()
         .find(|e| e.name == endpoint_name)
         .ok_or_else(|| {

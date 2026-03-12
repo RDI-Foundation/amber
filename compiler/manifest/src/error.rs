@@ -81,6 +81,18 @@ pub enum Error {
     #[diagnostic(code(manifest::empty_program_path))]
     EmptyProgramPath,
 
+    #[error("program.vm.image must be non-empty")]
+    #[diagnostic(code(manifest::empty_vm_image))]
+    EmptyVmImage,
+
+    #[error("program.vm.cpus must be greater than zero")]
+    #[diagnostic(code(manifest::invalid_vm_cpus))]
+    InvalidVmCpus,
+
+    #[error("program.vm.memory_mib must be greater than zero")]
+    #[diagnostic(code(manifest::invalid_vm_memory_mib))]
+    InvalidVmMemoryMib,
+
     #[error("export `{export}` references unknown capability `{target}`")]
     #[diagnostic(code(manifest::unknown_export_target))]
     UnknownExportTarget { export: String, target: String },

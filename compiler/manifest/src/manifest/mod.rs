@@ -22,6 +22,7 @@ use crate::{
         Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityKind, ComponentDecl,
         ConfigSchema, EnvironmentDecl, ExportTarget, LocalComponentRef, ManifestBinding,
         MountSource, Program, ProvideDecl, RawBinding, RawExportTarget, ResourceDecl, SlotDecl,
+        VmScalarU32,
     },
 };
 
@@ -126,6 +127,7 @@ fn find_unsupported_program_syntax(
     let (items, field_pointer): (&[ProgramArgItem], &str) = match program {
         Program::Image(program) => (&program.entrypoint.0, "/program/entrypoint"),
         Program::Path(program) => (&program.args.0, "/program/args"),
+        Program::Vm(_) => return None,
     };
 
     for (idx, item) in items.iter().enumerate() {
@@ -543,7 +545,7 @@ fn validate_endpoints(
     if let Some(program) = program
         && let Some(network) = program.network()
     {
-        for endpoint in &network.endpoints {
+        for endpoint in network.endpoints() {
             if !defined_endpoints.insert(endpoint.name.as_str()) {
                 return Err(Error::DuplicateEndpointName {
                     name: endpoint.name.clone(),
@@ -808,6 +810,15 @@ impl RawManifest {
                 }
                 Program::Path(program) if program.path.trim().is_empty() => {
                     return Err(Error::EmptyProgramPath);
+                }
+                Program::Vm(program) if program.0.image.trim().is_empty() => {
+                    return Err(Error::EmptyVmImage);
+                }
+                Program::Vm(program) if matches!(program.0.cpus, VmScalarU32::Literal(0)) => {
+                    return Err(Error::InvalidVmCpus);
+                }
+                Program::Vm(program) if matches!(program.0.memory_mib, VmScalarU32::Literal(0)) => {
+                    return Err(Error::InvalidVmMemoryMib);
                 }
                 _ => {}
             }

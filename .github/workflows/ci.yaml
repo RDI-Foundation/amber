@@ -144,6 +144,39 @@ jobs:
       - name: Run direct smoke test
         run: cargo test -p amber-cli --all-features direct_smoke_ -- --ignored --test-threads=1
 
+  vm-linux-tests:
+    name: VM Smoke Tests (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      AMBER_VM_FORCE_TCG: "1"
+      AMBER_VM_SMOKE_BASE_IMAGE: ${{ runner.temp }}/ubuntu-24.04-minimal-cloudimg-amd64.img
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Ensure VM runtime packages are available
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils xorriso
+      - name: Fetch Ubuntu minimal cloud image
+        run: |
+          set -euo pipefail
+          image_url="https://cloud-images.ubuntu.com/minimal/releases/noble/release-20240709/ubuntu-24.04-minimal-cloudimg-amd64.img"
+          if [ ! -f "$AMBER_VM_SMOKE_BASE_IMAGE" ]; then
+            curl --fail --show-error --silent --location \
+              --retry 5 \
+              --retry-all-errors \
+              --output "$AMBER_VM_SMOKE_BASE_IMAGE" \
+              "$image_url"
+          fi
+          qemu-img info "$AMBER_VM_SMOKE_BASE_IMAGE"
+      - name: Run Linux VM smoke test
+        run: cargo test -p amber-cli --test vm_smoke -- --ignored --nocapture --test-threads=1
+
   kubernetes-tests:
     name: Kubernetes Reporter Tests
     runs-on: ubuntu-latest

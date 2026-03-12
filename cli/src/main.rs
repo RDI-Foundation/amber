@@ -1,4 +1,5 @@
 mod docs;
+mod vm_runtime;
 
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
@@ -11,7 +12,7 @@ use std::{
     env, fmt, fs,
     hash::{Hash as _, Hasher as _},
     io::Write as _,
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
+    net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
 };
@@ -32,6 +33,7 @@ use amber_compiler::{
         kubernetes::KubernetesReporter,
         metadata::MetadataReporter,
         scenario_ir::ScenarioIrReporter,
+        vm::{VM_PLAN_FILENAME, VmArtifact, VmReporter},
     },
 };
 use amber_manifest::{CapabilityTransport, ManifestRef};
@@ -87,6 +89,10 @@ Common workflows:
   amber run /tmp/amber-direct
       Build and start the direct/native runtime locally.
 
+  amber compile path/to/root.json5 --vm /tmp/amber-vm
+  amber run /tmp/amber-vm
+      Build and start the VM runtime locally.
+
   amber proxy /tmp/amber-compose --export public=127.0.0.1:18080
       Expose scenario exports or wire external slots on localhost.
 
@@ -121,13 +127,17 @@ Outputs:
   --direct DIR
       Native/direct runtime artifacts for `amber run` and `amber proxy`.
 
+  --vm DIR
+      VM runtime artifacts for `amber run` and `amber proxy`.
+
   --bundle DIR
       Self-contained manifest bundle for offline or reproducible compilation.
 
 Examples:
   amber compile path/to/root.json5 --output /tmp/scenario.json
   amber compile path/to/root.json5 --docker-compose /tmp/amber-compose
-  amber compile path/to/root.json5 --direct /tmp/amber-direct";
+  amber compile path/to/root.json5 --direct /tmp/amber-direct
+  amber compile path/to/root.json5 --vm /tmp/amber-vm";
 
 const CHECK_LONG_ABOUT: &str = "\
 Resolve a root manifest or bundle, run the same validation and lint passes as `amber compile`, \
@@ -183,19 +193,21 @@ Print the manifest schema README that ships inside the CLI.
 Use this for the detailed manifest format, field semantics, and authoring examples.";
 
 const RUN_LONG_ABOUT: &str = "\
-Start a previously compiled direct output directory or a `direct-plan.json` file.
+Start a previously compiled runnable Amber output directory.
 
-This command only understands direct/native artifacts produced by `amber compile --direct`.";
+This command understands direct/native artifacts from `amber compile --direct` and VM artifacts \
+                              from `amber compile --vm`.";
 
 const RUN_AFTER_HELP: &str = "\
 Examples:
   amber run /tmp/amber-direct
   amber run /tmp/amber-direct/direct-plan.json
+  amber run /tmp/amber-vm
   amber run /tmp/amber-direct --storage-root /srv/amber-state
 
 Runtime requirements:
   Linux: `bwrap` and `slirp4netns`
-  macOS: `/usr/bin/sandbox-exec`";
+  macOS: `/usr/bin/sandbox-exec` or QEMU/HVF";
 
 const PROXY_LONG_ABOUT: &str = "\
 Attach a local proxy to compiled Amber output.
@@ -205,8 +217,8 @@ Use `--export` to expose a scenario export on localhost, `--slot` to connect a s
 
 Pass at least one `--export` or `--slot` binding.
 
-The output can be a Docker Compose output directory, a Kubernetes output directory, or a direct \
-                                output directory.";
+The output can be a Docker Compose output directory, a Kubernetes output directory, a direct \
+                                output directory, or a VM output directory.";
 
 const PROXY_AFTER_HELP: &str = "\
 Examples:
@@ -226,7 +238,7 @@ Notes:
   At least one `--slot NAME=ADDR:PORT` or `--export NAME=ADDR:PORT` is required.
   Docker Compose outputs auto-detect router control and, for exports, the published router mesh \
                                 port.
-  Direct outputs usually infer router control metadata automatically.
+  Direct and VM outputs usually infer local router metadata automatically.
   If you start Docker Compose with `-p <name>` before the stack is running, pass the same \
                                 `--project-name <name>` to `amber proxy`.
   Kubernetes output requires `--mesh-addr` when you use `--slot`, unless you are supplying an \
@@ -304,6 +316,8 @@ enum Command {
     Dashboard(DashboardArgs),
     #[command(hide = true, name = "run-direct-init")]
     RunDirectInit(RunDirectInitArgs),
+    #[command(hide = true, name = "run-vm-guestfwd-bridge")]
+    RunVmGuestfwdBridge(RunVmGuestfwdBridgeArgs),
 }
 
 #[derive(Args)]
@@ -339,6 +353,10 @@ struct CompileArgs {
     /// Write direct/native runtime artifact files to this directory.
     #[arg(long = "direct", value_name = "DIR")]
     direct: Option<PathBuf>,
+
+    /// Write VM runtime artifact files to this directory.
+    #[arg(long = "vm", value_name = "DIR")]
+    vm: Option<PathBuf>,
 
     /// Disable compiler optimizations.
     #[arg(long = "no-opt")]
@@ -397,11 +415,11 @@ struct DocsExamplesArgs {
 
 #[derive(Args)]
 struct RunArgs {
-    /// Direct output directory or `direct-plan.json` file from `amber compile --direct`.
+    /// Runnable output directory, `direct-plan.json`, or `vm-plan.json` from `amber compile`.
     #[arg(value_name = "OUTPUT")]
     output: String,
 
-    /// Override where Amber stores persistent direct runtime state.
+    /// Override where Amber stores persistent runtime state.
     #[arg(long = "storage-root", value_name = "DIR")]
     storage_root: Option<PathBuf>,
 }
@@ -418,8 +436,15 @@ struct RunDirectInitArgs {
 }
 
 #[derive(Args)]
+struct RunVmGuestfwdBridgeArgs {
+    /// Loopback upstream that receives one forwarded guest connection.
+    #[arg(value_name = "ADDR:PORT")]
+    upstream: SocketAddr,
+}
+
+#[derive(Args)]
 struct ProxyArgs {
-    /// Docker Compose output directory, direct output directory, or Kubernetes output directory from `amber compile`.
+    /// Docker Compose output directory, direct output directory, VM output directory, or Kubernetes output directory from `amber compile`.
     #[arg(value_name = "OUTPUT")]
     output: String,
 
@@ -500,6 +525,7 @@ enum ProxyTargetKind {
     DockerCompose,
     Kubernetes,
     Direct,
+    Vm,
 }
 
 struct ProxyTarget {
@@ -517,6 +543,7 @@ struct ComposeContainerRef {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RunTargetKind {
     Direct,
+    Vm,
 }
 
 struct RunTarget {
@@ -586,6 +613,7 @@ async fn main() -> Result<()> {
 
     let result = match cli.command {
         Command::Proxy(args) => proxy(args, verbose).await,
+        Command::RunVmGuestfwdBridge(args) => run_vm_guestfwd_bridge(args).await,
         command => {
             init_tracing(verbose, None)?;
             match command {
@@ -595,6 +623,7 @@ async fn main() -> Result<()> {
                 Command::Run(args) => run(args).await,
                 Command::Dashboard(args) => dashboard(args).await,
                 Command::RunDirectInit(args) => run_direct_init(args).await,
+                Command::RunVmGuestfwdBridge(_) => unreachable!("handled above"),
                 Command::Proxy(_) => unreachable!("handled above"),
             }
         }
@@ -651,6 +680,43 @@ async fn dashboard(args: DashboardArgs) -> Result<()> {
     if !status.success() {
         return Err(miette::miette!("dashboard exited with status {status}"));
     }
+    Ok(())
+}
+
+async fn run_vm_guestfwd_bridge(args: RunVmGuestfwdBridgeArgs) -> Result<()> {
+    let mut upstream = TcpStream::connect(args.upstream)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to connect VM slot bridge upstream {}",
+                args.upstream
+            )
+        })?;
+    let mut upstream_read = upstream
+        .try_clone()
+        .into_diagnostic()
+        .wrap_err("failed to clone VM slot bridge upstream socket")?;
+    let writer = std::thread::spawn(move || -> Result<()> {
+        let mut stdin = std::io::stdin().lock();
+        std::io::copy(&mut stdin, &mut upstream)
+            .into_diagnostic()
+            .wrap_err("failed to forward guest request to upstream")?;
+        upstream
+            .shutdown(Shutdown::Write)
+            .into_diagnostic()
+            .wrap_err("failed to finish guest request forwarding")
+    });
+    let mut stdout = std::io::stdout().lock();
+    std::io::copy(&mut upstream_read, &mut stdout)
+        .into_diagnostic()
+        .wrap_err("failed to forward upstream response to guest")?;
+    stdout
+        .flush()
+        .into_diagnostic()
+        .wrap_err("failed to flush guest response")?;
+    writer
+        .join()
+        .map_err(|_| miette::miette!("vm slot bridge writer thread panicked"))??;
     Ok(())
 }
 
@@ -824,6 +890,11 @@ async fn compile(args: CompileArgs) -> Result<()> {
         write_direct_output(&direct_dest, &artifact)?;
     }
 
+    if let Some(vm_dest) = outputs.vm {
+        let artifact = VmReporter.emit(&compiled).map_err(miette::Report::new)?;
+        write_vm_output(&vm_dest, &artifact)?;
+    }
+
     if let Some(metadata_dest) = outputs.metadata {
         let metadata = MetadataReporter
             .emit(&compiled)
@@ -877,6 +948,7 @@ async fn run(args: RunArgs) -> Result<()> {
             })
             .await
         }
+        RunTargetKind::Vm => vm_runtime::run_vm_init(target.plan, args.storage_root).await,
     }
 }
 
@@ -895,10 +967,18 @@ fn load_run_target(output: &str) -> Result<RunTarget> {
                 plan,
             });
         }
+        let plan = abs.join(VM_PLAN_FILENAME);
+        if plan.is_file() {
+            return Ok(RunTarget {
+                kind: RunTargetKind::Vm,
+                plan,
+            });
+        }
         return Err(miette::miette!(
-            "output directory {} is not a recognized runnable artifact (missing {})",
+            "output directory {} is not a recognized runnable artifact (missing {} or {})",
             abs.display(),
-            DIRECT_PLAN_FILENAME
+            DIRECT_PLAN_FILENAME,
+            VM_PLAN_FILENAME
         ));
     }
 
@@ -908,9 +988,15 @@ fn load_run_target(output: &str) -> Result<RunTarget> {
             plan: abs,
         });
     }
+    if abs.file_name().and_then(|name| name.to_str()) == Some(VM_PLAN_FILENAME) {
+        return Ok(RunTarget {
+            kind: RunTargetKind::Vm,
+            plan: abs,
+        });
+    }
 
     Err(miette::miette!(
-        "output path {} is not a direct artifact directory or plan file",
+        "output path {} is not a direct or vm artifact directory or plan file",
         abs.display()
     ))
 }
@@ -3794,7 +3880,9 @@ fn load_proxy_target(output: &str) -> Result<ProxyTarget> {
         }
         let metadata = load_proxy_metadata_file(&metadata_path)?;
         validate_proxy_metadata(&metadata, &metadata_path)?;
-        let kind = if abs.join(DIRECT_PLAN_FILENAME).is_file() {
+        let kind = if abs.join(VM_PLAN_FILENAME).is_file() {
+            ProxyTargetKind::Vm
+        } else if abs.join(DIRECT_PLAN_FILENAME).is_file() {
             ProxyTargetKind::Direct
         } else {
             ProxyTargetKind::Kubernetes
@@ -3802,7 +3890,7 @@ fn load_proxy_target(output: &str) -> Result<ProxyTarget> {
         return Ok(ProxyTarget {
             kind,
             metadata,
-            source: if matches!(kind, ProxyTargetKind::Direct) {
+            source: if matches!(kind, ProxyTargetKind::Direct | ProxyTargetKind::Vm) {
                 abs
             } else {
                 metadata_path
@@ -3815,6 +3903,11 @@ fn load_proxy_target(output: &str) -> Result<ProxyTarget> {
         validate_proxy_metadata(&metadata, &abs)?;
         let kind = if abs
             .parent()
+            .is_some_and(|parent| parent.join(VM_PLAN_FILENAME).is_file())
+        {
+            ProxyTargetKind::Vm
+        } else if abs
+            .parent()
             .is_some_and(|parent| parent.join(DIRECT_PLAN_FILENAME).is_file())
         {
             ProxyTargetKind::Direct
@@ -3824,7 +3917,7 @@ fn load_proxy_target(output: &str) -> Result<ProxyTarget> {
         return Ok(ProxyTarget {
             kind,
             metadata,
-            source: if matches!(kind, ProxyTargetKind::Direct) {
+            source: if matches!(kind, ProxyTargetKind::Direct | ProxyTargetKind::Vm) {
                 abs.parent()
                     .expect("metadata file should have a parent")
                     .to_path_buf()
@@ -3955,7 +4048,7 @@ fn resolve_mesh_addresses(
     if let Some(mesh_addr) = mesh_addr_override {
         let port = parse_mesh_addr_port(mesh_addr)?;
         let listen_ip = match target.kind {
-            ProxyTargetKind::Direct => Ipv4Addr::LOCALHOST,
+            ProxyTargetKind::Direct | ProxyTargetKind::Vm => Ipv4Addr::LOCALHOST,
             _ => Ipv4Addr::UNSPECIFIED,
         };
         let listen = SocketAddr::new(IpAddr::V4(listen_ip), port);
@@ -3965,7 +4058,7 @@ fn resolve_mesh_addresses(
     let port = pick_free_port()?;
     let mesh_addr = default_mesh_addr(target, port)?;
     let listen_ip = match target.kind {
-        ProxyTargetKind::Direct => Ipv4Addr::LOCALHOST,
+        ProxyTargetKind::Direct | ProxyTargetKind::Vm => Ipv4Addr::LOCALHOST,
         _ => Ipv4Addr::UNSPECIFIED,
     };
     let listen = SocketAddr::new(IpAddr::V4(listen_ip), port);
@@ -3975,7 +4068,7 @@ fn resolve_mesh_addresses(
 fn default_mesh_addr(target: &ProxyTarget, port: u16) -> Result<String> {
     match target.kind {
         ProxyTargetKind::DockerCompose => Ok(format!("host.docker.internal:{port}")),
-        ProxyTargetKind::Direct => Ok(format!("127.0.0.1:{port}")),
+        ProxyTargetKind::Direct | ProxyTargetKind::Vm => Ok(format!("127.0.0.1:{port}")),
         ProxyTargetKind::Kubernetes => Err(miette::miette!(
             "--mesh-addr is required when proxying against Kubernetes output"
         )),
@@ -4020,6 +4113,14 @@ async fn resolve_router_mesh_addr(
             [127, 0, 0, 1],
             wait_for_direct_runtime_router_port(&target.source, DIRECT_RUNTIME_STATE_WAIT_TIMEOUT)
                 .await?,
+        )),
+        ProxyTargetKind::Vm if router.mesh_port == 0 => SocketAddr::from((
+            [127, 0, 0, 1],
+            vm_runtime::wait_for_vm_runtime_router_port(
+                &target.source,
+                DIRECT_RUNTIME_STATE_WAIT_TIMEOUT,
+            )
+            .await?,
         )),
         _ => {
             if router.mesh_port == 0 {
@@ -4228,6 +4329,7 @@ fn resolve_control_endpoint(args: &ProxyArgs, target: &ProxyTarget) -> Result<Co
     let compose_project = match target.kind {
         ProxyTargetKind::DockerCompose => resolve_compose_project_name(args, &target.source)?,
         ProxyTargetKind::Direct => None,
+        ProxyTargetKind::Vm => None,
         ProxyTargetKind::Kubernetes => None,
     };
     if matches!(target.kind, ProxyTargetKind::DockerCompose)
@@ -4250,11 +4352,13 @@ fn resolve_control_endpoint(args: &ProxyArgs, target: &ProxyTarget) -> Result<Co
     }
     if let Some(socket) = router.control_socket.as_ref() {
         let resolved = expand_env_templates(socket, compose_project.as_deref())?;
-        if matches!(target.kind, ProxyTargetKind::Direct) {
+        if matches!(target.kind, ProxyTargetKind::Direct | ProxyTargetKind::Vm) {
             let _ = resolved;
-            return Ok(ControlEndpoint::Unix(direct_current_control_socket_path(
-                &target.source,
-            )));
+            return Ok(ControlEndpoint::Unix(match target.kind {
+                ProxyTargetKind::Direct => direct_current_control_socket_path(&target.source),
+                ProxyTargetKind::Vm => vm_runtime::vm_current_control_socket_path(&target.source),
+                _ => unreachable!("local runtime target kind should be direct or vm"),
+            }));
         }
         return Ok(ControlEndpoint::Unix(PathBuf::from(resolved)));
     }
@@ -5078,6 +5182,7 @@ struct OutputPaths {
     metadata: Option<ArtifactOutput>,
     kubernetes: Option<PathBuf>,
     direct: Option<PathBuf>,
+    vm: Option<PathBuf>,
 }
 
 fn ensure_outputs_requested(args: &CompileArgs) -> Result<()> {
@@ -5088,13 +5193,14 @@ fn ensure_outputs_requested(args: &CompileArgs) -> Result<()> {
         || args.bundle.is_some()
         || args.kubernetes.is_some()
         || args.direct.is_some()
+        || args.vm.is_some()
     {
         return Ok(());
     }
 
     Err(miette::miette!(
         help = "Request at least one output with `--output`, `--dot`, `--docker-compose`, \
-                `--metadata`, `--kubernetes`, `--direct`, or `--bundle`.",
+                `--metadata`, `--kubernetes`, `--direct`, `--vm`, or `--bundle`.",
         "no outputs requested for `amber compile`"
     ))
 }
@@ -5106,6 +5212,7 @@ fn resolve_output_paths(args: &CompileArgs) -> Result<OutputPaths> {
     let metadata = resolve_optional_output(&args.metadata);
     let kubernetes = args.kubernetes.clone();
     let direct = args.direct.clone();
+    let vm = args.vm.clone();
 
     let file_outputs = [
         ("primary output", primary.as_deref()),
@@ -5132,11 +5239,13 @@ fn resolve_output_paths(args: &CompileArgs) -> Result<OutputPaths> {
         ("docker compose output directory", docker_compose.as_ref()),
         ("kubernetes output directory", kubernetes.as_ref()),
         ("direct output directory", direct.as_ref()),
+        ("vm output directory", vm.as_ref()),
     ];
     for (name, dir) in [
         ("docker compose output directory", docker_compose.as_ref()),
         ("kubernetes output directory", kubernetes.as_ref()),
         ("direct output directory", direct.as_ref()),
+        ("vm output directory", vm.as_ref()),
     ] {
         let Some(dir) = dir else {
             continue;
@@ -5176,6 +5285,7 @@ fn resolve_output_paths(args: &CompileArgs) -> Result<OutputPaths> {
         metadata,
         kubernetes,
         direct,
+        vm,
     })
 }
 
@@ -5269,6 +5379,15 @@ fn write_direct_output(root: &Path, artifact: &DirectArtifact) -> Result<()> {
     write_directory_output(
         root,
         "direct output directory",
+        &artifact.files,
+        Some(Path::new(RUN_SCRIPT_FILENAME)),
+    )
+}
+
+fn write_vm_output(root: &Path, artifact: &VmArtifact) -> Result<()> {
+    write_directory_output(
+        root,
+        "vm output directory",
         &artifact.files,
         Some(Path::new(RUN_SCRIPT_FILENAME)),
     )

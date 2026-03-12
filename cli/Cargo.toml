@@ -18,6 +18,8 @@ amber-scenario = { workspace = true }
 amber-template = { workspace = true }
 base64 = { workspace = true }
 clap = { version = "4.5.46", features = ["derive"] }
+fatfs = "0.3.6"
+jsonschema = { workspace = true, default-features = false }
 libc = "0.2.177"
 miette = { workspace = true, features = ["fancy"] }
 serde = { workspace = true, features = ["derive"] }

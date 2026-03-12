@@ -249,12 +249,51 @@ fn visit_program_interpolated(
     program: &Program,
     mut visit: impl FnMut(&InterpolatedString) -> bool,
 ) -> bool {
-    let executable = program.path_ref().or_else(|| program.image_ref());
-    if let Some(executable) = executable
-        && let Ok(parsed) = executable.parse::<InterpolatedString>()
-        && visit(&parsed)
-    {
-        return true;
+    match program {
+        Program::Image(program) => {
+            if let Ok(parsed) = program.image.parse::<InterpolatedString>()
+                && visit(&parsed)
+            {
+                return true;
+            }
+        }
+        Program::Path(program) => {
+            if let Ok(parsed) = program.path.parse::<InterpolatedString>()
+                && visit(&parsed)
+            {
+                return true;
+            }
+        }
+        Program::Vm(program) => {
+            if let Ok(parsed) = program.0.image.parse::<InterpolatedString>()
+                && visit(&parsed)
+            {
+                return true;
+            }
+            for scalar in [&program.0.cpus, &program.0.memory_mib] {
+                let crate::VmScalarU32::Interpolated(raw) = scalar else {
+                    continue;
+                };
+                if let Ok(parsed) = raw.parse::<InterpolatedString>()
+                    && visit(&parsed)
+                {
+                    return true;
+                }
+            }
+            for value in [
+                program.0.cloud_init.user_data.as_deref(),
+                program.0.cloud_init.vendor_data.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Ok(parsed) = value.parse::<InterpolatedString>()
+                    && visit(&parsed)
+                {
+                    return true;
+                }
+            }
+        }
     }
     for item in &program.command().0 {
         let mut item_hit = false;
@@ -301,21 +340,20 @@ fn command_arg_optional_config_lints(
         return Vec::new();
     };
 
-    let (items, location_of, field_pointer): (
-        &[ProgramArgItem],
-        fn(usize) -> CommandArgLintLocation,
-        &str,
-    ) = match program {
-        Program::Image(program) => (
-            &program.entrypoint.0,
-            CommandArgLintLocation::Entrypoint,
+    let Some((items, location_of, field_pointer)) = (match program {
+        Program::Image(program) => Some((
+            program.entrypoint.0.as_slice(),
+            CommandArgLintLocation::Entrypoint as fn(usize) -> CommandArgLintLocation,
             "/program/entrypoint",
-        ),
-        Program::Path(program) => (
-            &program.args.0,
-            CommandArgLintLocation::Args,
+        )),
+        Program::Path(program) => Some((
+            program.args.0.as_slice(),
+            CommandArgLintLocation::Args as fn(usize) -> CommandArgLintLocation,
             "/program/args",
-        ),
+        )),
+        Program::Vm(_) => None,
+    }) else {
+        return Vec::new();
     };
 
     let source = src.inner().as_ref();
@@ -477,9 +515,12 @@ fn command_arg_required_slot_when_lints(
         return Vec::new();
     };
 
-    let (items, field_pointer): (&[ProgramArgItem], &str) = match program {
-        Program::Image(program) => (&program.entrypoint.0, "/program/entrypoint"),
-        Program::Path(program) => (&program.args.0, "/program/args"),
+    let Some((items, field_pointer)) = (match program {
+        Program::Image(program) => Some((program.entrypoint.0.as_slice(), "/program/entrypoint")),
+        Program::Path(program) => Some((program.args.0.as_slice(), "/program/args")),
+        Program::Vm(_) => None,
+    }) else {
+        return Vec::new();
     };
 
     let source = src.inner().as_ref();
@@ -1045,6 +1086,53 @@ mod tests {
         assert!(!lints.iter().any(|lint| matches!(
             lint,
             crate::lint::ManifestLint::UnusedConfig { path, .. } if path == "domain"
+        )));
+    }
+
+    #[test]
+    fn config_used_only_by_vm_scalar_is_not_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              cpus: { type: "integer" },
+              memory: { type: "integer" },
+              other: { type: "string" }
+            },
+          },
+          program: {
+            vm: {
+              image: "/tmp/base.qcow2",
+              cpus: "${config.cpus}",
+              memory_mib: "${config.memory}",
+              network: {
+                endpoints: [
+                  { name: "http", port: 8080, protocol: "http" }
+                ],
+                egress: "none"
+              }
+            }
+          },
+          provides: {
+            http: { kind: "http", endpoint: "http" }
+          },
+          exports: {
+            http: "http"
+          }
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedConfig { path, .. } if path == "cpus" || path == "memory"
+        )));
+        assert!(lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedConfig { path, .. } if path == "other"
         )));
     }
 

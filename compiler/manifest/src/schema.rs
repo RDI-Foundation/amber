@@ -4,10 +4,11 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
     str::FromStr,
+    sync::LazyLock,
 };
 
 use bon::bon;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use serde_with::{
     DefaultOnNull, DeserializeFromStr, MapPreventDuplicates, SerializeDisplay, rust::double_option,
@@ -27,13 +28,18 @@ use crate::{
 };
 
 #[serde_as]
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(untagged)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum Program {
     Image(ProgramImage),
     Path(ProgramPath),
+    Vm(ProgramVmField),
 }
+
+static EMPTY_PROGRAM_ENTRYPOINT: LazyLock<ProgramEntrypoint> =
+    LazyLock::new(ProgramEntrypoint::default);
+static EMPTY_PROGRAM_ENV: LazyLock<BTreeMap<String, ProgramEnvValue>> =
+    LazyLock::new(BTreeMap::new);
 
 impl<'de> Deserialize<'de> for Program {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -48,6 +54,8 @@ impl<'de> Deserialize<'de> for Program {
             image: Option<ProgramImageField>,
             #[serde(default)]
             path: Option<ProgramPathField>,
+            #[serde(default)]
+            vm: Option<VmProgram>,
             #[serde(default)]
             #[serde(deserialize_with = "double_option::deserialize")]
             entrypoint: Option<Option<ProgramEntrypoint>>,
@@ -64,8 +72,8 @@ impl<'de> Deserialize<'de> for Program {
         }
 
         let fields = ProgramFields::deserialize(deserializer)?;
-        match (fields.image, fields.path) {
-            (Some(image), None) => {
+        match (fields.image, fields.path, fields.vm) {
+            (Some(image), None, None) => {
                 if fields.args.is_some() {
                     return Err(serde::de::Error::custom(
                         "program.args is only supported with program.path",
@@ -81,7 +89,7 @@ impl<'de> Deserialize<'de> for Program {
                     },
                 }))
             }
-            (None, Some(path)) => {
+            (None, Some(path), None) => {
                 if fields.entrypoint.is_some() {
                     return Err(serde::de::Error::custom(
                         "program.entrypoint is only supported with program.image",
@@ -97,12 +105,64 @@ impl<'de> Deserialize<'de> for Program {
                     },
                 }))
             }
-            (Some(_), Some(_)) => Err(serde::de::Error::custom(
-                "program must declare exactly one of `image` or `path`",
+            (None, None, Some(vm)) => {
+                if fields.entrypoint.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "program.entrypoint is only supported with program.image",
+                    ));
+                }
+                if fields.args.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "program.args is only supported with program.path",
+                    ));
+                }
+                if !fields.env.is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "program.env is not supported with program.vm; configure guest startup \
+                         with program.vm.cloud_init.user_data or vendor_data",
+                    ));
+                }
+                if fields.network.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "program.network must be nested under program.vm",
+                    ));
+                }
+                if !fields.mounts.is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "program.mounts must be nested under program.vm",
+                    ));
+                }
+                Ok(Self::Vm(ProgramVmField(vm)))
+            }
+            (Some(_), Some(_), None) => Err(serde::de::Error::custom(
+                "program must declare exactly one of `image`, `path`, or `vm`",
             )),
-            (None, None) => Err(serde::de::Error::custom(
-                "program must declare either `image` or `path`",
+            (Some(_), None, Some(_)) | (None, Some(_), Some(_)) | (Some(_), Some(_), Some(_)) => {
+                Err(serde::de::Error::custom(
+                    "program must declare exactly one of `image`, `path`, or `vm`",
+                ))
+            }
+            (None, None, None) => Err(serde::de::Error::custom(
+                "program must declare either `image`, `path`, or `vm`",
             )),
+        }
+    }
+}
+
+impl Serialize for Program {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct VmProgramEnvelope<'a> {
+            vm: &'a VmProgram,
+        }
+
+        match self {
+            Self::Image(program) => program.serialize(serializer),
+            Self::Path(program) => program.serialize(serializer),
+            Self::Vm(program) => VmProgramEnvelope { vm: &program.0 }.serialize(serializer),
         }
     }
 }
@@ -124,10 +184,14 @@ impl Program {
         Self::Path(path)
     }
 
+    pub fn vm(vm: VmProgram) -> Self {
+        Self::Vm(ProgramVmField(vm))
+    }
+
     pub fn image_ref(&self) -> Option<&str> {
         match self {
             Self::Image(program) => Some(program.image.as_str()),
-            Self::Path(_) => None,
+            Self::Path(_) | Self::Vm(_) => None,
         }
     }
 
@@ -135,6 +199,7 @@ impl Program {
         match self {
             Self::Image(_) => None,
             Self::Path(program) => Some(program.path.as_str()),
+            Self::Vm(_) => None,
         }
     }
 
@@ -142,6 +207,7 @@ impl Program {
         match self {
             Self::Image(program) => &program.entrypoint,
             Self::Path(program) => &program.args,
+            Self::Vm(_) => &EMPTY_PROGRAM_ENTRYPOINT,
         }
     }
 
@@ -149,13 +215,23 @@ impl Program {
         match self {
             Self::Image(program) => &program.common.env,
             Self::Path(program) => &program.common.env,
+            Self::Vm(_) => &EMPTY_PROGRAM_ENV,
         }
     }
 
-    pub fn network(&self) -> Option<&Network> {
+    pub fn network(&self) -> Option<ProgramNetworkRef<'_>> {
         match self {
-            Self::Image(program) => program.common.network.as_ref(),
-            Self::Path(program) => program.common.network.as_ref(),
+            Self::Image(program) => program
+                .common
+                .network
+                .as_ref()
+                .map(ProgramNetworkRef::Common),
+            Self::Path(program) => program
+                .common
+                .network
+                .as_ref()
+                .map(ProgramNetworkRef::Common),
+            Self::Vm(program) => program.0.network.as_ref().map(ProgramNetworkRef::Vm),
         }
     }
 
@@ -163,17 +239,58 @@ impl Program {
         match self {
             Self::Image(program) => &program.common.mounts,
             Self::Path(program) => &program.common.mounts,
+            Self::Vm(program) => &program.0.mounts,
         }
     }
 
     /// Visit slot names referenced anywhere in the program. Returns `true` if the program
     /// references all slots.
     pub fn visit_slot_uses(&self, mut visit: impl FnMut(&str)) -> bool {
-        if let Some(executable) = self.path_ref().or_else(|| self.image_ref())
-            && let Ok(parsed) = executable.parse::<InterpolatedString>()
-            && parsed.visit_slot_uses(&mut visit)
-        {
-            return true;
+        match self {
+            Self::Image(program) => {
+                if let Ok(parsed) = program.image.parse::<InterpolatedString>()
+                    && parsed.visit_slot_uses(&mut visit)
+                {
+                    return true;
+                }
+            }
+            Self::Path(program) => {
+                if let Ok(parsed) = program.path.parse::<InterpolatedString>()
+                    && parsed.visit_slot_uses(&mut visit)
+                {
+                    return true;
+                }
+            }
+            Self::Vm(program) => {
+                if let Ok(parsed) = program.0.image.parse::<InterpolatedString>()
+                    && parsed.visit_slot_uses(&mut visit)
+                {
+                    return true;
+                }
+                for scalar in [&program.0.cpus, &program.0.memory_mib] {
+                    let VmScalarU32::Interpolated(raw) = scalar else {
+                        continue;
+                    };
+                    if let Ok(parsed) = raw.parse::<InterpolatedString>()
+                        && parsed.visit_slot_uses(&mut visit)
+                    {
+                        return true;
+                    }
+                }
+                for value in [
+                    program.0.cloud_init.user_data.as_deref(),
+                    program.0.cloud_init.vendor_data.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if let Ok(parsed) = value.parse::<InterpolatedString>()
+                        && parsed.visit_slot_uses(&mut visit)
+                    {
+                        return true;
+                    }
+                }
+            }
         }
 
         if self.command().visit_slot_uses(&mut visit) {
@@ -187,6 +304,21 @@ impl Program {
         }
 
         false
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ProgramNetworkRef<'a> {
+    Common(&'a Network),
+    Vm(&'a VmNetwork),
+}
+
+impl<'a> ProgramNetworkRef<'a> {
+    pub fn endpoints(self) -> &'a BTreeSet<Endpoint> {
+        match self {
+            Self::Common(network) => &network.endpoints,
+            Self::Vm(network) => &network.endpoints,
+        }
     }
 }
 
@@ -222,6 +354,94 @@ pub struct ProgramPath {
     pub args: ProgramEntrypoint,
     #[serde(flatten)]
     pub common: ProgramCommon,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProgramVmField(pub VmProgram);
+
+#[serde_as]
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, bon::Builder,
+)]
+#[builder(on(String, into))]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct VmProgram {
+    #[serde(deserialize_with = "deserialize_program_image")]
+    pub image: String,
+    pub cpus: VmScalarU32,
+    pub memory_mib: VmScalarU32,
+    #[serde(default)]
+    pub network: Option<VmNetwork>,
+    #[serde(default)]
+    #[builder(default)]
+    pub mounts: Vec<ProgramMount>,
+    #[serde(default)]
+    pub cloud_init: VmCloudInit,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct VmCloudInit {
+    #[serde(default)]
+    pub user_data: Option<String>,
+    #[serde(default)]
+    pub vendor_data: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(untagged)]
+#[non_exhaustive]
+pub enum VmScalarU32 {
+    Literal(u32),
+    Interpolated(String),
+}
+
+impl<'de> Deserialize<'de> for VmScalarU32 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Scalar {
+            Literal(u32),
+            Interpolated(String),
+        }
+
+        match Scalar::deserialize(deserializer)? {
+            Scalar::Literal(value) => Ok(Self::Literal(value)),
+            Scalar::Interpolated(value) => {
+                value
+                    .parse::<InterpolatedString>()
+                    .map_err(serde::de::Error::custom)?;
+                Ok(Self::Interpolated(value))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct VmNetwork {
+    #[serde(default, deserialize_with = "deserialize_endpoints")]
+    pub endpoints: BTreeSet<Endpoint>,
+    #[serde(default)]
+    pub egress: VmEgress,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum VmEgress {
+    #[default]
+    None,
+    Optional,
 }
 
 #[serde_as]

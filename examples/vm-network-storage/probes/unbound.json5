@@ -1,0 +1,95 @@
+{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      base_image: { type: "string" },
+    },
+    required: ["base_image"],
+    additionalProperties: false,
+  },
+  program: {
+    vm: {
+      image: "${config.base_image}",
+      cpus: 4,
+      memory_mib: 1024,
+      cloud_init: {
+        user_data: "\
+#cloud-config\n\
+write_files:\n\
+  - path: /usr/local/bin/amber-unbound-probe.py\n\
+    permissions: '0755'\n\
+    content: |\n\
+      from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n\
+      from pathlib import Path\n\
+      from urllib.request import Request, urlopen\n\
+      \n\
+      TARGET_URL = 'http://10.0.2.100:20000'.rstrip('/')\n\
+      OWN_EPHEMERAL = Path('/tmp/unbound-ephemeral.txt')\n\
+      API_EPHEMERAL = Path('/tmp/amber-api-ephemeral.txt')\n\
+      if not OWN_EPHEMERAL.exists():\n\
+          OWN_EPHEMERAL.write_text('owned:unbound', encoding='utf-8')\n\
+      \n\
+      def reachability() -> str:\n\
+          try:\n\
+              with urlopen(Request(f'{TARGET_URL}/identity'), timeout=2) as response:\n\
+                  return f\"reachable:{response.read().decode('utf-8')}\"\n\
+          except Exception as err:\n\
+              return f'blocked:{err.__class__.__name__}'\n\
+      \n\
+      def send(handler: BaseHTTPRequestHandler, status: int, body: str) -> None:\n\
+          payload = body.encode('utf-8')\n\
+          handler.send_response(status)\n\
+          handler.send_header('content-type', 'text/plain; charset=utf-8')\n\
+          handler.send_header('content-length', str(len(payload)))\n\
+          handler.end_headers()\n\
+          handler.wfile.write(payload)\n\
+      \n\
+      class Handler(BaseHTTPRequestHandler):\n\
+          def do_GET(self) -> None:\n\
+              if self.path == '/':\n\
+                  send(self, 200, 'GET /reachability\\nGET /ephemeral\\n')\n\
+              elif self.path == '/reachability':\n\
+                  send(self, 200, reachability())\n\
+              elif self.path == '/ephemeral':\n\
+                  own = OWN_EPHEMERAL.read_text(encoding='utf-8')\n\
+                  send(self, 200, f\"own={own};api_visible={str(API_EPHEMERAL.exists()).lower()}\")\n\
+              else:\n\
+                  send(self, 404, 'not found')\n\
+      \n\
+          def log_message(self, _format: str, *_args: object) -> None:\n\
+              pass\n\
+      \n\
+      ThreadingHTTPServer(('0.0.0.0', 8080), Handler).serve_forever()\n\
+  - path: /etc/systemd/system/amber-unbound-probe.service\n\
+    permissions: '0644'\n\
+    content: |\n\
+      [Unit]\n\
+      Description=Amber VM unbound probe demo\n\
+      \n\
+      [Service]\n\
+      ExecStart=/usr/bin/python3 /usr/local/bin/amber-unbound-probe.py\n\
+      Restart=always\n\
+      \n\
+      [Install]\n\
+      WantedBy=multi-user.target\n\
+runcmd:\n\
+  - [systemctl, daemon-reload]\n\
+  - [systemctl, enable, --now, amber-unbound-probe.service]\n\
+        ",
+      },
+      network: {
+        endpoints: [
+          { name: "http", port: 8080, protocol: "http" },
+        ],
+        egress: "none",
+      },
+    },
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" },
+  },
+  exports: {
+    http: "http",
+  },
+}

@@ -454,7 +454,7 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
     let config_plan = build_config_plan(
         s,
         program_components,
-        ProgramSupport::ImageOnly {
+        ProgramSupport::Image {
             backend_label: "docker-compose output",
         },
         crate::targets::program_config::RuntimeAddressResolution::Static,
@@ -733,6 +733,7 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
             mount_specs,
             config_plan.runtime_views.get(id),
             has_docker_mount,
+            false,
         )
         .map_err(dc_other)?;
         let mut deps: Vec<(String, &'static str)> = Vec::new();

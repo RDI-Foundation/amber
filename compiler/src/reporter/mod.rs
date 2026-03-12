@@ -14,10 +14,12 @@ pub mod scenario_ir;
 
 pub use direct::DirectReporter;
 pub use docker_compose::DockerComposeReporter;
+pub use vm::VmReporter;
 
 pub use crate::targets::{
     direct,
     mesh::{docker_compose, kubernetes},
+    vm,
 };
 
 #[derive(Clone, Debug)]

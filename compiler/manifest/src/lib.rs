@@ -35,8 +35,9 @@ pub use schema::{
     Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityDecl, CapabilityKind,
     CapabilityTransport, ComponentDecl, ComponentRef, ConfigSchema, Endpoint, EnvironmentDecl,
     ExportTarget, LocalComponentRef, ManifestBinding, MountSource, Network, NetworkProtocol,
-    Program, ProgramCommon, ProgramImage, ProgramMount, ProgramPath, ProvideDecl, RawBinding,
-    RawExportTarget, ResourceDecl, SlotDecl,
+    Program, ProgramCommon, ProgramImage, ProgramMount, ProgramNetworkRef, ProgramPath,
+    ProgramVmField, ProvideDecl, RawBinding, RawExportTarget, ResourceDecl, SlotDecl, VmCloudInit,
+    VmEgress, VmNetwork, VmProgram, VmScalarU32,
 };
 pub use slot_query::{
     SlotQuery, SlotQueryError, SlotQueryValidation, SlotTarget, parse_slot_query,
