@@ -8,6 +8,22 @@ This example shows both directions with one `amber proxy` process:
 - external slot ingress (`api`) from scenario -> your local HTTP server
 - exported capability egress (`public`) from host -> scenario
 
+Externalized root slots are supplied from outside the scenario via
+`amber proxy --slot ...`. Any binding path that depends on such a slot must be weak
+overall, because the consumer must tolerate that provider being absent until the proxy
+attaches it. In practice, the clearest approach is usually to make the first binding from
+`self.<slot>` weak:
+
+```json5
+bindings: [
+  { to: "#router.api", from: "self.api", weak: true },
+  { to: "#client.api", from: "#router.api" },
+]
+```
+
+Downstream hops do not all need to repeat `weak: true` if a weak binding already exists
+upstream. For a fuller multi-hop forwarding example, see `examples/slot-forwarding`.
+
 ## Quick start (Docker Compose)
 
 Use three terminals.
