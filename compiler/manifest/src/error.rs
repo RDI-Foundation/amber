@@ -19,6 +19,14 @@ pub enum Error {
     #[diagnostic(code(manifest::io_error))]
     Io(#[from] std::io::Error),
 
+    #[error("invalid program file reference `{path}` at {pointer}: {message}")]
+    #[diagnostic(code(manifest::program_file_reference))]
+    ProgramFileReference {
+        pointer: String,
+        path: String,
+        message: String,
+    },
+
     #[error("invalid manifest reference `{0}`")]
     #[diagnostic(code(manifest::invalid_reference))]
     InvalidManifestRef(String),
@@ -80,6 +88,18 @@ pub enum Error {
     #[error("program.path must be non-empty")]
     #[diagnostic(code(manifest::empty_program_path))]
     EmptyProgramPath,
+
+    #[error("program.vm.image must be non-empty")]
+    #[diagnostic(code(manifest::empty_vm_image))]
+    EmptyVmImage,
+
+    #[error("program.vm.cpus must be greater than zero")]
+    #[diagnostic(code(manifest::invalid_vm_cpus))]
+    InvalidVmCpus,
+
+    #[error("program.vm.memory_mib must be greater than zero")]
+    #[diagnostic(code(manifest::invalid_vm_memory_mib))]
+    InvalidVmMemoryMib,
 
     #[error("export `{export}` references unknown capability `{target}`")]
     #[diagnostic(code(manifest::unknown_export_target))]

@@ -1,6 +1,9 @@
 use std::{fs, path::Path, process::Command};
 
-use amber_compiler::reporter::direct::{DIRECT_CONTROL_SOCKET_RELATIVE_PATH, DIRECT_PLAN_VERSION};
+use amber_compiler::reporter::{
+    direct::{DIRECT_CONTROL_SOCKET_RELATIVE_PATH, DIRECT_PLAN_VERSION},
+    vm::{VM_PLAN_FILENAME, VM_PLAN_VERSION},
+};
 use amber_images::AMBER_ROUTER;
 use amber_manifest::ManifestDigest;
 use amber_template::{ProgramArgTemplate, ProgramEnvTemplate, TemplatePart, TemplateSpec};
@@ -323,6 +326,601 @@ fn compile_writes_direct_artifact() {
         Some(DIRECT_CONTROL_SOCKET_RELATIVE_PATH)
     );
     assert_eq!(proxy_json["router"]["control_port"].as_u64(), Some(0));
+}
+
+#[test]
+fn compile_writes_vm_artifact() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("vm-outputs-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let manifest = outputs_dir.path().join("scenario.json5");
+    fs::write(
+        &manifest,
+        r##"{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      base_image: { type: "string" }
+    },
+    required: ["base_image"],
+    additionalProperties: false
+  },
+  program: {
+    vm: {
+      image: "${config.base_image}",
+      cpus: 1,
+      memory_mib: 512,
+      cloud_init: {
+        user_data: "#cloud-config\nruncmd:\n  - [sh, -lc, 'echo ready >/run/amber-ready']\n"
+      },
+      network: {
+        endpoints: [
+          { name: "http", port: 8080, protocol: "http" }
+        ],
+        egress: "none"
+      }
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    )
+    .expect("failed to write manifest");
+
+    let artifact_dir = outputs_dir.path().join("vm");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--vm")
+        .arg(&artifact_dir)
+        .arg(&manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --vm: {err}"));
+
+    if !output.status.success() {
+        panic!(
+            "amber compile --vm failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let vm_plan_path = artifact_dir.join(VM_PLAN_FILENAME);
+    let provision_plan_path = artifact_dir.join("mesh-provision-plan.json");
+    let run_script_path = artifact_dir.join("run.sh");
+    let readme_path = artifact_dir.join("README.md");
+    let env_example_path = artifact_dir.join("env.example");
+    let proxy_metadata_path = artifact_dir.join("amber-proxy.json");
+
+    assert!(vm_plan_path.is_file(), "missing vm-plan.json");
+    assert!(
+        provision_plan_path.is_file(),
+        "missing mesh-provision-plan.json"
+    );
+    assert!(run_script_path.is_file(), "missing run.sh");
+    assert!(readme_path.is_file(), "missing README.md");
+    assert!(env_example_path.is_file(), "missing env.example");
+    assert!(proxy_metadata_path.is_file(), "missing amber-proxy.json");
+
+    let vm_plan: Value = serde_json::from_str(
+        &fs::read_to_string(&vm_plan_path).expect("failed to read vm-plan.json"),
+    )
+    .expect("vm-plan.json should be valid JSON");
+    assert_eq!(vm_plan["version"], VM_PLAN_VERSION);
+    assert_eq!(vm_plan["mesh_provision_plan"], "mesh-provision-plan.json");
+    let components = vm_plan["components"]
+        .as_array()
+        .expect("vm plan components should be an array");
+    assert_eq!(components.len(), 1, "{vm_plan:#}");
+    assert_eq!(components[0]["base_image"]["kind"], "runtime_config");
+    assert_eq!(components[0]["base_image"]["query"], "base_image");
+    assert_eq!(components[0]["cpus"]["kind"], "literal");
+    assert_eq!(components[0]["cpus"]["value"], 1);
+    assert_eq!(components[0]["memory_mib"]["kind"], "literal");
+    assert_eq!(components[0]["memory_mib"]["value"], 512);
+    let component = components[0]
+        .as_object()
+        .expect("vm component should serialize as an object");
+    assert!(
+        !component.contains_key("runtime_config"),
+        "vm component should omit runtime_config when it is unused"
+    );
+    assert!(
+        !component.contains_key("mount_spec_b64"),
+        "vm component should omit mount_spec_b64 when it is unused"
+    );
+
+    let readme = fs::read_to_string(&readme_path).expect("failed to read vm README");
+    assert!(
+        readme.contains("amber run ."),
+        "vm README should explain how to start the output"
+    );
+    let env_example = fs::read_to_string(&env_example_path).expect("failed to read vm env example");
+    assert!(
+        env_example.contains("AMBER_CONFIG_BASE_IMAGE"),
+        "vm env example should mention runtime config for the base image"
+    );
+
+    let proxy_metadata: Value = serde_json::from_str(
+        &fs::read_to_string(&proxy_metadata_path).expect("failed to read vm proxy metadata"),
+    )
+    .expect("vm proxy metadata should be valid JSON");
+    assert_eq!(
+        proxy_metadata["router"]["control_socket"].as_str(),
+        Some(DIRECT_CONTROL_SOCKET_RELATIVE_PATH)
+    );
+    assert_eq!(proxy_metadata["router"]["control_port"].as_u64(), Some(0));
+}
+
+#[test]
+fn compile_vm_artifact_supports_runtime_templates() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("vm-runtime-template-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let manifest = outputs_dir.path().join("scenario.json5");
+    fs::write(
+        &manifest,
+        r##"{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      base_image: { type: "string" },
+      message: { type: "string" }
+    },
+    required: ["base_image", "message"],
+    additionalProperties: false
+  },
+  slots: {
+    api: { kind: "http", optional: true }
+  },
+  program: {
+    vm: {
+      image: "./images/${config.base_image}",
+      cpus: 1,
+      memory_mib: 512,
+      cloud_init: {
+        user_data: "#cloud-config\nwrite_files:\n  - path: /tmp/value\n    content: 'msg=${config.message};api=${slots.api.url}'\n"
+      },
+      network: {
+        endpoints: [
+          { name: "http", port: 8080, protocol: "http" }
+        ],
+        egress: "none"
+      }
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    )
+    .expect("failed to write manifest");
+
+    let artifact_dir = outputs_dir.path().join("vm");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--vm")
+        .arg(&artifact_dir)
+        .arg(&manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --vm: {err}"));
+
+    if !output.status.success() {
+        panic!(
+            "amber compile --vm failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let vm_plan_path = artifact_dir.join(VM_PLAN_FILENAME);
+    let vm_plan: Value = serde_json::from_str(
+        &fs::read_to_string(&vm_plan_path).expect("failed to read vm-plan.json"),
+    )
+    .expect("vm-plan.json should be valid JSON");
+    let component = vm_plan["components"]
+        .as_array()
+        .and_then(|components| components.first())
+        .expect("vm plan should contain one component");
+
+    assert_eq!(component["base_image"]["kind"], "runtime_template");
+    assert_eq!(component["base_image"]["parts"][0]["kind"], "literal");
+    assert_eq!(component["base_image"]["parts"][0]["value"], "./images/");
+    assert_eq!(
+        component["base_image"]["parts"][1]["kind"],
+        "runtime_config"
+    );
+    assert_eq!(component["base_image"]["parts"][1]["query"], "base_image");
+    assert_eq!(
+        component["base_image"]["source_dir"].as_str(),
+        outputs_dir.path().to_str()
+    );
+
+    assert_eq!(
+        component["cloud_init_user_data"]["kind"],
+        "runtime_template"
+    );
+    let cloud_init_parts = component["cloud_init_user_data"]["parts"]
+        .as_array()
+        .expect("cloud-init template parts should be an array");
+    assert!(
+        cloud_init_parts
+            .iter()
+            .any(|part| part["config"] == "message"),
+        "cloud-init template should retain config interpolation"
+    );
+    assert!(
+        cloud_init_parts
+            .iter()
+            .any(|part| part["slot"] == "api.url"),
+        "cloud-init template should retain slot interpolation"
+    );
+    assert_eq!(
+        component["runtime_config"]["allowed_root_leaf_paths"][0],
+        "message"
+    );
+}
+
+#[test]
+fn compile_vm_artifact_resolves_static_child_config_for_scalars_and_cloud_init() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("vm-static-child-config-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let child_manifest = outputs_dir.path().join("child.json5");
+    fs::write(
+        &child_manifest,
+        r##"{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      image: { type: "string" },
+      cpu_count: { type: "integer" },
+      memory: { type: "integer" },
+      banner: { type: "string" }
+    },
+    required: ["image", "cpu_count", "memory", "banner"],
+    additionalProperties: false
+  },
+  program: {
+    vm: {
+      image: "${config.image}",
+      cpus: "${config.cpu_count}",
+      memory_mib: "${config.memory}",
+      cloud_init: {
+        user_data: "#cloud-config\nwrite_files:\n  - path: /tmp/banner\n    content: '${config.banner}'\n"
+      },
+      network: {
+        endpoints: [
+          { name: "http", port: 8080, protocol: "http" }
+        ],
+        egress: "none"
+      }
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    )
+    .expect("failed to write child manifest");
+
+    let root_manifest = outputs_dir.path().join("scenario.json5");
+    fs::write(
+        &root_manifest,
+        format!(
+            r##"{{
+  manifest_version: "0.1.0",
+  components: {{
+    child: {{
+      manifest: "{}",
+      config: {{
+        image: "./images/base.qcow2",
+        cpu_count: 3,
+        memory: 1536,
+        banner: "hello from parent"
+      }}
+    }}
+  }},
+  exports: {{
+    http: "#child.http"
+  }}
+}}
+"##,
+            child_manifest.display()
+        ),
+    )
+    .expect("failed to write root manifest");
+
+    let artifact_dir = outputs_dir.path().join("vm");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--vm")
+        .arg(&artifact_dir)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --vm: {err}"));
+
+    if !output.status.success() {
+        panic!(
+            "amber compile --vm failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let vm_plan: Value = serde_json::from_str(
+        &fs::read_to_string(artifact_dir.join(VM_PLAN_FILENAME))
+            .expect("failed to read vm-plan.json"),
+    )
+    .expect("vm-plan.json should be valid JSON");
+    let component = vm_plan["components"]
+        .as_array()
+        .and_then(|components| components.first())
+        .expect("vm plan should contain one component");
+
+    assert_eq!(component["base_image"]["kind"], "static");
+    assert_eq!(component["cpus"]["kind"], "literal");
+    assert_eq!(component["cpus"]["value"], 3);
+    assert_eq!(component["memory_mib"]["kind"], "literal");
+    assert_eq!(component["memory_mib"]["value"], 1536);
+    assert_eq!(component["cloud_init_user_data"]["kind"], "static");
+    assert!(
+        component["cloud_init_user_data"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("hello from parent")),
+        "{component:#}"
+    );
+    let component = component
+        .as_object()
+        .expect("vm component should serialize as an object");
+    assert!(
+        !component.contains_key("runtime_config"),
+        "static child config should not force runtime_config"
+    );
+}
+
+#[test]
+fn compile_vm_artifact_rewrites_runtime_scalar_paths_through_child_config() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("vm-runtime-child-config-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let child_manifest = outputs_dir.path().join("child.json5");
+    fs::write(
+        &child_manifest,
+        r##"{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      image: { type: "string" },
+      cpu_count: { type: "integer" },
+      memory: { type: "integer" }
+    },
+    required: ["image", "cpu_count", "memory"],
+    additionalProperties: false
+  },
+  program: {
+    vm: {
+      image: "${config.image}",
+      cpus: "${config.cpu_count}",
+      memory_mib: "${config.memory}",
+      network: {
+        endpoints: [
+          { name: "http", port: 8080, protocol: "http" }
+        ],
+        egress: "none"
+      }
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    )
+    .expect("failed to write child manifest");
+
+    let root_manifest = outputs_dir.path().join("scenario.json5");
+    fs::write(
+        &root_manifest,
+        format!(
+            r##"{{
+  manifest_version: "0.1.0",
+  config_schema: {{
+    type: "object",
+    properties: {{
+      vm: {{
+        type: "object",
+        properties: {{
+          image: {{ type: "string" }},
+          cpu: {{ type: "integer" }},
+          memory: {{ type: "integer" }}
+        }},
+        required: ["image", "cpu", "memory"],
+        additionalProperties: false
+      }}
+    }},
+    required: ["vm"],
+    additionalProperties: false
+  }},
+  components: {{
+    child: {{
+      manifest: "{}",
+      config: {{
+        image: "${{config.vm.image}}",
+        cpu_count: "${{config.vm.cpu}}",
+        memory: "${{config.vm.memory}}"
+      }}
+    }}
+  }},
+  exports: {{
+    http: "#child.http"
+  }}
+}}
+"##,
+            child_manifest.display()
+        ),
+    )
+    .expect("failed to write root manifest");
+
+    let artifact_dir = outputs_dir.path().join("vm");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--vm")
+        .arg(&artifact_dir)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --vm: {err}"));
+
+    if !output.status.success() {
+        panic!(
+            "amber compile --vm failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let vm_plan: Value = serde_json::from_str(
+        &fs::read_to_string(artifact_dir.join(VM_PLAN_FILENAME))
+            .expect("failed to read vm-plan.json"),
+    )
+    .expect("vm-plan.json should be valid JSON");
+    let component = vm_plan["components"]
+        .as_array()
+        .and_then(|components| components.first())
+        .expect("vm plan should contain one component");
+
+    assert_eq!(component["base_image"]["kind"], "runtime_config");
+    assert_eq!(component["base_image"]["query"], "vm.image");
+    assert_eq!(component["cpus"]["kind"], "runtime_config");
+    assert_eq!(component["cpus"]["query"], "vm.cpu");
+    assert_eq!(component["memory_mib"]["kind"], "runtime_config");
+    assert_eq!(component["memory_mib"]["query"], "vm.memory");
+}
+
+#[test]
+fn check_rejects_invalid_vm_scalar_config_ref() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("vm-invalid-scalar-check-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let manifest = outputs_dir.path().join("scenario.json5");
+    fs::write(
+        &manifest,
+        r#"{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      image: { type: "string" }
+    },
+    required: ["image"],
+    additionalProperties: false
+  },
+  program: {
+    vm: {
+      image: "${config.image}",
+      cpus: "${config.missing}",
+      memory_mib: 512,
+      network: {
+        endpoints: [
+          { name: "http", port: 8080, protocol: "http" }
+        ],
+        egress: "none"
+      }
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"#,
+    )
+    .expect("failed to write manifest");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("check")
+        .arg(&manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber check: {err}"));
+
+    assert!(
+        !output.status.success(),
+        "amber check unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("program.vm.cpus"),
+        "expected program.vm.cpus in stderr, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("config.missing"),
+        "expected missing config path in stderr, got:\n{stderr}"
+    );
 }
 
 #[test]

@@ -93,7 +93,7 @@ impl ComponentRoutePortAllocator {
             .as_ref()
             .and_then(|program| program.network())
         {
-            for endpoint in &net.endpoints {
+            for endpoint in net.endpoints() {
                 reserved.insert(endpoint.port);
             }
         }
@@ -238,7 +238,7 @@ pub(crate) fn allocate_mesh_ports(
 
         let mut reserved: HashSet<u16> = HashSet::new();
         if let Some(net) = program.network() {
-            for ep in &net.endpoints {
+            for ep in net.endpoints() {
                 reserved.insert(ep.port);
             }
         }

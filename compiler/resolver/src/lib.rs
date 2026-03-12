@@ -89,6 +89,7 @@ impl Resolver {
                     manifest,
                     source,
                     spans,
+                    bundle_source,
                 } = res;
                 let actual = manifest.digest();
                 if actual != expected {
@@ -99,6 +100,7 @@ impl Resolver {
                     manifest,
                     source,
                     spans,
+                    bundle_source,
                 })
             }
             None => Ok(res),
@@ -127,6 +129,7 @@ pub struct Resolution {
     pub manifest: Manifest,
     pub source: Arc<str>,
     pub spans: Arc<ManifestSpans>,
+    pub bundle_source: Option<Arc<str>>,
 }
 
 #[cfg(test)]

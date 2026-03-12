@@ -1,0 +1,37 @@
+{
+  // v2 changes the graph shape at the root: it now points at `stack`, but the durable storage
+  // resource is still owned here.
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      base_image: { type: "string" },
+    },
+    required: ["base_image"],
+    additionalProperties: false,
+  },
+  resources: {
+    app_state: {
+      kind: "storage",
+      params: {
+        size: "1Gi",
+      },
+    },
+  },
+  components: {
+    stack: {
+      manifest: "./stack.json5",
+      config: {
+        base_image: "${config.base_image}",
+      },
+    },
+  },
+  bindings: [
+    { to: "#stack.state", from: "resources.app_state" },
+  ],
+  exports: {
+    api: "#stack.api",
+    bound: "#stack.bound",
+    unbound: "#stack.unbound",
+  },
+}

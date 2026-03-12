@@ -1,0 +1,77 @@
+#cloud-config
+write_files:
+  - path: /usr/local/bin/amber-api.py
+    permissions: '0755'
+    content: |
+      from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+      from pathlib import Path
+
+      STATE_PATH = Path('/var/lib/app/storage.txt')
+      STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+      if not STATE_PATH.exists():
+          STATE_PATH.write_text('seeded by v2', encoding='utf-8')
+
+      EPHEMERAL_PATH = Path('/tmp/amber-api-ephemeral.txt')
+      if not EPHEMERAL_PATH.exists():
+          EPHEMERAL_PATH.write_text('boot:v2', encoding='utf-8')
+
+      def read_text(path: Path) -> str:
+          return path.read_text(encoding='utf-8')
+
+      def write_text(path: Path, value: str) -> str:
+          path.parent.mkdir(parents=True, exist_ok=True)
+          path.write_text(value, encoding='utf-8')
+          return read_text(path)
+
+      def send(handler: BaseHTTPRequestHandler, status: int, body: str) -> None:
+          payload = body.encode('utf-8')
+          handler.send_response(status)
+          handler.send_header('content-type', 'text/plain; charset=utf-8')
+          handler.send_header('content-length', str(len(payload)))
+          handler.end_headers()
+          handler.wfile.write(payload)
+
+      class Handler(BaseHTTPRequestHandler):
+          def do_GET(self) -> None:
+              if self.path == '/':
+                  send(self, 200, 'GET /identity\nGET /version\nGET /storage\nGET /ephemeral\nPUT /storage\nPUT /ephemeral\n')
+              elif self.path == '/identity':
+                  send(self, 200, 'api')
+              elif self.path == '/version':
+                  send(self, 200, 'v2')
+              elif self.path == '/storage':
+                  send(self, 200, read_text(STATE_PATH))
+              elif self.path == '/ephemeral':
+                  send(self, 200, read_text(EPHEMERAL_PATH))
+              else:
+                  send(self, 404, 'not found')
+
+          def do_PUT(self) -> None:
+              length = int(self.headers.get('content-length', '0'))
+              body = self.rfile.read(length).decode('utf-8')
+              if self.path == '/storage':
+                  send(self, 200, write_text(STATE_PATH, body))
+              elif self.path == '/ephemeral':
+                  send(self, 200, write_text(EPHEMERAL_PATH, body))
+              else:
+                  send(self, 404, 'not found')
+
+          def log_message(self, _format: str, *_args: object) -> None:
+              pass
+
+      ThreadingHTTPServer(('0.0.0.0', 8080), Handler).serve_forever()
+  - path: /etc/systemd/system/amber-api.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Amber VM API demo
+
+      [Service]
+      ExecStart=/usr/bin/python3 /usr/local/bin/amber-api.py
+      Restart=always
+
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, amber-api.service]

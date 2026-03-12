@@ -335,19 +335,63 @@ fn validate_manifest_slot_interpolations(
                 }
             }
         }
+        Program::Vm(program) => {
+            if let Ok(image) = program.0.image.parse::<InterpolatedString>() {
+                let location = SlotLocation::VmImage;
+                let span = location.span(source.as_ref(), spans);
+                validate_interpolated_string(&image, &ctx, location, span, false, &mut diagnostics);
+            }
+            if let Some(raw) = program.0.cloud_init.user_data.as_deref()
+                && let Ok(user_data) = raw.parse::<InterpolatedString>()
+            {
+                let location = SlotLocation::VmCloudInitUserData;
+                let span = location.span(source.as_ref(), spans);
+                validate_interpolated_string(
+                    &user_data,
+                    &ctx,
+                    location,
+                    span,
+                    false,
+                    &mut diagnostics,
+                );
+            }
+            if let Some(raw) = program.0.cloud_init.vendor_data.as_deref()
+                && let Ok(vendor_data) = raw.parse::<InterpolatedString>()
+            {
+                let location = SlotLocation::VmCloudInitVendorData;
+                let span = location.span(source.as_ref(), spans);
+                validate_interpolated_string(
+                    &vendor_data,
+                    &ctx,
+                    location,
+                    span,
+                    false,
+                    &mut diagnostics,
+                );
+            }
+        }
         _ => {}
     }
+
+    if matches!(program, Program::Vm(_)) {
+        return diagnostics;
+    }
+
+    let env_location = |key| SlotLocation::Env(key);
+    let env_condition_location = |key| SlotLocation::EnvCondition(key);
+    let env_each_location = |key| SlotLocation::EnvEach(key);
+    let env_value_location = |key| SlotLocation::EnvValue(key);
 
     for (key, value) in program.env() {
         match value {
             amber_manifest::ProgramEnvValue::Value(value) => {
-                let location = SlotLocation::Env(key.as_str());
+                let location = env_location(key.as_str());
                 let span = location.span(source.as_ref(), spans);
                 validate_interpolated_string(value, &ctx, location, span, false, &mut diagnostics);
             }
             amber_manifest::ProgramEnvValue::Group(group) => {
                 if group.when.source() == InterpolationSource::Slots {
-                    let location = SlotLocation::EnvCondition(key.as_str());
+                    let location = env_condition_location(key.as_str());
                     let span = location.span(source.as_ref(), spans);
                     validate_slot_condition(
                         group.when.query(),
@@ -357,7 +401,7 @@ fn validate_manifest_slot_interpolations(
                         &mut diagnostics,
                     );
                 }
-                let location = SlotLocation::EnvValue(key.as_str());
+                let location = env_value_location(key.as_str());
                 let span = location.span(source.as_ref(), spans);
                 validate_interpolated_string(
                     &group.value,
@@ -369,7 +413,7 @@ fn validate_manifest_slot_interpolations(
                 );
             }
             amber_manifest::ProgramEnvValue::Repeated(repeated) => {
-                let location = SlotLocation::EnvEach(key.as_str());
+                let location = env_each_location(key.as_str());
                 let span = location.span(source.as_ref(), spans);
                 validate_repeated_each(
                     repeated.each.slot(),
@@ -381,11 +425,11 @@ fn validate_manifest_slot_interpolations(
                 if let Some(when) = repeated.when.as_ref()
                     && when.source() == InterpolationSource::Slots
                 {
-                    let location = SlotLocation::EnvCondition(key.as_str());
+                    let location = env_condition_location(key.as_str());
                     let span = location.span(source.as_ref(), spans);
                     validate_slot_condition(when.query(), &ctx, location, span, &mut diagnostics);
                 }
-                let location = SlotLocation::EnvValue(key.as_str());
+                let location = env_value_location(key.as_str());
                 let span = location.span(source.as_ref(), spans);
                 validate_interpolated_string(
                     &repeated.value,
@@ -406,6 +450,9 @@ fn validate_manifest_slot_interpolations(
 enum SlotLocation<'a> {
     Image,
     Path,
+    VmImage,
+    VmCloudInitUserData,
+    VmCloudInitVendorData,
     Entrypoint(usize),
     EntrypointCondition(usize),
     EntrypointEach(usize),
@@ -425,6 +472,9 @@ impl SlotLocation<'_> {
         match self {
             SlotLocation::Image => "program.image".to_string(),
             SlotLocation::Path => "program.path".to_string(),
+            SlotLocation::VmImage => "program.vm.image".to_string(),
+            SlotLocation::VmCloudInitUserData => "program.vm.cloud_init.user_data".to_string(),
+            SlotLocation::VmCloudInitVendorData => "program.vm.cloud_init.vendor_data".to_string(),
             SlotLocation::Entrypoint(idx) => format!("program.entrypoint[{idx}]"),
             SlotLocation::EntrypointCondition(idx) => format!("program.entrypoint[{idx}].when"),
             SlotLocation::EntrypointEach(idx) => format!("program.entrypoint[{idx}].each"),
@@ -453,6 +503,19 @@ impl SlotLocation<'_> {
             SlotLocation::Path => span_for_json_pointer(source, root, "/program/path")
                 .or_else(|| spans.program.as_ref().map(|p| p.whole))
                 .unwrap_or_else(|| (0usize, 0usize).into()),
+            SlotLocation::VmImage => span_for_json_pointer(source, root, "/program/vm/image")
+                .or_else(|| spans.program.as_ref().map(|p| p.whole))
+                .unwrap_or_else(|| (0usize, 0usize).into()),
+            SlotLocation::VmCloudInitUserData => {
+                span_for_json_pointer(source, root, "/program/vm/cloud_init/user_data")
+                    .or_else(|| spans.program.as_ref().map(|p| p.whole))
+                    .unwrap_or_else(|| (0usize, 0usize).into())
+            }
+            SlotLocation::VmCloudInitVendorData => {
+                span_for_json_pointer(source, root, "/program/vm/cloud_init/vendor_data")
+                    .or_else(|| spans.program.as_ref().map(|p| p.whole))
+                    .unwrap_or_else(|| (0usize, 0usize).into())
+            }
             SlotLocation::Entrypoint(idx) => {
                 let pointer = format!("/program/entrypoint/{idx}");
                 if let Some(span) = span_for_json_pointer(source, root, &pointer) {

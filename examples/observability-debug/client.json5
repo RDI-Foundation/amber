@@ -9,7 +9,7 @@
     entrypoint: [
       "sh",
       "-lc",
-      "mkdir -p /www && echo client-ok > /www/index.html; httpd -f -p 9010 -h /www & echo '[client] started'; while true; do echo '[client] internal rpc -> server'; wget -qO- --header='x-amber-tutorial: internal-edge' \"$SERVER_API_URL/rpc\" >/dev/null || true; echo '[client] external rpc -> upstream' >&2; wget -qO- --header='content-type: application/json' --header='x-amber-tutorial: external-edge' --post-data='{\"jsonrpc\":\"2.0\",\"id\":\"external-1\",\"method\":\"tools/call\"}' \"$EXT_API_URL/rpc\" >/dev/null || true; echo '[client] external sse -> upstream'; wget -qO- --header='x-amber-tutorial: external-sse' \"$EXT_API_URL/stream\" >/dev/null || true; sleep 4; done",
+      { file: "./client.sh" },
     ],
     env: {
       SERVER_API_URL: "${slots.server_api.url}",

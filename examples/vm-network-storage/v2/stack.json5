@@ -1,0 +1,45 @@
+{
+  // v2 inserts this wrapper component between the root and the original VMs. The API still
+  // receives the same storage slot, but the parent-child structure is different.
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      base_image: { type: "string" },
+    },
+    required: ["base_image"],
+    additionalProperties: false,
+  },
+  slots: {
+    state: { kind: "storage" },
+  },
+  components: {
+    api: {
+      manifest: "./api.json5",
+      config: {
+        base_image: "${config.base_image}",
+      },
+    },
+    bound: {
+      manifest: "../probes/bound.json5",
+      config: {
+        base_image: "${config.base_image}",
+      },
+    },
+    unbound: {
+      manifest: "../probes/unbound.json5",
+      config: {
+        base_image: "${config.base_image}",
+      },
+    },
+  },
+  bindings: [
+    { to: "#api.state", from: "self.state" },
+    { to: "#bound.api", from: "#api.http" },
+  ],
+  exports: {
+    api: "#api.http",
+    bound: "#bound.http",
+    unbound: "#unbound.http",
+  },
+}

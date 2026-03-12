@@ -1,0 +1,38 @@
+{
+  // This probe shows the allowed path: Amber gives it `${slots.api.url}`, and the guest uses that
+  // value to call the API.
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      base_image: { type: "string" },
+    },
+    required: ["base_image"],
+    additionalProperties: false,
+  },
+  slots: {
+    api: { kind: "http" },
+  },
+  program: {
+    vm: {
+      image: "${config.base_image}",
+      cpus: 4,
+      memory_mib: 1024,
+      cloud_init: {
+        user_data: { file: "./bound.cloud-init.yaml" },
+      },
+      network: {
+        endpoints: [
+          { name: "http", port: 8080, protocol: "http" },
+        ],
+        egress: "none",
+      },
+    },
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" },
+  },
+  exports: {
+    http: "http",
+  },
+}

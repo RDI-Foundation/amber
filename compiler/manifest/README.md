@@ -202,6 +202,8 @@ program: {
   // Either:
   // - a list of strings, or
   // - a single string tokenized with shlex rules.
+  // Individual argv strings may also come from sidecar files:
+  // entrypoint: ["python3", "-c", { file: "./server.py" }],
   entrypoint: ["--port", "8080"],
   // entrypoint: "--port 8080",
 
@@ -259,6 +261,29 @@ program: {
     endpoints: [
       { name: "http", port: 8080, protocol: "http" },
     ],
+  },
+}
+```
+
+Sidecar file references:
+
+* Any inline string accepted in `program.entrypoint`, `program.args`, or `program.env` may be
+  written as `{ file: "./relative/or/absolute/path" }` instead.
+* Relative `file` paths are resolved relative to the manifest file for `file://`-backed manifests.
+* The compiler inlines file contents before validation and digesting, so changing a sidecar file
+  changes the manifest digest.
+* VM cloud-init strings use the same form:
+
+```json5
+program: {
+  vm: {
+    image: "/tmp/base.qcow2",
+    cpus: 2,
+    memory_mib: 1024,
+    cloud_init: {
+      user_data: { file: "./user-data.yaml" },
+      vendor_data: { file: "./vendor-data.yaml" },
+    },
   },
 }
 ```

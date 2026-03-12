@@ -20,9 +20,12 @@ pub use framework::{
     FrameworkBindingShape, FrameworkCapabilitySpec, framework_capabilities, framework_capability,
 };
 pub use interpolation::{
-    EachPath, InterpolatedPart, InterpolatedString, InterpolationSource, ProgramArgGroup,
-    ProgramArgItem, ProgramArgList, ProgramEntrypoint, ProgramEnvValue, RepeatedProgramArg,
-    RepeatedProgramArgv, RepeatedProgramEnv, WhenPath,
+    EachPath, FileRefSpec, InlineStringSpec, InterpolatedPart, InterpolatedString,
+    InterpolationSource, ProgramArgGroup, ProgramArgItem, ProgramArgList, ProgramEntrypoint,
+    ProgramEnvValue, RawProgramArgGroup, RawProgramArgItem, RawProgramArgList,
+    RawProgramEntrypoint, RawProgramEnvGroup, RawProgramEnvValue, RawRepeatedProgramArg,
+    RawRepeatedProgramArgv, RawRepeatedProgramEnv, RepeatedProgramArg, RepeatedProgramArgv,
+    RepeatedProgramEnv, WhenPath,
 };
 pub use manifest::{ExperimentalFeature, Manifest, RawManifest};
 pub use names::{
@@ -35,8 +38,10 @@ pub use schema::{
     Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityDecl, CapabilityKind,
     CapabilityTransport, ComponentDecl, ComponentRef, ConfigSchema, Endpoint, EnvironmentDecl,
     ExportTarget, LocalComponentRef, ManifestBinding, MountSource, Network, NetworkProtocol,
-    Program, ProgramCommon, ProgramImage, ProgramMount, ProgramPath, ProvideDecl, RawBinding,
-    RawExportTarget, ResourceDecl, SlotDecl,
+    Program, ProgramCommon, ProgramImage, ProgramMount, ProgramNetworkRef, ProgramPath,
+    ProgramVmField, ProvideDecl, RawBinding, RawExportTarget, RawProgram, RawProgramCommon,
+    RawProgramImage, RawProgramPath, RawProgramVmField, RawVmCloudInit, RawVmProgram, ResourceDecl,
+    SlotDecl, VmCloudInit, VmEgress, VmNetwork, VmProgram, VmScalarU32,
 };
 pub use slot_query::{
     SlotQuery, SlotQueryError, SlotQueryValidation, SlotTarget, parse_slot_query,

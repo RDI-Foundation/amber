@@ -1,0 +1,41 @@
+{
+  // Same API shape as v1, with different guest bootstrap data so `/version` and the boot-time
+  // ephemeral value change in v2.
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      base_image: { type: "string" },
+    },
+    required: ["base_image"],
+    additionalProperties: false,
+  },
+  slots: {
+    state: { kind: "storage" },
+  },
+  program: {
+    vm: {
+      image: "${config.base_image}",
+      cpus: 4,
+      memory_mib: 1024,
+      mounts: [
+        { path: "/var/lib/app", from: "slots.state" },
+      ],
+      cloud_init: {
+        user_data: { file: "./api.cloud-init.yaml" },
+      },
+      network: {
+        endpoints: [
+          { name: "http", port: 8080, protocol: "http" },
+        ],
+        egress: "none",
+      },
+    },
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" },
+  },
+  exports: {
+    http: "http",
+  },
+}

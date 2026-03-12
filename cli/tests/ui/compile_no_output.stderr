@@ -1,3 +1,4 @@
 Error:   × no outputs requested for `amber compile`
   help: Request at least one output with `--output`, `--dot`, `--docker-
-        compose`, `--metadata`, `--kubernetes`, `--direct`, or `--bundle`.
+        compose`, `--metadata`, `--kubernetes`, `--direct`, `--vm`, or
+        `--bundle`.

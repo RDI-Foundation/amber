@@ -6,7 +6,8 @@ use std::{
 
 use amber_config as rc;
 use amber_manifest::{
-    InterpolatedPart, InterpolationSource, MountSource, ProgramArgItem, framework_capability,
+    InterpolatedPart, InterpolationSource, MountSource, ProgramArgItem, VmScalarU32,
+    framework_capability,
 };
 use amber_scenario::{ComponentId, Scenario};
 use amber_template::{
@@ -61,8 +62,9 @@ pub(crate) enum ProgramImageOrigin {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProgramSupport {
-    ImageOnly { backend_label: &'static str },
-    PathOnly { backend_label: &'static str },
+    Image { backend_label: &'static str },
+    Path { backend_label: &'static str },
+    Vm { backend_label: &'static str },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,6 +98,12 @@ pub(crate) enum ProgramPlan {
         template_spec: TemplateSpec,
         needs_runtime_config: bool,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum VmScalarResolutionU32 {
+    Static(u32),
+    RuntimeConfig(String),
 }
 
 impl ProgramPlan {
@@ -254,6 +262,7 @@ pub(crate) fn build_config_plan(
         root_leaves.iter().map(|leaf| leaf.path.as_str()).collect();
 
     let mut program_plans = HashMap::new();
+    let mut vm_cloud_init_paths_by_component = HashMap::new();
     let mut needs_helper = false;
     let mut needs_runtime_config = false;
 
@@ -310,6 +319,29 @@ pub(crate) fn build_config_plan(
                 }
             }
         }
+        let mut vm_scalar_paths = BTreeSet::new();
+        collect_vm_scalar_runtime_paths(
+            program,
+            &component_label(scenario, *id),
+            template_opt,
+            &mut vm_scalar_paths,
+        )?;
+        if !vm_scalar_paths.is_empty() {
+            needs_runtime_config = true;
+        }
+        let mut vm_cloud_init_paths = BTreeSet::new();
+        collect_vm_cloud_init_runtime_paths(
+            scenario,
+            *id,
+            program,
+            slots,
+            template_opt,
+            &mut vm_cloud_init_paths,
+        )?;
+        if !vm_cloud_init_paths.is_empty() {
+            needs_runtime_config = true;
+        }
+        vm_cloud_init_paths_by_component.insert(*id, vm_cloud_init_paths);
         program_plans.insert(*id, plan);
     }
 
@@ -341,8 +373,12 @@ pub(crate) fn build_config_plan(
                 .get(id)
                 .expect("program plan should exist for program component");
             let mount_specs = mount_specs.get(id);
+            let vm_cloud_init_paths = vm_cloud_init_paths_by_component
+                .get(id)
+                .expect("vm cloud-init path set should exist for program component");
             let needs_config_payload = program_plan.needs_runtime_config()
-                || mount_specs.is_some_and(|specs| mount_specs_need_config(specs));
+                || mount_specs.is_some_and(|specs| mount_specs_need_config(specs))
+                || !vm_cloud_init_paths.is_empty();
             if !needs_config_payload {
                 continue;
             }
@@ -355,8 +391,11 @@ pub(crate) fn build_config_plan(
             let component_template = resolved_templates
                 .get(id)
                 .expect("component template should exist");
-            let used_paths =
-                used_component_paths(program_plan, mount_specs.map(|specs| specs.as_slice()));
+            let used_paths = used_component_paths(
+                program_plan,
+                mount_specs.map(|specs| specs.as_slice()),
+                Some(vm_cloud_init_paths),
+            );
 
             let view = build_runtime_config_view(
                 &component_label(scenario, *id),
@@ -385,6 +424,7 @@ pub(crate) fn build_config_plan(
 fn used_component_paths(
     program_plan: &ProgramPlan,
     mount_specs: Option<&[MountSpec]>,
+    extra_paths: Option<&BTreeSet<String>>,
 ) -> BTreeSet<String> {
     let mut used = BTreeSet::new();
 
@@ -400,7 +440,215 @@ fn used_component_paths(
         }
     }
 
+    if let Some(paths) = extra_paths {
+        used.extend(paths.iter().cloned());
+    }
+
     used
+}
+
+fn collect_vm_cloud_init_runtime_paths(
+    scenario: &Scenario,
+    id: ComponentId,
+    program: &amber_manifest::Program,
+    slots: &BTreeMap<String, SlotValue>,
+    template_opt: Option<&rc::ConfigNode>,
+    out: &mut BTreeSet<String>,
+) -> Result<(), MeshError> {
+    let amber_manifest::Program::Vm(program) = program else {
+        return Ok(());
+    };
+    for (field_name, raw) in [
+        (
+            "program.vm.cloud_init.user_data",
+            program.0.cloud_init.user_data.as_deref(),
+        ),
+        (
+            "program.vm.cloud_init.vendor_data",
+            program.0.cloud_init.vendor_data.as_deref(),
+        ),
+    ] {
+        let Some(raw) = raw else {
+            continue;
+        };
+        let Some(ts) = build_vm_cloud_init_template_string(
+            scenario,
+            id,
+            field_name,
+            Some(raw),
+            RuntimeAddressResolution::Deferred,
+            slots,
+            template_opt,
+        )?
+        else {
+            continue;
+        };
+        for part in ts {
+            if let TemplatePart::Config { config } = part {
+                out.insert(config);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_vm_scalar_runtime_paths(
+    program: &amber_manifest::Program,
+    component: &str,
+    template_opt: Option<&rc::ConfigNode>,
+    out: &mut BTreeSet<String>,
+) -> Result<(), MeshError> {
+    let amber_manifest::Program::Vm(program) = program else {
+        return Ok(());
+    };
+    for (field_name, scalar) in [
+        ("program.vm.cpus", &program.0.cpus),
+        ("program.vm.memory_mib", &program.0.memory_mib),
+    ] {
+        if let VmScalarResolutionU32::RuntimeConfig(path) =
+            resolve_vm_scalar_u32(template_opt, scalar, component, field_name)?
+        {
+            out.insert(path);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn build_vm_cloud_init_template_string(
+    scenario: &Scenario,
+    id: ComponentId,
+    field_name: &str,
+    raw: Option<&str>,
+    runtime_address_resolution: RuntimeAddressResolution,
+    slots: &BTreeMap<String, SlotValue>,
+    template_opt: Option<&rc::ConfigNode>,
+) -> Result<Option<TemplateString>, MeshError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let parsed = raw
+        .parse::<amber_manifest::InterpolatedString>()
+        .map_err(|err| {
+            MeshError::new(format!(
+                "failed to parse {field_name} interpolation in {}: {err}",
+                component_label(scenario, id)
+            ))
+        })?;
+    let mut needs_helper = false;
+    let mut needs_runtime_config = false;
+    resolve_program_template_string(
+        scenario,
+        id,
+        field_name,
+        &parsed,
+        runtime_address_resolution,
+        slots,
+        template_opt,
+        ItemResolution::NotAllowed,
+        &mut needs_helper,
+        &mut needs_runtime_config,
+        false,
+    )
+    .map(Some)
+}
+
+pub(crate) fn resolve_vm_scalar_u32(
+    template_opt: Option<&rc::ConfigNode>,
+    scalar: &VmScalarU32,
+    component: &str,
+    field_name: &str,
+) -> Result<VmScalarResolutionU32, MeshError> {
+    match scalar {
+        VmScalarU32::Literal(value) => {
+            if *value == 0 {
+                return Err(MeshError::new(format!(
+                    "{field_name} in component {component} must be greater than zero"
+                )));
+            }
+            Ok(VmScalarResolutionU32::Static(*value))
+        }
+        VmScalarU32::Interpolated(raw) => {
+            let parsed = raw
+                .parse::<amber_manifest::InterpolatedString>()
+                .map_err(|err| {
+                    MeshError::new(format!(
+                        "failed to parse {field_name} interpolation in component {component}: \
+                         {err}"
+                    ))
+                })?;
+            let [InterpolatedPart::Interpolation { source, query }] = parsed.parts.as_slice()
+            else {
+                return Err(MeshError::new(format!(
+                    "component {component} uses {field_name} with mixed interpolation, but VM \
+                     resource fields must be either a literal number or a single `${{config...}}` \
+                     reference"
+                )));
+            };
+            if *source != InterpolationSource::Config {
+                return Err(MeshError::new(format!(
+                    "component {component} uses non-config interpolation in {field_name}; only \
+                     `${{config...}}` is supported there"
+                )));
+            }
+            resolve_vm_scalar_query(template_opt, query, field_name)
+        }
+        _ => Err(MeshError::new(format!(
+            "component {component} uses an unsupported scalar form in {field_name}"
+        ))),
+    }
+}
+
+fn resolve_vm_scalar_query(
+    template_opt: Option<&rc::ConfigNode>,
+    query: &str,
+    field_name: &str,
+) -> Result<VmScalarResolutionU32, MeshError> {
+    let render_error = || {
+        MeshError::new(format!(
+            "{field_name} must resolve to an unsigned integer config leaf or a single runtime \
+             root config reference"
+        ))
+    };
+
+    if query.is_empty() {
+        return Err(MeshError::new(format!(
+            "{field_name} cannot reference the entire runtime config object; reference an integer \
+             leaf like `${{config.resources.cpus}}`"
+        )));
+    }
+
+    let Some(template) = template_opt else {
+        validate_config_query_syntax(query).map_err(MeshError::new)?;
+        return Ok(VmScalarResolutionU32::RuntimeConfig(query.to_string()));
+    };
+
+    match resolve_config_query_node(template, query).map_err(MeshError::new)? {
+        QueryResolution::RuntimePath(path) => Ok(VmScalarResolutionU32::RuntimeConfig(path)),
+        QueryResolution::Node(node) if !node.contains_runtime() => {
+            let value = node
+                .evaluate_static()
+                .map_err(|err| MeshError::new(err.to_string()))?;
+            let Some(value) = value.as_u64() else {
+                return Err(render_error());
+            };
+            if value == 0 || value > u32::MAX as u64 {
+                return Err(MeshError::new(format!(
+                    "{field_name} must be an unsigned integer greater than zero"
+                )));
+            }
+            Ok(VmScalarResolutionU32::Static(value as u32))
+        }
+        QueryResolution::Node(rc::ConfigNode::ConfigRef(path)) => {
+            if path.is_empty() {
+                return Err(MeshError::new(format!(
+                    "{field_name} cannot reference the entire runtime config object; reference an \
+                     integer leaf like `${{config.resources.cpus}}`"
+                )));
+            }
+            Ok(VmScalarResolutionU32::RuntimeConfig(path.clone()))
+        }
+        QueryResolution::Node(_) => Err(render_error()),
+    }
 }
 
 fn encode_json_b64(value: &(impl Serialize + ?Sized)) -> Result<String, serde_json::Error> {
@@ -420,9 +668,11 @@ pub(crate) fn build_component_runtime_plan<'a>(
     mount_specs: Option<&'a [MountSpec]>,
     runtime_view: Option<&'a RuntimeConfigView>,
     extra_helper_requirement: bool,
+    extra_runtime_config_requirement: bool,
 ) -> Result<ComponentRuntimePlan<'a>, MeshError> {
-    let needs_config_payload =
-        program_plan.needs_runtime_config() || mount_specs.is_some_and(mount_specs_need_config);
+    let needs_config_payload = program_plan.needs_runtime_config()
+        || mount_specs.is_some_and(mount_specs_need_config)
+        || extra_runtime_config_requirement;
     let needs_helper =
         program_plan.is_helper() || mount_specs.is_some() || extra_helper_requirement;
 
@@ -673,10 +923,46 @@ fn program_used_config_paths(
 ) -> Result<BTreeSet<String>, MeshError> {
     let mut used = BTreeSet::new();
 
-    if let Some(executable) = program.path_ref().or_else(|| program.image_ref())
-        && let Ok(parsed) = executable.parse::<amber_manifest::InterpolatedString>()
-    {
-        collect_program_config_paths(&parsed.parts, &mut used);
+    match program {
+        amber_manifest::Program::Image(program) => {
+            if let Ok(parsed) = program.image.parse::<amber_manifest::InterpolatedString>() {
+                collect_program_config_paths(&parsed.parts, &mut used);
+            }
+        }
+        amber_manifest::Program::Path(program) => {
+            if let Ok(parsed) = program.path.parse::<amber_manifest::InterpolatedString>() {
+                collect_program_config_paths(&parsed.parts, &mut used);
+            }
+        }
+        amber_manifest::Program::Vm(program) => {
+            if let Ok(parsed) = program
+                .0
+                .image
+                .parse::<amber_manifest::InterpolatedString>()
+            {
+                collect_program_config_paths(&parsed.parts, &mut used);
+            }
+            for scalar in [&program.0.cpus, &program.0.memory_mib] {
+                let amber_manifest::VmScalarU32::Interpolated(raw) = scalar else {
+                    continue;
+                };
+                if let Ok(parsed) = raw.parse::<amber_manifest::InterpolatedString>() {
+                    collect_program_config_paths(&parsed.parts, &mut used);
+                }
+            }
+            for value in [
+                program.0.cloud_init.user_data.as_deref(),
+                program.0.cloud_init.vendor_data.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Ok(parsed) = value.parse::<amber_manifest::InterpolatedString>() {
+                    collect_program_config_paths(&parsed.parts, &mut used);
+                }
+            }
+        }
+        _ => {}
     }
     for arg in &program.command().0 {
         match arg {
@@ -1818,12 +2104,22 @@ fn build_program_plan(
     let mut needs_runtime_config_for_program_templates = false;
     let (source, program_env) = match program {
         amber_manifest::Program::Image(program) => {
-            if let ProgramSupport::PathOnly { backend_label } = program_support {
-                return Err(MeshError::new(format!(
-                    "component {} uses `program.image`, but {backend_label} only supports \
-                     `program.path`",
-                    component_label(scenario, id)
-                )));
+            match program_support {
+                ProgramSupport::Path { backend_label } => {
+                    return Err(MeshError::new(format!(
+                        "component {} uses `program.image`, but {backend_label} only supports \
+                         `program.path`",
+                        component_label(scenario, id)
+                    )));
+                }
+                ProgramSupport::Vm { backend_label } => {
+                    return Err(MeshError::new(format!(
+                        "component {} uses `program.image`, but {backend_label} only supports \
+                         `program.vm`",
+                        component_label(scenario, id)
+                    )));
+                }
+                ProgramSupport::Image { .. } => {}
             }
             let mut image_parts: Vec<ProgramImagePart> = Vec::new();
             let image = program
@@ -1925,12 +2221,22 @@ fn build_program_plan(
             )
         }
         amber_manifest::Program::Path(program) => {
-            if let ProgramSupport::ImageOnly { backend_label } = program_support {
-                return Err(MeshError::new(format!(
-                    "component {} uses `program.path`, but {backend_label} only supports \
-                     `program.image`; use `amber compile --direct`",
-                    component_label(scenario, id)
-                )));
+            match program_support {
+                ProgramSupport::Image { backend_label } => {
+                    return Err(MeshError::new(format!(
+                        "component {} uses `program.path`, but {backend_label} only supports \
+                         `program.image`; use `amber compile --direct`",
+                        component_label(scenario, id)
+                    )));
+                }
+                ProgramSupport::Vm { backend_label } => {
+                    return Err(MeshError::new(format!(
+                        "component {} uses `program.path`, but {backend_label} only supports \
+                         `program.vm`",
+                        component_label(scenario, id)
+                    )));
+                }
+                ProgramSupport::Path { .. } => {}
             }
             let path = program
                 .path
@@ -1979,6 +2285,96 @@ fn build_program_plan(
             }
 
             (ProgramSourcePlan::Path, &program.common.env)
+        }
+        amber_manifest::Program::Vm(program) => {
+            let ProgramSupport::Vm { .. } = program_support else {
+                return Err(MeshError::new(format!(
+                    "component {} uses `program.vm`, but this backend does not support VM programs",
+                    component_label(scenario, id)
+                )));
+            };
+            let mut image_parts: Vec<ProgramImagePart> = Vec::new();
+            let image = program
+                .0
+                .image
+                .parse::<amber_manifest::InterpolatedString>()
+                .map_err(|err| {
+                    MeshError::new(format!(
+                        "failed to parse program.vm.image interpolation in {component}: {err}",
+                    ))
+                })?;
+            let image_origin = match image.parts.as_slice() {
+                [
+                    InterpolatedPart::Interpolation {
+                        source: InterpolationSource::Config,
+                        query,
+                    },
+                ] => ProgramImageOrigin::ComponentConfigPath(query.clone()),
+                _ => ProgramImageOrigin::ProgramImage,
+            };
+            for part in &image.parts {
+                match part {
+                    InterpolatedPart::Literal(lit) => {
+                        push_image_literal(&mut image_parts, lit.clone())
+                    }
+                    InterpolatedPart::Interpolation { source, query } => {
+                        if let Some(value) = resolve_slot_interpolation(
+                            scenario,
+                            id,
+                            "program.vm.image",
+                            source,
+                            query,
+                            slots,
+                        )? {
+                            push_image_literal(&mut image_parts, value);
+                            continue;
+                        }
+                        match resolve_config_query_for_program_image(template_opt, query)? {
+                            ImageConfigResolution::Static(value) => {
+                                push_image_literal(&mut image_parts, value);
+                            }
+                            ImageConfigResolution::RuntimeTemplate(parts) => {
+                                extend_image_parts(&mut image_parts, parts);
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(MeshError::new(format!(
+                            "unsupported interpolation part in {component} program.vm.image",
+                        )));
+                    }
+                }
+            }
+            if image_parts.is_empty() {
+                return Err(MeshError::new(format!(
+                    "internal error: produced empty image template for {component} \
+                     program.vm.image",
+                )));
+            }
+            let image = if image_parts
+                .iter()
+                .any(|part| matches!(part, ProgramImagePart::RootConfigPath(_)))
+            {
+                ProgramImagePlan::RuntimeTemplate(image_parts)
+            } else {
+                let mut rendered = String::new();
+                for part in image_parts {
+                    let ProgramImagePart::Literal(lit) = part else {
+                        unreachable!("runtime root config path was handled above");
+                    };
+                    rendered.push_str(&lit);
+                }
+                ProgramImagePlan::Static(rendered)
+            };
+
+            return Ok(ProgramPlan::Resolved {
+                source: ProgramSourcePlan::Image {
+                    image,
+                    image_origin,
+                },
+                entrypoint: Vec::new(),
+                env: BTreeMap::new(),
+            });
         }
         _ => {
             return Err(MeshError::new(format!(

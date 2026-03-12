@@ -1,0 +1,53 @@
+{
+  // The root scenario owns the base image input and the durable storage resource. That is why the
+  // storage survives both reruns and the v1 -> v2 graph change.
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      base_image: { type: "string" },
+    },
+    required: ["base_image"],
+    additionalProperties: false,
+  },
+  resources: {
+    app_state: {
+      kind: "storage",
+      params: {
+        size: "1Gi",
+      },
+    },
+  },
+  components: {
+    api: {
+      manifest: "./api.json5",
+      config: {
+        base_image: "${config.base_image}",
+      },
+    },
+    bound: {
+      // `bound` gets a real Amber connection to `api`.
+      manifest: "./probes/bound.json5",
+      config: {
+        base_image: "${config.base_image}",
+      },
+    },
+    unbound: {
+      // `unbound` gets no Amber connection at all; it only guesses what the guest-side route might
+      // look like.
+      manifest: "./probes/unbound.json5",
+      config: {
+        base_image: "${config.base_image}",
+      },
+    },
+  },
+  bindings: [
+    { to: "#api.state", from: "resources.app_state" },
+    { to: "#bound.api", from: "#api.http" },
+  ],
+  exports: {
+    api: "#api.http",
+    bound: "#bound.http",
+    unbound: "#unbound.http",
+  },
+}

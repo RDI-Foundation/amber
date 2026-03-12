@@ -10,7 +10,7 @@ use amber_config as rc;
 use amber_manifest::{
     BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, CapabilityKind, ChildName,
     ExportName, ExportTarget, InterpolatedPart, InterpolatedString, InterpolationSource, Manifest,
-    ManifestDigest, MountSource, framework_capability, span_for_json_pointer,
+    ManifestDigest, MountSource, Program, framework_capability, span_for_json_pointer,
 };
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, ProvideRef,
@@ -469,11 +469,24 @@ fn mount_source_site(
     let src = NamedSource::new(display_url(&prov.resolved_url), Arc::clone(&stored.source))
         .with_language("json5");
     let root = (0usize, stored.source.len()).into();
-    let pointer = format!("/program/mounts/{mount_index}/from");
-    let whole_mount_pointer = format!("/program/mounts/{mount_index}");
-    let span = span_for_json_pointer(stored.source.as_ref(), root, &pointer)
-        .or_else(|| span_for_json_pointer(stored.source.as_ref(), root, &whole_mount_pointer))
+    let pointers = [
+        format!("/program/mounts/{mount_index}/from"),
+        format!("/program/vm/mounts/{mount_index}/from"),
+    ];
+    let whole_mount_pointers = [
+        format!("/program/mounts/{mount_index}"),
+        format!("/program/vm/mounts/{mount_index}"),
+    ];
+    let span = pointers
+        .iter()
+        .find_map(|pointer| span_for_json_pointer(stored.source.as_ref(), root, pointer))
+        .or_else(|| {
+            whole_mount_pointers
+                .iter()
+                .find_map(|pointer| span_for_json_pointer(stored.source.as_ref(), root, pointer))
+        })
         .or_else(|| span_for_json_pointer(stored.source.as_ref(), root, "/program/mounts"))
+        .or_else(|| span_for_json_pointer(stored.source.as_ref(), root, "/program/vm/mounts"))
         .or_else(|| stored.spans.program.as_ref().map(|program| program.whole))
         .unwrap_or((0usize, 0usize).into());
     Some((src, span))
@@ -1263,94 +1276,144 @@ fn validate_config_tree(
             }
         };
 
-        if let Some(executable) = program.image_ref() {
-            if let Ok(parsed) = executable.parse::<InterpolatedString>() {
-                for part in &parsed.parts {
-                    let InterpolatedPart::Interpolation { source, query } = part else {
-                        continue;
-                    };
-                    if *source == InterpolationSource::Config {
-                        validate_config_ref("program.image".to_string(), query);
-                    }
-                }
-            }
-        } else if let Some(executable) = program.path_ref()
-            && let Ok(parsed) = executable.parse::<InterpolatedString>()
-        {
+        fn visit_program_string_config_refs(raw: &str, mut visit: impl FnMut(&str)) {
+            let Ok(parsed) = raw.parse::<InterpolatedString>() else {
+                return;
+            };
             for part in &parsed.parts {
                 let InterpolatedPart::Interpolation { source, query } = part else {
                     continue;
                 };
                 if *source == InterpolationSource::Config {
-                    validate_config_ref("program.path".to_string(), query);
+                    visit(query);
                 }
             }
         }
 
-        // args/env are structured (InterpolatedString), so we never need to re-parse `${...}`.
-        let command_location = if program.image_ref().is_some() {
-            "program.entrypoint"
-        } else {
-            "program.args"
-        };
-        for (arg_idx, item) in program.command().0.iter().enumerate() {
-            if let Some(when) = item.when()
-                && when.source() == InterpolationSource::Config
-            {
-                validate_config_ref(format!("{command_location}[{arg_idx}].when"), when.query());
-            }
-            item.visit_values(|arg| {
-                for part in &arg.parts {
-                    let InterpolatedPart::Interpolation { source, query } = part else {
-                        continue;
-                    };
-                    if *source == InterpolationSource::Config {
-                        validate_config_ref(format!("{command_location}[{arg_idx}]"), query);
-                    }
-                }
-            });
-            let repeated_argv = match item {
-                amber_manifest::ProgramArgItem::Group(group) => Some(&group.argv.0),
-                amber_manifest::ProgramArgItem::RepeatedArgv(repeated) => Some(&repeated.argv.0),
-                amber_manifest::ProgramArgItem::Arg(_)
-                | amber_manifest::ProgramArgItem::RepeatedArg(_) => None,
+        fn visit_vm_scalar_config_refs(
+            scalar: &amber_manifest::VmScalarU32,
+            mut visit: impl FnMut(&str),
+        ) {
+            let amber_manifest::VmScalarU32::Interpolated(raw) = scalar else {
+                return;
             };
-            if let Some(group) = repeated_argv {
-                for (group_idx, arg) in group.iter().enumerate() {
+            visit_program_string_config_refs(raw, |query| visit(query));
+        }
+
+        fn visit_program_command_config_refs(
+            command: &[amber_manifest::ProgramArgItem],
+            mut visit: impl FnMut(String, &str),
+        ) {
+            for (arg_idx, item) in command.iter().enumerate() {
+                if let Some(when) = item.when()
+                    && when.source() == InterpolationSource::Config
+                {
+                    visit(format!("[{arg_idx}].when"), when.query());
+                }
+                item.visit_values(|arg| {
                     for part in &arg.parts {
                         let InterpolatedPart::Interpolation { source, query } = part else {
                             continue;
                         };
-                        if source == &InterpolationSource::Config {
-                            validate_config_ref(
-                                format!("{command_location}[{arg_idx}].argv[{group_idx}]"),
-                                query,
-                            );
+                        if *source == InterpolationSource::Config {
+                            visit(format!("[{arg_idx}]"), query);
+                        }
+                    }
+                });
+                let repeated_argv = match item {
+                    amber_manifest::ProgramArgItem::Group(group) => Some(&group.argv.0),
+                    amber_manifest::ProgramArgItem::RepeatedArgv(repeated) => {
+                        Some(&repeated.argv.0)
+                    }
+                    amber_manifest::ProgramArgItem::Arg(_)
+                    | amber_manifest::ProgramArgItem::RepeatedArg(_) => None,
+                };
+                if let Some(group) = repeated_argv {
+                    for (group_idx, arg) in group.iter().enumerate() {
+                        for part in &arg.parts {
+                            let InterpolatedPart::Interpolation { source, query } = part else {
+                                continue;
+                            };
+                            if *source == InterpolationSource::Config {
+                                visit(format!("[{arg_idx}].argv[{group_idx}]"), query);
+                            }
                         }
                     }
                 }
             }
         }
 
-        for (k, v) in program.env() {
-            if let Some(when) = v.when()
-                && when.source() == InterpolationSource::Config
-            {
-                validate_config_ref(format!("program.env.{k}.when"), when.query());
-            }
-            let location = if v.group().is_some() {
-                format!("program.env.{k}.value")
-            } else {
-                format!("program.env.{k}")
-            };
-            for part in &v.value().parts {
-                let InterpolatedPart::Interpolation { source, query } = part else {
-                    continue;
+        fn visit_program_env_config_refs(
+            env: &BTreeMap<String, amber_manifest::ProgramEnvValue>,
+            mut visit: impl FnMut(String, &str),
+        ) {
+            for (key, value) in env {
+                if let Some(when) = value.when()
+                    && when.source() == InterpolationSource::Config
+                {
+                    visit(format!("{key}.when"), when.query());
+                }
+                let location_suffix = if value.group().is_some() {
+                    format!("{key}.value")
+                } else {
+                    key.to_string()
                 };
-                if *source == InterpolationSource::Config {
-                    validate_config_ref(location.clone(), query);
+                for part in &value.value().parts {
+                    let InterpolatedPart::Interpolation { source, query } = part else {
+                        continue;
+                    };
+                    if *source == InterpolationSource::Config {
+                        visit(location_suffix.clone(), query);
+                    }
                 }
             }
+        }
+
+        match program {
+            Program::Image(program) => {
+                visit_program_string_config_refs(&program.image, |query| {
+                    validate_config_ref("program.image".to_string(), query);
+                });
+                visit_program_command_config_refs(&program.entrypoint.0, |suffix, query| {
+                    validate_config_ref(format!("program.entrypoint{suffix}"), query);
+                });
+                visit_program_env_config_refs(&program.common.env, |suffix, query| {
+                    validate_config_ref(format!("program.env.{suffix}"), query);
+                });
+            }
+            Program::Path(program) => {
+                visit_program_string_config_refs(&program.path, |query| {
+                    validate_config_ref("program.path".to_string(), query);
+                });
+                visit_program_command_config_refs(&program.args.0, |suffix, query| {
+                    validate_config_ref(format!("program.args{suffix}"), query);
+                });
+                visit_program_env_config_refs(&program.common.env, |suffix, query| {
+                    validate_config_ref(format!("program.env.{suffix}"), query);
+                });
+            }
+            Program::Vm(program) => {
+                visit_program_string_config_refs(&program.0.image, |query| {
+                    validate_config_ref("program.vm.image".to_string(), query);
+                });
+                visit_vm_scalar_config_refs(&program.0.cpus, |query| {
+                    validate_config_ref("program.vm.cpus".to_string(), query);
+                });
+                visit_vm_scalar_config_refs(&program.0.memory_mib, |query| {
+                    validate_config_ref("program.vm.memory_mib".to_string(), query);
+                });
+                if let Some(raw) = program.0.cloud_init.user_data.as_deref() {
+                    visit_program_string_config_refs(raw, |query| {
+                        validate_config_ref("program.vm.cloud_init.user_data".to_string(), query);
+                    });
+                }
+                if let Some(raw) = program.0.cloud_init.vendor_data.as_deref() {
+                    visit_program_string_config_refs(raw, |query| {
+                        validate_config_ref("program.vm.cloud_init.vendor_data".to_string(), query);
+                    });
+                }
+            }
+            _ => (),
         }
     }
 

@@ -1,9 +1,10 @@
 #![allow(clippy::result_large_err)]
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use miette::{Diagnostic, LabeledSpan, NamedSource, SourceCode, SourceSpan};
 use thiserror::Error;
+use url::Url;
 
 use crate::{Error as ManifestError, Manifest, ManifestSpans, RawManifest};
 
@@ -12,6 +13,7 @@ pub struct ParsedManifest {
     pub manifest: Manifest,
     pub source: Arc<str>,
     pub spans: Arc<ManifestSpans>,
+    pub bundle_source: Option<Arc<str>>,
 }
 
 #[derive(Debug, Error)]
@@ -96,16 +98,40 @@ impl ParsedManifest {
 
         let spans = Arc::new(ManifestSpans::parse(&source));
 
-        let manifest = raw
-            .validate()
+        let origin = manifest_origin(name.as_ref());
+        let (manifest, used_file_refs) = raw
+            .validate_with_origin(origin.as_deref())
             .map_err(|e| ManifestDocError::new(name.as_ref(), Arc::clone(&source), &spans, e))?;
+        let bundle_source = used_file_refs.then(|| normalized_manifest_source(&manifest));
 
         Ok(Self {
             manifest,
             source,
             spans,
+            bundle_source,
         })
     }
+}
+
+fn manifest_origin(name: &str) -> Option<PathBuf> {
+    if let Ok(url) = Url::parse(name)
+        && url.scheme() == "file"
+    {
+        let path = url.to_file_path().ok()?;
+        return path.parent().map(PathBuf::from);
+    }
+
+    let path = PathBuf::from(name);
+    path.is_absolute()
+        .then_some(path)
+        .and_then(|path| path.parent().map(PathBuf::from))
+}
+
+fn normalized_manifest_source(manifest: &Manifest) -> Arc<str> {
+    let mut out =
+        serde_json::to_string_pretty(manifest).expect("manifest serialization should succeed");
+    out.push('\n');
+    out.into()
 }
 
 fn labels_for_manifest_error(
@@ -184,6 +210,15 @@ fn labels_for_manifest_error(
         }
         ManifestError::InvalidMountSource { mount, .. } => {
             labels_for_mount_source(spans, mount, "mount source here")
+        }
+        ManifestError::ProgramFileReference { pointer, .. } => {
+            let root_span: SourceSpan = (0usize, source.len()).into();
+            let span = crate::span_for_json_pointer(source, root_span, pointer)
+                .or_else(|| spans.program.as_ref().map(|program| program.whole));
+            vec![primary(
+                span_or_default(span),
+                Some("file reference here".to_string()),
+            )]
         }
         ManifestError::InvalidMountPath { path, .. } => {
             labels_for_mount_path(spans, path, "invalid mount path")
@@ -761,7 +796,12 @@ fn binding_target_key_for_span(span: &crate::BindingSpans) -> Option<crate::Bind
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use miette::Diagnostic as _;
 
@@ -771,6 +811,23 @@ mod tests {
         let start = label.offset();
         let end = start + label.len();
         source.get(start..end).expect("label span within source")
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "amber-manifest-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn write_file(path: &Path, contents: &str) {
+        fs::write(path, contents).unwrap();
     }
 
     #[test]
@@ -1116,5 +1173,127 @@ mod tests {
             .iter()
             .any(|label| labeled_span_text(source.as_ref(), label).contains("\"self.api\""));
         assert!(has_self_target);
+    }
+
+    #[test]
+    fn parse_named_inlines_relative_program_file_references() {
+        let dir = test_dir("program-file-ref");
+        let manifest_path = dir.join("scenario.json5");
+        write_file(&dir.join("script.py"), "print('from file')\n");
+
+        let source = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "python:3.13-alpine",
+            entrypoint: ["python3", "-c", { file: "./script.py" }],
+          },
+        }
+        "#;
+
+        let parsed =
+            ParsedManifest::parse_named(manifest_path.display().to_string(), Arc::from(source))
+                .expect("manifest should parse");
+
+        let crate::Program::Image(program) = parsed.manifest.program().expect("program") else {
+            panic!("expected image program");
+        };
+        assert_eq!(program.entrypoint.0.len(), 3);
+        assert_eq!(
+            program.entrypoint.0[2].arg().unwrap().to_string(),
+            "print('from file')\n"
+        );
+        assert!(parsed.bundle_source.is_some());
+    }
+
+    #[test]
+    fn parse_named_inlines_relative_vm_cloud_init_file_references() {
+        let dir = test_dir("vm-cloud-init-file-ref");
+        let manifest_path = dir.join("vm.json5");
+        write_file(
+            &dir.join("user-data.yaml"),
+            "#cloud-config\nruncmd:\n  - [echo, hello]\n",
+        );
+
+        let source = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            vm: {
+              image: "/tmp/base.qcow2",
+              cpus: 1,
+              memory_mib: 512,
+              cloud_init: {
+                user_data: { file: "./user-data.yaml" },
+              },
+            },
+          },
+        }
+        "#;
+
+        let parsed =
+            ParsedManifest::parse_named(manifest_path.display().to_string(), Arc::from(source))
+                .expect("manifest should parse");
+
+        let crate::Program::Vm(program) = parsed.manifest.program().expect("program") else {
+            panic!("expected vm program");
+        };
+        assert_eq!(
+            program.0.cloud_init.user_data.as_deref(),
+            Some("#cloud-config\nruncmd:\n  - [echo, hello]\n")
+        );
+    }
+
+    #[test]
+    fn relative_program_file_references_require_file_backed_manifests() {
+        let source = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "busybox:1.36",
+            entrypoint: ["sh", { file: "./script.sh" }],
+          },
+        }
+        "#;
+
+        let err =
+            ParsedManifest::parse_named("https://example.com/scenario.json5", Arc::from(source))
+                .unwrap_err();
+        assert!(matches!(
+            err.kind,
+            crate::Error::ProgramFileReference { .. }
+        ));
+        assert!(
+            err.to_string()
+                .contains("relative file references require a file-backed manifest")
+        );
+    }
+
+    #[test]
+    fn file_reference_contents_affect_manifest_digest() {
+        let dir = test_dir("digest-file-ref");
+        let manifest_path = dir.join("scenario.json5");
+        let script_path = dir.join("script.py");
+        let source = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "python:3.13-alpine",
+            entrypoint: ["python3", "-c", { file: "./script.py" }],
+          },
+        }
+        "#;
+
+        write_file(&script_path, "print('v1')\n");
+        let first =
+            ParsedManifest::parse_named(manifest_path.display().to_string(), Arc::from(source))
+                .expect("manifest should parse");
+
+        write_file(&script_path, "print('v2')\n");
+        let second =
+            ParsedManifest::parse_named(manifest_path.display().to_string(), Arc::from(source))
+                .expect("manifest should parse");
+
+        assert_ne!(first.manifest.digest(), second.manifest.digest());
     }
 }

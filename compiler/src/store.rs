@@ -32,6 +32,7 @@ pub struct StoredSource {
     pub digest: ManifestDigest,
     pub source: Arc<str>,
     pub spans: Arc<ManifestSpans>,
+    pub bundle_source: Option<Arc<str>>,
 }
 
 #[derive(Debug, Default)]
@@ -60,6 +61,7 @@ impl DigestStore {
         let StoredSource {
             source,
             spans,
+            bundle_source: _,
             digest: _,
         } = self.get_source(url)?;
         let name = display_url(url);

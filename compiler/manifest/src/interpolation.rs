@@ -1,8 +1,12 @@
 use std::{fmt, str::FromStr};
 
+use jsonptr::PointerBuf;
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
-    de::{SeqAccess, Visitor, value::SeqAccessDeserializer},
+    de::{
+        MapAccess, SeqAccess, Visitor,
+        value::{MapAccessDeserializer, SeqAccessDeserializer},
+    },
 };
 use serde_json::Value;
 use serde_with::{DeserializeFromStr, SerializeDisplay};
@@ -122,6 +126,59 @@ pub enum InterpolationSource {
     Config,
     Slots,
     Item,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileRefSpec {
+    pub file: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(untagged)]
+pub enum InlineStringSpec {
+    Inline(String),
+    File(FileRefSpec),
+}
+
+impl<'de> Deserialize<'de> for InlineStringSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match Value::deserialize(deserializer)? {
+            Value::String(value) => {
+                value
+                    .parse::<InterpolatedString>()
+                    .map_err(serde::de::Error::custom)?;
+                Ok(Self::Inline(value))
+            }
+            Value::Object(map) => serde_json::from_value::<FileRefSpec>(Value::Object(map))
+                .map(Self::File)
+                .map_err(serde::de::Error::custom),
+            _ => Err(serde::de::Error::custom(
+                "expected a string or a `{ file: ... }` reference",
+            )),
+        }
+    }
+}
+
+impl From<String> for InlineStringSpec {
+    fn from(value: String) -> Self {
+        Self::Inline(value)
+    }
+}
+
+impl From<InterpolatedString> for InlineStringSpec {
+    fn from(value: InterpolatedString) -> Self {
+        Self::Inline(value.to_string())
+    }
+}
+
+impl From<&str> for InlineStringSpec {
+    fn from(value: &str) -> Self {
+        Self::Inline(value.to_string())
+    }
 }
 
 impl fmt::Display for InterpolationSource {
@@ -746,6 +803,481 @@ impl<'de> Deserialize<'de> for ProgramEnvValue {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(untagged)]
+pub enum RawProgramArgList {
+    ShellWords(InlineStringSpec),
+    List(Vec<InlineStringSpec>),
+}
+
+impl<'de> Deserialize<'de> for RawProgramArgList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RawProgramArgListVisitor;
+
+        impl<'de> Visitor<'de> for RawProgramArgListVisitor {
+            type Value = RawProgramArgList;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(
+                    "a shell-style string, a `{ file: ... }` reference, or an array of strings",
+                )
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                parse_program_arg_list(value).map_err(E::custom)?;
+                Ok(RawProgramArgList::ShellWords(InlineStringSpec::Inline(
+                    value.to_string(),
+                )))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(&value)
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                deserialize_inline_string_spec_from_value(Value::deserialize(
+                    MapAccessDeserializer::new(map),
+                )?)
+                .map(RawProgramArgList::ShellWords)
+                .map_err(serde::de::Error::custom)
+            }
+
+            fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                Vec::<InlineStringSpec>::deserialize(SeqAccessDeserializer::new(seq))
+                    .map(RawProgramArgList::List)
+            }
+        }
+
+        deserializer.deserialize_any(RawProgramArgListVisitor)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawProgramArgGroup {
+    pub when: WhenPath,
+    pub argv: RawProgramArgList,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawRepeatedProgramArgv {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<WhenPath>,
+    pub each: EachPath,
+    pub argv: RawProgramArgList,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawRepeatedProgramArg {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<WhenPath>,
+    pub each: EachPath,
+    pub arg: InlineStringSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RawProgramArgItem {
+    Arg(InlineStringSpec),
+    Group(RawProgramArgGroup),
+    RepeatedArgv(RawRepeatedProgramArgv),
+    RepeatedArg(RawRepeatedProgramArg),
+}
+
+impl<'de> Deserialize<'de> for RawProgramArgItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match Value::deserialize(deserializer)? {
+            Value::String(value) => {
+                value
+                    .parse::<InterpolatedString>()
+                    .map_err(serde::de::Error::custom)?;
+                Ok(Self::Arg(InlineStringSpec::Inline(value)))
+            }
+            Value::Object(map) => {
+                let value = Value::Object(map.clone());
+                if map.contains_key("file") {
+                    deserialize_inline_string_spec_from_value(value)
+                        .map(Self::Arg)
+                        .map_err(serde::de::Error::custom)
+                } else if map.contains_key("each") {
+                    if map.contains_key("argv") {
+                        serde_json::from_value::<RawRepeatedProgramArgv>(value)
+                            .map(Self::RepeatedArgv)
+                            .map_err(serde::de::Error::custom)
+                    } else if map.contains_key("arg") {
+                        serde_json::from_value::<RawRepeatedProgramArg>(value)
+                            .map(Self::RepeatedArg)
+                            .map_err(serde::de::Error::custom)
+                    } else {
+                        Err(serde::de::Error::custom(
+                            "expected an object with `each` and one of `argv` or `arg`",
+                        ))
+                    }
+                } else {
+                    serde_json::from_value::<RawProgramArgGroup>(value)
+                        .map(Self::Group)
+                        .map_err(serde::de::Error::custom)
+                }
+            }
+            _ => Err(serde::de::Error::custom(
+                "expected a string, a `{ file: ... }` reference, or an object with `when`/`argv` \
+                 or `each`",
+            )),
+        }
+    }
+}
+
+impl Serialize for RawProgramArgItem {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Arg(arg) => arg.serialize(serializer),
+            Self::Group(group) => group.serialize(serializer),
+            Self::RepeatedArgv(repeated) => repeated.serialize(serializer),
+            Self::RepeatedArg(repeated) => repeated.serialize(serializer),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(untagged)]
+pub enum RawProgramEntrypoint {
+    ShellWords(InlineStringSpec),
+    Items(Vec<RawProgramArgItem>),
+}
+
+impl Default for RawProgramEntrypoint {
+    fn default() -> Self {
+        Self::Items(Vec::new())
+    }
+}
+
+impl<'de> Deserialize<'de> for RawProgramEntrypoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RawProgramEntrypointVisitor;
+
+        impl<'de> Visitor<'de> for RawProgramEntrypointVisitor {
+            type Value = RawProgramEntrypoint;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(
+                    "a shell-style string, a `{ file: ... }` reference, or an array of arguments",
+                )
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                parse_program_arg_list(value).map_err(E::custom)?;
+                Ok(RawProgramEntrypoint::ShellWords(InlineStringSpec::Inline(
+                    value.to_string(),
+                )))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(&value)
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                deserialize_inline_string_spec_from_value(Value::deserialize(
+                    MapAccessDeserializer::new(map),
+                )?)
+                .map(RawProgramEntrypoint::ShellWords)
+                .map_err(serde::de::Error::custom)
+            }
+
+            fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                Vec::<RawProgramArgItem>::deserialize(SeqAccessDeserializer::new(seq))
+                    .map(RawProgramEntrypoint::Items)
+            }
+        }
+
+        deserializer.deserialize_any(RawProgramEntrypointVisitor)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawProgramEnvGroup {
+    pub when: WhenPath,
+    pub value: InlineStringSpec,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawRepeatedProgramEnv {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<WhenPath>,
+    pub each: EachPath,
+    pub value: InlineStringSpec,
+    pub join: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RawProgramEnvValue {
+    Value(InlineStringSpec),
+    Group(RawProgramEnvGroup),
+    Repeated(RawRepeatedProgramEnv),
+}
+
+impl<'de> Deserialize<'de> for RawProgramEnvValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match Value::deserialize(deserializer)? {
+            Value::String(value) => {
+                value
+                    .parse::<InterpolatedString>()
+                    .map_err(serde::de::Error::custom)?;
+                Ok(Self::Value(InlineStringSpec::Inline(value)))
+            }
+            Value::Object(map) => {
+                let value = Value::Object(map.clone());
+                if map.contains_key("file") {
+                    deserialize_inline_string_spec_from_value(value)
+                        .map(Self::Value)
+                        .map_err(serde::de::Error::custom)
+                } else if map.contains_key("each") {
+                    serde_json::from_value::<RawRepeatedProgramEnv>(value)
+                        .map(Self::Repeated)
+                        .map_err(serde::de::Error::custom)
+                } else {
+                    serde_json::from_value::<RawProgramEnvGroup>(value)
+                        .map(Self::Group)
+                        .map_err(serde::de::Error::custom)
+                }
+            }
+            _ => Err(serde::de::Error::custom(
+                "expected an interpolation string, a `{ file: ... }` reference, or an object with \
+                 `when`/`value` or `each`",
+            )),
+        }
+    }
+}
+
+impl Serialize for RawProgramEnvValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Value(value) => value.serialize(serializer),
+            Self::Group(group) => group.serialize(serializer),
+            Self::Repeated(repeated) => repeated.serialize(serializer),
+        }
+    }
+}
+
+impl RawProgramArgList {
+    pub fn resolve(
+        self,
+        pointer: &str,
+        resolve_string: &mut impl FnMut(InlineStringSpec, &str) -> Result<String, Error>,
+    ) -> Result<ProgramArgList, Error> {
+        match self {
+            Self::ShellWords(spec) => {
+                let raw = resolve_string(spec, pointer)?;
+                parse_program_arg_list(&raw).map(Self::resolved_args_to_list)
+            }
+            Self::List(values) => values
+                .into_iter()
+                .enumerate()
+                .map(|(idx, value)| {
+                    let raw = resolve_string(value, &pointer_with_index(pointer, idx))?;
+                    raw.parse::<InterpolatedString>()
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(ProgramArgList),
+        }
+    }
+
+    fn resolved_args_to_list(args: Vec<InterpolatedString>) -> ProgramArgList {
+        ProgramArgList(args)
+    }
+}
+
+impl From<ProgramArgList> for RawProgramArgList {
+    fn from(value: ProgramArgList) -> Self {
+        Self::List(value.0.into_iter().map(InlineStringSpec::from).collect())
+    }
+}
+
+impl RawProgramArgItem {
+    pub fn resolve(
+        self,
+        pointer: &str,
+        resolve_string: &mut impl FnMut(InlineStringSpec, &str) -> Result<String, Error>,
+    ) -> Result<ProgramArgItem, Error> {
+        match self {
+            Self::Arg(value) => {
+                let raw = resolve_string(value, pointer)?;
+                raw.parse::<InterpolatedString>().map(ProgramArgItem::Arg)
+            }
+            Self::Group(group) => Ok(ProgramArgItem::Group(ProgramArgGroup {
+                when: group.when,
+                argv: group
+                    .argv
+                    .resolve(&pointer_with_segment(pointer, "argv"), resolve_string)?,
+            })),
+            Self::RepeatedArgv(repeated) => Ok(ProgramArgItem::RepeatedArgv(RepeatedProgramArgv {
+                when: repeated.when,
+                each: repeated.each,
+                argv: repeated
+                    .argv
+                    .resolve(&pointer_with_segment(pointer, "argv"), resolve_string)?,
+            })),
+            Self::RepeatedArg(repeated) => {
+                let raw = resolve_string(repeated.arg, &pointer_with_segment(pointer, "arg"))?;
+                Ok(ProgramArgItem::RepeatedArg(RepeatedProgramArg {
+                    when: repeated.when,
+                    each: repeated.each,
+                    arg: raw.parse::<InterpolatedString>()?,
+                    join: repeated.join,
+                }))
+            }
+        }
+    }
+}
+
+impl From<ProgramArgItem> for RawProgramArgItem {
+    fn from(value: ProgramArgItem) -> Self {
+        match value {
+            ProgramArgItem::Arg(arg) => Self::Arg(arg.into()),
+            ProgramArgItem::Group(group) => Self::Group(RawProgramArgGroup {
+                when: group.when,
+                argv: group.argv.into(),
+            }),
+            ProgramArgItem::RepeatedArgv(repeated) => Self::RepeatedArgv(RawRepeatedProgramArgv {
+                when: repeated.when,
+                each: repeated.each,
+                argv: repeated.argv.into(),
+            }),
+            ProgramArgItem::RepeatedArg(repeated) => Self::RepeatedArg(RawRepeatedProgramArg {
+                when: repeated.when,
+                each: repeated.each,
+                arg: repeated.arg.into(),
+                join: repeated.join,
+            }),
+        }
+    }
+}
+
+impl RawProgramEntrypoint {
+    pub fn resolve(
+        self,
+        pointer: &str,
+        resolve_string: &mut impl FnMut(InlineStringSpec, &str) -> Result<String, Error>,
+    ) -> Result<ProgramEntrypoint, Error> {
+        match self {
+            Self::ShellWords(spec) => {
+                let raw = resolve_string(spec, pointer)?;
+                parse_program_arg_list(&raw).map(|args| {
+                    ProgramEntrypoint(args.into_iter().map(ProgramArgItem::Arg).collect())
+                })
+            }
+            Self::Items(items) => items
+                .into_iter()
+                .enumerate()
+                .map(|(idx, item)| item.resolve(&pointer_with_index(pointer, idx), resolve_string))
+                .collect::<Result<Vec<_>, _>>()
+                .map(ProgramEntrypoint),
+        }
+    }
+}
+
+impl From<ProgramEntrypoint> for RawProgramEntrypoint {
+    fn from(value: ProgramEntrypoint) -> Self {
+        Self::Items(value.0.into_iter().map(RawProgramArgItem::from).collect())
+    }
+}
+
+impl RawProgramEnvValue {
+    pub fn resolve(
+        self,
+        pointer: &str,
+        resolve_string: &mut impl FnMut(InlineStringSpec, &str) -> Result<String, Error>,
+    ) -> Result<ProgramEnvValue, Error> {
+        match self {
+            Self::Value(value) => {
+                let raw = resolve_string(value, pointer)?;
+                raw.parse::<InterpolatedString>()
+                    .map(ProgramEnvValue::Value)
+            }
+            Self::Group(group) => {
+                let raw = resolve_string(group.value, &pointer_with_segment(pointer, "value"))?;
+                Ok(ProgramEnvValue::Group(ProgramEnvGroup {
+                    when: group.when,
+                    value: raw.parse::<InterpolatedString>()?,
+                }))
+            }
+            Self::Repeated(repeated) => {
+                let raw = resolve_string(repeated.value, &pointer_with_segment(pointer, "value"))?;
+                Ok(ProgramEnvValue::Repeated(RepeatedProgramEnv {
+                    when: repeated.when,
+                    each: repeated.each,
+                    value: raw.parse::<InterpolatedString>()?,
+                    join: repeated.join,
+                }))
+            }
+        }
+    }
+}
+
+impl From<ProgramEnvValue> for RawProgramEnvValue {
+    fn from(value: ProgramEnvValue) -> Self {
+        match value {
+            ProgramEnvValue::Value(value) => Self::Value(value.into()),
+            ProgramEnvValue::Group(group) => Self::Group(RawProgramEnvGroup {
+                when: group.when,
+                value: group.value.into(),
+            }),
+            ProgramEnvValue::Repeated(repeated) => Self::Repeated(RawRepeatedProgramEnv {
+                when: repeated.when,
+                each: repeated.each,
+                value: repeated.value.into(),
+                join: repeated.join,
+            }),
+        }
+    }
+}
+
 fn deserialize_program_arg_list<'de, D>(
     deserializer: D,
 ) -> Result<Vec<InterpolatedString>, D::Error>
@@ -792,6 +1324,34 @@ fn parse_program_arg_list(input: &str) -> Result<Vec<InterpolatedString>, Error>
         .into_iter()
         .map(|token| token.parse::<InterpolatedString>())
         .collect()
+}
+
+fn deserialize_inline_string_spec_from_value(value: Value) -> Result<InlineStringSpec, String> {
+    match value {
+        Value::String(value) => Ok(InlineStringSpec::Inline(value)),
+        Value::Object(map) => serde_json::from_value::<FileRefSpec>(Value::Object(map))
+            .map(InlineStringSpec::File)
+            .map_err(|err| err.to_string()),
+        _ => Err("expected a string or a `{ file: ... }` reference".to_string()),
+    }
+}
+
+fn parse_pointer(pointer: &str) -> PointerBuf {
+    if pointer.is_empty() {
+        PointerBuf::new()
+    } else {
+        PointerBuf::parse(pointer.to_string()).expect("pointer must be valid")
+    }
+}
+
+fn pointer_with_segment(pointer: &str, segment: impl AsRef<str>) -> String {
+    let mut pointer = parse_pointer(pointer);
+    pointer.push_back(segment.as_ref());
+    pointer.to_string()
+}
+
+fn pointer_with_index(pointer: &str, index: usize) -> String {
+    pointer_with_segment(pointer, index.to_string())
 }
 
 #[cfg(test)]

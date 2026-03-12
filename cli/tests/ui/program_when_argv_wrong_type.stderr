@@ -2,13 +2,14 @@ Error: manifest::deserialize_error
 
   × check failed
   ╰─▶ json5 deserialize error at program.args[0]: invalid type: integer `123`,
-      expected a shell-style string or an array of strings
+      expected a shell-style string, a `{ file: ... }` reference, or an array
+      of strings
     ╭─[<CARGO_MANIFEST_DIR>/tests/ui/program_when_argv_wrong_type.json5:6:7]
   5 │         args: [
   6 │ ╭─▶       {
   7 │ │           when: "config.profile",
   8 │ │           argv: 123,
   9 │ ├─▶       },
-    · ╰──── expected a shell-style string or an array of strings
+    · ╰──── expected a shell-style string, a `{ file: ... }` reference, or an array of strings
  10 │         ],
     ╰────
