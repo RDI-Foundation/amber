@@ -224,7 +224,9 @@ Examples:
 
 Notes:
   At least one `--slot NAME=ADDR:PORT` or `--export NAME=ADDR:PORT` is required.
-  Docker Compose and direct outputs usually infer router control metadata automatically.
+  Docker Compose outputs auto-detect router control and, for exports, the published router mesh \
+                                port.
+  Direct outputs usually infer router control metadata automatically.
   If you start Docker Compose with `-p <name>` before the stack is running, pass the same \
                                 `--project-name <name>` to `amber proxy`.
   Kubernetes output requires `--mesh-addr` when you use `--slot`, unless you are supplying an \
@@ -244,6 +246,8 @@ const DASHBOARD_AFTER_HELP: &str = concat!(
     "  Docker CLI plus a running Docker daemon.\n\n",
     "Default UI address: http://127.0.0.1:18888"
 );
+
+const COMPOSE_ROUTER_SERVICE_NAME: &str = "amber-router";
 
 #[derive(Parser)]
 #[command(name = "amber")]
@@ -435,7 +439,7 @@ struct ProxyArgs {
     #[arg(long = "mesh-addr", value_name = "HOST:PORT")]
     mesh_addr: Option<String>,
 
-    /// Router mesh address override (defaults to 127.0.0.1:<router mesh port>).
+    /// Router mesh address override (Compose export mode auto-detects the published host port).
     #[arg(long = "router-addr", value_name = "ADDR:PORT")]
     router_addr: Option<std::net::SocketAddr>,
 
@@ -504,6 +508,12 @@ struct ProxyTarget {
     source: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+struct ComposeContainerRef {
+    runtime: &'static str,
+    id: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RunTargetKind {
     Direct,
@@ -519,6 +529,26 @@ enum ControlEndpoint {
     Tcp(String),
     Unix(PathBuf),
     VolumeSocket { volume: String, socket_path: String },
+}
+
+#[derive(Debug, Deserialize)]
+struct ComposeInspectEntry {
+    #[serde(rename = "NetworkSettings")]
+    network_settings: ComposeInspectNetworkSettings,
+}
+
+#[derive(Debug, Deserialize)]
+struct ComposeInspectNetworkSettings {
+    #[serde(rename = "Ports")]
+    ports: BTreeMap<String, Option<Vec<ComposePortBinding>>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ComposePortBinding {
+    #[serde(rename = "HostIp")]
+    host_ip: String,
+    #[serde(rename = "HostPort")]
+    host_port: String,
 }
 
 impl fmt::Display for ControlEndpoint {
@@ -3509,30 +3539,7 @@ async fn proxy(args: ProxyArgs, verbose: u8) -> Result<()> {
         id: router_identity.id.clone(),
         public_key: router_identity.public_key,
     };
-    let router_addr = match args.router_addr {
-        Some(addr) => addr,
-        None => {
-            let router_meta = target.metadata.router.as_ref().ok_or_else(|| {
-                miette::miette!("router metadata missing; re-run `amber compile`")
-            })?;
-            let router_port = match target.kind {
-                ProxyTargetKind::Direct if router_meta.mesh_port == 0 => {
-                    wait_for_direct_runtime_router_port(
-                        &target.source,
-                        DIRECT_RUNTIME_STATE_WAIT_TIMEOUT,
-                    )
-                    .await?
-                }
-                _ => router_meta.mesh_port,
-            };
-            if router_port == 0 {
-                return Err(miette::miette!(
-                    "router mesh port is 0; compile output is missing router metadata"
-                ));
-            }
-            SocketAddr::from(([127, 0, 0, 1], router_port))
-        }
-    };
+    let router_addr = resolve_router_mesh_addr(&args, &target, !export_bindings.is_empty()).await?;
     let proxy_identity = build_proxy_identity("/proxy", &router_identity);
 
     init_tracing(verbose, Some(&proxy_identity))?;
@@ -3582,7 +3589,9 @@ async fn proxy(args: ProxyArgs, verbose: u8) -> Result<()> {
             listen_addr: Some(binding.listen.ip().to_string()),
             protocol,
             http_plugins: Vec::new(),
-            peer_addr: router_addr.to_string(),
+            peer_addr: router_addr
+                .expect("router address should exist when export bindings are present")
+                .to_string(),
             peer_id: router_identity.id.clone(),
             capability: export.to_string(),
         });
@@ -3986,6 +3995,226 @@ fn pick_free_port() -> Result<u16> {
     Ok(listener.local_addr().into_diagnostic()?.port())
 }
 
+async fn resolve_router_mesh_addr(
+    args: &ProxyArgs,
+    target: &ProxyTarget,
+    requires_router_mesh: bool,
+) -> Result<Option<SocketAddr>> {
+    if !requires_router_mesh {
+        return Ok(None);
+    }
+    if let Some(addr) = args.router_addr {
+        return Ok(Some(addr));
+    }
+
+    let router = target
+        .metadata
+        .router
+        .as_ref()
+        .ok_or_else(|| miette::miette!("router metadata missing; re-run `amber compile`"))?;
+    let router_addr = match target.kind {
+        ProxyTargetKind::DockerCompose => {
+            resolve_compose_router_mesh_addr(args, &target.source, router.mesh_port)?
+        }
+        ProxyTargetKind::Direct if router.mesh_port == 0 => SocketAddr::from((
+            [127, 0, 0, 1],
+            wait_for_direct_runtime_router_port(&target.source, DIRECT_RUNTIME_STATE_WAIT_TIMEOUT)
+                .await?,
+        )),
+        _ => {
+            if router.mesh_port == 0 {
+                return Err(miette::miette!(
+                    "router mesh port is 0; compile output is missing router metadata"
+                ));
+            }
+            SocketAddr::from(([127, 0, 0, 1], router.mesh_port))
+        }
+    };
+    Ok(Some(router_addr))
+}
+
+fn resolve_compose_router_mesh_addr(
+    args: &ProxyArgs,
+    compose_file: &Path,
+    router_container_port: u16,
+) -> Result<SocketAddr> {
+    if router_container_port == 0 {
+        return Err(miette::miette!(
+            "router mesh port is 0; compile output is missing router metadata"
+        ));
+    }
+    let compose_project = resolve_compose_project_name(args, compose_file)?.ok_or_else(|| {
+        miette::miette!(
+            "could not determine the Compose project name for {}. Pass `--project-name` or \
+             `--router-addr`.",
+            compose_file.display()
+        )
+    })?;
+    let container = find_running_compose_service_container(
+        compose_file,
+        &compose_project,
+        COMPOSE_ROUTER_SERVICE_NAME,
+    )?;
+    let published_addrs = inspect_compose_published_port_addrs(&container, router_container_port)
+        .wrap_err_with(|| {
+        format!(
+            "failed to resolve the published router mesh port for Compose project `{}`",
+            compose_project
+        )
+    })?;
+    Ok(published_addrs
+        .iter()
+        .copied()
+        .find(|addr| addr.ip().is_loopback())
+        .unwrap_or(published_addrs[0]))
+}
+
+fn find_running_compose_service_container(
+    compose_file: &Path,
+    project_name: &str,
+    service_name: &str,
+) -> Result<ComposeContainerRef> {
+    let mut containers = Vec::new();
+
+    for runtime in ["docker", "podman"] {
+        let mut cmd = ProcessCommand::new(runtime);
+        cmd.arg("ps")
+            .arg("--filter")
+            .arg(format!("label=com.docker.compose.project={project_name}"))
+            .arg("--filter")
+            .arg(format!("label=com.docker.compose.service={service_name}"))
+            .arg("--format")
+            .arg("{{.ID}}");
+        let Ok(output) = cmd.output() else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        for id in String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            containers.push(ComposeContainerRef {
+                runtime,
+                id: id.to_string(),
+            });
+        }
+    }
+
+    match containers.len() {
+        0 => Err(miette::miette!(
+            "failed to find a running `{}` container for Compose project `{}` from {}. Start the \
+             stack first or pass `--project-name`/`--router-addr`.",
+            service_name,
+            project_name,
+            compose_file.display()
+        )),
+        1 => Ok(containers.remove(0)),
+        _ => {
+            let matches = containers
+                .iter()
+                .map(|container| format!("{}:{}", container.runtime, container.id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(miette::miette!(
+                "multiple running `{}` containers matched Compose project `{}` from {}: {}. Pass \
+                 `--router-addr` to disambiguate.",
+                service_name,
+                project_name,
+                compose_file.display(),
+                matches
+            ))
+        }
+    }
+}
+
+fn inspect_compose_published_port_addrs(
+    container: &ComposeContainerRef,
+    container_port: u16,
+) -> Result<Vec<SocketAddr>> {
+    let output = ProcessCommand::new(container.runtime)
+        .arg("inspect")
+        .arg(&container.id)
+        .output()
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to inspect Compose container {} via {}",
+                container.id, container.runtime
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        return Err(miette::miette!(
+            "failed to inspect Compose container {} via {} (status {}{})",
+            container.id,
+            container.runtime,
+            output.status,
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        ));
+    }
+    parse_compose_published_port_addrs(&String::from_utf8_lossy(&output.stdout), container_port)
+}
+
+fn parse_compose_published_port_addrs(raw: &str, container_port: u16) -> Result<Vec<SocketAddr>> {
+    let entries: Vec<ComposeInspectEntry> = serde_json::from_str(raw)
+        .map_err(|err| miette::miette!("invalid Compose container inspect output: {err}"))?;
+    let entry = entries.into_iter().next().ok_or_else(|| {
+        miette::miette!("Compose container inspect output did not include any containers")
+    })?;
+    let port_key = format!("{container_port}/tcp");
+    let bindings = entry
+        .network_settings
+        .ports
+        .get(&port_key)
+        .and_then(|bindings| bindings.as_ref())
+        .ok_or_else(|| miette::miette!("container port {port_key} is not published on the host"))?;
+    let mut addrs = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let host_port = binding.host_port.parse::<u16>().map_err(|err| {
+            miette::miette!(
+                "invalid published host port {} for container port {}: {}",
+                binding.host_port,
+                port_key,
+                err
+            )
+        })?;
+        let host_ip = parse_compose_published_host_ip(&binding.host_ip)?;
+        addrs.push(SocketAddr::new(host_ip, host_port));
+    }
+    if addrs.is_empty() {
+        return Err(miette::miette!(
+            "container port {port_key} is not published on the host"
+        ));
+    }
+    Ok(addrs)
+}
+
+fn parse_compose_published_host_ip(host_ip: &str) -> Result<IpAddr> {
+    let host_ip = host_ip.trim();
+    if host_ip.is_empty() {
+        return Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+    let host_ip = host_ip.parse::<IpAddr>().map_err(|err| {
+        miette::miette!(
+            "invalid published host IP `{}` in Compose inspect output: {}",
+            host_ip,
+            err
+        )
+    })?;
+    if host_ip.is_unspecified() {
+        return Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+    Ok(host_ip)
+}
+
 fn resolve_control_endpoint(args: &ProxyArgs, target: &ProxyTarget) -> Result<ControlEndpoint> {
     if let Some(value) = args.router_control_addr.as_ref() {
         return parse_control_endpoint(value);
@@ -4055,7 +4284,7 @@ fn resolve_compose_project_name(args: &ProxyArgs, compose_file: &Path) -> Result
     }
 
     let env_project = env_var_non_empty(COMPOSE_PROJECT_NAME_ENV).ok();
-    let discovered = discover_running_compose_projects(compose_file);
+    let discovered = discover_running_compose_projects();
     choose_compose_project_name(
         env_project.as_deref(),
         &discovered,
@@ -4089,19 +4318,16 @@ fn choose_compose_project_name(
     Ok(inferred.map(ToOwned::to_owned))
 }
 
-fn discover_running_compose_projects(compose_file: &Path) -> BTreeSet<String> {
+fn discover_running_compose_projects() -> BTreeSet<String> {
     let mut projects = BTreeSet::new();
-    let compose_file = compose_file.display().to_string();
 
     for runtime in ["docker", "podman"] {
         let mut cmd = ProcessCommand::new(runtime);
         cmd.arg("ps")
             .arg("--filter")
             .arg(format!(
-                "label=com.docker.compose.project.config_files={compose_file}"
+                "label=com.docker.compose.service={COMPOSE_ROUTER_SERVICE_NAME}"
             ))
-            .arg("--filter")
-            .arg("label=com.docker.compose.service=amber-router")
             .arg("--format")
             .arg("{{.Label \"com.docker.compose.project\"}}");
         let Ok(output) = cmd.output() else {
@@ -5101,6 +5327,8 @@ fn write_directory_output(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
     use super::*;
 
     struct EnvVarRestore {
@@ -5110,6 +5338,14 @@ mod tests {
 
     impl EnvVarRestore {
         fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(name);
+            unsafe {
+                std::env::set_var(name, value);
+            }
+            Self { name, previous }
+        }
+
+        fn set_os(name: &'static str, value: &std::ffi::OsStr) -> Self {
             let previous = std::env::var_os(name);
             unsafe {
                 std::env::set_var(name, value);
@@ -5143,6 +5379,37 @@ mod tests {
             router_config_b64: None,
             router_config: None,
         }
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(unix)]
+    fn with_fake_compose_runtime<F>(script: &str, test: F)
+    where
+        F: FnOnce(),
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _env_guard = env_lock().lock().expect("env lock should not be poisoned");
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let docker_path = temp.path().join("docker");
+        fs::write(&docker_path, script).expect("fake docker script should be written");
+        let mut perms = fs::metadata(&docker_path)
+            .expect("fake docker script should exist")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&docker_path, perms).expect("fake docker script should be executable");
+
+        let original_path = env::var_os("PATH").unwrap_or_default();
+        let mut updated_path = std::ffi::OsString::from(temp.path().as_os_str());
+        updated_path.push(std::ffi::OsStr::new(":"));
+        updated_path.push(&original_path);
+        let _path = EnvVarRestore::set_os("PATH", &updated_path);
+
+        test();
     }
 
     #[test]
@@ -5213,6 +5480,70 @@ mod tests {
         assert!(rendered.contains("stack-a"), "{rendered}");
         assert!(rendered.contains("stack-b"), "{rendered}");
         assert!(rendered.contains("--project-name"), "{rendered}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn discover_running_compose_projects_handles_override_stacks() {
+        with_fake_compose_runtime(
+            r#"#!/bin/sh
+if [ "$1" = "ps" ]; then
+  shift
+  args="$*"
+  case "$args" in
+    *"label=com.docker.compose.project.config_files="*)
+      exit 0
+      ;;
+    *"label=com.docker.compose.service=amber-router"*'{{.Label "com.docker.compose.project"}}'*)
+      printf '%s\n' override-stack
+      exit 0
+      ;;
+  esac
+  exit 0
+fi
+exit 1
+"#,
+            || {
+                let projects = discover_running_compose_projects();
+                assert_eq!(projects, BTreeSet::from(["override-stack".to_string()]));
+            },
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn find_running_compose_service_container_handles_override_stacks() {
+        with_fake_compose_runtime(
+            r#"#!/bin/sh
+if [ "$1" = "ps" ]; then
+  shift
+  args="$*"
+  case "$args" in
+    *"label=com.docker.compose.project.config_files="*)
+      exit 0
+      ;;
+    *"label=com.docker.compose.project=override-stack"*\
+*"label=com.docker.compose.service=amber-router"*\
+*"{{.ID}}"*)
+      printf '%s\n' container-123
+      exit 0
+      ;;
+  esac
+  exit 0
+fi
+exit 1
+"#,
+            || {
+                let container = find_running_compose_service_container(
+                    Path::new("/tmp/amber.yaml"),
+                    "override-stack",
+                    COMPOSE_ROUTER_SERVICE_NAME,
+                )
+                .expect("container should be found");
+                assert_eq!(container.runtime, "docker");
+                assert_eq!(container.id, "container-123");
+            },
+        );
     }
 
     #[test]
@@ -5558,6 +5889,44 @@ mod tests {
             "direct control alias should stay well below unix socket path limits: {}",
             path.display()
         );
+    }
+
+    #[test]
+    fn parse_compose_published_port_addrs_reads_loopback_binding() {
+        let addrs = parse_compose_published_port_addrs(
+            r#"[{
+                "NetworkSettings": {
+                    "Ports": {
+                        "24000/tcp": [
+                            { "HostIp": "127.0.0.1", "HostPort": "32768" }
+                        ]
+                    }
+                }
+            }]"#,
+            24000,
+        )
+        .expect("published port should parse");
+
+        assert_eq!(addrs, vec![SocketAddr::from(([127, 0, 0, 1], 32768))]);
+    }
+
+    #[test]
+    fn parse_compose_published_port_addrs_defaults_unspecified_host_to_loopback() {
+        let addrs = parse_compose_published_port_addrs(
+            r#"[{
+                "NetworkSettings": {
+                    "Ports": {
+                        "24000/tcp": [
+                            { "HostIp": "0.0.0.0", "HostPort": "32768" }
+                        ]
+                    }
+                }
+            }]"#,
+            24000,
+        )
+        .expect("published port should parse");
+
+        assert_eq!(addrs, vec![SocketAddr::from(([127, 0, 0, 1], 32768))]);
     }
 
     #[test]

@@ -54,7 +54,7 @@ services:
     labels:
       amber.exports: '{"client_status":{"component":"/client","provide":"status","protocol":"http","router_mesh_port":24000},"public":{"component":"/server","provide":"api","protocol":"http","router_mesh_port":24000}}'
     ports:
-    - 127.0.0.1:24000:24000
+    - 127.0.0.1::24000
     extra_hosts:
     - host.docker.internal:host-gateway
     volumes:

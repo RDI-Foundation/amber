@@ -32,7 +32,8 @@ docker compose -f /tmp/amber-slot-forwarding.yaml up -d
 ```
 
 `amber proxy` auto-discovers router control from compile metadata.
-For Compose output this uses a project-scoped named volume that carries the router control socket.
+For Compose output this uses a project-scoped named volume that carries the router control socket,
+and export mode also discovers the router's published host port at runtime.
 
 2. Start an HTTP server inside `c2-consumer` so the exported path has a concrete responder:
 

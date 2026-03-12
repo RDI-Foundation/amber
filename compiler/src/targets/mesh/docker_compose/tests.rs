@@ -1447,12 +1447,7 @@ fn compose_emits_export_metadata_and_labels() {
     );
 
     let router_service = service(&compose, "amber-router");
-    assert!(
-        router_service
-            .ports
-            .iter()
-            .any(|p| p == "127.0.0.1:24000:24000")
-    );
+    assert!(router_service.ports.iter().any(|p| p == "127.0.0.1::24000"));
     assert!(
         router_service
             .ports
@@ -1559,6 +1554,10 @@ fn compose_routes_external_slots_through_router() {
     assert!(compose.services.contains_key("amber-router"));
     let router_service = service(&compose, "amber-router");
     assert!(env_value(router_service, "AMBER_EXTERNAL_SLOT_API_URL").is_some());
+    assert!(
+        router_service.ports.is_empty(),
+        "slot-only scenarios should not publish the router mesh port on the host"
+    );
     assert!(
         router_service
             .extra_hosts
