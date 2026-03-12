@@ -1444,8 +1444,9 @@ fn resolve_vm_scalar(plan: &VmScalarPlanU32, field_name: &str) -> Result<u32> {
 fn resolve_vm_base_image(plan: &VmHostPathPlan) -> Result<PathBuf> {
     let raw_path = match plan {
         VmHostPathPlan::Static { path } => path.clone(),
-        VmHostPathPlan::RuntimeConfig { query } => {
-            resolve_vm_runtime_config(query, "program.vm.image")?
+        VmHostPathPlan::RuntimeConfig { query, source_dir } => {
+            let path = resolve_vm_runtime_config(query, "program.vm.image")?;
+            return resolve_vm_runtime_host_path(&path, source_dir.as_deref());
         }
         VmHostPathPlan::RuntimeTemplate { parts, source_dir } => {
             let rendered = render_vm_host_path_template(parts)?;
@@ -3037,5 +3038,30 @@ mod tests {
         let script = render_bootstrap_script(&component);
         assert!(script.contains("mount -t vfat -o ro,exec /dev/vdc /amber/runtime"));
         assert!(script.contains("/dev/vdd"));
+    }
+
+    #[test]
+    fn resolve_vm_base_image_uses_source_dir_for_runtime_config_paths() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let image_dir = temp.path().join("images");
+        fs::create_dir_all(&image_dir).expect("image dir");
+        let image_path = image_dir.join("base.qcow2");
+        fs::write(&image_path, []).expect("image file");
+
+        unsafe {
+            env::set_var("AMBER_CONFIG_CONFIG__VM_IMAGE", "images/base.qcow2");
+        }
+
+        let resolved = resolve_vm_base_image(&VmHostPathPlan::RuntimeConfig {
+            query: "config.vm_image".to_string(),
+            source_dir: Some(temp.path().display().to_string()),
+        })
+        .expect("base image");
+
+        assert_eq!(resolved, image_path);
+
+        unsafe {
+            env::remove_var("AMBER_CONFIG_CONFIG__VM_IMAGE");
+        }
     }
 }

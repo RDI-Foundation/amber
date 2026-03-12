@@ -141,6 +141,8 @@ pub enum VmHostPathPlan {
     },
     RuntimeConfig {
         query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_dir: Option<String>,
     },
     RuntimeTemplate {
         parts: Vec<VmHostPathPart>,
@@ -658,6 +660,7 @@ fn build_vm_base_image_plan(
             };
             Ok(VmHostPathPlan::RuntimeConfig {
                 query: query.clone(),
+                source_dir: source_dir.map(|path| path.display().to_string()),
             })
         }
     }
