@@ -5,7 +5,7 @@
     "entrypoint": [
       "/bin/sh",
       "-c",
-      "mkdir -p /www && echo 'ok' > /www/index.html && exec busybox httpd -f -p 8080 -h /www"
+      { "file": "./serve.sh" }
     ],
     "network": {
       "endpoints": [{ "name": "endpoint", "port": 8080 }]

@@ -388,6 +388,7 @@ impl Backend for BundleResolver {
                 manifest,
                 source: parsed.source,
                 spans: parsed.spans,
+                bundle_source: parsed.bundle_source,
             })
         })
     }
@@ -445,10 +446,10 @@ fn write_bundle_manifests(
         let mut file = std::fs::File::create(&path)?;
 
         if let Some(url) = source_url_by_digest.get(digest) {
-            let source = store
+            let stored = store
                 .get_source(url)
-                .ok_or(Error::MissingManifest { digest: *digest })?
-                .source;
+                .ok_or(Error::MissingManifest { digest: *digest })?;
+            let source = stored.bundle_source.unwrap_or(stored.source);
             file.write_all(source.as_bytes())?;
             continue;
         }

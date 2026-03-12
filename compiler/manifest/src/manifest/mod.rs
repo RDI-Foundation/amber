@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
+    path::Path,
     str::FromStr,
     sync::OnceLock,
 };
@@ -21,8 +22,8 @@ use crate::{
     schema::{
         Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityKind, ComponentDecl,
         ConfigSchema, EnvironmentDecl, ExportTarget, LocalComponentRef, ManifestBinding,
-        MountSource, Program, ProvideDecl, RawBinding, RawExportTarget, ResourceDecl, SlotDecl,
-        VmScalarU32,
+        MountSource, Program, ProvideDecl, RawBinding, RawExportTarget, RawProgram, ResourceDecl,
+        SlotDecl, VmScalarU32,
     },
 };
 
@@ -36,7 +37,7 @@ pub struct RawManifest {
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     pub experimental_features: BTreeSet<ExperimentalFeature>,
     #[serde(default)]
-    pub program: Option<Program>,
+    pub program: Option<RawProgram>,
     #[serde_as(as = "MapPreventDuplicates<_, _>")]
     #[serde(default)]
     pub components: BTreeMap<String, ComponentDecl>,
@@ -748,8 +749,12 @@ impl RawManifest {
     }
 
     pub fn validate(self) -> Result<Manifest, Error> {
+        self.validate_with_origin(None)
+            .map(|(manifest, _)| manifest)
+    }
+
+    pub fn validate_with_origin(self, origin: Option<&Path>) -> Result<(Manifest, bool), Error> {
         self.validate_version()?;
-        let digest = self.digest();
 
         let RawManifest {
             manifest_version,
@@ -765,6 +770,11 @@ impl RawManifest {
             exports,
             metadata,
         } = self;
+
+        let (program, used_file_refs) = program
+            .map(|program| program.resolve(origin))
+            .transpose()?
+            .map_or((None, false), |(program, used)| (Some(program), used));
 
         validate_program_syntax_manifest_version(&manifest_version, program.as_ref())?;
 
@@ -824,7 +834,7 @@ impl RawManifest {
             }
         }
 
-        Ok(Manifest {
+        let mut manifest = Manifest {
             manifest_version,
             experimental_features,
             program,
@@ -837,8 +847,10 @@ impl RawManifest {
             bindings: bindings_out,
             exports: exports_out,
             metadata,
-            digest,
-        })
+            digest: ManifestDigest::new([0; 32]),
+        };
+        manifest.digest = RawManifest::from(&manifest).digest();
+        Ok((manifest, used_file_refs))
     }
 }
 
@@ -959,7 +971,7 @@ impl Manifest {
         RawManifest {
             manifest_version,
             experimental_features,
-            program,
+            program: program.map(RawProgram::from),
             components,
             environments,
             config_schema,
@@ -1086,7 +1098,7 @@ impl From<&Manifest> for RawManifest {
         RawManifest {
             manifest_version: manifest.manifest_version.clone(),
             experimental_features: manifest.experimental_features.clone(),
-            program: manifest.program.clone(),
+            program: manifest.program.as_ref().map(RawProgram::from),
             components,
             environments: manifest.environments.clone(),
             config_schema: manifest.config_schema.clone(),

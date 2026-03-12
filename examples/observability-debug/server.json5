@@ -5,7 +5,7 @@
     entrypoint: [
       "sh",
       "-lc",
-      "python3 - <<'PY'\nfrom http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n\nRESPONSE = b'{\"jsonrpc\":\"2.0\",\"id\":\"server-static\",\"method\":\"tools/list\",\"result\":{\"source\":\"server\",\"ok\":true}}'\n\n\nclass Handler(BaseHTTPRequestHandler):\n    def do_GET(self):\n        tutorial = self.headers.get('x-amber-tutorial', '-')\n        print(f'[server] received GET {self.path} x-amber-tutorial={tutorial}', flush=True)\n        self.send_response(200)\n        self.send_header('content-type', 'application/json')\n        self.send_header('content-length', str(len(RESPONSE)))\n        self.end_headers()\n        self.wfile.write(RESPONSE)\n        print(f'[server] responded 200 {self.path} id=server-static', flush=True)\n\n    def log_message(self, _format, *_args):\n        pass\n\n\nprint('[server] listening on :9000', flush=True)\nThreadingHTTPServer(('0.0.0.0', 9000), Handler).serve_forever()\nPY",
+      { file: "./server.sh" },
     ],
     network: {
       endpoints: [{ name: "api", port: 9000 }],

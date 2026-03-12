@@ -30,6 +30,7 @@ impl FileResolver {
             manifest,
             source,
             spans,
+            bundle_source: parsed.bundle_source,
         })
     }
 }

@@ -1958,6 +1958,7 @@ impl Backend for StaticBackend {
                 manifest,
                 source,
                 spans,
+                bundle_source: None,
             })
         })
     }
@@ -1981,6 +1982,7 @@ impl Backend for CountingBackend {
                 manifest,
                 source,
                 spans,
+                bundle_source: None,
             })
         })
     }
@@ -3273,6 +3275,7 @@ fn check_from_tree_handles_malformed_program_image_from_builder_with_source() {
             digest,
             source,
             spans,
+            bundle_source: None,
         },
     );
 
@@ -3333,6 +3336,47 @@ async fn bundle_builder_reserializes_when_source_missing() {
     let written = fs::read(&manifest_path).unwrap();
     let expected = serde_json::to_vec::<Manifest>(&manifest).unwrap();
     assert_eq!(written, expected);
+}
+
+#[tokio::test]
+async fn bundle_builder_inlines_program_file_references() {
+    let dir = tmp_dir("bundle-inline-file-ref");
+    let root_path = dir.path().join("root.json5");
+    let script_path = dir.path().join("script.py");
+    let bundle_dir = dir.path().join("bundle");
+
+    write_file(&script_path, "print('bundled')\n");
+    write_file(
+        &root_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "python:3.13-alpine",
+            entrypoint: ["python3", "-c", { file: "./script.py" }],
+          },
+        }
+        "#,
+    );
+
+    let root_ref = manifest_ref_for_path(&root_path);
+    let compiler = default_compiler();
+    let tree = compiler
+        .resolve_tree(root_ref, CompileOptions::default().resolve)
+        .await
+        .unwrap();
+
+    BundleBuilder::build(&tree, compiler.store(), &bundle_dir).unwrap();
+
+    let digest = tree.root.digest;
+    let digest_name = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.bytes());
+    let manifest_path = bundle_dir
+        .join("manifests")
+        .join(format!("{digest_name}.json5"));
+    let bundled = fs::read_to_string(manifest_path).unwrap();
+
+    assert!(bundled.contains("print('bundled')\\n"), "{bundled}");
+    assert!(!bundled.contains("\"file\""), "{bundled}");
 }
 
 #[tokio::test]

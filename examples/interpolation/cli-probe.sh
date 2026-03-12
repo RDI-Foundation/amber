@@ -1,0 +1,1 @@
+mkdir -p /www; upstreams_csv=$(printenv AMBER_UPSTREAMS_CSV 2>/dev/null || printf unset); printf 'name=%s\nargv=%s\nupstreams_csv=%s\n' "$AMBER_NAME" "$*" "$upstreams_csv" >/www/index.html; exec httpd -f -p 8080 -h /www

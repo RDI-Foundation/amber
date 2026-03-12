@@ -18,55 +18,7 @@
       "sh",
       "-eu",
       "-c",
-      "\
-python3 - <<'PY'\n\
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n\
-from pathlib import Path\n\
-import os\n\
-\n\
-STATE_PATH = Path('/var/lib/app/state.txt')\n\
-STATE_PATH.parent.mkdir(parents=True, exist_ok=True)\n\
-if not STATE_PATH.exists():\n\
-    STATE_PATH.write_text(os.environ['APP_INITIAL_STATE'], encoding='utf-8')\n\
-VERSION = os.environ['APP_VERSION']\n\
-\n\
-def read_state() -> str:\n\
-    return STATE_PATH.read_text(encoding='utf-8')\n\
-\n\
-def send(handler: BaseHTTPRequestHandler, status: int, body: str) -> None:\n\
-    payload = body.encode('utf-8')\n\
-    handler.send_response(status)\n\
-    handler.send_header('content-type', 'text/plain; charset=utf-8')\n\
-    handler.send_header('content-length', str(len(payload)))\n\
-    handler.end_headers()\n\
-    handler.wfile.write(payload)\n\
-\n\
-class Handler(BaseHTTPRequestHandler):\n\
-    def do_GET(self) -> None:\n\
-        if self.path == '/version':\n\
-            send(self, 200, VERSION)\n\
-        elif self.path == '/state':\n\
-            send(self, 200, read_state())\n\
-        elif self.path == '/':\n\
-            send(self, 200, 'GET /version\\nGET /state\\nPUT /state\\n')\n\
-        else:\n\
-            send(self, 404, 'not found\\n')\n\
-\n\
-    def do_PUT(self) -> None:\n\
-        if self.path != '/state':\n\
-            send(self, 404, 'not found\\n')\n\
-            return\n\
-        length = int(self.headers.get('content-length', '0'))\n\
-        state = self.rfile.read(length).decode('utf-8')\n\
-        STATE_PATH.write_text(state, encoding='utf-8')\n\
-        send(self, 200, read_state())\n\
-\n\
-    def log_message(self, _format: str, *_args: object) -> None:\n\
-        pass\n\
-\n\
-ThreadingHTTPServer(('0.0.0.0', 8080), Handler).serve_forever()\n\
-PY\n\
-      ",
+      { file: "./service.sh" },
     ],
     mounts: [
       { path: "/var/lib/app", from: "slots.state" },

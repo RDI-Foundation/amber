@@ -588,6 +588,7 @@ async fn resolve_manifest_inner(
         digest,
         source: resolution.source,
         spans: resolution.spans,
+        bundle_source: resolution.bundle_source,
     };
     svc.store.put_source(url.clone(), source_record);
 

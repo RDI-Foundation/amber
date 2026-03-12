@@ -120,6 +120,7 @@ impl HttpResolver {
             manifest,
             source,
             spans,
+            bundle_source: parsed.bundle_source,
         })
     }
 }

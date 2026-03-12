@@ -1,0 +1,61 @@
+#cloud-config
+write_files:
+  - path: /usr/local/bin/amber-bound-probe.py
+    permissions: '0755'
+    content: |
+      from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+      from pathlib import Path
+      from urllib.request import Request, urlopen
+
+      TARGET_URL = '${slots.api.url}'.rstrip('/')
+      OWN_EPHEMERAL = Path('/tmp/bound-ephemeral.txt')
+      API_EPHEMERAL = Path('/tmp/amber-api-ephemeral.txt')
+      if not OWN_EPHEMERAL.exists():
+          OWN_EPHEMERAL.write_text('owned:bound', encoding='utf-8')
+
+      def reachability() -> str:
+          try:
+              with urlopen(Request(f'{TARGET_URL}/identity'), timeout=10) as response:
+                  return f"reachable:{response.read().decode('utf-8')}"
+          except Exception as err:
+              return f'blocked:{err.__class__.__name__}'
+
+      def send(handler: BaseHTTPRequestHandler, status: int, body: str) -> None:
+          payload = body.encode('utf-8')
+          handler.send_response(status)
+          handler.send_header('content-type', 'text/plain; charset=utf-8')
+          handler.send_header('content-length', str(len(payload)))
+          handler.end_headers()
+          handler.wfile.write(payload)
+
+      class Handler(BaseHTTPRequestHandler):
+          def do_GET(self) -> None:
+              if self.path == '/':
+                  send(self, 200, 'GET /reachability\nGET /ephemeral\n')
+              elif self.path == '/reachability':
+                  send(self, 200, reachability())
+              elif self.path == '/ephemeral':
+                  own = OWN_EPHEMERAL.read_text(encoding='utf-8')
+                  send(self, 200, f"own={own};api_visible={str(API_EPHEMERAL.exists()).lower()}")
+              else:
+                  send(self, 404, 'not found')
+
+          def log_message(self, _format: str, *_args: object) -> None:
+              pass
+
+      ThreadingHTTPServer(('0.0.0.0', 8080), Handler).serve_forever()
+  - path: /etc/systemd/system/amber-bound-probe.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Amber VM bound probe demo
+
+      [Service]
+      ExecStart=/usr/bin/python3 /usr/local/bin/amber-bound-probe.py
+      Restart=always
+
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, amber-bound-probe.service]

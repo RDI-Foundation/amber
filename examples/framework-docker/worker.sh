@@ -1,0 +1,1 @@
+set -eu; test -S /var/run/docker.sock; docker version >/dev/null; docker create --name "${config.container_name}" busybox:1.36.1 true >/tmp/created-id; docker inspect "${config.container_name}" >/tmp/inspect.json

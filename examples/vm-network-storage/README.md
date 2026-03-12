@@ -18,9 +18,11 @@ Layout:
 
 - `scenario.json5`: default scenario
 - `api.json5`: default API VM
+- `api.cloud-init.yaml`: API VM guest bootstrap
 - `probes/`: bound and unbound probe VMs
 - `v2/scenario.json5`: migration scenario
 - `v2/api.json5`: migrated API VM
+- `v2/api.cloud-init.yaml`: migrated API VM guest bootstrap
 - `v2/stack.json5`: migration-only wrapper component
 
 ## Prereqs
