@@ -1,6 +1,8 @@
 {
   manifest_version: "0.1.0",
 
+  // Root config on the scenario becomes a backend runtime input. In this example Amber exposes
+  // the leaf below as `AMBER_CONFIG_API_KEY` on backends like Compose and Kubernetes.
   config_schema: {
     type: "object",
     properties: {
@@ -14,7 +16,9 @@
     api_client: {
       manifest: "./api-client.json5",
       config: {
+        // Forward the externally supplied root config into the child's config object.
         api_key: "${config.api_key}",
+        // Static parent-authored config stays compiled into the child config template.
         system_prompt: "You are an agent.",
       },
     },
