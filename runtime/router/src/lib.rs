@@ -4479,7 +4479,7 @@ async fn proxy_http_request_to_noise(
         let proxied = Request::from_parts(request_parts, request_body);
         let response = {
             let mut upstream = state.upstream.lock().await;
-            match upstream.send_request(proxied).await {
+            match send_http1_request(&mut upstream, proxied).await {
                 Ok(resp) => resp,
                 Err(err) => {
                     let error_detail = err.to_string();
@@ -4843,6 +4843,14 @@ async fn clear_mesh_http_upstream(state: &HttpProxyState) {
     state.mesh_upstream.lock().await.take();
 }
 
+async fn send_http1_request(
+    sender: &mut client_http1::SendRequest<BoxBody>,
+    request: Request<BoxBody>,
+) -> hyper::Result<Response<Incoming>> {
+    sender.ready().await?;
+    sender.send_request(request).await
+}
+
 async fn send_request_to_mesh_http_upstream(
     state: &HttpProxyState,
     target_url: &str,
@@ -4870,7 +4878,7 @@ async fn send_request_to_mesh_http_upstream(
         let cached = upstream
             .as_mut()
             .expect("mesh upstream must exist after initialization");
-        cached.sender.send_request(request).await
+        send_http1_request(&mut cached.sender, request).await
     };
     if response.is_err() {
         upstream.take();
