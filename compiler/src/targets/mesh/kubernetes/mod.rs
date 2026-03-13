@@ -1625,6 +1625,9 @@ exporters:
     encoding: proto
 
 service:
+  telemetry:
+    logs:
+      level: warn
   pipelines:
     traces:
       receivers: [otlp]

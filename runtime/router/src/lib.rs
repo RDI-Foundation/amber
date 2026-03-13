@@ -820,21 +820,78 @@ pub async fn run(config: MeshConfig) -> Result<(), RouterError> {
         ));
     }
 
-    let Some(listener) = listeners.join_next().await else {
+    if listeners.is_empty() {
         return Err(RouterError::Transport(
             "no listener tasks were started".to_string(),
         ));
+    }
+
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
+    let result = tokio::select! {
+        () = &mut shutdown => {
+            tracing::info!("router received shutdown signal");
+            Ok(())
+        }
+        listener = listeners.join_next() => {
+            let Some(listener) = listener else {
+                return Err(RouterError::Transport(
+                    "no listener tasks were started".to_string(),
+                ));
+            };
+            match listener {
+                Ok(Ok(())) => Err(RouterError::Transport(
+                    "listener task exited unexpectedly".to_string(),
+                )),
+                Ok(Err(err)) => Err(err),
+                Err(err) => Err(RouterError::Transport(format!(
+                    "listener task panicked: {err}"
+                ))),
+            }
+        }
     };
 
     listeners.abort_all();
-    match listener {
-        Ok(Ok(())) => Err(RouterError::Transport(
-            "listener task exited unexpectedly".to_string(),
-        )),
-        Ok(Err(err)) => Err(err),
-        Err(err) => Err(RouterError::Transport(format!(
-            "listener task panicked: {err}"
-        ))),
+    while listeners.join_next().await.is_some() {}
+    result
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(sigterm) => sigterm,
+            Err(err) => {
+                tracing::warn!("failed to install SIGTERM handler: {err}");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        let mut sighup = match signal(SignalKind::hangup()) {
+            Ok(sighup) => sighup,
+            Err(err) => {
+                tracing::warn!("failed to install SIGHUP handler: {err}");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+                return;
+            }
+        };
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+            _ = sighup.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 

@@ -629,6 +629,8 @@ fn compose_emits_otelcol_agent_and_wires_router_otel_env() {
     assert!(otelcol_config.contains("logs/otlp:"));
     assert!(otelcol_config.contains("logs/program:"));
     assert!(otelcol_config.contains("metrics:"));
+    assert!(otelcol_config.contains("telemetry:"));
+    assert!(otelcol_config.contains("level: warn"));
     assert!(otelcol_config.contains("resource/amber"));
     assert!(otelcol_config.contains("value: $${env:AMBER_SCENARIO_RUN_ID}"));
     assert!(otelcol_config.contains("endpoint: $${env:AMBER_OTEL_UPSTREAM_OTLP_HTTP_ENDPOINT}"));
