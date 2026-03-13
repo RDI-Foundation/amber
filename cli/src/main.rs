@@ -4388,7 +4388,7 @@ fn resolve_compose_project_name(args: &ProxyArgs, compose_file: &Path) -> Result
     }
 
     let env_project = env_var_non_empty(COMPOSE_PROJECT_NAME_ENV).ok();
-    let discovered = discover_running_compose_projects();
+    let discovered = discover_running_compose_projects(compose_file);
     choose_compose_project_name(
         env_project.as_deref(),
         &discovered,
@@ -4422,7 +4422,7 @@ fn choose_compose_project_name(
     Ok(inferred.map(ToOwned::to_owned))
 }
 
-fn discover_running_compose_projects() -> BTreeSet<String> {
+fn discover_running_compose_projects(compose_file: &Path) -> BTreeSet<String> {
     let mut projects = BTreeSet::new();
 
     for runtime in ["docker", "podman"] {
@@ -4433,14 +4433,20 @@ fn discover_running_compose_projects() -> BTreeSet<String> {
                 "label=com.docker.compose.service={COMPOSE_ROUTER_SERVICE_NAME}"
             ))
             .arg("--format")
-            .arg("{{.Label \"com.docker.compose.project\"}}");
+            .arg(
+                "{{.Label \"com.docker.compose.project\"}}\t{{.Label \
+                 \"com.docker.compose.project.config_files\"}}",
+            );
         let Ok(output) = cmd.output() else {
             continue;
         };
         if !output.status.success() {
             continue;
         }
-        for project in parse_compose_project_names(&String::from_utf8_lossy(&output.stdout)) {
+        for project in parse_matching_compose_project_names(
+            &String::from_utf8_lossy(&output.stdout),
+            compose_file,
+        ) {
             projects.insert(project);
         }
     }
@@ -4448,12 +4454,28 @@ fn discover_running_compose_projects() -> BTreeSet<String> {
     projects
 }
 
-fn parse_compose_project_names(raw: &str) -> BTreeSet<String> {
+fn parse_matching_compose_project_names(raw: &str, compose_file: &Path) -> BTreeSet<String> {
+    let compose_file = compose_file.display().to_string();
     raw.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
+        .filter_map(|line| {
+            let (project, config_files) = line.split_once('\t')?;
+            let project = project.trim();
+            if project.is_empty()
+                || !compose_project_config_files_match(config_files, &compose_file)
+            {
+                return None;
+            }
+            Some(project.to_string())
+        })
         .collect()
+}
+
+fn compose_project_config_files_match(config_files: &str, compose_file: &str) -> bool {
+    config_files
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .any(|value| value == compose_file)
 }
 
 fn parse_control_endpoint(value: &str) -> Result<ControlEndpoint> {
@@ -5551,11 +5573,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_compose_project_names_ignores_empty_lines() {
-        let projects = parse_compose_project_names("alpha\n\n beta \n");
+    fn parse_matching_compose_project_names_filters_to_target_compose_file() {
+        let projects = parse_matching_compose_project_names(
+            "alpha\t/tmp/amber.yaml\n\nbeta\t/tmp/other.yaml\n gamma \t /tmp/amber.yaml \n",
+            Path::new("/tmp/amber.yaml"),
+        );
         assert_eq!(
             projects,
-            BTreeSet::from(["alpha".to_string(), "beta".to_string()])
+            BTreeSet::from(["alpha".to_string(), "gamma".to_string()])
         );
     }
 
@@ -5610,11 +5635,9 @@ if [ "$1" = "ps" ]; then
   shift
   args="$*"
   case "$args" in
-    *"label=com.docker.compose.project.config_files="*)
-      exit 0
-      ;;
-    *"label=com.docker.compose.service=amber-router"*'{{.Label "com.docker.compose.project"}}'*)
-      printf '%s\n' override-stack
+    *"label=com.docker.compose.service=amber-router"*'{{.Label "com.docker.compose.project"}}'*'{{.Label "com.docker.compose.project.config_files"}}'*)
+      printf '%s\t%s\n' override-stack /tmp/amber.yaml
+      printf '%s\t%s\n' unrelated-stack /tmp/other.yaml
       exit 0
       ;;
   esac
@@ -5623,10 +5646,22 @@ fi
 exit 1
 "#,
             || {
-                let projects = discover_running_compose_projects();
+                let projects = discover_running_compose_projects(Path::new("/tmp/amber.yaml"));
                 assert_eq!(projects, BTreeSet::from(["override-stack".to_string()]));
             },
         );
+    }
+
+    #[test]
+    fn compose_project_config_files_match_accepts_multi_file_labels() {
+        assert!(compose_project_config_files_match(
+            "/tmp/base.yaml,/tmp/amber.yaml",
+            "/tmp/amber.yaml"
+        ));
+        assert!(!compose_project_config_files_match(
+            "/tmp/base.yaml,/tmp/other.yaml",
+            "/tmp/amber.yaml"
+        ));
     }
 
     #[test]
