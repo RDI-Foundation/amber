@@ -127,8 +127,8 @@ pub fn build_root_config(
 ) -> Result<Value> {
     let leafs = collect_leaf_paths(root_schema)?;
     let mut leaf_paths = BTreeSet::new();
-    for leaf in leafs {
-        leaf_paths.insert(leaf.path);
+    for leaf in &leafs {
+        leaf_paths.insert(leaf.path.clone());
     }
 
     let mut obj = serde_json::Map::new();
@@ -144,10 +144,24 @@ pub fn build_root_config(
         if v.is_empty() {
             continue;
         }
-
         let leaf_schema = schema_lookup_ref(root_schema, &path)?;
         let parsed = parse_env_value(v, leaf_schema)?;
         insert_path(&mut obj, &path, parsed)?;
+    }
+
+    for leaf in &leafs {
+        if leaf.required || obj_has_path(&obj, &leaf.path) {
+            continue;
+        }
+        let leaf_schema = schema_lookup_ref(root_schema, &leaf.path)?;
+        let default_value = if let Some(v) = leaf_schema.get("default") {
+            v.clone()
+        } else if leaf_schema.get("type").and_then(|t| t.as_str()) == Some("string") {
+            Value::String(String::new())
+        } else {
+            continue;
+        };
+        insert_path(&mut obj, &leaf.path, default_value)?;
     }
 
     let out = Value::Object(obj);
@@ -164,6 +178,20 @@ pub fn build_root_config(
     }
 
     Ok(out)
+}
+
+fn obj_has_path(obj: &serde_json::Map<String, Value>, path: &str) -> bool {
+    let mut cur: &Value = &Value::Object(obj.clone());
+    for seg in path.split('.') {
+        match cur {
+            Value::Object(map) => match map.get(seg) {
+                Some(v) => cur = v,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn insert_path(root: &mut serde_json::Map<String, Value>, path: &str, value: Value) -> Result<()> {

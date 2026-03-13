@@ -291,6 +291,86 @@ mod tests {
     }
 
     #[test]
+    fn missing_optional_with_explicit_default() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "required_key": { "type": "string" },
+                "optional_key": { "type": "string", "default": "fallback" },
+            },
+            "required": ["required_key"],
+            "additionalProperties": false,
+        });
+
+        let env = std::collections::BTreeMap::from([(
+            "AMBER_CONFIG_REQUIRED_KEY".to_string(),
+            "hello".to_string(),
+        )]);
+
+        let config = build_root_config(&schema, &env).expect("config should parse");
+        assert_eq!(get_by_path(&config, "required_key").unwrap(), "hello");
+        assert_eq!(get_by_path(&config, "optional_key").unwrap(), "fallback");
+    }
+
+    #[test]
+    fn missing_optional_without_default() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "required_key": { "type": "string" },
+                "optional_key": { "type": "string" },
+            },
+            "required": ["required_key"],
+            "additionalProperties": false,
+        });
+
+        let env = std::collections::BTreeMap::from([(
+            "AMBER_CONFIG_REQUIRED_KEY".to_string(),
+            "hello".to_string(),
+        )]);
+
+        let config = build_root_config(&schema, &env).expect("config should parse");
+        assert_eq!(get_by_path(&config, "required_key").unwrap(), "hello");
+        assert_eq!(get_by_path(&config, "optional_key").unwrap(), "");
+    }
+
+    #[test]
+    fn provided_value_overrides_default() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "key": { "type": "string", "default": "foo" },
+            },
+            "required": ["key"],
+            "additionalProperties": false,
+        });
+
+        let env = std::collections::BTreeMap::from([(
+            "AMBER_CONFIG_KEY".to_string(),
+            "bar".to_string(),
+        )]);
+
+        let config = build_root_config(&schema, &env).expect("config should parse");
+        assert_eq!(get_by_path(&config, "key").unwrap(), "bar");
+    }
+
+    #[test]
+    fn required_field_without_value_fails() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "required_key": { "type": "string" },
+            },
+            "required": ["required_key"],
+            "additionalProperties": false,
+        });
+
+        let env = std::collections::BTreeMap::new();
+        let err = build_root_config(&schema, &env).expect_err("should fail for missing required");
+        assert!(err.to_string().contains("required"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn collect_leaf_paths_tracks_secrets_through_allof() {
         let schema = json!({
             "type": "object",
