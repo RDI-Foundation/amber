@@ -3515,3 +3515,80 @@ async fn bundle_loader_rejects_duplicate_requests() {
         other => panic!("expected duplicate request error, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn program_config_refs_in_each_mounts_and_network_are_validated() {
+    let dir = tmp_dir("program-config-ref-validation");
+    let root_path = dir.path().join("root.json5");
+
+    write_file(
+        &root_path,
+        r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              command_each_ref: { type: "string" },
+              env_each_ref: { type: "string" },
+              endpoint_ref: { type: "string" },
+              mount_path_ref: { type: "string" },
+              mount_source_ref: { type: "string" },
+            },
+          },
+          program: {
+            image: "app",
+            entrypoint: [
+              {
+                each: "config.command_each_ref.extra",
+                arg: "${item}",
+              },
+            ],
+            env: {
+              TOKEN: {
+                each: "config.env_each_ref.extra",
+                value: "${item}",
+                join: ",",
+              },
+            },
+            network: {
+              endpoints: [
+                {
+                  name: "${config.endpoint_ref.extra}",
+                  port: 8080,
+                  protocol: "http",
+                },
+              ],
+            },
+            mounts: [
+              {
+                path: "/tmp/${config.mount_path_ref.extra}",
+                from: "config.${config.mount_source_ref.extra}",
+              },
+            ],
+          },
+        }
+        "#,
+    );
+
+    let err = default_compiler()
+        .compile(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .expect_err("invalid program config refs should fail validation");
+
+    for location in [
+        "program.entrypoint[0].each",
+        "program.env.TOKEN.each",
+        "program.network.endpoints[0].name",
+        "program.mounts[0].path",
+        "program.mounts[0].from",
+    ] {
+        assert!(
+            error_contains(&err, location),
+            "expected invalid config reference at {location}, got {err}"
+        );
+    }
+}

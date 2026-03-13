@@ -14,7 +14,7 @@ use amber_config as rc;
 use amber_manifest::{
     BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, CapabilityKind, ChildName,
     ExportName, ExportTarget, InterpolatedPart, InterpolatedString, InterpolationSource, Manifest,
-    ManifestDigest, Program, framework_capability, span_for_json_pointer,
+    ManifestDigest, ProgramConfigUseSite, framework_capability, span_for_json_pointer,
 };
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, ProgramMount, ProvideRef,
@@ -1393,125 +1393,15 @@ fn validate_config_tree(
             }
         };
 
-        fn visit_program_string_config_refs(raw: &str, mut visit: impl FnMut(&str)) {
-            let Ok(parsed) = raw.parse::<InterpolatedString>() else {
-                return;
+        program.visit_config_uses(|location, query| {
+            let location = match location {
+                ProgramConfigUseSite::MountSource { index } => {
+                    format!("program.mounts[{index}].from")
+                }
+                other => other.to_string(),
             };
-            for part in &parsed.parts {
-                let InterpolatedPart::Interpolation { source, query } = part else {
-                    continue;
-                };
-                if *source == InterpolationSource::Config {
-                    visit(query);
-                }
-            }
-        }
-
-        fn visit_vm_scalar_config_refs(
-            scalar: &amber_manifest::VmScalarU32,
-            mut visit: impl FnMut(&str),
-        ) {
-            let amber_manifest::VmScalarU32::Interpolated(raw) = scalar else {
-                return;
-            };
-            visit_program_string_config_refs(raw, |query| visit(query));
-        }
-
-        fn visit_program_command_config_refs(
-            command: &[amber_manifest::ProgramArgItem],
-            mut visit: impl FnMut(String, &str),
-        ) {
-            for (arg_idx, item) in command.iter().enumerate() {
-                if let Some(when) = item.when()
-                    && when.source() == InterpolationSource::Config
-                {
-                    visit(format!("[{arg_idx}].when"), when.query());
-                }
-                item.visit_values(|arg| {
-                    for part in &arg.parts {
-                        let InterpolatedPart::Interpolation { source, query } = part else {
-                            continue;
-                        };
-                        if *source == InterpolationSource::Config {
-                            visit(format!("[{arg_idx}]"), query);
-                        }
-                    }
-                });
-            }
-        }
-
-        fn visit_program_env_config_refs(
-            env: &BTreeMap<String, amber_manifest::ProgramEnvValue>,
-            mut visit: impl FnMut(String, &str),
-        ) {
-            for (key, value) in env {
-                if let Some(when) = value.when()
-                    && when.source() == InterpolationSource::Config
-                {
-                    visit(format!("{key}.when"), when.query());
-                }
-                let location_suffix = if value.when().is_some() || value.each().is_some() {
-                    format!("{key}.value")
-                } else {
-                    key.to_string()
-                };
-                for part in &value.value().parts {
-                    let InterpolatedPart::Interpolation { source, query } = part else {
-                        continue;
-                    };
-                    if *source == InterpolationSource::Config {
-                        visit(location_suffix.clone(), query);
-                    }
-                }
-            }
-        }
-
-        match program {
-            Program::Image(program) => {
-                visit_program_string_config_refs(&program.image, |query| {
-                    validate_config_ref("program.image".to_string(), query);
-                });
-                visit_program_command_config_refs(&program.entrypoint.0, |suffix, query| {
-                    validate_config_ref(format!("program.entrypoint{suffix}"), query);
-                });
-                visit_program_env_config_refs(&program.common.env, |suffix, query| {
-                    validate_config_ref(format!("program.env.{suffix}"), query);
-                });
-            }
-            Program::Path(program) => {
-                visit_program_string_config_refs(&program.path, |query| {
-                    validate_config_ref("program.path".to_string(), query);
-                });
-                visit_program_command_config_refs(&program.args.0, |suffix, query| {
-                    validate_config_ref(format!("program.args{suffix}"), query);
-                });
-                visit_program_env_config_refs(&program.common.env, |suffix, query| {
-                    validate_config_ref(format!("program.env.{suffix}"), query);
-                });
-            }
-            Program::Vm(program) => {
-                visit_program_string_config_refs(&program.0.image, |query| {
-                    validate_config_ref("program.vm.image".to_string(), query);
-                });
-                visit_vm_scalar_config_refs(&program.0.cpus, |query| {
-                    validate_config_ref("program.vm.cpus".to_string(), query);
-                });
-                visit_vm_scalar_config_refs(&program.0.memory_mib, |query| {
-                    validate_config_ref("program.vm.memory_mib".to_string(), query);
-                });
-                if let Some(raw) = program.0.cloud_init.user_data.as_deref() {
-                    visit_program_string_config_refs(raw, |query| {
-                        validate_config_ref("program.vm.cloud_init.user_data".to_string(), query);
-                    });
-                }
-                if let Some(raw) = program.0.cloud_init.vendor_data.as_deref() {
-                    visit_program_string_config_refs(raw, |query| {
-                        validate_config_ref("program.vm.cloud_init.vendor_data".to_string(), query);
-                    });
-                }
-            }
-            _ => (),
-        }
+            validate_config_ref(location, query);
+        });
     }
 
     fn validate_resource_config_refs(

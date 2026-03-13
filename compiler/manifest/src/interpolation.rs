@@ -44,6 +44,18 @@ impl InterpolatedString {
         }
     }
 
+    /// Visit config paths referenced by `${config...}` interpolations.
+    pub fn visit_config_uses(&self, mut visit: impl FnMut(&str)) {
+        for part in &self.parts {
+            let InterpolatedPart::Interpolation { source, query } = part else {
+                continue;
+            };
+            if *source == InterpolationSource::Config {
+                visit(query);
+            }
+        }
+    }
+
     /// Visit slot names referenced by `${slots...}` interpolations.
     ///
     /// The visited slot name is the first query segment (e.g. `${slots.llm.url}` visits `llm`).
@@ -272,6 +284,29 @@ impl WhenPath {
     pub fn query(&self) -> &str {
         &self.query
     }
+
+    pub fn visit_slot_uses(&self, mut visit: impl FnMut(&str)) -> bool {
+        if self.source != InterpolationSource::Slots {
+            return false;
+        }
+
+        match parse_slot_query(&self.query) {
+            Ok(parsed) => match parsed.target {
+                SlotTarget::All => true,
+                SlotTarget::Slot(slot) => {
+                    visit(slot);
+                    false
+                }
+            },
+            Err(_) => self.query.is_empty(),
+        }
+    }
+
+    pub fn visit_config_uses(&self, mut visit: impl FnMut(&str)) {
+        if self.source == InterpolationSource::Config {
+            visit(&self.query);
+        }
+    }
 }
 
 impl fmt::Display for WhenPath {
@@ -340,6 +375,18 @@ impl EachPath {
 
     pub fn config_path(&self) -> Option<&str> {
         (self.source == InterpolationSource::Config).then_some(self.query.as_str())
+    }
+
+    pub fn visit_slot_uses(&self, mut visit: impl FnMut(&str)) {
+        if let Some(slot) = self.slot() {
+            visit(slot);
+        }
+    }
+
+    pub fn visit_config_uses(&self, mut visit: impl FnMut(&str)) {
+        if let Some(path) = self.config_path() {
+            visit(path);
+        }
     }
 }
 
@@ -494,22 +541,29 @@ impl ProgramArgItem {
     /// repeated `each` selectors. Returns `true` if the item references all slots.
     pub fn visit_slot_uses(&self, mut visit: impl FnMut(&str)) -> bool {
         if let Some(when) = self.when()
-            && visit_when_slot_uses(when, &mut visit)
+            && when.visit_slot_uses(&mut visit)
         {
             return true;
         }
 
-        if let Some(each) = self.each()
-            && each.source() == InterpolationSource::Slots
-            && let Some(slot) = each.slot()
-        {
-            visit(slot);
+        if let Some(each) = self.each() {
+            each.visit_slot_uses(&mut visit);
         }
 
         match &self.value {
             ProgramArgValue::Arg(arg) => arg.visit_slot_uses(visit),
             ProgramArgValue::Argv(argv) => visit_program_arg_list_slot_uses(argv, &mut visit),
         }
+    }
+
+    pub fn visit_config_uses(&self, mut visit: impl FnMut(&str)) {
+        if let Some(when) = self.when() {
+            when.visit_config_uses(&mut visit);
+        }
+        if let Some(each) = self.each() {
+            each.visit_config_uses(&mut visit);
+        }
+        self.visit_values(|value| value.visit_config_uses(&mut visit));
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -650,6 +704,12 @@ impl ProgramEntrypoint {
         }
         false
     }
+
+    pub fn visit_config_uses(&self, mut visit: impl FnMut(&str)) {
+        for item in &self.0 {
+            item.visit_config_uses(&mut visit);
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for ProgramEntrypoint {
@@ -734,19 +794,26 @@ impl ProgramEnvValue {
     /// `each` selectors. Returns `true` if the value references all slots.
     pub fn visit_slot_uses(&self, mut visit: impl FnMut(&str)) -> bool {
         if let Some(when) = self.when()
-            && visit_when_slot_uses(when, &mut visit)
+            && when.visit_slot_uses(&mut visit)
         {
             return true;
         }
 
-        if let Some(each) = self.each()
-            && each.source() == InterpolationSource::Slots
-            && let Some(slot) = each.slot()
-        {
-            visit(slot);
+        if let Some(each) = self.each() {
+            each.visit_slot_uses(&mut visit);
         }
 
         self.value().visit_slot_uses(visit)
+    }
+
+    pub fn visit_config_uses(&self, mut visit: impl FnMut(&str)) {
+        if let Some(when) = self.when() {
+            when.visit_config_uses(&mut visit);
+        }
+        if let Some(each) = self.each() {
+            each.visit_config_uses(&mut visit);
+        }
+        self.value().visit_config_uses(visit);
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -765,23 +832,6 @@ fn visit_program_arg_list_slot_uses(args: &ProgramArgList, visit: &mut impl FnMu
         }
     }
     false
-}
-
-fn visit_when_slot_uses(when: &WhenPath, visit: &mut impl FnMut(&str)) -> bool {
-    if when.source() != InterpolationSource::Slots {
-        return false;
-    }
-
-    match parse_slot_query(when.query()) {
-        Ok(parsed) => match parsed.target {
-            SlotTarget::All => true,
-            SlotTarget::Slot(slot) => {
-                visit(slot);
-                false
-            }
-        },
-        Err(_) => when.query().is_empty(),
-    }
 }
 
 impl From<InterpolatedString> for ProgramEnvValue {
