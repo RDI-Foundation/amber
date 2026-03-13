@@ -22,8 +22,9 @@ use url::Url;
 
 use super::KubernetesReporter;
 use crate::{
-    CompileOptions, Compiler, DigestStore, OptimizeOptions, reporter::Reporter as _,
-    storage_plan::StorageIdentity, targets::mesh::internal_images::resolve_internal_images,
+    CompileOptions, Compiler, DigestStore, OptimizeOptions,
+    reporter::Reporter as _,
+    targets::{mesh::internal_images::resolve_internal_images, storage::StorageIdentity},
 };
 
 fn workspace_root() -> PathBuf {

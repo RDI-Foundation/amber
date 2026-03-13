@@ -21,7 +21,6 @@ use crate::{
         CompiledScenario, Reporter, ReporterError,
         execution_guide::{GENERATED_README_FILENAME, build_execution_guide},
     },
-    storage_plan::build_storage_plan,
     targets::{
         mesh::{
             addressing::{
@@ -46,6 +45,7 @@ use crate::{
             ComponentExecutionPlan, ProgramImageOrigin, ProgramImagePart, ProgramImagePlan,
             ProgramSupport, build_component_runtime_plan, build_config_plan,
         },
+        storage::build_storage_plan,
     },
 };
 
@@ -1787,8 +1787,8 @@ fn component_config_image_source(
         config_ptr.push_back(segment);
     }
     let span = span_for_json_pointer(stored.source.as_ref(), root_span, &config_ptr.to_string())?;
-    let src =
-        NamedSource::new(crate::store::display_url(url), stored.source).with_language("json5");
+    let src = NamedSource::new(crate::frontend::store::display_url(url), stored.source)
+        .with_language("json5");
     Some(ProgramImageSource {
         src,
         span,
@@ -1808,8 +1808,8 @@ fn component_program_image_source(
     let root_span: SourceSpan = (0usize, stored.source.len()).into();
     let span = span_for_json_pointer(stored.source.as_ref(), root_span, "/program/image")
         .unwrap_or(program.whole);
-    let src =
-        NamedSource::new(crate::store::display_url(url), stored.source).with_language("json5");
+    let src = NamedSource::new(crate::frontend::store::display_url(url), stored.source)
+        .with_language("json5");
     Some(ProgramImageSource {
         src,
         span,
@@ -1948,7 +1948,7 @@ fn sanitize_label_value(s: &str) -> String {
 
 fn storage_request_for(
     scenario: &Scenario,
-    identity: &crate::storage_plan::StorageIdentity,
+    identity: &crate::targets::storage::StorageIdentity,
 ) -> String {
     scenario
         .component(identity.owner)
@@ -1959,7 +1959,7 @@ fn storage_request_for(
         .to_string()
 }
 
-fn storage_claim_name(identity: &crate::storage_plan::StorageIdentity) -> String {
+fn storage_claim_name(identity: &crate::targets::storage::StorageIdentity) -> String {
     let prefix = format!(
         "storage-{}-{}",
         sanitize_dns_name(identity.owner_moniker.as_str()),

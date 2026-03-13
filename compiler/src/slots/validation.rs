@@ -12,9 +12,9 @@ use miette::{Diagnostic, NamedSource, Report, SourceSpan};
 use thiserror::Error;
 
 use crate::{
-    frontend::{ResolvedNode, ResolvedTree},
-    slot_query::{SlotQueryError, SlotTarget, parse_slot_query},
-    store::{DigestStore, display_url},
+    DigestStore,
+    frontend::{ResolvedNode, ResolvedTree, store::display_url},
+    slots::{SlotQueryError, SlotTarget, parse_slot_query},
 };
 
 #[derive(Debug, Error, Diagnostic)]

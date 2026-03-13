@@ -10,7 +10,7 @@ use amber_scenario::{
 use miette::Diagnostic;
 use thiserror::Error;
 
-use crate::{DigestStore, Provenance, manifest_table};
+use crate::{DigestStore, Provenance, linker::manifest_table};
 
 #[derive(Debug, Error, Diagnostic)]
 #[non_exhaustive]
@@ -875,7 +875,7 @@ mod tests {
     use amber_scenario::{Moniker, ProvideRef};
 
     use super::*;
-    use crate::program_lowering::lower_program;
+    use crate::linker::program_lowering::lower_program;
 
     fn component(id: usize, moniker: &str) -> Component {
         Component {

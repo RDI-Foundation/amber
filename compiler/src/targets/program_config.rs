@@ -23,13 +23,15 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
-    config_resolution::{
-        QueryResolution, parse_query_segments, resolve_config_query_node,
-        validate_config_query_syntax,
+    config::{
+        query::{
+            QueryResolution, parse_query_segments, resolve_config_query_node,
+            validate_config_query_syntax,
+        },
+        scope::{RuntimeConfigView, build_runtime_config_view},
+        templates,
     },
-    config_scope::{RuntimeConfigView, build_runtime_config_view},
-    config_templates,
-    slot_query::{
+    slots::{
         SlotObject, SlotTarget, SlotValue, parse_slot_query, resolve_slot_query,
         slot_query_is_present,
     },
@@ -226,8 +228,7 @@ pub(crate) struct ComponentRuntimePlan<'a> {
 fn compose_component_config_templates(
     scenario: &Scenario,
 ) -> Result<HashMap<ComponentId, rc::RootConfigTemplate>, MeshError> {
-    let composed =
-        config_templates::compose_root_config_templates(scenario.root, &scenario.components);
+    let composed = templates::compose_root_config_templates(scenario.root, &scenario.components);
     if let Some(err) = composed.errors.first() {
         return Err(MeshError::new(format!(
             "failed to compose component config templates: {}",
@@ -2807,7 +2808,9 @@ mod tests {
     use amber_scenario::{BindingEdge, Component, Moniker, Scenario};
 
     use super::*;
-    use crate::{config_template::parse_instance_config_template, program_lowering::lower_program};
+    use crate::{
+        config::template::parse_instance_config_template, linker::program_lowering::lower_program,
+    };
 
     fn test_scenario() -> Scenario {
         let manifest: Manifest = r#"

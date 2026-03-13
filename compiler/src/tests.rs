@@ -3363,7 +3363,7 @@ fn check_from_tree_handles_malformed_program_image_from_builder_with_source() {
     let spans = Arc::new(amber_manifest::ManifestSpans::parse(&source));
     store.put_source(
         url.clone(),
-        crate::store::StoredSource {
+        crate::frontend::store::StoredSource {
             digest,
             source,
             spans,

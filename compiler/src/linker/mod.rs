@@ -1,6 +1,10 @@
 #![allow(unused_assignments)]
 #![allow(clippy::result_large_err)]
 
+pub(crate) mod manifest_table;
+pub(crate) mod program_lowering;
+mod provenance;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
@@ -19,16 +23,17 @@ use amber_scenario::{
 };
 use jsonschema::Validator;
 use miette::{Diagnostic, NamedSource, SourceSpan};
+pub use provenance::{ComponentProvenance, Provenance};
 use serde_json::Value;
 use thiserror::Error;
 
-use super::frontend::{ResolvedNode, ResolvedTree};
+use self::program_lowering::{
+    ProgramLoweringError, ProgramLoweringSite, lower_program_with_origins,
+};
 use crate::{
-    ComponentProvenance, DigestStore, Provenance,
-    config_resolution::render_static_config_string,
-    config_templates,
-    program_lowering::{ProgramLoweringError, ProgramLoweringSite, lower_program_with_origins},
-    store::display_url,
+    DigestStore,
+    config::{query::render_static_config_string, templates},
+    frontend::{ResolvedNode, ResolvedTree, store::display_url},
 };
 
 #[allow(unused_assignments)]
@@ -236,7 +241,7 @@ impl<'a> ConfigErrorSite<'a> {
             config_span,
             instance_path,
         )?;
-        let name = crate::store::display_url(&parent_prov.resolved_url);
+        let name = display_url(&parent_prov.resolved_url);
         Some(ConfigSite {
             src: NamedSource::new(name, Arc::clone(&stored.source)).with_language("json5"),
             span,
@@ -897,13 +902,12 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
     debug_assert_eq!(components.len(), provenance.components.len());
     debug_assert_eq!(components.len(), link_index.len());
 
-    let manifests =
-        crate::manifest_table::build_manifest_table(&components, store).map_err(|e| {
-            Error::MissingManifest {
-                component_path: component_path_for(&components, e.component),
-                digest: e.digest,
-            }
-        })?;
+    let manifests = manifest_table::build_manifest_table(&components, store).map_err(|e| {
+        Error::MissingManifest {
+            component_path: component_path_for(&components, e.component),
+            digest: e.digest,
+        }
+    })?;
 
     for (c, m) in components.iter_mut().zip(&manifests) {
         let (Some(c), Some(m)) = (c.as_mut(), m.as_ref()) else {
@@ -1300,7 +1304,7 @@ fn validate_config_tree(
     store: &DigestStore,
     schema_cache: &mut HashMap<ManifestDigest, Arc<Validator>>,
     errors: &mut Vec<Error>,
-) -> config_templates::ComposedTemplates {
+) -> templates::ComposedTemplates {
     fn invalid_config_error(
         component_path: String,
         site: &ConfigSite,
@@ -1780,7 +1784,7 @@ fn validate_config_tree(
         validate_resource_config_refs(id, components, manifests, provenance, store, schema, errors);
     }
 
-    let composed = config_templates::compose_root_config_templates(root, components);
+    let composed = templates::compose_root_config_templates(root, components);
 
     for err in &composed.errors {
         let component_path = component_path_for(components, err.component);
@@ -1891,7 +1895,7 @@ fn validate_config_tree(
 fn resolve_resource_params(
     components: &mut [Option<Component>],
     manifests: &[Option<Arc<Manifest>>],
-    composed: &config_templates::ComposedTemplates,
+    composed: &templates::ComposedTemplates,
     provenance: &Provenance,
     store: &DigestStore,
     errors: &mut Vec<Error>,
@@ -3429,7 +3433,7 @@ mod tests {
     };
 
     use super::collect_program_slot_uses;
-    use crate::program_lowering::lower_program;
+    use crate::linker::program_lowering::lower_program;
 
     #[test]
     fn collect_program_slot_uses_includes_slot_conditions() {

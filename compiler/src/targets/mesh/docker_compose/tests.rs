@@ -23,8 +23,9 @@ use url::Url;
 
 use super::DockerComposeReporter;
 use crate::{
-    program_lowering::lower_program, reporter::Reporter as _, storage_plan::StorageIdentity,
-    targets::mesh::internal_images::resolve_internal_images,
+    linker::program_lowering::lower_program,
+    reporter::Reporter as _,
+    targets::{mesh::internal_images::resolve_internal_images, storage::StorageIdentity},
 };
 
 fn digest(byte: u8) -> ManifestDigest {

@@ -4,7 +4,7 @@ use amber_manifest::NetworkProtocol;
 use amber_scenario::{ComponentId, Scenario};
 
 use crate::{
-    slot_query::{SlotObject, SlotValue},
+    slots::{SlotObject, SlotValue},
     targets::mesh::{
         plan::{
             MeshError, MeshPlan, ResolvedBinding, ResolvedComponentBinding,

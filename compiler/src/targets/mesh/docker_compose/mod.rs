@@ -26,7 +26,6 @@ use crate::{
             build_execution_guide,
         },
     },
-    storage_plan::{StorageIdentity, build_storage_plan},
     targets::{
         mesh::{
             addressing::{
@@ -47,6 +46,7 @@ use crate::{
             ComponentExecutionPlan, ProgramImagePart, ProgramImagePlan, ProgramSupport,
             build_component_runtime_plan, build_config_plan,
         },
+        storage::{StorageIdentity, build_storage_plan},
     },
 };
 

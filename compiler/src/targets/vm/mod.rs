@@ -11,14 +11,13 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::{
-    config_templates,
+    config::templates,
     reporter::{
         CompiledScenario, Reporter, ReporterError,
         execution_guide::{
             GENERATED_ENV_SAMPLE_FILENAME, GENERATED_README_FILENAME, build_execution_guide,
         },
     },
-    storage_plan::{StorageIdentity, StorageMount, StoragePlan, build_storage_plan},
     targets::{
         common::{TargetError as MeshError, component_label},
         direct::{
@@ -48,6 +47,7 @@ use crate::{
             build_component_runtime_plan, build_config_plan, build_vm_cloud_init_template_string,
             resolve_vm_scalar_u32,
         },
+        storage::{StorageIdentity, StorageMount, StoragePlan, build_storage_plan},
     },
 };
 
@@ -188,8 +188,7 @@ struct VmComponentPlanInputs<'a> {
     mesh_ports_by_component: &'a HashMap<ComponentId, u16>,
     compiled: &'a CompiledScenario,
     program_components: &'a [ComponentId],
-    slot_values_by_component:
-        &'a HashMap<ComponentId, BTreeMap<String, crate::slot_query::SlotValue>>,
+    slot_values_by_component: &'a HashMap<ComponentId, BTreeMap<String, crate::slots::SlotValue>>,
 }
 
 impl Reporter for VmReporter {
@@ -406,8 +405,7 @@ fn build_component_plans(
         slot_values_by_component,
     } = inputs;
 
-    let composed =
-        config_templates::compose_root_config_templates(scenario.root, &scenario.components);
+    let composed = templates::compose_root_config_templates(scenario.root, &scenario.components);
     if let Some(err) = composed.errors.first() {
         return Err(MeshError::new(format!(
             "failed to compose component config templates: {}",
@@ -831,7 +829,7 @@ fn placeholder_mesh_ports(program_components: &[ComponentId]) -> HashMap<Compone
 
 fn build_runtime_address_plan(
     scenario: &Scenario,
-    slot_values_by_component: &HashMap<ComponentId, BTreeMap<String, crate::slot_query::SlotValue>>,
+    slot_values_by_component: &HashMap<ComponentId, BTreeMap<String, crate::slots::SlotValue>>,
 ) -> Result<DirectRuntimeAddressPlan, MeshError> {
     let mut slots_by_scope = BTreeMap::new();
     let mut slot_items_by_scope = BTreeMap::new();
@@ -851,7 +849,7 @@ fn build_runtime_address_plan(
                     ))
                 })?;
             match (slot_decl.multiple, value) {
-                (true, crate::slot_query::SlotValue::One(value)) => {
+                (true, crate::slots::SlotValue::One(value)) => {
                     repeated_entries.insert(
                         slot.clone(),
                         vec![DirectRuntimeUrlSource::SlotItem {
@@ -862,7 +860,7 @@ fn build_runtime_address_plan(
                         }],
                     );
                 }
-                (false, crate::slot_query::SlotValue::One(value)) => {
+                (false, crate::slots::SlotValue::One(value)) => {
                     singular_entries.insert(
                         slot.clone(),
                         DirectRuntimeUrlSource::Slot {
@@ -872,7 +870,7 @@ fn build_runtime_address_plan(
                         },
                     );
                 }
-                (_, crate::slot_query::SlotValue::Many(values)) => {
+                (_, crate::slots::SlotValue::Many(values)) => {
                     let mut sources = Vec::with_capacity(values.len());
                     for (item_index, value) in values.iter().enumerate() {
                         sources.push(DirectRuntimeUrlSource::SlotItem {

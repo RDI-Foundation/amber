@@ -15,31 +15,19 @@ use amber_scenario::{BindingFrom, ComponentId, Scenario};
 use miette::{Diagnostic, Report};
 use thiserror::Error;
 
-mod config_resolution;
-pub(crate) mod config_scope;
-mod config_template;
-mod config_templates;
-mod environment;
+mod config;
 mod frontend;
 mod linker;
-mod manifest_table;
 pub mod mesh;
 mod mir;
-mod program_lowering;
-mod provenance;
-mod slot_query;
-mod slot_validation;
-mod storage_plan;
-mod store;
+mod slots;
 mod targets;
 
 pub mod bundle;
 pub mod reporter;
 
-pub use environment::ResolverRegistry;
-pub use frontend::{ResolveOptions, ResolvedNode, ResolvedTree};
-pub use provenance::{ComponentProvenance, Provenance};
-pub use store::DigestStore;
+pub use frontend::{DigestStore, ResolveOptions, ResolvedNode, ResolvedTree, ResolverRegistry};
+pub use linker::{ComponentProvenance, Provenance};
 
 #[derive(Clone, Debug, Default)]
 pub struct CompileOptions {
@@ -139,7 +127,7 @@ impl Compiler {
         opts: OptimizeOptions,
     ) -> Result<CompileOutput, Error> {
         let mut diagnostics =
-            slot_validation::collect_slot_interpolation_diagnostics_from_tree(&tree, &self.store);
+            slots::collect_slot_interpolation_diagnostics_from_tree(&tree, &self.store);
         let (scenario, provenance) = linker::link(tree, &self.store)?;
         diagnostics.extend(collect_manifest_diagnostics(
             &scenario,
@@ -165,7 +153,7 @@ impl Compiler {
     #[allow(clippy::result_large_err)]
     pub fn check_from_tree(&self, tree: ResolvedTree) -> Result<CheckOutput, Error> {
         let mut diagnostics =
-            slot_validation::collect_slot_interpolation_diagnostics_from_tree(&tree, &self.store);
+            slots::collect_slot_interpolation_diagnostics_from_tree(&tree, &self.store);
         let mut has_errors = false;
         let tree_for_manifest_lints = tree.clone();
 

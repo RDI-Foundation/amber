@@ -10,7 +10,7 @@ use url::Url;
 use super::flatten_routing_only;
 use crate::{
     CompileOutput, ComponentProvenance, DigestStore, Provenance,
-    program_lowering::lower_program,
+    linker::program_lowering::lower_program,
     reporter::{Reporter as _, dot::DotReporter},
 };
 

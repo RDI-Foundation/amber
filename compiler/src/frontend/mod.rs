@@ -1,6 +1,9 @@
 #![allow(unused_assignments)]
 #![allow(clippy::result_large_err)]
 
+mod registry;
+pub(crate) mod store;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
@@ -14,14 +17,13 @@ use amber_manifest::{ComponentDecl, ExperimentalFeature, Manifest, ManifestDiges
 use amber_resolver::{self as resolver, RemoteResolver, Resolver};
 use futures::stream::StreamExt;
 use miette::{Diagnostic, NamedSource, SourceSpan};
+pub use registry::ResolverRegistry;
+pub use store::DigestStore;
 use thiserror::Error;
 use tokio::sync::{OnceCell, Semaphore};
 use url::Url;
 
-use crate::{
-    DigestStore, ResolverRegistry,
-    store::{StoredSource, display_url},
-};
+use self::store::{StoredSource, display_url};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExperimentalFeatureList(Vec<ExperimentalFeature>);

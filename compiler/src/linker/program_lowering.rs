@@ -11,7 +11,7 @@ use amber_scenario::{
 use amber_template::{TemplatePart, TemplateString};
 use serde_json::Value;
 
-use crate::config_resolution::{
+use crate::config::query::{
     QueryResolution, parse_query_segments, resolve_config_query_node, validate_config_query_syntax,
 };
 

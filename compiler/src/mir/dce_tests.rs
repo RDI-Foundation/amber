@@ -8,7 +8,7 @@ use amber_scenario::{
 use serde_json::json;
 
 use super::dce_only;
-use crate::program_lowering::lower_program;
+use crate::linker::program_lowering::lower_program;
 
 fn component(id: usize, moniker: &str) -> Component {
     Component {

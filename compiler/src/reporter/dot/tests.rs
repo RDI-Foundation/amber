@@ -7,7 +7,7 @@ use amber_scenario::{
 };
 
 use super::{render_dot, render_dot_with_exports};
-use crate::program_lowering::lower_program;
+use crate::linker::program_lowering::lower_program;
 
 fn component(id: usize, moniker: &str) -> Component {
     Component {
