@@ -7,7 +7,6 @@ use std::{
 use amber_config as rc;
 use amber_manifest::{
     InterpolatedPart, InterpolationSource, MountSource, ProgramArgItem, VmScalarU32,
-    framework_capability,
 };
 use amber_scenario::{
     ComponentId, FileMount, FileMountSource, Program, ProgramCondition, ProgramEach, ProgramMount,
@@ -352,6 +351,7 @@ pub(crate) fn build_config_plan(
     let mount_specs = build_mount_specs(
         scenario,
         program_components,
+        runtime_address_resolution,
         &resolved_templates,
         slot_values_by_component,
     )?;
@@ -896,6 +896,7 @@ fn file_mount_uses_config(mount: &FileMount) -> bool {
 fn build_mount_specs(
     scenario: &Scenario,
     program_components: &[ComponentId],
+    runtime_address_resolution: RuntimeAddressResolution,
     resolved_templates: &HashMap<ComponentId, rc::RootConfigTemplate>,
     slot_values_by_component: &HashMap<ComponentId, BTreeMap<String, SlotValue>>,
 ) -> Result<HashMap<ComponentId, Vec<MountSpec>>, MeshError> {
@@ -939,6 +940,7 @@ fn build_mount_specs(
         } else {
             None
         };
+        let component_schema = component.config_schema.as_ref();
 
         let mut specs = Vec::new();
         for (mount_idx, mount) in program.mounts().iter().enumerate() {
@@ -966,6 +968,7 @@ fn build_mount_specs(
                     scenario,
                     *id,
                     &format!("{location}.path"),
+                    runtime_address_resolution,
                     &mount.path,
                     slots,
                     template_opt,
@@ -978,6 +981,7 @@ fn build_mount_specs(
                     scenario,
                     *id,
                     &format!("{location}.from"),
+                    runtime_address_resolution,
                     &mount.source,
                     slots,
                     template_opt,
@@ -1003,15 +1007,25 @@ fn build_mount_specs(
 
                 let path = render_template_string_static(&path_ts)?;
                 let source_raw = render_template_string_static(&source_ts)?;
-                let source = source_raw.parse::<MountSource>().map_err(|err| {
+                let source = rc::parse_rendered_file_mount_source(&source_raw).map_err(|err| {
                     MeshError::new(format!(
                         "invalid mount source `{source_raw}` in {} {location}: {err}",
                         component_label(scenario, *id)
                     ))
                 })?;
+                let component_schema = component_schema.expect("file mounts require config_schema");
+                rc::validate_rendered_file_mount_source(component_schema, source).map_err(
+                    |err| {
+                        MeshError::new(format!(
+                            "invalid mount source `{source_raw}` in {} {location}: {err}",
+                            component_label(scenario, *id)
+                        ))
+                    },
+                )?;
                 match source {
-                    MountSource::Config(path_query) | MountSource::Secret(path_query) => {
-                        match resolve_config_query_for_mount(template_opt, &path_query)? {
+                    rc::RenderedFileMountSource::Config { path: path_query }
+                    | rc::RenderedFileMountSource::Secret { path: path_query } => {
+                        match resolve_config_query_for_mount(template_opt, path_query)? {
                             MountResolution::Static(value) => {
                                 let content = rc::stringify_for_mount(&value)
                                     .map_err(|err| MeshError::new(err.to_string()))?;
@@ -1027,25 +1041,6 @@ fn build_mount_specs(
                             }
                         }
                     }
-                    MountSource::Resource(_) | MountSource::Slot(_) => {
-                        // Storage mounts are planned separately from helper-written file mounts.
-                    }
-                    MountSource::Framework(name) => {
-                        if framework_capability(name.as_str()).is_none() {
-                            return Err(MeshError::new(format!(
-                                "unknown framework mount source framework.{} in {}",
-                                name,
-                                component_label(scenario, *id)
-                            )));
-                        }
-                        // Handled by target-specific runtime wiring.
-                    }
-                    _ => {
-                        return Err(MeshError::new(format!(
-                            "unsupported mount source `{source_raw}` in {}",
-                            component_label(scenario, *id)
-                        )));
-                    }
                 }
                 Ok(())
             };
@@ -1054,11 +1049,25 @@ fn build_mount_specs(
                 None => emit_spec(ItemResolution::NotAllowed, None, &mut specs)?,
                 Some(each) => match each {
                     ProgramEach::Slot { slot: slot_name } => {
+                        let scope = id.0 as u64;
                         let items = repeated_slot_items_for_component(
                             scenario, *id, slot_name, slots, &location,
                         )?;
-                        for item in items {
-                            emit_spec(ItemResolution::StaticSlot(item), None, &mut specs)?;
+                        for (item_idx, item) in items.iter().enumerate() {
+                            let item_resolution = if matches!(
+                                runtime_address_resolution,
+                                RuntimeAddressResolution::Deferred
+                            ) {
+                                ItemResolution::RuntimeSlotTemplate {
+                                    scope,
+                                    slot: slot_name,
+                                    index: item_idx,
+                                    item,
+                                }
+                            } else {
+                                ItemResolution::StaticSlot(item)
+                            };
+                            emit_spec(item_resolution, None, &mut specs)?;
                         }
                     }
                     ProgramEach::Config { path } => {
@@ -1137,6 +1146,7 @@ fn resolve_lowered_template_string(
     scenario: &Scenario,
     id: ComponentId,
     location: &str,
+    runtime_address_resolution: RuntimeAddressResolution,
     value: &TemplateString,
     slots: &BTreeMap<String, SlotValue>,
     template_opt: Option<&rc::ConfigNode>,
@@ -1160,6 +1170,23 @@ fn resolve_lowered_template_string(
                     }
                 }
             }
+            TemplatePart::Slot { slot, .. }
+                if matches!(
+                    runtime_address_resolution,
+                    RuntimeAddressResolution::Deferred
+                ) =>
+            {
+                resolve_slot_interpolation(
+                    scenario,
+                    id,
+                    location,
+                    &InterpolationSource::Slots,
+                    slot,
+                    slots,
+                )?;
+                ts.push(part.clone());
+                *needs_helper_for_program_templates = true;
+            }
             TemplatePart::Slot { slot, .. } => {
                 if let Some(value) = resolve_slot_interpolation(
                     scenario,
@@ -1179,10 +1206,16 @@ fn resolve_lowered_template_string(
                          {component} {location}",
                     )));
                 }
-                ItemResolution::RuntimeSlotTemplate { .. } => unreachable!(
-                    "lowered mount templates should not contain TemplatePart::CurrentItem with \
-                     runtime slot templates"
-                ),
+                ItemResolution::RuntimeSlotTemplate {
+                    scope,
+                    slot,
+                    index,
+                    item: item_value,
+                } => {
+                    resolve_slot_item_interpolation(item_value, item, &component, location)?;
+                    ts.push(TemplatePart::item(scope, slot, index, item.clone()));
+                    *needs_helper_for_program_templates = true;
+                }
                 ItemResolution::RuntimeCurrentItem => {
                     ts.push(TemplatePart::current_item(item.clone()));
                     *needs_helper_for_program_templates = true;
@@ -1201,8 +1234,14 @@ fn resolve_lowered_template_string(
                          {component} {location}",
                     )));
                 }
-                ItemResolution::RuntimeSlotTemplate { .. } => {
-                    ts.push(TemplatePart::current_item(item.clone()));
+                ItemResolution::RuntimeSlotTemplate {
+                    scope,
+                    slot,
+                    index,
+                    item: item_value,
+                } => {
+                    resolve_slot_item_interpolation(item_value, item, &component, location)?;
+                    ts.push(TemplatePart::item(scope, slot, index, item.clone()));
                     *needs_helper_for_program_templates = true;
                 }
                 ItemResolution::RuntimeCurrentItem => {
@@ -1231,6 +1270,7 @@ fn resolve_lowered_mount_source(
     scenario: &Scenario,
     id: ComponentId,
     location: &str,
+    runtime_address_resolution: RuntimeAddressResolution,
     source: &FileMountSource,
     slots: &BTreeMap<String, SlotValue>,
     template_opt: Option<&rc::ConfigNode>,
@@ -1247,6 +1287,7 @@ fn resolve_lowered_mount_source(
         scenario,
         id,
         location,
+        runtime_address_resolution,
         path,
         slots,
         template_opt,
@@ -2898,9 +2939,19 @@ mod tests {
         }
     }
 
+    fn scenario_with_child(child: Component) -> Scenario {
+        let mut root = component_with_config_and_program(0, None, "/", None, None, None);
+        root.children.push(child.id);
+        Scenario {
+            root: ComponentId(0),
+            components: vec![Some(root), Some(child)],
+            bindings: Vec::<BindingEdge>::new(),
+            exports: Vec::new(),
+        }
+    }
+
     #[test]
     fn build_mount_specs_materializes_literal_config_mounts() {
-        let mut root = component_with_config_and_program(0, None, "/", None, None, None);
         let child = component_with_config_and_program(
             1,
             Some(0),
@@ -2923,17 +2974,12 @@ mod tests {
                 ],
             })),
         );
-        root.children.push(ComponentId(1));
-        let scenario = Scenario {
-            root: ComponentId(0),
-            components: vec![Some(root), Some(child)],
-            bindings: Vec::<BindingEdge>::new(),
-            exports: Vec::new(),
-        };
+        let scenario = scenario_with_child(child);
         let templates = compose_component_config_templates(&scenario).expect("templates");
         let mount_specs = build_mount_specs(
             &scenario,
             &[ComponentId(1)],
+            RuntimeAddressResolution::Static,
             &templates,
             &HashMap::from([(ComponentId(1), BTreeMap::new())]),
         )
@@ -2945,6 +2991,276 @@ mod tests {
                 path: "/etc/app/config.txt".to_string(),
                 content: "hello from config".to_string(),
             }])
+        );
+    }
+
+    #[test]
+    fn build_mount_specs_defers_slot_mount_templates_for_deferred_runtime_addresses() {
+        let config_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mount_file": { "type": "string" }
+            },
+            "required": ["mount_file"]
+        });
+        let config = serde_json::json!({
+            "mount_file": "hello from config"
+        });
+        let manifest: Manifest = r#"
+            {
+              manifest_version: "0.3.0",
+              config_schema: {
+                type: "object",
+                properties: {
+                  mount_file: { type: "string" }
+                },
+                required: ["mount_file"]
+              },
+              slots: {
+                api: { kind: "http", optional: true }
+              },
+              program: {
+                image: "app",
+                entrypoint: ["app"],
+                mounts: [
+                  { path: "/tmp/${slots.api.url}", from: "config.mount_file" }
+                ]
+              }
+            }
+        "#
+        .parse()
+        .expect("manifest");
+        let template = parse_instance_config_template(Some(&config), Some(&config_schema))
+            .expect("component config template");
+        let program = lower_program(
+            ComponentId(1),
+            manifest.program().expect("program"),
+            Some(&template),
+        )
+        .expect("program");
+        let child = Component {
+            id: ComponentId(1),
+            parent: Some(ComponentId(0)),
+            moniker: Moniker::from(Arc::<str>::from("/worker")),
+            digest: ManifestDigest::new([1; 32]),
+            config: Some(config),
+            config_schema: Some(config_schema),
+            program: Some(program),
+            slots: manifest
+                .slots()
+                .iter()
+                .map(|(name, decl)| (name.to_string(), decl.clone()))
+                .collect(),
+            provides: BTreeMap::new(),
+            resources: BTreeMap::new(),
+            metadata: None,
+            children: Vec::new(),
+        };
+        let scenario = scenario_with_child(child);
+        let templates = compose_component_config_templates(&scenario).expect("templates");
+        let mount_specs = build_mount_specs(
+            &scenario,
+            &[ComponentId(1)],
+            RuntimeAddressResolution::Deferred,
+            &templates,
+            &HashMap::from([(ComponentId(1), test_slot_values())]),
+        )
+        .expect("mount specs");
+
+        assert_eq!(
+            mount_specs.get(&ComponentId(1)),
+            Some(&vec![MountSpec::Template(MountTemplateSpec {
+                when: None,
+                each: None,
+                path: vec![TemplatePart::lit("/tmp/"), TemplatePart::slot(1, "api.url"),],
+                source: vec![
+                    TemplatePart::lit("config."),
+                    TemplatePart::lit("mount_file"),
+                ],
+            })])
+        );
+    }
+
+    #[test]
+    fn build_mount_specs_defers_repeated_slot_item_mount_templates_for_deferred_runtime_addresses()
+    {
+        let config_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mount_file": { "type": "string" }
+            },
+            "required": ["mount_file"]
+        });
+        let config = serde_json::json!({
+            "mount_file": "hello from config"
+        });
+        let manifest: Manifest = r#"
+            {
+              manifest_version: "0.3.0",
+              config_schema: {
+                type: "object",
+                properties: {
+                  mount_file: { type: "string" }
+                },
+                required: ["mount_file"]
+              },
+              slots: {
+                upstream: { kind: "http", optional: true, multiple: true }
+              },
+              program: {
+                image: "app",
+                entrypoint: ["app"],
+                mounts: [
+                  {
+                    each: "slots.upstream",
+                    path: "/tmp/${item.url}",
+                    from: "config.mount_file"
+                  }
+                ]
+              }
+            }
+        "#
+        .parse()
+        .expect("manifest");
+        let template = parse_instance_config_template(Some(&config), Some(&config_schema))
+            .expect("component config template");
+        let program = lower_program(
+            ComponentId(1),
+            manifest.program().expect("program"),
+            Some(&template),
+        )
+        .expect("program");
+        let child = Component {
+            id: ComponentId(1),
+            parent: Some(ComponentId(0)),
+            moniker: Moniker::from(Arc::<str>::from("/worker")),
+            digest: ManifestDigest::new([1; 32]),
+            config: Some(config),
+            config_schema: Some(config_schema),
+            program: Some(program),
+            slots: manifest
+                .slots()
+                .iter()
+                .map(|(name, decl)| (name.to_string(), decl.clone()))
+                .collect(),
+            provides: BTreeMap::new(),
+            resources: BTreeMap::new(),
+            metadata: None,
+            children: Vec::new(),
+        };
+        let scenario = scenario_with_child(child);
+        let templates = compose_component_config_templates(&scenario).expect("templates");
+        let mount_specs = build_mount_specs(
+            &scenario,
+            &[ComponentId(1)],
+            RuntimeAddressResolution::Deferred,
+            &templates,
+            &HashMap::from([(ComponentId(1), test_slot_values())]),
+        )
+        .expect("mount specs");
+
+        assert_eq!(
+            mount_specs.get(&ComponentId(1)),
+            Some(&vec![MountSpec::Template(MountTemplateSpec {
+                when: None,
+                each: None,
+                path: vec![
+                    TemplatePart::lit("/tmp/"),
+                    TemplatePart::item(1, "upstream", 0, "url"),
+                ],
+                source: vec![
+                    TemplatePart::lit("config."),
+                    TemplatePart::lit("mount_file"),
+                ],
+            })])
+        );
+    }
+
+    #[test]
+    fn build_mount_specs_rejects_config_mount_source_that_resolves_to_secret_path() {
+        let child = component_with_config_and_program(
+            1,
+            Some(0),
+            "/worker",
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "source_path": { "type": "string" },
+                    "token": { "type": "string", "secret": true }
+                },
+                "required": ["source_path", "token"]
+            })),
+            Some(serde_json::json!({
+                "source_path": "token",
+                "token": "shh"
+            })),
+            Some(serde_json::json!({
+                "image": "app",
+                "entrypoint": ["app"],
+                "mounts": [
+                    { "path": "/etc/app/config.txt", "from": "config.${config.source_path}" }
+                ],
+            })),
+        );
+        let scenario = scenario_with_child(child);
+        let templates = compose_component_config_templates(&scenario).expect("templates");
+        let err = build_mount_specs(
+            &scenario,
+            &[ComponentId(1)],
+            RuntimeAddressResolution::Static,
+            &templates,
+            &HashMap::from([(ComponentId(1), BTreeMap::new())]),
+        )
+        .expect_err("config mount to a secret path should fail");
+
+        assert!(
+            err.to_string()
+                .contains("config mount path `token` refers to secret config"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn build_mount_specs_rejects_secret_mount_source_that_resolves_to_public_path() {
+        let child = component_with_config_and_program(
+            1,
+            Some(0),
+            "/worker",
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "source_path": { "type": "string" },
+                    "public": { "type": "string" }
+                },
+                "required": ["source_path", "public"]
+            })),
+            Some(serde_json::json!({
+                "source_path": "public",
+                "public": "hello"
+            })),
+            Some(serde_json::json!({
+                "image": "app",
+                "entrypoint": ["app"],
+                "mounts": [
+                    { "path": "/etc/app/secret.txt", "from": "secret.${config.source_path}" }
+                ],
+            })),
+        );
+        let scenario = scenario_with_child(child);
+        let templates = compose_component_config_templates(&scenario).expect("templates");
+        let err = build_mount_specs(
+            &scenario,
+            &[ComponentId(1)],
+            RuntimeAddressResolution::Static,
+            &templates,
+            &HashMap::from([(ComponentId(1), BTreeMap::new())]),
+        )
+        .expect_err("secret mount to a public path should fail");
+
+        assert!(
+            err.to_string()
+                .contains("secret mount path `public` is not secret"),
+            "{err}"
         );
     }
 

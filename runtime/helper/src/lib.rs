@@ -278,7 +278,7 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
         )));
     }
 
-    let component_config = if config_payload_present {
+    let (component_config, component_schema) = if config_payload_present {
         let root_schema_b64 = root_schema_b64
             .ok_or_else(|| HelperError::Msg(format!("{ROOT_SCHEMA_ENV} is required")))?;
         let component_schema_b64 = component_schema_b64
@@ -324,9 +324,9 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
             }
         }
 
-        Some(component_config)
+        (Some(component_config), Some(component_schema))
     } else {
-        None
+        (None, None)
     };
 
     if mount_requires_config && component_config.is_none() {
@@ -416,6 +416,7 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
     write_mounts(
         &mounts,
         component_config.as_ref(),
+        component_schema.as_ref(),
         &runtime_template_context,
     )?;
 
@@ -736,11 +737,15 @@ fn decode_b64_json_t<T: for<'de> Deserialize<'de>>(name: &'static str, raw: &str
 fn write_mounts(
     mounts: &[MountSpec],
     component_config: Option<&Value>,
+    component_schema: Option<&Value>,
     runtime_template_context: &RuntimeTemplateContext,
 ) -> Result<()> {
-    for (path, content) in
-        config::render_mount_specs(mounts, component_config, runtime_template_context)?
-    {
+    for (path, content) in config::render_mount_specs(
+        mounts,
+        component_config,
+        component_schema,
+        runtime_template_context,
+    )? {
         let mount_path = std::path::Path::new(&path);
         if let Some(parent) = mount_path.parent() {
             std::fs::create_dir_all(parent)

@@ -254,7 +254,8 @@ pub(crate) async fn run_vm_init(plan: PathBuf, storage_root: Option<PathBuf>) ->
                 build_component_config(component.runtime_config.as_ref(), &runtime_context)?;
             let mount_files = render_mount_files(
                 component.mount_spec_b64.as_deref(),
-                component_config.as_ref(),
+                component_config.as_ref().map(|(config, _)| config),
+                component_config.as_ref().map(|(_, schema)| schema),
                 &runtime_context,
             )?;
             wait_for_guestfwd_targets(component, &port_assignments, VM_GUESTFWD_READY_TIMEOUT)?;
@@ -271,7 +272,7 @@ pub(crate) async fn run_vm_init(plan: PathBuf, storage_root: Option<PathBuf>) ->
                 component,
                 &port_assignments,
                 &runtime_context,
-                component_config.as_ref(),
+                component_config.as_ref().map(|(config, _)| config),
                 &mount_files,
             )?;
             spawn_command(
@@ -978,6 +979,7 @@ async fn cleanup_vm_runtime(
 fn render_mount_files(
     mount_spec_b64: Option<&str>,
     component_config: Option<&Value>,
+    component_schema: Option<&Value>,
     runtime_context: &RuntimeTemplateContext,
 ) -> Result<Vec<RenderedMountFile>> {
     let Some(mount_spec_b64) = mount_spec_b64 else {
@@ -985,8 +987,9 @@ fn render_mount_files(
     };
     let mounts = decode_b64_json_t::<Vec<MountSpec>>("AMBER_MOUNT_SPEC_B64", mount_spec_b64)?;
     let mut rendered = Vec::with_capacity(mounts.len());
-    for (path, contents) in render_mount_specs(&mounts, component_config, runtime_context)
-        .map_err(|err| miette::miette!("{err}"))?
+    for (path, contents) in
+        render_mount_specs(&mounts, component_config, component_schema, runtime_context)
+            .map_err(|err| miette::miette!("{err}"))?
     {
         if !Path::new(&path).is_absolute() {
             return Err(miette::miette!(
@@ -1005,7 +1008,7 @@ fn render_mount_files(
 fn build_component_config(
     payload: Option<&DirectRuntimeConfigPayload>,
     runtime_context: &RuntimeTemplateContext,
-) -> Result<Option<Value>> {
+) -> Result<Option<(Value, Value)>> {
     let Some(payload) = payload else {
         return Ok(None);
     };
@@ -1058,7 +1061,7 @@ fn build_component_config(
         }
     }
 
-    Ok(Some(component_config))
+    Ok(Some((component_config, component_schema)))
 }
 
 fn build_vm_runtime_template_context(

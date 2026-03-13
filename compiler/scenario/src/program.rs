@@ -412,7 +412,7 @@ fn default_network_protocol() -> NetworkProtocol {
     NetworkProtocol::Http
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProgramMount {
     File(FileMount),
     Slot {
@@ -427,6 +427,42 @@ pub enum ProgramMount {
         path: String,
         capability: FrameworkCapabilityName,
     },
+}
+
+impl Serialize for ProgramMount {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum ProgramMountFields<'a> {
+            File(&'a FileMount),
+            Slot {
+                path: &'a str,
+                slot: &'a str,
+            },
+            Resource {
+                path: &'a str,
+                resource: &'a str,
+            },
+            Framework {
+                path: &'a str,
+                capability: &'a FrameworkCapabilityName,
+            },
+        }
+
+        let fields = match self {
+            Self::File(mount) => ProgramMountFields::File(mount),
+            Self::Slot { path, slot } => ProgramMountFields::Slot { path, slot },
+            Self::Resource { path, resource } => ProgramMountFields::Resource { path, resource },
+            Self::Framework { path, capability } => {
+                ProgramMountFields::Framework { path, capability }
+            }
+        };
+
+        fields.serialize(serializer)
+    }
 }
 
 impl<'de> Deserialize<'de> for ProgramMount {
@@ -618,7 +654,7 @@ fn validate_concrete_mount_path(path: &str) -> Result<(), String> {
 mod tests {
     use serde_json::json;
 
-    use super::Program;
+    use super::{FrameworkCapabilityName, Program, ProgramMount};
 
     #[test]
     fn program_deserialize_rejects_image_with_args() {
@@ -663,5 +699,23 @@ mod tests {
         .expect_err("invalid concrete mount paths must be rejected");
 
         assert!(err.to_string().contains("mount path must be absolute"));
+    }
+
+    #[test]
+    fn program_mount_serializes_with_kind_tag() {
+        let value = serde_json::to_value(ProgramMount::Framework {
+            path: "/var/run/docker.sock".to_string(),
+            capability: FrameworkCapabilityName::try_from("docker").expect("capability"),
+        })
+        .expect("program mount should serialize");
+
+        assert_eq!(
+            value,
+            json!({
+                "kind": "framework",
+                "path": "/var/run/docker.sock",
+                "capability": "docker"
+            })
+        );
     }
 }
