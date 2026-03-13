@@ -19,7 +19,7 @@ use amber_compiler::reporter::{
 };
 use amber_config::{
     build_root_config, env_var_for_path, eval_config_template_partial_with_context, get_by_path,
-    get_by_path_opt, render_template_string_with_context, stringify_for_mount,
+    render_template_string_with_context, stringify_for_mount,
 };
 use amber_mesh::{
     InboundTarget, MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MESH_PROVISION_PLAN_VERSION,
@@ -112,7 +112,7 @@ struct VmHostContext<'a> {
     accel: QemuAccel,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct RenderedMountFile {
     guest_path: String,
     contents: String,
@@ -149,18 +149,11 @@ struct QemuImgInfo {
     format: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum MountSpec {
-    Literal {
-        path: String,
-        content: String,
-    },
-    Config {
-        path: String,
-        config: String,
-        optional: bool,
-    },
+    Literal { path: String, content: String },
+    Config { path: String, config: String },
 }
 
 pub(crate) async fn run_vm_init(plan: PathBuf, storage_root: Option<PathBuf>) -> Result<()> {
@@ -1003,11 +996,7 @@ fn render_mount_files(
     for mount in mounts {
         let (path, contents) = match mount {
             MountSpec::Literal { path, content } => (path, content),
-            MountSpec::Config {
-                path,
-                config,
-                optional,
-            } => {
+            MountSpec::Config { path, config } => {
                 let component_config = component_config.ok_or_else(|| {
                     miette::miette!(
                         "mount {} requires config resolution but no runtime config payload was \
@@ -1015,22 +1004,12 @@ fn render_mount_files(
                         path
                     )
                 })?;
+                let value = get_by_path(component_config, &config).map_err(|err| {
+                    miette::miette!("failed to resolve config mount {}: {err}", config)
+                })?;
                 (
                     path,
-                    if optional {
-                        match get_by_path_opt(component_config, &config).map_err(|err| {
-                            miette::miette!("failed to resolve config mount {}: {err}", config)
-                        })? {
-                            Some(value) => stringify_for_mount(value)
-                                .map_err(|err| miette::miette!("{err}"))?,
-                            None => String::new(),
-                        }
-                    } else {
-                        let value = get_by_path(component_config, &config).map_err(|err| {
-                            miette::miette!("failed to resolve config mount {}: {err}", config)
-                        })?;
-                        stringify_for_mount(value).map_err(|err| miette::miette!("{err}"))?
-                    },
+                    stringify_for_mount(value).map_err(|err| miette::miette!("{err}"))?,
                 )
             }
         };
@@ -2995,29 +2974,6 @@ mod tests {
         assert!(rendered.contains("multipart/mixed"));
         assert!(rendered.contains("text/cloud-boothook"));
         assert!(rendered.contains("text/x-shellscript"));
-    }
-
-    #[test]
-    fn render_mount_files_uses_empty_contents_for_missing_optional_config() {
-        use base64::engine::general_purpose::STANDARD;
-
-        let mounts = vec![MountSpec::Config {
-            path: "/etc/secret.txt".to_string(),
-            config: "secret_value".to_string(),
-            optional: true,
-        }];
-        let mount_spec_b64 = STANDARD.encode(serde_json::to_vec(&mounts).unwrap());
-
-        let rendered = render_mount_files(Some(&mount_spec_b64), Some(&serde_json::json!({})))
-            .expect("render mount files");
-
-        assert_eq!(
-            rendered,
-            vec![RenderedMountFile {
-                guest_path: "/etc/secret.txt".to_string(),
-                contents: String::new(),
-            }]
-        );
     }
 
     #[test]

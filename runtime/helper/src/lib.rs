@@ -31,15 +31,8 @@ const RUNTIME_TEMPLATE_CONTEXT_ENV: &str = "AMBER_RUNTIME_TEMPLATE_CONTEXT_B64";
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 enum MountSpec {
-    Literal {
-        path: String,
-        content: String,
-    },
-    Config {
-        path: String,
-        config: String,
-        optional: bool,
-    },
+    Literal { path: String, content: String },
+    Config { path: String, config: String },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -534,26 +527,15 @@ fn write_mounts(mounts: &[MountSpec], component_config: Option<&Value>) -> Resul
     for mount in mounts {
         let (path, content) = match mount {
             MountSpec::Literal { path, content } => (path.as_str(), content.clone()),
-            MountSpec::Config {
-                path,
-                config,
-                optional,
-            } => {
+            MountSpec::Config { path, config } => {
                 let config_value = component_config.ok_or_else(|| {
                     HelperError::Msg(format!(
                         "mount {path} requires config resolution but no config payload was \
                          provided"
                     ))
                 })?;
-                let content = if *optional {
-                    match config::get_by_path_opt(config_value, config)? {
-                        Some(value) => config::stringify_for_mount(value)?,
-                        None => String::new(),
-                    }
-                } else {
-                    let value = config::get_by_path(config_value, config)?;
-                    config::stringify_for_mount(value)?
-                };
+                let value = config::get_by_path(config_value, config)?;
+                let content = config::stringify_for_mount(value)?;
                 (path.as_str(), content)
             }
         };
@@ -961,7 +943,6 @@ mod tests {
         let mounts = vec![MountSpec::Config {
             path: "/tmp/app.txt".to_string(),
             config: "app".to_string(),
-            optional: false,
         }];
 
         let envs = BTreeMap::from([
@@ -999,7 +980,6 @@ mod tests {
         let mounts = vec![MountSpec::Config {
             path: mount_path.display().to_string(),
             config: "app".to_string(),
-            optional: false,
         }];
 
         let schema = serde_json::json!({
@@ -1045,63 +1025,6 @@ mod tests {
 
         let contents = std::fs::read_to_string(&mount_path).expect("mount written");
         assert_eq!(contents, "hello");
-    }
-
-    #[test]
-    fn helper_optional_mount_with_missing_config_writes_empty_file() {
-        use base64::engine::general_purpose::STANDARD;
-        use tempfile::tempdir;
-
-        let dir = tempdir().expect("temp dir");
-        let mount_path = dir.path().join("secret.txt");
-
-        let entrypoint = vec!["/bin/echo".to_string(), "ok".to_string()];
-        let env = BTreeMap::from([("HELLO".to_string(), "world".to_string())]);
-        let mounts = vec![MountSpec::Config {
-            path: mount_path.display().to_string(),
-            config: "secret_value".to_string(),
-            optional: true,
-        }];
-
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "secret_value": { "type": "string", "secret": true }
-            }
-        });
-
-        let envs = BTreeMap::from([
-            (
-                RESOLVED_ENTRYPOINT_ENV.to_string(),
-                STANDARD.encode(serde_json::to_vec(&entrypoint).unwrap()),
-            ),
-            (
-                RESOLVED_ENV_ENV.to_string(),
-                STANDARD.encode(serde_json::to_vec(&env).unwrap()),
-            ),
-            (ROOT_SCHEMA_ENV.to_string(), encode_json_b64(&schema)),
-            (COMPONENT_SCHEMA_ENV.to_string(), encode_json_b64(&schema)),
-            (
-                COMPONENT_TEMPLATE_ENV.to_string(),
-                encode_json_b64(&ConfigTemplatePayload::Root.to_value()),
-            ),
-            (
-                MOUNT_SPEC_ENV.to_string(),
-                STANDARD.encode(serde_json::to_vec(&mounts).unwrap()),
-            ),
-        ]);
-
-        let os_env = envs
-            .into_iter()
-            .map(|(k, v)| (OsString::from(k), OsString::from(v)));
-        let plan = build_run_plan(os_env).expect("build run plan");
-
-        assert_eq!(plan.entrypoint, entrypoint);
-        let contents = std::fs::read_to_string(&mount_path).expect("mount written");
-        assert!(
-            contents.is_empty(),
-            "expected empty mount file, got {contents:?}"
-        );
     }
 
     #[test]

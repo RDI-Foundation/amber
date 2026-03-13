@@ -329,8 +329,6 @@ Notes:
 * Mount paths must be absolute and must not include `..`.
 * `secret.<path>` requires the path to be secret in the component’s config schema.
 * `config.<path>` must not reference secret values.
-* If a mounted `config.<path>` / `secret.<path>` is optional in the component config schema and
-  resolves to no value, Amber writes an empty file at the target path.
 * `resources.<name>` mounts a storage resource owned by the same component.
 * `slots.<name>` mounts storage routed in from another component. Use a directory path such as
   `/var/lib/app`, not a single file path.

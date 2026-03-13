@@ -195,18 +195,11 @@ pub(crate) struct ComponentRuntimePlan<'a> {
     pub(crate) execution: ComponentExecutionPlan<'a>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
 pub(crate) enum MountSpec {
-    Literal {
-        path: String,
-        content: String,
-    },
-    Config {
-        path: String,
-        config: String,
-        optional: bool,
-    },
+    Literal { path: String, content: String },
+    Config { path: String, config: String },
 }
 
 pub(crate) fn build_config_plan(
@@ -867,19 +860,6 @@ fn build_mount_specs(
         } else {
             None
         };
-        let mount_schema_leaves = if has_config_or_secret_mount {
-            Some(
-                rc::collect_schema_leaves(
-                    component
-                        .config_schema
-                        .as_ref()
-                        .expect("config mounts require config schema"),
-                )
-                .leaves,
-            )
-        } else {
-            None
-        };
 
         let mut specs = Vec::new();
         for mount in program.mounts() {
@@ -910,10 +890,7 @@ fn build_mount_specs(
             };
 
             let template_opt = template_opt.expect("config/secret mounts require template");
-            let mount_optional = mount_schema_leaves
-                .as_deref()
-                .is_some_and(|leaves| mount_query_is_optional(leaves, query));
-            match resolve_config_query_for_mount(template_opt, query, mount_optional)? {
+            match resolve_config_query_for_mount(template_opt, query)? {
                 MountResolution::Static(value) => {
                     let content = rc::stringify_for_mount(&value)
                         .map_err(|e| MeshError::new(e.to_string()))?;
@@ -926,7 +903,6 @@ fn build_mount_specs(
                     specs.push(MountSpec::Config {
                         path: mount.path.clone(),
                         config: query.clone(),
-                        optional: mount_optional,
                     });
                 }
             }
@@ -1200,25 +1176,6 @@ fn resolve_optional_config_query_node<'a>(
     Ok(Some(QueryResolution::Node(current)))
 }
 
-fn mount_query_is_optional(leaves: &[rc::SchemaLeaf], query: &str) -> bool {
-    if query.is_empty() {
-        return false;
-    }
-
-    let prefix = format!("{query}.");
-    let mut matched = false;
-    for leaf in leaves {
-        if leaf.path == query || leaf.path.starts_with(&prefix) {
-            matched = true;
-            if leaf.required {
-                return false;
-            }
-        }
-    }
-
-    matched
-}
-
 #[derive(Debug)]
 enum ConfigResolution {
     Static(String),
@@ -1363,23 +1320,14 @@ fn resolve_config_query_for_program_image(
 fn resolve_config_query_for_mount(
     template: Option<&rc::ConfigNode>,
     query: &str,
-    optional: bool,
 ) -> Result<MountResolution, MeshError> {
     let Some(template) = template else {
         return Ok(MountResolution::Runtime);
     };
 
-    let cur = if optional {
-        match resolve_optional_config_query_node(template, query)? {
-            None => return Ok(MountResolution::Static(Value::Null)),
-            Some(QueryResolution::Node(cur)) => cur,
-            Some(QueryResolution::RuntimePath(_)) => return Ok(MountResolution::Runtime),
-        }
-    } else {
-        match resolve_config_query_node(template, query).map_err(MeshError::new)? {
-            QueryResolution::Node(cur) => cur,
-            QueryResolution::RuntimePath(_) => return Ok(MountResolution::Runtime),
-        }
+    let cur = match resolve_config_query_node(template, query).map_err(MeshError::new)? {
+        QueryResolution::Node(cur) => cur,
+        QueryResolution::RuntimePath(_) => return Ok(MountResolution::Runtime),
     };
 
     if cur.contains_runtime() {
@@ -2719,7 +2667,6 @@ mod tests {
 
     use amber_manifest::{Manifest, ManifestDigest};
     use amber_scenario::{BindingEdge, Component, Moniker, Scenario};
-    use serde_json::json;
 
     use super::*;
 
@@ -2778,34 +2725,6 @@ mod tests {
         ])
     }
 
-    fn component_from_manifest(
-        id: ComponentId,
-        parent: Option<ComponentId>,
-        moniker: &str,
-        manifest: &Manifest,
-        config: Option<Value>,
-        children: Vec<ComponentId>,
-    ) -> Component {
-        Component {
-            id,
-            parent,
-            moniker: Moniker::from(Arc::<str>::from(moniker)),
-            digest: manifest.digest(),
-            config,
-            config_schema: manifest.config_schema().map(|schema| schema.0.clone()),
-            program: manifest.program().cloned(),
-            slots: manifest
-                .slots()
-                .iter()
-                .map(|(name, decl)| (name.to_string(), decl.clone()))
-                .collect(),
-            provides: BTreeMap::new(),
-            resources: BTreeMap::new(),
-            metadata: manifest.metadata().cloned(),
-            children,
-        }
-    }
-
     #[test]
     fn resolve_slot_interpolation_rejects_whole_slots_when_component_declares_repeated_slots() {
         let err = resolve_slot_interpolation(
@@ -2839,137 +2758,5 @@ mod tests {
         assert!(message.contains("slot `upstream`"), "{message}");
         assert!(message.contains("multiple: true"), "{message}");
         assert!(message.contains("slots.upstream"), "{message}");
-    }
-
-    #[test]
-    fn build_config_plan_materializes_missing_optional_mount_as_empty_literal() {
-        let root_manifest: Manifest = r#"
-            {
-              manifest_version: "0.3.0",
-            }
-        "#
-        .parse()
-        .expect("root manifest");
-        let child_manifest: Manifest = r#"
-            {
-              manifest_version: "0.3.0",
-              config_schema: {
-                type: "object",
-                properties: {
-                  message: { type: "string" },
-                },
-              },
-              program: {
-                image: "busybox",
-                entrypoint: ["sh", "-lc", "cat /etc/message"],
-                mounts: [{ path: "/etc/message", from: "config.message" }],
-              },
-            }
-        "#
-        .parse()
-        .expect("child manifest");
-
-        let scenario = Scenario {
-            root: ComponentId(0),
-            components: vec![
-                Some(component_from_manifest(
-                    ComponentId(0),
-                    None,
-                    "/",
-                    &root_manifest,
-                    None,
-                    vec![ComponentId(1)],
-                )),
-                Some(component_from_manifest(
-                    ComponentId(1),
-                    Some(ComponentId(0)),
-                    "/child",
-                    &child_manifest,
-                    Some(json!({})),
-                    Vec::new(),
-                )),
-            ],
-            bindings: Vec::<BindingEdge>::new(),
-            exports: Vec::new(),
-        };
-
-        let slot_values = HashMap::from([(ComponentId(1), BTreeMap::new())]);
-        let plan = build_config_plan(
-            &scenario,
-            &[ComponentId(1)],
-            ProgramSupport::Image {
-                backend_label: "test",
-            },
-            RuntimeAddressResolution::Static,
-            &slot_values,
-        )
-        .expect("config plan");
-
-        assert_eq!(
-            plan.mount_specs.get(&ComponentId(1)),
-            Some(&vec![MountSpec::Literal {
-                path: "/etc/message".to_string(),
-                content: String::new(),
-            }]),
-        );
-        assert!(!plan.needs_runtime_config);
-    }
-
-    #[test]
-    fn build_config_plan_marks_missing_optional_runtime_mounts() {
-        let root_manifest: Manifest = r#"
-            {
-              manifest_version: "0.3.0",
-              config_schema: {
-                type: "object",
-                properties: {
-                  api_key: { type: "string", secret: true },
-                },
-              },
-              program: {
-                image: "busybox",
-                entrypoint: ["sh", "-lc", "cat /run/secrets/api_key"],
-                mounts: [{ path: "/run/secrets/api_key", from: "secret.api_key" }],
-              },
-            }
-        "#
-        .parse()
-        .expect("root manifest");
-
-        let scenario = Scenario {
-            root: ComponentId(0),
-            components: vec![Some(component_from_manifest(
-                ComponentId(0),
-                None,
-                "/",
-                &root_manifest,
-                None,
-                Vec::new(),
-            ))],
-            bindings: Vec::<BindingEdge>::new(),
-            exports: Vec::new(),
-        };
-
-        let slot_values = HashMap::from([(ComponentId(0), BTreeMap::new())]);
-        let plan = build_config_plan(
-            &scenario,
-            &[ComponentId(0)],
-            ProgramSupport::Image {
-                backend_label: "test",
-            },
-            RuntimeAddressResolution::Static,
-            &slot_values,
-        )
-        .expect("config plan");
-
-        assert_eq!(
-            plan.mount_specs.get(&ComponentId(0)),
-            Some(&vec![MountSpec::Config {
-                path: "/run/secrets/api_key".to_string(),
-                config: "api_key".to_string(),
-                optional: true,
-            }]),
-        );
-        assert!(plan.needs_runtime_config);
     }
 }
