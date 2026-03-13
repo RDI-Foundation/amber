@@ -1364,6 +1364,8 @@ fn kubernetes_emits_otelcol_and_wires_otel_env() {
         "{otelcol_config}"
     );
     assert!(otelcol_config.contains("service:"), "{otelcol_config}");
+    assert!(otelcol_config.contains("telemetry:"), "{otelcol_config}");
+    assert!(otelcol_config.contains("level: warn"), "{otelcol_config}");
     assert!(otelcol_config.contains("traces:"), "{otelcol_config}");
     assert!(otelcol_config.contains("logs/otlp:"), "{otelcol_config}");
     assert!(otelcol_config.contains("logs/program:"), "{otelcol_config}");
