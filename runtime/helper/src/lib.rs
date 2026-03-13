@@ -384,11 +384,15 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
                     {
                         continue;
                     }
-                    render_repeated_program_env_template(
+                    let Some(rendered) = render_repeated_program_env_template(
                         repeated,
                         component_config,
                         &runtime_template_context,
                     )?
+                    else {
+                        continue;
+                    };
+                    rendered
                 }
             };
             rendered_env.insert(k.clone(), rendered);
@@ -645,7 +649,9 @@ fn render_repeated_program_arg_template(
                 )?);
             }
             if let Some(join) = &repeated.join {
-                out.push(rendered.join(join));
+                if !rendered.is_empty() {
+                    out.push(rendered.join(join));
+                }
             } else {
                 out.extend(rendered);
             }
@@ -677,7 +683,7 @@ fn render_repeated_program_env_template(
     repeated: &RepeatedProgramEnvTemplate,
     component_config: &Value,
     runtime_template_context: &RuntimeTemplateContext,
-) -> Result<String> {
+) -> Result<Option<String>> {
     let items = match &repeated.each {
         RepeatedTemplateSource::Config { path } => {
             config::repeated_config_items(component_config, path)?
@@ -692,7 +698,10 @@ fn render_repeated_program_env_template(
             item,
         )?);
     }
-    Ok(rendered.join(&repeated.join))
+    if rendered.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(rendered.join(&repeated.join)))
 }
 
 fn query_value_opt<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
@@ -765,6 +774,78 @@ mod tests {
     fn encode_spec_b64(spec: &TemplateSpec) -> String {
         let bytes = serde_json::to_vec(spec).expect("spec should serialize");
         STANDARD.encode(bytes)
+    }
+
+    fn repeated_targets_template_spec() -> TemplateSpec {
+        TemplateSpec {
+            program: amber_template::ProgramTemplateSpec {
+                entrypoint: vec![
+                    ProgramArgTemplate::Arg(vec![TemplatePart::lit("/app/bin/server")]),
+                    ProgramArgTemplate::Repeated(RepeatedProgramArgTemplate {
+                        when: None,
+                        each: RepeatedTemplateSource::Config {
+                            path: "targets".to_string(),
+                        },
+                        arg: Some(vec![TemplatePart::current_item("host")]),
+                        argv: Vec::new(),
+                        join: Some(",".to_string()),
+                    }),
+                ],
+                env: BTreeMap::from([(
+                    "TARGETS".to_string(),
+                    ProgramEnvTemplate::Repeated(RepeatedProgramEnvTemplate {
+                        when: None,
+                        each: RepeatedTemplateSource::Config {
+                            path: "targets".to_string(),
+                        },
+                        value: vec![TemplatePart::current_item("host")],
+                        join: ",".to_string(),
+                    }),
+                )]),
+            },
+        }
+    }
+
+    fn repeated_targets_root_schema(targets_schema: Value) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "targets": targets_schema
+            }
+        })
+    }
+
+    fn build_run_plan_with_repeated_targets(
+        root_schema: Value,
+        targets_env: Option<&str>,
+    ) -> RunPlan {
+        let component_schema = root_schema.clone();
+        let template_spec = repeated_targets_template_spec();
+
+        let mut env = BTreeMap::from([
+            ("PATH".to_string(), "/bin".to_string()),
+            (
+                TEMPLATE_SPEC_ENV.to_string(),
+                encode_spec_b64(&template_spec),
+            ),
+            (
+                COMPONENT_TEMPLATE_ENV.to_string(),
+                encode_json_b64(&ConfigTemplatePayload::Root.to_value()),
+            ),
+            (
+                COMPONENT_SCHEMA_ENV.to_string(),
+                encode_json_b64(&component_schema),
+            ),
+            (ROOT_SCHEMA_ENV.to_string(), encode_json_b64(&root_schema)),
+        ]);
+        if let Some(targets) = targets_env {
+            env.insert("AMBER_CONFIG_TARGETS".to_string(), targets.to_string());
+        }
+
+        let os_env = env
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        build_run_plan(os_env).expect("run plan should build")
     }
 
     #[test]
@@ -1319,6 +1400,75 @@ mod tests {
         assert!(
             !plan.env.contains_key(&OsString::from("TARGETS")),
             "repeated env should be omitted when its config-based `when` is absent"
+        );
+    }
+
+    #[test]
+    fn build_run_plan_skips_joined_repeated_config_arg_and_env_for_empty_array() {
+        let plan = build_run_plan_with_repeated_targets(
+            repeated_targets_root_schema(serde_json::json!({
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "host": { "type": "string" }
+                    },
+                    "required": ["host"]
+                }
+            })),
+            Some("[]"),
+        );
+
+        assert_eq!(plan.entrypoint, vec!["/app/bin/server".to_string()]);
+        assert!(
+            !plan.env.contains_key(&OsString::from("TARGETS")),
+            "repeated env should be omitted when config expansion is empty"
+        );
+    }
+
+    #[test]
+    fn build_run_plan_skips_joined_repeated_config_arg_and_env_for_missing_path() {
+        let plan = build_run_plan_with_repeated_targets(
+            repeated_targets_root_schema(serde_json::json!({
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "host": { "type": "string" }
+                    },
+                    "required": ["host"]
+                }
+            })),
+            None,
+        );
+
+        assert_eq!(plan.entrypoint, vec!["/app/bin/server".to_string()]);
+        assert!(
+            !plan.env.contains_key(&OsString::from("TARGETS")),
+            "repeated env should be omitted when config expansion is missing"
+        );
+    }
+
+    #[test]
+    fn build_run_plan_skips_joined_repeated_config_arg_and_env_for_null() {
+        let plan = build_run_plan_with_repeated_targets(
+            repeated_targets_root_schema(serde_json::json!({
+                "type": ["array", "null"],
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "host": { "type": "string" }
+                    },
+                    "required": ["host"]
+                }
+            })),
+            Some("null"),
+        );
+
+        assert_eq!(plan.entrypoint, vec!["/app/bin/server".to_string()]);
+        assert!(
+            !plan.env.contains_key(&OsString::from("TARGETS")),
+            "repeated env should be omitted when config expansion is null"
         );
     }
 
