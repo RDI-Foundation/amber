@@ -8,7 +8,7 @@ use std::{
 use amber_config as rc;
 use amber_manifest::span_for_json_pointer;
 use amber_mesh::{MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProvisionOutput};
-use amber_scenario::{ComponentId, Scenario};
+use amber_scenario::{ComponentId, ProgramMount, Scenario};
 use base64::Engine as _;
 use jsonptr::PointerBuf;
 use miette::{LabeledSpan, NamedSource, SourceSpan};
@@ -17,7 +17,6 @@ use serde::Serialize;
 
 use crate::{
     CompileOutput,
-    program_semantics::{StaticMountKind, validated_static_mounts},
     reporter::{
         CompiledScenario, Reporter, ReporterError,
         execution_guide::{GENERATED_README_FILENAME, build_execution_guide},
@@ -164,7 +163,6 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
     let s = compiled.scenario();
     let scenario_digest =
         scenario_ir_digest(s).map_err(|err| ReporterError::new(err.to_string()))?;
-    let static_mounts = validated_static_mounts(s, "kubernetes planning");
     let endpoint_plan = crate::targets::program_config::build_endpoint_plan(s)
         .map_err(|e| ReporterError::new(e.to_string()))?;
     let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
@@ -176,8 +174,12 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
     )
     .map_err(|e| ReporterError::new(e.to_string()))?;
     for &component_id in mesh_plan.program_components() {
-        for mount in static_mounts.component_mounts(component_id) {
-            if let StaticMountKind::Framework(capability) = &mount.kind
+        let component = s.component(component_id);
+        let Some(program) = component.program.as_ref() else {
+            continue;
+        };
+        for mount in program.mounts() {
+            if let ProgramMount::Framework { capability, .. } = mount
                 && capability.as_str() == "docker"
             {
                 return Err(ReporterError::new(

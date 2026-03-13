@@ -9,7 +9,10 @@ use amber_manifest::{
     InterpolatedPart, InterpolationSource, MountSource, ProgramArgItem, VmScalarU32,
     framework_capability,
 };
-use amber_scenario::{ComponentId, Scenario};
+use amber_scenario::{
+    ComponentId, FileMount, FileMountSource, Program, ProgramCondition, ProgramEach, ProgramMount,
+    Scenario,
+};
 use amber_template::{
     ConditionalProgramArgTemplate, ConditionalProgramEnvTemplate, MountSpec, MountTemplateSpec,
     ProgramArgTemplate, ProgramEnvTemplate, ProgramTemplateSpec, RepeatedProgramArgTemplate,
@@ -242,28 +245,6 @@ pub(crate) fn build_config_plan(
     slot_values_by_component: &HashMap<ComponentId, BTreeMap<String, SlotValue>>,
 ) -> Result<ConfigPlan, MeshError> {
     let resolved_templates = compose_component_config_templates(scenario)?;
-
-    let mut used_config_paths_by_component: HashMap<ComponentId, BTreeSet<String>> =
-        HashMap::with_capacity(program_components.len());
-    for id in program_components {
-        let component = scenario.component(*id);
-        let Some(program) = component.program.as_ref() else {
-            continue;
-        };
-        let template_opt = resolved_templates
-            .get(id)
-            .and_then(|template| template.node());
-        let slots = slot_values_by_component.get(id).ok_or_else(|| {
-            MeshError::new(format!(
-                "internal error: missing slot values for {}",
-                component_label(scenario, *id)
-            ))
-        })?;
-        let used_paths = program_used_config_paths(program, template_opt, slots)?;
-        if !used_paths.is_empty() {
-            used_config_paths_by_component.insert(*id, used_paths);
-        }
-    }
 
     let root_schema = scenario
         .component(scenario.root)
@@ -500,22 +481,22 @@ fn collect_mount_source_used_paths(source: &TemplateString, out: &mut BTreeSet<S
 fn collect_vm_cloud_init_runtime_paths(
     scenario: &Scenario,
     id: ComponentId,
-    program: &amber_manifest::Program,
+    program: &Program,
     slots: &BTreeMap<String, SlotValue>,
     template_opt: Option<&rc::ConfigNode>,
     out: &mut BTreeSet<String>,
 ) -> Result<(), MeshError> {
-    let amber_manifest::Program::Vm(program) = program else {
+    let Program::Vm(program) = program else {
         return Ok(());
     };
     for (field_name, raw) in [
         (
             "program.vm.cloud_init.user_data",
-            program.0.cloud_init.user_data.as_deref(),
+            program.cloud_init.user_data.as_deref(),
         ),
         (
             "program.vm.cloud_init.vendor_data",
-            program.0.cloud_init.vendor_data.as_deref(),
+            program.cloud_init.vendor_data.as_deref(),
         ),
     ] {
         let Some(raw) = raw else {
@@ -543,17 +524,17 @@ fn collect_vm_cloud_init_runtime_paths(
 }
 
 fn collect_vm_scalar_runtime_paths(
-    program: &amber_manifest::Program,
+    program: &Program,
     component: &str,
     template_opt: Option<&rc::ConfigNode>,
     out: &mut BTreeSet<String>,
 ) -> Result<(), MeshError> {
-    let amber_manifest::Program::Vm(program) = program else {
+    let Program::Vm(program) = program else {
         return Ok(());
     };
     for (field_name, scalar) in [
-        ("program.vm.cpus", &program.0.cpus),
-        ("program.vm.memory_mib", &program.0.memory_mib),
+        ("program.vm.cpus", &program.cpus),
+        ("program.vm.memory_mib", &program.memory_mib),
     ] {
         if let VmScalarResolutionU32::RuntimeConfig(path) =
             resolve_vm_scalar_u32(template_opt, scalar, component, field_name)?
@@ -889,32 +870,26 @@ fn collect_used_paths_from_template_string(ts: &TemplateString, out: &mut BTreeS
     }
 }
 
-fn interpolated_string_uses_config(value: &amber_manifest::InterpolatedString) -> bool {
-    value.parts.iter().any(|part| {
-        matches!(
-            part,
-            InterpolatedPart::Interpolation {
-                source: InterpolationSource::Config,
-                ..
-            }
-        )
-    })
+fn template_string_uses_config(value: &TemplateString) -> bool {
+    value
+        .iter()
+        .any(|part| matches!(part, TemplatePart::Config { .. }))
 }
 
-fn mount_uses_config(mount: &amber_manifest::ProgramMount) -> bool {
+fn file_mount_uses_config(mount: &FileMount) -> bool {
     mount
         .when
         .as_ref()
-        .is_some_and(|when| when.source() == InterpolationSource::Config)
+        .is_some_and(|when| matches!(when, ProgramCondition::Config { .. }))
         || mount
             .each
             .as_ref()
-            .is_some_and(|each| each.source() == InterpolationSource::Config)
-        || mount
-            .literal_source()
-            .is_some_and(|source| matches!(source, MountSource::Config(_) | MountSource::Secret(_)))
-        || interpolated_string_uses_config(&mount.path)
-        || interpolated_string_uses_config(&mount.source)
+            .is_some_and(|each| matches!(each, ProgramEach::Config { .. }))
+        || template_string_uses_config(&mount.path)
+        || matches!(
+            &mount.source,
+            FileMountSource::Config { .. } | FileMountSource::Secret { .. }
+        )
 }
 
 fn build_mount_specs(
@@ -941,7 +916,9 @@ fn build_mount_specs(
                 component_label(scenario, *id)
             ))
         })?;
-        let needs_component_config = program.mounts().iter().any(mount_uses_config);
+        let needs_component_config = program.mounts().iter().any(|mount| {
+            matches!(mount, ProgramMount::File(file_mount) if file_mount_uses_config(file_mount))
+        });
 
         if needs_component_config && component.config_schema.is_none() {
             return Err(MeshError::new(format!(
@@ -964,7 +941,11 @@ fn build_mount_specs(
 
         let mut specs = Vec::new();
         for (mount_idx, mount) in program.mounts().iter().enumerate() {
-            let when = resolve_program_when(mount.when.as_ref(), template_opt, slots)?;
+            let ProgramMount::File(mount) = mount else {
+                continue;
+            };
+
+            let when = resolve_file_mount_when(mount.when.as_ref(), template_opt, slots)?;
             if matches!(when, ResolvedWhen::Absent) {
                 continue;
             }
@@ -980,12 +961,11 @@ fn build_mount_specs(
              -> Result<(), MeshError> {
                 let mut needs_helper_for_mount = false;
                 let mut needs_runtime_config_for_mount = false;
-                let path_ts = resolve_program_template_string(
+                let path_ts = resolve_lowered_template_string(
                     scenario,
                     *id,
                     &format!("{location}.path"),
                     &mount.path,
-                    RuntimeAddressResolution::Static,
                     slots,
                     template_opt,
                     item_resolution,
@@ -993,12 +973,11 @@ fn build_mount_specs(
                     &mut needs_runtime_config_for_mount,
                     true,
                 )?;
-                let source_ts = resolve_program_template_string(
+                let source_ts = resolve_lowered_mount_source(
                     scenario,
                     *id,
                     &format!("{location}.from"),
                     &mount.source,
-                    RuntimeAddressResolution::Static,
                     slots,
                     template_opt,
                     item_resolution,
@@ -1072,11 +1051,8 @@ fn build_mount_specs(
 
             match mount.each.as_ref() {
                 None => emit_spec(ItemResolution::NotAllowed, None, &mut specs)?,
-                Some(each) => match each.source() {
-                    InterpolationSource::Slots => {
-                        let slot_name = each
-                            .slot()
-                            .expect("slot-based each path should expose a slot name");
+                Some(each) => match each {
+                    ProgramEach::Slot { slot: slot_name } => {
                         let items = repeated_slot_items_for_component(
                             scenario, *id, slot_name, slots, &location,
                         )?;
@@ -1084,8 +1060,8 @@ fn build_mount_specs(
                             emit_spec(ItemResolution::StaticSlot(item), None, &mut specs)?;
                         }
                     }
-                    InterpolationSource::Config => {
-                        match resolve_config_each_values(template_opt, each.query(), &location)? {
+                    ProgramEach::Config { path } => {
+                        match resolve_config_each_values(template_opt, path, &location)? {
                             ConfigEachResolution::Static(items) => {
                                 for item in &items {
                                     emit_spec(
@@ -1098,16 +1074,12 @@ fn build_mount_specs(
                             ConfigEachResolution::Runtime => {
                                 emit_spec(
                                     ItemResolution::RuntimeCurrentItem,
-                                    Some(RepeatedTemplateSource::Config {
-                                        path: each.query().to_string(),
-                                    }),
+                                    Some(RepeatedTemplateSource::Config { path: path.clone() }),
                                     &mut specs,
                                 )?;
                             }
                         }
                     }
-                    InterpolationSource::Item => unreachable!("each paths never use item"),
-                    _ => unreachable!("unsupported interpolation source for each"),
                 },
             }
         }
@@ -1120,88 +1092,186 @@ fn build_mount_specs(
     Ok(out)
 }
 
-fn endpoint_uses_config(endpoint: &amber_manifest::Endpoint) -> bool {
-    endpoint
-        .when
-        .as_ref()
-        .is_some_and(|when| when.source() == InterpolationSource::Config)
-        || endpoint
-            .each
-            .as_ref()
-            .is_some_and(|each| each.source() == InterpolationSource::Config)
-        || interpolated_string_uses_config(&endpoint.name)
-        || interpolated_string_uses_config(&endpoint.protocol)
-        || matches!(
-            &endpoint.port,
-            amber_manifest::EndpointPort::Interpolated(value)
-                if interpolated_string_uses_config(value)
-        )
-}
-
-fn resolve_endpoint_template_string(
-    component: &str,
-    location: &str,
-    value: &amber_manifest::InterpolatedString,
+fn resolve_file_mount_when(
+    when: Option<&ProgramCondition>,
     template_opt: Option<&rc::ConfigNode>,
-    item: Option<&Value>,
-) -> Result<String, MeshError> {
-    let mut rendered = String::new();
-    for part in &value.parts {
-        match part {
-            InterpolatedPart::Literal(lit) => rendered.push_str(lit),
-            InterpolatedPart::Interpolation { source, query } => match source {
-                InterpolationSource::Config => {
-                    match resolve_config_query_for_program(template_opt, query)? {
-                        ConfigResolution::Static(value) => rendered.push_str(&value),
-                        ConfigResolution::Runtime => {
-                            return Err(MeshError::new(format!(
-                                "{component} {location} depends on runtime config, but endpoints \
-                                 must resolve entirely at compile time"
-                            )));
-                        }
-                    }
+    slots: &BTreeMap<String, SlotValue>,
+) -> Result<ResolvedWhen, MeshError> {
+    let Some(when) = when else {
+        return Ok(ResolvedWhen::Present);
+    };
+
+    match when {
+        ProgramCondition::Config { path } => {
+            match resolve_condition_presence_for_program(
+                InterpolationSource::Config,
+                path,
+                template_opt,
+                slots,
+            )? {
+                ConfigPresence::Present => Ok(ResolvedWhen::Present),
+                ConfigPresence::Absent => Ok(ResolvedWhen::Absent),
+                ConfigPresence::Runtime => Ok(ResolvedWhen::Runtime(path.clone())),
+            }
+        }
+        ProgramCondition::Slot { query } => {
+            match resolve_condition_presence_for_program(
+                InterpolationSource::Slots,
+                query,
+                template_opt,
+                slots,
+            )? {
+                ConfigPresence::Present => Ok(ResolvedWhen::Present),
+                ConfigPresence::Absent => Ok(ResolvedWhen::Absent),
+                ConfigPresence::Runtime => {
+                    unreachable!("slot conditions always resolve before runtime")
                 }
-                InterpolationSource::Item => {
-                    let item = item.ok_or_else(|| {
-                        MeshError::new(format!(
-                            "`item` interpolation is only valid inside repeated endpoint `each` \
-                             expansions in {component} {location}"
-                        ))
-                    })?;
-                    rendered.push_str(&resolve_item_interpolation_from_value(
-                        item, query, component, location,
-                    )?);
-                }
-                InterpolationSource::Slots => {
-                    let label = if query.is_empty() {
-                        "slots".to_string()
-                    } else {
-                        format!("slots.{query}")
-                    };
-                    return Err(MeshError::new(format!(
-                        "{component} {location} references `{label}`, but endpoints cannot depend \
-                         on slots because mesh planning and port allocation happen before slot \
-                         values exist"
-                    )));
-                }
-                _ => {
-                    return Err(MeshError::new(format!(
-                        "unsupported interpolation source {source} in {component} {location}",
-                    )));
-                }
-            },
-            _ => {
-                return Err(MeshError::new(format!(
-                    "unsupported interpolation in {component} {location}",
-                )));
             }
         }
     }
-    Ok(rendered)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_lowered_template_string(
+    scenario: &Scenario,
+    id: ComponentId,
+    location: &str,
+    value: &TemplateString,
+    slots: &BTreeMap<String, SlotValue>,
+    template_opt: Option<&rc::ConfigNode>,
+    item_resolution: ItemResolution<'_>,
+    needs_helper_for_program_templates: &mut bool,
+    needs_runtime_config_for_program_templates: &mut bool,
+    require_non_empty: bool,
+) -> Result<TemplateString, MeshError> {
+    let component = component_label(scenario, id);
+    let mut ts: TemplateString = Vec::new();
+    for part in value {
+        match part {
+            TemplatePart::Lit { lit } => ts.push(TemplatePart::lit(lit)),
+            TemplatePart::Config { config } => {
+                match resolve_config_query_for_program(template_opt, config)? {
+                    ConfigResolution::Static(value) => ts.push(TemplatePart::lit(value)),
+                    ConfigResolution::Runtime => {
+                        ts.push(TemplatePart::config(config.clone()));
+                        *needs_helper_for_program_templates = true;
+                        *needs_runtime_config_for_program_templates = true;
+                    }
+                }
+            }
+            TemplatePart::Slot { slot, .. } => {
+                if let Some(value) = resolve_slot_interpolation(
+                    scenario,
+                    id,
+                    location,
+                    &InterpolationSource::Slots,
+                    slot,
+                    slots,
+                )? {
+                    ts.push(TemplatePart::lit(value));
+                }
+            }
+            TemplatePart::CurrentItem { item } => match item_resolution {
+                ItemResolution::NotAllowed => {
+                    return Err(MeshError::new(format!(
+                        "`item` interpolation is only valid inside repeated `each` expansions in \
+                         {component} {location}",
+                    )));
+                }
+                ItemResolution::RuntimeSlotTemplate { .. } => unreachable!(
+                    "lowered mount templates should not contain TemplatePart::CurrentItem with \
+                     runtime slot templates"
+                ),
+                ItemResolution::RuntimeCurrentItem => {
+                    ts.push(TemplatePart::current_item(item.clone()));
+                    *needs_helper_for_program_templates = true;
+                }
+                ItemResolution::StaticSlot(item_value) => ts.push(TemplatePart::lit(
+                    resolve_slot_item_interpolation(item_value, item, &component, location)?,
+                )),
+                ItemResolution::StaticConfig(item_value) => ts.push(TemplatePart::lit(
+                    resolve_item_interpolation_from_value(item_value, item, &component, location)?,
+                )),
+            },
+            TemplatePart::Item { item, .. } => match item_resolution {
+                ItemResolution::NotAllowed => {
+                    return Err(MeshError::new(format!(
+                        "`item` interpolation is only valid inside repeated `each` expansions in \
+                         {component} {location}",
+                    )));
+                }
+                ItemResolution::RuntimeSlotTemplate { .. } => {
+                    ts.push(TemplatePart::current_item(item.clone()));
+                    *needs_helper_for_program_templates = true;
+                }
+                ItemResolution::RuntimeCurrentItem => {
+                    ts.push(TemplatePart::current_item(item.clone()));
+                    *needs_helper_for_program_templates = true;
+                }
+                ItemResolution::StaticSlot(item_value) => ts.push(TemplatePart::lit(
+                    resolve_slot_item_interpolation(item_value, item, &component, location)?,
+                )),
+                ItemResolution::StaticConfig(item_value) => ts.push(TemplatePart::lit(
+                    resolve_item_interpolation_from_value(item_value, item, &component, location)?,
+                )),
+            },
+        }
+    }
+    if require_non_empty && ts.is_empty() {
+        return Err(MeshError::new(format!(
+            "internal error: produced empty template for {component} {location}",
+        )));
+    }
+    Ok(ts)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_lowered_mount_source(
+    scenario: &Scenario,
+    id: ComponentId,
+    location: &str,
+    source: &FileMountSource,
+    slots: &BTreeMap<String, SlotValue>,
+    template_opt: Option<&rc::ConfigNode>,
+    item_resolution: ItemResolution<'_>,
+    needs_helper_for_program_templates: &mut bool,
+    needs_runtime_config_for_program_templates: &mut bool,
+    require_non_empty: bool,
+) -> Result<TemplateString, MeshError> {
+    let (prefix, path) = match source {
+        FileMountSource::Config { path } => ("config", path),
+        FileMountSource::Secret { path } => ("secret", path),
+    };
+    let path = resolve_lowered_template_string(
+        scenario,
+        id,
+        location,
+        path,
+        slots,
+        template_opt,
+        item_resolution,
+        needs_helper_for_program_templates,
+        needs_runtime_config_for_program_templates,
+        false,
+    )?;
+
+    let mut full = Vec::new();
+    if path.is_empty() {
+        full.push(TemplatePart::lit(prefix));
+    } else {
+        full.push(TemplatePart::lit(format!("{prefix}.")));
+        full.extend(path);
+    }
+    if require_non_empty && full.is_empty() {
+        return Err(MeshError::new(format!(
+            "internal error: produced empty mount source for {} {location}",
+            component_label(scenario, id)
+        )));
+    }
+    Ok(full)
 }
 
 pub(crate) fn build_endpoint_plan(scenario: &Scenario) -> Result<EndpointPlan, MeshError> {
-    let resolved_templates = compose_component_config_templates(scenario)?;
     let mut by_component = HashMap::new();
 
     for (id, component) in scenario.components_iter() {
@@ -1211,371 +1281,24 @@ pub(crate) fn build_endpoint_plan(scenario: &Scenario) -> Result<EndpointPlan, M
         let Some(network) = program.network() else {
             continue;
         };
-        if network.endpoints().is_empty() {
+        if network.endpoints.is_empty() {
             continue;
         }
-
-        let needs_component_config = network.endpoints().iter().any(endpoint_uses_config);
-        if needs_component_config && component.config_schema.is_none() {
-            return Err(MeshError::new(format!(
-                "component {} requires config_schema when using variadic or interpolated \
-                 program.network.endpoints",
-                component_label(scenario, id)
-            )));
-        }
-        let template_opt = if needs_component_config {
-            let template = resolved_templates.get(&id).ok_or_else(|| {
-                MeshError::new(format!(
-                    "no config template for component {}",
-                    component_label(scenario, id)
-                ))
-            })?;
-            template.node()
-        } else {
-            None
-        };
-
-        let component_name = component_label(scenario, id);
-        let mut endpoints = Vec::new();
-        let mut seen_names = BTreeSet::new();
-
-        for (endpoint_idx, endpoint) in network.endpoints().iter().enumerate() {
-            let when = match endpoint.when.as_ref() {
-                Some(when) => match when.source() {
-                    InterpolationSource::Config => {
-                        resolve_program_when(Some(when), template_opt, &BTreeMap::new())?
-                    }
-                    InterpolationSource::Slots => {
-                        return Err(MeshError::new(format!(
-                            "{} program.network.endpoints[{endpoint_idx}] uses `when: \
-                             \"{when}\"`, but endpoints cannot depend on slots because mesh \
-                             planning and port allocation happen before slot values exist",
-                            component_name
-                        )));
-                    }
-                    _ => {
-                        return Err(MeshError::new(format!(
-                            "{} program.network.endpoints[{endpoint_idx}] uses unsupported `when` \
-                             source `{when}`",
-                            component_name
-                        )));
-                    }
-                },
-                None => ResolvedWhen::Present,
-            };
-            if matches!(when, ResolvedWhen::Absent) {
-                continue;
-            }
-            if let ResolvedWhen::Runtime(query) = &when {
-                return Err(MeshError::new(format!(
-                    "{} program.network.endpoints[{endpoint_idx}] depends on runtime config \
-                     `{query}`, but endpoints must resolve entirely at compile time",
-                    component_name
-                )));
-            }
-
-            let location = format!("program.network.endpoints[{endpoint_idx}]");
-            let emit_endpoint = |item: Option<&Value>,
-                                 endpoints: &mut Vec<ExpandedEndpoint>,
-                                 seen_names: &mut BTreeSet<String>|
-             -> Result<(), MeshError> {
-                let name = resolve_endpoint_template_string(
-                    &component_name,
-                    &format!("{location}.name"),
-                    &endpoint.name,
-                    template_opt,
-                    item,
-                )?;
-                if name.is_empty() {
-                    return Err(MeshError::new(format!(
-                        "{} {location}.name resolves to an empty string",
-                        component_name
-                    )));
-                }
-                let port = match &endpoint.port {
-                    amber_manifest::EndpointPort::Literal(value) => *value,
-                    amber_manifest::EndpointPort::Interpolated(value) => {
-                        resolve_endpoint_template_string(
-                            &component_name,
-                            &format!("{location}.port"),
-                            value,
-                            template_opt,
-                            item,
-                        )?
-                        .parse::<u16>()
-                        .map_err(|err| {
-                            MeshError::new(format!(
-                                "{} {location}.port must resolve to a valid u16: {err}",
-                                component_name
-                            ))
-                        })?
-                    }
-                    _ => {
-                        return Err(MeshError::new(format!(
-                            "{} {location}.port uses an unsupported endpoint port form",
-                            component_name
-                        )));
-                    }
-                };
-                let protocol = resolve_endpoint_template_string(
-                    &component_name,
-                    &format!("{location}.protocol"),
-                    &endpoint.protocol,
-                    template_opt,
-                    item,
-                )?
-                .parse::<amber_manifest::NetworkProtocol>()
-                .map_err(MeshError::new)?;
-
-                if !seen_names.insert(name.clone()) {
-                    return Err(MeshError::new(format!(
-                        "component {} defines duplicate endpoint name `{name}` after endpoint \
-                         expansion",
-                        component_label(scenario, id)
-                    )));
-                }
-
-                endpoints.push(ExpandedEndpoint {
-                    name,
-                    port,
-                    protocol,
-                });
-                Ok(())
-            };
-
-            match endpoint.each.as_ref() {
-                None => emit_endpoint(None, &mut endpoints, &mut seen_names)?,
-                Some(each) => match each.source() {
-                    InterpolationSource::Config => {
-                        match resolve_config_each_values(template_opt, each.query(), &location)? {
-                            ConfigEachResolution::Static(items) => {
-                                for item in &items {
-                                    emit_endpoint(Some(item), &mut endpoints, &mut seen_names)?;
-                                }
-                            }
-                            ConfigEachResolution::Runtime => {
-                                return Err(MeshError::new(format!(
-                                    "{} {location} depends on runtime config, but endpoints must \
-                                     resolve entirely at compile time",
-                                    component_name
-                                )));
-                            }
-                        }
-                    }
-                    InterpolationSource::Slots => {
-                        return Err(MeshError::new(format!(
-                            "{} {location} uses `each: \"{}\"`, but endpoints cannot depend on \
-                             slots because mesh planning and port allocation happen before slot \
-                             values exist",
-                            component_name, each
-                        )));
-                    }
-                    InterpolationSource::Item => unreachable!("each paths never use item"),
-                    _ => unreachable!("unsupported interpolation source for each"),
-                },
-            }
-        }
-
-        if !endpoints.is_empty() {
-            by_component.insert(id, endpoints);
-        }
+        by_component.insert(
+            id,
+            network
+                .endpoints
+                .iter()
+                .map(|endpoint| ExpandedEndpoint {
+                    name: endpoint.name.clone(),
+                    port: endpoint.port,
+                    protocol: endpoint.protocol,
+                })
+                .collect(),
+        );
     }
 
     Ok(EndpointPlan { by_component })
-}
-
-fn program_used_config_paths(
-    program: &amber_manifest::Program,
-    template_opt: Option<&rc::ConfigNode>,
-    slots: &BTreeMap<String, SlotValue>,
-) -> Result<BTreeSet<String>, MeshError> {
-    let mut used = BTreeSet::new();
-
-    match program {
-        amber_manifest::Program::Image(program) => {
-            if let Ok(parsed) = program.image.parse::<amber_manifest::InterpolatedString>() {
-                collect_program_config_paths(&parsed.parts, &mut used);
-            }
-        }
-        amber_manifest::Program::Path(program) => {
-            if let Ok(parsed) = program.path.parse::<amber_manifest::InterpolatedString>() {
-                collect_program_config_paths(&parsed.parts, &mut used);
-            }
-        }
-        amber_manifest::Program::Vm(program) => {
-            if let Ok(parsed) = program
-                .0
-                .image
-                .parse::<amber_manifest::InterpolatedString>()
-            {
-                collect_program_config_paths(&parsed.parts, &mut used);
-            }
-            for scalar in [&program.0.cpus, &program.0.memory_mib] {
-                let amber_manifest::VmScalarU32::Interpolated(raw) = scalar else {
-                    continue;
-                };
-                if let Ok(parsed) = raw.parse::<amber_manifest::InterpolatedString>() {
-                    collect_program_config_paths(&parsed.parts, &mut used);
-                }
-            }
-            for value in [
-                program.0.cloud_init.user_data.as_deref(),
-                program.0.cloud_init.vendor_data.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if let Ok(parsed) = value.parse::<amber_manifest::InterpolatedString>() {
-                    collect_program_config_paths(&parsed.parts, &mut used);
-                }
-            }
-        }
-        _ => {}
-    }
-    for arg in &program.command().0 {
-        let condition = match arg.when() {
-            Some(when) => {
-                let presence = resolve_condition_presence_for_program(
-                    when.source(),
-                    when.query(),
-                    template_opt,
-                    slots,
-                )?;
-                if when.source() == InterpolationSource::Config
-                    && !matches!(presence, ConfigPresence::Absent)
-                {
-                    used.insert(when.query().to_string());
-                }
-                presence
-            }
-            None => ConfigPresence::Present,
-        };
-        if matches!(condition, ConfigPresence::Absent) {
-            continue;
-        }
-        if let Some(each) = arg.each()
-            && each.source() == InterpolationSource::Config
-        {
-            used.insert(each.query().to_string());
-        }
-        if static_each_is_empty(arg.each(), template_opt, slots, "program command")? == Some(true) {
-            continue;
-        }
-        arg.visit_values(|value| collect_program_config_paths(&value.parts, &mut used));
-    }
-    for value in program.env().values() {
-        let condition = match value.when() {
-            Some(when) => {
-                let presence = resolve_condition_presence_for_program(
-                    when.source(),
-                    when.query(),
-                    template_opt,
-                    slots,
-                )?;
-                if when.source() == InterpolationSource::Config
-                    && !matches!(presence, ConfigPresence::Absent)
-                {
-                    used.insert(when.query().to_string());
-                }
-                presence
-            }
-            None => ConfigPresence::Present,
-        };
-        if matches!(condition, ConfigPresence::Absent) {
-            continue;
-        }
-        if let Some(each) = value.each()
-            && each.source() == InterpolationSource::Config
-        {
-            used.insert(each.query().to_string());
-        }
-        if static_each_is_empty(value.each(), template_opt, slots, "program env")? == Some(true) {
-            continue;
-        }
-        collect_program_config_paths(&value.value().parts, &mut used);
-    }
-    for mount in program.mounts() {
-        let condition = match &mount.when {
-            Some(when) => {
-                let presence = resolve_condition_presence_for_program(
-                    when.source(),
-                    when.query(),
-                    template_opt,
-                    slots,
-                )?;
-                if when.source() == InterpolationSource::Config
-                    && !matches!(presence, ConfigPresence::Absent)
-                {
-                    used.insert(when.query().to_string());
-                }
-                presence
-            }
-            None => ConfigPresence::Present,
-        };
-        if matches!(condition, ConfigPresence::Absent) {
-            continue;
-        }
-        if let Some(each) = &mount.each
-            && each.source() == InterpolationSource::Config
-        {
-            used.insert(each.query().to_string());
-        }
-        if static_each_is_empty(mount.each.as_ref(), template_opt, slots, "program mounts")?
-            == Some(true)
-        {
-            continue;
-        }
-        collect_program_config_paths(&mount.path.parts, &mut used);
-        collect_program_config_paths(&mount.source.parts, &mut used);
-        if let Some(source) = mount.literal_source()
-            && let MountSource::Config(path) | MountSource::Secret(path) = source
-        {
-            used.insert(path);
-        }
-    }
-
-    Ok(used)
-}
-
-fn collect_program_config_paths(parts: &[InterpolatedPart], out: &mut BTreeSet<String>) {
-    for part in parts {
-        let InterpolatedPart::Interpolation { source, query } = part else {
-            continue;
-        };
-        if *source == InterpolationSource::Config {
-            out.insert(query.clone());
-        }
-    }
-}
-
-fn static_each_is_empty(
-    each: Option<&amber_manifest::EachPath>,
-    template_opt: Option<&rc::ConfigNode>,
-    slots: &BTreeMap<String, SlotValue>,
-    location: &str,
-) -> Result<Option<bool>, MeshError> {
-    let Some(each) = each else {
-        return Ok(Some(false));
-    };
-
-    match each.source() {
-        InterpolationSource::Config => {
-            match resolve_config_each_values(template_opt, each.query(), location)? {
-                ConfigEachResolution::Static(items) => Ok(Some(items.is_empty())),
-                ConfigEachResolution::Runtime => Ok(None),
-            }
-        }
-        InterpolationSource::Slots => Ok(Some(
-            repeated_slot_items(
-                slots,
-                each.slot()
-                    .expect("slot-based each path should expose a slot"),
-            )
-            .is_empty(),
-        )),
-        InterpolationSource::Item => unreachable!("each paths never use item"),
-        _ => unreachable!("unsupported interpolation source for each"),
-    }
 }
 
 fn resolve_condition_presence_for_program(
@@ -2535,7 +2258,7 @@ fn append_program_command_item_templates(
 fn build_program_plan(
     scenario: &Scenario,
     id: ComponentId,
-    program: &amber_manifest::Program,
+    program: &Program,
     program_support: ProgramSupport,
     runtime_address_resolution: RuntimeAddressResolution,
     slots: &BTreeMap<String, SlotValue>,
@@ -2547,7 +2270,7 @@ fn build_program_plan(
     let mut needs_helper_for_program_templates = false;
     let mut needs_runtime_config_for_program_templates = false;
     let (source, program_env) = match program {
-        amber_manifest::Program::Image(program) => {
+        Program::Image(program) => {
             match program_support {
                 ProgramSupport::Path { backend_label } => {
                     return Err(MeshError::new(format!(
@@ -2664,7 +2387,7 @@ fn build_program_plan(
                 &program.common.env,
             )
         }
-        amber_manifest::Program::Path(program) => {
+        Program::Path(program) => {
             match program_support {
                 ProgramSupport::Image { backend_label } => {
                     return Err(MeshError::new(format!(
@@ -2730,7 +2453,7 @@ fn build_program_plan(
 
             (ProgramSourcePlan::Path, &program.common.env)
         }
-        amber_manifest::Program::Vm(program) => {
+        Program::Vm(program) => {
             let ProgramSupport::Vm { .. } = program_support else {
                 return Err(MeshError::new(format!(
                     "component {} uses `program.vm`, but this backend does not support VM programs",
@@ -2739,7 +2462,6 @@ fn build_program_plan(
             };
             let mut image_parts: Vec<ProgramImagePart> = Vec::new();
             let image = program
-                .0
                 .image
                 .parse::<amber_manifest::InterpolatedString>()
                 .map_err(|err| {
@@ -3076,12 +2798,16 @@ fn build_program_plan(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::{
+        collections::{BTreeMap, HashMap},
+        sync::Arc,
+    };
 
-    use amber_manifest::{Manifest, ManifestDigest};
+    use amber_manifest::{Manifest, ManifestDigest, Program as ManifestProgram};
     use amber_scenario::{BindingEdge, Component, Moniker, Scenario};
 
     use super::*;
+    use crate::{config_template::parse_instance_config_template, program_lowering::lower_program};
 
     fn test_scenario() -> Scenario {
         let manifest: Manifest = r#"
@@ -3146,6 +2872,13 @@ mod tests {
         config: Option<serde_json::Value>,
         program: Option<serde_json::Value>,
     ) -> Component {
+        let template = parse_instance_config_template(config.as_ref(), config_schema.as_ref())
+            .expect("component config template");
+        let program = program.map(|program| {
+            let program: ManifestProgram =
+                serde_json::from_value(program).expect("manifest program");
+            lower_program(ComponentId(id), &program, Some(&template)).expect("program")
+        });
         Component {
             id: ComponentId(id),
             parent: parent.map(ComponentId),
@@ -3153,13 +2886,63 @@ mod tests {
             digest: ManifestDigest::new([id as u8; 32]),
             config,
             config_schema,
-            program: program.map(|program| serde_json::from_value(program).expect("program")),
+            program,
             slots: BTreeMap::new(),
             provides: BTreeMap::new(),
             resources: BTreeMap::new(),
             metadata: None,
             children: Vec::new(),
         }
+    }
+
+    #[test]
+    fn build_mount_specs_materializes_literal_config_mounts() {
+        let mut root = component_with_config_and_program(0, None, "/", None, None, None);
+        let child = component_with_config_and_program(
+            1,
+            Some(0),
+            "/worker",
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "mount_file": { "type": "string" },
+                },
+                "required": ["mount_file"],
+            })),
+            Some(serde_json::json!({
+                "mount_file": "hello from config",
+            })),
+            Some(serde_json::json!({
+                "image": "app",
+                "entrypoint": ["app"],
+                "mounts": [
+                    { "path": "/etc/app/config.txt", "from": "config.mount_file" }
+                ],
+            })),
+        );
+        root.children.push(ComponentId(1));
+        let scenario = Scenario {
+            root: ComponentId(0),
+            components: vec![Some(root), Some(child)],
+            bindings: Vec::<BindingEdge>::new(),
+            exports: Vec::new(),
+        };
+        let templates = compose_component_config_templates(&scenario).expect("templates");
+        let mount_specs = build_mount_specs(
+            &scenario,
+            &[ComponentId(1)],
+            &templates,
+            &HashMap::from([(ComponentId(1), BTreeMap::new())]),
+        )
+        .expect("mount specs");
+
+        assert_eq!(
+            mount_specs.get(&ComponentId(1)),
+            Some(&vec![MountSpec::Literal {
+                path: "/etc/app/config.txt".to_string(),
+                content: "hello from config".to_string(),
+            }])
+        );
     }
 
     #[test]

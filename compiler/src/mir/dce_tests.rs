@@ -8,6 +8,7 @@ use amber_scenario::{
 use serde_json::json;
 
 use super::dce_only;
+use crate::program_lowering::lower_program;
 
 fn component(id: usize, moniker: &str) -> Component {
     Component {
@@ -27,7 +28,9 @@ fn component(id: usize, moniker: &str) -> Component {
 }
 
 fn apply_manifest(component: &mut Component, manifest: &Manifest) {
-    component.program = manifest.program().cloned();
+    component.program = manifest.program().map(|program| {
+        lower_program(component.id, program, None).expect("program fixture should lower")
+    });
     component.config_schema = manifest.config_schema().map(|schema| schema.0.clone());
     component.slots = manifest
         .slots()
@@ -56,6 +59,10 @@ fn apply_manifest(component: &mut Component, manifest: &Manifest) {
             )
         })
         .collect();
+}
+
+fn lower_fixture_program(id: usize, program: Program) -> amber_scenario::Program {
+    lower_program(ComponentId(id), &program, None).expect("program fixture should lower")
 }
 
 fn component_mut(components: &mut [Option<Component>], id: usize) -> &mut Component {
@@ -147,7 +154,7 @@ fn externally_rooted_child_scenario(
 
     let mut child = component(1, "/child");
     child.parent = Some(ComponentId(0));
-    child.program = Some(child_program);
+    child.program = Some(lower_fixture_program(1, child_program));
     child.slots.insert(slot_name.to_string(), slot_decl);
 
     let mut scenario = Scenario {
@@ -905,7 +912,7 @@ fn dce_keeps_resource_owner_between_export_and_storage_sink() {
     component_mut(&mut components, 1)
         .resources
         .insert("state".to_string(), storage_resource_decl(Some("5Gi")));
-    component_mut(&mut components, 2).program = Some(app_program);
+    component_mut(&mut components, 2).program = Some(lower_fixture_program(2, app_program));
     component_mut(&mut components, 2)
         .slots
         .insert("state".to_string(), storage_slot);
@@ -1000,17 +1007,17 @@ fn dce_keeps_ancestors_without_marking_ancestor_program_live() {
     connect_parent_child(&mut components, 0, 1);
     connect_parent_child(&mut components, 0, 2);
 
-    component_mut(&mut components, 0).program = Some(root_program);
+    component_mut(&mut components, 0).program = Some(lower_fixture_program(0, root_program));
     component_mut(&mut components, 0)
         .slots
         .insert("up".to_string(), slot_decl);
 
-    component_mut(&mut components, 1).program = Some(consumer_program);
+    component_mut(&mut components, 1).program = Some(lower_fixture_program(1, consumer_program));
     component_mut(&mut components, 1)
         .provides
         .insert("out".to_string(), export_provide_decl);
 
-    component_mut(&mut components, 2).program = Some(provider_program);
+    component_mut(&mut components, 2).program = Some(lower_fixture_program(2, provider_program));
     component_mut(&mut components, 2)
         .provides
         .insert("up".to_string(), provide_decl);
@@ -1056,7 +1063,7 @@ fn dce_keeps_framework_bound_slots() {
 
     let mut components = vec![Some(component(0, "/")), Some(component(1, "/consumer"))];
     connect_parent_child(&mut components, 0, 1);
-    component_mut(&mut components, 1).program = Some(consumer_program);
+    component_mut(&mut components, 1).program = Some(lower_fixture_program(1, consumer_program));
     component_mut(&mut components, 1)
         .slots
         .insert("control".to_string(), control_slot);
@@ -1109,7 +1116,7 @@ fn dce_keeps_live_external_root_slot_when_export_makes_consumer_live() {
 
     let mut green = component(1, "/green");
     green.parent = Some(ComponentId(0));
-    green.program = Some(green_program);
+    green.program = Some(lower_fixture_program(1, green_program));
     green.slots.insert(
         "white".to_string(),
         serde_json::from_value(json!({ "kind": "a2a" })).unwrap(),
@@ -1167,7 +1174,7 @@ fn dce_keeps_live_external_root_slot_used_in_when_condition() {
 
     let mut green = component(1, "/green");
     green.parent = Some(ComponentId(0));
-    green.program = Some(green_program);
+    green.program = Some(lower_fixture_program(1, green_program));
     green.slots.insert(
         "white".to_string(),
         serde_json::from_value(json!({ "kind": "a2a" })).unwrap(),
@@ -1228,7 +1235,7 @@ fn dce_keeps_live_external_root_slot_used_in_env_when_condition() {
 
     let mut green = component(1, "/green");
     green.parent = Some(ComponentId(0));
-    green.program = Some(green_program);
+    green.program = Some(lower_fixture_program(1, green_program));
     green.slots.insert(
         "white".to_string(),
         serde_json::from_value(json!({ "kind": "a2a" })).unwrap(),
@@ -1278,7 +1285,7 @@ fn dce_keeps_externally_rooted_child_program_without_exports() {
 
     let mut child = component(1, "/child");
     child.parent = Some(ComponentId(0));
-    child.program = Some(child_program);
+    child.program = Some(lower_fixture_program(1, child_program));
     child.slots.insert("api".to_string(), slot_decl);
 
     let scenario = Scenario {
@@ -1325,7 +1332,7 @@ fn dce_keeps_externally_rooted_root_program_without_exports() {
     .expect("program");
 
     let mut root = component(0, "/");
-    root.program = Some(root_program);
+    root.program = Some(lower_fixture_program(0, root_program));
     root.slots.insert("api".to_string(), slot_decl);
 
     let scenario = Scenario {
@@ -1375,7 +1382,7 @@ fn dce_prunes_unused_external_binding_without_exports() {
 
     let mut child = component(1, "/child");
     child.parent = Some(ComponentId(0));
-    child.program = Some(child_program);
+    child.program = Some(lower_fixture_program(1, child_program));
     child.slots.insert("api".to_string(), slot_decl);
 
     let scenario = Scenario {
@@ -1430,7 +1437,7 @@ fn dce_keeps_internal_dependencies_of_externally_rooted_program_without_exports(
 
     let mut consumer = component(1, "/consumer");
     consumer.parent = Some(ComponentId(0));
-    consumer.program = Some(consumer_program);
+    consumer.program = Some(lower_fixture_program(1, consumer_program));
     consumer.slots.insert("api".to_string(), slot_http.clone());
     consumer
         .slots
@@ -1438,7 +1445,7 @@ fn dce_keeps_internal_dependencies_of_externally_rooted_program_without_exports(
 
     let mut provider = component(2, "/provider");
     provider.parent = Some(ComponentId(0));
-    provider.program = Some(provider_program);
+    provider.program = Some(lower_fixture_program(2, provider_program));
     provider.provides.insert("admin".to_string(), provide_http);
 
     let scenario = Scenario {
@@ -1502,7 +1509,7 @@ fn dce_keeps_externally_rooted_program_when_slot_is_only_used_in_when_without_ex
 
     let mut child = component(1, "/child");
     child.parent = Some(ComponentId(0));
-    child.program = Some(child_program);
+    child.program = Some(lower_fixture_program(1, child_program));
     child.slots.insert("api".to_string(), slot_decl);
 
     let scenario = Scenario {
@@ -1611,7 +1618,7 @@ fn dce_keeps_all_slot_dependencies_for_externally_rooted_program_without_exports
 
     let mut consumer = component(1, "/consumer");
     consumer.parent = Some(ComponentId(0));
-    consumer.program = Some(consumer_program);
+    consumer.program = Some(lower_fixture_program(1, consumer_program));
     consumer.slots.insert("api".to_string(), slot_http.clone());
     consumer
         .slots
@@ -1619,7 +1626,7 @@ fn dce_keeps_all_slot_dependencies_for_externally_rooted_program_without_exports
 
     let mut provider = component(2, "/provider");
     provider.parent = Some(ComponentId(0));
-    provider.program = Some(provider_program);
+    provider.program = Some(lower_fixture_program(2, provider_program));
     provider.provides.insert("admin".to_string(), provide_http);
 
     let scenario = Scenario {
@@ -1686,7 +1693,7 @@ fn dce_prunes_dead_incoming_edges_of_live_externally_rooted_program() {
 
     let mut consumer = component(1, "/consumer");
     consumer.parent = Some(ComponentId(0));
-    consumer.program = Some(consumer_program);
+    consumer.program = Some(lower_fixture_program(1, consumer_program));
     consumer.slots.insert("api".to_string(), slot_http.clone());
     consumer
         .slots
@@ -1697,7 +1704,7 @@ fn dce_prunes_dead_incoming_edges_of_live_externally_rooted_program() {
 
     let mut provider = component(2, "/provider");
     provider.parent = Some(ComponentId(0));
-    provider.program = Some(provider_program);
+    provider.program = Some(lower_fixture_program(2, provider_program));
     provider.provides.insert("admin".to_string(), provide_http);
 
     let mut scenario = Scenario {

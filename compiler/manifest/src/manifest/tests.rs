@@ -1276,6 +1276,39 @@ fn endpoint_validation_passes_for_defined_reference() {
 }
 
 #[test]
+fn endpoint_validation_still_rejects_unknown_provide_with_conditional_literal_endpoints() {
+    let err = r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              enabled: { type: "boolean" },
+            },
+          },
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            network: {
+              endpoints: [
+                { name: "api", port: 80 },
+                { when: "config.enabled", name: "admin", port: 81 },
+              ]
+            }
+          },
+          provides: {
+            api: { kind: "http", endpoint: "missing" }
+          },
+          exports: { api: "api" },
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    assert!(err.to_string().contains("unknown endpoint `missing`"));
+}
+
+#[test]
 fn docker_capability_kind_parses_for_slots_and_provides() {
     let m: Manifest = r#"
         {
@@ -1662,6 +1695,35 @@ fn duplicate_mount_paths_error() {
     .unwrap_err();
 
     assert!(err.to_string().contains("duplicate mount path"));
+}
+
+#[test]
+fn conditional_mounts_still_validate_storage_sources() {
+    let err = r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              enabled: { type: "boolean" },
+            },
+          },
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [
+              { when: "config.enabled", path: "/var/lib/app", from: "slots.state" },
+            ]
+          }
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    match err {
+        Error::UnknownMountSlot { slot } => assert_eq!(slot, "state"),
+        other => panic!("expected UnknownMountSlot error, got: {other}"),
+    }
 }
 
 #[test]

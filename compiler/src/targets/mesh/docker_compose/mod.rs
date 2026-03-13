@@ -8,7 +8,7 @@ use std::{
 
 use amber_config as rc;
 use amber_mesh::{MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProvisionOutput};
-use amber_scenario::{ComponentId, Scenario};
+use amber_scenario::{ComponentId, ProgramMount, Scenario};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
@@ -19,7 +19,6 @@ use framework_docker_injection::{
 };
 
 use crate::{
-    program_semantics::{StaticMountKind, validated_static_mounts},
     reporter::{
         CompiledScenario, Reporter, ReporterError,
         execution_guide::{
@@ -1117,15 +1116,17 @@ fn collect_framework_docker_mount_paths(
     scenario: &Scenario,
     program_components: &[ComponentId],
 ) -> HashMap<ComponentId, Vec<String>> {
-    let static_mounts = validated_static_mounts(scenario, "docker-compose planning");
     let mut out = HashMap::new();
     for component in program_components {
-        let paths: Vec<String> = static_mounts
-            .component_mounts(*component)
-            .iter()
-            .filter_map(|mount| match &mount.kind {
-                StaticMountKind::Framework(name) if name.as_str() == "docker" => {
-                    Some(mount.path.clone())
+        let paths: Vec<String> = scenario
+            .component(*component)
+            .program
+            .as_ref()
+            .into_iter()
+            .flat_map(|program| program.mounts())
+            .filter_map(|mount| match mount {
+                ProgramMount::Framework { path, capability } if capability.as_str() == "docker" => {
+                    Some(path.clone())
                 }
                 _ => None,
             })

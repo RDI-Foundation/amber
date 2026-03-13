@@ -582,21 +582,24 @@ fn validate_endpoints(
     program: Option<&Program>,
     provides: &BTreeMap<ProvideName, ProvideDecl>,
 ) -> Result<(), Error> {
-    let mut defined_endpoints = BTreeSet::new();
-    let mut all_static = true;
+    let mut unconditional_literal_endpoints = BTreeSet::new();
+    let mut possible_literal_endpoints = BTreeSet::new();
+    let mut has_opaque_endpoint_name = false;
     if let Some(program) = program
         && let Some(network) = program.network()
     {
         for endpoint in network.endpoints() {
             let Some(name) = endpoint.name.as_literal() else {
-                all_static = false;
+                has_opaque_endpoint_name = true;
                 continue;
             };
-            if endpoint.when.is_some() || endpoint.each.is_some() {
-                all_static = false;
-                continue;
-            }
-            if !defined_endpoints.insert(name) {
+
+            possible_literal_endpoints.insert(name);
+
+            if endpoint.when.is_none()
+                && endpoint.each.is_none()
+                && !unconditional_literal_endpoints.insert(name)
+            {
                 return Err(Error::DuplicateEndpointName {
                     name: name.to_string(),
                 });
@@ -618,7 +621,7 @@ fn validate_endpoints(
             });
         };
 
-        if all_static && !defined_endpoints.contains(endpoint) {
+        if !possible_literal_endpoints.contains(endpoint) && !has_opaque_endpoint_name {
             return Err(Error::UnknownEndpoint {
                 name: endpoint.to_string(),
             });
@@ -643,19 +646,14 @@ fn validate_mounts(
     let mut paths = BTreeSet::new();
 
     for mount in program.mounts() {
+        let is_variadic = mount.when.is_some() || mount.each.is_some();
         let Some(path) = mount.path.as_literal() else {
             continue;
         };
-        let Some(source) = mount.source.as_literal() else {
-            continue;
-        };
-        if mount.when.is_some() || mount.each.is_some() {
-            continue;
-        }
 
         if let Some(name) = mount.name.as_ref().and_then(InterpolatedString::as_literal) {
             ensure_name_no_dot(name, "mount")?;
-            if !names.insert(name) {
+            if !is_variadic && !names.insert(name) {
                 return Err(Error::DuplicateMountName {
                     name: name.to_string(),
                 });
@@ -674,12 +672,15 @@ fn validate_mounts(
                 message: "mount path must not contain `..`".to_string(),
             });
         }
-        if !paths.insert(path) {
+        if !is_variadic && !paths.insert(path) {
             return Err(Error::DuplicateMountPath {
                 path: path.to_string(),
             });
         }
 
+        let Some(source) = mount.source.as_literal() else {
+            continue;
+        };
         match source.parse::<MountSource>()? {
             MountSource::Config(path) => {
                 let Some(schema) = config_schema else {

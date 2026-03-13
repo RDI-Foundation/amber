@@ -5,7 +5,7 @@ use std::{
 
 use amber_manifest::VmEgress;
 use amber_mesh::{MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProvisionOutput};
-use amber_scenario::{ComponentId, Scenario};
+use amber_scenario::{ComponentId, Program, Scenario};
 use amber_template::{TemplatePart, TemplateString};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -419,7 +419,7 @@ fn build_component_plans(
     let mut out = Vec::with_capacity(program_components.len());
     for id in program_components {
         let component = scenario.component(*id);
-        let amber_manifest::Program::Vm(program) = component.program.as_ref().ok_or_else(|| {
+        let Program::Vm(program) = component.program.as_ref().ok_or_else(|| {
             MeshError::new(format!(
                 "internal error: missing program for {}",
                 component.moniker.as_str()
@@ -456,7 +456,7 @@ fn build_component_plans(
                 scenario,
                 *id,
                 "program.vm.cloud_init.user_data",
-                program.0.cloud_init.user_data.as_deref(),
+                program.cloud_init.user_data.as_deref(),
                 RuntimeAddressResolution::Deferred,
                 slots,
                 template_opt,
@@ -466,7 +466,7 @@ fn build_component_plans(
                 scenario,
                 *id,
                 "program.vm.cloud_init.vendor_data",
-                program.0.cloud_init.vendor_data.as_deref(),
+                program.cloud_init.vendor_data.as_deref(),
                 RuntimeAddressResolution::Deferred,
                 slots,
                 template_opt,
@@ -512,13 +512,13 @@ fn build_component_plans(
             mesh_identity_path: mesh_identity_relative_path(&names.mesh_dir),
             cpus: build_vm_scalar_plan(resolve_vm_scalar_u32(
                 template_opt,
-                &program.0.cpus,
+                &program.cpus,
                 component.moniker.as_str(),
                 "program.vm.cpus",
             )?),
             memory_mib: build_vm_scalar_plan(resolve_vm_scalar_u32(
                 template_opt,
-                &program.0.memory_mib,
+                &program.memory_mib,
                 component.moniker.as_str(),
                 "program.vm.memory_mib",
             )?),
@@ -534,13 +534,7 @@ fn build_component_plans(
             )?,
             cloud_init_user_data,
             cloud_init_vendor_data,
-            egress: match program
-                .0
-                .network
-                .as_ref()
-                .map(|network| network.egress)
-                .unwrap_or(VmEgress::None)
-            {
+            egress: match program.egress {
                 VmEgress::None => VmEgressPlan::None,
                 VmEgress::Optional => VmEgressPlan::Optional,
                 _ => VmEgressPlan::None,

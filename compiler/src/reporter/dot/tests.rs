@@ -7,6 +7,7 @@ use amber_scenario::{
 };
 
 use super::{render_dot, render_dot_with_exports};
+use crate::program_lowering::lower_program;
 
 fn component(id: usize, moniker: &str) -> Component {
     Component {
@@ -26,7 +27,9 @@ fn component(id: usize, moniker: &str) -> Component {
 }
 
 fn apply_manifest(component: &mut Component, manifest: &Manifest) {
-    component.program = manifest.program().cloned();
+    component.program = manifest.program().map(|program| {
+        lower_program(component.id, program, None).expect("program fixture should lower")
+    });
     component.config_schema = manifest.config_schema().map(|schema| schema.0.clone());
     component.slots = manifest
         .slots()

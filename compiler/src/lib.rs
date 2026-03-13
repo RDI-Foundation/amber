@@ -25,7 +25,7 @@ mod linker;
 mod manifest_table;
 pub mod mesh;
 mod mir;
-mod program_semantics;
+mod program_lowering;
 mod provenance;
 mod slot_query;
 mod slot_validation;
@@ -379,21 +379,16 @@ fn externally_rooted_programs_by_component(
     scenario: &Scenario,
     provenance: &Provenance,
 ) -> BTreeSet<String> {
-    let static_mounts = program_semantics::validated_static_mounts(scenario, "diagnostics");
     let used_slots_by_component: Vec<BTreeSet<String>> = scenario
         .components
         .iter()
-        .enumerate()
-        .map(|(idx, component)| {
+        .map(|component| {
             component
                 .as_ref()
                 .map(|component| {
-                    mir::collect_program_used_slots(
-                        component,
-                        static_mounts.component_mounts(ComponentId(idx)),
-                    )
-                    .into_iter()
-                    .collect()
+                    mir::collect_program_used_slots(component)
+                        .into_iter()
+                        .collect()
                 })
                 .unwrap_or_default()
         })

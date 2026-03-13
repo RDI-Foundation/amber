@@ -1373,7 +1373,10 @@ async fn program_can_mount_local_storage_resource_directly() {
             .expect("root program")
             .mounts()
             .iter()
-            .any(|mount| mount.source.to_string() == "resources.state"),
+            .any(|mount| matches!(
+                mount,
+                amber_scenario::ProgramMount::Resource { resource, .. } if resource == "state"
+            )),
         "program should keep the direct resource mount"
     );
     assert!(

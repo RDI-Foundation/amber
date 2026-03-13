@@ -1,20 +1,20 @@
 use std::collections::BTreeMap;
 
 use amber_manifest::{
-    CapabilityDecl, CapabilityKind, FrameworkCapabilityName, ManifestDigest, MountSource, Program,
-    ProvideDecl, SlotDecl, framework_capability,
+    CapabilityDecl, CapabilityKind, FrameworkCapabilityName, ManifestDigest, ProvideDecl, SlotDecl,
+    framework_capability,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceDecl,
-    ResourceRef, Scenario, ScenarioExport, SlotRef,
+    BindingEdge, BindingFrom, Component, ComponentId, Moniker, Program, ProgramMount, ProvideRef,
+    ResourceDecl, ResourceRef, Scenario, ScenarioExport, SlotRef,
 };
 
 pub const SCENARIO_IR_SCHEMA: &str = "amber.scenario.ir";
-pub const SCENARIO_IR_VERSION: u32 = 3;
-const MIN_SCENARIO_IR_VERSION: u32 = 1;
+pub const SCENARIO_IR_VERSION: u32 = 4;
+const MIN_SCENARIO_IR_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScenarioIr {
@@ -801,7 +801,7 @@ fn validate_mounted_storage_slots(scenario: &Scenario) -> Result<(), ScenarioIrE
         };
 
         for mount in program.mounts() {
-            let Some(MountSource::Slot(slot)) = mount.literal_source() else {
+            let ProgramMount::Slot { slot, .. } = mount else {
                 continue;
             };
             let Some(slot_decl) = component.slots.get(slot.as_str()) else {
@@ -930,7 +930,7 @@ mod tests {
     use amber_manifest::{FrameworkCapabilityName, ManifestDigest};
     use serde_json::json;
 
-    use super::{SCENARIO_IR_SCHEMA, SCENARIO_IR_VERSION, ScenarioIr};
+    use super::{SCENARIO_IR_SCHEMA, SCENARIO_IR_VERSION, ScenarioIr, ScenarioIrError};
     use crate::{
         BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
         ScenarioExport, SlotRef,
@@ -1057,8 +1057,6 @@ mod tests {
                     "program": {
                         "image": "example/child",
                         "entrypoint": [],
-                        "env": {},
-                        "mounts": [],
                         "network": {
                             "endpoints": [
                                 {
@@ -1119,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn scenario_ir_accepts_v1_inputs() {
+    fn scenario_ir_rejects_legacy_versions() {
         let ir = json!({
             "schema": SCENARIO_IR_SCHEMA,
             "version": 1,
@@ -1143,10 +1141,14 @@ mod tests {
 
         let parsed: ScenarioIr =
             serde_json::from_value(ir).expect("deserialize legacy scenario IR");
-        let scenario =
-            Scenario::try_from(parsed).expect("legacy scenario IR should remain accepted");
-        assert_eq!(scenario.root, ComponentId(0));
-        assert_eq!(scenario.components_iter().count(), 1);
+        let err = Scenario::try_from(parsed).expect_err("legacy scenario IR should be rejected");
+        assert!(matches!(
+            err,
+            ScenarioIrError::VersionMismatch {
+                expected: SCENARIO_IR_VERSION,
+                actual: 1
+            }
+        ));
     }
 
     #[test]
@@ -1484,7 +1486,11 @@ mod tests {
                         "image": "busybox:stable",
                         "entrypoint": ["sh"],
                         "mounts": [
-                            { "path": "/var/lib/app", "from": "slots.state" }
+                            {
+                                "kind": "slot",
+                                "path": "/var/lib/app",
+                                "slot": "state"
+                            }
                         ]
                     },
                     "slots": {

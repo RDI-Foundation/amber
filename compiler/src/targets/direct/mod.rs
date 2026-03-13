@@ -4,14 +4,13 @@ use std::{
 };
 
 use amber_mesh::{MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProvisionOutput};
-use amber_scenario::{ComponentId, Scenario};
+use amber_scenario::{ComponentId, ProgramMount, Scenario};
 use amber_template::{ProgramArgTemplate, TemplatePart, TemplateSpec};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::{
-    program_semantics::{StaticMountKind, validated_static_mounts},
     reporter::{
         CompiledScenario, Reporter, ReporterError,
         execution_guide::{
@@ -809,11 +808,13 @@ fn ensure_direct_mount_sources_supported(
     scenario: &Scenario,
     program_components: &[ComponentId],
 ) -> Result<(), MeshError> {
-    let static_mounts = validated_static_mounts(scenario, "direct planning");
     for id in program_components {
         let component = scenario.component(*id);
-        for mount in static_mounts.component_mounts(*id) {
-            if let StaticMountKind::Framework(capability) = &mount.kind {
+        let Some(program) = component.program.as_ref() else {
+            continue;
+        };
+        for mount in program.mounts() {
+            if let ProgramMount::Framework { capability, .. } = mount {
                 return Err(MeshError::new(format!(
                     "component {} uses framework mount source `framework.{}`, which is not \
                      supported by direct output",

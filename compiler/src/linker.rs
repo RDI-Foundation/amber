@@ -13,7 +13,7 @@ use amber_manifest::{
     ManifestDigest, Program, framework_capability, span_for_json_pointer,
 };
 use amber_scenario::{
-    BindingEdge, BindingFrom, Component, ComponentId, ProvideRef,
+    BindingEdge, BindingFrom, Component, ComponentId, ProgramMount, ProvideRef,
     ResourceDecl as ScenarioResourceDecl, ResourceRef, Scenario, ScenarioExport, SlotRef,
     StorageResourceParams as ScenarioStorageResourceParams, graph::component_path_for,
 };
@@ -27,7 +27,7 @@ use crate::{
     ComponentProvenance, DigestStore, Provenance,
     config_resolution::render_static_config_string,
     config_templates,
-    program_semantics::{StaticMount, StaticMountKind, StaticMountPlan, analyze_mount_semantics},
+    program_lowering::{ProgramLoweringError, ProgramLoweringSite, lower_program_with_origins},
     store::display_url,
 };
 
@@ -451,10 +451,15 @@ fn slot_decl_related_span(
     })
 }
 
-fn has_storage_mount(static_mounts: &[StaticMount], slot: &str) -> bool {
-    static_mounts
-        .iter()
-        .any(|mount| matches!(&mount.kind, StaticMountKind::Slot(mount_slot) if mount_slot == slot))
+fn has_storage_mount(component: &Component, slot: &str) -> bool {
+    component
+        .program
+        .as_ref()
+        .is_some_and(|program| {
+            program.mounts().iter().any(
+                |mount| matches!(mount, ProgramMount::Slot { slot: mount_slot, .. } if mount_slot == slot),
+            )
+        })
 }
 
 fn mount_source_site(
@@ -491,12 +496,57 @@ fn mount_source_site(
     Some((src, span))
 }
 
+fn endpoint_site(
+    provenance: &Provenance,
+    store: &DigestStore,
+    id: ComponentId,
+    endpoint_index: usize,
+) -> Option<(NamedSource<Arc<str>>, SourceSpan)> {
+    let prov = provenance.for_component(id);
+    let stored = store.get_source(&prov.resolved_url)?;
+    let src = NamedSource::new(display_url(&prov.resolved_url), Arc::clone(&stored.source))
+        .with_language("json5");
+    let root = (0usize, stored.source.len()).into();
+    let whole_endpoint_pointers = [
+        format!("/program/network/endpoints/{endpoint_index}"),
+        format!("/program/vm/network/endpoints/{endpoint_index}"),
+    ];
+    let span = whole_endpoint_pointers
+        .iter()
+        .find_map(|pointer| span_for_json_pointer(stored.source.as_ref(), root, pointer))
+        .or_else(|| {
+            span_for_json_pointer(stored.source.as_ref(), root, "/program/network/endpoints")
+        })
+        .or_else(|| {
+            span_for_json_pointer(
+                stored.source.as_ref(),
+                root,
+                "/program/vm/network/endpoints",
+            )
+        })
+        .or_else(|| stored.spans.program.as_ref().map(|program| program.whole))
+        .unwrap_or((0usize, 0usize).into());
+    Some((src, span))
+}
+
+fn authored_mount_index(
+    mount_source_indices_by_component: &HashMap<ComponentId, Vec<usize>>,
+    component: ComponentId,
+    lowered_mount_index: usize,
+) -> usize {
+    mount_source_indices_by_component
+        .get(&component)
+        .and_then(|source_indices| source_indices.get(lowered_mount_index))
+        .copied()
+        .unwrap_or(lowered_mount_index)
+}
+
 #[derive(Clone, Debug)]
 enum StorageMountSinkSite {
     Binding(BindingOrigin),
     Mount {
         component: ComponentId,
-        mount_index: usize,
+        authored_mount_index: usize,
     },
 }
 
@@ -519,8 +569,8 @@ fn storage_mount_sink_site(
         }
         StorageMountSinkSite::Mount {
             component,
-            mount_index,
-        } => mount_source_site(provenance, store, *component, *mount_index),
+            authored_mount_index,
+        } => mount_source_site(provenance, store, *component, *authored_mount_index),
     }
 }
 
@@ -718,6 +768,17 @@ pub enum Error {
         span: SourceSpan,
     },
 
+    #[error("unsupported program endpoint on {component_path}: {message}")]
+    #[diagnostic(code(linker::unsupported_program_endpoint))]
+    UnsupportedProgramEndpoint {
+        component_path: String,
+        message: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label(primary, "endpoint declared here")]
+        span: SourceSpan,
+    },
+
     #[error("slot `{slot}` on {component_path} is not bound (non-optional slots must be filled)")]
     #[diagnostic(code(linker::unbound_slot))]
     UnboundSlot {
@@ -848,7 +909,6 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         let (Some(c), Some(m)) = (c.as_mut(), m.as_ref()) else {
             continue;
         };
-        c.program = m.program().cloned();
         c.slots = m
             .slots()
             .iter()
@@ -896,6 +956,44 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         );
     }
 
+    let mut mount_source_indices_by_component: HashMap<ComponentId, Vec<usize>> = HashMap::new();
+    for id in (0..components.len()).map(ComponentId) {
+        let Some(component) = components[id.0].as_mut() else {
+            continue;
+        };
+        let Some(manifest) = manifests[id.0].as_ref() else {
+            continue;
+        };
+        let Some(program) = manifest.program() else {
+            continue;
+        };
+        let template_opt = composed
+            .templates
+            .get(&id)
+            .and_then(rc::RootConfigTemplate::node);
+        match lower_program_with_origins(id, program, template_opt) {
+            Ok(lowered) => {
+                mount_source_indices_by_component.insert(id, lowered.mount_source_indices);
+                component.program = Some(lowered.program);
+            }
+            Err(program_errors) => record_program_lowering_errors(
+                id,
+                &component_path_for(&components, id),
+                &program_errors,
+                &provenance,
+                store,
+                &mut errors,
+            ),
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(Error::Multiple {
+            count: errors.len(),
+            errors,
+        });
+    }
+
     let bindings = collect_bindings(
         &components,
         &manifests,
@@ -904,14 +1002,6 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         store,
         &mut errors,
     );
-    let mount_scenario = Scenario {
-        root,
-        components: components.clone(),
-        bindings: Vec::new(),
-        exports: Vec::new(),
-    };
-    let (static_mounts, mount_errors) = analyze_mount_semantics(&mount_scenario);
-    record_mount_semantics_errors(&mount_errors, &provenance, store, &components, &mut errors);
 
     let root_manifest = manifests[root.0]
         .as_ref()
@@ -920,7 +1010,6 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         components[root.0]
             .as_ref()
             .expect("root component should exist"),
-        static_mounts.component_mounts(root),
     );
 
     let mut resolver = SlotResolver::new(
@@ -939,7 +1028,6 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         &binding_edges,
         &external_root_slots,
         root,
-        &static_mounts,
         &provenance,
         store,
         &mut errors,
@@ -949,7 +1037,7 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         &manifests,
         &bindings,
         &mut resolver,
-        &static_mounts,
+        &mount_source_indices_by_component,
         &provenance,
         store,
         &mut errors,
@@ -2832,10 +2920,7 @@ fn format_cycle(parts: &[String]) -> String {
     out.join(" -> ")
 }
 
-fn collect_program_slot_uses(
-    component: &Component,
-    static_mounts: &[StaticMount],
-) -> HashSet<String> {
+fn collect_program_slot_uses(component: &Component) -> HashSet<String> {
     let mut uses = HashSet::new();
     let Some(program) = component.program.as_ref() else {
         return uses;
@@ -2847,14 +2932,6 @@ fn collect_program_slot_uses(
         }
     }) {
         uses.extend(component.slots.keys().cloned());
-    }
-
-    for mount in static_mounts {
-        if let StaticMountKind::Slot(slot) = &mount.kind
-            && component.slots.contains_key(slot.as_str())
-        {
-            uses.insert(slot.clone());
-        }
     }
 
     uses
@@ -3029,7 +3106,6 @@ fn validate_all_slots_bound(
     bindings: &[BindingEdge],
     external_root_slots: &HashSet<String>,
     root: ComponentId,
-    static_mounts: &StaticMountPlan,
     provenance: &Provenance,
     store: &DigestStore,
     errors: &mut Vec<Error>,
@@ -3041,12 +3117,13 @@ fn validate_all_slots_bound(
 
     for id in (0..components.len()).map(ComponentId) {
         let m = manifests[id.0].as_ref().expect("manifest should exist");
+        let component = components[id.0].as_ref().expect("component should exist");
         for (slot_name, slot_decl) in m.slots().iter() {
             if slot_decl.optional {
                 continue;
             }
             if slot_decl.decl.kind == CapabilityKind::Storage
-                && has_storage_mount(static_mounts.component_mounts(id), slot_name.as_str())
+                && has_storage_mount(component, slot_name.as_str())
             {
                 continue;
             }
@@ -3087,7 +3164,7 @@ fn validate_storage_mounts(
     manifests: &[Option<Arc<Manifest>>],
     binding_specs: &[BindingSpec],
     resolver: &mut SlotResolver<'_>,
-    static_mounts: &StaticMountPlan,
+    mount_source_indices_by_component: &HashMap<ComponentId, Vec<usize>>,
     provenance: &Provenance,
     store: &DigestStore,
     errors: &mut Vec<Error>,
@@ -3105,10 +3182,18 @@ fn validate_storage_mounts(
 
     for id in (0..components.len()).map(ComponentId) {
         let manifest = manifests[id.0].as_ref().expect("manifest should exist");
-        for mount in static_mounts.component_mounts(id) {
-            let mount_index = mount.mount_index;
-            match &mount.kind {
-                crate::program_semantics::StaticMountKind::Slot(slot_name) => {
+        let component = components[id.0].as_ref().expect("component should exist");
+        let Some(program) = component.program.as_ref() else {
+            continue;
+        };
+
+        for (lowered_mount_index, mount) in program.mounts().iter().enumerate() {
+            let source_mount_index =
+                authored_mount_index(mount_source_indices_by_component, id, lowered_mount_index);
+            match mount {
+                ProgramMount::Slot {
+                    slot: slot_name, ..
+                } => {
                     let Some(slot_decl) = manifest.slots().get(slot_name.as_str()) else {
                         continue;
                     };
@@ -3124,8 +3209,9 @@ fn validate_storage_mounts(
                     let Some(resolved) = resolved else {
                         let component_path =
                             describe_component_path(&component_path_for(components, id));
-                        let (src, span) = mount_source_site(provenance, store, id, mount_index)
-                            .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                        let (src, span) =
+                            mount_source_site(provenance, store, id, source_mount_index)
+                                .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
                         let mut related: Vec<_> =
                             component_decl_site(components, provenance, store, id)
                                 .into_iter()
@@ -3153,8 +3239,9 @@ fn validate_storage_mounts(
                     let [resolved] = resolved.as_slice() else {
                         let component_path =
                             describe_component_path(&component_path_for(components, id));
-                        let (src, span) = mount_source_site(provenance, store, id, mount_index)
-                            .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                        let (src, span) =
+                            mount_source_site(provenance, store, id, source_mount_index)
+                                .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
                         let mut related: Vec<_> =
                             component_decl_site(components, provenance, store, id)
                                 .into_iter()
@@ -3182,8 +3269,9 @@ fn validate_storage_mounts(
                     let BindingFrom::Resource(resource) = &resolved.from else {
                         let component_path =
                             describe_component_path(&component_path_for(components, id));
-                        let (src, span) = mount_source_site(provenance, store, id, mount_index)
-                            .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                        let (src, span) =
+                            mount_source_site(provenance, store, id, source_mount_index)
+                                .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
                         let mut related: Vec<_> =
                             component_decl_site(components, provenance, store, id)
                                 .into_iter()
@@ -3232,7 +3320,10 @@ fn validate_storage_mounts(
                             site,
                         });
                 }
-                crate::program_semantics::StaticMountKind::Resource(resource_name) => {
+                ProgramMount::Resource {
+                    resource: resource_name,
+                    ..
+                } => {
                     sinks_by_resource
                         .entry(ResourceRef {
                             component: id,
@@ -3241,15 +3332,15 @@ fn validate_storage_mounts(
                         .or_default()
                         .push(StorageMountSink {
                             component: id,
-                            sink_id: format!("mount:{mount_index}"),
+                            sink_id: format!("mount:{lowered_mount_index}"),
                             description: format!("resources.{resource_name}"),
                             site: StorageMountSinkSite::Mount {
                                 component: id,
-                                mount_index,
+                                authored_mount_index: source_mount_index,
                             },
                         });
                 }
-                crate::program_semantics::StaticMountKind::Framework(_) => {}
+                ProgramMount::File(_) | ProgramMount::Framework { .. } => {}
             }
         }
     }
@@ -3291,28 +3382,37 @@ fn validate_storage_mounts(
     }
 }
 
-fn record_mount_semantics_errors(
-    mount_errors: &[crate::program_semantics::MountSemanticsError],
+fn record_program_lowering_errors(
+    component: ComponentId,
+    component_path: &str,
+    program_errors: &[ProgramLoweringError],
     provenance: &Provenance,
     store: &DigestStore,
-    components: &[Option<Component>],
     errors: &mut Vec<Error>,
 ) {
-    for mount_error in mount_errors {
-        let component_path = component_path_for(components, mount_error.component);
-        let (src, span) = mount_source_site(
-            provenance,
-            store,
-            mount_error.component,
-            mount_error.mount_index,
-        )
-        .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
-        errors.push(Error::UnsupportedProgramMount {
-            component_path,
-            message: mount_error.message.clone(),
-            src,
-            span,
-        });
+    for program_error in program_errors {
+        match program_error.site {
+            ProgramLoweringSite::Mount(mount_index) => {
+                let (src, span) = mount_source_site(provenance, store, component, mount_index)
+                    .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                errors.push(Error::UnsupportedProgramMount {
+                    component_path: component_path.to_string(),
+                    message: program_error.message.clone(),
+                    src,
+                    span,
+                });
+            }
+            ProgramLoweringSite::Endpoint(endpoint_index) => {
+                let (src, span) = endpoint_site(provenance, store, component, endpoint_index)
+                    .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                errors.push(Error::UnsupportedProgramEndpoint {
+                    component_path: component_path.to_string(),
+                    message: program_error.message.clone(),
+                    src,
+                    span,
+                });
+            }
+        }
     }
 }
 
@@ -3323,11 +3423,13 @@ mod tests {
         sync::Arc,
     };
 
-    use amber_manifest::{Manifest, ManifestDigest};
-    use amber_scenario::{Component, ComponentId, Moniker};
+    use amber_manifest::{Manifest, ManifestDigest, ProgramEntrypoint};
+    use amber_scenario::{
+        Component, ComponentId, Moniker, Program, ProgramCommon, ProgramImage, ProgramMount,
+    };
 
     use super::collect_program_slot_uses;
-    use crate::program_semantics::{StaticMount, StaticMountKind};
+    use crate::program_lowering::lower_program;
 
     #[test]
     fn collect_program_slot_uses_includes_slot_conditions() {
@@ -3355,7 +3457,10 @@ mod tests {
             digest: ManifestDigest::new([0; 32]),
             config: None,
             config_schema: None,
-            program: manifest.program().cloned(),
+            program: Some(
+                lower_program(ComponentId(0), manifest.program().expect("program"), None)
+                    .expect("program should lower"),
+            ),
             slots: manifest
                 .slots()
                 .iter()
@@ -3368,23 +3473,16 @@ mod tests {
         };
 
         assert_eq!(
-            collect_program_slot_uses(&component, &[]),
+            collect_program_slot_uses(&component),
             HashSet::from(["api".to_string()])
         );
     }
 
     #[test]
-    fn collect_program_slot_uses_includes_static_mount_slots() {
+    fn collect_program_slot_uses_includes_lowered_mount_slots() {
         let manifest: Manifest = r#"
             {
-              manifest_version: "0.3.0",
-              program: {
-                image: "app",
-                entrypoint: ["app"],
-                mounts: [
-                  { path: "/var/lib/app", from: "${config.mount_source}" },
-                ],
-              },
+              manifest_version: "0.2.0",
               slots: {
                 state: { kind: "storage" },
               },
@@ -3399,7 +3497,18 @@ mod tests {
             digest: ManifestDigest::new([0; 32]),
             config: None,
             config_schema: None,
-            program: manifest.program().cloned(),
+            program: Some(Program::Image(ProgramImage {
+                image: "app".to_string(),
+                entrypoint: ProgramEntrypoint::default(),
+                common: ProgramCommon {
+                    env: BTreeMap::new(),
+                    network: None,
+                    mounts: vec![ProgramMount::Slot {
+                        path: "/var/lib/app".to_string(),
+                        slot: "state".to_string(),
+                    }],
+                },
+            })),
             slots: manifest
                 .slots()
                 .iter()
@@ -3412,14 +3521,7 @@ mod tests {
         };
 
         assert_eq!(
-            collect_program_slot_uses(
-                &component,
-                &[StaticMount {
-                    mount_index: 0,
-                    path: "/var/lib/app".to_string(),
-                    kind: StaticMountKind::Slot("state".to_string()),
-                }],
-            ),
+            collect_program_slot_uses(&component),
             HashSet::from(["state".to_string()])
         );
     }

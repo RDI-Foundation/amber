@@ -79,7 +79,7 @@ fn compile_writes_primary_output_and_dot_artifact() {
     let primary_json: Value =
         serde_json::from_str(&primary_contents).expect("primary output did not contain valid JSON");
     assert_eq!(primary_json["schema"], "amber.scenario.ir");
-    assert_eq!(primary_json["version"], 3);
+    assert_eq!(primary_json["version"], 4);
     assert_eq!(primary_json["root"], 0);
 
     let components = primary_json["components"]
@@ -2836,7 +2836,7 @@ fn compile_direct_rejects_scenario_ir_with_non_resource_storage_mount_binding() 
         &ir_path,
         serde_json::to_vec_pretty(&serde_json::json!({
             "schema": "amber.scenario.ir",
-            "version": 2,
+            "version": 4,
             "root": 0,
             "components": [
                 {
@@ -2863,7 +2863,11 @@ fn compile_direct_rejects_scenario_ir_with_non_resource_storage_mount_binding() 
                         "image": "busybox:stable",
                         "entrypoint": ["sh"],
                         "mounts": [
-                            { "path": "/var/lib/app", "from": "slots.state" }
+                            {
+                                "kind": "slot",
+                                "path": "/var/lib/app",
+                                "slot": "state"
+                            }
                         ]
                     },
                     "slots": {
