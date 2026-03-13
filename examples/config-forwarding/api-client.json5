@@ -12,6 +12,7 @@
   },
 
   program: {
+    // Printing `${config}` makes the rendered child config visible when you run the example.
     image: "busybox:1.36",
     entrypoint: [
       "sh",
