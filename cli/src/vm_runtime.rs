@@ -18,8 +18,8 @@ use amber_compiler::reporter::{
     },
 };
 use amber_config::{
-    build_root_config, env_var_for_path, eval_config_template_partial_with_context, get_by_path,
-    render_template_string_with_context, stringify_for_mount,
+    build_root_config, env_var_for_path, eval_config_template_partial_with_context,
+    render_mount_specs, render_template_string_with_context,
 };
 use amber_mesh::{
     InboundTarget, MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MESH_PROVISION_PLAN_VERSION,
@@ -27,7 +27,7 @@ use amber_mesh::{
     MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTarget,
 };
 use amber_template::{
-    ConfigTemplatePayload, RuntimeSlotObject, RuntimeTemplateContext, TemplatePart,
+    ConfigTemplatePayload, MountSpec, RuntimeSlotObject, RuntimeTemplateContext, TemplatePart,
 };
 use base64::Engine as _;
 use fatfs::{FileSystem, FormatVolumeOptions, FsOptions, format_volume};
@@ -149,13 +149,6 @@ struct QemuImgInfo {
     format: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum MountSpec {
-    Literal { path: String, content: String },
-    Config { path: String, config: String },
-}
-
 pub(crate) async fn run_vm_init(plan: PathBuf, storage_root: Option<PathBuf>) -> Result<()> {
     let plan_path = canonicalize_path(&plan, "vm plan")?;
     let plan_root = plan_path
@@ -262,6 +255,7 @@ pub(crate) async fn run_vm_init(plan: PathBuf, storage_root: Option<PathBuf>) ->
             let mount_files = render_mount_files(
                 component.mount_spec_b64.as_deref(),
                 component_config.as_ref(),
+                &runtime_context,
             )?;
             wait_for_guestfwd_targets(component, &port_assignments, VM_GUESTFWD_READY_TIMEOUT)?;
             let vm_launch = build_vm_launch_plan(
@@ -984,35 +978,16 @@ async fn cleanup_vm_runtime(
 fn render_mount_files(
     mount_spec_b64: Option<&str>,
     component_config: Option<&Value>,
+    runtime_context: &RuntimeTemplateContext,
 ) -> Result<Vec<RenderedMountFile>> {
     let Some(mount_spec_b64) = mount_spec_b64 else {
         return Ok(Vec::new());
     };
     let mounts = decode_b64_json_t::<Vec<MountSpec>>("AMBER_MOUNT_SPEC_B64", mount_spec_b64)?;
-    if mounts.is_empty() {
-        return Ok(Vec::new());
-    }
     let mut rendered = Vec::with_capacity(mounts.len());
-    for mount in mounts {
-        let (path, contents) = match mount {
-            MountSpec::Literal { path, content } => (path, content),
-            MountSpec::Config { path, config } => {
-                let component_config = component_config.ok_or_else(|| {
-                    miette::miette!(
-                        "mount {} requires config resolution but no runtime config payload was \
-                         provided",
-                        path
-                    )
-                })?;
-                let value = get_by_path(component_config, &config).map_err(|err| {
-                    miette::miette!("failed to resolve config mount {}: {err}", config)
-                })?;
-                (
-                    path,
-                    stringify_for_mount(value).map_err(|err| miette::miette!("{err}"))?,
-                )
-            }
-        };
+    for (path, contents) in render_mount_specs(&mounts, component_config, runtime_context)
+        .map_err(|err| miette::miette!("{err}"))?
+    {
         if !Path::new(&path).is_absolute() {
             return Err(miette::miette!(
                 "vm mount path {} must be absolute",

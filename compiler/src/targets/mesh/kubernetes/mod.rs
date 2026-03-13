@@ -6,7 +6,7 @@ use std::{
 };
 
 use amber_config as rc;
-use amber_manifest::{MountSource, span_for_json_pointer};
+use amber_manifest::span_for_json_pointer;
 use amber_mesh::{MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProvisionOutput};
 use amber_scenario::{ComponentId, Scenario};
 use base64::Engine as _;
@@ -17,6 +17,7 @@ use serde::Serialize;
 
 use crate::{
     CompileOutput,
+    program_semantics::{StaticMountKind, validated_static_mounts},
     reporter::{
         CompiledScenario, Reporter, ReporterError,
         execution_guide::{GENERATED_README_FILENAME, build_execution_guide},
@@ -163,20 +164,20 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
     let s = compiled.scenario();
     let scenario_digest =
         scenario_ir_digest(s).map_err(|err| ReporterError::new(err.to_string()))?;
+    let static_mounts = validated_static_mounts(s, "kubernetes planning");
+    let endpoint_plan = crate::targets::program_config::build_endpoint_plan(s)
+        .map_err(|e| ReporterError::new(e.to_string()))?;
     let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
         s,
+        &endpoint_plan,
         MeshOptions {
             backend_label: "kubernetes reporter",
         },
     )
     .map_err(|e| ReporterError::new(e.to_string()))?;
     for &component_id in mesh_plan.program_components() {
-        let component = s.component(component_id);
-        let Some(program) = component.program.as_ref() else {
-            continue;
-        };
-        for mount in program.mounts() {
-            if let MountSource::Framework(capability) = &mount.source
+        for mount in static_mounts.component_mounts(component_id) {
+            if let StaticMountKind::Framework(capability) = &mount.kind
                 && capability.as_str() == "docker"
             {
                 return Err(ReporterError::new(
@@ -202,10 +203,11 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
     let provisioner_job_name = provisioner_job_name(&scenario_digest);
     let needs_router = mesh_plan.needs_router();
 
-    let route_ports =
-        allocate_local_route_ports(s, &mesh_plan).map_err(|e| ReporterError::new(e.to_string()))?;
+    let route_ports = allocate_local_route_ports(s, &endpoint_plan, &mesh_plan)
+        .map_err(|e| ReporterError::new(e.to_string()))?;
     let mesh_ports_by_component = allocate_mesh_ports(
         s,
+        &endpoint_plan,
         program_components,
         COMPONENT_MESH_PORT_BASE,
         &route_ports,
@@ -646,7 +648,6 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
 
     // Deployments
     for id in program_components {
-        let c = s.component(*id);
         let cnames = names.get(id).unwrap();
         let labels = component_labels(*id, &cnames.service);
         let storage_mounts = storage_plan
@@ -655,7 +656,6 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let workload_kind = "Deployment";
-        let program = c.program.as_ref().unwrap();
         let program_plan = program_plans.get(id).unwrap();
         let mesh_port = *mesh_ports_by_component.get(id).expect("mesh port missing");
         let label = component_label(s, *id);
@@ -693,14 +693,12 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
         let needs_helper_for_component = runtime_plan.needs_helper;
 
         let mut ports: Vec<ContainerPort> = Vec::new();
-        if let Some(network) = program.network() {
-            for ep in network.endpoints() {
-                ports.push(ContainerPort {
-                    name: sanitize_port_name(&ep.name),
-                    container_port: ep.port,
-                    protocol: "TCP",
-                });
-            }
+        for endpoint in endpoint_plan.component_endpoints(*id) {
+            ports.push(ContainerPort {
+                name: sanitize_port_name(&endpoint.name),
+                container_port: endpoint.port,
+                protocol: "TCP",
+            });
         }
 
         let (mut container, mut volumes) = match runtime_plan.execution {

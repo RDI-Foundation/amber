@@ -1,5 +1,6 @@
 use amber_template::{
-    ConfigTemplate, ConfigTemplatePayload, RuntimeTemplateContext, TemplatePart, TemplateString,
+    ConfigTemplate, ConfigTemplatePayload, MountSpec, MountTemplateSpec, RepeatedTemplateSource,
+    RuntimeTemplateContext, TemplatePart, TemplateString,
 };
 use serde_json::Value;
 
@@ -153,6 +154,7 @@ fn eval_config_node_with_behavior(
             parts,
             root_config,
             runtime_context,
+            None,
             missing_behavior,
         )
         .map(|value| value.map(Value::String)),
@@ -196,10 +198,20 @@ pub fn render_template_string_with_context(
     config: &Value,
     runtime_context: &RuntimeTemplateContext,
 ) -> Result<String> {
+    render_template_string_with_current_item(parts, config, runtime_context, None)
+}
+
+pub fn render_template_string_with_current_item(
+    parts: &TemplateString,
+    config: &Value,
+    runtime_context: &RuntimeTemplateContext,
+    current_item: Option<&Value>,
+) -> Result<String> {
     render_template_string_with_behavior(
         parts,
         config,
         runtime_context,
+        current_item,
         MissingConfigBehavior::Error,
     )?
     .ok_or_else(|| ConfigError::interp("template resolved to no value".to_string()))
@@ -209,6 +221,7 @@ fn render_template_string_with_behavior(
     parts: &TemplateString,
     config: &Value,
     runtime_context: &RuntimeTemplateContext,
+    current_item: Option<&Value>,
     missing_behavior: MissingConfigBehavior,
 ) -> Result<Option<String>> {
     let mut out = String::new();
@@ -278,9 +291,142 @@ fn render_template_string_with_behavior(
                 })?;
                 out.push_str(&stringify_for_interpolation(value)?);
             }
+            TemplatePart::CurrentItem { item: path } => {
+                let item = current_item.ok_or_else(|| {
+                    ConfigError::interp(format!(
+                        "item.{path} cannot be rendered without a repeated item context"
+                    ))
+                })?;
+                let value = query_value_opt(item, path).ok_or_else(|| {
+                    ConfigError::interp(format!(
+                        "item.{path} not found in the current repeated item"
+                    ))
+                })?;
+                out.push_str(&stringify_for_interpolation(value)?);
+            }
         }
     }
     Ok(Some(out))
+}
+
+pub fn config_path_is_present(config_value: &Value, path: &str) -> Result<bool> {
+    Ok(get_by_path_opt(config_value, path)?.is_some_and(|value| !value.is_null()))
+}
+
+pub fn repeated_config_items<'a>(component_config: &'a Value, path: &str) -> Result<&'a [Value]> {
+    match get_by_path_opt(component_config, path)? {
+        None | Some(Value::Null) => Ok(&[]),
+        Some(Value::Array(items)) => Ok(items.as_slice()),
+        Some(other) => Err(ConfigError::interp(format!(
+            "config.{path} must resolve to an array for repeated expansion, got {}",
+            value_kind(other)
+        ))),
+    }
+}
+
+pub fn render_mount_specs(
+    mounts: &[MountSpec],
+    component_config: Option<&Value>,
+    runtime_context: &RuntimeTemplateContext,
+) -> Result<Vec<(String, String)>> {
+    if mounts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut rendered = Vec::with_capacity(mounts.len());
+    for mount in mounts {
+        match mount {
+            MountSpec::Literal { path, content } => {
+                rendered.push((path.clone(), content.clone()));
+            }
+            MountSpec::Template(spec) => {
+                let config_value = component_config.ok_or_else(|| {
+                    ConfigError::interp("config payload is required to render mount templates")
+                })?;
+                if let Some(when) = spec.when.as_deref()
+                    && !config_path_is_present(config_value, when)?
+                {
+                    continue;
+                }
+
+                match spec.each.as_ref() {
+                    None => rendered.push(render_mount_template_once(
+                        spec,
+                        config_value,
+                        runtime_context,
+                        None,
+                    )?),
+                    Some(RepeatedTemplateSource::Config { path }) => {
+                        for item in repeated_config_items(config_value, path)? {
+                            rendered.push(render_mount_template_once(
+                                spec,
+                                config_value,
+                                runtime_context,
+                                Some(item),
+                            )?);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(rendered)
+}
+
+fn rendered_mount_source_query(source: &str) -> Result<&str> {
+    if source == "config" {
+        return Ok("");
+    }
+    if let Some(path) = source.strip_prefix("config.") {
+        return Ok(path);
+    }
+    if let Some(path) = source.strip_prefix("secret.") {
+        return Ok(path);
+    }
+    if source == "secret" {
+        return Err(ConfigError::interp(
+            "secret mounts require an explicit path (secret.<path>)".to_string(),
+        ));
+    }
+    Err(ConfigError::interp(format!(
+        "mount source must render to config.<path> or secret.<path>, got `{source}`"
+    )))
+}
+
+fn render_mount_template_once(
+    spec: &MountTemplateSpec,
+    component_config: &Value,
+    runtime_context: &RuntimeTemplateContext,
+    current_item: Option<&Value>,
+) -> Result<(String, String)> {
+    let path = render_template_string_with_current_item(
+        &spec.path,
+        component_config,
+        runtime_context,
+        current_item,
+    )?;
+    let source = render_template_string_with_current_item(
+        &spec.source,
+        component_config,
+        runtime_context,
+        current_item,
+    )?;
+    let query = rendered_mount_source_query(&source)?;
+    let value = get_by_path(component_config, query)?;
+    let content = stringify_for_mount(value)?;
+    Ok((path, content))
+}
+
+pub fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 fn query_value_opt<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
@@ -296,4 +442,112 @@ fn query_value_opt<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
         }
     }
     Some(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use amber_template::{
+        MountSpec, MountTemplateSpec, RepeatedTemplateSource, RuntimeTemplateContext, TemplatePart,
+    };
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn render_template_string_with_current_item_uses_item_context() {
+        let rendered = render_template_string_with_current_item(
+            &[
+                TemplatePart::lit("http://"),
+                TemplatePart::current_item("host"),
+                TemplatePart::lit(":"),
+                TemplatePart::current_item("port"),
+            ]
+            .to_vec(),
+            &json!({}),
+            &RuntimeTemplateContext::default(),
+            Some(&json!({
+                "host": "api.internal",
+                "port": 8080
+            })),
+        )
+        .expect("item context should render");
+
+        assert_eq!(rendered, "http://api.internal:8080");
+    }
+
+    #[test]
+    fn render_template_string_with_current_item_requires_item_context() {
+        let err = render_template_string_with_current_item(
+            &[TemplatePart::current_item("url")].to_vec(),
+            &json!({}),
+            &RuntimeTemplateContext::default(),
+            None,
+        )
+        .expect_err("missing item context should fail");
+
+        assert!(err.to_string().contains("repeated item context"), "{}", err);
+    }
+
+    #[test]
+    fn render_mount_specs_skips_template_when_path_is_absent() {
+        let mounts = vec![MountSpec::Template(MountTemplateSpec {
+            when: Some("optional".to_string()),
+            each: None,
+            path: vec![TemplatePart::lit("/tmp/optional.txt")],
+            source: vec![TemplatePart::lit("config.app")],
+        })];
+
+        let rendered = render_mount_specs(
+            &mounts,
+            Some(&json!({ "app": "hello" })),
+            &RuntimeTemplateContext::default(),
+        )
+        .expect("mount rendering should succeed");
+
+        assert!(rendered.is_empty());
+    }
+
+    #[test]
+    fn render_mount_specs_expands_repeated_config_mounts() {
+        let mounts = vec![MountSpec::Template(MountTemplateSpec {
+            when: None,
+            each: Some(RepeatedTemplateSource::Config {
+                path: "files".to_string(),
+            }),
+            path: vec![
+                TemplatePart::lit("/tmp/"),
+                TemplatePart::current_item("name"),
+                TemplatePart::lit(".txt"),
+            ],
+            source: vec![
+                TemplatePart::lit("config."),
+                TemplatePart::current_item("source"),
+            ],
+        })];
+        let component_config = json!({
+            "files": [
+                { "name": "alpha", "source": "content.alpha" },
+                { "name": "beta", "source": "content.beta" }
+            ],
+            "content": {
+                "alpha": "A",
+                "beta": "B"
+            }
+        });
+
+        let rendered = render_mount_specs(
+            &mounts,
+            Some(&component_config),
+            &RuntimeTemplateContext::default(),
+        )
+        .expect("mount rendering should succeed");
+
+        assert_eq!(
+            rendered,
+            vec![
+                ("/tmp/alpha.txt".to_string(), "A".to_string()),
+                ("/tmp/beta.txt".to_string(), "B".to_string()),
+            ]
+        );
+    }
 }

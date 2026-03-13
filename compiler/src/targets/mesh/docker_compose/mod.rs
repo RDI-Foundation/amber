@@ -7,7 +7,6 @@ use std::{
 };
 
 use amber_config as rc;
-use amber_manifest::MountSource;
 use amber_mesh::{MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProvisionOutput};
 use amber_scenario::{ComponentId, Scenario};
 use base64::Engine as _;
@@ -20,6 +19,7 @@ use framework_docker_injection::{
 };
 
 use crate::{
+    program_semantics::{StaticMountKind, validated_static_mounts},
     reporter::{
         CompiledScenario, Reporter, ReporterError,
         execution_guide::{
@@ -331,9 +331,11 @@ fn render_docker_compose(
 fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArtifact> {
     let transformed = rewrite_framework_docker_as_injected_component(scenario).map_err(dc_other)?;
     let s = &transformed.scenario;
+    let endpoint_plan = crate::targets::program_config::build_endpoint_plan(s).map_err(dc_other)?;
 
     let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
         s,
+        &endpoint_plan,
         MeshOptions {
             backend_label: "docker-compose reporter",
         },
@@ -358,9 +360,10 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
     let docker_gateway_component = transformed.gateway_component;
     let needs_router = mesh_plan.needs_router();
 
-    let route_ports = allocate_local_route_ports(s, &mesh_plan)?;
+    let route_ports = allocate_local_route_ports(s, &endpoint_plan, &mesh_plan)?;
     let mesh_ports_by_component = allocate_mesh_ports(
         s,
+        &endpoint_plan,
         program_components,
         COMPONENT_MESH_PORT_BASE,
         &route_ports,
@@ -1114,16 +1117,14 @@ fn collect_framework_docker_mount_paths(
     scenario: &Scenario,
     program_components: &[ComponentId],
 ) -> HashMap<ComponentId, Vec<String>> {
+    let static_mounts = validated_static_mounts(scenario, "docker-compose planning");
     let mut out = HashMap::new();
     for component in program_components {
-        let Some(program) = scenario.component(*component).program.as_ref() else {
-            continue;
-        };
-        let paths: Vec<String> = program
-            .mounts()
+        let paths: Vec<String> = static_mounts
+            .component_mounts(*component)
             .iter()
-            .filter_map(|mount| match &mount.source {
-                MountSource::Framework(name) if name.as_str() == "docker" => {
+            .filter_map(|mount| match &mount.kind {
+                StaticMountKind::Framework(name) if name.as_str() == "docker" => {
                     Some(mount.path.clone())
                 }
                 _ => None,

@@ -202,8 +202,10 @@ impl Reporter for VmReporter {
 
 fn render_vm(compiled: &CompiledScenario) -> Result<VmArtifact, MeshError> {
     let scenario = compiled.scenario();
+    let endpoint_plan = crate::targets::program_config::build_endpoint_plan(scenario)?;
     let mesh_plan = build_mesh_plan(
         scenario,
+        &endpoint_plan,
         MeshOptions {
             backend_label: "vm reporter",
         },
@@ -219,7 +221,7 @@ fn render_vm(compiled: &CompiledScenario) -> Result<VmArtifact, MeshError> {
             }
         });
 
-    let route_ports = placeholder_local_route_ports(scenario, &mesh_plan);
+    let route_ports = placeholder_local_route_ports(scenario, &endpoint_plan, &mesh_plan);
     let mesh_ports_by_component = placeholder_mesh_ports(program_components);
     let needs_router = mesh_plan.needs_router();
     let router_ports = needs_router.then_some(RouterPorts {

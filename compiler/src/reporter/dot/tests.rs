@@ -296,7 +296,7 @@ fn dot_renders_root_exports_as_endpoints() {
         }],
     };
 
-    let dot = render_dot_with_exports(&scenario);
+    let dot = render_dot_with_exports(&scenario).expect("dot rendering");
     let expected = r#"digraph scenario {
   rankdir=LR;
   compound=true;
@@ -359,7 +359,7 @@ fn dot_renders_root_exports_from_root_component() {
         }],
     };
 
-    let dot = render_dot_with_exports(&scenario);
+    let dot = render_dot_with_exports(&scenario).expect("dot rendering");
     assert!(dot.contains("c0 [label=\"program\"]"));
     assert!(dot.contains("e0 [label=\"http:80\", shape=box]"));
     assert!(dot.contains("c0 -> e0 [label=\"http\"]"));

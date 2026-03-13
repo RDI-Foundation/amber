@@ -801,7 +801,7 @@ fn validate_mounted_storage_slots(scenario: &Scenario) -> Result<(), ScenarioIrE
         };
 
         for mount in program.mounts() {
-            let MountSource::Slot(slot) = &mount.source else {
+            let Some(MountSource::Slot(slot)) = mount.literal_source() else {
                 continue;
             };
             let Some(slot_decl) = component.slots.get(slot.as_str()) else {

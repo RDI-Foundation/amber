@@ -1,5 +1,5 @@
 use super::*;
-use crate::{CapabilityKind, Endpoint, NetworkProtocol};
+use crate::{CapabilityKind, NetworkProtocol};
 
 #[test]
 fn create_empty_manifest() {
@@ -159,7 +159,7 @@ fn conditional_program_args_require_manifest_version_0_2_0() {
         } => {
             assert_eq!(*manifest_version, Version::new(0, 1, 0));
             assert_eq!(required_version, "0.2.0");
-            assert_eq!(feature, "conditional argument groups");
+            assert_eq!(feature, "conditional argument items");
             assert_eq!(pointer, "/program/args/0");
         }
         other => panic!("expected UnsupportedProgramSyntaxForManifestVersion error, got: {other}"),
@@ -188,7 +188,15 @@ fn when_is_accepted_in_manifest_version_0_2_0() {
     let Program::Path(program) = manifest.program().expect("program should exist") else {
         panic!("expected native path program");
     };
-    assert_eq!(program.args.groups().count(), 1);
+    assert_eq!(
+        program
+            .args
+            .0
+            .iter()
+            .filter(|item| item.when().is_some())
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -255,7 +263,7 @@ fn conditional_program_env_is_accepted_in_manifest_version_0_2_0() {
             .common
             .env
             .get("PROFILE")
-            .is_some_and(|value| value.group().is_some())
+            .is_some_and(|value| value.when().is_some())
     );
 }
 
@@ -890,7 +898,7 @@ fn manifest_deserialize_error_includes_path() {
           program: {
             image: "x",
             entrypoint: ["x"],
-            network: { endpoints: [ { name: "endpoint", port: "80" } ] }
+            network: { endpoints: [ { name: "endpoint", port: { value: 80 } } ] }
           }
         }
         "#
@@ -1254,11 +1262,12 @@ fn endpoint_validation_passes_for_defined_reference() {
 
     let network = program.network().expect("network");
     assert_eq!(network.endpoints().len(), 1);
-    assert!(network.endpoints().contains(&Endpoint {
-        name: "endpoint".to_string(),
-        port: 80,
-        protocol: NetworkProtocol::Http,
-    }));
+    let endpoint = network.endpoints().iter().find(|endpoint| {
+        endpoint.literal_name() == Some("endpoint")
+            && endpoint.literal_port() == Some(80)
+            && endpoint.literal_protocol() == Some(NetworkProtocol::Http)
+    });
+    assert!(endpoint.is_some(), "expected concrete endpoint");
 
     let api = m.provides.get("api").expect("api provide");
     assert_eq!(api.decl.kind, CapabilityKind::Http);

@@ -235,7 +235,7 @@ program: {
   args: ["python3", "-m", "http.server", "8080"],
   // args: "python3 -m http.server 8080",
   //
-  // Args and entrypoint items may also contain `when`-guarded argv groups.
+  // Args and entrypoint items may also contain `when`-guarded argv items.
   // The whole `argv` array is omitted when the `when` path is absent or null.
   // Presence is not truthiness: false, 0, and "" still count as present.
   //

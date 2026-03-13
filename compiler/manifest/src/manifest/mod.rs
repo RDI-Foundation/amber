@@ -16,7 +16,7 @@ use serde_with::{MapPreventDuplicates, serde_as};
 use crate::{
     error::Error,
     framework::{framework_capabilities, framework_capability},
-    interpolation::ProgramArgItem,
+    interpolation::{InterpolatedString, ProgramArgItem},
     names::{ChildName, ExportName, ProvideName, ResourceName, SlotName, ensure_name_no_dot},
     refs::{ManifestDigest, ManifestRef, ManifestUrl},
     schema::{
@@ -132,25 +132,20 @@ fn find_unsupported_program_syntax(
     };
 
     for (idx, item) in items.iter().enumerate() {
-        if !supports_conditionals && matches!(item, ProgramArgItem::Group(_)) {
+        if !supports_conditionals && item.when().is_some() {
             return Some((
                 "0.2.0",
                 UnsupportedProgramSyntax {
-                    feature: "conditional argument groups",
+                    feature: "conditional argument items",
                     pointer: format!("{field_pointer}/{idx}"),
                 },
             ));
         }
-        if !supports_repeated
-            && matches!(
-                item,
-                ProgramArgItem::RepeatedArgv(_) | ProgramArgItem::RepeatedArg(_)
-            )
-        {
+        if !supports_repeated && item.each().is_some() {
             return Some((
                 "0.3.0",
                 UnsupportedProgramSyntax {
-                    feature: "repeated slot argument expansion",
+                    feature: "variadic argument expansion",
                     pointer: format!("{field_pointer}/{idx}"),
                 },
             ));
@@ -158,7 +153,7 @@ fn find_unsupported_program_syntax(
     }
 
     for (key, value) in program.env() {
-        if !supports_conditionals && value.group().is_some() {
+        if !supports_conditionals && value.when().is_some() {
             return Some((
                 "0.2.0",
                 UnsupportedProgramSyntax {
@@ -167,14 +162,59 @@ fn find_unsupported_program_syntax(
                 },
             ));
         }
-        if !supports_repeated && value.repeated().is_some() {
+        if !supports_repeated && value.each().is_some() {
             return Some((
                 "0.3.0",
                 UnsupportedProgramSyntax {
-                    feature: "repeated slot environment expansion",
+                    feature: "variadic environment expansion",
                     pointer: format!("/program/env/{key}"),
                 },
             ));
+        }
+    }
+
+    let mounts = program.mounts();
+    for (idx, mount) in mounts.iter().enumerate() {
+        if !supports_conditionals && mount.when.is_some() {
+            return Some((
+                "0.2.0",
+                UnsupportedProgramSyntax {
+                    feature: "conditional mounts",
+                    pointer: format!("/program/mounts/{idx}"),
+                },
+            ));
+        }
+        if !supports_repeated && mount.each.is_some() {
+            return Some((
+                "0.3.0",
+                UnsupportedProgramSyntax {
+                    feature: "variadic mounts",
+                    pointer: format!("/program/mounts/{idx}"),
+                },
+            ));
+        }
+    }
+
+    if let Some(network) = program.network() {
+        for (idx, endpoint) in network.endpoints().iter().enumerate() {
+            if !supports_conditionals && endpoint.when.is_some() {
+                return Some((
+                    "0.2.0",
+                    UnsupportedProgramSyntax {
+                        feature: "conditional endpoints",
+                        pointer: format!("/program/network/endpoints/{idx}"),
+                    },
+                ));
+            }
+            if !supports_repeated && endpoint.each.is_some() {
+                return Some((
+                    "0.3.0",
+                    UnsupportedProgramSyntax {
+                        feature: "variadic endpoints",
+                        pointer: format!("/program/network/endpoints/{idx}"),
+                    },
+                ));
+            }
         }
     }
 
@@ -543,13 +583,22 @@ fn validate_endpoints(
     provides: &BTreeMap<ProvideName, ProvideDecl>,
 ) -> Result<(), Error> {
     let mut defined_endpoints = BTreeSet::new();
+    let mut all_static = true;
     if let Some(program) = program
         && let Some(network) = program.network()
     {
         for endpoint in network.endpoints() {
-            if !defined_endpoints.insert(endpoint.name.as_str()) {
+            let Some(name) = endpoint.name.as_literal() else {
+                all_static = false;
+                continue;
+            };
+            if endpoint.when.is_some() || endpoint.each.is_some() {
+                all_static = false;
+                continue;
+            }
+            if !defined_endpoints.insert(name) {
                 return Err(Error::DuplicateEndpointName {
-                    name: endpoint.name.clone(),
+                    name: name.to_string(),
                 });
             }
         }
@@ -569,7 +618,7 @@ fn validate_endpoints(
             });
         };
 
-        if !defined_endpoints.contains(endpoint) {
+        if all_static && !defined_endpoints.contains(endpoint) {
             return Err(Error::UnknownEndpoint {
                 name: endpoint.to_string(),
             });
@@ -594,7 +643,17 @@ fn validate_mounts(
     let mut paths = BTreeSet::new();
 
     for mount in program.mounts() {
-        if let Some(name) = mount.name.as_deref() {
+        let Some(path) = mount.path.as_literal() else {
+            continue;
+        };
+        let Some(source) = mount.source.as_literal() else {
+            continue;
+        };
+        if mount.when.is_some() || mount.each.is_some() {
+            continue;
+        }
+
+        if let Some(name) = mount.name.as_ref().and_then(InterpolatedString::as_literal) {
             ensure_name_no_dot(name, "mount")?;
             if !names.insert(name) {
                 return Err(Error::DuplicateMountName {
@@ -603,25 +662,25 @@ fn validate_mounts(
             }
         }
 
-        if !mount.path.starts_with('/') {
+        if !path.starts_with('/') {
             return Err(Error::InvalidMountPath {
-                path: mount.path.clone(),
+                path: path.to_string(),
                 message: "mount path must be absolute".to_string(),
             });
         }
-        if mount.path.split('/').any(|seg| seg == "..") {
+        if path.split('/').any(|seg| seg == "..") {
             return Err(Error::InvalidMountPath {
-                path: mount.path.clone(),
+                path: path.to_string(),
                 message: "mount path must not contain `..`".to_string(),
             });
         }
-        if !paths.insert(mount.path.as_str()) {
+        if !paths.insert(path) {
             return Err(Error::DuplicateMountPath {
-                path: mount.path.clone(),
+                path: path.to_string(),
             });
         }
 
-        match &mount.source {
+        match source.parse::<MountSource>()? {
             MountSource::Config(path) => {
                 let Some(schema) = config_schema else {
                     return Err(Error::InvalidMountConfigPath {
@@ -629,13 +688,13 @@ fn validate_mounts(
                         message: "component has no config_schema".to_string(),
                     });
                 };
-                validate_mount_path(&schema.0, path).map_err(|message| {
+                validate_mount_path(&schema.0, &path).map_err(|message| {
                     Error::InvalidMountConfigPath {
                         path: path.clone(),
                         message,
                     }
                 })?;
-                let (any_secret, _) = mount_secret_flags(&schema.0, path)?;
+                let (any_secret, _) = mount_secret_flags(&schema.0, &path)?;
                 if any_secret {
                     return Err(Error::MountConfigPathIsSecret { path: path.clone() });
                 }
@@ -647,22 +706,20 @@ fn validate_mounts(
                         message: "component has no config_schema".to_string(),
                     });
                 };
-                validate_mount_path(&schema.0, path).map_err(|message| {
+                validate_mount_path(&schema.0, &path).map_err(|message| {
                     Error::InvalidMountSecretPath {
                         path: path.clone(),
                         message,
                     }
                 })?;
-                let (any_secret, any_non_secret) = mount_secret_flags(&schema.0, path)?;
+                let (any_secret, any_non_secret) = mount_secret_flags(&schema.0, &path)?;
                 if !any_secret || any_non_secret {
                     return Err(Error::MountSecretPathIsNotSecret { path: path.clone() });
                 }
             }
             MountSource::Resource(resource) => {
                 if !resources.contains_key(resource.as_str()) {
-                    return Err(Error::UnknownMountResource {
-                        resource: resource.clone(),
-                    });
+                    return Err(Error::UnknownMountResource { resource });
                 }
             }
             MountSource::Framework(name) => {

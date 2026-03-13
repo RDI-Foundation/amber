@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use amber_manifest::{
-    CapabilityDecl, CapabilityKind, ComponentDecl, Endpoint, Error, InterpolatedString, Manifest,
-    ManifestRef, ManifestUrl, Network, Program, ProgramCommon, ProgramEntrypoint, ProgramImage,
-    ProvideDecl,
+    CapabilityDecl, CapabilityKind, ComponentDecl, Endpoint, EndpointPort, Error,
+    InterpolatedString, Manifest, ManifestRef, ManifestUrl, Network, Program, ProgramCommon,
+    ProgramEntrypoint, ProgramImage, ProvideDecl,
 };
-use bon::{map, set};
+use bon::map;
 use semver::Version;
 use serde_json::json;
 
@@ -21,7 +21,12 @@ fn manifest_builder_constructs_a_valid_manifest() {
                 ProgramCommon::builder()
                     .network(
                         Network::builder()
-                            .endpoints(set![Endpoint::builder().name("api").port(80).build()])
+                            .endpoints(vec![
+                                Endpoint::builder()
+                                    .name(InterpolatedString::from_literal("api"))
+                                    .port(EndpointPort::Literal(80))
+                                    .build(),
+                            ])
                             .build(),
                     )
                     .build(),

@@ -356,12 +356,15 @@ mod tests {
     use amber_scenario::{BindingEdge, Component, Moniker, Scenario};
 
     use super::*;
-    use crate::targets::mesh::{
-        plan::{
-            EndpointInfo, MeshPlan, ResolvedBinding, ResolvedComponentBinding,
-            ResolvedExternalBinding, ResolvedFrameworkBinding,
+    use crate::targets::{
+        mesh::{
+            plan::{
+                EndpointInfo, MeshPlan, ResolvedBinding, ResolvedComponentBinding,
+                ResolvedExternalBinding, ResolvedFrameworkBinding,
+            },
+            ports::allocate_local_route_ports,
         },
-        ports::allocate_local_route_ports,
+        program_config::build_endpoint_plan,
     };
 
     fn component(id: usize, moniker: &str, program_image: &str) -> Component {
@@ -443,8 +446,9 @@ mod tests {
             HashMap::new(),
         );
 
-        let route_ports =
-            allocate_local_route_ports(&scenario, &mesh_plan).expect("local route ports");
+        let endpoint_plan = build_endpoint_plan(&scenario).expect("endpoint plan");
+        let route_ports = allocate_local_route_ports(&scenario, &endpoint_plan, &mesh_plan)
+            .expect("local route ports");
         let addressing = LocalAddressing::new(
             &scenario,
             &route_ports,
@@ -544,8 +548,9 @@ mod tests {
             HashMap::new(),
         );
 
-        let route_ports =
-            allocate_local_route_ports(&scenario, &mesh_plan).expect("local route ports");
+        let endpoint_plan = build_endpoint_plan(&scenario).expect("endpoint plan");
+        let route_ports = allocate_local_route_ports(&scenario, &endpoint_plan, &mesh_plan)
+            .expect("local route ports");
         let addressing = LocalAddressing::new(
             &scenario,
             &route_ports,

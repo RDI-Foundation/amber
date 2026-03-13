@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
 
-use amber_manifest::{CapabilityKind, MountSource};
+use amber_manifest::CapabilityKind;
 use amber_scenario::{BindingFrom, ComponentId, Scenario};
 use sha2::Digest as _;
+
+use crate::program_semantics::{StaticMountKind, validated_static_mounts};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(crate) struct StorageIdentity {
@@ -48,6 +50,7 @@ pub(crate) fn build_storage_plan(
     scenario: &Scenario,
     program_components: &[ComponentId],
 ) -> StoragePlan {
+    let static_mounts = validated_static_mounts(scenario, "storage planning");
     let mut resource_by_target: BTreeMap<(ComponentId, String), StorageIdentity> = BTreeMap::new();
     for binding in &scenario.bindings {
         let Some(slot_decl) = scenario
@@ -83,14 +86,10 @@ pub(crate) fn build_storage_plan(
     let mut mounts_by_component: HashMap<ComponentId, Vec<StorageMount>> = HashMap::new();
     for component_id in program_components {
         let component = scenario.component(*component_id);
-        let Some(program) = component.program.as_ref() else {
-            continue;
-        };
-
         let mut mounts = Vec::new();
-        for mount in program.mounts() {
-            let (identity, source_name) = match &mount.source {
-                MountSource::Slot(slot) => {
+        for mount in static_mounts.component_mounts(*component_id) {
+            let (identity, source_name) = match &mount.kind {
+                StaticMountKind::Slot(slot) => {
                     let Some(slot_decl) = component.slots.get(slot.as_str()) else {
                         continue;
                     };
@@ -110,7 +109,7 @@ pub(crate) fn build_storage_plan(
                         });
                     (identity, slot.clone())
                 }
-                MountSource::Resource(resource) => {
+                StaticMountKind::Resource(resource) => {
                     let Some(resource_decl) = component.resources.get(resource.as_str()) else {
                         unreachable!(
                             "manifest validation should reject unknown mounted resource before \
@@ -131,7 +130,7 @@ pub(crate) fn build_storage_plan(
                         resource.clone(),
                     )
                 }
-                _ => continue,
+                StaticMountKind::Framework(_) => continue,
             };
 
             mounts.push(StorageMount {

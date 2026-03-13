@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fmt,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
@@ -21,8 +21,8 @@ use crate::{
     config_schema_profile,
     error::Error,
     interpolation::{
-        InlineStringSpec, InterpolatedString, ProgramEntrypoint, ProgramEnvValue,
-        RawProgramEntrypoint, RawProgramEnvValue,
+        InlineStringSpec, InterpolatedString, InterpolationSource, ProgramEntrypoint,
+        ProgramEnvValue, RawProgramEntrypoint, RawProgramEnvValue,
     },
     names::{
         ChildName, ExportName, FrameworkCapabilityName, ProvideName, ResourceName, SlotName,
@@ -304,6 +304,56 @@ impl Program {
 
         for value in self.env().values() {
             if value.visit_slot_uses(&mut visit) {
+                return true;
+            }
+        }
+
+        if let Some(network) = self.network() {
+            for endpoint in network.endpoints() {
+                if let Some(when) = &endpoint.when
+                    && when.source() == InterpolationSource::Slots
+                    && let Some(slot) = when.query().split('.').next()
+                {
+                    visit(slot);
+                }
+                if let Some(each) = &endpoint.each
+                    && each.source() == InterpolationSource::Slots
+                    && let Some(slot) = each.slot()
+                {
+                    visit(slot);
+                }
+                if endpoint.name.visit_slot_uses(&mut visit)
+                    || endpoint.protocol.visit_slot_uses(&mut visit)
+                {
+                    return true;
+                }
+                if let EndpointPort::Interpolated(port) = &endpoint.port
+                    && port.visit_slot_uses(&mut visit)
+                {
+                    return true;
+                }
+            }
+        }
+
+        for mount in self.mounts() {
+            if let Some(when) = &mount.when
+                && when.source() == InterpolationSource::Slots
+                && let Some(slot) = when.query().split('.').next()
+            {
+                visit(slot);
+            }
+            if let Some(each) = &mount.each
+                && each.source() == InterpolationSource::Slots
+                && let Some(slot) = each.slot()
+            {
+                visit(slot);
+            }
+            if mount.path.visit_slot_uses(&mut visit) || mount.source.visit_slot_uses(&mut visit) {
+                return true;
+            }
+            if let Some(name) = &mount.name
+                && name.visit_slot_uses(&mut visit)
+            {
                 return true;
             }
         }
@@ -745,10 +795,10 @@ pub enum ProgramNetworkRef<'a> {
 }
 
 impl<'a> ProgramNetworkRef<'a> {
-    pub fn endpoints(self) -> &'a BTreeSet<Endpoint> {
+    pub fn endpoints(self) -> &'a [Endpoint] {
         match self {
-            Self::Common(network) => &network.endpoints,
-            Self::Vm(network) => &network.endpoints,
+            Self::Common(network) => network.endpoints.as_slice(),
+            Self::Vm(network) => network.endpoints.as_slice(),
         }
     }
 }
@@ -858,8 +908,8 @@ impl<'de> Deserialize<'de> for VmScalarU32 {
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct VmNetwork {
-    #[serde(default, deserialize_with = "deserialize_endpoints")]
-    pub endpoints: BTreeSet<Endpoint>,
+    #[serde(default)]
+    pub endpoints: Vec<Endpoint>,
     #[serde(default)]
     pub egress: VmEgress,
 }
@@ -912,10 +962,32 @@ pub struct ProgramCommon {
 #[non_exhaustive]
 pub struct ProgramMount {
     #[serde(default)]
-    pub name: Option<String>,
-    pub path: String,
+    pub when: Option<crate::WhenPath>,
+    #[serde(default)]
+    pub each: Option<crate::EachPath>,
+    #[serde(default)]
+    pub name: Option<InterpolatedString>,
+    pub path: InterpolatedString,
     #[serde(rename = "from")]
-    pub source: MountSource,
+    pub source: InterpolatedString,
+}
+
+impl ProgramMount {
+    pub fn is_variadic(&self) -> bool {
+        self.when.is_some() || self.each.is_some()
+    }
+
+    pub fn literal_name(&self) -> Option<&str> {
+        self.name.as_ref().and_then(InterpolatedString::as_literal)
+    }
+
+    pub fn literal_path(&self) -> Option<&str> {
+        self.path.as_literal()
+    }
+
+    pub fn literal_source(&self) -> Option<MountSource> {
+        self.source.as_literal()?.parse().ok()
+    }
 }
 
 #[derive(
@@ -1162,40 +1234,42 @@ fn display_file_reference_path(raw: &str, resolved: &Path) -> String {
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Network {
-    #[serde(default, deserialize_with = "deserialize_endpoints")]
+    #[serde(default)]
     #[builder(default)]
-    pub endpoints: BTreeSet<Endpoint>,
+    pub endpoints: Vec<Endpoint>,
 }
 
-fn deserialize_endpoints<'de, D>(deserializer: D) -> Result<BTreeSet<Endpoint>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let endpoints = Vec::<Endpoint>::deserialize(deserializer)?;
-    let mut names = BTreeSet::new();
-    for endpoint in &endpoints {
-        if !names.insert(endpoint.name.as_str()) {
-            return Err(serde::de::Error::custom(Error::DuplicateEndpointName {
-                name: endpoint.name.clone(),
-            }));
-        }
-    }
-    Ok(endpoints.into_iter().collect())
-}
-
-#[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, bon::Builder,
-)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, bon::Builder)]
 #[builder(on(String, into))]
-#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Endpoint {
-    pub name: String,
-    // TODO: this should be an enum tagged by `NetworkProtocol` and carrying appropriate data for the protocol
-    pub port: u16,
-    #[serde(default = "default_protocol")]
-    #[builder(default = default_protocol())]
-    pub protocol: NetworkProtocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<crate::WhenPath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub each: Option<crate::EachPath>,
+    pub name: InterpolatedString,
+    pub port: EndpointPort,
+    #[serde(default = "default_protocol_template")]
+    #[builder(default = default_protocol_template())]
+    pub protocol: InterpolatedString,
+}
+
+impl Endpoint {
+    pub fn is_variadic(&self) -> bool {
+        self.when.is_some() || self.each.is_some()
+    }
+
+    pub fn literal_name(&self) -> Option<&str> {
+        self.name.as_literal()
+    }
+
+    pub fn literal_port(&self) -> Option<u16> {
+        self.port.as_literal()
+    }
+
+    pub fn literal_protocol(&self) -> Option<NetworkProtocol> {
+        self.protocol.as_literal()?.parse().ok()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1218,8 +1292,117 @@ impl fmt::Display for NetworkProtocol {
     }
 }
 
+impl FromStr for NetworkProtocol {
+    type Err = String;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        match input {
+            "http" => Ok(Self::Http),
+            "https" => Ok(Self::Https),
+            "tcp" => Ok(Self::Tcp),
+            other => Err(format!("unknown network protocol `{other}`")),
+        }
+    }
+}
+
 fn default_protocol() -> NetworkProtocol {
     NetworkProtocol::Http
+}
+
+fn default_protocol_template() -> InterpolatedString {
+    InterpolatedString::from_literal(default_protocol().to_string())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum EndpointPort {
+    Literal(u16),
+    Interpolated(InterpolatedString),
+}
+
+impl EndpointPort {
+    pub fn as_literal(&self) -> Option<u16> {
+        match self {
+            Self::Literal(value) => Some(*value),
+            Self::Interpolated(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for EndpointPort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Literal(value) => write!(f, "{value}"),
+            Self::Interpolated(value) => f.write_str(
+                value
+                    .as_literal()
+                    .expect("interpolated endpoint port is not concrete here"),
+            ),
+        }
+    }
+}
+
+impl Serialize for EndpointPort {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Literal(value) => serializer.serialize_u16(*value),
+            Self::Interpolated(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EndpointPort {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum PortValue {
+            Literal(u16),
+            Interpolated(String),
+        }
+
+        match PortValue::deserialize(deserializer)? {
+            PortValue::Literal(value) => Ok(Self::Literal(value)),
+            PortValue::Interpolated(value) => value
+                .parse::<InterpolatedString>()
+                .map(Self::Interpolated)
+                .map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Endpoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct EndpointFields {
+            #[serde(default)]
+            when: Option<crate::WhenPath>,
+            #[serde(default)]
+            each: Option<crate::EachPath>,
+            name: InterpolatedString,
+            port: EndpointPort,
+            #[serde(default = "default_protocol_template")]
+            protocol: InterpolatedString,
+        }
+
+        let endpoint = EndpointFields::deserialize(deserializer)?;
+        Ok(Self {
+            when: endpoint.when,
+            each: endpoint.each,
+            name: endpoint.name,
+            port: endpoint.port,
+            protocol: endpoint.protocol,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

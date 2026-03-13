@@ -4,6 +4,7 @@ use amber_manifest::CapabilityKind;
 use amber_scenario::{BindingFrom, Component, ComponentId, Scenario};
 
 use super::{CompiledScenario, Reporter, ReporterError};
+use crate::targets::program_config::{EndpointPlan, build_endpoint_plan};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DotReporter;
@@ -12,7 +13,7 @@ impl Reporter for DotReporter {
     type Artifact = String;
 
     fn emit(&self, compiled: &CompiledScenario) -> Result<Self::Artifact, ReporterError> {
-        Ok(render_dot_with_exports(compiled.scenario()))
+        render_dot_with_exports(compiled.scenario())
     }
 }
 
@@ -28,7 +29,9 @@ struct ExportEdge {
     kind: CapabilityKind,
 }
 
-fn render_dot_with_exports(s: &Scenario) -> String {
+fn render_dot_with_exports(s: &Scenario) -> Result<String, ReporterError> {
+    let endpoint_plan =
+        build_endpoint_plan(s).map_err(|err| ReporterError::new(err.to_string()))?;
     let mut exports = Vec::with_capacity(s.exports.len());
     for export in &s.exports {
         let from = export.from.component;
@@ -36,14 +39,16 @@ fn render_dot_with_exports(s: &Scenario) -> String {
         exports.push(ExportEdge {
             endpoint_label: endpoint_label_for_provide(
                 s.component(from),
+                from,
                 export.from.name.as_str(),
+                &endpoint_plan,
             ),
             from,
             kind,
         });
     }
 
-    render_dot_inner(s, &exports)
+    Ok(render_dot_inner(s, &exports))
 }
 
 fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
@@ -150,27 +155,24 @@ fn render_dot_inner(s: &Scenario, exports: &[ExportEdge]) -> String {
     out
 }
 
-fn endpoint_label_for_provide(component: &Component, provide_name: &str) -> String {
+fn endpoint_label_for_provide(
+    component: &Component,
+    component_id: ComponentId,
+    provide_name: &str,
+    endpoint_plan: &EndpointPlan,
+) -> String {
     let provide = component
         .provides
         .get(provide_name)
         .expect("scenario invariant: provide exists");
-
-    let network = component
-        .program
-        .as_ref()
-        .and_then(|p| p.network())
-        .expect("scenario invariant: provide requires a network");
 
     let endpoint_name = provide
         .endpoint
         .as_deref()
         .expect("scenario invariant: provide declares an endpoint");
 
-    let endpoint = network
-        .endpoints()
-        .iter()
-        .find(|e| e.name == endpoint_name)
+    let endpoint = endpoint_plan
+        .lookup(component_id, endpoint_name)
         .expect("scenario invariant: endpoint exists");
 
     format!("{}:{}", endpoint.protocol, endpoint.port)

@@ -3,7 +3,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use amber_manifest::MountSource;
 use amber_mesh::{MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProvisionOutput};
 use amber_scenario::{ComponentId, Scenario};
 use amber_template::{ProgramArgTemplate, TemplatePart, TemplateSpec};
@@ -12,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::{
+    program_semantics::{StaticMountKind, validated_static_mounts},
     reporter::{
         CompiledScenario, Reporter, ReporterError,
         execution_guide::{
@@ -39,7 +39,7 @@ use crate::{
             },
         },
         program_config::{
-            ComponentExecutionPlan, ProgramSupport, RuntimeConfigPayload,
+            ComponentExecutionPlan, EndpointPlan, ProgramSupport, RuntimeConfigPayload,
             build_component_runtime_plan, build_config_plan,
         },
     },
@@ -204,15 +204,17 @@ fn render_direct(compiled: &CompiledScenario) -> Result<DirectArtifact, Reporter
 
 fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, MeshError> {
     let scenario = compiled.scenario();
+    let endpoint_plan = crate::targets::program_config::build_endpoint_plan(scenario)?;
     let mesh_plan = build_mesh_plan(
         scenario,
+        &endpoint_plan,
         MeshOptions {
             backend_label: "direct reporter",
         },
     )?;
     let program_components = mesh_plan.program_components();
     ensure_direct_mount_sources_supported(scenario, program_components)?;
-    ensure_no_endpoint_port_conflicts(scenario, program_components)?;
+    ensure_no_endpoint_port_conflicts(&endpoint_plan, scenario, program_components)?;
 
     let component_names: HashMap<ComponentId, DirectComponentNames> =
         map_program_components(scenario, program_components, |id, local_name| {
@@ -224,7 +226,7 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
             }
         });
 
-    let route_ports = placeholder_local_route_ports(scenario, &mesh_plan);
+    let route_ports = placeholder_local_route_ports(scenario, &endpoint_plan, &mesh_plan);
     let mesh_ports_by_component = placeholder_mesh_ports(program_components);
 
     let needs_router = mesh_plan.needs_router();
@@ -683,7 +685,7 @@ fn decode_template_spec_program(raw_b64: &str) -> Result<String, MeshError> {
 fn render_program_arg_template_literal(arg: &ProgramArgTemplate) -> Result<String, MeshError> {
     let ProgramArgTemplate::Arg(parts) = arg else {
         return Err(MeshError::new(
-            "internal error: template spec program entrypoint starts with a conditional arg group",
+            "internal error: template spec program entrypoint starts with a conditional arg item",
         ));
     };
     render_template_string_literal(parts)
@@ -706,6 +708,12 @@ fn render_template_string_literal(parts: &[TemplatePart]) -> Result<String, Mesh
                 )));
             }
             TemplatePart::Item { item, .. } => {
+                return Err(MeshError::new(format!(
+                    "internal error: unresolved repeated item interpolation `{item}` in direct \
+                     program path"
+                )));
+            }
+            TemplatePart::CurrentItem { item } => {
                 return Err(MeshError::new(format!(
                     "internal error: unresolved repeated item interpolation `{item}` in direct \
                      program path"
@@ -801,21 +809,16 @@ fn ensure_direct_mount_sources_supported(
     scenario: &Scenario,
     program_components: &[ComponentId],
 ) -> Result<(), MeshError> {
+    let static_mounts = validated_static_mounts(scenario, "direct planning");
     for id in program_components {
         let component = scenario.component(*id);
-        let program = component.program.as_ref().ok_or_else(|| {
-            MeshError::new(format!(
-                "internal error: missing program for {}",
-                component.moniker.as_str()
-            ))
-        })?;
-        for mount in program.mounts() {
-            if let MountSource::Framework(capability) = &mount.source {
+        for mount in static_mounts.component_mounts(*id) {
+            if let StaticMountKind::Framework(capability) = &mount.kind {
                 return Err(MeshError::new(format!(
                     "component {} uses framework mount source `framework.{}`, which is not \
                      supported by direct output",
                     component.moniker.as_str(),
-                    capability.as_str()
+                    capability.as_str(),
                 )));
             }
         }
@@ -824,19 +827,14 @@ fn ensure_direct_mount_sources_supported(
 }
 
 fn ensure_no_endpoint_port_conflicts(
+    endpoint_plan: &EndpointPlan,
     scenario: &Scenario,
     program_components: &[ComponentId],
 ) -> Result<(), MeshError> {
     let mut by_port: BTreeMap<u16, Vec<String>> = BTreeMap::new();
     for id in program_components {
         let component = scenario.component(*id);
-        let Some(program) = component.program.as_ref() else {
-            continue;
-        };
-        let Some(network) = program.network() else {
-            continue;
-        };
-        for endpoint in network.endpoints() {
+        for endpoint in endpoint_plan.component_endpoints(*id) {
             by_port.entry(endpoint.port).or_default().push(format!(
                 "{}:{}",
                 component.moniker.as_str(),

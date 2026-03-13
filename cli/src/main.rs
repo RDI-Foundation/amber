@@ -2186,7 +2186,7 @@ fn decode_template_spec_program(raw_b64: &str) -> Result<String> {
 fn render_program_arg_template_literal(arg: &ProgramArgTemplate) -> Result<String> {
     let ProgramArgTemplate::Arg(parts) = arg else {
         return Err(miette::miette!(
-            "internal error: template spec program entrypoint starts with a conditional arg group"
+            "internal error: template spec program entrypoint starts with a conditional arg item"
         ));
     };
     render_template_string_literal(parts)
@@ -2209,6 +2209,12 @@ fn render_template_string_literal(parts: &[TemplatePart]) -> Result<String> {
                 ));
             }
             TemplatePart::Item { item, .. } => {
+                return Err(miette::miette!(
+                    "internal error: unresolved repeated item interpolation `{item}` in direct \
+                     program path"
+                ));
+            }
+            TemplatePart::CurrentItem { item } => {
                 return Err(miette::miette!(
                     "internal error: unresolved repeated item interpolation `{item}` in direct \
                      program path"

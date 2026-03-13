@@ -1501,6 +1501,95 @@ async fn mounted_storage_slot_requires_resource_binding_at_link_time() {
 }
 
 #[tokio::test]
+async fn config_expanded_storage_mount_slot_requires_resource_binding_at_link_time() {
+    let dir = tmp_dir("config-expanded-storage-slot-requires-resource-binding");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              mount_source: { type: "string" },
+            },
+            required: ["mount_source"],
+          },
+          program: {
+            image: "busybox:1.36.1",
+            entrypoint: ["sh", "-lc", "test -d /var/lib/app && sleep 3600"],
+            mounts: [
+              { path: "/var/lib/app", from: "${config.mount_source}" },
+            ],
+            network: {
+              endpoints: [{ name: "http", port: 8080 }],
+            },
+          },
+          slots: {
+            state: { kind: "storage" },
+          },
+          provides: {
+            http: { kind: "http", endpoint: "http" },
+          },
+          exports: {
+            http: "http",
+          },
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.3.0",
+              components: {{
+                child: {{
+                  manifest: "{child}",
+                  config: {{
+                    mount_source: "slots.state"
+                  }}
+                }}
+              }},
+              exports: {{ http: "#child.http" }}
+            }}
+            "##,
+            child = file_url(&child_path),
+        ),
+    );
+
+    let err = default_compiler()
+        .compile(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .expect_err(
+            "config-expanded storage slot without resource binding should fail during linking",
+        );
+
+    let crate::Error::Linker(crate::linker::Error::Multiple { errors, .. }) = err else {
+        panic!("expected linker error, got {err}");
+    };
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            crate::linker::Error::StorageMountRequiresResource { slot, .. } if slot == "state"
+        )),
+        "expected storage mount linker error, got {errors:?}"
+    );
+    assert!(
+        !errors
+            .iter()
+            .any(|error| matches!(error, crate::linker::Error::UnboundSlot { slot, .. } if slot == "state")),
+        "config-expanded storage mount should not be reported as a generic unbound slot: {errors:?}"
+    );
+}
+
+#[tokio::test]
 async fn optional_mounted_storage_slot_is_rejected_at_link_time() {
     let dir = tmp_dir("optional-mounted-storage-slot");
     let root_path = dir.path().join("root.json5");

@@ -1,12 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use amber_manifest::{MountSource, ProvideDecl, SlotDecl};
+use amber_manifest::{ProvideDecl, SlotDecl};
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario, SlotRef,
 };
 use serde_json::json;
 
-use crate::targets::common::TargetError as MeshError;
+use crate::{
+    program_semantics::{StaticMountKind, validated_static_mounts},
+    targets::common::TargetError as MeshError,
+};
 
 pub(crate) const FRAMEWORK_DOCKER_GATEWAY_INTERNAL_SLOT: &str = "__amber_internal_framework_docker";
 pub(crate) const FRAMEWORK_DOCKER_GATEWAY_ENDPOINT: &str = "docker";
@@ -26,6 +29,7 @@ pub(crate) struct FrameworkDockerInjection {
 pub(crate) fn rewrite_framework_docker_as_injected_component(
     scenario: &Scenario,
 ) -> Result<FrameworkDockerInjection, MeshError> {
+    let static_mounts = validated_static_mounts(scenario, "docker injection planning");
     let mut framework_binding_consumers = BTreeSet::new();
     let mut proxy_slot_by_component = HashMap::new();
     for binding in &scenario.bindings {
@@ -42,12 +46,9 @@ pub(crate) fn rewrite_framework_docker_as_injected_component(
     }
 
     let mut docker_mount_consumers = BTreeSet::new();
-    for (id, component) in scenario.components_iter() {
-        let Some(program) = component.program.as_ref() else {
-            continue;
-        };
-        if program.mounts().iter().any(|mount| {
-            matches!(&mount.source, MountSource::Framework(capability) if capability.as_str() == "docker")
+    for (id, _) in scenario.components_iter() {
+        if static_mounts.component_mounts(id).iter().any(|mount| {
+            matches!(&mount.kind, StaticMountKind::Framework(capability) if capability.as_str() == "docker")
         }) {
             docker_mount_consumers.insert(id);
         }

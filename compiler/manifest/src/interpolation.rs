@@ -321,18 +321,31 @@ fn validate_config_when_path(input: &str, query: &str) -> Result<(), Error> {
     Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, DeserializeFromStr, SerializeDisplay,
 )]
 pub struct EachPath {
-    slot: String,
+    source: InterpolationSource,
+    query: String,
 }
 
 impl EachPath {
-    pub fn slot(&self) -> &str {
-        &self.slot
+    pub fn source(&self) -> InterpolationSource {
+        self.source
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub fn slot(&self) -> Option<&str> {
+        (self.source == InterpolationSource::Slots).then_some(self.query.as_str())
+    }
+
+    pub fn config_path(&self) -> Option<&str> {
+        (self.source == InterpolationSource::Config).then_some(self.query.as_str())
     }
 }
 
 impl fmt::Display for EachPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "slots.{}", self.slot)
+        write!(f, "{}.{}", self.source, self.query)
     }
 }
 
@@ -340,21 +353,37 @@ impl FromStr for EachPath {
     type Err = Error;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        let Some(slot) = input.strip_prefix("slots.") else {
-            return Err(Error::InvalidEachPath {
-                input: input.to_string(),
-                message: "expected `slots.<slot>`".to_string(),
-            });
+        let (source, query) = input
+            .split_once('.')
+            .map_or((input, ""), |(source, query)| (source, query));
+        let source = match source {
+            "config" => InterpolationSource::Config,
+            "slots" => InterpolationSource::Slots,
+            _ => {
+                return Err(Error::InvalidEachPath {
+                    input: input.to_string(),
+                    message: "expected `config.<path>` or `slots.<slot>`".to_string(),
+                });
+            }
         };
-        if slot.is_empty() || slot.contains('.') {
+
+        if query.is_empty() || query.split('.').any(str::is_empty) {
             return Err(Error::InvalidEachPath {
                 input: input.to_string(),
-                message: "expected `slots.<slot>`".to_string(),
+                message: "expected `config.<path>` or `slots.<slot>`".to_string(),
+            });
+        }
+
+        if source == InterpolationSource::Slots && query.contains('.') {
+            return Err(Error::InvalidEachPath {
+                input: input.to_string(),
+                message: "expected `config.<path>` or `slots.<slot>`".to_string(),
             });
         }
 
         Ok(Self {
-            slot: slot.to_string(),
+            source,
+            query: query.to_string(),
         })
     }
 }
@@ -398,98 +427,66 @@ impl<'de> Deserialize<'de> for ProgramArgList {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProgramArgGroup {
-    pub when: WhenPath,
-    pub argv: ProgramArgList,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RepeatedProgramArgv {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub when: Option<WhenPath>,
-    pub each: EachPath,
-    pub argv: ProgramArgList,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RepeatedProgramArg {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub when: Option<WhenPath>,
-    pub each: EachPath,
-    pub arg: InterpolatedString,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub join: Option<String>,
-}
-
-impl ProgramArgGroup {
-    pub fn visit_values(&self, mut visit: impl FnMut(&InterpolatedString)) {
-        for arg in &self.argv.0 {
-            visit(arg);
-        }
-    }
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ProgramArgValue {
+    Arg(InterpolatedString),
+    Argv(ProgramArgList),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ProgramArgItem {
-    Arg(InterpolatedString),
-    Group(ProgramArgGroup),
-    RepeatedArgv(RepeatedProgramArgv),
-    RepeatedArg(RepeatedProgramArg),
+pub struct ProgramArgItem {
+    pub when: Option<WhenPath>,
+    pub each: Option<EachPath>,
+    pub value: ProgramArgValue,
+    pub join: Option<String>,
 }
 
 impl ProgramArgItem {
     pub fn arg(&self) -> Option<&InterpolatedString> {
-        match self {
-            Self::Arg(arg) => Some(arg),
-            Self::Group(_) | Self::RepeatedArgv(_) | Self::RepeatedArg(_) => None,
+        match &self.value {
+            ProgramArgValue::Arg(arg) => Some(arg),
+            ProgramArgValue::Argv(_) => None,
         }
     }
 
-    pub fn group(&self) -> Option<&ProgramArgGroup> {
-        match self {
-            Self::Arg(_) => None,
-            Self::Group(group) => Some(group),
-            Self::RepeatedArgv(_) | Self::RepeatedArg(_) => None,
-        }
-    }
-
-    pub fn repeated_argv(&self) -> Option<&RepeatedProgramArgv> {
-        match self {
-            Self::RepeatedArgv(repeated) => Some(repeated),
-            Self::Arg(_) | Self::Group(_) | Self::RepeatedArg(_) => None,
-        }
-    }
-
-    pub fn repeated_arg(&self) -> Option<&RepeatedProgramArg> {
-        match self {
-            Self::RepeatedArg(repeated) => Some(repeated),
-            Self::Arg(_) | Self::Group(_) | Self::RepeatedArgv(_) => None,
+    pub fn argv(&self) -> Option<&ProgramArgList> {
+        match &self.value {
+            ProgramArgValue::Arg(_) => None,
+            ProgramArgValue::Argv(argv) => Some(argv),
         }
     }
 
     pub fn when(&self) -> Option<&WhenPath> {
-        match self {
-            Self::Arg(_) => None,
-            Self::Group(group) => Some(&group.when),
-            Self::RepeatedArgv(repeated) => repeated.when.as_ref(),
-            Self::RepeatedArg(repeated) => repeated.when.as_ref(),
+        self.when.as_ref()
+    }
+
+    pub fn each(&self) -> Option<&EachPath> {
+        self.each.as_ref()
+    }
+
+    pub fn is_repeated(&self) -> bool {
+        self.each.is_some()
+    }
+
+    pub fn join(&self) -> Option<&str> {
+        self.join.as_deref()
+    }
+
+    pub fn field_name(&self) -> &'static str {
+        match self.value {
+            ProgramArgValue::Arg(_) => "arg",
+            ProgramArgValue::Argv(_) => "argv",
         }
     }
 
     pub fn visit_values(&self, mut visit: impl FnMut(&InterpolatedString)) {
-        match self {
-            Self::Arg(arg) => visit(arg),
-            Self::Group(group) => group.visit_values(visit),
-            Self::RepeatedArgv(repeated) => {
-                for arg in &repeated.argv.0 {
+        match &self.value {
+            ProgramArgValue::Arg(arg) => visit(arg),
+            ProgramArgValue::Argv(argv) => {
+                for arg in &argv.0 {
                     visit(arg);
                 }
             }
-            Self::RepeatedArg(repeated) => visit(&repeated.arg),
         }
     }
 
@@ -502,24 +499,38 @@ impl ProgramArgItem {
             return true;
         }
 
-        match self {
-            Self::Arg(arg) => arg.visit_slot_uses(visit),
-            Self::Group(group) => visit_program_arg_list_slot_uses(&group.argv, &mut visit),
-            Self::RepeatedArgv(repeated) => {
-                visit(repeated.each.slot());
-                visit_program_arg_list_slot_uses(&repeated.argv, &mut visit)
+        if let Some(each) = self.each()
+            && each.source() == InterpolationSource::Slots
+            && let Some(slot) = each.slot()
+        {
+            visit(slot);
+        }
+
+        match &self.value {
+            ProgramArgValue::Arg(arg) => arg.visit_slot_uses(visit),
+            ProgramArgValue::Argv(argv) => visit_program_arg_list_slot_uses(argv, &mut visit),
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        match (self.each.as_ref(), &self.value, self.join.as_ref()) {
+            (None, _, Some(_)) => Err("`join` is only valid with `each` and `arg`".to_string()),
+            (Some(_), ProgramArgValue::Argv(_), Some(_)) => {
+                Err("`join` is only valid with `each` and `arg`".to_string())
             }
-            Self::RepeatedArg(repeated) => {
-                visit(repeated.each.slot());
-                repeated.arg.visit_slot_uses(visit)
-            }
+            _ => Ok(()),
         }
     }
 }
 
 impl From<InterpolatedString> for ProgramArgItem {
     fn from(value: InterpolatedString) -> Self {
-        Self::Arg(value)
+        Self {
+            when: None,
+            each: None,
+            value: ProgramArgValue::Arg(value),
+            join: None,
+        }
     }
 }
 
@@ -528,12 +539,31 @@ impl Serialize for ProgramArgItem {
     where
         S: Serializer,
     {
-        match self {
-            Self::Arg(arg) => arg.serialize(serializer),
-            Self::Group(group) => group.serialize(serializer),
-            Self::RepeatedArgv(repeated) => repeated.serialize(serializer),
-            Self::RepeatedArg(repeated) => repeated.serialize(serializer),
+        if self.when.is_none()
+            && self.each.is_none()
+            && self.join.is_none()
+            && let ProgramArgValue::Arg(arg) = &self.value
+        {
+            return arg.serialize(serializer);
         }
+
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(when) = &self.when {
+            map.serialize_entry("when", when)?;
+        }
+        if let Some(each) = &self.each {
+            map.serialize_entry("each", each)?;
+        }
+        if let Some(join) = &self.join {
+            map.serialize_entry("join", join)?;
+        }
+        match &self.value {
+            ProgramArgValue::Arg(arg) => map.serialize_entry("arg", arg)?,
+            ProgramArgValue::Argv(argv) => map.serialize_entry("argv", argv)?,
+        }
+        map.end()
     }
 }
 
@@ -545,32 +575,51 @@ impl<'de> Deserialize<'de> for ProgramArgItem {
         match Value::deserialize(deserializer)? {
             Value::String(value) => value
                 .parse::<InterpolatedString>()
-                .map(ProgramArgItem::Arg)
+                .map(ProgramArgItem::from)
                 .map_err(serde::de::Error::custom),
             Value::Object(map) => {
-                let value = Value::Object(map.clone());
-                if map.contains_key("each") {
-                    if map.contains_key("argv") {
-                        serde_json::from_value::<RepeatedProgramArgv>(value)
-                            .map(ProgramArgItem::RepeatedArgv)
-                            .map_err(serde::de::Error::custom)
-                    } else if map.contains_key("arg") {
-                        serde_json::from_value::<RepeatedProgramArg>(value)
-                            .map(ProgramArgItem::RepeatedArg)
-                            .map_err(serde::de::Error::custom)
-                    } else {
-                        Err(serde::de::Error::custom(
-                            "expected an object with `each` and one of `argv` or `arg`",
-                        ))
-                    }
-                } else {
-                    serde_json::from_value::<ProgramArgGroup>(value)
-                        .map(ProgramArgItem::Group)
-                        .map_err(serde::de::Error::custom)
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct ProgramArgItemFields {
+                    #[serde(default)]
+                    when: Option<WhenPath>,
+                    #[serde(default)]
+                    each: Option<EachPath>,
+                    #[serde(default)]
+                    arg: Option<InterpolatedString>,
+                    #[serde(default)]
+                    argv: Option<ProgramArgList>,
+                    #[serde(default)]
+                    join: Option<String>,
                 }
+
+                let fields = serde_json::from_value::<ProgramArgItemFields>(Value::Object(map))
+                    .map_err(serde::de::Error::custom)?;
+                let value = match (fields.arg, fields.argv) {
+                    (Some(arg), None) => ProgramArgValue::Arg(arg),
+                    (None, Some(argv)) => ProgramArgValue::Argv(argv),
+                    (Some(_), Some(_)) => {
+                        return Err(serde::de::Error::custom(
+                            "expected exactly one of `arg` or `argv`",
+                        ));
+                    }
+                    (None, None) => {
+                        return Err(serde::de::Error::custom(
+                            "expected an object with one of `arg` or `argv`",
+                        ));
+                    }
+                };
+                let item = Self {
+                    when: fields.when,
+                    each: fields.each,
+                    value,
+                    join: fields.join,
+                };
+                item.validate().map_err(serde::de::Error::custom)?;
+                Ok(item)
             }
             _ => Err(serde::de::Error::custom(
-                "expected a string or an object with `when`/`argv` or `each`",
+                "expected a string or an object with one of `arg` or `argv`",
             )),
         }
     }
@@ -585,10 +634,6 @@ impl ProgramEntrypoint {
         for item in &self.0 {
             item.visit_values(&mut visit);
         }
-    }
-
-    pub fn groups(&self) -> impl Iterator<Item = &ProgramArgGroup> {
-        self.0.iter().filter_map(ProgramArgItem::group)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -627,7 +672,7 @@ impl<'de> Deserialize<'de> for ProgramEntrypoint {
             {
                 parse_program_arg_list(value)
                     .map(|args| {
-                        ProgramEntrypoint(args.into_iter().map(ProgramArgItem::Arg).collect())
+                        ProgramEntrypoint(args.into_iter().map(ProgramArgItem::from).collect())
                     })
                     .map_err(E::custom)
             }
@@ -652,60 +697,33 @@ impl<'de> Deserialize<'de> for ProgramEntrypoint {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProgramEnvGroup {
-    pub when: WhenPath,
-    pub value: InterpolatedString,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RepeatedProgramEnv {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub when: Option<WhenPath>,
-    pub each: EachPath,
-    pub value: InterpolatedString,
-    pub join: String,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ProgramEnvValue {
-    Value(InterpolatedString),
-    Group(ProgramEnvGroup),
-    Repeated(RepeatedProgramEnv),
+pub struct ProgramEnvValue {
+    pub when: Option<WhenPath>,
+    pub each: Option<EachPath>,
+    pub value: InterpolatedString,
+    pub join: Option<String>,
 }
 
 impl ProgramEnvValue {
     pub fn value(&self) -> &InterpolatedString {
-        match self {
-            Self::Value(value) => value,
-            Self::Group(group) => &group.value,
-            Self::Repeated(repeated) => &repeated.value,
-        }
-    }
-
-    pub fn group(&self) -> Option<&ProgramEnvGroup> {
-        match self {
-            Self::Value(_) => None,
-            Self::Group(group) => Some(group),
-            Self::Repeated(_) => None,
-        }
-    }
-
-    pub fn repeated(&self) -> Option<&RepeatedProgramEnv> {
-        match self {
-            Self::Repeated(repeated) => Some(repeated),
-            Self::Value(_) | Self::Group(_) => None,
-        }
+        &self.value
     }
 
     pub fn when(&self) -> Option<&WhenPath> {
-        match self {
-            Self::Value(_) => None,
-            Self::Group(group) => Some(&group.when),
-            Self::Repeated(repeated) => repeated.when.as_ref(),
-        }
+        self.when.as_ref()
+    }
+
+    pub fn each(&self) -> Option<&EachPath> {
+        self.each.as_ref()
+    }
+
+    pub fn is_repeated(&self) -> bool {
+        self.each.is_some()
+    }
+
+    pub fn join(&self) -> Option<&str> {
+        self.join.as_deref()
     }
 
     pub fn visit_values(&self, mut visit: impl FnMut(&InterpolatedString)) {
@@ -721,11 +739,22 @@ impl ProgramEnvValue {
             return true;
         }
 
-        if let Some(repeated) = self.repeated() {
-            visit(repeated.each.slot());
+        if let Some(each) = self.each()
+            && each.source() == InterpolationSource::Slots
+            && let Some(slot) = each.slot()
+        {
+            visit(slot);
         }
 
         self.value().visit_slot_uses(visit)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        match (self.each.as_ref(), self.join.as_ref()) {
+            (None, Some(_)) => Err("`join` is only valid with `each`".to_string()),
+            (Some(_), None) => Err("`join` is required with `each` in program.env".to_string()),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -757,7 +786,12 @@ fn visit_when_slot_uses(when: &WhenPath, visit: &mut impl FnMut(&str)) -> bool {
 
 impl From<InterpolatedString> for ProgramEnvValue {
     fn from(value: InterpolatedString) -> Self {
-        Self::Value(value)
+        Self {
+            when: None,
+            each: None,
+            value,
+            join: None,
+        }
     }
 }
 
@@ -766,11 +800,24 @@ impl Serialize for ProgramEnvValue {
     where
         S: Serializer,
     {
-        match self {
-            Self::Value(value) => value.serialize(serializer),
-            Self::Group(group) => group.serialize(serializer),
-            Self::Repeated(repeated) => repeated.serialize(serializer),
+        if self.when.is_none() && self.each.is_none() && self.join.is_none() {
+            return self.value.serialize(serializer);
         }
+
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(when) = &self.when {
+            map.serialize_entry("when", when)?;
+        }
+        if let Some(each) = &self.each {
+            map.serialize_entry("each", each)?;
+        }
+        if let Some(join) = &self.join {
+            map.serialize_entry("join", join)?;
+        }
+        map.serialize_entry("value", &self.value)?;
+        map.end()
     }
 }
 
@@ -782,22 +829,34 @@ impl<'de> Deserialize<'de> for ProgramEnvValue {
         match Value::deserialize(deserializer)? {
             Value::String(value) => value
                 .parse::<InterpolatedString>()
-                .map(ProgramEnvValue::Value)
+                .map(ProgramEnvValue::from)
                 .map_err(serde::de::Error::custom),
             Value::Object(map) => {
-                let value = Value::Object(map.clone());
-                if map.contains_key("each") {
-                    serde_json::from_value::<RepeatedProgramEnv>(value)
-                        .map(ProgramEnvValue::Repeated)
-                        .map_err(serde::de::Error::custom)
-                } else {
-                    serde_json::from_value::<ProgramEnvGroup>(value)
-                        .map(ProgramEnvValue::Group)
-                        .map_err(serde::de::Error::custom)
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct ProgramEnvValueFields {
+                    #[serde(default)]
+                    when: Option<WhenPath>,
+                    #[serde(default)]
+                    each: Option<EachPath>,
+                    value: InterpolatedString,
+                    #[serde(default)]
+                    join: Option<String>,
                 }
+
+                let value = serde_json::from_value::<ProgramEnvValueFields>(Value::Object(map))
+                    .map_err(serde::de::Error::custom)?;
+                let env_value = Self {
+                    when: value.when,
+                    each: value.each,
+                    value: value.value,
+                    join: value.join,
+                };
+                env_value.validate().map_err(serde::de::Error::custom)?;
+                Ok(env_value)
             }
             _ => Err(serde::de::Error::custom(
-                "expected an interpolation string or an object with `when`/`value` or `each`",
+                "expected an interpolation string or an object with `value`",
             )),
         }
     }
@@ -867,39 +926,18 @@ impl<'de> Deserialize<'de> for RawProgramArgList {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawProgramArgGroup {
-    pub when: WhenPath,
-    pub argv: RawProgramArgList,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawRepeatedProgramArgv {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub when: Option<WhenPath>,
-    pub each: EachPath,
-    pub argv: RawProgramArgList,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawRepeatedProgramArg {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub when: Option<WhenPath>,
-    pub each: EachPath,
-    pub arg: InlineStringSpec,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub join: Option<String>,
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RawProgramArgValue {
+    Arg(InlineStringSpec),
+    Argv(RawProgramArgList),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum RawProgramArgItem {
-    Arg(InlineStringSpec),
-    Group(RawProgramArgGroup),
-    RepeatedArgv(RawRepeatedProgramArgv),
-    RepeatedArg(RawRepeatedProgramArg),
+pub struct RawProgramArgItem {
+    pub when: Option<WhenPath>,
+    pub each: Option<EachPath>,
+    pub value: RawProgramArgValue,
+    pub join: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for RawProgramArgItem {
@@ -912,38 +950,83 @@ impl<'de> Deserialize<'de> for RawProgramArgItem {
                 value
                     .parse::<InterpolatedString>()
                     .map_err(serde::de::Error::custom)?;
-                Ok(Self::Arg(InlineStringSpec::Inline(value)))
+                Ok(Self {
+                    when: None,
+                    each: None,
+                    value: RawProgramArgValue::Arg(InlineStringSpec::Inline(value)),
+                    join: None,
+                })
             }
             Value::Object(map) => {
                 let value = Value::Object(map.clone());
                 if map.contains_key("file") {
                     deserialize_inline_string_spec_from_value(value)
-                        .map(Self::Arg)
+                        .map(|arg| Self {
+                            when: None,
+                            each: None,
+                            value: RawProgramArgValue::Arg(arg),
+                            join: None,
+                        })
                         .map_err(serde::de::Error::custom)
-                } else if map.contains_key("each") {
-                    if map.contains_key("argv") {
-                        serde_json::from_value::<RawRepeatedProgramArgv>(value)
-                            .map(Self::RepeatedArgv)
-                            .map_err(serde::de::Error::custom)
-                    } else if map.contains_key("arg") {
-                        serde_json::from_value::<RawRepeatedProgramArg>(value)
-                            .map(Self::RepeatedArg)
-                            .map_err(serde::de::Error::custom)
-                    } else {
-                        Err(serde::de::Error::custom(
-                            "expected an object with `each` and one of `argv` or `arg`",
-                        ))
-                    }
                 } else {
-                    serde_json::from_value::<RawProgramArgGroup>(value)
-                        .map(Self::Group)
-                        .map_err(serde::de::Error::custom)
+                    #[derive(Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct RawProgramArgItemFields {
+                        #[serde(default)]
+                        when: Option<WhenPath>,
+                        #[serde(default)]
+                        each: Option<EachPath>,
+                        #[serde(default)]
+                        arg: Option<InlineStringSpec>,
+                        #[serde(default)]
+                        argv: Option<RawProgramArgList>,
+                        #[serde(default)]
+                        join: Option<String>,
+                    }
+
+                    let value =
+                        serde_json::from_value::<RawProgramArgItemFields>(Value::Object(map))
+                            .map_err(serde::de::Error::custom)?;
+                    let item_value = match (value.arg, value.argv) {
+                        (Some(arg), None) => RawProgramArgValue::Arg(arg),
+                        (None, Some(argv)) => RawProgramArgValue::Argv(argv),
+                        (Some(_), Some(_)) => {
+                            return Err(serde::de::Error::custom(
+                                "expected exactly one of `arg` or `argv`",
+                            ));
+                        }
+                        (None, None) => {
+                            return Err(serde::de::Error::custom(
+                                "expected an object with one of `arg` or `argv`",
+                            ));
+                        }
+                    };
+                    let item = Self {
+                        when: value.when,
+                        each: value.each,
+                        value: item_value,
+                        join: value.join,
+                    };
+                    item.validate().map_err(serde::de::Error::custom)?;
+                    Ok(item)
                 }
             }
             _ => Err(serde::de::Error::custom(
-                "expected a string, a `{ file: ... }` reference, or an object with `when`/`argv` \
-                 or `each`",
+                "expected a string, a `{ file: ... }` reference, or an object with one of `arg` \
+                 or `argv`",
             )),
+        }
+    }
+}
+
+impl RawProgramArgItem {
+    fn validate(&self) -> Result<(), String> {
+        match (self.each.as_ref(), &self.value, self.join.as_ref()) {
+            (None, _, Some(_)) => Err("`join` is only valid with `each` and `arg`".to_string()),
+            (Some(_), RawProgramArgValue::Argv(_), Some(_)) => {
+                Err("`join` is only valid with `each` and `arg`".to_string())
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -953,12 +1036,31 @@ impl Serialize for RawProgramArgItem {
     where
         S: Serializer,
     {
-        match self {
-            Self::Arg(arg) => arg.serialize(serializer),
-            Self::Group(group) => group.serialize(serializer),
-            Self::RepeatedArgv(repeated) => repeated.serialize(serializer),
-            Self::RepeatedArg(repeated) => repeated.serialize(serializer),
+        if self.when.is_none()
+            && self.each.is_none()
+            && self.join.is_none()
+            && let RawProgramArgValue::Arg(arg) = &self.value
+        {
+            return arg.serialize(serializer);
         }
+
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(when) = &self.when {
+            map.serialize_entry("when", when)?;
+        }
+        if let Some(each) = &self.each {
+            map.serialize_entry("each", each)?;
+        }
+        if let Some(join) = &self.join {
+            map.serialize_entry("join", join)?;
+        }
+        match &self.value {
+            RawProgramArgValue::Arg(arg) => map.serialize_entry("arg", arg)?,
+            RawProgramArgValue::Argv(argv) => map.serialize_entry("argv", argv)?,
+        }
+        map.end()
     }
 }
 
@@ -1032,28 +1134,12 @@ impl<'de> Deserialize<'de> for RawProgramEntrypoint {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawProgramEnvGroup {
-    pub when: WhenPath,
-    pub value: InlineStringSpec,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawRepeatedProgramEnv {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub when: Option<WhenPath>,
-    pub each: EachPath,
-    pub value: InlineStringSpec,
-    pub join: String,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum RawProgramEnvValue {
-    Value(InlineStringSpec),
-    Group(RawProgramEnvGroup),
-    Repeated(RawRepeatedProgramEnv),
+pub struct RawProgramEnvValue {
+    pub when: Option<WhenPath>,
+    pub each: Option<EachPath>,
+    pub value: InlineStringSpec,
+    pub join: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for RawProgramEnvValue {
@@ -1066,28 +1152,64 @@ impl<'de> Deserialize<'de> for RawProgramEnvValue {
                 value
                     .parse::<InterpolatedString>()
                     .map_err(serde::de::Error::custom)?;
-                Ok(Self::Value(InlineStringSpec::Inline(value)))
+                Ok(Self {
+                    when: None,
+                    each: None,
+                    value: InlineStringSpec::Inline(value),
+                    join: None,
+                })
             }
             Value::Object(map) => {
                 let value = Value::Object(map.clone());
                 if map.contains_key("file") {
                     deserialize_inline_string_spec_from_value(value)
-                        .map(Self::Value)
-                        .map_err(serde::de::Error::custom)
-                } else if map.contains_key("each") {
-                    serde_json::from_value::<RawRepeatedProgramEnv>(value)
-                        .map(Self::Repeated)
+                        .map(|value| Self {
+                            when: None,
+                            each: None,
+                            value,
+                            join: None,
+                        })
                         .map_err(serde::de::Error::custom)
                 } else {
-                    serde_json::from_value::<RawProgramEnvGroup>(value)
-                        .map(Self::Group)
-                        .map_err(serde::de::Error::custom)
+                    #[derive(Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct RawProgramEnvValueFields {
+                        #[serde(default)]
+                        when: Option<WhenPath>,
+                        #[serde(default)]
+                        each: Option<EachPath>,
+                        value: InlineStringSpec,
+                        #[serde(default)]
+                        join: Option<String>,
+                    }
+
+                    let value =
+                        serde_json::from_value::<RawProgramEnvValueFields>(Value::Object(map))
+                            .map_err(serde::de::Error::custom)?;
+                    let env_value = Self {
+                        when: value.when,
+                        each: value.each,
+                        value: value.value,
+                        join: value.join,
+                    };
+                    env_value.validate().map_err(serde::de::Error::custom)?;
+                    Ok(env_value)
                 }
             }
             _ => Err(serde::de::Error::custom(
                 "expected an interpolation string, a `{ file: ... }` reference, or an object with \
-                 `when`/`value` or `each`",
+                 `value`",
             )),
+        }
+    }
+}
+
+impl RawProgramEnvValue {
+    fn validate(&self) -> Result<(), String> {
+        match (self.each.as_ref(), self.join.as_ref()) {
+            (None, Some(_)) => Err("`join` is only valid with `each`".to_string()),
+            (Some(_), None) => Err("`join` is required with `each` in program.env".to_string()),
+            _ => Ok(()),
         }
     }
 }
@@ -1097,11 +1219,24 @@ impl Serialize for RawProgramEnvValue {
     where
         S: Serializer,
     {
-        match self {
-            Self::Value(value) => value.serialize(serializer),
-            Self::Group(group) => group.serialize(serializer),
-            Self::Repeated(repeated) => repeated.serialize(serializer),
+        if self.when.is_none() && self.each.is_none() && self.join.is_none() {
+            return self.value.serialize(serializer);
         }
+
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(when) = &self.when {
+            map.serialize_entry("when", when)?;
+        }
+        if let Some(each) = &self.each {
+            map.serialize_entry("each", each)?;
+        }
+        if let Some(join) = &self.join {
+            map.serialize_entry("join", join)?;
+        }
+        map.serialize_entry("value", &self.value)?;
+        map.end()
     }
 }
 
@@ -1145,56 +1280,35 @@ impl RawProgramArgItem {
         pointer: &str,
         resolve_string: &mut impl FnMut(InlineStringSpec, &str) -> Result<String, Error>,
     ) -> Result<ProgramArgItem, Error> {
-        match self {
-            Self::Arg(value) => {
-                let raw = resolve_string(value, pointer)?;
-                raw.parse::<InterpolatedString>().map(ProgramArgItem::Arg)
+        let value = match self.value {
+            RawProgramArgValue::Arg(value) => {
+                let raw = resolve_string(value, &pointer_with_segment(pointer, "arg"))?;
+                ProgramArgValue::Arg(raw.parse::<InterpolatedString>()?)
             }
-            Self::Group(group) => Ok(ProgramArgItem::Group(ProgramArgGroup {
-                when: group.when,
-                argv: group
-                    .argv
-                    .resolve(&pointer_with_segment(pointer, "argv"), resolve_string)?,
-            })),
-            Self::RepeatedArgv(repeated) => Ok(ProgramArgItem::RepeatedArgv(RepeatedProgramArgv {
-                when: repeated.when,
-                each: repeated.each,
-                argv: repeated
-                    .argv
-                    .resolve(&pointer_with_segment(pointer, "argv"), resolve_string)?,
-            })),
-            Self::RepeatedArg(repeated) => {
-                let raw = resolve_string(repeated.arg, &pointer_with_segment(pointer, "arg"))?;
-                Ok(ProgramArgItem::RepeatedArg(RepeatedProgramArg {
-                    when: repeated.when,
-                    each: repeated.each,
-                    arg: raw.parse::<InterpolatedString>()?,
-                    join: repeated.join,
-                }))
-            }
-        }
+            RawProgramArgValue::Argv(argv) => ProgramArgValue::Argv(
+                argv.resolve(&pointer_with_segment(pointer, "argv"), resolve_string)?,
+            ),
+        };
+        Ok(ProgramArgItem {
+            when: self.when,
+            each: self.each,
+            value,
+            join: self.join,
+        })
     }
 }
 
 impl From<ProgramArgItem> for RawProgramArgItem {
     fn from(value: ProgramArgItem) -> Self {
-        match value {
-            ProgramArgItem::Arg(arg) => Self::Arg(arg.into()),
-            ProgramArgItem::Group(group) => Self::Group(RawProgramArgGroup {
-                when: group.when,
-                argv: group.argv.into(),
-            }),
-            ProgramArgItem::RepeatedArgv(repeated) => Self::RepeatedArgv(RawRepeatedProgramArgv {
-                when: repeated.when,
-                each: repeated.each,
-                argv: repeated.argv.into(),
-            }),
-            ProgramArgItem::RepeatedArg(repeated) => Self::RepeatedArg(RawRepeatedProgramArg {
-                when: repeated.when,
-                each: repeated.each,
-                arg: repeated.arg.into(),
-                join: repeated.join,
-            }),
+        let raw_value = match value.value {
+            ProgramArgValue::Arg(arg) => RawProgramArgValue::Arg(arg.into()),
+            ProgramArgValue::Argv(argv) => RawProgramArgValue::Argv(argv.into()),
+        };
+        Self {
+            when: value.when,
+            each: value.each,
+            value: raw_value,
+            join: value.join,
         }
     }
 }
@@ -1209,7 +1323,7 @@ impl RawProgramEntrypoint {
             Self::ShellWords(spec) => {
                 let raw = resolve_string(spec, pointer)?;
                 parse_program_arg_list(&raw).map(|args| {
-                    ProgramEntrypoint(args.into_iter().map(ProgramArgItem::Arg).collect())
+                    ProgramEntrypoint(args.into_iter().map(ProgramArgItem::from).collect())
                 })
             }
             Self::Items(items) => items
@@ -1234,46 +1348,23 @@ impl RawProgramEnvValue {
         pointer: &str,
         resolve_string: &mut impl FnMut(InlineStringSpec, &str) -> Result<String, Error>,
     ) -> Result<ProgramEnvValue, Error> {
-        match self {
-            Self::Value(value) => {
-                let raw = resolve_string(value, pointer)?;
-                raw.parse::<InterpolatedString>()
-                    .map(ProgramEnvValue::Value)
-            }
-            Self::Group(group) => {
-                let raw = resolve_string(group.value, &pointer_with_segment(pointer, "value"))?;
-                Ok(ProgramEnvValue::Group(ProgramEnvGroup {
-                    when: group.when,
-                    value: raw.parse::<InterpolatedString>()?,
-                }))
-            }
-            Self::Repeated(repeated) => {
-                let raw = resolve_string(repeated.value, &pointer_with_segment(pointer, "value"))?;
-                Ok(ProgramEnvValue::Repeated(RepeatedProgramEnv {
-                    when: repeated.when,
-                    each: repeated.each,
-                    value: raw.parse::<InterpolatedString>()?,
-                    join: repeated.join,
-                }))
-            }
-        }
+        let raw = resolve_string(self.value, &pointer_with_segment(pointer, "value"))?;
+        Ok(ProgramEnvValue {
+            when: self.when,
+            each: self.each,
+            value: raw.parse::<InterpolatedString>()?,
+            join: self.join,
+        })
     }
 }
 
 impl From<ProgramEnvValue> for RawProgramEnvValue {
     fn from(value: ProgramEnvValue) -> Self {
-        match value {
-            ProgramEnvValue::Value(value) => Self::Value(value.into()),
-            ProgramEnvValue::Group(group) => Self::Group(RawProgramEnvGroup {
-                when: group.when,
-                value: group.value.into(),
-            }),
-            ProgramEnvValue::Repeated(repeated) => Self::Repeated(RawRepeatedProgramEnv {
-                when: repeated.when,
-                each: repeated.each,
-                value: repeated.value.into(),
-                join: repeated.join,
-            }),
+        Self {
+            when: value.when,
+            each: value.each,
+            value: value.value.into(),
+            join: value.join,
         }
     }
 }
@@ -1443,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    fn conditional_program_arg_group_supports_nested_shlex_sugar() {
+    fn conditional_program_arg_item_supports_nested_shlex_sugar() {
         let parsed: ProgramEntrypoint = serde_json::from_str(
             r#"[
               "server",
@@ -1454,11 +1545,13 @@ mod tests {
             ]"#,
         )
         .unwrap();
-        let group = parsed.0[1].group().expect("expected conditional group");
-        assert_eq!(group.when.source(), InterpolationSource::Config);
-        assert_eq!(group.when.query(), "profile");
-        assert_eq!(group.argv.0.len(), 2);
-        assert_eq!(group.argv.0[0].to_string(), "--profile");
-        assert_eq!(group.argv.0[1].to_string(), "${config.profile}");
+        let item = &parsed.0[1];
+        let when = item.when().expect("expected conditional item");
+        let argv = item.argv().expect("expected argv item");
+        assert_eq!(when.source(), InterpolationSource::Config);
+        assert_eq!(when.query(), "profile");
+        assert_eq!(argv.0.len(), 2);
+        assert_eq!(argv.0[0].to_string(), "--profile");
+        assert_eq!(argv.0[1].to_string(), "${config.profile}");
     }
 }

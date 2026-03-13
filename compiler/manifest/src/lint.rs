@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::{
     BindingSource, ComponentDecl, ExportTarget, InterpolatedPart, InterpolatedString,
-    InterpolationSource, Manifest, ManifestSpans, MountSource, Program, ProgramArgItem, SlotName,
+    InterpolationSource, Manifest, ManifestSpans, MountSource, Program, ProgramArgValue, SlotName,
     SlotTarget, parse_slot_query, validate_slot_query_for_slot,
 };
 
@@ -147,13 +147,13 @@ pub enum ManifestLint {
 
     #[error(
         "this `when` condition is unnecessary: slot `{slot}` is required, so it is always bound \
-         and this argv group is always included (in component {component})"
+         and this argv item is always included (in component {component})"
     )]
     #[diagnostic(
         code(manifest::required_slot_when),
         severity(Warning),
         help(
-            "Remove `when` if this argv group should always be included. If it should disappear \
+            "Remove `when` if this argv item should always be included. If it should disappear \
              when the parent does not bind the slot, mark `slots.{slot}` as `optional: true`."
         )
     )]
@@ -366,141 +366,42 @@ fn command_arg_optional_config_lints(
 
     let mut out = Vec::new();
     for (idx, item) in items.iter().enumerate() {
-        match item {
-            ProgramArgItem::Arg(arg) => {
-                for part in &arg.parts {
-                    let InterpolatedPart::Interpolation {
-                        source: kind,
-                        query,
-                    } = part
-                    else {
-                        continue;
-                    };
-                    if *kind != InterpolationSource::Config || !optional_leaf_paths.contains(query)
-                    {
-                        continue;
-                    }
-                    let span =
+        let suppress_query = item
+            .when()
+            .filter(|when| when.source() == InterpolationSource::Config);
+        let base_pointer = match &item.value {
+            ProgramArgValue::Arg(_) => format!("{field_pointer}/{idx}/arg"),
+            ProgramArgValue::Argv(_) => format!("{field_pointer}/{idx}/argv"),
+        };
+        item.visit_values(|arg| {
+            for part in &arg.parts {
+                let InterpolatedPart::Interpolation {
+                    source: kind,
+                    query,
+                } = part
+                else {
+                    continue;
+                };
+                if *kind != InterpolationSource::Config
+                    || !optional_leaf_paths.contains(query)
+                    || suppress_query.is_some_and(|when| query == when.query())
+                {
+                    continue;
+                }
+                let span = crate::span_for_json_pointer(source, root, &base_pointer)
+                    .or_else(|| {
                         crate::span_for_json_pointer(source, root, &location_of(idx).pointer())
-                            .or_else(|| crate::span_for_json_pointer(source, root, field_pointer))
-                            .unwrap_or(fallback);
-                    out.push(ManifestLint::OptionalCommandConfig {
-                        path: query.clone(),
-                        component: component.to_string(),
-                        src: src.clone(),
-                        span,
-                    });
-                }
+                    })
+                    .or_else(|| crate::span_for_json_pointer(source, root, field_pointer))
+                    .unwrap_or(fallback);
+                out.push(ManifestLint::OptionalCommandConfig {
+                    path: query.clone(),
+                    component: component.to_string(),
+                    src: src.clone(),
+                    span,
+                });
             }
-            ProgramArgItem::Group(group) => {
-                for (group_idx, arg) in group.argv.0.iter().enumerate() {
-                    for part in &arg.parts {
-                        let InterpolatedPart::Interpolation {
-                            source: kind,
-                            query,
-                        } = part
-                        else {
-                            continue;
-                        };
-                        if *kind != InterpolationSource::Config
-                            || !optional_leaf_paths.contains(query)
-                            || (group.when.source() == InterpolationSource::Config
-                                && query == group.when.query())
-                        {
-                            continue;
-                        }
-                        let pointer = format!("{}/{idx}/argv/{group_idx}", field_pointer);
-                        let span = crate::span_for_json_pointer(source, root, &pointer)
-                            .or_else(|| {
-                                crate::span_for_json_pointer(
-                                    source,
-                                    root,
-                                    &location_of(idx).pointer(),
-                                )
-                            })
-                            .or_else(|| crate::span_for_json_pointer(source, root, field_pointer))
-                            .unwrap_or(fallback);
-                        out.push(ManifestLint::OptionalCommandConfig {
-                            path: query.clone(),
-                            component: component.to_string(),
-                            src: src.clone(),
-                            span,
-                        });
-                    }
-                }
-            }
-            ProgramArgItem::RepeatedArgv(repeated) => {
-                for (group_idx, arg) in repeated.argv.0.iter().enumerate() {
-                    for part in &arg.parts {
-                        let InterpolatedPart::Interpolation {
-                            source: kind,
-                            query,
-                        } = part
-                        else {
-                            continue;
-                        };
-                        if *kind != InterpolationSource::Config
-                            || !optional_leaf_paths.contains(query)
-                            || repeated.when.as_ref().is_some_and(|when| {
-                                when.source() == InterpolationSource::Config
-                                    && query == when.query()
-                            })
-                        {
-                            continue;
-                        }
-                        let pointer = format!("{}/{idx}/argv/{group_idx}", field_pointer);
-                        let span = crate::span_for_json_pointer(source, root, &pointer)
-                            .or_else(|| {
-                                crate::span_for_json_pointer(
-                                    source,
-                                    root,
-                                    &location_of(idx).pointer(),
-                                )
-                            })
-                            .or_else(|| crate::span_for_json_pointer(source, root, field_pointer))
-                            .unwrap_or(fallback);
-                        out.push(ManifestLint::OptionalCommandConfig {
-                            path: query.clone(),
-                            component: component.to_string(),
-                            src: src.clone(),
-                            span,
-                        });
-                    }
-                }
-            }
-            ProgramArgItem::RepeatedArg(repeated) => {
-                for part in &repeated.arg.parts {
-                    let InterpolatedPart::Interpolation {
-                        source: kind,
-                        query,
-                    } = part
-                    else {
-                        continue;
-                    };
-                    if *kind != InterpolationSource::Config
-                        || !optional_leaf_paths.contains(query)
-                        || repeated.when.as_ref().is_some_and(|when| {
-                            when.source() == InterpolationSource::Config && query == when.query()
-                        })
-                    {
-                        continue;
-                    }
-                    let pointer = format!("{field_pointer}/{idx}/arg");
-                    let span = crate::span_for_json_pointer(source, root, &pointer)
-                        .or_else(|| {
-                            crate::span_for_json_pointer(source, root, &location_of(idx).pointer())
-                        })
-                        .or_else(|| crate::span_for_json_pointer(source, root, field_pointer))
-                        .unwrap_or(fallback);
-                    out.push(ManifestLint::OptionalCommandConfig {
-                        path: query.clone(),
-                        component: component.to_string(),
-                        src: src.clone(),
-                        span,
-                    });
-                }
-            }
-        }
+        });
     }
     out
 }
@@ -611,7 +512,7 @@ fn program_env_optional_config_lints(
                 continue;
             }
 
-            let pointer = if value.group().is_some() || value.repeated().is_some() {
+            let pointer = if value.when().is_some() || value.each().is_some() {
                 PointerBuf::from_tokens(["program", "env", key, "value"]).to_string()
             } else {
                 PointerBuf::from_tokens(["program", "env", key]).to_string()
@@ -736,9 +637,11 @@ fn collect_config_uses(manifest: &Manifest) -> ConfigUses {
     let mut uses = ConfigUses::default();
 
     if let Some(program) = manifest.program() {
-        for group in program.command().groups() {
-            if group.when.source() == InterpolationSource::Config {
-                uses.add_query(group.when.query());
+        for item in &program.command().0 {
+            if let Some(when) = item.when()
+                && when.source() == InterpolationSource::Config
+            {
+                uses.add_query(when.query());
             }
         }
         for value in program.env().values() {
@@ -753,9 +656,24 @@ fn collect_config_uses(manifest: &Manifest) -> ConfigUses {
             false
         });
         for mount in program.mounts() {
-            match &mount.source {
-                MountSource::Config(path) | MountSource::Secret(path) => uses.add_query(path),
-                MountSource::Resource(_) | MountSource::Slot(_) | MountSource::Framework(_) => {}
+            if let Some(when) = &mount.when
+                && when.source() == InterpolationSource::Config
+            {
+                uses.add_query(when.query());
+            }
+            if let Some(each) = &mount.each
+                && each.source() == InterpolationSource::Config
+            {
+                uses.add_query(each.query());
+            }
+            if let Some(source) = mount.source.as_literal()
+                && let Ok(parsed) = source.parse::<MountSource>()
+            {
+                match parsed {
+                    MountSource::Config(path) | MountSource::Secret(path) => uses.add_query(&path),
+                    MountSource::Resource(_) | MountSource::Slot(_) | MountSource::Framework(_) => {
+                    }
+                }
             }
         }
     }
@@ -829,9 +747,18 @@ pub fn lint_manifest(
 
     let mut program_used_slots = BTreeSet::new();
     if let Some(program) = manifest.program() {
-        for group in program.command().groups() {
-            if group.when.source() == InterpolationSource::Slots {
-                add_slot_condition_use(manifest, &mut program_used_slots, group.when.query());
+        for item in &program.command().0 {
+            if let Some(when) = item.when()
+                && when.source() == InterpolationSource::Slots
+            {
+                add_slot_condition_use(manifest, &mut program_used_slots, when.query());
+            }
+            if let Some(each) = item.each()
+                && each.source() == InterpolationSource::Slots
+                && let Some(slot) = each.slot()
+                && let Some((slot_key, _)) = manifest.slots().get_key_value(slot)
+            {
+                program_used_slots.insert(slot_key);
             }
         }
         for value in program.env().values() {
@@ -840,12 +767,32 @@ pub fn lint_manifest(
             {
                 add_slot_condition_use(manifest, &mut program_used_slots, when.query());
             }
+            if let Some(each) = value.each()
+                && each.source() == InterpolationSource::Slots
+                && let Some(slot) = each.slot()
+                && let Some((slot_key, _)) = manifest.slots().get_key_value(slot)
+            {
+                program_used_slots.insert(slot_key);
+            }
         }
         let _ = visit_program_interpolated(program, |value| {
             add_program_slot_uses(manifest, &mut program_used_slots, value)
         });
         for mount in program.mounts() {
-            if let MountSource::Slot(slot) = &mount.source
+            if let Some(when) = &mount.when
+                && when.source() == InterpolationSource::Slots
+            {
+                add_slot_condition_use(manifest, &mut program_used_slots, when.query());
+            }
+            if let Some(each) = &mount.each
+                && each.source() == InterpolationSource::Slots
+                && let Some(slot) = each.slot()
+                && let Some((slot_key, _)) = manifest.slots().get_key_value(slot)
+            {
+                program_used_slots.insert(slot_key);
+            }
+            if let Some(source) = mount.source.as_literal()
+                && let Ok(MountSource::Slot(slot)) = source.parse::<MountSource>()
                 && let Some((slot_key, _)) = manifest.slots().get_key_value(slot.as_str())
             {
                 program_used_slots.insert(slot_key);

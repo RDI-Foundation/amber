@@ -10,7 +10,7 @@ use amber_config as rc;
 use amber_manifest::{
     BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, CapabilityKind, ChildName,
     ExportName, ExportTarget, InterpolatedPart, InterpolatedString, InterpolationSource, Manifest,
-    ManifestDigest, MountSource, Program, framework_capability, span_for_json_pointer,
+    ManifestDigest, Program, framework_capability, span_for_json_pointer,
 };
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, ProvideRef,
@@ -24,8 +24,11 @@ use thiserror::Error;
 
 use super::frontend::{ResolvedNode, ResolvedTree};
 use crate::{
-    ComponentProvenance, DigestStore, Provenance, config_resolution::render_static_config_string,
-    config_templates, store::display_url,
+    ComponentProvenance, DigestStore, Provenance,
+    config_resolution::render_static_config_string,
+    config_templates,
+    program_semantics::{StaticMount, StaticMountKind, StaticMountPlan, analyze_mount_semantics},
+    store::display_url,
 };
 
 #[allow(unused_assignments)]
@@ -448,14 +451,10 @@ fn slot_decl_related_span(
     })
 }
 
-fn storage_mount_index(manifest: &Manifest, slot: &str) -> Option<usize> {
-    let program = manifest.program()?;
-    program.mounts().iter().position(|mount| {
-        matches!(
-            &mount.source,
-            MountSource::Slot(mount_slot) if mount_slot.as_str() == slot
-        )
-    })
+fn has_storage_mount(static_mounts: &[StaticMount], slot: &str) -> bool {
+    static_mounts
+        .iter()
+        .any(|mount| matches!(&mount.kind, StaticMountKind::Slot(mount_slot) if mount_slot == slot))
 }
 
 fn mount_source_site(
@@ -708,6 +707,17 @@ pub enum Error {
         related: Vec<RelatedSpan>,
     },
 
+    #[error("unsupported program mount on {component_path}: {message}")]
+    #[diagnostic(code(linker::unsupported_program_mount))]
+    UnsupportedProgramMount {
+        component_path: String,
+        message: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label(primary, "mount declared here")]
+        span: SourceSpan,
+    },
+
     #[error("slot `{slot}` on {component_path} is not bound (non-optional slots must be filled)")]
     #[diagnostic(code(linker::unbound_slot))]
     UnboundSlot {
@@ -894,11 +904,24 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         store,
         &mut errors,
     );
+    let mount_scenario = Scenario {
+        root,
+        components: components.clone(),
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    };
+    let (static_mounts, mount_errors) = analyze_mount_semantics(&mount_scenario);
+    record_mount_semantics_errors(&mount_errors, &provenance, store, &components, &mut errors);
 
     let root_manifest = manifests[root.0]
         .as_ref()
         .expect("root manifest should exist");
-    let root_program_slots = collect_program_slot_uses(root_manifest);
+    let root_program_slots = collect_program_slot_uses(
+        components[root.0]
+            .as_ref()
+            .expect("root component should exist"),
+        static_mounts.component_mounts(root),
+    );
 
     let mut resolver = SlotResolver::new(
         &components,
@@ -916,6 +939,7 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         &binding_edges,
         &external_root_slots,
         root,
+        &static_mounts,
         &provenance,
         store,
         &mut errors,
@@ -925,6 +949,7 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         &manifests,
         &bindings,
         &mut resolver,
+        &static_mounts,
         &provenance,
         store,
         &mut errors,
@@ -1320,26 +1345,6 @@ fn validate_config_tree(
                         }
                     }
                 });
-                let repeated_argv = match item {
-                    amber_manifest::ProgramArgItem::Group(group) => Some(&group.argv.0),
-                    amber_manifest::ProgramArgItem::RepeatedArgv(repeated) => {
-                        Some(&repeated.argv.0)
-                    }
-                    amber_manifest::ProgramArgItem::Arg(_)
-                    | amber_manifest::ProgramArgItem::RepeatedArg(_) => None,
-                };
-                if let Some(group) = repeated_argv {
-                    for (group_idx, arg) in group.iter().enumerate() {
-                        for part in &arg.parts {
-                            let InterpolatedPart::Interpolation { source, query } = part else {
-                                continue;
-                            };
-                            if *source == InterpolationSource::Config {
-                                visit(format!("[{arg_idx}].argv[{group_idx}]"), query);
-                            }
-                        }
-                    }
-                }
             }
         }
 
@@ -1353,7 +1358,7 @@ fn validate_config_tree(
                 {
                     visit(format!("{key}.when"), when.query());
                 }
-                let location_suffix = if value.group().is_some() {
+                let location_suffix = if value.when().is_some() || value.each().is_some() {
                     format!("{key}.value")
                 } else {
                     key.to_string()
@@ -2827,23 +2832,26 @@ fn format_cycle(parts: &[String]) -> String {
     out.join(" -> ")
 }
 
-fn collect_program_slot_uses(manifest: &Manifest) -> HashSet<String> {
+fn collect_program_slot_uses(
+    component: &Component,
+    static_mounts: &[StaticMount],
+) -> HashSet<String> {
     let mut uses = HashSet::new();
-    let Some(program) = manifest.program() else {
+    let Some(program) = component.program.as_ref() else {
         return uses;
     };
 
     if program.visit_slot_uses(|slot| {
-        if manifest.slots().contains_key(slot) {
+        if component.slots.contains_key(slot) {
             uses.insert(slot.to_string());
         }
     }) {
-        uses.extend(manifest.slots().keys().map(|s| s.to_string()));
+        uses.extend(component.slots.keys().cloned());
     }
 
-    for mount in program.mounts() {
-        if let MountSource::Slot(slot) = &mount.source
-            && manifest.slots().contains_key(slot.as_str())
+    for mount in static_mounts {
+        if let StaticMountKind::Slot(slot) = &mount.kind
+            && component.slots.contains_key(slot.as_str())
         {
             uses.insert(slot.clone());
         }
@@ -3021,6 +3029,7 @@ fn validate_all_slots_bound(
     bindings: &[BindingEdge],
     external_root_slots: &HashSet<String>,
     root: ComponentId,
+    static_mounts: &StaticMountPlan,
     provenance: &Provenance,
     store: &DigestStore,
     errors: &mut Vec<Error>,
@@ -3037,7 +3046,7 @@ fn validate_all_slots_bound(
                 continue;
             }
             if slot_decl.decl.kind == CapabilityKind::Storage
-                && storage_mount_index(m, slot_name.as_str()).is_some()
+                && has_storage_mount(static_mounts.component_mounts(id), slot_name.as_str())
             {
                 continue;
             }
@@ -3078,6 +3087,7 @@ fn validate_storage_mounts(
     manifests: &[Option<Arc<Manifest>>],
     binding_specs: &[BindingSpec],
     resolver: &mut SlotResolver<'_>,
+    static_mounts: &StaticMountPlan,
     provenance: &Provenance,
     store: &DigestStore,
     errors: &mut Vec<Error>,
@@ -3095,12 +3105,10 @@ fn validate_storage_mounts(
 
     for id in (0..components.len()).map(ComponentId) {
         let manifest = manifests[id.0].as_ref().expect("manifest should exist");
-        let Some(program) = manifest.program() else {
-            continue;
-        };
-        for (mount_index, mount) in program.mounts().iter().enumerate() {
-            match &mount.source {
-                MountSource::Slot(slot_name) => {
+        for mount in static_mounts.component_mounts(id) {
+            let mount_index = mount.mount_index;
+            match &mount.kind {
+                crate::program_semantics::StaticMountKind::Slot(slot_name) => {
                     let Some(slot_decl) = manifest.slots().get(slot_name.as_str()) else {
                         continue;
                     };
@@ -3224,7 +3232,7 @@ fn validate_storage_mounts(
                             site,
                         });
                 }
-                MountSource::Resource(resource_name) => {
+                crate::program_semantics::StaticMountKind::Resource(resource_name) => {
                     sinks_by_resource
                         .entry(ResourceRef {
                             component: id,
@@ -3241,7 +3249,7 @@ fn validate_storage_mounts(
                             },
                         });
                 }
-                _ => {}
+                crate::program_semantics::StaticMountKind::Framework(_) => {}
             }
         }
     }
@@ -3283,13 +3291,43 @@ fn validate_storage_mounts(
     }
 }
 
+fn record_mount_semantics_errors(
+    mount_errors: &[crate::program_semantics::MountSemanticsError],
+    provenance: &Provenance,
+    store: &DigestStore,
+    components: &[Option<Component>],
+    errors: &mut Vec<Error>,
+) {
+    for mount_error in mount_errors {
+        let component_path = component_path_for(components, mount_error.component);
+        let (src, span) = mount_source_site(
+            provenance,
+            store,
+            mount_error.component,
+            mount_error.mount_index,
+        )
+        .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+        errors.push(Error::UnsupportedProgramMount {
+            component_path,
+            message: mount_error.message.clone(),
+            src,
+            span,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{
+        collections::{BTreeMap, HashSet},
+        sync::Arc,
+    };
 
-    use amber_manifest::Manifest;
+    use amber_manifest::{Manifest, ManifestDigest};
+    use amber_scenario::{Component, ComponentId, Moniker};
 
     use super::collect_program_slot_uses;
+    use crate::program_semantics::{StaticMount, StaticMountKind};
 
     #[test]
     fn collect_program_slot_uses_includes_slot_conditions() {
@@ -3310,10 +3348,79 @@ mod tests {
         "#
         .parse()
         .expect("manifest");
+        let component = Component {
+            id: ComponentId(0),
+            parent: None,
+            moniker: Moniker::from(Arc::<str>::from("/")),
+            digest: ManifestDigest::new([0; 32]),
+            config: None,
+            config_schema: None,
+            program: manifest.program().cloned(),
+            slots: manifest
+                .slots()
+                .iter()
+                .map(|(name, decl)| (name.to_string(), decl.clone()))
+                .collect(),
+            provides: BTreeMap::new(),
+            resources: BTreeMap::new(),
+            metadata: None,
+            children: Vec::new(),
+        };
 
         assert_eq!(
-            collect_program_slot_uses(&manifest),
+            collect_program_slot_uses(&component, &[]),
             HashSet::from(["api".to_string()])
+        );
+    }
+
+    #[test]
+    fn collect_program_slot_uses_includes_static_mount_slots() {
+        let manifest: Manifest = r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                image: "app",
+                entrypoint: ["app"],
+                mounts: [
+                  { path: "/var/lib/app", from: "${config.mount_source}" },
+                ],
+              },
+              slots: {
+                state: { kind: "storage" },
+              },
+            }
+        "#
+        .parse()
+        .expect("manifest");
+        let component = Component {
+            id: ComponentId(0),
+            parent: None,
+            moniker: Moniker::from(Arc::<str>::from("/")),
+            digest: ManifestDigest::new([0; 32]),
+            config: None,
+            config_schema: None,
+            program: manifest.program().cloned(),
+            slots: manifest
+                .slots()
+                .iter()
+                .map(|(name, decl)| (name.to_string(), decl.clone()))
+                .collect(),
+            provides: BTreeMap::new(),
+            resources: BTreeMap::new(),
+            metadata: None,
+            children: Vec::new(),
+        };
+
+        assert_eq!(
+            collect_program_slot_uses(
+                &component,
+                &[StaticMount {
+                    mount_index: 0,
+                    path: "/var/lib/app".to_string(),
+                    kind: StaticMountKind::Slot("state".to_string()),
+                }],
+            ),
+            HashSet::from(["state".to_string()])
         );
     }
 }
