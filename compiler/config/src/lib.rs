@@ -345,10 +345,8 @@ mod tests {
             "additionalProperties": false,
         });
 
-        let env = std::collections::BTreeMap::from([(
-            "AMBER_CONFIG_KEY".to_string(),
-            "bar".to_string(),
-        )]);
+        let env =
+            std::collections::BTreeMap::from([("AMBER_CONFIG_KEY".to_string(), "bar".to_string())]);
 
         let config = build_root_config(&schema, &env).expect("config should parse");
         assert_eq!(get_by_path(&config, "key").unwrap(), "bar");
@@ -367,7 +365,10 @@ mod tests {
 
         let env = std::collections::BTreeMap::new();
         let err = build_root_config(&schema, &env).expect_err("should fail for missing required");
-        assert!(err.to_string().contains("required"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("required"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
