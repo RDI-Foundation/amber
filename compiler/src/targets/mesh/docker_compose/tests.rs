@@ -9,8 +9,8 @@ use std::{
 };
 
 use amber_manifest::{
-    CapabilityKind, FrameworkCapabilityName, Manifest, ManifestDigest, ManifestRef, ProvideDecl,
-    SlotDecl,
+    CapabilityKind, FrameworkCapabilityName, Manifest, ManifestDigest, ManifestRef,
+    Program as ManifestProgram, ProvideDecl, SlotDecl,
 };
 use amber_mesh::{InboundTarget, MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTarget};
 use amber_scenario::{
@@ -23,8 +23,9 @@ use url::Url;
 
 use super::DockerComposeReporter;
 use crate::{
-    reporter::Reporter as _, storage_plan::StorageIdentity,
-    targets::mesh::internal_images::resolve_internal_images,
+    linker::program_lowering::lower_program,
+    reporter::Reporter as _,
+    targets::{mesh::internal_images::resolve_internal_images, storage::StorageIdentity},
 };
 
 fn digest(byte: u8) -> ManifestDigest {
@@ -63,30 +64,6 @@ fn compile_output_with_manifest_overrides(
             "manifest_version".to_string(),
             Value::String("0.1.0".to_string()),
         );
-        if let Some(program) = &component.program {
-            manifest.insert(
-                "program".to_string(),
-                serde_json::to_value(program).unwrap(),
-            );
-        }
-        if !component.slots.is_empty() {
-            manifest.insert(
-                "slots".to_string(),
-                serde_json::to_value(&component.slots).unwrap(),
-            );
-        }
-        if !component.provides.is_empty() {
-            manifest.insert(
-                "provides".to_string(),
-                serde_json::to_value(&component.provides).unwrap(),
-            );
-        }
-        if !component.resources.is_empty() {
-            manifest.insert(
-                "resources".to_string(),
-                serde_json::to_value(&component.resources).unwrap(),
-            );
-        }
         if let Some(extra) = overrides.get(&component.id) {
             for (key, value) in extra {
                 manifest.insert(key.clone(), value.clone());
@@ -126,6 +103,11 @@ fn compile_output_with_manifest_overrides(
 
 fn compile_output(scenario: Scenario) -> crate::CompileOutput {
     compile_output_with_manifest_overrides(scenario, BTreeMap::new())
+}
+
+fn lower_test_program(id: usize, value: Value) -> amber_scenario::Program {
+    let program: ManifestProgram = serde_json::from_value(value).expect("manifest program");
+    lower_program(ComponentId(id), &program, None).expect("program should lower")
 }
 
 fn compile_output_with_docker_feature(scenario: Scenario) -> crate::CompileOutput {
@@ -378,8 +360,9 @@ fn storage_scenario(version: &str, initial_state: &str) -> Scenario {
         digest: digest(0),
         config: None,
         config_schema: None,
-        program: Some(
-            serde_json::from_value(json!({
+        program: Some(lower_test_program(
+            0,
+            json!({
                 "image": "busybox:1.36.1",
                 "entrypoint": [
                     "sh",
@@ -397,9 +380,8 @@ fn storage_scenario(version: &str, initial_state: &str) -> Scenario {
                         { "name": "http", "port": 8080, "protocol": "http" }
                     ]
                 }
-            }))
-            .unwrap(),
-        ),
+            }),
+        )),
         slots: BTreeMap::new(),
         provides: BTreeMap::from([("http".to_string(), provide_http)]),
         resources: BTreeMap::from([("state".to_string(), storage_resource_decl(None))]),
@@ -417,12 +399,14 @@ fn storage_scenario(version: &str, initial_state: &str) -> Scenario {
 
 #[test]
 fn compose_artifact_emits_env_sample_and_readme() {
-    let program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["sh", "-lc", "sleep infinity"],
-        "env": {}
-    }))
-    .unwrap();
+    let program = lower_test_program(
+        0,
+        json!({
+            "image": "alpine:3.20",
+            "entrypoint": ["sh", "-lc", "sleep infinity"],
+            "env": {}
+        }),
+    );
 
     let root = Component {
         id: ComponentId(0),
@@ -466,16 +450,16 @@ fn compose_emits_storage_volume_mounts() {
         digest: digest(0),
         config: None,
         config_schema: None,
-        program: Some(
-            serde_json::from_value(json!({
+        program: Some(lower_test_program(
+            0,
+            json!({
                 "image": "busybox:1.36.1",
                 "entrypoint": ["sh", "-lc", "sleep infinity"],
                 "mounts": [
                     { "path": "/var/lib/app", "from": "resources.state" }
                 ]
-            }))
-            .unwrap(),
-        ),
+            }),
+        )),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::from([("state".to_string(), storage_resource_decl(None))]),
@@ -535,12 +519,14 @@ fn compose_storage_volume_names_include_identity_hash() {
 
 #[test]
 fn compose_emits_otelcol_agent_and_wires_router_otel_env() {
-    let program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["sh", "-lc", "sleep infinity"],
-        "env": {}
-    }))
-    .unwrap();
+    let program = lower_test_program(
+        0,
+        json!({
+            "image": "alpine:3.20",
+            "entrypoint": ["sh", "-lc", "sleep infinity"],
+            "env": {}
+        }),
+    );
 
     let root = Component {
         id: ComponentId(0),
@@ -752,14 +738,16 @@ fn control_socket_volume_name_uses_compose_project() {
 
 #[test]
 fn docker_compose_emits_gateway_for_framework_docker_binding() {
-    let program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["sh", "-lc", "sleep infinity"],
-        "env": {
-            "DOCKER_HOST": "${slots.docker.url}",
-        },
-    }))
-    .unwrap();
+    let program = lower_test_program(
+        0,
+        json!({
+            "image": "alpine:3.20",
+            "entrypoint": ["sh", "-lc", "sleep infinity"],
+            "env": {
+                "DOCKER_HOST": "${slots.docker.url}",
+            },
+        }),
+    );
     let slot_docker: SlotDecl = serde_json::from_value(json!({ "kind": "docker" })).unwrap();
 
     let root = Component {
@@ -841,14 +829,16 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
 
 #[test]
 fn docker_compose_emits_framework_docker_mount_proxy_wiring() {
-    let program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["sh", "-lc", "sleep infinity"],
-        "mounts": [
-            { "path": "/var/run/docker.sock", "from": "framework.docker" },
-        ],
-    }))
-    .unwrap();
+    let program = lower_test_program(
+        0,
+        json!({
+            "image": "alpine:3.20",
+            "entrypoint": ["sh", "-lc", "sleep infinity"],
+            "mounts": [
+                { "path": "/var/run/docker.sock", "from": "framework.docker" },
+            ],
+        }),
+    );
 
     let root = Component {
         id: ComponentId(0),
@@ -928,26 +918,30 @@ fn docker_compose_emits_framework_docker_mount_proxy_wiring() {
 
 #[test]
 fn compose_emits_sidecars_and_programs_and_slot_urls() {
-    let server_program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["server"],
-        "env": {},
-        "network": {
-            "endpoints": [
-                { "name": "api", "port": 8080, "protocol": "http" }
-            ]
-        }
-    }))
-    .unwrap();
+    let server_program = lower_test_program(
+        1,
+        json!({
+            "image": "alpine:3.20",
+            "entrypoint": ["server"],
+            "env": {},
+            "network": {
+                "endpoints": [
+                    { "name": "api", "port": 8080, "protocol": "http" }
+                ]
+            }
+        }),
+    );
 
-    let client_program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["client"],
-        "env": {
-            "URL": "${slots.api.url}"
-        }
-    }))
-    .unwrap();
+    let client_program = lower_test_program(
+        2,
+        json!({
+            "image": "alpine:3.20",
+            "entrypoint": ["client"],
+            "env": {
+                "URL": "${slots.api.url}"
+            }
+        }),
+    );
 
     let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
     let provide_http: ProvideDecl =
@@ -1093,36 +1087,42 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
 
 #[test]
 fn compose_emits_minimal_peer_keys() {
-    let server1_program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["server1"],
-        "network": {
-            "endpoints": [
-                { "name": "api1", "port": 8080, "protocol": "http" }
-            ]
-        }
-    }))
-    .unwrap();
+    let server1_program = lower_test_program(
+        1,
+        json!({
+            "image": "alpine:3.20",
+            "entrypoint": ["server1"],
+            "network": {
+                "endpoints": [
+                    { "name": "api1", "port": 8080, "protocol": "http" }
+                ]
+            }
+        }),
+    );
 
-    let server2_program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["server2"],
-        "network": {
-            "endpoints": [
-                { "name": "api2", "port": 8081, "protocol": "http" }
-            ]
-        }
-    }))
-    .unwrap();
+    let server2_program = lower_test_program(
+        2,
+        json!({
+            "image": "alpine:3.20",
+            "entrypoint": ["server2"],
+            "network": {
+                "endpoints": [
+                    { "name": "api2", "port": 8081, "protocol": "http" }
+                ]
+            }
+        }),
+    );
 
-    let client_program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["client"],
-        "env": {
-            "URL": "${slots.api1.url}"
-        }
-    }))
-    .unwrap();
+    let client_program = lower_test_program(
+        3,
+        json!({
+            "image": "alpine:3.20",
+            "entrypoint": ["client"],
+            "env": {
+                "URL": "${slots.api1.url}"
+            }
+        }),
+    );
 
     let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
     let provide_api1: ProvideDecl =
@@ -1252,16 +1252,16 @@ fn compose_emits_named_volumes_for_storage_mounts() {
         digest: digest(0),
         config: None,
         config_schema: None,
-        program: Some(
-            serde_json::from_value(json!({
+        program: Some(lower_test_program(
+            0,
+            json!({
                 "image": "busybox:1.36.1",
                 "entrypoint": ["sh", "-lc", "sleep 3600"],
                 "mounts": [
                     { "path": "/var/lib/app", "from": "resources.state" }
                 ]
-            }))
-            .unwrap(),
-        ),
+            }),
+        )),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::from([("state".to_string(), storage_resource_decl(None))]),
@@ -1304,11 +1304,13 @@ fn compose_emits_named_volumes_for_storage_mounts() {
 
 #[test]
 fn compose_escapes_entrypoint_dollars() {
-    let program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["sh", "-lc", "echo $API_URL"]
-    }))
-    .unwrap();
+    let program = lower_test_program(
+        0,
+        json!({
+            "image": "alpine:3.20",
+            "entrypoint": ["sh", "-lc", "echo $API_URL"]
+        }),
+    );
 
     let root = Component {
         id: ComponentId(0),
@@ -1350,17 +1352,19 @@ fn compose_escapes_entrypoint_dollars() {
 
 #[test]
 fn compose_emits_export_metadata_and_labels() {
-    let server_program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["server"],
-        "env": {},
-        "network": {
-            "endpoints": [
-                { "name": "api", "port": 8080, "protocol": "http" }
-            ]
-        }
-    }))
-    .unwrap();
+    let server_program = lower_test_program(
+        1,
+        json!({
+            "image": "alpine:3.20",
+            "entrypoint": ["server"],
+            "env": {},
+            "network": {
+                "endpoints": [
+                    { "name": "api", "port": 8080, "protocol": "http" }
+                ]
+            }
+        }),
+    );
 
     let provide_http: ProvideDecl =
         serde_json::from_value(json!({ "kind": "http", "endpoint": "api" })).unwrap();
@@ -1491,14 +1495,16 @@ fn compose_emits_export_metadata_and_labels() {
 
 #[test]
 fn compose_routes_external_slots_through_router() {
-    let client_program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["client"],
-        "env": {
-            "API_URL": "${slots.api.url}"
-        }
-    }))
-    .unwrap();
+    let client_program = lower_test_program(
+        1,
+        json!({
+            "image": "alpine:3.20",
+            "entrypoint": ["client"],
+            "env": {
+                "API_URL": "${slots.api.url}"
+            }
+        }),
+    );
 
     let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
 
@@ -1693,14 +1699,16 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
     ensure_image_platform("busybox:1.36.1", &platform);
     ensure_image_platform("alpine:3.20", &platform);
 
-    let client_program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["sh", "-lc", "sleep infinity"],
-        "env": {
-            "API_URL": "${slots.api.url}"
-        }
-    }))
-    .unwrap();
+    let client_program = lower_test_program(
+        1,
+        json!({
+            "image": "alpine:3.20",
+            "entrypoint": ["sh", "-lc", "sleep infinity"],
+            "env": {
+                "API_URL": "${slots.api.url}"
+            }
+        }),
+    );
 
     let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
 
@@ -1928,34 +1936,40 @@ touch /tmp/c-send-failed
 sleep infinity
 "#;
 
-    let agent_a_program = serde_json::from_value(json!({
-        "image": "busybox:1.36.1",
-        "entrypoint": ["sh", "-lc", agent_a_entrypoint],
-        "network": {
-            "endpoints": [{ "name": "agent", "port": 8080, "protocol": "http" }]
-        }
-    }))
-    .unwrap();
-    let agent_b_program = serde_json::from_value(json!({
-        "image": "busybox:1.36.1",
-        "entrypoint": ["sh", "-lc", agent_b_entrypoint],
-        "env": {
-            "A_URL": "${slots.agent_a.url}"
-        },
-        "network": {
-            "endpoints": [{ "name": "agent", "port": 8080, "protocol": "http" }]
-        }
-    }))
-    .unwrap();
-    let client_c_program = serde_json::from_value(json!({
-        "image": "busybox:1.36.1",
-        "entrypoint": ["sh", "-lc", client_c_entrypoint],
-        "env": {
-            "A_URL": "${slots.z_agent_a.url}",
-            "B_URL": "${slots.agent_b.url}"
-        }
-    }))
-    .unwrap();
+    let agent_a_program = lower_test_program(
+        1,
+        json!({
+            "image": "busybox:1.36.1",
+            "entrypoint": ["sh", "-lc", agent_a_entrypoint],
+            "network": {
+                "endpoints": [{ "name": "agent", "port": 8080, "protocol": "http" }]
+            }
+        }),
+    );
+    let agent_b_program = lower_test_program(
+        2,
+        json!({
+            "image": "busybox:1.36.1",
+            "entrypoint": ["sh", "-lc", agent_b_entrypoint],
+            "env": {
+                "A_URL": "${slots.agent_a.url}"
+            },
+            "network": {
+                "endpoints": [{ "name": "agent", "port": 8080, "protocol": "http" }]
+            }
+        }),
+    );
+    let client_c_program = lower_test_program(
+        3,
+        json!({
+            "image": "busybox:1.36.1",
+            "entrypoint": ["sh", "-lc", client_c_entrypoint],
+            "env": {
+                "A_URL": "${slots.z_agent_a.url}",
+                "B_URL": "${slots.agent_b.url}"
+            }
+        }),
+    );
 
     let slot_a2a: SlotDecl = serde_json::from_value(json!({ "kind": "a2a" })).unwrap();
     let provide_a2a: ProvideDecl =
@@ -2213,25 +2227,29 @@ fn docker_smoke_sidecar_restart_rejoins_mesh() {
     ensure_image_platform("busybox:1.36.1", &platform);
     ensure_image_platform("alpine:3.20", &platform);
 
-    let server_program = serde_json::from_value(json!({
-        "image": "busybox:1.36.1",
-        "entrypoint": ["sh", "-lc", "mkdir -p /www && echo rejoin-ok > /www/index.html && httpd -f -p 8080 -h /www"],
-        "network": {
-            "endpoints": [
-                { "name": "api", "port": 8080, "protocol": "http" }
-            ]
-        }
-    }))
-    .unwrap();
+    let server_program = lower_test_program(
+        1,
+        json!({
+            "image": "busybox:1.36.1",
+            "entrypoint": ["sh", "-lc", "mkdir -p /www && echo rejoin-ok > /www/index.html && httpd -f -p 8080 -h /www"],
+            "network": {
+                "endpoints": [
+                    { "name": "api", "port": 8080, "protocol": "http" }
+                ]
+            }
+        }),
+    );
 
-    let client_program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["sh", "-lc", "sleep infinity"],
-        "env": {
-            "URL": "${slots.api.url}"
-        }
-    }))
-    .unwrap();
+    let client_program = lower_test_program(
+        2,
+        json!({
+            "image": "alpine:3.20",
+            "entrypoint": ["sh", "-lc", "sleep infinity"],
+            "env": {
+                "URL": "${slots.api.url}"
+            }
+        }),
+    );
 
     let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
     let provide_http: ProvideDecl =
@@ -2397,27 +2415,31 @@ fn docker_smoke_sidecar_restart_rejoins_mesh() {
 
 #[test]
 fn docker_compose_allows_shared_port_with_different_endpoints() {
-    let server_program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["server"],
-        "network": {
-            "endpoints": [
-                { "name": "a", "port": 80, "protocol": "http" },
-                { "name": "b", "port": 80, "protocol": "http" }
-            ]
-        }
-    }))
-    .unwrap();
+    let server_program = lower_test_program(
+        1,
+        json!({
+            "image": "alpine:3.20",
+            "entrypoint": ["server"],
+            "network": {
+                "endpoints": [
+                    { "name": "a", "port": 80, "protocol": "http" },
+                    { "name": "b", "port": 80, "protocol": "http" }
+                ]
+            }
+        }),
+    );
 
-    let client_program = serde_json::from_value(json!({
-        "image": "alpine:3.20",
-        "entrypoint": ["client"],
-        "env": {
-            "V1": "${slots.v1.url}",
-            "ADMIN": "${slots.admin.url}"
-        }
-    }))
-    .unwrap();
+    let client_program = lower_test_program(
+        2,
+        json!({
+            "image": "alpine:3.20",
+            "entrypoint": ["client"],
+            "env": {
+                "V1": "${slots.v1.url}",
+                "ADMIN": "${slots.admin.url}"
+            }
+        }),
+    );
 
     let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
     let provide_v1 = serde_json::from_value(json!({ "kind": "http", "endpoint": "a" })).unwrap();
@@ -2859,20 +2881,24 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
     let _compose_guard = ComposeGuard::new(project);
     let server_host = "c1-server-net";
 
-    let server_program = serde_json::from_value(json!({
-        "image": "busybox:1.36.1",
-        "entrypoint": ["sh", "-lc", "mkdir -p /www && echo hello > /www/index.html && httpd -f -p 8080 -h /www"],
-        "network": { "endpoints": [ { "name": "api", "port": 8080, "protocol": "http" } ] }
-    }))
-    .unwrap();
+    let server_program = lower_test_program(
+        1,
+        json!({
+            "image": "busybox:1.36.1",
+            "entrypoint": ["sh", "-lc", "mkdir -p /www && echo hello > /www/index.html && httpd -f -p 8080 -h /www"],
+            "network": { "endpoints": [ { "name": "api", "port": 8080, "protocol": "http" } ] }
+        }),
+    );
 
-    let sleeper_program = |env: serde_json::Value| {
-        serde_json::from_value(json!({
-            "image": "alpine:3.20",
-            "entrypoint": ["sh", "-lc", "sleep infinity"],
-            "env": env
-        }))
-        .unwrap()
+    let sleeper_program = |id: usize, env: serde_json::Value| {
+        lower_test_program(
+            id,
+            json!({
+                "image": "alpine:3.20",
+                "entrypoint": ["sh", "-lc", "sleep infinity"],
+                "env": env
+            }),
+        )
     };
 
     let slot_http: SlotDecl = serde_json::from_value(json!({ "kind": "http" })).unwrap();
@@ -2916,7 +2942,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         digest: digest(2),
         config: None,
         config_schema: None,
-        program: Some(sleeper_program(json!({ "URL": "${slots.api.url}" }))),
+        program: Some(sleeper_program(2, json!({ "URL": "${slots.api.url}" }))),
         slots: BTreeMap::from([("api".to_string(), slot_http.clone())]),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
@@ -2931,7 +2957,7 @@ fn docker_smoke_ocap_blocks_unbound_callers() {
         digest: digest(3),
         config: None,
         config_schema: None,
-        program: Some(sleeper_program(json!({}))),
+        program: Some(sleeper_program(3, json!({}))),
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),

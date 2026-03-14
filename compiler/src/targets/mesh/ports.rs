@@ -9,6 +9,7 @@ use super::plan::{
     MeshError, MeshPlan, ResolvedBinding, ResolvedComponentBinding, ResolvedExternalBinding,
     ResolvedFrameworkBinding, component_label,
 };
+use crate::targets::program_config::EndpointPlan;
 
 const LOCAL_SLOT_PORT_BASE: u16 = 20000;
 
@@ -85,17 +86,10 @@ struct ComponentRoutePortAllocator {
 }
 
 impl ComponentRoutePortAllocator {
-    fn new(scenario: &Scenario, component_id: ComponentId) -> Self {
+    fn new(endpoint_plan: &EndpointPlan, component_id: ComponentId) -> Self {
         let mut reserved = HashSet::new();
-        if let Some(net) = scenario
-            .component(component_id)
-            .program
-            .as_ref()
-            .and_then(|program| program.network())
-        {
-            for endpoint in net.endpoints() {
-                reserved.insert(endpoint.port);
-            }
+        for endpoint in endpoint_plan.component_endpoints(component_id) {
+            reserved.insert(endpoint.port);
         }
 
         Self {
@@ -154,12 +148,13 @@ impl ComponentRoutePortAllocator {
 
 pub(crate) fn allocate_local_route_ports(
     scenario: &Scenario,
+    endpoint_plan: &EndpointPlan,
     mesh_plan: &MeshPlan,
 ) -> Result<LocalRoutePorts, MeshError> {
     let mut out = LocalRoutePorts::default();
 
     for id in mesh_plan.program_components() {
-        let mut allocator = ComponentRoutePortAllocator::new(scenario, *id);
+        let mut allocator = ComponentRoutePortAllocator::new(endpoint_plan, *id);
 
         for binding in mesh_plan.bindings_for_consumer(*id) {
             let port = allocator.allocate(scenario, *id, binding.slot())?;
@@ -189,12 +184,13 @@ pub(crate) fn allocate_local_route_ports(
 
 pub(crate) fn placeholder_local_route_ports(
     scenario: &Scenario,
+    endpoint_plan: &EndpointPlan,
     mesh_plan: &MeshPlan,
 ) -> LocalRoutePorts {
     let mut out = LocalRoutePorts::default();
 
     for id in mesh_plan.program_components() {
-        let mut allocator = ComponentRoutePortAllocator::new(scenario, *id);
+        let mut allocator = ComponentRoutePortAllocator::new(endpoint_plan, *id);
 
         for binding in mesh_plan.bindings_for_consumer(*id) {
             let port = allocator
@@ -226,6 +222,7 @@ pub(crate) fn placeholder_local_route_ports(
 
 pub(crate) fn allocate_mesh_ports(
     scenario: &Scenario,
+    endpoint_plan: &EndpointPlan,
     program_components: &[ComponentId],
     base_port: u16,
     route_ports: &LocalRoutePorts,
@@ -233,14 +230,9 @@ pub(crate) fn allocate_mesh_ports(
     let mut out: HashMap<ComponentId, u16> = HashMap::new();
 
     for id in program_components {
-        let component = scenario.component(*id);
-        let program = component.program.as_ref().unwrap();
-
         let mut reserved: HashSet<u16> = HashSet::new();
-        if let Some(net) = program.network() {
-            for ep in net.endpoints() {
-                reserved.insert(ep.port);
-            }
+        for endpoint in endpoint_plan.component_endpoints(*id) {
+            reserved.insert(endpoint.port);
         }
         for &port in route_ports.reserved_ports(*id) {
             reserved.insert(port);
@@ -269,9 +261,12 @@ mod tests {
     use amber_scenario::{BindingEdge, Component, Moniker, Scenario};
 
     use super::*;
-    use crate::targets::mesh::plan::{
-        EndpointInfo, MeshPlan, ResolvedBinding, ResolvedComponentBinding, ResolvedExternalBinding,
-        ResolvedFrameworkBinding,
+    use crate::targets::{
+        mesh::plan::{
+            EndpointInfo, MeshPlan, ResolvedBinding, ResolvedComponentBinding,
+            ResolvedExternalBinding, ResolvedFrameworkBinding,
+        },
+        program_config::build_endpoint_plan,
     };
 
     fn component(id: usize, moniker: &str, program: serde_json::Value) -> Component {
@@ -364,8 +359,9 @@ mod tests {
             HashMap::new(),
         );
 
-        let route_ports =
-            allocate_local_route_ports(&scenario, &mesh_plan).expect("local route ports");
+        let endpoint_plan = build_endpoint_plan(&scenario).expect("endpoint plan");
+        let route_ports = allocate_local_route_ports(&scenario, &endpoint_plan, &mesh_plan)
+            .expect("local route ports");
         let ResolvedBinding::Component(first) = &mesh_plan.bindings()[0] else {
             panic!("expected component binding");
         };
@@ -470,7 +466,8 @@ mod tests {
             HashMap::new(),
         );
 
-        let route_ports = placeholder_local_route_ports(&scenario, &mesh_plan);
+        let endpoint_plan = build_endpoint_plan(&scenario).expect("endpoint plan");
+        let route_ports = placeholder_local_route_ports(&scenario, &endpoint_plan, &mesh_plan);
         let ResolvedBinding::Framework(first) = &mesh_plan.bindings()[0] else {
             panic!("expected framework binding");
         };

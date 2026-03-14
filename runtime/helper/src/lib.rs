@@ -10,8 +10,9 @@ use std::{
 
 use amber_config::{self as config, CONFIG_ENV_PREFIX, ConfigError};
 use amber_template::{
-    ConfigTemplatePayload, ProgramArgTemplate, ProgramEnvTemplate, RuntimeTemplateContext,
-    TemplateSpec,
+    ConfigTemplatePayload, MountSpec, ProgramArgTemplate, ProgramEnvTemplate,
+    RepeatedProgramArgTemplate, RepeatedProgramEnvTemplate, RepeatedTemplateSource,
+    RuntimeTemplateContext, TemplateSpec,
 };
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -27,20 +28,6 @@ const RESOLVED_ENV_ENV: &str = "AMBER_RESOLVED_ENV_B64";
 const MOUNT_SPEC_ENV: &str = "AMBER_MOUNT_SPEC_B64";
 const DOCKER_MOUNT_PROXY_SPEC_ENV: &str = "AMBER_DOCKER_MOUNT_PROXY_SPEC_B64";
 const RUNTIME_TEMPLATE_CONTEXT_ENV: &str = "AMBER_RUNTIME_TEMPLATE_CONTEXT_B64";
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(untagged)]
-enum MountSpec {
-    Literal {
-        path: String,
-        content: String,
-    },
-    Config {
-        path: String,
-        config: String,
-        optional: bool,
-    },
-}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct DockerMountProxySpec {
@@ -263,9 +250,7 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
     let has_resolved_entrypoint = resolved_entrypoint_b64.is_some();
     let has_resolved_env = resolved_env_b64.is_some();
     let has_resolved_payload = has_resolved_entrypoint || has_resolved_env;
-    let mount_requires_config = mounts
-        .iter()
-        .any(|mount| matches!(mount, MountSpec::Config { .. }));
+    let mount_requires_config = mounts.iter().any(MountSpec::requires_config);
 
     if has_resolved_payload && (!has_resolved_entrypoint || !has_resolved_env) {
         return Err(HelperError::Msg(format!(
@@ -293,7 +278,7 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
         )));
     }
 
-    let component_config = if config_payload_present {
+    let (component_config, component_schema) = if config_payload_present {
         let root_schema_b64 = root_schema_b64
             .ok_or_else(|| HelperError::Msg(format!("{ROOT_SCHEMA_ENV} is required")))?;
         let component_schema_b64 = component_schema_b64
@@ -310,38 +295,17 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
                 HelperError::Interp(format!("invalid component config template: {err}"))
             })?;
 
-        // 1) Parse and validate root config from AMBER_CONFIG_* using the root schema.
-        let root_config = config::build_root_config(&root_schema, &config_env)?;
-
-        // 2) Resolve component config from template.
-        let component_config = config::eval_config_template_partial_with_context(
+        let component_config = config::resolve_runtime_component_config(
+            &root_schema,
+            &component_schema,
             &component_template,
-            &root_config,
+            &config_env,
             &runtime_template_context,
         )?;
 
-        if !component_config.is_object() {
-            return Err(HelperError::Schema(
-                "resolved component config must be an object".to_string(),
-            ));
-        }
-
-        // 3) Validate component config against component schema.
-        {
-            let validator = jsonschema::validator_for(&component_schema).map_err(|e| {
-                HelperError::Schema(format!("failed to compile component schema: {e}"))
-            })?;
-            let mut it = validator.iter_errors(&component_config);
-            if let Some(first) = it.next() {
-                let mut msgs = vec![first.to_string()];
-                msgs.extend(it.take(7).map(|e| e.to_string()));
-                return Err(HelperError::Validation(msgs.join("; ")));
-            }
-        }
-
-        Some(component_config)
+        (Some(component_config), Some(component_schema))
     } else {
-        None
+        (None, None)
     };
 
     if mount_requires_config && component_config.is_none() {
@@ -382,8 +346,8 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
                     component_config,
                     &runtime_template_context,
                 )?,
-                ProgramEnvTemplate::Group(group) => {
-                    let present = config_path_is_present(component_config, &group.when)?;
+                ProgramEnvTemplate::Conditional(group) => {
+                    let present = config::config_path_is_present(component_config, &group.when)?;
                     if !present {
                         continue;
                     }
@@ -392,6 +356,22 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
                         component_config,
                         &runtime_template_context,
                     )?
+                }
+                ProgramEnvTemplate::Repeated(repeated) => {
+                    if let Some(when) = repeated.when.as_deref()
+                        && !config::config_path_is_present(component_config, when)?
+                    {
+                        continue;
+                    }
+                    let Some(rendered) = render_repeated_program_env_template(
+                        repeated,
+                        component_config,
+                        &runtime_template_context,
+                    )?
+                    else {
+                        continue;
+                    };
+                    rendered
                 }
             };
             rendered_env.insert(k.clone(), rendered);
@@ -412,7 +392,12 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
         (entrypoint, rendered_env)
     };
 
-    write_mounts(&mounts, component_config.as_ref())?;
+    write_mounts(
+        &mounts,
+        component_config.as_ref(),
+        component_schema.as_ref(),
+        &runtime_template_context,
+    )?;
 
     let mut env_out = passthrough_env;
     for (k, v) in rendered_env {
@@ -448,9 +433,21 @@ fn template_spec_requires_config(spec: &TemplateSpec) -> bool {
 fn program_arg_template_requires_config(arg: &ProgramArgTemplate) -> bool {
     match arg {
         ProgramArgTemplate::Arg(parts) => template_string_requires_config(parts),
-        ProgramArgTemplate::Group(group) => {
+        ProgramArgTemplate::Conditional(group) => {
             !group.when.is_empty()
                 || group
+                    .argv
+                    .iter()
+                    .any(|parts| template_string_requires_config(parts))
+        }
+        ProgramArgTemplate::Repeated(repeated) => {
+            repeated.when.as_ref().is_some_and(|when| !when.is_empty())
+                || repeated_template_source_requires_config(&repeated.each)
+                || repeated
+                    .arg
+                    .as_ref()
+                    .is_some_and(|parts| template_string_requires_config(parts))
+                || repeated
                     .argv
                     .iter()
                     .any(|parts| template_string_requires_config(parts))
@@ -461,8 +458,13 @@ fn program_arg_template_requires_config(arg: &ProgramArgTemplate) -> bool {
 fn program_env_template_requires_config(value: &ProgramEnvTemplate) -> bool {
     match value {
         ProgramEnvTemplate::Value(parts) => template_string_requires_config(parts),
-        ProgramEnvTemplate::Group(group) => {
+        ProgramEnvTemplate::Conditional(group) => {
             !group.when.is_empty() || template_string_requires_config(&group.value)
+        }
+        ProgramEnvTemplate::Repeated(repeated) => {
+            repeated.when.as_ref().is_some_and(|when| !when.is_empty())
+                || repeated_template_source_requires_config(&repeated.each)
+                || template_string_requires_config(&repeated.value)
         }
     }
 }
@@ -488,8 +490,8 @@ fn render_program_arg_templates(
                     runtime_template_context,
                 )?);
             }
-            ProgramArgTemplate::Group(group) => {
-                let present = config_path_is_present(component_config, &group.when)?;
+            ProgramArgTemplate::Conditional(group) => {
+                let present = config::config_path_is_present(component_config, &group.when)?;
                 if !present {
                     continue;
                 }
@@ -501,15 +503,200 @@ fn render_program_arg_templates(
                     )?);
                 }
             }
+            ProgramArgTemplate::Repeated(repeated) => {
+                if let Some(when) = repeated.when.as_deref()
+                    && !config::config_path_is_present(component_config, when)?
+                {
+                    continue;
+                }
+                render_repeated_program_arg_template(
+                    repeated,
+                    component_config,
+                    runtime_template_context,
+                    out,
+                )?;
+            }
         }
     }
     Ok(())
 }
 
-fn config_path_is_present(config_value: &Value, path: &str) -> Result<bool> {
-    config::get_by_path_opt(config_value, path)
-        .map(|value| value.is_some_and(|value| !value.is_null()))
-        .map_err(HelperError::from)
+fn repeated_template_source_requires_config(source: &RepeatedTemplateSource) -> bool {
+    match source {
+        RepeatedTemplateSource::Config { .. } => true,
+    }
+}
+
+fn render_repeated_template_string(
+    parts: &amber_template::TemplateString,
+    component_config: &Value,
+    runtime_template_context: &RuntimeTemplateContext,
+    item: &Value,
+) -> Result<String> {
+    let mut rendered = String::new();
+    for part in parts {
+        match part {
+            amber_template::TemplatePart::Lit { lit } => rendered.push_str(lit),
+            amber_template::TemplatePart::Config { config: path } => {
+                let value =
+                    config::get_by_path(component_config, path).map_err(HelperError::from)?;
+                rendered.push_str(
+                    &config::stringify_for_interpolation(value).map_err(HelperError::from)?,
+                );
+            }
+            amber_template::TemplatePart::Slot { slot, scope } => {
+                let value = runtime_template_context
+                    .slots_by_scope
+                    .get(scope)
+                    .and_then(|slots| slots.get(slot))
+                    .ok_or_else(|| {
+                        HelperError::Interp(format!(
+                            "slot interpolation slots.{slot} cannot be rendered at runtime for \
+                             scope {scope}"
+                        ))
+                    })?;
+                rendered.push_str(value);
+            }
+            amber_template::TemplatePart::Item {
+                item: path,
+                scope,
+                slot,
+                index,
+            } => {
+                let item = runtime_template_context
+                    .slot_items_by_scope
+                    .get(scope)
+                    .and_then(|slots| slots.get(slot))
+                    .and_then(|items| items.get(*index))
+                    .ok_or_else(|| {
+                        HelperError::Interp(format!(
+                            "item interpolation item.{path} cannot be rendered at runtime for \
+                             scope {scope}, slot {slot}, item {index}"
+                        ))
+                    })?;
+                let item = serde_json::to_value(item).map_err(|err| {
+                    HelperError::Interp(format!(
+                        "failed to serialize runtime slot item for scope {scope}, slot {slot}, \
+                         item {index}: {err}"
+                    ))
+                })?;
+                let value = query_value_opt(&item, path).ok_or_else(|| {
+                    HelperError::Interp(format!(
+                        "item.{path} not found in runtime slot item for scope {scope}, slot \
+                         {slot}, item {index}"
+                    ))
+                })?;
+                rendered.push_str(
+                    &config::stringify_for_interpolation(value).map_err(HelperError::from)?,
+                );
+            }
+            amber_template::TemplatePart::CurrentItem { item: path } => {
+                let value = query_value_opt(item, path).ok_or_else(|| {
+                    HelperError::Interp(format!(
+                        "item.{path} not found in the current repeated item"
+                    ))
+                })?;
+                rendered.push_str(
+                    &config::stringify_for_interpolation(value).map_err(HelperError::from)?,
+                );
+            }
+        }
+    }
+    Ok(rendered)
+}
+
+fn render_repeated_program_arg_template(
+    repeated: &RepeatedProgramArgTemplate,
+    component_config: &Value,
+    runtime_template_context: &RuntimeTemplateContext,
+    out: &mut Vec<String>,
+) -> Result<()> {
+    let items = match &repeated.each {
+        RepeatedTemplateSource::Config { path } => {
+            config::repeated_config_items(component_config, path)?
+        }
+    };
+
+    match (&repeated.arg, repeated.argv.is_empty()) {
+        (Some(arg), true) => {
+            let mut rendered = Vec::with_capacity(items.len());
+            for item in items {
+                rendered.push(render_repeated_template_string(
+                    arg,
+                    component_config,
+                    runtime_template_context,
+                    item,
+                )?);
+            }
+            if let Some(join) = &repeated.join {
+                if !rendered.is_empty() {
+                    out.push(rendered.join(join));
+                }
+            } else {
+                out.extend(rendered);
+            }
+            Ok(())
+        }
+        (None, false) if repeated.join.is_none() => {
+            for item in items {
+                for arg in &repeated.argv {
+                    out.push(render_repeated_template_string(
+                        arg,
+                        component_config,
+                        runtime_template_context,
+                        item,
+                    )?);
+                }
+            }
+            Ok(())
+        }
+        (Some(_), false) | (None, true) => Err(HelperError::Interp(
+            "repeated program arg template must use exactly one of `arg` or `argv`".to_string(),
+        )),
+        (None, false) => Err(HelperError::Interp(
+            "repeated program arg template cannot use `join` with `argv`".to_string(),
+        )),
+    }
+}
+
+fn render_repeated_program_env_template(
+    repeated: &RepeatedProgramEnvTemplate,
+    component_config: &Value,
+    runtime_template_context: &RuntimeTemplateContext,
+) -> Result<Option<String>> {
+    let items = match &repeated.each {
+        RepeatedTemplateSource::Config { path } => {
+            config::repeated_config_items(component_config, path)?
+        }
+    };
+    let mut rendered = Vec::with_capacity(items.len());
+    for item in items {
+        rendered.push(render_repeated_template_string(
+            &repeated.value,
+            component_config,
+            runtime_template_context,
+            item,
+        )?);
+    }
+    if rendered.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(rendered.join(&repeated.join)))
+}
+
+fn query_value_opt<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
+    if path.is_empty() {
+        return Some(root);
+    }
+
+    let mut current = root;
+    for segment in path.split('.') {
+        match current {
+            Value::Object(map) => current = map.get(segment)?,
+            _ => return None,
+        }
+    }
+    Some(current)
 }
 
 fn decode_b64_json(name: &'static str, raw: &str) -> Result<Value> {
@@ -526,39 +713,19 @@ fn decode_b64_json_t<T: for<'de> Deserialize<'de>>(name: &'static str, raw: &str
     serde_json::from_slice::<T>(&bytes).map_err(|e| HelperError::Json { name, source: e })
 }
 
-fn write_mounts(mounts: &[MountSpec], component_config: Option<&Value>) -> Result<()> {
-    if mounts.is_empty() {
-        return Ok(());
-    }
-
-    for mount in mounts {
-        let (path, content) = match mount {
-            MountSpec::Literal { path, content } => (path.as_str(), content.clone()),
-            MountSpec::Config {
-                path,
-                config,
-                optional,
-            } => {
-                let config_value = component_config.ok_or_else(|| {
-                    HelperError::Msg(format!(
-                        "mount {path} requires config resolution but no config payload was \
-                         provided"
-                    ))
-                })?;
-                let content = if *optional {
-                    match config::get_by_path_opt(config_value, config)? {
-                        Some(value) => config::stringify_for_mount(value)?,
-                        None => String::new(),
-                    }
-                } else {
-                    let value = config::get_by_path(config_value, config)?;
-                    config::stringify_for_mount(value)?
-                };
-                (path.as_str(), content)
-            }
-        };
-
-        let mount_path = std::path::Path::new(path);
+fn write_mounts(
+    mounts: &[MountSpec],
+    component_config: Option<&Value>,
+    component_schema: Option<&Value>,
+    runtime_template_context: &RuntimeTemplateContext,
+) -> Result<()> {
+    for (path, content) in config::render_mount_specs(
+        mounts,
+        component_config,
+        component_schema,
+        runtime_template_context,
+    )? {
+        let mount_path = std::path::Path::new(&path);
         if let Some(parent) = mount_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|err| HelperError::Msg(format!("failed to create {parent:?}: {err}")))?;
@@ -574,7 +741,10 @@ fn write_mounts(mounts: &[MountSpec], component_config: Option<&Value>) -> Resul
 mod tests {
     use std::time::Duration;
 
-    use amber_template::{ProgramArgTemplate, TemplatePart};
+    use amber_template::{
+        MountTemplateSpec, ProgramArgTemplate, ProgramEnvTemplate, RepeatedProgramArgTemplate,
+        RepeatedProgramEnvTemplate, RepeatedTemplateSource, TemplatePart,
+    };
     use base64::engine::general_purpose::STANDARD;
     use tempfile::tempdir;
 
@@ -588,6 +758,78 @@ mod tests {
     fn encode_spec_b64(spec: &TemplateSpec) -> String {
         let bytes = serde_json::to_vec(spec).expect("spec should serialize");
         STANDARD.encode(bytes)
+    }
+
+    fn repeated_targets_template_spec() -> TemplateSpec {
+        TemplateSpec {
+            program: amber_template::ProgramTemplateSpec {
+                entrypoint: vec![
+                    ProgramArgTemplate::Arg(vec![TemplatePart::lit("/app/bin/server")]),
+                    ProgramArgTemplate::Repeated(RepeatedProgramArgTemplate {
+                        when: None,
+                        each: RepeatedTemplateSource::Config {
+                            path: "targets".to_string(),
+                        },
+                        arg: Some(vec![TemplatePart::current_item("host")]),
+                        argv: Vec::new(),
+                        join: Some(",".to_string()),
+                    }),
+                ],
+                env: BTreeMap::from([(
+                    "TARGETS".to_string(),
+                    ProgramEnvTemplate::Repeated(RepeatedProgramEnvTemplate {
+                        when: None,
+                        each: RepeatedTemplateSource::Config {
+                            path: "targets".to_string(),
+                        },
+                        value: vec![TemplatePart::current_item("host")],
+                        join: ",".to_string(),
+                    }),
+                )]),
+            },
+        }
+    }
+
+    fn repeated_targets_root_schema(targets_schema: Value) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "targets": targets_schema
+            }
+        })
+    }
+
+    fn build_run_plan_with_repeated_targets(
+        root_schema: Value,
+        targets_env: Option<&str>,
+    ) -> RunPlan {
+        let component_schema = root_schema.clone();
+        let template_spec = repeated_targets_template_spec();
+
+        let mut env = BTreeMap::from([
+            ("PATH".to_string(), "/bin".to_string()),
+            (
+                TEMPLATE_SPEC_ENV.to_string(),
+                encode_spec_b64(&template_spec),
+            ),
+            (
+                COMPONENT_TEMPLATE_ENV.to_string(),
+                encode_json_b64(&ConfigTemplatePayload::Root.to_value()),
+            ),
+            (
+                COMPONENT_SCHEMA_ENV.to_string(),
+                encode_json_b64(&component_schema),
+            ),
+            (ROOT_SCHEMA_ENV.to_string(), encode_json_b64(&root_schema)),
+        ]);
+        if let Some(targets) = targets_env {
+            env.insert("AMBER_CONFIG_TARGETS".to_string(), targets.to_string());
+        }
+
+        let os_env = env
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        build_run_plan(os_env).expect("run plan should build")
     }
 
     #[test]
@@ -662,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn build_run_plan_skips_conditional_program_arg_group_when_config_is_missing() {
+    fn build_run_plan_skips_conditional_program_arg_item_when_config_is_missing() {
         let root_schema = serde_json::json!({
             "type": "object",
             "properties": {
@@ -676,13 +918,15 @@ mod tests {
             program: amber_template::ProgramTemplateSpec {
                 entrypoint: vec![
                     ProgramArgTemplate::Arg(vec![TemplatePart::lit("/app/bin/server")]),
-                    ProgramArgTemplate::Group(amber_template::ConditionalProgramArgTemplate {
-                        when: "profile".to_string(),
-                        argv: vec![
-                            vec![TemplatePart::lit("--profile")],
-                            vec![TemplatePart::config("profile")],
-                        ],
-                    }),
+                    ProgramArgTemplate::Conditional(
+                        amber_template::ConditionalProgramArgTemplate {
+                            when: "profile".to_string(),
+                            argv: vec![
+                                vec![TemplatePart::lit("--profile")],
+                                vec![TemplatePart::config("profile")],
+                            ],
+                        },
+                    ),
                 ],
                 env: BTreeMap::new(),
             },
@@ -714,7 +958,7 @@ mod tests {
     }
 
     #[test]
-    fn build_run_plan_renders_conditional_program_arg_group_when_config_is_present() {
+    fn build_run_plan_renders_conditional_program_arg_item_when_config_is_present() {
         let root_schema = serde_json::json!({
             "type": "object",
             "properties": {
@@ -728,13 +972,15 @@ mod tests {
             program: amber_template::ProgramTemplateSpec {
                 entrypoint: vec![
                     ProgramArgTemplate::Arg(vec![TemplatePart::lit("/app/bin/server")]),
-                    ProgramArgTemplate::Group(amber_template::ConditionalProgramArgTemplate {
-                        when: "profile".to_string(),
-                        argv: vec![
-                            vec![TemplatePart::lit("--profile")],
-                            vec![TemplatePart::config("profile")],
-                        ],
-                    }),
+                    ProgramArgTemplate::Conditional(
+                        amber_template::ConditionalProgramArgTemplate {
+                            when: "profile".to_string(),
+                            argv: vec![
+                                vec![TemplatePart::lit("--profile")],
+                                vec![TemplatePart::config("profile")],
+                            ],
+                        },
+                    ),
                 ],
                 env: BTreeMap::new(),
             },
@@ -953,16 +1199,335 @@ mod tests {
     }
 
     #[test]
+    fn build_run_plan_renders_repeated_config_program_args_and_env() {
+        let root_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "targets": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "host": { "type": "string" },
+                            "port": { "type": "integer" }
+                        },
+                        "required": ["host", "port"]
+                    }
+                }
+            }
+        });
+
+        let component_schema = root_schema.clone();
+        let template_spec = TemplateSpec {
+            program: amber_template::ProgramTemplateSpec {
+                entrypoint: vec![
+                    ProgramArgTemplate::Arg(vec![TemplatePart::lit("/app/bin/server")]),
+                    ProgramArgTemplate::Repeated(RepeatedProgramArgTemplate {
+                        when: None,
+                        each: RepeatedTemplateSource::Config {
+                            path: "targets".to_string(),
+                        },
+                        arg: None,
+                        argv: vec![
+                            vec![TemplatePart::lit("--target")],
+                            vec![
+                                TemplatePart::current_item("host"),
+                                TemplatePart::lit(":"),
+                                TemplatePart::current_item("port"),
+                            ],
+                        ],
+                        join: None,
+                    }),
+                ],
+                env: BTreeMap::from([(
+                    "TARGETS".to_string(),
+                    ProgramEnvTemplate::Repeated(RepeatedProgramEnvTemplate {
+                        when: None,
+                        each: RepeatedTemplateSource::Config {
+                            path: "targets".to_string(),
+                        },
+                        value: vec![
+                            TemplatePart::current_item("host"),
+                            TemplatePart::lit(":"),
+                            TemplatePart::current_item("port"),
+                        ],
+                        join: ",".to_string(),
+                    }),
+                )]),
+            },
+        };
+
+        let env = BTreeMap::from([
+            ("PATH".to_string(), "/bin".to_string()),
+            (
+                TEMPLATE_SPEC_ENV.to_string(),
+                encode_spec_b64(&template_spec),
+            ),
+            (
+                COMPONENT_TEMPLATE_ENV.to_string(),
+                encode_json_b64(&ConfigTemplatePayload::Root.to_value()),
+            ),
+            (
+                COMPONENT_SCHEMA_ENV.to_string(),
+                encode_json_b64(&component_schema),
+            ),
+            (ROOT_SCHEMA_ENV.to_string(), encode_json_b64(&root_schema)),
+            (
+                "AMBER_CONFIG_TARGETS".to_string(),
+                r#"[{"host":"api-a.internal","port":8080},{"host":"api-b.internal","port":9090}]"#
+                    .to_string(),
+            ),
+        ]);
+
+        let os_env = env
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let plan = build_run_plan(os_env).expect("run plan should build");
+
+        assert_eq!(
+            plan.entrypoint,
+            vec![
+                "/app/bin/server".to_string(),
+                "--target".to_string(),
+                "api-a.internal:8080".to_string(),
+                "--target".to_string(),
+                "api-b.internal:9090".to_string(),
+            ]
+        );
+        assert_eq!(
+            plan.env.get(&OsString::from("TARGETS")),
+            Some(&OsString::from("api-a.internal:8080,api-b.internal:9090"))
+        );
+    }
+
+    #[test]
+    fn build_run_plan_joins_repeated_config_arg_and_skips_missing_optional_repeated_env() {
+        let root_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "targets": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "host": { "type": "string" }
+                        },
+                        "required": ["host"]
+                    }
+                },
+                "enabled": { "type": "boolean" }
+            }
+        });
+
+        let component_schema = root_schema.clone();
+        let template_spec = TemplateSpec {
+            program: amber_template::ProgramTemplateSpec {
+                entrypoint: vec![
+                    ProgramArgTemplate::Arg(vec![TemplatePart::lit("/app/bin/server")]),
+                    ProgramArgTemplate::Repeated(RepeatedProgramArgTemplate {
+                        when: None,
+                        each: RepeatedTemplateSource::Config {
+                            path: "targets".to_string(),
+                        },
+                        arg: Some(vec![TemplatePart::current_item("host")]),
+                        argv: Vec::new(),
+                        join: Some(",".to_string()),
+                    }),
+                ],
+                env: BTreeMap::from([(
+                    "TARGETS".to_string(),
+                    ProgramEnvTemplate::Repeated(RepeatedProgramEnvTemplate {
+                        when: Some("enabled".to_string()),
+                        each: RepeatedTemplateSource::Config {
+                            path: "targets".to_string(),
+                        },
+                        value: vec![TemplatePart::current_item("host")],
+                        join: ",".to_string(),
+                    }),
+                )]),
+            },
+        };
+
+        let env = BTreeMap::from([
+            ("PATH".to_string(), "/bin".to_string()),
+            (
+                TEMPLATE_SPEC_ENV.to_string(),
+                encode_spec_b64(&template_spec),
+            ),
+            (
+                COMPONENT_TEMPLATE_ENV.to_string(),
+                encode_json_b64(&ConfigTemplatePayload::Root.to_value()),
+            ),
+            (
+                COMPONENT_SCHEMA_ENV.to_string(),
+                encode_json_b64(&component_schema),
+            ),
+            (ROOT_SCHEMA_ENV.to_string(), encode_json_b64(&root_schema)),
+            (
+                "AMBER_CONFIG_TARGETS".to_string(),
+                r#"[{"host":"api-a.internal"},{"host":"api-b.internal"}]"#.to_string(),
+            ),
+        ]);
+
+        let os_env = env
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let plan = build_run_plan(os_env).expect("run plan should build");
+
+        assert_eq!(
+            plan.entrypoint,
+            vec![
+                "/app/bin/server".to_string(),
+                "api-a.internal,api-b.internal".to_string(),
+            ]
+        );
+        assert!(
+            !plan.env.contains_key(&OsString::from("TARGETS")),
+            "repeated env should be omitted when its config-based `when` is absent"
+        );
+    }
+
+    #[test]
+    fn build_run_plan_skips_joined_repeated_config_arg_and_env_for_empty_array() {
+        let plan = build_run_plan_with_repeated_targets(
+            repeated_targets_root_schema(serde_json::json!({
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "host": { "type": "string" }
+                    },
+                    "required": ["host"]
+                }
+            })),
+            Some("[]"),
+        );
+
+        assert_eq!(plan.entrypoint, vec!["/app/bin/server".to_string()]);
+        assert!(
+            !plan.env.contains_key(&OsString::from("TARGETS")),
+            "repeated env should be omitted when config expansion is empty"
+        );
+    }
+
+    #[test]
+    fn build_run_plan_skips_joined_repeated_config_arg_and_env_for_missing_path() {
+        let plan = build_run_plan_with_repeated_targets(
+            repeated_targets_root_schema(serde_json::json!({
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "host": { "type": "string" }
+                    },
+                    "required": ["host"]
+                }
+            })),
+            None,
+        );
+
+        assert_eq!(plan.entrypoint, vec!["/app/bin/server".to_string()]);
+        assert!(
+            !plan.env.contains_key(&OsString::from("TARGETS")),
+            "repeated env should be omitted when config expansion is missing"
+        );
+    }
+
+    #[test]
+    fn build_run_plan_skips_joined_repeated_config_arg_and_env_for_null() {
+        let plan = build_run_plan_with_repeated_targets(
+            repeated_targets_root_schema(serde_json::json!({
+                "type": ["array", "null"],
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "host": { "type": "string" }
+                    },
+                    "required": ["host"]
+                }
+            })),
+            Some("null"),
+        );
+
+        assert_eq!(plan.entrypoint, vec!["/app/bin/server".to_string()]);
+        assert!(
+            !plan.env.contains_key(&OsString::from("TARGETS")),
+            "repeated env should be omitted when config expansion is null"
+        );
+    }
+
+    #[test]
+    fn build_run_plan_rejects_non_array_repeated_config_source() {
+        let root_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "targets": { "type": "string" }
+            }
+        });
+
+        let component_schema = root_schema.clone();
+        let template_spec = TemplateSpec {
+            program: amber_template::ProgramTemplateSpec {
+                entrypoint: vec![
+                    ProgramArgTemplate::Arg(vec![TemplatePart::lit("/app/bin/server")]),
+                    ProgramArgTemplate::Repeated(RepeatedProgramArgTemplate {
+                        when: None,
+                        each: RepeatedTemplateSource::Config {
+                            path: "targets".to_string(),
+                        },
+                        arg: Some(vec![TemplatePart::current_item("host")]),
+                        argv: Vec::new(),
+                        join: None,
+                    }),
+                ],
+                env: BTreeMap::new(),
+            },
+        };
+
+        let env = BTreeMap::from([
+            ("PATH".to_string(), "/bin".to_string()),
+            (
+                TEMPLATE_SPEC_ENV.to_string(),
+                encode_spec_b64(&template_spec),
+            ),
+            (
+                COMPONENT_TEMPLATE_ENV.to_string(),
+                encode_json_b64(&ConfigTemplatePayload::Root.to_value()),
+            ),
+            (
+                COMPONENT_SCHEMA_ENV.to_string(),
+                encode_json_b64(&component_schema),
+            ),
+            (ROOT_SCHEMA_ENV.to_string(), encode_json_b64(&root_schema)),
+            (
+                "AMBER_CONFIG_TARGETS".to_string(),
+                "\"not-an-array\"".to_string(),
+            ),
+        ]);
+
+        let os_env = env
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let err = build_run_plan(os_env).expect_err("non-array repeated source should fail");
+        assert!(
+            err.to_string().contains("must resolve to an array"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
     fn helper_mount_requires_config_payload() {
         use base64::engine::general_purpose::STANDARD;
 
         let entrypoint = vec!["/bin/echo".to_string(), "ok".to_string()];
         let env = BTreeMap::from([("HELLO".to_string(), "world".to_string())]);
-        let mounts = vec![MountSpec::Config {
-            path: "/tmp/app.txt".to_string(),
-            config: "app".to_string(),
-            optional: false,
-        }];
+        let mounts = vec![MountSpec::Template(MountTemplateSpec {
+            when: None,
+            each: None,
+            path: vec![TemplatePart::lit("/tmp/app.txt")],
+            source: vec![TemplatePart::lit("config.app")],
+        })];
 
         let envs = BTreeMap::from([
             (
@@ -996,11 +1561,12 @@ mod tests {
 
         let entrypoint = vec!["/bin/echo".to_string(), "ok".to_string()];
         let env = BTreeMap::from([("HELLO".to_string(), "world".to_string())]);
-        let mounts = vec![MountSpec::Config {
-            path: mount_path.display().to_string(),
-            config: "app".to_string(),
-            optional: false,
-        }];
+        let mounts = vec![MountSpec::Template(MountTemplateSpec {
+            when: None,
+            each: None,
+            path: vec![TemplatePart::lit(mount_path.display().to_string())],
+            source: vec![TemplatePart::lit("config.app")],
+        })];
 
         let schema = serde_json::json!({
             "type": "object",
@@ -1045,63 +1611,6 @@ mod tests {
 
         let contents = std::fs::read_to_string(&mount_path).expect("mount written");
         assert_eq!(contents, "hello");
-    }
-
-    #[test]
-    fn helper_optional_mount_with_missing_config_writes_empty_file() {
-        use base64::engine::general_purpose::STANDARD;
-        use tempfile::tempdir;
-
-        let dir = tempdir().expect("temp dir");
-        let mount_path = dir.path().join("secret.txt");
-
-        let entrypoint = vec!["/bin/echo".to_string(), "ok".to_string()];
-        let env = BTreeMap::from([("HELLO".to_string(), "world".to_string())]);
-        let mounts = vec![MountSpec::Config {
-            path: mount_path.display().to_string(),
-            config: "secret_value".to_string(),
-            optional: true,
-        }];
-
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "secret_value": { "type": "string", "secret": true }
-            }
-        });
-
-        let envs = BTreeMap::from([
-            (
-                RESOLVED_ENTRYPOINT_ENV.to_string(),
-                STANDARD.encode(serde_json::to_vec(&entrypoint).unwrap()),
-            ),
-            (
-                RESOLVED_ENV_ENV.to_string(),
-                STANDARD.encode(serde_json::to_vec(&env).unwrap()),
-            ),
-            (ROOT_SCHEMA_ENV.to_string(), encode_json_b64(&schema)),
-            (COMPONENT_SCHEMA_ENV.to_string(), encode_json_b64(&schema)),
-            (
-                COMPONENT_TEMPLATE_ENV.to_string(),
-                encode_json_b64(&ConfigTemplatePayload::Root.to_value()),
-            ),
-            (
-                MOUNT_SPEC_ENV.to_string(),
-                STANDARD.encode(serde_json::to_vec(&mounts).unwrap()),
-            ),
-        ]);
-
-        let os_env = envs
-            .into_iter()
-            .map(|(k, v)| (OsString::from(k), OsString::from(v)));
-        let plan = build_run_plan(os_env).expect("build run plan");
-
-        assert_eq!(plan.entrypoint, entrypoint);
-        let contents = std::fs::read_to_string(&mount_path).expect("mount written");
-        assert!(
-            contents.is_empty(),
-            "expected empty mount file, got {contents:?}"
-        );
     }
 
     #[test]

@@ -1,6 +1,10 @@
 #![allow(unused_assignments)]
 #![allow(clippy::result_large_err)]
 
+pub(crate) mod manifest_table;
+pub(crate) mod program_lowering;
+mod provenance;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
@@ -10,22 +14,27 @@ use amber_config as rc;
 use amber_manifest::{
     BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, CapabilityKind, ChildName,
     ExportName, ExportTarget, InterpolatedPart, InterpolatedString, InterpolationSource, Manifest,
-    ManifestDigest, MountSource, Program, framework_capability, span_for_json_pointer,
+    ManifestDigest, ProgramConfigUseSite, framework_capability, span_for_json_pointer,
 };
 use amber_scenario::{
-    BindingEdge, BindingFrom, Component, ComponentId, ProvideRef,
+    BindingEdge, BindingFrom, Component, ComponentId, ProgramMount, ProvideRef,
     ResourceDecl as ScenarioResourceDecl, ResourceRef, Scenario, ScenarioExport, SlotRef,
     StorageResourceParams as ScenarioStorageResourceParams, graph::component_path_for,
 };
 use jsonschema::Validator;
 use miette::{Diagnostic, NamedSource, SourceSpan};
+pub use provenance::{ComponentProvenance, Provenance};
 use serde_json::Value;
 use thiserror::Error;
 
-use super::frontend::{ResolvedNode, ResolvedTree};
+use self::program_lowering::{
+    ProgramLoweringError, ProgramLoweringSite, lower_program_with_origins,
+    validate_lowered_program_mounts,
+};
 use crate::{
-    ComponentProvenance, DigestStore, Provenance, config_resolution::render_static_config_string,
-    config_templates, store::display_url,
+    DigestStore,
+    config::{query::render_static_config_string, templates},
+    frontend::{ResolvedNode, ResolvedTree, store::display_url},
 };
 
 #[allow(unused_assignments)]
@@ -233,7 +242,7 @@ impl<'a> ConfigErrorSite<'a> {
             config_span,
             instance_path,
         )?;
-        let name = crate::store::display_url(&parent_prov.resolved_url);
+        let name = display_url(&parent_prov.resolved_url);
         Some(ConfigSite {
             src: NamedSource::new(name, Arc::clone(&stored.source)).with_language("json5"),
             span,
@@ -448,14 +457,15 @@ fn slot_decl_related_span(
     })
 }
 
-fn storage_mount_index(manifest: &Manifest, slot: &str) -> Option<usize> {
-    let program = manifest.program()?;
-    program.mounts().iter().position(|mount| {
-        matches!(
-            &mount.source,
-            MountSource::Slot(mount_slot) if mount_slot.as_str() == slot
-        )
-    })
+fn has_storage_mount(component: &Component, slot: &str) -> bool {
+    component
+        .program
+        .as_ref()
+        .is_some_and(|program| {
+            program.mounts().iter().any(
+                |mount| matches!(mount, ProgramMount::Slot { slot: mount_slot, .. } if mount_slot == slot),
+            )
+        })
 }
 
 fn mount_source_site(
@@ -492,12 +502,57 @@ fn mount_source_site(
     Some((src, span))
 }
 
+fn endpoint_site(
+    provenance: &Provenance,
+    store: &DigestStore,
+    id: ComponentId,
+    endpoint_index: usize,
+) -> Option<(NamedSource<Arc<str>>, SourceSpan)> {
+    let prov = provenance.for_component(id);
+    let stored = store.get_source(&prov.resolved_url)?;
+    let src = NamedSource::new(display_url(&prov.resolved_url), Arc::clone(&stored.source))
+        .with_language("json5");
+    let root = (0usize, stored.source.len()).into();
+    let whole_endpoint_pointers = [
+        format!("/program/network/endpoints/{endpoint_index}"),
+        format!("/program/vm/network/endpoints/{endpoint_index}"),
+    ];
+    let span = whole_endpoint_pointers
+        .iter()
+        .find_map(|pointer| span_for_json_pointer(stored.source.as_ref(), root, pointer))
+        .or_else(|| {
+            span_for_json_pointer(stored.source.as_ref(), root, "/program/network/endpoints")
+        })
+        .or_else(|| {
+            span_for_json_pointer(
+                stored.source.as_ref(),
+                root,
+                "/program/vm/network/endpoints",
+            )
+        })
+        .or_else(|| stored.spans.program.as_ref().map(|program| program.whole))
+        .unwrap_or((0usize, 0usize).into());
+    Some((src, span))
+}
+
+fn authored_mount_index(
+    mount_source_indices_by_component: &HashMap<ComponentId, Vec<usize>>,
+    component: ComponentId,
+    lowered_mount_index: usize,
+) -> usize {
+    mount_source_indices_by_component
+        .get(&component)
+        .and_then(|source_indices| source_indices.get(lowered_mount_index))
+        .copied()
+        .unwrap_or(lowered_mount_index)
+}
+
 #[derive(Clone, Debug)]
 enum StorageMountSinkSite {
     Binding(BindingOrigin),
     Mount {
         component: ComponentId,
-        mount_index: usize,
+        authored_mount_index: usize,
     },
 }
 
@@ -520,8 +575,8 @@ fn storage_mount_sink_site(
         }
         StorageMountSinkSite::Mount {
             component,
-            mount_index,
-        } => mount_source_site(provenance, store, *component, *mount_index),
+            authored_mount_index,
+        } => mount_source_site(provenance, store, *component, *authored_mount_index),
     }
 }
 
@@ -708,6 +763,28 @@ pub enum Error {
         related: Vec<RelatedSpan>,
     },
 
+    #[error("unsupported program mount on {component_path}: {message}")]
+    #[diagnostic(code(linker::unsupported_program_mount))]
+    UnsupportedProgramMount {
+        component_path: String,
+        message: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label(primary, "mount declared here")]
+        span: SourceSpan,
+    },
+
+    #[error("unsupported program endpoint on {component_path}: {message}")]
+    #[diagnostic(code(linker::unsupported_program_endpoint))]
+    UnsupportedProgramEndpoint {
+        component_path: String,
+        message: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label(primary, "endpoint declared here")]
+        span: SourceSpan,
+    },
+
     #[error("slot `{slot}` on {component_path} is not bound (non-optional slots must be filled)")]
     #[diagnostic(code(linker::unbound_slot))]
     UnboundSlot {
@@ -826,19 +903,17 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
     debug_assert_eq!(components.len(), provenance.components.len());
     debug_assert_eq!(components.len(), link_index.len());
 
-    let manifests =
-        crate::manifest_table::build_manifest_table(&components, store).map_err(|e| {
-            Error::MissingManifest {
-                component_path: component_path_for(&components, e.component),
-                digest: e.digest,
-            }
-        })?;
+    let manifests = manifest_table::build_manifest_table(&components, store).map_err(|e| {
+        Error::MissingManifest {
+            component_path: component_path_for(&components, e.component),
+            digest: e.digest,
+        }
+    })?;
 
     for (c, m) in components.iter_mut().zip(&manifests) {
         let (Some(c), Some(m)) = (c.as_mut(), m.as_ref()) else {
             continue;
         };
-        c.program = m.program().cloned();
         c.slots = m
             .slots()
             .iter()
@@ -886,6 +961,62 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         );
     }
 
+    let mut mount_source_indices_by_component: HashMap<ComponentId, Vec<usize>> = HashMap::new();
+    for id in (0..components.len()).map(ComponentId) {
+        let Some(component) = components[id.0].as_mut() else {
+            continue;
+        };
+        let Some(manifest) = manifests[id.0].as_ref() else {
+            continue;
+        };
+        let Some(program) = manifest.program() else {
+            continue;
+        };
+        let template_opt = composed
+            .templates
+            .get(&id)
+            .and_then(rc::RootConfigTemplate::node);
+        match lower_program_with_origins(id, program, template_opt) {
+            Ok(lowered) => {
+                if let Err(program_errors) = validate_lowered_program_mounts(
+                    &lowered.program,
+                    &lowered.mount_source_indices,
+                    manifest.config_schema(),
+                    manifest.resources(),
+                    manifest.slots(),
+                    manifest.experimental_features(),
+                ) {
+                    record_program_lowering_errors(
+                        id,
+                        &component_path_for(&components, id),
+                        &program_errors,
+                        &provenance,
+                        store,
+                        &mut errors,
+                    );
+                    continue;
+                }
+                mount_source_indices_by_component.insert(id, lowered.mount_source_indices);
+                component.program = Some(lowered.program);
+            }
+            Err(program_errors) => record_program_lowering_errors(
+                id,
+                &component_path_for(&components, id),
+                &program_errors,
+                &provenance,
+                store,
+                &mut errors,
+            ),
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(Error::Multiple {
+            count: errors.len(),
+            errors,
+        });
+    }
+
     let bindings = collect_bindings(
         &components,
         &manifests,
@@ -898,7 +1029,11 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
     let root_manifest = manifests[root.0]
         .as_ref()
         .expect("root manifest should exist");
-    let root_program_slots = collect_program_slot_uses(root_manifest);
+    let root_program_slots = collect_program_slot_uses(
+        components[root.0]
+            .as_ref()
+            .expect("root component should exist"),
+    );
 
     let mut resolver = SlotResolver::new(
         &components,
@@ -925,6 +1060,7 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         &manifests,
         &bindings,
         &mut resolver,
+        &mount_source_indices_by_component,
         &provenance,
         store,
         &mut errors,
@@ -1187,7 +1323,7 @@ fn validate_config_tree(
     store: &DigestStore,
     schema_cache: &mut HashMap<ManifestDigest, Arc<Validator>>,
     errors: &mut Vec<Error>,
-) -> config_templates::ComposedTemplates {
+) -> templates::ComposedTemplates {
     fn invalid_config_error(
         component_path: String,
         site: &ConfigSite,
@@ -1276,145 +1412,15 @@ fn validate_config_tree(
             }
         };
 
-        fn visit_program_string_config_refs(raw: &str, mut visit: impl FnMut(&str)) {
-            let Ok(parsed) = raw.parse::<InterpolatedString>() else {
-                return;
+        program.visit_config_uses(|location, query| {
+            let location = match location {
+                ProgramConfigUseSite::MountSource { index } => {
+                    format!("program.mounts[{index}].from")
+                }
+                other => other.to_string(),
             };
-            for part in &parsed.parts {
-                let InterpolatedPart::Interpolation { source, query } = part else {
-                    continue;
-                };
-                if *source == InterpolationSource::Config {
-                    visit(query);
-                }
-            }
-        }
-
-        fn visit_vm_scalar_config_refs(
-            scalar: &amber_manifest::VmScalarU32,
-            mut visit: impl FnMut(&str),
-        ) {
-            let amber_manifest::VmScalarU32::Interpolated(raw) = scalar else {
-                return;
-            };
-            visit_program_string_config_refs(raw, |query| visit(query));
-        }
-
-        fn visit_program_command_config_refs(
-            command: &[amber_manifest::ProgramArgItem],
-            mut visit: impl FnMut(String, &str),
-        ) {
-            for (arg_idx, item) in command.iter().enumerate() {
-                if let Some(when) = item.when()
-                    && when.source() == InterpolationSource::Config
-                {
-                    visit(format!("[{arg_idx}].when"), when.query());
-                }
-                item.visit_values(|arg| {
-                    for part in &arg.parts {
-                        let InterpolatedPart::Interpolation { source, query } = part else {
-                            continue;
-                        };
-                        if *source == InterpolationSource::Config {
-                            visit(format!("[{arg_idx}]"), query);
-                        }
-                    }
-                });
-                let repeated_argv = match item {
-                    amber_manifest::ProgramArgItem::Group(group) => Some(&group.argv.0),
-                    amber_manifest::ProgramArgItem::RepeatedArgv(repeated) => {
-                        Some(&repeated.argv.0)
-                    }
-                    amber_manifest::ProgramArgItem::Arg(_)
-                    | amber_manifest::ProgramArgItem::RepeatedArg(_) => None,
-                };
-                if let Some(group) = repeated_argv {
-                    for (group_idx, arg) in group.iter().enumerate() {
-                        for part in &arg.parts {
-                            let InterpolatedPart::Interpolation { source, query } = part else {
-                                continue;
-                            };
-                            if *source == InterpolationSource::Config {
-                                visit(format!("[{arg_idx}].argv[{group_idx}]"), query);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        fn visit_program_env_config_refs(
-            env: &BTreeMap<String, amber_manifest::ProgramEnvValue>,
-            mut visit: impl FnMut(String, &str),
-        ) {
-            for (key, value) in env {
-                if let Some(when) = value.when()
-                    && when.source() == InterpolationSource::Config
-                {
-                    visit(format!("{key}.when"), when.query());
-                }
-                let location_suffix = if value.group().is_some() {
-                    format!("{key}.value")
-                } else {
-                    key.to_string()
-                };
-                for part in &value.value().parts {
-                    let InterpolatedPart::Interpolation { source, query } = part else {
-                        continue;
-                    };
-                    if *source == InterpolationSource::Config {
-                        visit(location_suffix.clone(), query);
-                    }
-                }
-            }
-        }
-
-        match program {
-            Program::Image(program) => {
-                visit_program_string_config_refs(&program.image, |query| {
-                    validate_config_ref("program.image".to_string(), query);
-                });
-                visit_program_command_config_refs(&program.entrypoint.0, |suffix, query| {
-                    validate_config_ref(format!("program.entrypoint{suffix}"), query);
-                });
-                visit_program_env_config_refs(&program.common.env, |suffix, query| {
-                    validate_config_ref(format!("program.env.{suffix}"), query);
-                });
-            }
-            Program::Path(program) => {
-                visit_program_string_config_refs(&program.path, |query| {
-                    validate_config_ref("program.path".to_string(), query);
-                });
-                visit_program_command_config_refs(&program.args.0, |suffix, query| {
-                    validate_config_ref(format!("program.args{suffix}"), query);
-                });
-                visit_program_env_config_refs(&program.common.env, |suffix, query| {
-                    validate_config_ref(format!("program.env.{suffix}"), query);
-                });
-            }
-            Program::Vm(program) => {
-                visit_program_string_config_refs(&program.0.image, |query| {
-                    validate_config_ref("program.vm.image".to_string(), query);
-                });
-                visit_vm_scalar_config_refs(&program.0.cpus, |query| {
-                    validate_config_ref("program.vm.cpus".to_string(), query);
-                });
-                visit_vm_scalar_config_refs(&program.0.memory_mib, |query| {
-                    validate_config_ref("program.vm.memory_mib".to_string(), query);
-                });
-                if let Some(raw) = program.0.cloud_init.user_data.as_deref() {
-                    visit_program_string_config_refs(raw, |query| {
-                        validate_config_ref("program.vm.cloud_init.user_data".to_string(), query);
-                    });
-                }
-                if let Some(raw) = program.0.cloud_init.vendor_data.as_deref() {
-                    visit_program_string_config_refs(raw, |query| {
-                        validate_config_ref("program.vm.cloud_init.vendor_data".to_string(), query);
-                    });
-                }
-            }
-            _ => (),
-        }
+            validate_config_ref(location, query);
+        });
     }
 
     fn validate_resource_config_refs(
@@ -1687,7 +1693,7 @@ fn validate_config_tree(
         validate_resource_config_refs(id, components, manifests, provenance, store, schema, errors);
     }
 
-    let composed = config_templates::compose_root_config_templates(root, components);
+    let composed = templates::compose_root_config_templates(root, components);
 
     for err in &composed.errors {
         let component_path = component_path_for(components, err.component);
@@ -1798,7 +1804,7 @@ fn validate_config_tree(
 fn resolve_resource_params(
     components: &mut [Option<Component>],
     manifests: &[Option<Arc<Manifest>>],
-    composed: &config_templates::ComposedTemplates,
+    composed: &templates::ComposedTemplates,
     provenance: &Provenance,
     store: &DigestStore,
     errors: &mut Vec<Error>,
@@ -2827,26 +2833,18 @@ fn format_cycle(parts: &[String]) -> String {
     out.join(" -> ")
 }
 
-fn collect_program_slot_uses(manifest: &Manifest) -> HashSet<String> {
+fn collect_program_slot_uses(component: &Component) -> HashSet<String> {
     let mut uses = HashSet::new();
-    let Some(program) = manifest.program() else {
+    let Some(program) = component.program.as_ref() else {
         return uses;
     };
 
     if program.visit_slot_uses(|slot| {
-        if manifest.slots().contains_key(slot) {
+        if component.slots.contains_key(slot) {
             uses.insert(slot.to_string());
         }
     }) {
-        uses.extend(manifest.slots().keys().map(|s| s.to_string()));
-    }
-
-    for mount in program.mounts() {
-        if let MountSource::Slot(slot) = &mount.source
-            && manifest.slots().contains_key(slot.as_str())
-        {
-            uses.insert(slot.clone());
-        }
+        uses.extend(component.slots.keys().cloned());
     }
 
     uses
@@ -3032,12 +3030,13 @@ fn validate_all_slots_bound(
 
     for id in (0..components.len()).map(ComponentId) {
         let m = manifests[id.0].as_ref().expect("manifest should exist");
+        let component = components[id.0].as_ref().expect("component should exist");
         for (slot_name, slot_decl) in m.slots().iter() {
             if slot_decl.optional {
                 continue;
             }
             if slot_decl.decl.kind == CapabilityKind::Storage
-                && storage_mount_index(m, slot_name.as_str()).is_some()
+                && has_storage_mount(component, slot_name.as_str())
             {
                 continue;
             }
@@ -3078,6 +3077,7 @@ fn validate_storage_mounts(
     manifests: &[Option<Arc<Manifest>>],
     binding_specs: &[BindingSpec],
     resolver: &mut SlotResolver<'_>,
+    mount_source_indices_by_component: &HashMap<ComponentId, Vec<usize>>,
     provenance: &Provenance,
     store: &DigestStore,
     errors: &mut Vec<Error>,
@@ -3095,12 +3095,18 @@ fn validate_storage_mounts(
 
     for id in (0..components.len()).map(ComponentId) {
         let manifest = manifests[id.0].as_ref().expect("manifest should exist");
-        let Some(program) = manifest.program() else {
+        let component = components[id.0].as_ref().expect("component should exist");
+        let Some(program) = component.program.as_ref() else {
             continue;
         };
-        for (mount_index, mount) in program.mounts().iter().enumerate() {
-            match &mount.source {
-                MountSource::Slot(slot_name) => {
+
+        for (lowered_mount_index, mount) in program.mounts().iter().enumerate() {
+            let source_mount_index =
+                authored_mount_index(mount_source_indices_by_component, id, lowered_mount_index);
+            match mount {
+                ProgramMount::Slot {
+                    slot: slot_name, ..
+                } => {
                     let Some(slot_decl) = manifest.slots().get(slot_name.as_str()) else {
                         continue;
                     };
@@ -3116,8 +3122,9 @@ fn validate_storage_mounts(
                     let Some(resolved) = resolved else {
                         let component_path =
                             describe_component_path(&component_path_for(components, id));
-                        let (src, span) = mount_source_site(provenance, store, id, mount_index)
-                            .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                        let (src, span) =
+                            mount_source_site(provenance, store, id, source_mount_index)
+                                .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
                         let mut related: Vec<_> =
                             component_decl_site(components, provenance, store, id)
                                 .into_iter()
@@ -3145,8 +3152,9 @@ fn validate_storage_mounts(
                     let [resolved] = resolved.as_slice() else {
                         let component_path =
                             describe_component_path(&component_path_for(components, id));
-                        let (src, span) = mount_source_site(provenance, store, id, mount_index)
-                            .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                        let (src, span) =
+                            mount_source_site(provenance, store, id, source_mount_index)
+                                .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
                         let mut related: Vec<_> =
                             component_decl_site(components, provenance, store, id)
                                 .into_iter()
@@ -3174,8 +3182,9 @@ fn validate_storage_mounts(
                     let BindingFrom::Resource(resource) = &resolved.from else {
                         let component_path =
                             describe_component_path(&component_path_for(components, id));
-                        let (src, span) = mount_source_site(provenance, store, id, mount_index)
-                            .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                        let (src, span) =
+                            mount_source_site(provenance, store, id, source_mount_index)
+                                .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
                         let mut related: Vec<_> =
                             component_decl_site(components, provenance, store, id)
                                 .into_iter()
@@ -3224,7 +3233,10 @@ fn validate_storage_mounts(
                             site,
                         });
                 }
-                MountSource::Resource(resource_name) => {
+                ProgramMount::Resource {
+                    resource: resource_name,
+                    ..
+                } => {
                     sinks_by_resource
                         .entry(ResourceRef {
                             component: id,
@@ -3233,15 +3245,15 @@ fn validate_storage_mounts(
                         .or_default()
                         .push(StorageMountSink {
                             component: id,
-                            sink_id: format!("mount:{mount_index}"),
+                            sink_id: format!("mount:{lowered_mount_index}"),
                             description: format!("resources.{resource_name}"),
                             site: StorageMountSinkSite::Mount {
                                 component: id,
-                                mount_index,
+                                authored_mount_index: source_mount_index,
                             },
                         });
                 }
-                _ => {}
+                ProgramMount::File(_) | ProgramMount::Framework { .. } => {}
             }
         }
     }
@@ -3283,13 +3295,54 @@ fn validate_storage_mounts(
     }
 }
 
+fn record_program_lowering_errors(
+    component: ComponentId,
+    component_path: &str,
+    program_errors: &[ProgramLoweringError],
+    provenance: &Provenance,
+    store: &DigestStore,
+    errors: &mut Vec<Error>,
+) {
+    for program_error in program_errors {
+        match program_error.site {
+            ProgramLoweringSite::Mount(mount_index) => {
+                let (src, span) = mount_source_site(provenance, store, component, mount_index)
+                    .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                errors.push(Error::UnsupportedProgramMount {
+                    component_path: component_path.to_string(),
+                    message: program_error.message.clone(),
+                    src,
+                    span,
+                });
+            }
+            ProgramLoweringSite::Endpoint(endpoint_index) => {
+                let (src, span) = endpoint_site(provenance, store, component, endpoint_index)
+                    .unwrap_or_else(|| (unknown_source(), (0usize, 0usize).into()));
+                errors.push(Error::UnsupportedProgramEndpoint {
+                    component_path: component_path.to_string(),
+                    message: program_error.message.clone(),
+                    src,
+                    span,
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{
+        collections::{BTreeMap, HashSet},
+        sync::Arc,
+    };
 
-    use amber_manifest::Manifest;
+    use amber_manifest::{Manifest, ManifestDigest, ProgramEntrypoint};
+    use amber_scenario::{
+        Component, ComponentId, Moniker, Program, ProgramCommon, ProgramImage, ProgramMount,
+    };
 
     use super::collect_program_slot_uses;
+    use crate::linker::program_lowering::lower_program;
 
     #[test]
     fn collect_program_slot_uses_includes_slot_conditions() {
@@ -3310,10 +3363,79 @@ mod tests {
         "#
         .parse()
         .expect("manifest");
+        let component = Component {
+            id: ComponentId(0),
+            parent: None,
+            moniker: Moniker::from(Arc::<str>::from("/")),
+            digest: ManifestDigest::new([0; 32]),
+            config: None,
+            config_schema: None,
+            program: Some(
+                lower_program(ComponentId(0), manifest.program().expect("program"), None)
+                    .expect("program should lower"),
+            ),
+            slots: manifest
+                .slots()
+                .iter()
+                .map(|(name, decl)| (name.to_string(), decl.clone()))
+                .collect(),
+            provides: BTreeMap::new(),
+            resources: BTreeMap::new(),
+            metadata: None,
+            children: Vec::new(),
+        };
 
         assert_eq!(
-            collect_program_slot_uses(&manifest),
+            collect_program_slot_uses(&component),
             HashSet::from(["api".to_string()])
+        );
+    }
+
+    #[test]
+    fn collect_program_slot_uses_includes_lowered_mount_slots() {
+        let manifest: Manifest = r#"
+            {
+              manifest_version: "0.2.0",
+              slots: {
+                state: { kind: "storage" },
+              },
+            }
+        "#
+        .parse()
+        .expect("manifest");
+        let component = Component {
+            id: ComponentId(0),
+            parent: None,
+            moniker: Moniker::from(Arc::<str>::from("/")),
+            digest: ManifestDigest::new([0; 32]),
+            config: None,
+            config_schema: None,
+            program: Some(Program::Image(ProgramImage {
+                image: "app".to_string(),
+                entrypoint: ProgramEntrypoint::default(),
+                common: ProgramCommon {
+                    env: BTreeMap::new(),
+                    network: None,
+                    mounts: vec![ProgramMount::Slot {
+                        path: "/var/lib/app".to_string(),
+                        slot: "state".to_string(),
+                    }],
+                },
+            })),
+            slots: manifest
+                .slots()
+                .iter()
+                .map(|(name, decl)| (name.to_string(), decl.clone()))
+                .collect(),
+            provides: BTreeMap::new(),
+            resources: BTreeMap::new(),
+            metadata: None,
+            children: Vec::new(),
+        };
+
+        assert_eq!(
+            collect_program_slot_uses(&component),
+            HashSet::from(["state".to_string()])
         );
     }
 }

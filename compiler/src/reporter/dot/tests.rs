@@ -7,6 +7,7 @@ use amber_scenario::{
 };
 
 use super::{render_dot, render_dot_with_exports};
+use crate::linker::program_lowering::lower_program;
 
 fn component(id: usize, moniker: &str) -> Component {
     Component {
@@ -26,7 +27,9 @@ fn component(id: usize, moniker: &str) -> Component {
 }
 
 fn apply_manifest(component: &mut Component, manifest: &Manifest) {
-    component.program = manifest.program().cloned();
+    component.program = manifest.program().map(|program| {
+        lower_program(component.id, program, None).expect("program fixture should lower")
+    });
     component.config_schema = manifest.config_schema().map(|schema| schema.0.clone());
     component.slots = manifest
         .slots()
@@ -296,7 +299,7 @@ fn dot_renders_root_exports_as_endpoints() {
         }],
     };
 
-    let dot = render_dot_with_exports(&scenario);
+    let dot = render_dot_with_exports(&scenario).expect("dot rendering");
     let expected = r#"digraph scenario {
   rankdir=LR;
   compound=true;
@@ -359,7 +362,7 @@ fn dot_renders_root_exports_from_root_component() {
         }],
     };
 
-    let dot = render_dot_with_exports(&scenario);
+    let dot = render_dot_with_exports(&scenario).expect("dot rendering");
     assert!(dot.contains("c0 [label=\"program\"]"));
     assert!(dot.contains("e0 [label=\"http:80\", shape=box]"));
     assert!(dot.contains("c0 -> e0 [label=\"http\"]"));

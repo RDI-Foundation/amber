@@ -79,7 +79,7 @@ fn compile_writes_primary_output_and_dot_artifact() {
     let primary_json: Value =
         serde_json::from_str(&primary_contents).expect("primary output did not contain valid JSON");
     assert_eq!(primary_json["schema"], "amber.scenario.ir");
-    assert_eq!(primary_json["version"], 3);
+    assert_eq!(primary_json["version"], 4);
     assert_eq!(primary_json["root"], 0);
 
     let components = primary_json["components"]
@@ -1060,7 +1060,7 @@ fn compile_direct_emits_storage_mounts_in_plan() {
 }
 
 #[test]
-fn compile_compose_preserves_runtime_conditional_entrypoint_group_in_template_spec() {
+fn compile_compose_preserves_runtime_conditional_entrypoint_item_in_template_spec() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("cli crate should live under the workspace root");
@@ -1160,9 +1160,9 @@ fn compile_compose_preserves_runtime_conditional_entrypoint_group_in_template_sp
     );
     match &spec.program.entrypoint[1] {
         ProgramArgTemplate::Arg(_) => {
-            panic!("expected runtime conditional entrypoint group in helper template spec")
+            panic!("expected runtime conditional entrypoint item in helper template spec")
         }
-        ProgramArgTemplate::Group(group) => {
+        ProgramArgTemplate::Conditional(group) => {
             assert_eq!(group.when, "profile");
             assert_eq!(
                 group.argv,
@@ -1172,14 +1172,20 @@ fn compile_compose_preserves_runtime_conditional_entrypoint_group_in_template_sp
                 ]
             );
         }
+        ProgramArgTemplate::Repeated(_) => {
+            panic!("expected conditional entrypoint item, got repeated expansion")
+        }
     }
     match spec.program.env.get("PROFILE") {
-        Some(ProgramEnvTemplate::Group(group)) => {
+        Some(ProgramEnvTemplate::Conditional(group)) => {
             assert_eq!(group.when, "profile");
             assert_eq!(group.value, vec![TemplatePart::config("profile")]);
         }
         Some(ProgramEnvTemplate::Value(_)) => {
             panic!("expected runtime conditional env value in helper template spec")
+        }
+        Some(ProgramEnvTemplate::Repeated(_)) => {
+            panic!("expected conditional env value, got repeated expansion")
         }
         None => panic!("expected PROFILE env template"),
     }
@@ -1321,7 +1327,7 @@ fn compile_compose_resolves_optional_slot_when_before_backend_emission() {
 }
 
 #[test]
-fn compile_direct_preserves_runtime_conditional_program_arg_group_in_template_spec() {
+fn compile_direct_preserves_runtime_conditional_program_arg_item_in_template_spec() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("cli crate should live under the workspace root");
@@ -1422,9 +1428,9 @@ fn compile_direct_preserves_runtime_conditional_program_arg_group_in_template_sp
     );
     match &spec.program.entrypoint[2] {
         ProgramArgTemplate::Arg(_) => {
-            panic!("expected runtime conditional arg group in helper template spec")
+            panic!("expected runtime conditional arg item in helper template spec")
         }
-        ProgramArgTemplate::Group(group) => {
+        ProgramArgTemplate::Conditional(group) => {
             assert_eq!(group.when, "profile");
             assert_eq!(
                 group.argv,
@@ -1434,14 +1440,20 @@ fn compile_direct_preserves_runtime_conditional_program_arg_group_in_template_sp
                 ]
             );
         }
+        ProgramArgTemplate::Repeated(_) => {
+            panic!("expected conditional arg item, got repeated expansion")
+        }
     }
     match spec.program.env.get("PROFILE") {
-        Some(ProgramEnvTemplate::Group(group)) => {
+        Some(ProgramEnvTemplate::Conditional(group)) => {
             assert_eq!(group.when, "profile");
             assert_eq!(group.value, vec![TemplatePart::config("profile")]);
         }
         Some(ProgramEnvTemplate::Value(_)) => {
             panic!("expected runtime conditional env value in helper template spec")
+        }
+        Some(ProgramEnvTemplate::Repeated(_)) => {
+            panic!("expected conditional env value, got repeated expansion")
         }
         None => panic!("expected PROFILE env template"),
     }
@@ -2824,7 +2836,7 @@ fn compile_direct_rejects_scenario_ir_with_non_resource_storage_mount_binding() 
         &ir_path,
         serde_json::to_vec_pretty(&serde_json::json!({
             "schema": "amber.scenario.ir",
-            "version": 2,
+            "version": 4,
             "root": 0,
             "components": [
                 {
@@ -2851,7 +2863,11 @@ fn compile_direct_rejects_scenario_ir_with_non_resource_storage_mount_binding() 
                         "image": "busybox:stable",
                         "entrypoint": ["sh"],
                         "mounts": [
-                            { "path": "/var/lib/app", "from": "slots.state" }
+                            {
+                                "kind": "slot",
+                                "path": "/var/lib/app",
+                                "slot": "state"
+                            }
                         ]
                     },
                     "slots": {

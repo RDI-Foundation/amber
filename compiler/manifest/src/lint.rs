@@ -10,8 +10,8 @@ use thiserror::Error;
 
 use crate::{
     BindingSource, ComponentDecl, ExportTarget, InterpolatedPart, InterpolatedString,
-    InterpolationSource, Manifest, ManifestSpans, MountSource, Program, ProgramArgItem, SlotName,
-    SlotTarget, parse_slot_query, validate_slot_query_for_slot,
+    InterpolationSource, Manifest, ManifestSpans, Program, ProgramArgValue, SlotTarget,
+    parse_slot_query, validate_slot_query_for_slot,
 };
 
 #[allow(unused_assignments)]
@@ -147,13 +147,13 @@ pub enum ManifestLint {
 
     #[error(
         "this `when` condition is unnecessary: slot `{slot}` is required, so it is always bound \
-         and this argv group is always included (in component {component})"
+         and this argv item is always included (in component {component})"
     )]
     #[diagnostic(
         code(manifest::required_slot_when),
         severity(Warning),
         help(
-            "Remove `when` if this argv group should always be included. If it should disappear \
+            "Remove `when` if this argv item should always be included. If it should disappear \
              when the parent does not bind the slot, mark `slots.{slot}` as `optional: true`."
         )
     )]
@@ -205,113 +205,6 @@ pub enum ManifestLint {
         #[label("duplicate resolver `{resolver}`")]
         span: SourceSpan,
     },
-}
-
-fn add_program_slot_uses<'a>(
-    manifest: &'a Manifest,
-    used_slots: &mut BTreeSet<&'a SlotName>,
-    value: &InterpolatedString,
-) -> bool {
-    let used_all = value.visit_slot_uses(|slot_name| {
-        if let Some((slot_key, _)) = manifest.slots().get_key_value(slot_name) {
-            used_slots.insert(slot_key);
-        }
-    });
-    if used_all {
-        used_slots.extend(manifest.slots().keys());
-    }
-    used_all
-}
-
-fn add_slot_condition_use<'a>(
-    manifest: &'a Manifest,
-    used_slots: &mut BTreeSet<&'a SlotName>,
-    query: &str,
-) {
-    match parse_slot_query(query) {
-        Ok(parsed) => match parsed.target {
-            SlotTarget::All => used_slots.extend(manifest.slots().keys()),
-            SlotTarget::Slot(slot) => {
-                if let Some((slot_key, _)) = manifest.slots().get_key_value(slot) {
-                    used_slots.insert(slot_key);
-                }
-            }
-        },
-        Err(_) => {
-            if query.is_empty() {
-                used_slots.extend(manifest.slots().keys());
-            }
-        }
-    }
-}
-
-fn visit_program_interpolated(
-    program: &Program,
-    mut visit: impl FnMut(&InterpolatedString) -> bool,
-) -> bool {
-    match program {
-        Program::Image(program) => {
-            if let Ok(parsed) = program.image.parse::<InterpolatedString>()
-                && visit(&parsed)
-            {
-                return true;
-            }
-        }
-        Program::Path(program) => {
-            if let Ok(parsed) = program.path.parse::<InterpolatedString>()
-                && visit(&parsed)
-            {
-                return true;
-            }
-        }
-        Program::Vm(program) => {
-            if let Ok(parsed) = program.0.image.parse::<InterpolatedString>()
-                && visit(&parsed)
-            {
-                return true;
-            }
-            for scalar in [&program.0.cpus, &program.0.memory_mib] {
-                let crate::VmScalarU32::Interpolated(raw) = scalar else {
-                    continue;
-                };
-                if let Ok(parsed) = raw.parse::<InterpolatedString>()
-                    && visit(&parsed)
-                {
-                    return true;
-                }
-            }
-            for value in [
-                program.0.cloud_init.user_data.as_deref(),
-                program.0.cloud_init.vendor_data.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if let Ok(parsed) = value.parse::<InterpolatedString>()
-                    && visit(&parsed)
-                {
-                    return true;
-                }
-            }
-        }
-    }
-    for item in &program.command().0 {
-        let mut item_hit = false;
-        item.visit_values(|value| {
-            if !item_hit {
-                item_hit = visit(value);
-            }
-        });
-        if item_hit {
-            return true;
-        }
-    }
-    for value in program.env().values() {
-        if visit(value.value()) {
-            return true;
-        }
-    }
-    false
 }
 
 #[derive(Clone, Copy)]
@@ -366,141 +259,42 @@ fn command_arg_optional_config_lints(
 
     let mut out = Vec::new();
     for (idx, item) in items.iter().enumerate() {
-        match item {
-            ProgramArgItem::Arg(arg) => {
-                for part in &arg.parts {
-                    let InterpolatedPart::Interpolation {
-                        source: kind,
-                        query,
-                    } = part
-                    else {
-                        continue;
-                    };
-                    if *kind != InterpolationSource::Config || !optional_leaf_paths.contains(query)
-                    {
-                        continue;
-                    }
-                    let span =
+        let suppress_query = item
+            .when()
+            .filter(|when| when.source() == InterpolationSource::Config);
+        let base_pointer = match &item.value {
+            ProgramArgValue::Arg(_) => format!("{field_pointer}/{idx}/arg"),
+            ProgramArgValue::Argv(_) => format!("{field_pointer}/{idx}/argv"),
+        };
+        item.visit_values(|arg| {
+            for part in &arg.parts {
+                let InterpolatedPart::Interpolation {
+                    source: kind,
+                    query,
+                } = part
+                else {
+                    continue;
+                };
+                if *kind != InterpolationSource::Config
+                    || !optional_leaf_paths.contains(query)
+                    || suppress_query.is_some_and(|when| query == when.query())
+                {
+                    continue;
+                }
+                let span = crate::span_for_json_pointer(source, root, &base_pointer)
+                    .or_else(|| {
                         crate::span_for_json_pointer(source, root, &location_of(idx).pointer())
-                            .or_else(|| crate::span_for_json_pointer(source, root, field_pointer))
-                            .unwrap_or(fallback);
-                    out.push(ManifestLint::OptionalCommandConfig {
-                        path: query.clone(),
-                        component: component.to_string(),
-                        src: src.clone(),
-                        span,
-                    });
-                }
+                    })
+                    .or_else(|| crate::span_for_json_pointer(source, root, field_pointer))
+                    .unwrap_or(fallback);
+                out.push(ManifestLint::OptionalCommandConfig {
+                    path: query.clone(),
+                    component: component.to_string(),
+                    src: src.clone(),
+                    span,
+                });
             }
-            ProgramArgItem::Group(group) => {
-                for (group_idx, arg) in group.argv.0.iter().enumerate() {
-                    for part in &arg.parts {
-                        let InterpolatedPart::Interpolation {
-                            source: kind,
-                            query,
-                        } = part
-                        else {
-                            continue;
-                        };
-                        if *kind != InterpolationSource::Config
-                            || !optional_leaf_paths.contains(query)
-                            || (group.when.source() == InterpolationSource::Config
-                                && query == group.when.query())
-                        {
-                            continue;
-                        }
-                        let pointer = format!("{}/{idx}/argv/{group_idx}", field_pointer);
-                        let span = crate::span_for_json_pointer(source, root, &pointer)
-                            .or_else(|| {
-                                crate::span_for_json_pointer(
-                                    source,
-                                    root,
-                                    &location_of(idx).pointer(),
-                                )
-                            })
-                            .or_else(|| crate::span_for_json_pointer(source, root, field_pointer))
-                            .unwrap_or(fallback);
-                        out.push(ManifestLint::OptionalCommandConfig {
-                            path: query.clone(),
-                            component: component.to_string(),
-                            src: src.clone(),
-                            span,
-                        });
-                    }
-                }
-            }
-            ProgramArgItem::RepeatedArgv(repeated) => {
-                for (group_idx, arg) in repeated.argv.0.iter().enumerate() {
-                    for part in &arg.parts {
-                        let InterpolatedPart::Interpolation {
-                            source: kind,
-                            query,
-                        } = part
-                        else {
-                            continue;
-                        };
-                        if *kind != InterpolationSource::Config
-                            || !optional_leaf_paths.contains(query)
-                            || repeated.when.as_ref().is_some_and(|when| {
-                                when.source() == InterpolationSource::Config
-                                    && query == when.query()
-                            })
-                        {
-                            continue;
-                        }
-                        let pointer = format!("{}/{idx}/argv/{group_idx}", field_pointer);
-                        let span = crate::span_for_json_pointer(source, root, &pointer)
-                            .or_else(|| {
-                                crate::span_for_json_pointer(
-                                    source,
-                                    root,
-                                    &location_of(idx).pointer(),
-                                )
-                            })
-                            .or_else(|| crate::span_for_json_pointer(source, root, field_pointer))
-                            .unwrap_or(fallback);
-                        out.push(ManifestLint::OptionalCommandConfig {
-                            path: query.clone(),
-                            component: component.to_string(),
-                            src: src.clone(),
-                            span,
-                        });
-                    }
-                }
-            }
-            ProgramArgItem::RepeatedArg(repeated) => {
-                for part in &repeated.arg.parts {
-                    let InterpolatedPart::Interpolation {
-                        source: kind,
-                        query,
-                    } = part
-                    else {
-                        continue;
-                    };
-                    if *kind != InterpolationSource::Config
-                        || !optional_leaf_paths.contains(query)
-                        || repeated.when.as_ref().is_some_and(|when| {
-                            when.source() == InterpolationSource::Config && query == when.query()
-                        })
-                    {
-                        continue;
-                    }
-                    let pointer = format!("{field_pointer}/{idx}/arg");
-                    let span = crate::span_for_json_pointer(source, root, &pointer)
-                        .or_else(|| {
-                            crate::span_for_json_pointer(source, root, &location_of(idx).pointer())
-                        })
-                        .or_else(|| crate::span_for_json_pointer(source, root, field_pointer))
-                        .unwrap_or(fallback);
-                    out.push(ManifestLint::OptionalCommandConfig {
-                        path: query.clone(),
-                        component: component.to_string(),
-                        src: src.clone(),
-                        span,
-                    });
-                }
-            }
-        }
+        });
     }
     out
 }
@@ -611,7 +405,7 @@ fn program_env_optional_config_lints(
                 continue;
             }
 
-            let pointer = if value.group().is_some() || value.repeated().is_some() {
+            let pointer = if value.when().is_some() || value.each().is_some() {
                 PointerBuf::from_tokens(["program", "env", key, "value"]).to_string()
             } else {
                 PointerBuf::from_tokens(["program", "env", key]).to_string()
@@ -736,28 +530,7 @@ fn collect_config_uses(manifest: &Manifest) -> ConfigUses {
     let mut uses = ConfigUses::default();
 
     if let Some(program) = manifest.program() {
-        for group in program.command().groups() {
-            if group.when.source() == InterpolationSource::Config {
-                uses.add_query(group.when.query());
-            }
-        }
-        for value in program.env().values() {
-            if let Some(when) = value.when()
-                && when.source() == InterpolationSource::Config
-            {
-                uses.add_query(when.query());
-            }
-        }
-        let _ = visit_program_interpolated(program, |value| {
-            collect_config_uses_from_interpolated(value, &mut uses);
-            false
-        });
-        for mount in program.mounts() {
-            match &mount.source {
-                MountSource::Config(path) | MountSource::Secret(path) => uses.add_query(path),
-                MountSource::Resource(_) | MountSource::Slot(_) | MountSource::Framework(_) => {}
-            }
-        }
+        program.visit_config_uses(|_, query| uses.add_query(query));
     }
 
     for decl in manifest.components().values() {
@@ -774,15 +547,7 @@ fn collect_config_uses(manifest: &Manifest) -> ConfigUses {
 }
 
 fn collect_config_uses_from_interpolated(value: &InterpolatedString, uses: &mut ConfigUses) {
-    for part in &value.parts {
-        let InterpolatedPart::Interpolation { source, query } = part else {
-            continue;
-        };
-        if *source != InterpolationSource::Config {
-            continue;
-        }
-        uses.add_query(query);
-    }
+    value.visit_config_uses(|query| uses.add_query(query));
 }
 
 fn collect_config_uses_from_value(value: &Value, uses: &mut ConfigUses) {
@@ -828,29 +593,14 @@ pub fn lint_manifest(
     }
 
     let mut program_used_slots = BTreeSet::new();
-    if let Some(program) = manifest.program() {
-        for group in program.command().groups() {
-            if group.when.source() == InterpolationSource::Slots {
-                add_slot_condition_use(manifest, &mut program_used_slots, group.when.query());
-            }
-        }
-        for value in program.env().values() {
-            if let Some(when) = value.when()
-                && when.source() == InterpolationSource::Slots
-            {
-                add_slot_condition_use(manifest, &mut program_used_slots, when.query());
-            }
-        }
-        let _ = visit_program_interpolated(program, |value| {
-            add_program_slot_uses(manifest, &mut program_used_slots, value)
-        });
-        for mount in program.mounts() {
-            if let MountSource::Slot(slot) = &mount.source
-                && let Some((slot_key, _)) = manifest.slots().get_key_value(slot.as_str())
-            {
+    if let Some(program) = manifest.program()
+        && program.visit_slot_uses(|slot_name| {
+            if let Some((slot_key, _)) = manifest.slots().get_key_value(slot_name) {
                 program_used_slots.insert(slot_key);
             }
-        }
+        })
+    {
+        program_used_slots.extend(manifest.slots().keys());
     }
 
     let mut exported_provides = BTreeSet::new();
@@ -1165,6 +915,119 @@ mod tests {
     }
 
     #[test]
+    fn config_used_only_in_program_mounts_is_not_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              mount_name: { type: "string" },
+              mount_file: { type: "string" },
+              source_path: { type: "string" },
+              other: { type: "string" },
+            },
+          },
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [
+              { path: "/etc/${config.mount_name}", from: "config.mount_file" },
+              { path: "/tmp/value", from: "config.${config.source_path}" },
+            ],
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedConfig { path, .. }
+                if path == "mount_name" || path == "mount_file" || path == "source_path"
+        )));
+        assert!(lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedConfig { path, .. } if path == "other"
+        )));
+    }
+
+    #[test]
+    fn config_used_only_in_program_arg_each_is_not_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              items: {
+                type: "array",
+                items: { type: "string" },
+              },
+              other: { type: "string" },
+            },
+          },
+          program: {
+            image: "x",
+            entrypoint: [
+              {
+                each: "config.items",
+                argv: ["${item}"],
+              },
+            ],
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedConfig { path, .. } if path == "items"
+        )));
+        assert!(lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedConfig { path, .. } if path == "other"
+        )));
+    }
+
+    #[test]
+    fn config_used_only_in_program_endpoint_when_is_not_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              enabled: { type: "boolean" },
+              other: { type: "string" },
+            },
+          },
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            network: {
+              endpoints: [
+                { when: "config.enabled", name: "http", port: 80 },
+              ],
+            },
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedConfig { path, .. } if path == "enabled"
+        )));
+        assert!(lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedConfig { path, .. } if path == "other"
+        )));
+    }
+
+    #[test]
     fn config_lint_incomplete_is_reported() {
         let manifest = Manifest::builder()
             .config_schema(serde_json::json!({
@@ -1269,6 +1132,60 @@ mod tests {
         assert!(!lints.iter().any(|lint| matches!(
             lint,
             crate::lint::ManifestLint::UnusedSlot { name, .. } if name == "state"
+        )));
+    }
+
+    #[test]
+    fn slot_used_only_in_program_mount_path_is_not_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              mount_file: { type: "string" },
+            },
+          },
+          slots: { api: { kind: "http" } },
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [{ path: "/tmp/${slots.api.url}", from: "config.mount_file" }],
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedSlot { name, .. } if name == "api"
+        )));
+    }
+
+    #[test]
+    fn slot_used_only_in_program_endpoint_when_is_not_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.3.0",
+          slots: { api: { kind: "http" } },
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            network: {
+              endpoints: [
+                { when: "slots.api.url", name: "http", port: 80 },
+              ],
+            },
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedSlot { name, .. } if name == "api"
         )));
     }
 
@@ -1546,6 +1463,156 @@ mod tests {
         assert!(lints.iter().any(|lint| matches!(
             lint,
             crate::lint::ManifestLint::OptionalCommandConfig { path, .. } if path == "color"
+        )));
+    }
+
+    #[test]
+    fn config_used_across_program_templates_is_not_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              command_each: { type: "array", items: { type: "string" } },
+              command_name: { type: "string" },
+              env_each: { type: "array", items: { type: "string" } },
+              env_token: { type: "string" },
+              endpoint_enabled: { type: "boolean" },
+              endpoint_each: { type: "array", items: { type: "string" } },
+              endpoint_name: { type: "string" },
+              endpoint_port: { type: "string" },
+              endpoint_protocol: { type: "string" },
+              mount_enabled: { type: "boolean" },
+              mount_each: { type: "array", items: { type: "string" } },
+              mount_name: { type: "string" },
+              mount_path: { type: "string" },
+              mount_source: { type: "string" },
+              unused: { type: "string" },
+            },
+          },
+          program: {
+            image: "app",
+            entrypoint: [
+              {
+                each: "config.command_each",
+                arg: "${config.command_name}",
+              },
+            ],
+            env: {
+              TOKEN: {
+                each: "config.env_each",
+                value: "${config.env_token}",
+                join: ",",
+              },
+            },
+            network: {
+              endpoints: [
+                {
+                  when: "config.endpoint_enabled",
+                  each: "config.endpoint_each",
+                  name: "${config.endpoint_name}",
+                  port: "${config.endpoint_port}",
+                  protocol: "${config.endpoint_protocol}",
+                },
+              ],
+            },
+            mounts: [
+              {
+                when: "config.mount_enabled",
+                each: "config.mount_each",
+                name: "${config.mount_name}",
+                path: "/tmp/${config.mount_path}",
+                from: "config.${config.mount_source}",
+              },
+            ],
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+
+        for used in [
+            "command_each",
+            "command_name",
+            "env_each",
+            "env_token",
+            "endpoint_enabled",
+            "endpoint_each",
+            "endpoint_name",
+            "endpoint_port",
+            "endpoint_protocol",
+            "mount_enabled",
+            "mount_each",
+            "mount_name",
+            "mount_path",
+            "mount_source",
+        ] {
+            assert!(
+                !lints.iter().any(|lint| matches!(
+                    lint,
+                    crate::lint::ManifestLint::UnusedConfig { path, .. } if path == used
+                )),
+                "unexpected unused-config lint for {used}: {lints:#?}"
+            );
+        }
+        assert!(lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedConfig { path, .. } if path == "unused"
+        )));
+    }
+
+    #[test]
+    fn slot_used_only_in_mount_template_is_not_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+          },
+          slots: { api: { kind: "http" } },
+          program: {
+            image: "app",
+            entrypoint: ["app"],
+            mounts: [
+              { path: "/tmp/${slots.api.url}", from: "config" },
+            ],
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedSlot { name, .. } if name == "api"
+        )));
+    }
+
+    #[test]
+    fn slot_used_only_in_network_template_is_not_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.3.0",
+          slots: { api: { kind: "http" } },
+          program: {
+            image: "app",
+            entrypoint: ["app"],
+            network: {
+              endpoints: [
+                { name: "${slots.api.url}", port: 8080, protocol: "http" },
+              ],
+            },
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::UnusedSlot { name, .. } if name == "api"
         )));
     }
 }

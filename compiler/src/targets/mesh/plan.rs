@@ -7,6 +7,7 @@ use amber_manifest::{
 use amber_scenario::{BindingFrom, ComponentId, Scenario};
 
 pub(crate) use crate::targets::common::{TargetError as MeshError, component_label};
+use crate::targets::program_config::EndpointPlan;
 
 #[derive(Clone, Debug)]
 pub(crate) struct MeshOptions {
@@ -159,6 +160,7 @@ impl MeshPlan {
 
 pub(crate) fn build_mesh_plan(
     scenario: &Scenario,
+    endpoint_plan: &EndpointPlan,
     options: MeshOptions,
 ) -> Result<MeshPlan, MeshError> {
     let program_components: Vec<ComponentId> = scenario
@@ -232,7 +234,8 @@ pub(crate) fn build_mesh_plan(
         }
         match &binding.from {
             BindingFrom::Component(from) => {
-                let endpoint = resolve_provide_endpoint(scenario, from.component, &from.name)?;
+                let endpoint =
+                    resolve_provide_endpoint(scenario, endpoint_plan, from.component, &from.name)?;
                 bindings.push(ResolvedBinding::Component(ResolvedComponentBinding {
                     provider: from.component,
                     consumer: binding.to.component,
@@ -288,7 +291,8 @@ pub(crate) fn build_mesh_plan(
 
     let mut exports = Vec::with_capacity(scenario.exports.len());
     for ex in &scenario.exports {
-        let endpoint = resolve_provide_endpoint(scenario, ex.from.component, &ex.from.name)?;
+        let endpoint =
+            resolve_provide_endpoint(scenario, endpoint_plan, ex.from.component, &ex.from.name)?;
         exports.push(ResolvedExport {
             name: ex.name.clone(),
             provider: ex.from.component,
@@ -332,6 +336,7 @@ pub(crate) fn map_program_components<T>(
 
 fn resolve_provide_endpoint(
     scenario: &Scenario,
+    endpoint_plan: &EndpointPlan,
     component_id: ComponentId,
     provide_name: &str,
 ) -> Result<EndpointInfo, MeshError> {
@@ -345,22 +350,6 @@ fn resolve_provide_endpoint(
         ))
     })?;
 
-    let program = component.program.as_ref().ok_or_else(|| {
-        MeshError::new(format!(
-            "provide {}.{} requires a program, but component has none",
-            component_label(scenario, component_id),
-            provide_name
-        ))
-    })?;
-
-    let network = program.network().ok_or_else(|| {
-        MeshError::new(format!(
-            "provide {}.{} requires program.network, but none exists",
-            component_label(scenario, component_id),
-            provide_name
-        ))
-    })?;
-
     let endpoint_name = provide.endpoint.as_deref().ok_or_else(|| {
         MeshError::new(format!(
             "provide {}.{} is missing an endpoint reference",
@@ -369,10 +358,8 @@ fn resolve_provide_endpoint(
         ))
     })?;
 
-    let endpoint = network
-        .endpoints()
-        .iter()
-        .find(|e| e.name == endpoint_name)
+    let endpoint = endpoint_plan
+        .lookup(component_id, endpoint_name)
         .ok_or_else(|| {
             MeshError::new(format!(
                 "provide {}.{} references unknown endpoint {:?}",

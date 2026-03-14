@@ -6,9 +6,9 @@ use std::{
 };
 
 use amber_config as rc;
-use amber_manifest::{MountSource, span_for_json_pointer};
+use amber_manifest::span_for_json_pointer;
 use amber_mesh::{MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProvisionOutput};
-use amber_scenario::{ComponentId, Scenario};
+use amber_scenario::{ComponentId, ProgramMount, Scenario};
 use base64::Engine as _;
 use jsonptr::PointerBuf;
 use miette::{LabeledSpan, NamedSource, SourceSpan};
@@ -21,7 +21,6 @@ use crate::{
         CompiledScenario, Reporter, ReporterError,
         execution_guide::{GENERATED_README_FILENAME, build_execution_guide},
     },
-    storage_plan::build_storage_plan,
     targets::{
         mesh::{
             addressing::{
@@ -46,6 +45,7 @@ use crate::{
             ComponentExecutionPlan, ProgramImageOrigin, ProgramImagePart, ProgramImagePlan,
             ProgramSupport, build_component_runtime_plan, build_config_plan,
         },
+        storage::build_storage_plan,
     },
 };
 
@@ -163,8 +163,11 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
     let s = compiled.scenario();
     let scenario_digest =
         scenario_ir_digest(s).map_err(|err| ReporterError::new(err.to_string()))?;
+    let endpoint_plan = crate::targets::program_config::build_endpoint_plan(s)
+        .map_err(|e| ReporterError::new(e.to_string()))?;
     let mesh_plan = crate::targets::mesh::plan::build_mesh_plan(
         s,
+        &endpoint_plan,
         MeshOptions {
             backend_label: "kubernetes reporter",
         },
@@ -176,7 +179,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
             continue;
         };
         for mount in program.mounts() {
-            if let MountSource::Framework(capability) = &mount.source
+            if let ProgramMount::Framework { capability, .. } = mount
                 && capability.as_str() == "docker"
             {
                 return Err(ReporterError::new(
@@ -202,10 +205,11 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
     let provisioner_job_name = provisioner_job_name(&scenario_digest);
     let needs_router = mesh_plan.needs_router();
 
-    let route_ports =
-        allocate_local_route_ports(s, &mesh_plan).map_err(|e| ReporterError::new(e.to_string()))?;
+    let route_ports = allocate_local_route_ports(s, &endpoint_plan, &mesh_plan)
+        .map_err(|e| ReporterError::new(e.to_string()))?;
     let mesh_ports_by_component = allocate_mesh_ports(
         s,
+        &endpoint_plan,
         program_components,
         COMPONENT_MESH_PORT_BASE,
         &route_ports,
@@ -646,7 +650,6 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
 
     // Deployments
     for id in program_components {
-        let c = s.component(*id);
         let cnames = names.get(id).unwrap();
         let labels = component_labels(*id, &cnames.service);
         let storage_mounts = storage_plan
@@ -655,7 +658,6 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let workload_kind = "Deployment";
-        let program = c.program.as_ref().unwrap();
         let program_plan = program_plans.get(id).unwrap();
         let mesh_port = *mesh_ports_by_component.get(id).expect("mesh port missing");
         let label = component_label(s, *id);
@@ -693,14 +695,12 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
         let needs_helper_for_component = runtime_plan.needs_helper;
 
         let mut ports: Vec<ContainerPort> = Vec::new();
-        if let Some(network) = program.network() {
-            for ep in network.endpoints() {
-                ports.push(ContainerPort {
-                    name: sanitize_port_name(&ep.name),
-                    container_port: ep.port,
-                    protocol: "TCP",
-                });
-            }
+        for endpoint in endpoint_plan.component_endpoints(*id) {
+            ports.push(ContainerPort {
+                name: sanitize_port_name(&endpoint.name),
+                container_port: endpoint.port,
+                protocol: "TCP",
+            });
         }
 
         let (mut container, mut volumes) = match runtime_plan.execution {
@@ -1787,8 +1787,8 @@ fn component_config_image_source(
         config_ptr.push_back(segment);
     }
     let span = span_for_json_pointer(stored.source.as_ref(), root_span, &config_ptr.to_string())?;
-    let src =
-        NamedSource::new(crate::store::display_url(url), stored.source).with_language("json5");
+    let src = NamedSource::new(crate::frontend::store::display_url(url), stored.source)
+        .with_language("json5");
     Some(ProgramImageSource {
         src,
         span,
@@ -1808,8 +1808,8 @@ fn component_program_image_source(
     let root_span: SourceSpan = (0usize, stored.source.len()).into();
     let span = span_for_json_pointer(stored.source.as_ref(), root_span, "/program/image")
         .unwrap_or(program.whole);
-    let src =
-        NamedSource::new(crate::store::display_url(url), stored.source).with_language("json5");
+    let src = NamedSource::new(crate::frontend::store::display_url(url), stored.source)
+        .with_language("json5");
     Some(ProgramImageSource {
         src,
         span,
@@ -1948,7 +1948,7 @@ fn sanitize_label_value(s: &str) -> String {
 
 fn storage_request_for(
     scenario: &Scenario,
-    identity: &crate::storage_plan::StorageIdentity,
+    identity: &crate::targets::storage::StorageIdentity,
 ) -> String {
     scenario
         .component(identity.owner)
@@ -1959,7 +1959,7 @@ fn storage_request_for(
         .to_string()
 }
 
-fn storage_claim_name(identity: &crate::storage_plan::StorageIdentity) -> String {
+fn storage_claim_name(identity: &crate::targets::storage::StorageIdentity) -> String {
     let prefix = format!(
         "storage-{}-{}",
         sanitize_dns_name(identity.owner_moniker.as_str()),

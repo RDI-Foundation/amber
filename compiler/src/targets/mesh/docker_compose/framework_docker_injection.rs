@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use amber_manifest::{MountSource, ProvideDecl, SlotDecl};
+use amber_manifest::{ProvideDecl, SlotDecl};
 use amber_scenario::{
-    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario, SlotRef,
+    BindingEdge, BindingFrom, Component, ComponentId, Moniker, Program, ProgramMount, ProvideRef,
+    Scenario, SlotRef,
 };
 use serde_json::json;
 
@@ -42,12 +43,11 @@ pub(crate) fn rewrite_framework_docker_as_injected_component(
     }
 
     let mut docker_mount_consumers = BTreeSet::new();
-    for (id, component) in scenario.components_iter() {
-        let Some(program) = component.program.as_ref() else {
-            continue;
-        };
-        if program.mounts().iter().any(|mount| {
-            matches!(&mount.source, MountSource::Framework(capability) if capability.as_str() == "docker")
+    for (id, _) in scenario.components_iter() {
+        if scenario.component(id).program.as_ref().is_some_and(|program| {
+            program.mounts().iter().any(|mount| {
+                matches!(mount, ProgramMount::Framework { capability, .. } if capability.as_str() == "docker")
+            })
         }) {
             docker_mount_consumers.insert(id);
         }
@@ -143,7 +143,7 @@ pub(crate) fn rewrite_framework_docker_as_injected_component(
     })
 }
 
-fn injected_gateway_program() -> Result<amber_manifest::Program, MeshError> {
+fn injected_gateway_program() -> Result<Program, MeshError> {
     serde_json::from_value(json!({
         "image": FRAMEWORK_DOCKER_GATEWAY_IMAGE,
         "entrypoint": [FRAMEWORK_DOCKER_GATEWAY_ENTRYPOINT],

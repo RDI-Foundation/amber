@@ -4,16 +4,20 @@ use std::{
 };
 
 use amber_manifest::{
-    CapabilityDecl, CapabilityKind, FrameworkCapabilityName, ManifestDigest, Program, ProvideDecl,
-    SlotDecl,
+    CapabilityDecl, CapabilityKind, FrameworkCapabilityName, ManifestDigest, ProvideDecl, SlotDecl,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod graph;
 pub mod ir;
+pub mod program;
 
 pub use ir::{SCENARIO_IR_SCHEMA, SCENARIO_IR_VERSION, ScenarioIr, ScenarioIrError};
+pub use program::{
+    Endpoint, FileMount, FileMountSource, Program, ProgramCommon, ProgramCondition, ProgramEach,
+    ProgramImage, ProgramMount, ProgramNetwork, ProgramPath, ProgramVm,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

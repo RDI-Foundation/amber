@@ -16,7 +16,6 @@ use serde_with::{MapPreventDuplicates, serde_as};
 use crate::{
     error::Error,
     framework::{framework_capabilities, framework_capability},
-    interpolation::ProgramArgItem,
     names::{ChildName, ExportName, ProvideName, ResourceName, SlotName, ensure_name_no_dot},
     refs::{ManifestDigest, ManifestRef, ManifestUrl},
     schema::{
@@ -123,59 +122,28 @@ fn find_unsupported_program_syntax(
     program: &Program,
     manifest_version: &Version,
 ) -> Option<(&'static str, UnsupportedProgramSyntax)> {
-    let supports_conditionals = manifest_version >= &Version::new(0, 2, 0);
-    let supports_repeated = manifest_version >= &Version::new(0, 3, 0);
-    let (items, field_pointer): (&[ProgramArgItem], &str) = match program {
-        Program::Image(program) => (&program.entrypoint.0, "/program/entrypoint"),
-        Program::Path(program) => (&program.args.0, "/program/args"),
-        Program::Vm(_) => return None,
-    };
-
-    for (idx, item) in items.iter().enumerate() {
-        if !supports_conditionals && matches!(item, ProgramArgItem::Group(_)) {
-            return Some((
-                "0.2.0",
-                UnsupportedProgramSyntax {
-                    feature: "conditional argument groups",
-                    pointer: format!("{field_pointer}/{idx}"),
-                },
-            ));
-        }
-        if !supports_repeated
-            && matches!(
-                item,
-                ProgramArgItem::RepeatedArgv(_) | ProgramArgItem::RepeatedArg(_)
-            )
-        {
-            return Some((
-                "0.3.0",
-                UnsupportedProgramSyntax {
-                    feature: "repeated slot argument expansion",
-                    pointer: format!("{field_pointer}/{idx}"),
-                },
-            ));
-        }
+    if manifest_version < &Version::new(0, 2, 0)
+        && let Some(syntax) = program.first_conditional_syntax()
+    {
+        return Some((
+            syntax.required_version(),
+            UnsupportedProgramSyntax {
+                feature: syntax.feature(),
+                pointer: syntax.pointer(),
+            },
+        ));
     }
 
-    for (key, value) in program.env() {
-        if !supports_conditionals && value.group().is_some() {
-            return Some((
-                "0.2.0",
-                UnsupportedProgramSyntax {
-                    feature: "conditional environment values",
-                    pointer: format!("/program/env/{key}"),
-                },
-            ));
-        }
-        if !supports_repeated && value.repeated().is_some() {
-            return Some((
-                "0.3.0",
-                UnsupportedProgramSyntax {
-                    feature: "repeated slot environment expansion",
-                    pointer: format!("/program/env/{key}"),
-                },
-            ));
-        }
+    if manifest_version < &Version::new(0, 3, 0)
+        && let Some(syntax) = program.first_variadic_syntax()
+    {
+        return Some((
+            syntax.required_version(),
+            UnsupportedProgramSyntax {
+                feature: syntax.feature(),
+                pointer: syntax.pointer(),
+            },
+        ));
     }
 
     None
@@ -542,14 +510,26 @@ fn validate_endpoints(
     program: Option<&Program>,
     provides: &BTreeMap<ProvideName, ProvideDecl>,
 ) -> Result<(), Error> {
-    let mut defined_endpoints = BTreeSet::new();
+    let mut unconditional_literal_endpoints = BTreeSet::new();
+    let mut possible_literal_endpoints = BTreeSet::new();
+    let mut has_opaque_endpoint_name = false;
     if let Some(program) = program
         && let Some(network) = program.network()
     {
         for endpoint in network.endpoints() {
-            if !defined_endpoints.insert(endpoint.name.as_str()) {
+            let Some(name) = endpoint.name.as_literal() else {
+                has_opaque_endpoint_name = true;
+                continue;
+            };
+
+            possible_literal_endpoints.insert(name);
+
+            if endpoint.when.is_none()
+                && endpoint.each.is_none()
+                && !unconditional_literal_endpoints.insert(name)
+            {
                 return Err(Error::DuplicateEndpointName {
-                    name: endpoint.name.clone(),
+                    name: name.to_string(),
                 });
             }
         }
@@ -569,10 +549,89 @@ fn validate_endpoints(
             });
         };
 
-        if !defined_endpoints.contains(endpoint) {
+        if !possible_literal_endpoints.contains(endpoint) && !has_opaque_endpoint_name {
             return Err(Error::UnknownEndpoint {
                 name: endpoint.to_string(),
             });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_mount_literal_path(path: &str) -> Result<(), Error> {
+    if !path.starts_with('/') {
+        return Err(Error::InvalidMountPath {
+            path: path.to_string(),
+            message: "mount path must be absolute".to_string(),
+        });
+    }
+    if path.split('/').any(|seg| seg == "..") {
+        return Err(Error::InvalidMountPath {
+            path: path.to_string(),
+            message: "mount path must not contain `..`".to_string(),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProgramFileMountKind {
+    Config,
+    Secret,
+}
+
+fn validate_program_file_mount_source(
+    kind: ProgramFileMountKind,
+    display_path: &str,
+    literal_path: Option<&str>,
+    config_schema: Option<&ConfigSchema>,
+) -> Result<(), Error> {
+    let Some(schema) = config_schema else {
+        return Err(match kind {
+            ProgramFileMountKind::Config => Error::InvalidMountConfigPath {
+                path: display_path.to_string(),
+                message: "component has no config_schema".to_string(),
+            },
+            ProgramFileMountKind::Secret => Error::InvalidMountSecretPath {
+                path: display_path.to_string(),
+                message: "component has no config_schema".to_string(),
+            },
+        });
+    };
+
+    let Some(path) = literal_path else {
+        return Ok(());
+    };
+
+    match kind {
+        ProgramFileMountKind::Config => {
+            validate_mount_path(&schema.0, path).map_err(|message| {
+                Error::InvalidMountConfigPath {
+                    path: path.to_string(),
+                    message,
+                }
+            })?;
+            let (any_secret, _) = mount_secret_flags(&schema.0, path)?;
+            if any_secret {
+                return Err(Error::MountConfigPathIsSecret {
+                    path: path.to_string(),
+                });
+            }
+        }
+        ProgramFileMountKind::Secret => {
+            validate_mount_path(&schema.0, path).map_err(|message| {
+                Error::InvalidMountSecretPath {
+                    path: path.to_string(),
+                    message,
+                }
+            })?;
+            let (any_secret, any_non_secret) = mount_secret_flags(&schema.0, path)?;
+            if !any_secret || any_non_secret {
+                return Err(Error::MountSecretPathIsNotSecret {
+                    path: path.to_string(),
+                });
+            }
         }
     }
 
@@ -594,100 +653,73 @@ fn validate_mounts(
     let mut paths = BTreeSet::new();
 
     for mount in program.mounts() {
-        if let Some(name) = mount.name.as_deref() {
+        let is_variadic = mount.is_variadic();
+
+        if let Some(name) = mount.literal_name() {
             ensure_name_no_dot(name, "mount")?;
-            if !names.insert(name) {
+            if !is_variadic && !names.insert(name) {
                 return Err(Error::DuplicateMountName {
                     name: name.to_string(),
                 });
             }
         }
 
-        if !mount.path.starts_with('/') {
-            return Err(Error::InvalidMountPath {
-                path: mount.path.clone(),
-                message: "mount path must be absolute".to_string(),
-            });
-        }
-        if mount.path.split('/').any(|seg| seg == "..") {
-            return Err(Error::InvalidMountPath {
-                path: mount.path.clone(),
-                message: "mount path must not contain `..`".to_string(),
-            });
-        }
-        if !paths.insert(mount.path.as_str()) {
-            return Err(Error::DuplicateMountPath {
-                path: mount.path.clone(),
-            });
+        if let Some(path) = mount.literal_path() {
+            validate_mount_literal_path(path)?;
+            if !is_variadic && !paths.insert(path) {
+                return Err(Error::DuplicateMountPath {
+                    path: path.to_string(),
+                });
+            }
         }
 
-        match &mount.source {
-            MountSource::Config(path) => {
-                let Some(schema) = config_schema else {
-                    return Err(Error::InvalidMountConfigPath {
-                        path: path.clone(),
-                        message: "component has no config_schema".to_string(),
-                    });
-                };
-                validate_mount_path(&schema.0, path).map_err(|message| {
-                    Error::InvalidMountConfigPath {
-                        path: path.clone(),
-                        message,
+        if let Some(source) = mount.literal_source() {
+            match source {
+                MountSource::Config(path) => {
+                    validate_program_file_mount_source(
+                        ProgramFileMountKind::Config,
+                        &path,
+                        Some(&path),
+                        config_schema,
+                    )?;
+                }
+                MountSource::Secret(path) => {
+                    validate_program_file_mount_source(
+                        ProgramFileMountKind::Secret,
+                        &path,
+                        Some(&path),
+                        config_schema,
+                    )?;
+                }
+                MountSource::Resource(resource) => {
+                    if !resources.contains_key(resource.as_str()) {
+                        return Err(Error::UnknownMountResource { resource });
                     }
-                })?;
-                let (any_secret, _) = mount_secret_flags(&schema.0, path)?;
-                if any_secret {
-                    return Err(Error::MountConfigPathIsSecret { path: path.clone() });
                 }
-            }
-            MountSource::Secret(path) => {
-                let Some(schema) = config_schema else {
-                    return Err(Error::InvalidMountSecretPath {
-                        path: path.clone(),
-                        message: "component has no config_schema".to_string(),
-                    });
-                };
-                validate_mount_path(&schema.0, path).map_err(|message| {
-                    Error::InvalidMountSecretPath {
-                        path: path.clone(),
-                        message,
+                MountSource::Framework(name) => {
+                    let capability = name.as_str();
+                    let Some(spec) = framework_capability(capability) else {
+                        return Err(Error::UnknownFrameworkCapability {
+                            capability: capability.to_string(),
+                            help: framework_capability_help(),
+                        });
+                    };
+                    require_framework_capability_feature(
+                        capability,
+                        spec.required_experimental_feature,
+                        enabled_features,
+                    )?;
+                }
+                MountSource::Slot(slot) => {
+                    let Some(slot_decl) = slots.get(slot.as_str()) else {
+                        return Err(Error::UnknownMountSlot { slot: slot.clone() });
+                    };
+                    if slot_decl.decl.kind != CapabilityKind::Storage {
+                        return Err(Error::MountSlotRequiresStorage {
+                            slot: slot.clone(),
+                            kind: slot_decl.decl.kind,
+                        });
                     }
-                })?;
-                let (any_secret, any_non_secret) = mount_secret_flags(&schema.0, path)?;
-                if !any_secret || any_non_secret {
-                    return Err(Error::MountSecretPathIsNotSecret { path: path.clone() });
-                }
-            }
-            MountSource::Resource(resource) => {
-                if !resources.contains_key(resource.as_str()) {
-                    return Err(Error::UnknownMountResource {
-                        resource: resource.clone(),
-                    });
-                }
-            }
-            MountSource::Framework(name) => {
-                let capability = name.as_str();
-                let Some(spec) = framework_capability(capability) else {
-                    return Err(Error::UnknownFrameworkCapability {
-                        capability: capability.to_string(),
-                        help: framework_capability_help(),
-                    });
-                };
-                require_framework_capability_feature(
-                    capability,
-                    spec.required_experimental_feature,
-                    enabled_features,
-                )?;
-            }
-            MountSource::Slot(slot) => {
-                let Some(slot_decl) = slots.get(slot.as_str()) else {
-                    return Err(Error::UnknownMountSlot { slot: slot.clone() });
-                };
-                if slot_decl.decl.kind != CapabilityKind::Storage {
-                    return Err(Error::MountSlotRequiresStorage {
-                        slot: slot.clone(),
-                        kind: slot_decl.decl.kind,
-                    });
                 }
             }
         }

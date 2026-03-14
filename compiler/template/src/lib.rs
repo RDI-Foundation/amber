@@ -23,6 +23,9 @@ pub enum TemplatePart {
         slot: String,
         index: usize,
     },
+    CurrentItem {
+        item: String,
+    },
 }
 
 impl TemplatePart {
@@ -57,12 +60,17 @@ impl TemplatePart {
         }
     }
 
+    pub fn current_item(value: impl Into<String>) -> Self {
+        Self::CurrentItem { item: value.into() }
+    }
+
     pub fn as_lit(&self) -> Option<&str> {
         match self {
             Self::Lit { lit } => Some(lit.as_str()),
             Self::Config { .. } => None,
             Self::Slot { .. } => None,
             Self::Item { .. } => None,
+            Self::CurrentItem { .. } => None,
         }
     }
 
@@ -75,11 +83,41 @@ impl TemplatePart {
     }
 
     pub fn is_item(&self) -> bool {
-        matches!(self, Self::Item { .. })
+        matches!(self, Self::Item { .. } | Self::CurrentItem { .. })
     }
 }
 
 pub type TemplateString = Vec<TemplatePart>;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RepeatedTemplateSource {
+    Config { path: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MountTemplateSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub each: Option<RepeatedTemplateSource>,
+    pub path: TemplateString,
+    pub source: TemplateString,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MountSpec {
+    Literal { path: String, content: String },
+    Template(MountTemplateSpec),
+}
+
+impl MountSpec {
+    pub fn requires_config(&self) -> bool {
+        matches!(self, Self::Template(_))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -89,10 +127,25 @@ pub struct ConditionalProgramArgTemplate {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepeatedProgramArgTemplate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
+    pub each: RepeatedTemplateSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg: Option<TemplateString>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub argv: Vec<TemplateString>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ProgramArgTemplate {
     Arg(TemplateString),
-    Group(ConditionalProgramArgTemplate),
+    Conditional(ConditionalProgramArgTemplate),
+    Repeated(RepeatedProgramArgTemplate),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,10 +156,21 @@ pub struct ConditionalProgramEnvTemplate {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepeatedProgramEnvTemplate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
+    pub each: RepeatedTemplateSource,
+    pub value: TemplateString,
+    pub join: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ProgramEnvTemplate {
     Value(TemplateString),
-    Group(ConditionalProgramEnvTemplate),
+    Conditional(ConditionalProgramEnvTemplate),
+    Repeated(RepeatedProgramEnvTemplate),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

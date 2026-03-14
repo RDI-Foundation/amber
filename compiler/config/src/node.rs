@@ -287,6 +287,9 @@ pub fn compose_config_template(
                         } => {
                             out.push(TemplatePart::item(scope, slot, index, item));
                         }
+                        TemplatePart::CurrentItem { item } => {
+                            out.push(TemplatePart::current_item(item));
+                        }
                     }
                 }
                 Ok(ConfigNode::StringTemplate(out).simplify())

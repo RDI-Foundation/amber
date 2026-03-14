@@ -18,8 +18,8 @@ use amber_compiler::reporter::{
     },
 };
 use amber_config::{
-    build_root_config, env_var_for_path, eval_config_template_partial_with_context, get_by_path,
-    get_by_path_opt, render_template_string_with_context, stringify_for_mount,
+    build_root_config, env_var_for_path, eval_config_template_partial_with_context,
+    render_mount_specs, render_template_string_with_context,
 };
 use amber_mesh::{
     InboundTarget, MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MESH_PROVISION_PLAN_VERSION,
@@ -27,7 +27,7 @@ use amber_mesh::{
     MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTarget,
 };
 use amber_template::{
-    ConfigTemplatePayload, RuntimeSlotObject, RuntimeTemplateContext, TemplatePart,
+    ConfigTemplatePayload, MountSpec, RuntimeSlotObject, RuntimeTemplateContext, TemplatePart,
 };
 use base64::Engine as _;
 use fatfs::{FileSystem, FormatVolumeOptions, FsOptions, format_volume};
@@ -112,7 +112,7 @@ struct VmHostContext<'a> {
     accel: QemuAccel,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct RenderedMountFile {
     guest_path: String,
     contents: String,
@@ -147,20 +147,6 @@ enum QemuAccel {
 #[derive(Debug, Deserialize)]
 struct QemuImgInfo {
     format: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(untagged)]
-enum MountSpec {
-    Literal {
-        path: String,
-        content: String,
-    },
-    Config {
-        path: String,
-        config: String,
-        optional: bool,
-    },
 }
 
 pub(crate) async fn run_vm_init(plan: PathBuf, storage_root: Option<PathBuf>) -> Result<()> {
@@ -268,7 +254,9 @@ pub(crate) async fn run_vm_init(plan: PathBuf, storage_root: Option<PathBuf>) ->
                 build_component_config(component.runtime_config.as_ref(), &runtime_context)?;
             let mount_files = render_mount_files(
                 component.mount_spec_b64.as_deref(),
-                component_config.as_ref(),
+                component_config.as_ref().map(|(config, _)| config),
+                component_config.as_ref().map(|(_, schema)| schema),
+                &runtime_context,
             )?;
             wait_for_guestfwd_targets(component, &port_assignments, VM_GUESTFWD_READY_TIMEOUT)?;
             let vm_launch = build_vm_launch_plan(
@@ -284,7 +272,7 @@ pub(crate) async fn run_vm_init(plan: PathBuf, storage_root: Option<PathBuf>) ->
                 component,
                 &port_assignments,
                 &runtime_context,
-                component_config.as_ref(),
+                component_config.as_ref().map(|(config, _)| config),
                 &mount_files,
             )?;
             spawn_command(
@@ -991,49 +979,18 @@ async fn cleanup_vm_runtime(
 fn render_mount_files(
     mount_spec_b64: Option<&str>,
     component_config: Option<&Value>,
+    component_schema: Option<&Value>,
+    runtime_context: &RuntimeTemplateContext,
 ) -> Result<Vec<RenderedMountFile>> {
     let Some(mount_spec_b64) = mount_spec_b64 else {
         return Ok(Vec::new());
     };
     let mounts = decode_b64_json_t::<Vec<MountSpec>>("AMBER_MOUNT_SPEC_B64", mount_spec_b64)?;
-    if mounts.is_empty() {
-        return Ok(Vec::new());
-    }
     let mut rendered = Vec::with_capacity(mounts.len());
-    for mount in mounts {
-        let (path, contents) = match mount {
-            MountSpec::Literal { path, content } => (path, content),
-            MountSpec::Config {
-                path,
-                config,
-                optional,
-            } => {
-                let component_config = component_config.ok_or_else(|| {
-                    miette::miette!(
-                        "mount {} requires config resolution but no runtime config payload was \
-                         provided",
-                        path
-                    )
-                })?;
-                (
-                    path,
-                    if optional {
-                        match get_by_path_opt(component_config, &config).map_err(|err| {
-                            miette::miette!("failed to resolve config mount {}: {err}", config)
-                        })? {
-                            Some(value) => stringify_for_mount(value)
-                                .map_err(|err| miette::miette!("{err}"))?,
-                            None => String::new(),
-                        }
-                    } else {
-                        let value = get_by_path(component_config, &config).map_err(|err| {
-                            miette::miette!("failed to resolve config mount {}: {err}", config)
-                        })?;
-                        stringify_for_mount(value).map_err(|err| miette::miette!("{err}"))?
-                    },
-                )
-            }
-        };
+    for (path, contents) in
+        render_mount_specs(&mounts, component_config, component_schema, runtime_context)
+            .map_err(|err| miette::miette!("{err}"))?
+    {
         if !Path::new(&path).is_absolute() {
             return Err(miette::miette!(
                 "vm mount path {} must be absolute",
@@ -1051,7 +1008,7 @@ fn render_mount_files(
 fn build_component_config(
     payload: Option<&DirectRuntimeConfigPayload>,
     runtime_context: &RuntimeTemplateContext,
-) -> Result<Option<Value>> {
+) -> Result<Option<(Value, Value)>> {
     let Some(payload) = payload else {
         return Ok(None);
     };
@@ -1104,7 +1061,7 @@ fn build_component_config(
         }
     }
 
-    Ok(Some(component_config))
+    Ok(Some((component_config, component_schema)))
 }
 
 fn build_vm_runtime_template_context(
@@ -2995,29 +2952,6 @@ mod tests {
         assert!(rendered.contains("multipart/mixed"));
         assert!(rendered.contains("text/cloud-boothook"));
         assert!(rendered.contains("text/x-shellscript"));
-    }
-
-    #[test]
-    fn render_mount_files_uses_empty_contents_for_missing_optional_config() {
-        use base64::engine::general_purpose::STANDARD;
-
-        let mounts = vec![MountSpec::Config {
-            path: "/etc/secret.txt".to_string(),
-            config: "secret_value".to_string(),
-            optional: true,
-        }];
-        let mount_spec_b64 = STANDARD.encode(serde_json::to_vec(&mounts).unwrap());
-
-        let rendered = render_mount_files(Some(&mount_spec_b64), Some(&serde_json::json!({})))
-            .expect("render mount files");
-
-        assert_eq!(
-            rendered,
-            vec![RenderedMountFile {
-                guest_path: "/etc/secret.txt".to_string(),
-                contents: String::new(),
-            }]
-        );
     }
 
     #[test]

@@ -21,11 +21,9 @@ pub use framework::{
 };
 pub use interpolation::{
     EachPath, FileRefSpec, InlineStringSpec, InterpolatedPart, InterpolatedString,
-    InterpolationSource, ProgramArgGroup, ProgramArgItem, ProgramArgList, ProgramEntrypoint,
-    ProgramEnvValue, RawProgramArgGroup, RawProgramArgItem, RawProgramArgList,
-    RawProgramEntrypoint, RawProgramEnvGroup, RawProgramEnvValue, RawRepeatedProgramArg,
-    RawRepeatedProgramArgv, RawRepeatedProgramEnv, RepeatedProgramArg, RepeatedProgramArgv,
-    RepeatedProgramEnv, WhenPath,
+    InterpolationSource, ProgramArgItem, ProgramArgList, ProgramArgValue, ProgramEntrypoint,
+    ProgramEnvValue, RawProgramArgItem, RawProgramArgList, RawProgramArgValue,
+    RawProgramEntrypoint, RawProgramEnvValue, WhenPath,
 };
 pub use manifest::{ExperimentalFeature, Manifest, RawManifest};
 pub use names::{
@@ -36,12 +34,13 @@ pub use refs::{ManifestDigest, ManifestRef, ManifestUrl};
 pub(crate) use schema::binding_target_key_for_binding;
 pub use schema::{
     Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityDecl, CapabilityKind,
-    CapabilityTransport, ComponentDecl, ComponentRef, ConfigSchema, Endpoint, EnvironmentDecl,
-    ExportTarget, LocalComponentRef, ManifestBinding, MountSource, Network, NetworkProtocol,
-    Program, ProgramCommon, ProgramImage, ProgramMount, ProgramNetworkRef, ProgramPath,
-    ProgramVmField, ProvideDecl, RawBinding, RawExportTarget, RawProgram, RawProgramCommon,
-    RawProgramImage, RawProgramPath, RawProgramVmField, RawVmCloudInit, RawVmProgram, ResourceDecl,
-    SlotDecl, VmCloudInit, VmEgress, VmNetwork, VmProgram, VmScalarU32,
+    CapabilityTransport, ComponentDecl, ComponentRef, ConfigSchema, Endpoint, EndpointPort,
+    EnvironmentDecl, ExportTarget, LocalComponentRef, ManifestBinding, MountSource, Network,
+    NetworkProtocol, Program, ProgramCommandKind, ProgramCommon, ProgramConfigUseSite,
+    ProgramImage, ProgramMount, ProgramNetworkRef, ProgramPath, ProgramVmField, ProvideDecl,
+    RawBinding, RawExportTarget, RawProgram, RawProgramCommon, RawProgramImage, RawProgramPath,
+    RawProgramVmField, RawVmCloudInit, RawVmProgram, ResourceDecl, SlotDecl, VmCloudInit, VmEgress,
+    VmNetwork, VmProgram, VmScalarU32,
 };
 pub use slot_query::{
     SlotQuery, SlotQueryError, SlotQueryValidation, SlotTarget, parse_slot_query,

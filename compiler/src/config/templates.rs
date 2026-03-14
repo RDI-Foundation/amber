@@ -4,7 +4,7 @@ use amber_config as rc;
 use amber_scenario::{Component, ComponentId};
 use serde_json::Value;
 
-use crate::config_template;
+use super::template;
 
 #[derive(Clone, Debug)]
 pub struct TemplateError {
@@ -57,19 +57,17 @@ pub fn compose_root_config_templates(
         } else if schema.is_none() {
             rc::RootConfigTemplate::Node(rc::ConfigNode::empty_object())
         } else {
-            let initial = match config_template::parse_instance_config_template(
-                c.config.as_ref(),
-                parent_schema,
-            ) {
-                Ok(t) => t,
-                Err(err) => {
-                    errors.push(TemplateError {
-                        component: id,
-                        message: err.to_string(),
-                    });
-                    rc::ConfigNode::empty_object()
-                }
-            };
+            let initial =
+                match template::parse_instance_config_template(c.config.as_ref(), parent_schema) {
+                    Ok(t) => t,
+                    Err(err) => {
+                        errors.push(TemplateError {
+                            component: id,
+                            message: err.to_string(),
+                        });
+                        rc::ConfigNode::empty_object()
+                    }
+                };
 
             let composed = match rc::compose_config_template(initial, parent_template) {
                 Ok(t) => t.simplify(),

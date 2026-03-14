@@ -155,7 +155,7 @@ fn labels_for_manifest_error(
                 .or(spans.manifest_version);
             vec![primary(
                 span_or_default(span),
-                Some("conditional argument group used here".to_string()),
+                Some("unsupported program syntax used here".to_string()),
             )]
         }
         ManifestError::InvalidName { kind, name } => labels_for_invalid_name(spans, kind, name),

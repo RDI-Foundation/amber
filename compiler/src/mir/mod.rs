@@ -4,11 +4,13 @@ use std::{
 };
 
 use amber_manifest::{BindingSource, BindingTarget, Manifest};
-use amber_scenario::{BindingEdge, BindingFrom, Component, ComponentId, Scenario, SlotRef};
+use amber_scenario::{
+    BindingEdge, BindingFrom, Component, ComponentId, ProgramMount, Scenario, SlotRef,
+};
 use miette::Diagnostic;
 use thiserror::Error;
 
-use crate::{DigestStore, Provenance, manifest_table};
+use crate::{DigestStore, Provenance, linker::manifest_table};
 
 #[derive(Debug, Error, Diagnostic)]
 #[non_exhaustive]
@@ -530,6 +532,7 @@ struct DceSolver<'a> {
     scenario: &'a Scenario,
     incoming: Vec<Vec<usize>>,
     program_used_slots: Vec<HashSet<String>>,
+    program_used_resources: Vec<HashSet<String>>,
     keep_components: Vec<bool>,
     live_programs: Vec<bool>,
     live_slots: HashSet<CapKey>,
@@ -555,10 +558,30 @@ impl<'a> DceSolver<'a> {
         let program_used_slots = scenario
             .components
             .iter()
-            .map(|component| {
+            .enumerate()
+            .map(|(idx, component)| {
                 component
                     .as_ref()
-                    .map(|component| collect_program_used_slots(component).into_iter().collect())
+                    .map(|component| {
+                        let _ = idx;
+                        collect_program_used_slots(component).into_iter().collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        let program_used_resources = scenario
+            .components
+            .iter()
+            .enumerate()
+            .map(|(idx, component)| {
+                component
+                    .as_ref()
+                    .map(|component| {
+                        let _ = idx;
+                        collect_program_used_resources(component)
+                            .into_iter()
+                            .collect()
+                    })
                     .unwrap_or_default()
             })
             .collect();
@@ -568,6 +591,7 @@ impl<'a> DceSolver<'a> {
             scenario,
             incoming,
             program_used_slots,
+            program_used_resources,
             keep_components: vec![false; n],
             live_programs: vec![false; n],
             live_slots: HashSet::new(),
@@ -711,13 +735,21 @@ impl<'a> DceSolver<'a> {
         }
     }
     fn mark_program_used_slots(&mut self, component: ComponentId) {
-        for slot in collect_program_used_slots(self.scenario.component(component)) {
+        let slots: Vec<String> = self.program_used_slots[component.0]
+            .iter()
+            .cloned()
+            .collect();
+        for slot in slots {
             self.mark_slot(component.0, &slot);
         }
     }
 
     fn mark_program_used_resources(&mut self, component: ComponentId) {
-        for resource in collect_program_used_resources(self.scenario.component(component)) {
+        let resources: Vec<String> = self.program_used_resources[component.0]
+            .iter()
+            .cloned()
+            .collect();
+        for resource in resources {
             self.mark_resource(component.0, &resource);
         }
     }
@@ -778,12 +810,6 @@ pub(crate) fn collect_program_used_slots(component: &amber_scenario::Component) 
     if program.visit_slot_uses(&mut mark_slot) {
         return all_slots();
     }
-
-    for mount in program.mounts() {
-        if let amber_manifest::MountSource::Slot(slot) = &mount.source {
-            mark_slot(slot);
-        }
-    }
     used.into_iter().collect()
 }
 
@@ -794,7 +820,7 @@ fn collect_program_used_resources(component: &amber_scenario::Component) -> Vec<
 
     let mut used = BTreeSet::new();
     for mount in program.mounts() {
-        if let amber_manifest::MountSource::Resource(resource) = &mount.source {
+        if let ProgramMount::Resource { resource, .. } = mount {
             used.insert(resource.clone());
         }
     }
@@ -845,10 +871,11 @@ fn compute_keep_set(
 
 #[cfg(test)]
 mod tests {
-    use amber_manifest::SlotDecl;
+    use amber_manifest::{Program as ManifestProgram, SlotDecl};
     use amber_scenario::{Moniker, ProvideRef};
 
     use super::*;
+    use crate::linker::program_lowering::lower_program;
 
     fn component(id: usize, moniker: &str) -> Component {
         Component {
@@ -867,13 +894,20 @@ mod tests {
         }
     }
 
+    fn lower_test_program(id: usize, value: serde_json::Value) -> amber_scenario::Program {
+        let program: ManifestProgram = serde_json::from_value(value).expect("manifest program");
+        lower_program(ComponentId(id), &program, None).expect("program should lower")
+    }
+
     #[test]
     fn rewrite_bindings_preserves_duplicate_authored_edges() {
-        let consumer_program = serde_json::from_value(serde_json::json!({
-            "image": "consumer",
-            "entrypoint": ["consumer"],
-        }))
-        .expect("program");
+        let consumer_program = lower_test_program(
+            1,
+            serde_json::json!({
+                "image": "consumer",
+                "entrypoint": ["consumer"],
+            }),
+        );
         let mut scenario = Scenario {
             root: ComponentId(0),
             components: vec![
@@ -931,26 +965,28 @@ mod tests {
 
     #[test]
     fn collect_program_used_slots_covers_program_surface() {
-        let program = serde_json::from_value(serde_json::json!({
-            "path": "${slots.runner.path}",
-            "args": [
-                "${slots.api.url}",
-                { "when": "slots.gate", "argv": ["--gate"] },
-                { "each": "slots.peers", "argv": ["--peer", "${item.url}"] },
-            ],
-            "env": {
-                "HEADERS_URL": "${slots.headers.url}",
-                "PEERS": {
-                    "each": "slots.peers",
-                    "value": "${item.url}",
-                    "join": ","
-                }
-            },
-            "mounts": [
-                { "path": "/var/lib/state", "from": "slots.state" }
-            ]
-        }))
-        .expect("program");
+        let program = lower_test_program(
+            0,
+            serde_json::json!({
+                "path": "${slots.runner.path}",
+                "args": [
+                    "${slots.api.url}",
+                    { "when": "slots.gate", "argv": ["--gate"] },
+                    { "each": "slots.peers", "argv": ["--peer", "${item.url}"] },
+                ],
+                "env": {
+                    "HEADERS_URL": "${slots.headers.url}",
+                    "PEERS": {
+                        "each": "slots.peers",
+                        "value": "${item.url}",
+                        "join": ","
+                    }
+                },
+                "mounts": [
+                    { "path": "/var/lib/state", "from": "slots.state" }
+                ]
+            }),
+        );
 
         let mut component = component(0, "/");
         component.program = Some(program);
@@ -991,14 +1027,16 @@ mod tests {
 
     #[test]
     fn collect_program_used_slots_returns_all_slots_for_whole_slots_interpolation() {
-        let program = serde_json::from_value(serde_json::json!({
-            "image": "runner",
-            "entrypoint": ["runner"],
-            "env": {
-                "ALL_SLOTS": "${slots}"
-            }
-        }))
-        .expect("program");
+        let program = lower_test_program(
+            0,
+            serde_json::json!({
+                "image": "runner",
+                "entrypoint": ["runner"],
+                "env": {
+                    "ALL_SLOTS": "${slots}"
+                }
+            }),
+        );
 
         let mut component = component(0, "/");
         component.program = Some(program);
@@ -1012,6 +1050,37 @@ mod tests {
         assert_eq!(
             collect_program_used_slots(&component),
             vec!["admin".to_string(), "api".to_string()]
+        );
+    }
+
+    #[test]
+    fn collect_program_used_slots_normalizes_lowered_file_mount_slot_queries() {
+        let program = lower_test_program(
+            0,
+            serde_json::json!({
+                "image": "runner",
+                "entrypoint": ["runner"],
+                "mounts": [
+                    {
+                        "path": "/cfg/${slots.api.url}",
+                        "from": "config.mount_file"
+                    }
+                ]
+            }),
+        );
+
+        let mut component = component(0, "/");
+        component.program = Some(program);
+        component
+            .slots
+            .insert("api".to_string(), slot_decl("http", false, false));
+        component
+            .slots
+            .insert("unused".to_string(), slot_decl("http", false, false));
+
+        assert_eq!(
+            collect_program_used_slots(&component),
+            vec!["api".to_string()]
         );
     }
 }

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
-use amber_manifest::{CapabilityKind, MountSource};
-use amber_scenario::{BindingFrom, ComponentId, Scenario};
+use amber_manifest::CapabilityKind;
+use amber_scenario::{BindingFrom, ComponentId, ProgramMount, Scenario};
 use sha2::Digest as _;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -86,11 +86,10 @@ pub(crate) fn build_storage_plan(
         let Some(program) = component.program.as_ref() else {
             continue;
         };
-
         let mut mounts = Vec::new();
         for mount in program.mounts() {
-            let (identity, source_name) = match &mount.source {
-                MountSource::Slot(slot) => {
+            let (identity, source_name, mount_path) = match mount {
+                ProgramMount::Slot { path, slot } => {
                     let Some(slot_decl) = component.slots.get(slot.as_str()) else {
                         continue;
                     };
@@ -108,9 +107,9 @@ pub(crate) fn build_storage_plan(
                                 component.moniker, slot
                             )
                         });
-                    (identity, slot.clone())
+                    (identity, slot.clone(), path.clone())
                 }
-                MountSource::Resource(resource) => {
+                ProgramMount::Resource { path, resource } => {
                     let Some(resource_decl) = component.resources.get(resource.as_str()) else {
                         unreachable!(
                             "manifest validation should reject unknown mounted resource before \
@@ -129,15 +128,16 @@ pub(crate) fn build_storage_plan(
                             resource: resource.clone(),
                         },
                         resource.clone(),
+                        path.clone(),
                     )
                 }
-                _ => continue,
+                ProgramMount::File(_) | ProgramMount::Framework { .. } => continue,
             };
 
             mounts.push(StorageMount {
                 identity,
                 slot: source_name,
-                mount_path: mount.path.clone(),
+                mount_path,
             });
         }
 

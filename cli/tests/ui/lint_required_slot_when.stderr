@@ -1,6 +1,6 @@
 manifest::required_slot_when
 
-  x this `when` condition is unnecessary: slot `api` is required, so it is always bound and this argv group is always included (in component /child)
+  x this `when` condition is unnecessary: slot `api` is required, so it is always bound and this argv item is always included (in component /child)
     ,-[<CARGO_MANIFEST_DIR>/tests/ui/lint_required_slot_when_child.json5:11:15]
  10 |       {
  11 |         when: "slots.api",
@@ -9,5 +9,5 @@ manifest::required_slot_when
  12 |         argv: ["--peer", "${slots.api.url}"],
     `----
   help: warning treated as error because it was denied via `-D warnings`
-        Remove `when` if this argv group should always be included. If it should disappear when the parent does not bind the slot, mark `slots.api` as `optional: true`.
+        Remove `when` if this argv item should always be included. If it should disappear when the parent does not bind the slot, mark `slots.api` as `optional: true`.
 Error:   × check failed

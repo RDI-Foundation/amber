@@ -7,25 +7,31 @@ use std::{
 use amber_config as rc;
 use amber_manifest::{
     InterpolatedPart, InterpolationSource, MountSource, ProgramArgItem, VmScalarU32,
-    framework_capability,
 };
-use amber_scenario::{ComponentId, Scenario};
+use amber_scenario::{
+    ComponentId, FileMount, FileMountSource, Program, ProgramCondition, ProgramEach, ProgramMount,
+    Scenario,
+};
 use amber_template::{
-    ConditionalProgramArgTemplate, ConditionalProgramEnvTemplate, ProgramArgTemplate,
-    ProgramEnvTemplate, ProgramTemplateSpec, TemplatePart, TemplateSpec, TemplateString,
+    ConditionalProgramArgTemplate, ConditionalProgramEnvTemplate, MountSpec, MountTemplateSpec,
+    ProgramArgTemplate, ProgramEnvTemplate, ProgramTemplateSpec, RepeatedProgramArgTemplate,
+    RepeatedProgramEnvTemplate, RepeatedTemplateSource, TemplatePart, TemplateSpec, TemplateString,
 };
 use base64::Engine as _;
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
-    config_resolution::{
-        QueryResolution, parse_query_segments, resolve_config_query_node,
-        validate_config_query_syntax,
+    config::{
+        query::{
+            ConfigEachResolution, ConfigPresence, QueryResolution,
+            resolve_config_each_values as resolve_shared_config_each_values,
+            resolve_config_presence, resolve_config_query_node, validate_config_query_syntax,
+        },
+        scope::{RuntimeConfigView, build_runtime_config_view},
+        templates,
     },
-    config_scope::{RuntimeConfigView, build_runtime_config_view},
-    config_templates,
-    slot_query::{
+    slots::{
         SlotObject, SlotTarget, SlotValue, parse_slot_query, resolve_slot_query,
         slot_query_is_present,
     },
@@ -40,6 +46,30 @@ pub(crate) struct ConfigPlan {
     pub(crate) needs_helper: bool,
     pub(crate) needs_runtime_config: bool,
     pub(crate) runtime_views: HashMap<ComponentId, RuntimeConfigView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExpandedEndpoint {
+    pub(crate) name: String,
+    pub(crate) port: u16,
+    pub(crate) protocol: amber_manifest::NetworkProtocol,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct EndpointPlan {
+    by_component: HashMap<ComponentId, Vec<ExpandedEndpoint>>,
+}
+
+impl EndpointPlan {
+    pub(crate) fn component_endpoints(&self, id: ComponentId) -> &[ExpandedEndpoint] {
+        self.by_component.get(&id).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    pub(crate) fn lookup(&self, id: ComponentId, endpoint_name: &str) -> Option<&ExpandedEndpoint> {
+        self.component_endpoints(id)
+            .iter()
+            .find(|endpoint| endpoint.name == endpoint_name)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,13 +180,6 @@ impl ProgramPlan {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ConfigPresence {
-    Present,
-    Absent,
-    Runtime,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) enum ProgramSourcePlan {
     Image {
@@ -195,18 +218,17 @@ pub(crate) struct ComponentRuntimePlan<'a> {
     pub(crate) execution: ComponentExecutionPlan<'a>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(untagged)]
-pub(crate) enum MountSpec {
-    Literal {
-        path: String,
-        content: String,
-    },
-    Config {
-        path: String,
-        config: String,
-        optional: bool,
-    },
+fn compose_component_config_templates(
+    scenario: &Scenario,
+) -> Result<HashMap<ComponentId, rc::RootConfigTemplate>, MeshError> {
+    let composed = templates::compose_root_config_templates(scenario.root, &scenario.components);
+    if let Some(err) = composed.errors.first() {
+        return Err(MeshError::new(format!(
+            "failed to compose component config templates: {}",
+            err.message
+        )));
+    }
+    Ok(composed.templates)
 }
 
 pub(crate) fn build_config_plan(
@@ -216,39 +238,7 @@ pub(crate) fn build_config_plan(
     runtime_address_resolution: RuntimeAddressResolution,
     slot_values_by_component: &HashMap<ComponentId, BTreeMap<String, SlotValue>>,
 ) -> Result<ConfigPlan, MeshError> {
-    let composed =
-        config_templates::compose_root_config_templates(scenario.root, &scenario.components);
-    if let Some(err) = composed.errors.first() {
-        return Err(MeshError::new(format!(
-            "failed to compose component config templates: {}",
-            err.message
-        )));
-    }
-
-    let mut used_config_paths_by_component: HashMap<ComponentId, BTreeSet<String>> =
-        HashMap::with_capacity(program_components.len());
-    for id in program_components {
-        let component = scenario.component(*id);
-        let Some(program) = component.program.as_ref() else {
-            continue;
-        };
-        let template_opt = composed
-            .templates
-            .get(id)
-            .and_then(|template| template.node());
-        let slots = slot_values_by_component.get(id).ok_or_else(|| {
-            MeshError::new(format!(
-                "internal error: missing slot values for {}",
-                component_label(scenario, *id)
-            ))
-        })?;
-        let used_paths = program_used_config_paths(program, template_opt, slots)?;
-        if !used_paths.is_empty() {
-            used_config_paths_by_component.insert(*id, used_paths);
-        }
-    }
-
-    let resolved_templates = composed.templates;
+    let resolved_templates = compose_component_config_templates(scenario)?;
 
     let root_schema = scenario
         .component(scenario.root)
@@ -352,12 +342,16 @@ pub(crate) fn build_config_plan(
         program_plans.insert(*id, plan);
     }
 
-    let mount_specs = build_mount_specs(scenario, program_components, &resolved_templates)?;
-    let mounts_need_runtime = mount_specs.values().any(|specs| {
-        specs
-            .iter()
-            .any(|spec| matches!(spec, MountSpec::Config { .. }))
-    });
+    let mount_specs = build_mount_specs(
+        scenario,
+        program_components,
+        runtime_address_resolution,
+        &resolved_templates,
+        slot_values_by_component,
+    )?;
+    let mounts_need_runtime = mount_specs
+        .values()
+        .any(|specs| mount_specs_need_config(specs));
     needs_runtime_config = needs_runtime_config || mounts_need_runtime;
     if !mount_specs.is_empty() {
         needs_helper = true;
@@ -441,8 +435,15 @@ fn used_component_paths(
 
     if let Some(specs) = mount_specs {
         for spec in specs {
-            if let MountSpec::Config { config, .. } = spec {
-                used.insert(config.clone());
+            if let MountSpec::Template(spec) = spec {
+                if let Some(when) = &spec.when {
+                    used.insert(when.clone());
+                }
+                if let Some(RepeatedTemplateSource::Config { path }) = &spec.each {
+                    used.insert(path.clone());
+                }
+                collect_used_paths_from_template_string(&spec.path, &mut used);
+                collect_mount_source_used_paths(&spec.source, &mut used);
             }
         }
     }
@@ -454,25 +455,43 @@ fn used_component_paths(
     used
 }
 
+fn collect_mount_source_used_paths(source: &TemplateString, out: &mut BTreeSet<String>) {
+    collect_used_paths_from_template_string(source, out);
+    match render_template_string_static(source) {
+        Ok(rendered) => {
+            if let Ok(MountSource::Config(path) | MountSource::Secret(path)) =
+                rendered.parse::<MountSource>()
+            {
+                out.insert(path);
+            }
+        }
+        Err(_) => {
+            // Dynamic mount sources can select arbitrary config keys at runtime, so the runtime
+            // config view must conservatively include the full component config.
+            out.insert(String::new());
+        }
+    }
+}
+
 fn collect_vm_cloud_init_runtime_paths(
     scenario: &Scenario,
     id: ComponentId,
-    program: &amber_manifest::Program,
+    program: &Program,
     slots: &BTreeMap<String, SlotValue>,
     template_opt: Option<&rc::ConfigNode>,
     out: &mut BTreeSet<String>,
 ) -> Result<(), MeshError> {
-    let amber_manifest::Program::Vm(program) = program else {
+    let Program::Vm(program) = program else {
         return Ok(());
     };
     for (field_name, raw) in [
         (
             "program.vm.cloud_init.user_data",
-            program.0.cloud_init.user_data.as_deref(),
+            program.cloud_init.user_data.as_deref(),
         ),
         (
             "program.vm.cloud_init.vendor_data",
-            program.0.cloud_init.vendor_data.as_deref(),
+            program.cloud_init.vendor_data.as_deref(),
         ),
     ] {
         let Some(raw) = raw else {
@@ -500,17 +519,17 @@ fn collect_vm_cloud_init_runtime_paths(
 }
 
 fn collect_vm_scalar_runtime_paths(
-    program: &amber_manifest::Program,
+    program: &Program,
     component: &str,
     template_opt: Option<&rc::ConfigNode>,
     out: &mut BTreeSet<String>,
 ) -> Result<(), MeshError> {
-    let amber_manifest::Program::Vm(program) = program else {
+    let Program::Vm(program) = program else {
         return Ok(());
     };
     for (field_name, scalar) in [
-        ("program.vm.cpus", &program.0.cpus),
-        ("program.vm.memory_mib", &program.0.memory_mib),
+        ("program.vm.cpus", &program.cpus),
+        ("program.vm.memory_mib", &program.memory_mib),
     ] {
         if let VmScalarResolutionU32::RuntimeConfig(path) =
             resolve_vm_scalar_u32(template_opt, scalar, component, field_name)?
@@ -666,7 +685,7 @@ fn encode_json_b64(value: &(impl Serialize + ?Sized)) -> Result<String, serde_js
 pub(crate) fn mount_specs_need_config(specs: &[MountSpec]) -> bool {
     specs
         .iter()
-        .any(|spec| matches!(spec, MountSpec::Config { .. }))
+        .any(|spec| matches!(spec, MountSpec::Template(_)))
 }
 
 pub(crate) fn build_component_runtime_plan<'a>(
@@ -798,9 +817,22 @@ fn collect_used_paths_from_template_spec(spec: &TemplateSpec, out: &mut BTreeSet
     for arg in &spec.program.entrypoint {
         match arg {
             ProgramArgTemplate::Arg(ts) => collect_used_paths_from_template_string(ts, out),
-            ProgramArgTemplate::Group(group) => {
+            ProgramArgTemplate::Conditional(group) => {
                 out.insert(group.when.clone());
                 for ts in &group.argv {
+                    collect_used_paths_from_template_string(ts, out);
+                }
+            }
+            ProgramArgTemplate::Repeated(repeated) => {
+                if let Some(when) = &repeated.when {
+                    out.insert(when.clone());
+                }
+                let RepeatedTemplateSource::Config { path } = &repeated.each;
+                out.insert(path.clone());
+                if let Some(arg) = &repeated.arg {
+                    collect_used_paths_from_template_string(arg, out);
+                }
+                for ts in &repeated.argv {
                     collect_used_paths_from_template_string(ts, out);
                 }
             }
@@ -809,9 +841,17 @@ fn collect_used_paths_from_template_spec(spec: &TemplateSpec, out: &mut BTreeSet
     for value in spec.program.env.values() {
         match value {
             ProgramEnvTemplate::Value(ts) => collect_used_paths_from_template_string(ts, out),
-            ProgramEnvTemplate::Group(group) => {
+            ProgramEnvTemplate::Conditional(group) => {
                 out.insert(group.when.clone());
                 collect_used_paths_from_template_string(&group.value, out);
+            }
+            ProgramEnvTemplate::Repeated(repeated) => {
+                if let Some(when) = &repeated.when {
+                    out.insert(when.clone());
+                }
+                let RepeatedTemplateSource::Config { path } = &repeated.each;
+                out.insert(path.clone());
+                collect_used_paths_from_template_string(&repeated.value, out);
             }
         }
     }
@@ -825,10 +865,34 @@ fn collect_used_paths_from_template_string(ts: &TemplateString, out: &mut BTreeS
     }
 }
 
+fn template_string_uses_config(value: &TemplateString) -> bool {
+    value
+        .iter()
+        .any(|part| matches!(part, TemplatePart::Config { .. }))
+}
+
+fn file_mount_uses_config(mount: &FileMount) -> bool {
+    mount
+        .when
+        .as_ref()
+        .is_some_and(|when| matches!(when, ProgramCondition::Config { .. }))
+        || mount
+            .each
+            .as_ref()
+            .is_some_and(|each| matches!(each, ProgramEach::Config { .. }))
+        || template_string_uses_config(&mount.path)
+        || matches!(
+            &mount.source,
+            FileMountSource::Config { .. } | FileMountSource::Secret { .. }
+        )
+}
+
 fn build_mount_specs(
     scenario: &Scenario,
     program_components: &[ComponentId],
+    runtime_address_resolution: RuntimeAddressResolution,
     resolved_templates: &HashMap<ComponentId, rc::RootConfigTemplate>,
+    slot_values_by_component: &HashMap<ComponentId, BTreeMap<String, SlotValue>>,
 ) -> Result<HashMap<ComponentId, Vec<MountSpec>>, MeshError> {
     let mut out = HashMap::new();
 
@@ -842,93 +906,185 @@ fn build_mount_specs(
             continue;
         }
 
-        let has_config_or_secret_mount = program.mounts().iter().any(|mount| {
-            matches!(
-                mount.source,
-                MountSource::Config(_) | MountSource::Secret(_)
-            )
+        let slots = slot_values_by_component.get(id).ok_or_else(|| {
+            MeshError::new(format!(
+                "internal error: missing slot values for {}",
+                component_label(scenario, *id)
+            ))
+        })?;
+        let needs_component_config = program.mounts().iter().any(|mount| {
+            matches!(mount, ProgramMount::File(file_mount) if file_mount_uses_config(file_mount))
         });
 
-        if has_config_or_secret_mount && component.config_schema.is_none() {
+        if needs_component_config && component.config_schema.is_none() {
             return Err(MeshError::new(format!(
                 "component {} requires config_schema when using program.mounts",
                 component_label(scenario, *id)
             )));
         }
 
-        let template_opt = if has_config_or_secret_mount {
+        let template_opt = if needs_component_config {
             let template = resolved_templates.get(id).ok_or_else(|| {
                 MeshError::new(format!(
                     "no config template for component {}",
                     component_label(scenario, *id)
                 ))
             })?;
-            Some(template.node())
+            template.node()
         } else {
             None
         };
-        let mount_schema_leaves = if has_config_or_secret_mount {
-            Some(
-                rc::collect_schema_leaves(
-                    component
-                        .config_schema
-                        .as_ref()
-                        .expect("config mounts require config schema"),
-                )
-                .leaves,
-            )
-        } else {
-            None
-        };
+        let component_schema = component.config_schema.as_ref();
 
         let mut specs = Vec::new();
-        for mount in program.mounts() {
-            let query = match &mount.source {
-                MountSource::Config(path) | MountSource::Secret(path) => path,
-                MountSource::Resource(_) | MountSource::Slot(_) => {
-                    // Storage mounts are planned separately from helper-written file mounts.
-                    continue;
-                }
-                MountSource::Framework(name) => {
-                    if framework_capability(name.as_str()).is_none() {
-                        return Err(MeshError::new(format!(
-                            "unknown framework mount source framework.{} in {}",
-                            name,
-                            component_label(scenario, *id)
-                        )));
-                    }
-                    // Handled by target-specific runtime wiring. Config mount specs only cover
-                    // config/secret file materialization.
-                    continue;
-                }
-                other => {
-                    return Err(MeshError::new(format!(
-                        "reserved mount source {other} in {}",
-                        component_label(scenario, *id)
-                    )));
-                }
+        for (mount_idx, mount) in program.mounts().iter().enumerate() {
+            let ProgramMount::File(mount) = mount else {
+                continue;
             };
 
-            let template_opt = template_opt.expect("config/secret mounts require template");
-            let mount_optional = mount_schema_leaves
-                .as_deref()
-                .is_some_and(|leaves| mount_query_is_optional(leaves, query));
-            match resolve_config_query_for_mount(template_opt, query, mount_optional)? {
-                MountResolution::Static(value) => {
-                    let content = rc::stringify_for_mount(&value)
-                        .map_err(|e| MeshError::new(e.to_string()))?;
-                    specs.push(MountSpec::Literal {
-                        path: mount.path.clone(),
-                        content,
-                    });
+            let when = resolve_file_mount_when(mount.when.as_ref(), template_opt, slots)?;
+            if matches!(when, ResolvedWhen::Absent) {
+                continue;
+            }
+            let runtime_when = match &when {
+                ResolvedWhen::Runtime(query) => Some(query.clone()),
+                ResolvedWhen::Present | ResolvedWhen::Absent => None,
+            };
+            let location = format!("program.mounts[{mount_idx}]");
+
+            let emit_spec = |item_resolution,
+                             runtime_each: Option<RepeatedTemplateSource>,
+                             specs: &mut Vec<MountSpec>|
+             -> Result<(), MeshError> {
+                let mut needs_helper_for_mount = false;
+                let mut needs_runtime_config_for_mount = false;
+                let path_ts = resolve_lowered_template_string(
+                    scenario,
+                    *id,
+                    &format!("{location}.path"),
+                    runtime_address_resolution,
+                    &mount.path,
+                    slots,
+                    template_opt,
+                    item_resolution,
+                    &mut needs_helper_for_mount,
+                    &mut needs_runtime_config_for_mount,
+                    true,
+                )?;
+                let source_ts = resolve_lowered_mount_source(
+                    scenario,
+                    *id,
+                    &format!("{location}.from"),
+                    runtime_address_resolution,
+                    &mount.source,
+                    slots,
+                    template_opt,
+                    item_resolution,
+                    &mut needs_helper_for_mount,
+                    &mut needs_runtime_config_for_mount,
+                    true,
+                )?;
+
+                if runtime_when.is_some()
+                    || runtime_each.is_some()
+                    || needs_helper_for_mount
+                    || needs_runtime_config_for_mount
+                {
+                    specs.push(MountSpec::Template(MountTemplateSpec {
+                        when: runtime_when.clone(),
+                        each: runtime_each,
+                        path: path_ts,
+                        source: source_ts,
+                    }));
+                    return Ok(());
                 }
-                MountResolution::Runtime => {
-                    specs.push(MountSpec::Config {
-                        path: mount.path.clone(),
-                        config: query.clone(),
-                        optional: mount_optional,
-                    });
+
+                let path = render_template_string_static(&path_ts)?;
+                let source_raw = render_template_string_static(&source_ts)?;
+                let source = rc::parse_rendered_file_mount_source(&source_raw).map_err(|err| {
+                    MeshError::new(format!(
+                        "invalid mount source `{source_raw}` in {} {location}: {err}",
+                        component_label(scenario, *id)
+                    ))
+                })?;
+                let component_schema = component_schema.expect("file mounts require config_schema");
+                rc::validate_rendered_file_mount_source(component_schema, source).map_err(
+                    |err| {
+                        MeshError::new(format!(
+                            "invalid mount source `{source_raw}` in {} {location}: {err}",
+                            component_label(scenario, *id)
+                        ))
+                    },
+                )?;
+                match source {
+                    rc::RenderedFileMountSource::Config { path: path_query }
+                    | rc::RenderedFileMountSource::Secret { path: path_query } => {
+                        match resolve_config_query_for_mount(template_opt, path_query)? {
+                            MountResolution::Static(value) => {
+                                let content = rc::stringify_for_mount(&value)
+                                    .map_err(|err| MeshError::new(err.to_string()))?;
+                                specs.push(MountSpec::Literal { path, content });
+                            }
+                            MountResolution::Runtime => {
+                                specs.push(MountSpec::Template(MountTemplateSpec {
+                                    when: runtime_when.clone(),
+                                    each: runtime_each,
+                                    path: path_ts,
+                                    source: source_ts,
+                                }));
+                            }
+                        }
+                    }
                 }
+                Ok(())
+            };
+
+            match mount.each.as_ref() {
+                None => emit_spec(ItemResolution::NotAllowed, None, &mut specs)?,
+                Some(each) => match each {
+                    ProgramEach::Slot { slot: slot_name } => {
+                        let scope = id.0 as u64;
+                        let items = repeated_slot_items_for_component(
+                            scenario, *id, slot_name, slots, &location,
+                        )?;
+                        for (item_idx, item) in items.iter().enumerate() {
+                            let item_resolution = if matches!(
+                                runtime_address_resolution,
+                                RuntimeAddressResolution::Deferred
+                            ) {
+                                ItemResolution::RuntimeSlotTemplate {
+                                    scope,
+                                    slot: slot_name,
+                                    index: item_idx,
+                                    item,
+                                }
+                            } else {
+                                ItemResolution::StaticSlot(item)
+                            };
+                            emit_spec(item_resolution, None, &mut specs)?;
+                        }
+                    }
+                    ProgramEach::Config { path } => {
+                        match resolve_config_each_values(template_opt, path, &location)? {
+                            ConfigEachResolution::Static(items) => {
+                                for item in &items {
+                                    emit_spec(
+                                        ItemResolution::StaticConfig(item),
+                                        None,
+                                        &mut specs,
+                                    )?;
+                                }
+                            }
+                            ConfigEachResolution::Runtime => {
+                                emit_spec(
+                                    ItemResolution::RuntimeCurrentItem,
+                                    Some(RepeatedTemplateSource::Config { path: path.clone() }),
+                                    &mut specs,
+                                )?;
+                            }
+                        }
+                    }
+                },
             }
         }
 
@@ -940,188 +1096,245 @@ fn build_mount_specs(
     Ok(out)
 }
 
-fn program_used_config_paths(
-    program: &amber_manifest::Program,
+fn resolve_file_mount_when(
+    when: Option<&ProgramCondition>,
     template_opt: Option<&rc::ConfigNode>,
     slots: &BTreeMap<String, SlotValue>,
-) -> Result<BTreeSet<String>, MeshError> {
-    let mut used = BTreeSet::new();
+) -> Result<ResolvedWhen, MeshError> {
+    let Some(when) = when else {
+        return Ok(ResolvedWhen::Present);
+    };
 
-    match program {
-        amber_manifest::Program::Image(program) => {
-            if let Ok(parsed) = program.image.parse::<amber_manifest::InterpolatedString>() {
-                collect_program_config_paths(&parsed.parts, &mut used);
-            }
-        }
-        amber_manifest::Program::Path(program) => {
-            if let Ok(parsed) = program.path.parse::<amber_manifest::InterpolatedString>() {
-                collect_program_config_paths(&parsed.parts, &mut used);
-            }
-        }
-        amber_manifest::Program::Vm(program) => {
-            if let Ok(parsed) = program
-                .0
-                .image
-                .parse::<amber_manifest::InterpolatedString>()
-            {
-                collect_program_config_paths(&parsed.parts, &mut used);
-            }
-            for scalar in [&program.0.cpus, &program.0.memory_mib] {
-                let amber_manifest::VmScalarU32::Interpolated(raw) = scalar else {
-                    continue;
-                };
-                if let Ok(parsed) = raw.parse::<amber_manifest::InterpolatedString>() {
-                    collect_program_config_paths(&parsed.parts, &mut used);
-                }
-            }
-            for value in [
-                program.0.cloud_init.user_data.as_deref(),
-                program.0.cloud_init.vendor_data.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if let Ok(parsed) = value.parse::<amber_manifest::InterpolatedString>() {
-                    collect_program_config_paths(&parsed.parts, &mut used);
-                }
-            }
-        }
-        _ => {}
-    }
-    for arg in &program.command().0 {
-        match arg {
-            ProgramArgItem::Arg(arg) => collect_program_config_paths(&arg.parts, &mut used),
-            ProgramArgItem::Group(group) => {
-                match resolve_condition_presence_for_program(
-                    group.when.source(),
-                    group.when.query(),
-                    template_opt,
-                    slots,
-                )? {
-                    ConfigPresence::Present => {
-                        if group.when.source() == InterpolationSource::Config {
-                            used.insert(group.when.query().to_string());
-                        }
-                        for arg in &group.argv.0 {
-                            collect_program_config_paths(&arg.parts, &mut used);
-                        }
-                    }
-                    ConfigPresence::Absent => {}
-                    ConfigPresence::Runtime => {
-                        used.insert(group.when.query().to_string());
-                        for arg in &group.argv.0 {
-                            collect_program_config_paths(&arg.parts, &mut used);
-                        }
-                    }
-                }
-            }
-            ProgramArgItem::RepeatedArgv(repeated) => {
-                let condition = match repeated.when.as_ref() {
-                    Some(when) => resolve_condition_presence_for_program(
-                        when.source(),
-                        when.query(),
-                        template_opt,
-                        slots,
-                    )?,
-                    None => ConfigPresence::Present,
-                };
-                match condition {
-                    ConfigPresence::Present => {
-                        if let Some(when) = repeated.when.as_ref()
-                            && when.source() == InterpolationSource::Config
-                        {
-                            used.insert(when.query().to_string());
-                        }
-                        for arg in &repeated.argv.0 {
-                            collect_program_config_paths(&arg.parts, &mut used);
-                        }
-                    }
-                    ConfigPresence::Absent => {}
-                    ConfigPresence::Runtime => {
-                        if let Some(when) = repeated.when.as_ref() {
-                            used.insert(when.query().to_string());
-                        }
-                        for arg in &repeated.argv.0 {
-                            collect_program_config_paths(&arg.parts, &mut used);
-                        }
-                    }
-                }
-            }
-            ProgramArgItem::RepeatedArg(repeated) => {
-                let condition = match repeated.when.as_ref() {
-                    Some(when) => resolve_condition_presence_for_program(
-                        when.source(),
-                        when.query(),
-                        template_opt,
-                        slots,
-                    )?,
-                    None => ConfigPresence::Present,
-                };
-                match condition {
-                    ConfigPresence::Present => {
-                        if let Some(when) = repeated.when.as_ref()
-                            && when.source() == InterpolationSource::Config
-                        {
-                            used.insert(when.query().to_string());
-                        }
-                        collect_program_config_paths(&repeated.arg.parts, &mut used);
-                    }
-                    ConfigPresence::Absent => {}
-                    ConfigPresence::Runtime => {
-                        if let Some(when) = repeated.when.as_ref() {
-                            used.insert(when.query().to_string());
-                        }
-                        collect_program_config_paths(&repeated.arg.parts, &mut used);
-                    }
-                }
-            }
-        }
-    }
-    for value in program.env().values() {
-        if let Some(when) = value.when() {
+    match when {
+        ProgramCondition::Config { path } => {
             match resolve_condition_presence_for_program(
-                when.source(),
-                when.query(),
+                InterpolationSource::Config,
+                path,
                 template_opt,
                 slots,
             )? {
-                ConfigPresence::Present => {
-                    if when.source() == InterpolationSource::Config {
-                        used.insert(when.query().to_string());
-                    }
-                    collect_program_config_paths(&value.value().parts, &mut used);
-                }
-                ConfigPresence::Absent => {}
+                ConfigPresence::Present => Ok(ResolvedWhen::Present),
+                ConfigPresence::Absent => Ok(ResolvedWhen::Absent),
+                ConfigPresence::Runtime => Ok(ResolvedWhen::Runtime(path.clone())),
+            }
+        }
+        ProgramCondition::Slot { query } => {
+            match resolve_condition_presence_for_program(
+                InterpolationSource::Slots,
+                query,
+                template_opt,
+                slots,
+            )? {
+                ConfigPresence::Present => Ok(ResolvedWhen::Present),
+                ConfigPresence::Absent => Ok(ResolvedWhen::Absent),
                 ConfigPresence::Runtime => {
-                    used.insert(when.query().to_string());
-                    collect_program_config_paths(&value.value().parts, &mut used);
+                    unreachable!("slot conditions always resolve before runtime")
                 }
             }
-            continue;
-        }
-        collect_program_config_paths(&value.value().parts, &mut used);
-    }
-    for mount in program.mounts() {
-        match &mount.source {
-            MountSource::Config(path) | MountSource::Secret(path) => {
-                used.insert(path.clone());
-            }
-            _ => {}
         }
     }
-
-    Ok(used)
 }
 
-fn collect_program_config_paths(parts: &[InterpolatedPart], out: &mut BTreeSet<String>) {
-    for part in parts {
-        let InterpolatedPart::Interpolation { source, query } = part else {
-            continue;
-        };
-        if *source == InterpolationSource::Config {
-            out.insert(query.clone());
+#[allow(clippy::too_many_arguments)]
+fn resolve_lowered_template_string(
+    scenario: &Scenario,
+    id: ComponentId,
+    location: &str,
+    runtime_address_resolution: RuntimeAddressResolution,
+    value: &TemplateString,
+    slots: &BTreeMap<String, SlotValue>,
+    template_opt: Option<&rc::ConfigNode>,
+    item_resolution: ItemResolution<'_>,
+    needs_helper_for_program_templates: &mut bool,
+    needs_runtime_config_for_program_templates: &mut bool,
+    require_non_empty: bool,
+) -> Result<TemplateString, MeshError> {
+    let component = component_label(scenario, id);
+    let mut ts: TemplateString = Vec::new();
+    for part in value {
+        match part {
+            TemplatePart::Lit { lit } => ts.push(TemplatePart::lit(lit)),
+            TemplatePart::Config { config } => {
+                match resolve_config_query_for_program(template_opt, config)? {
+                    ConfigResolution::Static(value) => ts.push(TemplatePart::lit(value)),
+                    ConfigResolution::Runtime => {
+                        ts.push(TemplatePart::config(config.clone()));
+                        *needs_helper_for_program_templates = true;
+                        *needs_runtime_config_for_program_templates = true;
+                    }
+                }
+            }
+            TemplatePart::Slot { slot, .. }
+                if matches!(
+                    runtime_address_resolution,
+                    RuntimeAddressResolution::Deferred
+                ) =>
+            {
+                resolve_slot_interpolation(
+                    scenario,
+                    id,
+                    location,
+                    &InterpolationSource::Slots,
+                    slot,
+                    slots,
+                )?;
+                ts.push(part.clone());
+                *needs_helper_for_program_templates = true;
+            }
+            TemplatePart::Slot { slot, .. } => {
+                if let Some(value) = resolve_slot_interpolation(
+                    scenario,
+                    id,
+                    location,
+                    &InterpolationSource::Slots,
+                    slot,
+                    slots,
+                )? {
+                    ts.push(TemplatePart::lit(value));
+                }
+            }
+            TemplatePart::CurrentItem { item } => match item_resolution {
+                ItemResolution::NotAllowed => {
+                    return Err(MeshError::new(format!(
+                        "`item` interpolation is only valid inside repeated `each` expansions in \
+                         {component} {location}",
+                    )));
+                }
+                ItemResolution::RuntimeSlotTemplate {
+                    scope,
+                    slot,
+                    index,
+                    item: item_value,
+                } => {
+                    resolve_slot_item_interpolation(item_value, item, &component, location)?;
+                    ts.push(TemplatePart::item(scope, slot, index, item.clone()));
+                    *needs_helper_for_program_templates = true;
+                }
+                ItemResolution::RuntimeCurrentItem => {
+                    ts.push(TemplatePart::current_item(item.clone()));
+                    *needs_helper_for_program_templates = true;
+                }
+                ItemResolution::StaticSlot(item_value) => ts.push(TemplatePart::lit(
+                    resolve_slot_item_interpolation(item_value, item, &component, location)?,
+                )),
+                ItemResolution::StaticConfig(item_value) => ts.push(TemplatePart::lit(
+                    resolve_item_interpolation_from_value(item_value, item, &component, location)?,
+                )),
+            },
+            TemplatePart::Item { item, .. } => match item_resolution {
+                ItemResolution::NotAllowed => {
+                    return Err(MeshError::new(format!(
+                        "`item` interpolation is only valid inside repeated `each` expansions in \
+                         {component} {location}",
+                    )));
+                }
+                ItemResolution::RuntimeSlotTemplate {
+                    scope,
+                    slot,
+                    index,
+                    item: item_value,
+                } => {
+                    resolve_slot_item_interpolation(item_value, item, &component, location)?;
+                    ts.push(TemplatePart::item(scope, slot, index, item.clone()));
+                    *needs_helper_for_program_templates = true;
+                }
+                ItemResolution::RuntimeCurrentItem => {
+                    ts.push(TemplatePart::current_item(item.clone()));
+                    *needs_helper_for_program_templates = true;
+                }
+                ItemResolution::StaticSlot(item_value) => ts.push(TemplatePart::lit(
+                    resolve_slot_item_interpolation(item_value, item, &component, location)?,
+                )),
+                ItemResolution::StaticConfig(item_value) => ts.push(TemplatePart::lit(
+                    resolve_item_interpolation_from_value(item_value, item, &component, location)?,
+                )),
+            },
         }
     }
+    if require_non_empty && ts.is_empty() {
+        return Err(MeshError::new(format!(
+            "internal error: produced empty template for {component} {location}",
+        )));
+    }
+    Ok(ts)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_lowered_mount_source(
+    scenario: &Scenario,
+    id: ComponentId,
+    location: &str,
+    runtime_address_resolution: RuntimeAddressResolution,
+    source: &FileMountSource,
+    slots: &BTreeMap<String, SlotValue>,
+    template_opt: Option<&rc::ConfigNode>,
+    item_resolution: ItemResolution<'_>,
+    needs_helper_for_program_templates: &mut bool,
+    needs_runtime_config_for_program_templates: &mut bool,
+    require_non_empty: bool,
+) -> Result<TemplateString, MeshError> {
+    let (prefix, path) = match source {
+        FileMountSource::Config { path } => ("config", path),
+        FileMountSource::Secret { path } => ("secret", path),
+    };
+    let path = resolve_lowered_template_string(
+        scenario,
+        id,
+        location,
+        runtime_address_resolution,
+        path,
+        slots,
+        template_opt,
+        item_resolution,
+        needs_helper_for_program_templates,
+        needs_runtime_config_for_program_templates,
+        false,
+    )?;
+
+    let mut full = Vec::new();
+    if path.is_empty() {
+        full.push(TemplatePart::lit(prefix));
+    } else {
+        full.push(TemplatePart::lit(format!("{prefix}.")));
+        full.extend(path);
+    }
+    if require_non_empty && full.is_empty() {
+        return Err(MeshError::new(format!(
+            "internal error: produced empty mount source for {} {location}",
+            component_label(scenario, id)
+        )));
+    }
+    Ok(full)
+}
+
+pub(crate) fn build_endpoint_plan(scenario: &Scenario) -> Result<EndpointPlan, MeshError> {
+    let mut by_component = HashMap::new();
+
+    for (id, component) in scenario.components_iter() {
+        let Some(program) = component.program.as_ref() else {
+            continue;
+        };
+        let Some(network) = program.network() else {
+            continue;
+        };
+        if network.endpoints.is_empty() {
+            continue;
+        }
+        by_component.insert(
+            id,
+            network
+                .endpoints
+                .iter()
+                .map(|endpoint| ExpandedEndpoint {
+                    name: endpoint.name.clone(),
+                    port: endpoint.port,
+                    protocol: endpoint.protocol,
+                })
+                .collect(),
+        );
+    }
+
+    Ok(EndpointPlan { by_component })
 }
 
 fn resolve_condition_presence_for_program(
@@ -1132,27 +1345,7 @@ fn resolve_condition_presence_for_program(
 ) -> Result<ConfigPresence, MeshError> {
     match source {
         InterpolationSource::Config => {
-            let Some(template) = template_opt else {
-                return Ok(ConfigPresence::Runtime);
-            };
-            match resolve_optional_config_query_node(template, query)? {
-                None => Ok(ConfigPresence::Absent),
-                Some(QueryResolution::RuntimePath(_)) => Ok(ConfigPresence::Runtime),
-                Some(QueryResolution::Node(node)) => {
-                    if node.contains_runtime() {
-                        Ok(ConfigPresence::Runtime)
-                    } else {
-                        let value = node
-                            .evaluate_static()
-                            .map_err(|err| MeshError::new(err.to_string()))?;
-                        if value.is_null() {
-                            Ok(ConfigPresence::Absent)
-                        } else {
-                            Ok(ConfigPresence::Present)
-                        }
-                    }
-                }
-            }
+            resolve_config_presence(template_opt, query).map_err(MeshError::new)
         }
         InterpolationSource::Slots => Ok(
             if slot_query_is_present(slots, query).map_err(MeshError::new)? {
@@ -1165,58 +1358,6 @@ fn resolve_condition_presence_for_program(
             "unsupported conditional interpolation source for `{source}.{query}`"
         ))),
     }
-}
-
-fn resolve_optional_config_query_node<'a>(
-    template: &'a rc::ConfigNode,
-    query: &str,
-) -> Result<Option<QueryResolution<'a>>, MeshError> {
-    if query.is_empty() {
-        return Ok(Some(QueryResolution::Node(template)));
-    }
-
-    let segments = parse_query_segments(query)?;
-    let mut current = template;
-    for (idx, seg) in segments.iter().enumerate() {
-        match current {
-            rc::ConfigNode::Object(map) => {
-                let Some(next) = map.get(*seg) else {
-                    return Ok(None);
-                };
-                current = next;
-            }
-            rc::ConfigNode::ConfigRef(path) => {
-                let suffix = segments[idx..].join(".");
-                let full = if path.is_empty() {
-                    suffix
-                } else {
-                    format!("{path}.{suffix}")
-                };
-                return Ok(Some(QueryResolution::RuntimePath(full)));
-            }
-            _ => return Ok(None),
-        }
-    }
-    Ok(Some(QueryResolution::Node(current)))
-}
-
-fn mount_query_is_optional(leaves: &[rc::SchemaLeaf], query: &str) -> bool {
-    if query.is_empty() {
-        return false;
-    }
-
-    let prefix = format!("{query}.");
-    let mut matched = false;
-    for leaf in leaves {
-        if leaf.path == query || leaf.path.starts_with(&prefix) {
-            matched = true;
-            if leaf.required {
-                return false;
-            }
-        }
-    }
-
-    matched
 }
 
 #[derive(Debug)]
@@ -1307,6 +1448,12 @@ fn resolve_program_image_runtime_node(
                              interpolation"
                         )));
                     }
+                    TemplatePart::CurrentItem { item } => {
+                        return Err(MeshError::new(format!(
+                            "failed to resolve runtime image template: unresolved item.{item} \
+                             interpolation"
+                        )));
+                    }
                 }
             }
             if out.is_empty() {
@@ -1363,23 +1510,14 @@ fn resolve_config_query_for_program_image(
 fn resolve_config_query_for_mount(
     template: Option<&rc::ConfigNode>,
     query: &str,
-    optional: bool,
 ) -> Result<MountResolution, MeshError> {
     let Some(template) = template else {
         return Ok(MountResolution::Runtime);
     };
 
-    let cur = if optional {
-        match resolve_optional_config_query_node(template, query)? {
-            None => return Ok(MountResolution::Static(Value::Null)),
-            Some(QueryResolution::Node(cur)) => cur,
-            Some(QueryResolution::RuntimePath(_)) => return Ok(MountResolution::Runtime),
-        }
-    } else {
-        match resolve_config_query_node(template, query).map_err(MeshError::new)? {
-            QueryResolution::Node(cur) => cur,
-            QueryResolution::RuntimePath(_) => return Ok(MountResolution::Runtime),
-        }
+    let cur = match resolve_config_query_node(template, query).map_err(MeshError::new)? {
+        QueryResolution::Node(cur) => cur,
+        QueryResolution::RuntimePath(_) => return Ok(MountResolution::Runtime),
     };
 
     if cur.contains_runtime() {
@@ -1389,6 +1527,14 @@ fn resolve_config_query_for_mount(
             .map(MountResolution::Static)
             .map_err(|e| MeshError::new(e.to_string()))
     }
+}
+
+fn resolve_config_each_values(
+    template: Option<&rc::ConfigNode>,
+    query: &str,
+    location: &str,
+) -> Result<ConfigEachResolution, MeshError> {
+    resolve_shared_config_each_values(template, query, location).map_err(MeshError::new)
 }
 
 fn render_template_string_static(ts: &TemplateString) -> Result<String, MeshError> {
@@ -1404,6 +1550,7 @@ fn render_template_string_static(ts: &TemplateString) -> Result<String, MeshErro
             TemplatePart::Config { .. } => unreachable!(),
             TemplatePart::Slot { .. } => unreachable!(),
             TemplatePart::Item { .. } => unreachable!(),
+            TemplatePart::CurrentItem { .. } => unreachable!(),
         }
     }
     Ok(out)
@@ -1447,13 +1594,15 @@ fn extend_image_parts(parts: &mut Vec<ProgramImagePart>, extra: Vec<ProgramImage
 #[derive(Clone, Copy)]
 enum ItemResolution<'a> {
     NotAllowed,
-    RuntimeTemplate {
+    RuntimeSlotTemplate {
         scope: u64,
         slot: &'a str,
         index: usize,
         item: &'a SlotObject,
     },
-    Static(&'a SlotObject),
+    RuntimeCurrentItem,
+    StaticSlot(&'a SlotObject),
+    StaticConfig(&'a Value),
 }
 
 fn repeated_slot_items<'a>(slots: &'a BTreeMap<String, SlotValue>, slot: &str) -> &'a [SlotObject] {
@@ -1497,18 +1646,13 @@ fn query_value_opt<'a>(root: &'a Value, query: &str) -> Option<&'a Value> {
     Some(current)
 }
 
-fn resolve_item_interpolation(
-    item: &SlotObject,
+fn resolve_item_interpolation_from_value(
+    item: &Value,
     query: &str,
     component: &str,
     location: &str,
 ) -> Result<String, MeshError> {
-    let value = serde_json::to_value(item).map_err(|err| {
-        MeshError::new(format!(
-            "failed to serialize repeated slot item in {component} {location}: {err}"
-        ))
-    })?;
-    let value = query_value_opt(&value, query).ok_or_else(|| {
+    let value = query_value_opt(item, query).ok_or_else(|| {
         let label = if query.is_empty() {
             "item".to_string()
         } else {
@@ -1523,6 +1667,20 @@ fn resolve_item_interpolation(
             "failed to stringify repeated slot item in {component} {location}: {err}"
         ))
     })
+}
+
+fn resolve_slot_item_interpolation(
+    item: &SlotObject,
+    query: &str,
+    component: &str,
+    location: &str,
+) -> Result<String, MeshError> {
+    let value = serde_json::to_value(item).map_err(|err| {
+        MeshError::new(format!(
+            "failed to serialize repeated slot item in {component} {location}: {err}"
+        ))
+    })?;
+    resolve_item_interpolation_from_value(&value, query, component, location)
 }
 
 fn join_template_strings(values: Vec<TemplateString>, separator: &str) -> TemplateString {
@@ -1632,18 +1790,27 @@ fn resolve_program_template_string(
                                  expansions in {component} {location}",
                             )));
                         }
-                        ItemResolution::RuntimeTemplate {
+                        ItemResolution::RuntimeSlotTemplate {
                             scope,
                             slot,
                             index,
                             item,
                         } => {
-                            resolve_item_interpolation(item, query, &component, location)?;
+                            resolve_slot_item_interpolation(item, query, &component, location)?;
                             ts.push(TemplatePart::item(scope, slot, index, query.clone()));
                             *needs_helper_for_program_templates = true;
                         }
-                        ItemResolution::Static(item) => {
-                            ts.push(TemplatePart::lit(resolve_item_interpolation(
+                        ItemResolution::RuntimeCurrentItem => {
+                            ts.push(TemplatePart::current_item(query.clone()));
+                            *needs_helper_for_program_templates = true;
+                        }
+                        ItemResolution::StaticSlot(item) => {
+                            ts.push(TemplatePart::lit(resolve_slot_item_interpolation(
+                                item, query, &component, location,
+                            )?));
+                        }
+                        ItemResolution::StaticConfig(item) => {
+                            ts.push(TemplatePart::lit(resolve_item_interpolation_from_value(
                                 item, query, &component, location,
                             )?));
                         }
@@ -1693,6 +1860,60 @@ fn resolve_program_template_string(
     Ok(ts)
 }
 
+#[derive(Clone, Debug)]
+enum ResolvedWhen {
+    Present,
+    Absent,
+    Runtime(String),
+}
+
+fn resolve_program_when(
+    when: Option<&amber_manifest::WhenPath>,
+    template_opt: Option<&rc::ConfigNode>,
+    slots: &BTreeMap<String, SlotValue>,
+) -> Result<ResolvedWhen, MeshError> {
+    let Some(when) = when else {
+        return Ok(ResolvedWhen::Present);
+    };
+
+    match resolve_condition_presence_for_program(when.source(), when.query(), template_opt, slots)?
+    {
+        ConfigPresence::Present => Ok(ResolvedWhen::Present),
+        ConfigPresence::Absent => Ok(ResolvedWhen::Absent),
+        ConfigPresence::Runtime => {
+            if when.source() != InterpolationSource::Config {
+                return Err(MeshError::new(format!(
+                    "internal error: runtime program `when` must be config-based, got `{when}`"
+                )));
+            }
+            Ok(ResolvedWhen::Runtime(when.query().to_string()))
+        }
+    }
+}
+
+fn emit_program_arg_templates(
+    out: &mut Vec<ProgramArgTemplate>,
+    argv: Vec<TemplateString>,
+    runtime_when: Option<String>,
+    needs_helper_for_program_templates: &mut bool,
+    needs_runtime_config_for_program_templates: &mut bool,
+) {
+    if argv.is_empty() {
+        return;
+    }
+
+    if let Some(when) = runtime_when {
+        *needs_helper_for_program_templates = true;
+        *needs_runtime_config_for_program_templates = true;
+        out.push(ProgramArgTemplate::Conditional(
+            ConditionalProgramArgTemplate { when, argv },
+        ));
+        return;
+    }
+
+    out.extend(argv.into_iter().map(ProgramArgTemplate::Arg));
+}
+
 #[allow(clippy::too_many_arguments)]
 fn append_program_command_item_templates(
     scenario: &Scenario,
@@ -1707,443 +1928,274 @@ fn append_program_command_item_templates(
     needs_runtime_config_for_program_templates: &mut bool,
     out: &mut Vec<ProgramArgTemplate>,
 ) -> Result<(), MeshError> {
-    match item {
-        ProgramArgItem::Arg(arg) => {
-            let location = format!("{location_prefix}[{idx}]");
-            let ts = resolve_program_template_string(
-                scenario,
-                id,
-                &location,
-                arg,
-                runtime_address_resolution,
-                slots,
-                template_opt,
-                ItemResolution::NotAllowed,
+    let when = resolve_program_when(item.when(), template_opt, slots)?;
+    if matches!(when, ResolvedWhen::Absent) {
+        return Ok(());
+    }
+
+    let runtime_when = match &when {
+        ResolvedWhen::Runtime(query) => Some(query.clone()),
+        ResolvedWhen::Present | ResolvedWhen::Absent => None,
+    };
+
+    let location = format!("{location_prefix}[{idx}]");
+    let render_arg = |location: &str,
+                      value: &amber_manifest::InterpolatedString,
+                      item_resolution,
+                      needs_helper_for_program_templates: &mut bool,
+                      needs_runtime_config_for_program_templates: &mut bool|
+     -> Result<TemplateString, MeshError> {
+        resolve_program_template_string(
+            scenario,
+            id,
+            location,
+            value,
+            runtime_address_resolution,
+            slots,
+            template_opt,
+            item_resolution,
+            needs_helper_for_program_templates,
+            needs_runtime_config_for_program_templates,
+            true,
+        )
+    };
+
+    match item.each() {
+        None => {
+            let mut argv = Vec::new();
+            match &item.value {
+                amber_manifest::ProgramArgValue::Arg(arg) => {
+                    argv.push(render_arg(
+                        &location,
+                        arg,
+                        ItemResolution::NotAllowed,
+                        needs_helper_for_program_templates,
+                        needs_runtime_config_for_program_templates,
+                    )?);
+                }
+                amber_manifest::ProgramArgValue::Argv(args) => {
+                    for (group_idx, arg) in args.iter().enumerate() {
+                        argv.push(render_arg(
+                            &format!("{location}.argv[{group_idx}]"),
+                            arg,
+                            ItemResolution::NotAllowed,
+                            needs_helper_for_program_templates,
+                            needs_runtime_config_for_program_templates,
+                        )?);
+                    }
+                }
+            }
+            emit_program_arg_templates(
+                out,
+                argv,
+                runtime_when,
                 needs_helper_for_program_templates,
                 needs_runtime_config_for_program_templates,
-                true,
-            )?;
-            out.push(ProgramArgTemplate::Arg(ts));
+            );
+            Ok(())
         }
-        ProgramArgItem::Group(group) => match resolve_condition_presence_for_program(
-            group.when.source(),
-            group.when.query(),
-            template_opt,
-            slots,
-        )? {
-            ConfigPresence::Absent => {}
-            ConfigPresence::Present => {
-                for (group_idx, arg) in group.argv.0.iter().enumerate() {
-                    let location = format!("{location_prefix}[{idx}].argv[{group_idx}]");
-                    let ts = resolve_program_template_string(
-                        scenario,
-                        id,
-                        &location,
-                        arg,
+        Some(each) => match each.source() {
+            InterpolationSource::Slots => {
+                let scope = id.0 as u64;
+                let slot_name = each
+                    .slot()
+                    .expect("slot-based each path should expose a slot name");
+                let items =
+                    repeated_slot_items_for_component(scenario, id, slot_name, slots, &location)?;
+                if items.is_empty() {
+                    return Ok(());
+                }
+
+                let item_resolution = |item_idx, item| {
+                    if matches!(
                         runtime_address_resolution,
-                        slots,
-                        template_opt,
-                        ItemResolution::NotAllowed,
-                        needs_helper_for_program_templates,
-                        needs_runtime_config_for_program_templates,
-                        true,
-                    )?;
-                    out.push(ProgramArgTemplate::Arg(ts));
-                }
-            }
-            ConfigPresence::Runtime => {
-                if group.when.source() != InterpolationSource::Config {
-                    return Err(MeshError::new(format!(
-                        "internal error: runtime conditional program arg group requires \
-                         config-based `when`, got `{}`",
-                        group.when
-                    )));
-                }
-                let mut argv = Vec::with_capacity(group.argv.0.len());
-                for (group_idx, arg) in group.argv.0.iter().enumerate() {
-                    let location = format!("{location_prefix}[{idx}].argv[{group_idx}]");
-                    let ts = resolve_program_template_string(
-                        scenario,
-                        id,
-                        &location,
-                        arg,
-                        runtime_address_resolution,
-                        slots,
-                        template_opt,
-                        ItemResolution::NotAllowed,
-                        needs_helper_for_program_templates,
-                        needs_runtime_config_for_program_templates,
-                        true,
-                    )?;
-                    argv.push(ts);
-                }
-                *needs_helper_for_program_templates = true;
-                *needs_runtime_config_for_program_templates = true;
-                out.push(ProgramArgTemplate::Group(ConditionalProgramArgTemplate {
-                    when: group.when.query().to_string(),
-                    argv,
-                }));
-            }
-        },
-        ProgramArgItem::RepeatedArgv(repeated) => {
-            let scope = id.0 as u64;
-            let slot_name = repeated.each.slot();
-            let condition = match repeated.when.as_ref() {
-                Some(when) => Some((
-                    when.query().to_string(),
-                    resolve_condition_presence_for_program(
-                        when.source(),
-                        when.query(),
-                        template_opt,
-                        slots,
-                    )?,
-                )),
-                None => None,
-            };
-            let items = repeated_slot_items_for_component(
-                scenario,
-                id,
-                repeated.each.slot(),
-                slots,
-                &format!("{location_prefix}[{idx}]"),
-            )?;
-            if items.is_empty() {
-                return Ok(());
-            }
-            match (
-                runtime_address_resolution,
-                condition.as_ref().map(|(_, value)| value),
-            ) {
-                (_, Some(ConfigPresence::Absent)) => {}
-                (RuntimeAddressResolution::Deferred, Some(ConfigPresence::Runtime))
-                | (RuntimeAddressResolution::Deferred, None)
-                | (RuntimeAddressResolution::Deferred, Some(ConfigPresence::Present)) => {
-                    let when_runtime = condition
-                        .as_ref()
-                        .is_some_and(|(_, value)| matches!(value, ConfigPresence::Runtime));
-                    let mut argv = Vec::new();
-                    for (item_idx, item) in items.iter().enumerate() {
-                        for (group_idx, arg) in repeated.argv.0.iter().enumerate() {
-                            let location = format!("{location_prefix}[{idx}].argv[{group_idx}]");
-                            let ts = resolve_program_template_string(
-                                scenario,
-                                id,
-                                &location,
-                                arg,
-                                runtime_address_resolution,
-                                slots,
-                                template_opt,
-                                ItemResolution::RuntimeTemplate {
-                                    scope,
-                                    slot: slot_name,
-                                    index: item_idx,
-                                    item,
-                                },
-                                needs_helper_for_program_templates,
-                                needs_runtime_config_for_program_templates,
-                                true,
-                            )?;
-                            if when_runtime {
-                                argv.push(ts);
-                            } else {
-                                out.push(ProgramArgTemplate::Arg(ts));
+                        RuntimeAddressResolution::Deferred
+                    ) {
+                        ItemResolution::RuntimeSlotTemplate {
+                            scope,
+                            slot: slot_name,
+                            index: item_idx,
+                            item,
+                        }
+                    } else {
+                        ItemResolution::StaticSlot(item)
+                    }
+                };
+
+                let mut argv = Vec::new();
+                match &item.value {
+                    amber_manifest::ProgramArgValue::Arg(arg) => {
+                        let arg_location = format!("{location}.arg");
+                        if let Some(join) = item.join() {
+                            let mut rendered = Vec::with_capacity(items.len());
+                            for (item_idx, repeated_item) in items.iter().enumerate() {
+                                rendered.push(render_arg(
+                                    &arg_location,
+                                    arg,
+                                    item_resolution(item_idx, repeated_item),
+                                    needs_helper_for_program_templates,
+                                    needs_runtime_config_for_program_templates,
+                                )?);
                             }
-                        }
-                    }
-                    if when_runtime && !argv.is_empty() {
-                        *needs_helper_for_program_templates = true;
-                        *needs_runtime_config_for_program_templates = true;
-                        out.push(ProgramArgTemplate::Group(ConditionalProgramArgTemplate {
-                            when: condition
-                                .as_ref()
-                                .expect("runtime condition should exist")
-                                .0
-                                .clone(),
-                            argv,
-                        }));
-                    }
-                }
-                (RuntimeAddressResolution::Static, Some(ConfigPresence::Runtime)) => {
-                    let when = condition
-                        .as_ref()
-                        .expect("runtime condition should exist")
-                        .0
-                        .clone();
-                    let mut argv = Vec::new();
-                    for item in items {
-                        for (group_idx, arg) in repeated.argv.0.iter().enumerate() {
-                            let location = format!("{location_prefix}[{idx}].argv[{group_idx}]");
-                            let ts = resolve_program_template_string(
-                                scenario,
-                                id,
-                                &location,
-                                arg,
-                                runtime_address_resolution,
-                                slots,
-                                template_opt,
-                                ItemResolution::Static(item),
-                                needs_helper_for_program_templates,
-                                needs_runtime_config_for_program_templates,
-                                true,
-                            )?;
-                            argv.push(ts);
-                        }
-                    }
-                    if !argv.is_empty() {
-                        *needs_helper_for_program_templates = true;
-                        *needs_runtime_config_for_program_templates = true;
-                        out.push(ProgramArgTemplate::Group(ConditionalProgramArgTemplate {
-                            when,
-                            argv,
-                        }));
-                    }
-                }
-                (RuntimeAddressResolution::Static, None)
-                | (RuntimeAddressResolution::Static, Some(ConfigPresence::Present)) => {
-                    for item in items {
-                        for (group_idx, arg) in repeated.argv.0.iter().enumerate() {
-                            let location = format!("{location_prefix}[{idx}].argv[{group_idx}]");
-                            let ts = resolve_program_template_string(
-                                scenario,
-                                id,
-                                &location,
-                                arg,
-                                runtime_address_resolution,
-                                slots,
-                                template_opt,
-                                ItemResolution::Static(item),
-                                needs_helper_for_program_templates,
-                                needs_runtime_config_for_program_templates,
-                                true,
-                            )?;
-                            out.push(ProgramArgTemplate::Arg(ts));
-                        }
-                    }
-                }
-            }
-        }
-        ProgramArgItem::RepeatedArg(repeated) => {
-            let scope = id.0 as u64;
-            let slot_name = repeated.each.slot();
-            let condition = match repeated.when.as_ref() {
-                Some(when) => Some((
-                    when.query().to_string(),
-                    resolve_condition_presence_for_program(
-                        when.source(),
-                        when.query(),
-                        template_opt,
-                        slots,
-                    )?,
-                )),
-                None => None,
-            };
-            let items = repeated_slot_items_for_component(
-                scenario,
-                id,
-                repeated.each.slot(),
-                slots,
-                &format!("{location_prefix}[{idx}]"),
-            )?;
-            if items.is_empty() {
-                return Ok(());
-            }
-            match (
-                runtime_address_resolution,
-                condition.as_ref().map(|(_, value)| value),
-            ) {
-                (_, Some(ConfigPresence::Absent)) => {}
-                (RuntimeAddressResolution::Deferred, Some(ConfigPresence::Runtime))
-                | (RuntimeAddressResolution::Deferred, None)
-                | (RuntimeAddressResolution::Deferred, Some(ConfigPresence::Present)) => {
-                    let when_runtime = condition
-                        .as_ref()
-                        .is_some_and(|(_, value)| matches!(value, ConfigPresence::Runtime));
-                    let location = format!("{location_prefix}[{idx}].arg");
-                    if let Some(join) = &repeated.join {
-                        let mut rendered = Vec::with_capacity(items.len());
-                        for (item_idx, item) in items.iter().enumerate() {
-                            rendered.push(resolve_program_template_string(
-                                scenario,
-                                id,
-                                &location,
-                                &repeated.arg,
-                                runtime_address_resolution,
-                                slots,
-                                template_opt,
-                                ItemResolution::RuntimeTemplate {
-                                    scope,
-                                    slot: slot_name,
-                                    index: item_idx,
-                                    item,
-                                },
-                                needs_helper_for_program_templates,
-                                needs_runtime_config_for_program_templates,
-                                true,
-                            )?);
-                        }
-                        let joined = join_template_strings(rendered, join);
-                        if when_runtime {
-                            *needs_helper_for_program_templates = true;
-                            *needs_runtime_config_for_program_templates = true;
-                            out.push(ProgramArgTemplate::Group(ConditionalProgramArgTemplate {
-                                when: condition
-                                    .as_ref()
-                                    .expect("runtime condition should exist")
-                                    .0
-                                    .clone(),
-                                argv: vec![joined],
-                            }));
+                            argv.push(join_template_strings(rendered, join));
                         } else {
-                            out.push(ProgramArgTemplate::Arg(joined));
-                        }
-                    } else {
-                        let mut argv = Vec::with_capacity(items.len());
-                        for (item_idx, item) in items.iter().enumerate() {
-                            let ts = resolve_program_template_string(
-                                scenario,
-                                id,
-                                &location,
-                                &repeated.arg,
-                                runtime_address_resolution,
-                                slots,
-                                template_opt,
-                                ItemResolution::RuntimeTemplate {
-                                    scope,
-                                    slot: slot_name,
-                                    index: item_idx,
-                                    item,
-                                },
-                                needs_helper_for_program_templates,
-                                needs_runtime_config_for_program_templates,
-                                true,
-                            )?;
-                            if when_runtime {
-                                argv.push(ts);
-                            } else {
-                                out.push(ProgramArgTemplate::Arg(ts));
+                            for (item_idx, repeated_item) in items.iter().enumerate() {
+                                argv.push(render_arg(
+                                    &arg_location,
+                                    arg,
+                                    item_resolution(item_idx, repeated_item),
+                                    needs_helper_for_program_templates,
+                                    needs_runtime_config_for_program_templates,
+                                )?);
                             }
                         }
-                        if when_runtime && !argv.is_empty() {
-                            *needs_helper_for_program_templates = true;
-                            *needs_runtime_config_for_program_templates = true;
-                            out.push(ProgramArgTemplate::Group(ConditionalProgramArgTemplate {
-                                when: condition
-                                    .as_ref()
-                                    .expect("runtime condition should exist")
-                                    .0
-                                    .clone(),
-                                argv,
-                            }));
+                    }
+                    amber_manifest::ProgramArgValue::Argv(args) => {
+                        for (item_idx, repeated_item) in items.iter().enumerate() {
+                            for (group_idx, arg) in args.iter().enumerate() {
+                                argv.push(render_arg(
+                                    &format!("{location}.argv[{group_idx}]"),
+                                    arg,
+                                    item_resolution(item_idx, repeated_item),
+                                    needs_helper_for_program_templates,
+                                    needs_runtime_config_for_program_templates,
+                                )?);
+                            }
                         }
                     }
                 }
-                (RuntimeAddressResolution::Static, Some(ConfigPresence::Runtime)) => {
-                    let when = condition
-                        .as_ref()
-                        .expect("runtime condition should exist")
-                        .0
-                        .clone();
-                    let location = format!("{location_prefix}[{idx}].arg");
-                    if let Some(join) = &repeated.join {
-                        let mut rendered = Vec::with_capacity(items.len());
-                        for item in items {
-                            rendered.push(resolve_program_template_string(
-                                scenario,
-                                id,
-                                &location,
-                                &repeated.arg,
-                                runtime_address_resolution,
-                                slots,
-                                template_opt,
-                                ItemResolution::Static(item),
-                                needs_helper_for_program_templates,
-                                needs_runtime_config_for_program_templates,
-                                true,
-                            )?);
+
+                emit_program_arg_templates(
+                    out,
+                    argv,
+                    runtime_when,
+                    needs_helper_for_program_templates,
+                    needs_runtime_config_for_program_templates,
+                );
+                Ok(())
+            }
+            InterpolationSource::Config => {
+                match resolve_config_each_values(template_opt, each.query(), &location)? {
+                    ConfigEachResolution::Static(items) => {
+                        if items.is_empty() {
+                            return Ok(());
                         }
-                        *needs_helper_for_program_templates = true;
-                        *needs_runtime_config_for_program_templates = true;
-                        out.push(ProgramArgTemplate::Group(ConditionalProgramArgTemplate {
-                            when,
-                            argv: vec![join_template_strings(rendered, join)],
-                        }));
-                    } else {
-                        let mut argv = Vec::with_capacity(items.len());
-                        for item in items {
-                            argv.push(resolve_program_template_string(
-                                scenario,
-                                id,
-                                &location,
-                                &repeated.arg,
-                                runtime_address_resolution,
-                                slots,
-                                template_opt,
-                                ItemResolution::Static(item),
-                                needs_helper_for_program_templates,
-                                needs_runtime_config_for_program_templates,
-                                true,
-                            )?);
+
+                        let mut argv = Vec::new();
+                        match &item.value {
+                            amber_manifest::ProgramArgValue::Arg(arg) => {
+                                let arg_location = format!("{location}.arg");
+                                if let Some(join) = item.join() {
+                                    let mut rendered = Vec::with_capacity(items.len());
+                                    for repeated_item in &items {
+                                        rendered.push(render_arg(
+                                            &arg_location,
+                                            arg,
+                                            ItemResolution::StaticConfig(repeated_item),
+                                            needs_helper_for_program_templates,
+                                            needs_runtime_config_for_program_templates,
+                                        )?);
+                                    }
+                                    argv.push(join_template_strings(rendered, join));
+                                } else {
+                                    for repeated_item in &items {
+                                        argv.push(render_arg(
+                                            &arg_location,
+                                            arg,
+                                            ItemResolution::StaticConfig(repeated_item),
+                                            needs_helper_for_program_templates,
+                                            needs_runtime_config_for_program_templates,
+                                        )?);
+                                    }
+                                }
+                            }
+                            amber_manifest::ProgramArgValue::Argv(args) => {
+                                for repeated_item in &items {
+                                    for (group_idx, arg) in args.iter().enumerate() {
+                                        argv.push(render_arg(
+                                            &format!("{location}.argv[{group_idx}]"),
+                                            arg,
+                                            ItemResolution::StaticConfig(repeated_item),
+                                            needs_helper_for_program_templates,
+                                            needs_runtime_config_for_program_templates,
+                                        )?);
+                                    }
+                                }
+                            }
                         }
-                        *needs_helper_for_program_templates = true;
-                        *needs_runtime_config_for_program_templates = true;
-                        out.push(ProgramArgTemplate::Group(ConditionalProgramArgTemplate {
-                            when,
+
+                        emit_program_arg_templates(
+                            out,
                             argv,
-                        }));
+                            runtime_when,
+                            needs_helper_for_program_templates,
+                            needs_runtime_config_for_program_templates,
+                        );
+                        Ok(())
                     }
-                }
-                (RuntimeAddressResolution::Static, None)
-                | (RuntimeAddressResolution::Static, Some(ConfigPresence::Present)) => {
-                    let location = format!("{location_prefix}[{idx}].arg");
-                    if let Some(join) = &repeated.join {
-                        let mut rendered = Vec::with_capacity(items.len());
-                        for item in items {
-                            rendered.push(resolve_program_template_string(
-                                scenario,
-                                id,
-                                &location,
-                                &repeated.arg,
-                                runtime_address_resolution,
-                                slots,
-                                template_opt,
-                                ItemResolution::Static(item),
-                                needs_helper_for_program_templates,
-                                needs_runtime_config_for_program_templates,
-                                true,
-                            )?);
-                        }
-                        out.push(ProgramArgTemplate::Arg(join_template_strings(
-                            rendered, join,
-                        )));
-                    } else {
-                        for item in items {
-                            out.push(ProgramArgTemplate::Arg(resolve_program_template_string(
-                                scenario,
-                                id,
-                                &location,
-                                &repeated.arg,
-                                runtime_address_resolution,
-                                slots,
-                                template_opt,
-                                ItemResolution::Static(item),
-                                needs_helper_for_program_templates,
-                                needs_runtime_config_for_program_templates,
-                                true,
-                            )?));
-                        }
+                    ConfigEachResolution::Runtime => {
+                        *needs_helper_for_program_templates = true;
+                        *needs_runtime_config_for_program_templates = true;
+
+                        let repeated = match &item.value {
+                            amber_manifest::ProgramArgValue::Arg(arg) => {
+                                RepeatedProgramArgTemplate {
+                                    when: runtime_when,
+                                    each: RepeatedTemplateSource::Config {
+                                        path: each.query().to_string(),
+                                    },
+                                    arg: Some(render_arg(
+                                        &format!("{location}.arg"),
+                                        arg,
+                                        ItemResolution::RuntimeCurrentItem,
+                                        needs_helper_for_program_templates,
+                                        needs_runtime_config_for_program_templates,
+                                    )?),
+                                    argv: Vec::new(),
+                                    join: item.join().map(ToString::to_string),
+                                }
+                            }
+                            amber_manifest::ProgramArgValue::Argv(args) => {
+                                let mut argv = Vec::with_capacity(args.0.len());
+                                for (group_idx, arg) in args.iter().enumerate() {
+                                    argv.push(render_arg(
+                                        &format!("{location}.argv[{group_idx}]"),
+                                        arg,
+                                        ItemResolution::RuntimeCurrentItem,
+                                        needs_helper_for_program_templates,
+                                        needs_runtime_config_for_program_templates,
+                                    )?);
+                                }
+                                RepeatedProgramArgTemplate {
+                                    when: runtime_when,
+                                    each: RepeatedTemplateSource::Config {
+                                        path: each.query().to_string(),
+                                    },
+                                    arg: None,
+                                    argv,
+                                    join: None,
+                                }
+                            }
+                        };
+
+                        out.push(ProgramArgTemplate::Repeated(repeated));
+                        Ok(())
                     }
                 }
             }
-        }
+            InterpolationSource::Item => {
+                unreachable!("each paths never use item as a source")
+            }
+            _ => unreachable!("unsupported interpolation source for each"),
+        },
     }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn build_program_plan(
     scenario: &Scenario,
     id: ComponentId,
-    program: &amber_manifest::Program,
+    program: &Program,
     program_support: ProgramSupport,
     runtime_address_resolution: RuntimeAddressResolution,
     slots: &BTreeMap<String, SlotValue>,
@@ -2155,7 +2207,7 @@ fn build_program_plan(
     let mut needs_helper_for_program_templates = false;
     let mut needs_runtime_config_for_program_templates = false;
     let (source, program_env) = match program {
-        amber_manifest::Program::Image(program) => {
+        Program::Image(program) => {
             match program_support {
                 ProgramSupport::Path { backend_label } => {
                     return Err(MeshError::new(format!(
@@ -2272,7 +2324,7 @@ fn build_program_plan(
                 &program.common.env,
             )
         }
-        amber_manifest::Program::Path(program) => {
+        Program::Path(program) => {
             match program_support {
                 ProgramSupport::Image { backend_label } => {
                     return Err(MeshError::new(format!(
@@ -2338,7 +2390,7 @@ fn build_program_plan(
 
             (ProgramSourcePlan::Path, &program.common.env)
         }
-        amber_manifest::Program::Vm(program) => {
+        Program::Vm(program) => {
             let ProgramSupport::Vm { .. } = program_support else {
                 return Err(MeshError::new(format!(
                     "component {} uses `program.vm`, but this backend does not support VM programs",
@@ -2347,7 +2399,6 @@ fn build_program_plan(
             };
             let mut image_parts: Vec<ProgramImagePart> = Vec::new();
             let image = program
-                .0
                 .image
                 .parse::<amber_manifest::InterpolatedString>()
                 .map_err(|err| {
@@ -2438,14 +2489,23 @@ fn build_program_plan(
 
     let mut env_ts: BTreeMap<String, ProgramEnvTemplate> = BTreeMap::new();
     for (k, v) in program_env {
-        match v {
-            amber_manifest::ProgramEnvValue::Value(value) => {
-                let location = format!("program.env.{k}");
+        let when = resolve_program_when(v.when(), template_opt, slots)?;
+        if matches!(when, ResolvedWhen::Absent) {
+            continue;
+        }
+        let runtime_when = match &when {
+            ResolvedWhen::Runtime(query) => Some(query.clone()),
+            ResolvedWhen::Present | ResolvedWhen::Absent => None,
+        };
+        let location = format!("program.env.{k}.value");
+
+        match v.each() {
+            None => {
                 let ts = resolve_program_template_string(
                     scenario,
                     id,
                     &location,
-                    value,
+                    v.value(),
                     runtime_address_resolution,
                     slots,
                     template_opt,
@@ -2454,205 +2514,159 @@ fn build_program_plan(
                     &mut needs_runtime_config_for_program_templates,
                     false,
                 )?;
-                env_ts.insert(k.clone(), ProgramEnvTemplate::Value(ts));
+                if let Some(when) = runtime_when {
+                    needs_helper_for_program_templates = true;
+                    needs_runtime_config_for_program_templates = true;
+                    env_ts.insert(
+                        k.clone(),
+                        ProgramEnvTemplate::Conditional(ConditionalProgramEnvTemplate {
+                            when,
+                            value: ts,
+                        }),
+                    );
+                } else {
+                    env_ts.insert(k.clone(), ProgramEnvTemplate::Value(ts));
+                }
             }
-            amber_manifest::ProgramEnvValue::Group(group) => {
-                match resolve_condition_presence_for_program(
-                    group.when.source(),
-                    group.when.query(),
-                    template_opt,
-                    slots,
-                )? {
-                    ConfigPresence::Absent => {}
-                    ConfigPresence::Present => {
-                        let location = format!("program.env.{k}.value");
-                        let ts = resolve_program_template_string(
-                            scenario,
-                            id,
-                            &location,
-                            &group.value,
-                            runtime_address_resolution,
-                            slots,
-                            template_opt,
-                            ItemResolution::NotAllowed,
-                            &mut needs_helper_for_program_templates,
-                            &mut needs_runtime_config_for_program_templates,
-                            false,
-                        )?;
-                        env_ts.insert(k.clone(), ProgramEnvTemplate::Value(ts));
+            Some(each) => match each.source() {
+                InterpolationSource::Slots => {
+                    let scope = id.0 as u64;
+                    let slot_name = each
+                        .slot()
+                        .expect("slot-based each path should expose a slot name");
+                    let items = repeated_slot_items_for_component(
+                        scenario,
+                        id,
+                        slot_name,
+                        slots,
+                        &format!("program.env.{k}"),
+                    )?;
+                    if items.is_empty() {
+                        continue;
                     }
-                    ConfigPresence::Runtime => {
-                        if group.when.source() != InterpolationSource::Config {
-                            return Err(MeshError::new(format!(
-                                "internal error: runtime conditional program env value requires \
-                                 config-based `when`, got `{}`",
-                                group.when
-                            )));
-                        }
-                        let location = format!("program.env.{k}.value");
-                        let ts = resolve_program_template_string(
+
+                    let mut rendered = Vec::with_capacity(items.len());
+                    for (item_idx, item) in items.iter().enumerate() {
+                        let item_resolution = if matches!(
+                            runtime_address_resolution,
+                            RuntimeAddressResolution::Deferred
+                        ) {
+                            ItemResolution::RuntimeSlotTemplate {
+                                scope,
+                                slot: slot_name,
+                                index: item_idx,
+                                item,
+                            }
+                        } else {
+                            ItemResolution::StaticSlot(item)
+                        };
+                        rendered.push(resolve_program_template_string(
                             scenario,
                             id,
                             &location,
-                            &group.value,
+                            v.value(),
                             runtime_address_resolution,
                             slots,
                             template_opt,
-                            ItemResolution::NotAllowed,
+                            item_resolution,
                             &mut needs_helper_for_program_templates,
                             &mut needs_runtime_config_for_program_templates,
                             false,
-                        )?;
+                        )?);
+                    }
+                    let value = join_template_strings(
+                        rendered,
+                        v.join().expect("program env each requires join"),
+                    );
+                    if let Some(when) = runtime_when {
                         needs_helper_for_program_templates = true;
                         needs_runtime_config_for_program_templates = true;
                         env_ts.insert(
                             k.clone(),
-                            ProgramEnvTemplate::Group(ConditionalProgramEnvTemplate {
-                                when: group.when.query().to_string(),
-                                value: ts,
+                            ProgramEnvTemplate::Conditional(ConditionalProgramEnvTemplate {
+                                when,
+                                value,
                             }),
                         );
+                    } else {
+                        env_ts.insert(k.clone(), ProgramEnvTemplate::Value(value));
                     }
                 }
-            }
-            amber_manifest::ProgramEnvValue::Repeated(repeated) => {
-                let scope = id.0 as u64;
-                let slot_name = repeated.each.slot();
-                let condition = match repeated.when.as_ref() {
-                    Some(when) => Some((
-                        when.query().to_string(),
-                        resolve_condition_presence_for_program(
-                            when.source(),
-                            when.query(),
-                            template_opt,
-                            slots,
-                        )?,
-                    )),
-                    None => None,
-                };
-                let items = repeated_slot_items_for_component(
-                    scenario,
-                    id,
-                    repeated.each.slot(),
-                    slots,
-                    &format!("program.env.{k}"),
-                )?;
-                if items.is_empty() {
-                    continue;
-                }
-                match (
-                    runtime_address_resolution,
-                    condition.as_ref().map(|(_, value)| value),
-                ) {
-                    (_, Some(ConfigPresence::Absent)) => {}
-                    (RuntimeAddressResolution::Deferred, Some(ConfigPresence::Runtime))
-                    | (RuntimeAddressResolution::Deferred, None)
-                    | (RuntimeAddressResolution::Deferred, Some(ConfigPresence::Present)) => {
-                        let location = format!("program.env.{k}.value");
-                        let mut rendered = Vec::with_capacity(items.len());
-                        for (item_idx, item) in items.iter().enumerate() {
-                            rendered.push(resolve_program_template_string(
-                                scenario,
-                                id,
-                                &location,
-                                &repeated.value,
-                                runtime_address_resolution,
-                                slots,
-                                template_opt,
-                                ItemResolution::RuntimeTemplate {
-                                    scope,
-                                    slot: slot_name,
-                                    index: item_idx,
-                                    item,
-                                },
-                                &mut needs_helper_for_program_templates,
-                                &mut needs_runtime_config_for_program_templates,
-                                false,
-                            )?);
+                InterpolationSource::Config => {
+                    match resolve_config_each_values(template_opt, each.query(), &location)? {
+                        ConfigEachResolution::Static(items) => {
+                            if items.is_empty() {
+                                continue;
+                            }
+
+                            let mut rendered = Vec::with_capacity(items.len());
+                            for item in &items {
+                                rendered.push(resolve_program_template_string(
+                                    scenario,
+                                    id,
+                                    &location,
+                                    v.value(),
+                                    runtime_address_resolution,
+                                    slots,
+                                    template_opt,
+                                    ItemResolution::StaticConfig(item),
+                                    &mut needs_helper_for_program_templates,
+                                    &mut needs_runtime_config_for_program_templates,
+                                    false,
+                                )?);
+                            }
+                            let value = join_template_strings(
+                                rendered,
+                                v.join().expect("program env each requires join"),
+                            );
+                            if let Some(when) = runtime_when {
+                                needs_helper_for_program_templates = true;
+                                needs_runtime_config_for_program_templates = true;
+                                env_ts.insert(
+                                    k.clone(),
+                                    ProgramEnvTemplate::Conditional(
+                                        ConditionalProgramEnvTemplate { when, value },
+                                    ),
+                                );
+                            } else {
+                                env_ts.insert(k.clone(), ProgramEnvTemplate::Value(value));
+                            }
                         }
-                        let value = join_template_strings(rendered, &repeated.join);
-                        if condition
-                            .as_ref()
-                            .is_some_and(|(_, value)| matches!(value, ConfigPresence::Runtime))
-                        {
+                        ConfigEachResolution::Runtime => {
                             needs_helper_for_program_templates = true;
                             needs_runtime_config_for_program_templates = true;
                             env_ts.insert(
                                 k.clone(),
-                                ProgramEnvTemplate::Group(ConditionalProgramEnvTemplate {
-                                    when: condition
-                                        .as_ref()
-                                        .expect("runtime condition should exist")
-                                        .0
-                                        .clone(),
-                                    value,
+                                ProgramEnvTemplate::Repeated(RepeatedProgramEnvTemplate {
+                                    when: runtime_when,
+                                    each: RepeatedTemplateSource::Config {
+                                        path: each.query().to_string(),
+                                    },
+                                    value: resolve_program_template_string(
+                                        scenario,
+                                        id,
+                                        &location,
+                                        v.value(),
+                                        runtime_address_resolution,
+                                        slots,
+                                        template_opt,
+                                        ItemResolution::RuntimeCurrentItem,
+                                        &mut needs_helper_for_program_templates,
+                                        &mut needs_runtime_config_for_program_templates,
+                                        false,
+                                    )?,
+                                    join: v
+                                        .join()
+                                        .expect("program env each requires join")
+                                        .to_string(),
                                 }),
                             );
-                        } else {
-                            env_ts.insert(k.clone(), ProgramEnvTemplate::Value(value));
                         }
-                    }
-                    (RuntimeAddressResolution::Static, Some(ConfigPresence::Runtime)) => {
-                        let location = format!("program.env.{k}.value");
-                        let mut rendered = Vec::with_capacity(items.len());
-                        for item in items {
-                            rendered.push(resolve_program_template_string(
-                                scenario,
-                                id,
-                                &location,
-                                &repeated.value,
-                                runtime_address_resolution,
-                                slots,
-                                template_opt,
-                                ItemResolution::Static(item),
-                                &mut needs_helper_for_program_templates,
-                                &mut needs_runtime_config_for_program_templates,
-                                false,
-                            )?);
-                        }
-                        needs_helper_for_program_templates = true;
-                        needs_runtime_config_for_program_templates = true;
-                        env_ts.insert(
-                            k.clone(),
-                            ProgramEnvTemplate::Group(ConditionalProgramEnvTemplate {
-                                when: condition
-                                    .as_ref()
-                                    .expect("runtime condition should exist")
-                                    .0
-                                    .clone(),
-                                value: join_template_strings(rendered, &repeated.join),
-                            }),
-                        );
-                    }
-                    (RuntimeAddressResolution::Static, None)
-                    | (RuntimeAddressResolution::Static, Some(ConfigPresence::Present)) => {
-                        let location = format!("program.env.{k}.value");
-                        let mut rendered = Vec::with_capacity(items.len());
-                        for item in items {
-                            rendered.push(resolve_program_template_string(
-                                scenario,
-                                id,
-                                &location,
-                                &repeated.value,
-                                runtime_address_resolution,
-                                slots,
-                                template_opt,
-                                ItemResolution::Static(item),
-                                &mut needs_helper_for_program_templates,
-                                &mut needs_runtime_config_for_program_templates,
-                                false,
-                            )?);
-                        }
-                        env_ts.insert(
-                            k.clone(),
-                            ProgramEnvTemplate::Value(join_template_strings(
-                                rendered,
-                                &repeated.join,
-                            )),
-                        );
                     }
                 }
-            }
+                InterpolationSource::Item => unreachable!("each paths never use item"),
+                _ => unreachable!("unsupported interpolation source for each"),
+            },
         }
     }
 
@@ -2683,8 +2697,11 @@ fn build_program_plan(
             .into_iter()
             .map(|arg| match arg {
                 ProgramArgTemplate::Arg(ts) => render_template_string_static(&ts),
-                ProgramArgTemplate::Group(_) => Err(MeshError::new(
-                    "internal error: conditional arg group reached resolved program plan",
+                ProgramArgTemplate::Conditional(_) => Err(MeshError::new(
+                    "internal error: conditional arg item reached resolved program plan",
+                )),
+                ProgramArgTemplate::Repeated(_) => Err(MeshError::new(
+                    "internal error: repeated arg template reached resolved program plan",
                 )),
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -2699,8 +2716,11 @@ fn build_program_plan(
                 ProgramEnvTemplate::Value(ts) => {
                     render_template_string_static(&ts).map(|rendered| (k, rendered))
                 }
-                ProgramEnvTemplate::Group(_) => Err(MeshError::new(
+                ProgramEnvTemplate::Conditional(_) => Err(MeshError::new(
                     "internal error: conditional env value reached resolved program plan",
+                )),
+                ProgramEnvTemplate::Repeated(_) => Err(MeshError::new(
+                    "internal error: repeated env value reached resolved program plan",
                 )),
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
@@ -2715,13 +2735,18 @@ fn build_program_plan(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::{
+        collections::{BTreeMap, HashMap},
+        sync::Arc,
+    };
 
-    use amber_manifest::{Manifest, ManifestDigest};
+    use amber_manifest::{Manifest, ManifestDigest, Program as ManifestProgram};
     use amber_scenario::{BindingEdge, Component, Moniker, Scenario};
-    use serde_json::json;
 
     use super::*;
+    use crate::{
+        config::template::parse_instance_config_template, linker::program_lowering::lower_program,
+    };
 
     fn test_scenario() -> Scenario {
         let manifest: Manifest = r#"
@@ -2778,22 +2803,144 @@ mod tests {
         ])
     }
 
-    fn component_from_manifest(
-        id: ComponentId,
-        parent: Option<ComponentId>,
+    fn component_with_config_and_program(
+        id: usize,
+        parent: Option<usize>,
         moniker: &str,
-        manifest: &Manifest,
-        config: Option<Value>,
-        children: Vec<ComponentId>,
+        config_schema: Option<serde_json::Value>,
+        config: Option<serde_json::Value>,
+        program: Option<serde_json::Value>,
     ) -> Component {
+        let template = parse_instance_config_template(config.as_ref(), config_schema.as_ref())
+            .expect("component config template");
+        let program = program.map(|program| {
+            let program: ManifestProgram =
+                serde_json::from_value(program).expect("manifest program");
+            lower_program(ComponentId(id), &program, Some(&template)).expect("program")
+        });
         Component {
-            id,
-            parent,
+            id: ComponentId(id),
+            parent: parent.map(ComponentId),
             moniker: Moniker::from(Arc::<str>::from(moniker)),
-            digest: manifest.digest(),
+            digest: ManifestDigest::new([id as u8; 32]),
             config,
-            config_schema: manifest.config_schema().map(|schema| schema.0.clone()),
-            program: manifest.program().cloned(),
+            config_schema,
+            program,
+            slots: BTreeMap::new(),
+            provides: BTreeMap::new(),
+            resources: BTreeMap::new(),
+            metadata: None,
+            children: Vec::new(),
+        }
+    }
+
+    fn scenario_with_child(child: Component) -> Scenario {
+        let mut root = component_with_config_and_program(0, None, "/", None, None, None);
+        root.children.push(child.id);
+        Scenario {
+            root: ComponentId(0),
+            components: vec![Some(root), Some(child)],
+            bindings: Vec::<BindingEdge>::new(),
+            exports: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn build_mount_specs_materializes_literal_config_mounts() {
+        let child = component_with_config_and_program(
+            1,
+            Some(0),
+            "/worker",
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "mount_file": { "type": "string" },
+                },
+                "required": ["mount_file"],
+            })),
+            Some(serde_json::json!({
+                "mount_file": "hello from config",
+            })),
+            Some(serde_json::json!({
+                "image": "app",
+                "entrypoint": ["app"],
+                "mounts": [
+                    { "path": "/etc/app/config.txt", "from": "config.mount_file" }
+                ],
+            })),
+        );
+        let scenario = scenario_with_child(child);
+        let templates = compose_component_config_templates(&scenario).expect("templates");
+        let mount_specs = build_mount_specs(
+            &scenario,
+            &[ComponentId(1)],
+            RuntimeAddressResolution::Static,
+            &templates,
+            &HashMap::from([(ComponentId(1), BTreeMap::new())]),
+        )
+        .expect("mount specs");
+
+        assert_eq!(
+            mount_specs.get(&ComponentId(1)),
+            Some(&vec![MountSpec::Literal {
+                path: "/etc/app/config.txt".to_string(),
+                content: "hello from config".to_string(),
+            }])
+        );
+    }
+
+    #[test]
+    fn build_mount_specs_defers_slot_mount_templates_for_deferred_runtime_addresses() {
+        let config_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mount_file": { "type": "string" }
+            },
+            "required": ["mount_file"]
+        });
+        let config = serde_json::json!({
+            "mount_file": "hello from config"
+        });
+        let manifest: Manifest = r#"
+            {
+              manifest_version: "0.3.0",
+              config_schema: {
+                type: "object",
+                properties: {
+                  mount_file: { type: "string" }
+                },
+                required: ["mount_file"]
+              },
+              slots: {
+                api: { kind: "http", optional: true }
+              },
+              program: {
+                image: "app",
+                entrypoint: ["app"],
+                mounts: [
+                  { path: "/tmp/${slots.api.url}", from: "config.mount_file" }
+                ]
+              }
+            }
+        "#
+        .parse()
+        .expect("manifest");
+        let template = parse_instance_config_template(Some(&config), Some(&config_schema))
+            .expect("component config template");
+        let program = lower_program(
+            ComponentId(1),
+            manifest.program().expect("program"),
+            Some(&template),
+        )
+        .expect("program");
+        let child = Component {
+            id: ComponentId(1),
+            parent: Some(ComponentId(0)),
+            moniker: Moniker::from(Arc::<str>::from("/worker")),
+            digest: ManifestDigest::new([1; 32]),
+            config: Some(config),
+            config_schema: Some(config_schema),
+            program: Some(program),
             slots: manifest
                 .slots()
                 .iter()
@@ -2801,9 +2948,215 @@ mod tests {
                 .collect(),
             provides: BTreeMap::new(),
             resources: BTreeMap::new(),
-            metadata: manifest.metadata().cloned(),
-            children,
-        }
+            metadata: None,
+            children: Vec::new(),
+        };
+        let scenario = scenario_with_child(child);
+        let templates = compose_component_config_templates(&scenario).expect("templates");
+        let mount_specs = build_mount_specs(
+            &scenario,
+            &[ComponentId(1)],
+            RuntimeAddressResolution::Deferred,
+            &templates,
+            &HashMap::from([(ComponentId(1), test_slot_values())]),
+        )
+        .expect("mount specs");
+
+        assert_eq!(
+            mount_specs.get(&ComponentId(1)),
+            Some(&vec![MountSpec::Template(MountTemplateSpec {
+                when: None,
+                each: None,
+                path: vec![TemplatePart::lit("/tmp/"), TemplatePart::slot(1, "api.url"),],
+                source: vec![
+                    TemplatePart::lit("config."),
+                    TemplatePart::lit("mount_file"),
+                ],
+            })])
+        );
+    }
+
+    #[test]
+    fn build_mount_specs_defers_repeated_slot_item_mount_templates_for_deferred_runtime_addresses()
+    {
+        let config_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mount_file": { "type": "string" }
+            },
+            "required": ["mount_file"]
+        });
+        let config = serde_json::json!({
+            "mount_file": "hello from config"
+        });
+        let manifest: Manifest = r#"
+            {
+              manifest_version: "0.3.0",
+              config_schema: {
+                type: "object",
+                properties: {
+                  mount_file: { type: "string" }
+                },
+                required: ["mount_file"]
+              },
+              slots: {
+                upstream: { kind: "http", optional: true, multiple: true }
+              },
+              program: {
+                image: "app",
+                entrypoint: ["app"],
+                mounts: [
+                  {
+                    each: "slots.upstream",
+                    path: "/tmp/${item.url}",
+                    from: "config.mount_file"
+                  }
+                ]
+              }
+            }
+        "#
+        .parse()
+        .expect("manifest");
+        let template = parse_instance_config_template(Some(&config), Some(&config_schema))
+            .expect("component config template");
+        let program = lower_program(
+            ComponentId(1),
+            manifest.program().expect("program"),
+            Some(&template),
+        )
+        .expect("program");
+        let child = Component {
+            id: ComponentId(1),
+            parent: Some(ComponentId(0)),
+            moniker: Moniker::from(Arc::<str>::from("/worker")),
+            digest: ManifestDigest::new([1; 32]),
+            config: Some(config),
+            config_schema: Some(config_schema),
+            program: Some(program),
+            slots: manifest
+                .slots()
+                .iter()
+                .map(|(name, decl)| (name.to_string(), decl.clone()))
+                .collect(),
+            provides: BTreeMap::new(),
+            resources: BTreeMap::new(),
+            metadata: None,
+            children: Vec::new(),
+        };
+        let scenario = scenario_with_child(child);
+        let templates = compose_component_config_templates(&scenario).expect("templates");
+        let mount_specs = build_mount_specs(
+            &scenario,
+            &[ComponentId(1)],
+            RuntimeAddressResolution::Deferred,
+            &templates,
+            &HashMap::from([(ComponentId(1), test_slot_values())]),
+        )
+        .expect("mount specs");
+
+        assert_eq!(
+            mount_specs.get(&ComponentId(1)),
+            Some(&vec![MountSpec::Template(MountTemplateSpec {
+                when: None,
+                each: None,
+                path: vec![
+                    TemplatePart::lit("/tmp/"),
+                    TemplatePart::item(1, "upstream", 0, "url"),
+                ],
+                source: vec![
+                    TemplatePart::lit("config."),
+                    TemplatePart::lit("mount_file"),
+                ],
+            })])
+        );
+    }
+
+    #[test]
+    fn build_mount_specs_rejects_config_mount_source_that_resolves_to_secret_path() {
+        let child = component_with_config_and_program(
+            1,
+            Some(0),
+            "/worker",
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "source_path": { "type": "string" },
+                    "token": { "type": "string", "secret": true }
+                },
+                "required": ["source_path", "token"]
+            })),
+            Some(serde_json::json!({
+                "source_path": "token",
+                "token": "shh"
+            })),
+            Some(serde_json::json!({
+                "image": "app",
+                "entrypoint": ["app"],
+                "mounts": [
+                    { "path": "/etc/app/config.txt", "from": "config.${config.source_path}" }
+                ],
+            })),
+        );
+        let scenario = scenario_with_child(child);
+        let templates = compose_component_config_templates(&scenario).expect("templates");
+        let err = build_mount_specs(
+            &scenario,
+            &[ComponentId(1)],
+            RuntimeAddressResolution::Static,
+            &templates,
+            &HashMap::from([(ComponentId(1), BTreeMap::new())]),
+        )
+        .expect_err("config mount to a secret path should fail");
+
+        assert!(
+            err.to_string()
+                .contains("config mount path `token` refers to secret config"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn build_mount_specs_rejects_secret_mount_source_that_resolves_to_public_path() {
+        let child = component_with_config_and_program(
+            1,
+            Some(0),
+            "/worker",
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "source_path": { "type": "string" },
+                    "public": { "type": "string" }
+                },
+                "required": ["source_path", "public"]
+            })),
+            Some(serde_json::json!({
+                "source_path": "public",
+                "public": "hello"
+            })),
+            Some(serde_json::json!({
+                "image": "app",
+                "entrypoint": ["app"],
+                "mounts": [
+                    { "path": "/etc/app/secret.txt", "from": "secret.${config.source_path}" }
+                ],
+            })),
+        );
+        let scenario = scenario_with_child(child);
+        let templates = compose_component_config_templates(&scenario).expect("templates");
+        let err = build_mount_specs(
+            &scenario,
+            &[ComponentId(1)],
+            RuntimeAddressResolution::Static,
+            &templates,
+            &HashMap::from([(ComponentId(1), BTreeMap::new())]),
+        )
+        .expect_err("secret mount to a public path should fail");
+
+        assert!(
+            err.to_string()
+                .contains("secret mount path `public` is not secret"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2842,134 +3195,82 @@ mod tests {
     }
 
     #[test]
-    fn build_config_plan_materializes_missing_optional_mount_as_empty_literal() {
-        let root_manifest: Manifest = r#"
-            {
-              manifest_version: "0.3.0",
-            }
-        "#
-        .parse()
-        .expect("root manifest");
-        let child_manifest: Manifest = r#"
-            {
-              manifest_version: "0.3.0",
-              config_schema: {
-                type: "object",
-                properties: {
-                  message: { type: "string" },
+    fn build_endpoint_plan_expands_variadic_config_endpoints() {
+        let root = component_with_config_and_program(0, None, "/", None, None, None);
+        let child = component_with_config_and_program(
+            1,
+            Some(0),
+            "/api",
+            Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "ports": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "port": { "type": "integer" },
+                                "protocol": { "type": "string" }
+                            },
+                            "required": ["name", "port", "protocol"]
+                        }
+                    }
                 },
-              },
-              program: {
-                image: "busybox",
-                entrypoint: ["sh", "-lc", "cat /etc/message"],
-                mounts: [{ path: "/etc/message", from: "config.message" }],
-              },
-            }
-        "#
-        .parse()
-        .expect("child manifest");
+                "required": ["ports"]
+            })),
+            Some(serde_json::json!({
+                "ports": [
+                    { "name": "http", "port": 8080, "protocol": "http" },
+                    { "name": "admin", "port": 9000, "protocol": "tcp" }
+                ]
+            })),
+            Some(serde_json::json!({
+                "image": "service",
+                "entrypoint": ["service"],
+                "network": {
+                    "endpoints": [
+                        {
+                            "when": "config.missing_optional",
+                            "name": "debug",
+                            "port": 7000
+                        },
+                        {
+                            "each": "config.ports",
+                            "name": "${item.name}",
+                            "port": "${item.port}",
+                            "protocol": "${item.protocol}"
+                        }
+                    ]
+                }
+            })),
+        );
 
+        let mut root = root;
+        root.children.push(ComponentId(1));
         let scenario = Scenario {
             root: ComponentId(0),
-            components: vec![
-                Some(component_from_manifest(
-                    ComponentId(0),
-                    None,
-                    "/",
-                    &root_manifest,
-                    None,
-                    vec![ComponentId(1)],
-                )),
-                Some(component_from_manifest(
-                    ComponentId(1),
-                    Some(ComponentId(0)),
-                    "/child",
-                    &child_manifest,
-                    Some(json!({})),
-                    Vec::new(),
-                )),
-            ],
+            components: vec![Some(root), Some(child)],
             bindings: Vec::<BindingEdge>::new(),
             exports: Vec::new(),
         };
 
-        let slot_values = HashMap::from([(ComponentId(1), BTreeMap::new())]);
-        let plan = build_config_plan(
-            &scenario,
-            &[ComponentId(1)],
-            ProgramSupport::Image {
-                backend_label: "test",
-            },
-            RuntimeAddressResolution::Static,
-            &slot_values,
-        )
-        .expect("config plan");
+        let endpoint_plan = build_endpoint_plan(&scenario).expect("endpoint plan");
 
         assert_eq!(
-            plan.mount_specs.get(&ComponentId(1)),
-            Some(&vec![MountSpec::Literal {
-                path: "/etc/message".to_string(),
-                content: String::new(),
-            }]),
-        );
-        assert!(!plan.needs_runtime_config);
-    }
-
-    #[test]
-    fn build_config_plan_marks_missing_optional_runtime_mounts() {
-        let root_manifest: Manifest = r#"
-            {
-              manifest_version: "0.3.0",
-              config_schema: {
-                type: "object",
-                properties: {
-                  api_key: { type: "string", secret: true },
+            endpoint_plan.component_endpoints(ComponentId(1)),
+            &[
+                ExpandedEndpoint {
+                    name: "http".to_string(),
+                    port: 8080,
+                    protocol: amber_manifest::NetworkProtocol::Http,
                 },
-              },
-              program: {
-                image: "busybox",
-                entrypoint: ["sh", "-lc", "cat /run/secrets/api_key"],
-                mounts: [{ path: "/run/secrets/api_key", from: "secret.api_key" }],
-              },
-            }
-        "#
-        .parse()
-        .expect("root manifest");
-
-        let scenario = Scenario {
-            root: ComponentId(0),
-            components: vec![Some(component_from_manifest(
-                ComponentId(0),
-                None,
-                "/",
-                &root_manifest,
-                None,
-                Vec::new(),
-            ))],
-            bindings: Vec::<BindingEdge>::new(),
-            exports: Vec::new(),
-        };
-
-        let slot_values = HashMap::from([(ComponentId(0), BTreeMap::new())]);
-        let plan = build_config_plan(
-            &scenario,
-            &[ComponentId(0)],
-            ProgramSupport::Image {
-                backend_label: "test",
-            },
-            RuntimeAddressResolution::Static,
-            &slot_values,
-        )
-        .expect("config plan");
-
-        assert_eq!(
-            plan.mount_specs.get(&ComponentId(0)),
-            Some(&vec![MountSpec::Config {
-                path: "/run/secrets/api_key".to_string(),
-                config: "api_key".to_string(),
-                optional: true,
-            }]),
+                ExpandedEndpoint {
+                    name: "admin".to_string(),
+                    port: 9000,
+                    protocol: amber_manifest::NetworkProtocol::Tcp,
+                },
+            ]
         );
-        assert!(plan.needs_runtime_config);
     }
 }

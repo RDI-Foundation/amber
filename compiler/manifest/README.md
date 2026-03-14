@@ -235,7 +235,7 @@ program: {
   args: ["python3", "-m", "http.server", "8080"],
   // args: "python3 -m http.server 8080",
   //
-  // Args and entrypoint items may also contain `when`-guarded argv groups.
+  // Args and entrypoint items may also contain `when`-guarded argv items.
   // The whole `argv` array is omitted when the `when` path is absent or null.
   // Presence is not truthiness: false, 0, and "" still count as present.
   //
@@ -329,8 +329,6 @@ Notes:
 * Mount paths must be absolute and must not include `..`.
 * `secret.<path>` requires the path to be secret in the component’s config schema.
 * `config.<path>` must not reference secret values.
-* If a mounted `config.<path>` / `secret.<path>` is optional in the component config schema and
-  resolves to no value, Amber writes an empty file at the target path.
 * `resources.<name>` mounts a storage resource owned by the same component.
 * `slots.<name>` mounts storage routed in from another component. Use a directory path such as
   `/var/lib/app`, not a single file path.

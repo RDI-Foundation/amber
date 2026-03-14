@@ -36,6 +36,7 @@ use amber_compiler::{
         vm::{VM_PLAN_FILENAME, VmArtifact, VmReporter},
     },
 };
+use amber_config::{self as config, CONFIG_ENV_PREFIX};
 use amber_manifest::{CapabilityTransport, ManifestRef};
 use amber_mesh::{
     InboundRoute, InboundTarget, MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME,
@@ -53,7 +54,8 @@ use amber_resolver::Resolver;
 use amber_router as router;
 use amber_scenario::{SCENARIO_IR_SCHEMA, ScenarioIr};
 use amber_template::{
-    ProgramArgTemplate, RuntimeSlotObject, RuntimeTemplateContext, TemplatePart, TemplateSpec,
+    ConfigTemplatePayload, MountSpec, ProgramArgTemplate, RuntimeSlotObject,
+    RuntimeTemplateContext, TemplatePart, TemplateSpec,
 };
 use base64::Engine as _;
 use clap::{ArgAction, Args, Parser, Subcommand};
@@ -1881,6 +1883,8 @@ fn component_program_spec(
         } => {
             let helper_binary = resolve_runtime_binary("amber-helper")?;
             let mut env = BTreeMap::new();
+            let runtime_template_context =
+                build_runtime_template_context(runtime_addresses, runtime_state)?;
             if let Some(value) = entrypoint_b64.as_ref() {
                 env.insert("AMBER_RESOLVED_ENTRYPOINT_B64".to_string(), value.clone());
             }
@@ -1896,9 +1900,14 @@ fn component_program_spec(
             if let Some(payload) = runtime_config {
                 append_runtime_config_env(&mut env, payload)?;
             }
-            append_runtime_template_context_env(&mut env, runtime_addresses, runtime_state)?;
+            append_runtime_template_context_env(&mut env, &runtime_template_context)?;
             if let Some(b64) = mount_spec_b64 {
-                writable_dirs.extend(decode_mount_parent_dirs(b64)?);
+                writable_dirs.extend(decode_mount_parent_dirs(
+                    b64,
+                    runtime_config.as_ref(),
+                    &runtime_template_context,
+                    &env,
+                )?);
             }
             Ok(ProcessSpec {
                 name: component.program.log_name.clone(),
@@ -1943,16 +1952,12 @@ fn direct_storage_bind_mounts(
 
 fn append_runtime_template_context_env(
     env_map: &mut BTreeMap<String, String>,
-    runtime_addresses: &DirectRuntimeAddressPlan,
-    runtime_state: &DirectRuntimeState,
+    context: &RuntimeTemplateContext,
 ) -> Result<()> {
-    if runtime_addresses.slots_by_scope.is_empty()
-        && runtime_addresses.slot_items_by_scope.is_empty()
-    {
+    if context.slots_by_scope.is_empty() && context.slot_items_by_scope.is_empty() {
         return Ok(());
     }
 
-    let context = build_runtime_template_context(runtime_addresses, runtime_state)?;
     let encoded =
         base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&context).map_err(
             |err| miette::miette!("failed to serialize direct runtime template context: {err}"),
@@ -2186,7 +2191,7 @@ fn decode_template_spec_program(raw_b64: &str) -> Result<String> {
 fn render_program_arg_template_literal(arg: &ProgramArgTemplate) -> Result<String> {
     let ProgramArgTemplate::Arg(parts) = arg else {
         return Err(miette::miette!(
-            "internal error: template spec program entrypoint starts with a conditional arg group"
+            "internal error: template spec program entrypoint starts with a conditional arg item"
         ));
     };
     render_template_string_literal(parts)
@@ -2209,6 +2214,12 @@ fn render_template_string_literal(parts: &[TemplatePart]) -> Result<String> {
                 ));
             }
             TemplatePart::Item { item, .. } => {
+                return Err(miette::miette!(
+                    "internal error: unresolved repeated item interpolation `{item}` in direct \
+                     program path"
+                ));
+            }
+            TemplatePart::CurrentItem { item } => {
                 return Err(miette::miette!(
                     "internal error: unresolved repeated item interpolation `{item}` in direct \
                      program path"
@@ -2237,21 +2248,28 @@ fn ensure_absolute_direct_program_path(program: &str, component_moniker: &str) -
     ))
 }
 
-fn decode_mount_parent_dirs(raw_b64: &str) -> Result<Vec<PathBuf>> {
+fn decode_mount_parent_dirs(
+    raw_b64: &str,
+    runtime_config: Option<&DirectRuntimeConfigPayload>,
+    runtime_template_context: &RuntimeTemplateContext,
+    env_map: &BTreeMap<String, String>,
+) -> Result<Vec<PathBuf>> {
+    decode_mount_parent_dirs_with_env(raw_b64, runtime_config, runtime_template_context, env_map)
+}
+
+fn decode_mount_parent_dirs_with_env(
+    raw_b64: &str,
+    runtime_config: Option<&DirectRuntimeConfigPayload>,
+    runtime_template_context: &RuntimeTemplateContext,
+    env_map: &BTreeMap<String, String>,
+) -> Result<Vec<PathBuf>> {
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(raw_b64.as_bytes())
         .map_err(|err| miette::miette!("invalid AMBER_MOUNT_SPEC_B64: {err}"))?;
-    let value: serde_json::Value = serde_json::from_slice(&decoded)
+    let mounts: Vec<MountSpec> = serde_json::from_slice(&decoded)
         .map_err(|err| miette::miette!("invalid mount spec payload: {err}"))?;
     let mut parents = BTreeSet::new();
-    let items = value
-        .as_array()
-        .ok_or_else(|| miette::miette!("invalid mount spec payload: expected array"))?;
-    for item in items {
-        let path = item
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| miette::miette!("invalid mount spec payload: missing path field"))?;
+    for path in rendered_mount_paths(&mounts, runtime_config, runtime_template_context, env_map)? {
         let path = PathBuf::from(path);
         if !path.is_absolute() {
             return Err(miette::miette!(
@@ -2268,6 +2286,91 @@ fn decode_mount_parent_dirs(raw_b64: &str) -> Result<Vec<PathBuf>> {
         parents.insert(parent.to_path_buf());
     }
     Ok(parents.into_iter().collect())
+}
+
+fn rendered_mount_paths(
+    mounts: &[MountSpec],
+    runtime_config: Option<&DirectRuntimeConfigPayload>,
+    runtime_template_context: &RuntimeTemplateContext,
+    env_map: &BTreeMap<String, String>,
+) -> Result<Vec<String>> {
+    if mounts
+        .iter()
+        .all(|mount| matches!(mount, MountSpec::Literal { .. }))
+    {
+        return Ok(mounts
+            .iter()
+            .map(|mount| match mount {
+                MountSpec::Literal { path, .. } => path.clone(),
+                MountSpec::Template(_) => unreachable!("checked above"),
+            })
+            .collect());
+    }
+
+    let runtime_config = runtime_config.ok_or_else(|| {
+        miette::miette!("mount specs require runtime config to resolve mount paths")
+    })?;
+    let (component_config, component_schema) =
+        resolve_runtime_component_config(runtime_config, runtime_template_context, env_map)?;
+    config::render_mount_specs(
+        mounts,
+        Some(&component_config),
+        Some(&component_schema),
+        runtime_template_context,
+    )
+    .map(|rendered| rendered.into_iter().map(|(path, _)| path).collect())
+    .map_err(|err| miette::miette!(err.to_string()))
+}
+
+fn resolve_runtime_component_config(
+    runtime_config: &DirectRuntimeConfigPayload,
+    runtime_template_context: &RuntimeTemplateContext,
+    env_map: &BTreeMap<String, String>,
+) -> Result<(serde_json::Value, serde_json::Value)> {
+    let root_schema = decode_runtime_json_b64(
+        "runtime root config schema",
+        runtime_config.root_schema_b64.as_str(),
+    )?;
+    let component_schema = decode_runtime_json_b64(
+        "runtime component config schema",
+        runtime_config.component_schema_b64.as_str(),
+    )?;
+    let component_template = ConfigTemplatePayload::from_value(decode_runtime_json_b64(
+        "runtime component config template",
+        runtime_config.component_cfg_template_b64.as_str(),
+    )?)
+    .map_err(|err| miette::miette!("invalid runtime component config template: {err}"))?;
+    let config_env = collect_runtime_config_env(env_map);
+    let component_config = config::resolve_runtime_component_config(
+        &root_schema,
+        &component_schema,
+        &component_template,
+        &config_env,
+        runtime_template_context,
+    )
+    .map_err(|err| {
+        miette::miette!("failed to resolve runtime component config for mount paths: {err}")
+    })?;
+
+    Ok((component_config, component_schema))
+}
+
+fn collect_runtime_config_env(env_map: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut config_env = BTreeMap::new();
+    for (key, value) in env_map {
+        if !key.starts_with(CONFIG_ENV_PREFIX) {
+            continue;
+        }
+        config_env.insert(key.clone(), value.clone());
+    }
+    config_env
+}
+
+fn decode_runtime_json_b64(name: &str, raw_b64: &str) -> Result<serde_json::Value> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(raw_b64.as_bytes())
+        .map_err(|err| miette::miette!("invalid {name}: {err}"))?;
+    serde_json::from_slice(&decoded).map_err(|err| miette::miette!("invalid {name}: {err}"))
 }
 
 async fn spawn_managed_process(
@@ -5508,6 +5611,25 @@ mod tests {
         }
     }
 
+    fn encode_json_b64(value: &serde_json::Value) -> String {
+        base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(value).expect("json should serialize"))
+    }
+
+    fn encode_mount_specs_b64(mounts: &[MountSpec]) -> String {
+        base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(mounts).expect("mount specs should serialize"))
+    }
+
+    fn root_runtime_config_payload(schema: serde_json::Value) -> DirectRuntimeConfigPayload {
+        DirectRuntimeConfigPayload {
+            root_schema_b64: encode_json_b64(&schema),
+            component_cfg_template_b64: encode_json_b64(&ConfigTemplatePayload::Root.to_value()),
+            component_schema_b64: encode_json_b64(&schema),
+            allowed_root_leaf_paths: Vec::new(),
+        }
+    }
+
     fn test_proxy_args() -> ProxyArgs {
         ProxyArgs {
             output: String::new(),
@@ -5862,6 +5984,68 @@ exit 1
                     .collect::<Vec<_>>()),
             Some(vec!["http://127.0.0.1:32001", "http://127.0.0.1:32002"])
         );
+    }
+
+    #[test]
+    fn decode_mount_parent_dirs_supports_literal_template_mount_paths() {
+        let mounts = vec![MountSpec::Template(amber_template::MountTemplateSpec {
+            when: None,
+            each: None,
+            path: vec![TemplatePart::lit("/run/app.txt")],
+            source: vec![TemplatePart::lit("config.app")],
+        })];
+        let runtime_config = root_runtime_config_payload(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "app": { "type": "string" }
+            },
+            "required": ["app"]
+        }));
+
+        let parents = decode_mount_parent_dirs_with_env(
+            &encode_mount_specs_b64(&mounts),
+            Some(&runtime_config),
+            &RuntimeTemplateContext::default(),
+            &BTreeMap::from([("AMBER_CONFIG_APP".to_string(), "hello".to_string())]),
+        )
+        .expect("literal template mount path should resolve");
+
+        assert_eq!(parents, vec![PathBuf::from("/run")]);
+    }
+
+    #[test]
+    fn decode_mount_parent_dirs_renders_config_template_mount_paths() {
+        let mounts = vec![MountSpec::Template(amber_template::MountTemplateSpec {
+            when: None,
+            each: None,
+            path: vec![
+                TemplatePart::lit("/etc/"),
+                TemplatePart::config("mount_dir"),
+                TemplatePart::lit("/app.txt"),
+            ],
+            source: vec![TemplatePart::lit("config.app")],
+        })];
+        let runtime_config = root_runtime_config_payload(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "app": { "type": "string" },
+                "mount_dir": { "type": "string" }
+            },
+            "required": ["app", "mount_dir"]
+        }));
+
+        let parents = decode_mount_parent_dirs_with_env(
+            &encode_mount_specs_b64(&mounts),
+            Some(&runtime_config),
+            &RuntimeTemplateContext::default(),
+            &BTreeMap::from([
+                ("AMBER_CONFIG_APP".to_string(), "hello".to_string()),
+                ("AMBER_CONFIG_MOUNT_DIR".to_string(), "service".to_string()),
+            ]),
+        )
+        .expect("config template mount path should resolve");
+
+        assert_eq!(parents, vec![PathBuf::from("/etc/service")]);
     }
 
     #[test]

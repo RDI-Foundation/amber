@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fmt,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
@@ -21,8 +21,8 @@ use crate::{
     config_schema_profile,
     error::Error,
     interpolation::{
-        InlineStringSpec, InterpolatedString, ProgramEntrypoint, ProgramEnvValue,
-        RawProgramEntrypoint, RawProgramEnvValue,
+        InlineStringSpec, InterpolatedString, InterpolationSource, ProgramEntrypoint,
+        ProgramEnvValue, RawProgramEntrypoint, RawProgramEnvValue,
     },
     names::{
         ChildName, ExportName, FrameworkCapabilityName, ProvideName, ResourceName, SlotName,
@@ -45,6 +45,234 @@ static EMPTY_PROGRAM_ENTRYPOINT: LazyLock<ProgramEntrypoint> =
     LazyLock::new(ProgramEntrypoint::default);
 static EMPTY_PROGRAM_ENV: LazyLock<BTreeMap<String, ProgramEnvValue>> =
     LazyLock::new(BTreeMap::new);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgramCommandKind {
+    Entrypoint,
+    Args,
+}
+
+impl ProgramCommandKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Entrypoint => "program.entrypoint",
+            Self::Args => "program.args",
+        }
+    }
+
+    fn json_pointer(self) -> &'static str {
+        match self {
+            Self::Entrypoint => "/program/entrypoint",
+            Self::Args => "/program/args",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgramConfigUseSite<'a> {
+    Image,
+    Path,
+    VmImage,
+    VmCpus,
+    VmMemoryMib,
+    VmCloudInitUserData,
+    VmCloudInitVendorData,
+    CommandWhen {
+        kind: ProgramCommandKind,
+        index: usize,
+    },
+    CommandEach {
+        kind: ProgramCommandKind,
+        index: usize,
+    },
+    CommandValue {
+        kind: ProgramCommandKind,
+        index: usize,
+    },
+    EnvWhen {
+        name: &'a str,
+    },
+    EnvEach {
+        name: &'a str,
+    },
+    EnvValue {
+        name: &'a str,
+        wrapped: bool,
+    },
+    EndpointWhen {
+        index: usize,
+    },
+    EndpointEach {
+        index: usize,
+    },
+    EndpointName {
+        index: usize,
+    },
+    EndpointPort {
+        index: usize,
+    },
+    EndpointProtocol {
+        index: usize,
+    },
+    MountWhen {
+        index: usize,
+    },
+    MountEach {
+        index: usize,
+    },
+    MountName {
+        index: usize,
+    },
+    MountPath {
+        index: usize,
+    },
+    MountSource {
+        index: usize,
+    },
+}
+
+impl fmt::Display for ProgramConfigUseSite<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Image => f.write_str("program.image"),
+            Self::Path => f.write_str("program.path"),
+            Self::VmImage => f.write_str("program.vm.image"),
+            Self::VmCpus => f.write_str("program.vm.cpus"),
+            Self::VmMemoryMib => f.write_str("program.vm.memory_mib"),
+            Self::VmCloudInitUserData => f.write_str("program.vm.cloud_init.user_data"),
+            Self::VmCloudInitVendorData => f.write_str("program.vm.cloud_init.vendor_data"),
+            Self::CommandWhen { kind, index } => write!(f, "{}[{index}].when", kind.label()),
+            Self::CommandEach { kind, index } => write!(f, "{}[{index}].each", kind.label()),
+            Self::CommandValue { kind, index } => write!(f, "{}[{index}]", kind.label()),
+            Self::EnvWhen { name } => write!(f, "program.env.{name}.when"),
+            Self::EnvEach { name } => write!(f, "program.env.{name}.each"),
+            Self::EnvValue {
+                name,
+                wrapped: true,
+            } => write!(f, "program.env.{name}.value"),
+            Self::EnvValue {
+                name,
+                wrapped: false,
+            } => write!(f, "program.env.{name}"),
+            Self::EndpointWhen { index } => write!(f, "program.network.endpoints[{index}].when"),
+            Self::EndpointEach { index } => write!(f, "program.network.endpoints[{index}].each"),
+            Self::EndpointName { index } => write!(f, "program.network.endpoints[{index}].name"),
+            Self::EndpointPort { index } => write!(f, "program.network.endpoints[{index}].port"),
+            Self::EndpointProtocol { index } => {
+                write!(f, "program.network.endpoints[{index}].protocol")
+            }
+            Self::MountWhen { index } => write!(f, "program.mounts[{index}].when"),
+            Self::MountEach { index } => write!(f, "program.mounts[{index}].each"),
+            Self::MountName { index } => write!(f, "program.mounts[{index}].name"),
+            Self::MountPath { index } => write!(f, "program.mounts[{index}].path"),
+            Self::MountSource { index } => write!(f, "program.mounts[{index}].from"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProgramFieldLocation {
+    Common,
+    Vm,
+}
+
+impl ProgramFieldLocation {
+    fn mounts_pointer(self) -> &'static str {
+        match self {
+            Self::Common => "/program/mounts",
+            Self::Vm => "/program/vm/mounts",
+        }
+    }
+
+    fn endpoints_pointer(self) -> &'static str {
+        match self {
+            Self::Common => "/program/network/endpoints",
+            Self::Vm => "/program/vm/network/endpoints",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProgramVersionGatedSyntax<'a> {
+    ConditionalCommandItem {
+        kind: ProgramCommandKind,
+        index: usize,
+    },
+    VariadicCommandItem {
+        kind: ProgramCommandKind,
+        index: usize,
+    },
+    ConditionalEnvValue {
+        name: &'a str,
+    },
+    VariadicEnvValue {
+        name: &'a str,
+    },
+    ConditionalMount {
+        location: ProgramFieldLocation,
+        index: usize,
+    },
+    VariadicMount {
+        location: ProgramFieldLocation,
+        index: usize,
+    },
+    ConditionalEndpoint {
+        location: ProgramFieldLocation,
+        index: usize,
+    },
+    VariadicEndpoint {
+        location: ProgramFieldLocation,
+        index: usize,
+    },
+}
+
+impl ProgramVersionGatedSyntax<'_> {
+    pub(crate) fn required_version(self) -> &'static str {
+        match self {
+            Self::ConditionalCommandItem { .. }
+            | Self::ConditionalEnvValue { .. }
+            | Self::ConditionalMount { .. }
+            | Self::ConditionalEndpoint { .. } => "0.2.0",
+            Self::VariadicCommandItem { .. }
+            | Self::VariadicEnvValue { .. }
+            | Self::VariadicMount { .. }
+            | Self::VariadicEndpoint { .. } => "0.3.0",
+        }
+    }
+
+    pub(crate) fn feature(self) -> &'static str {
+        match self {
+            Self::ConditionalCommandItem { .. } => "conditional argument items",
+            Self::VariadicCommandItem { .. } => "variadic argument expansion",
+            Self::ConditionalEnvValue { .. } => "conditional environment values",
+            Self::VariadicEnvValue { .. } => "variadic environment expansion",
+            Self::ConditionalMount { .. } => "conditional mounts",
+            Self::VariadicMount { .. } => "variadic mounts",
+            Self::ConditionalEndpoint { .. } => "conditional endpoints",
+            Self::VariadicEndpoint { .. } => "variadic endpoints",
+        }
+    }
+
+    pub(crate) fn pointer(self) -> String {
+        match self {
+            Self::ConditionalCommandItem { kind, index }
+            | Self::VariadicCommandItem { kind, index } => {
+                format!("{}/{index}", kind.json_pointer())
+            }
+            Self::ConditionalEnvValue { name } | Self::VariadicEnvValue { name } => {
+                format!("/program/env/{name}")
+            }
+            Self::ConditionalMount { location, index }
+            | Self::VariadicMount { location, index } => {
+                format!("{}/{index}", location.mounts_pointer())
+            }
+            Self::ConditionalEndpoint { location, index }
+            | Self::VariadicEndpoint { location, index } => {
+                format!("{}/{index}", location.endpoints_pointer())
+            }
+        }
+    }
+}
 
 impl<'de> Deserialize<'de> for Program {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -248,6 +476,317 @@ impl Program {
         }
     }
 
+    pub(crate) fn first_conditional_syntax(&self) -> Option<ProgramVersionGatedSyntax<'_>> {
+        self.first_command_or_env_syntax(true).or_else(|| {
+            let location = match self {
+                Self::Vm(_) => ProgramFieldLocation::Vm,
+                Self::Image(_) | Self::Path(_) => ProgramFieldLocation::Common,
+            };
+            self.mounts()
+                .iter()
+                .enumerate()
+                .find_map(|(index, mount)| {
+                    mount
+                        .when
+                        .as_ref()
+                        .map(|_| ProgramVersionGatedSyntax::ConditionalMount { location, index })
+                })
+                .or_else(|| {
+                    self.network().and_then(|network| {
+                        network
+                            .endpoints()
+                            .iter()
+                            .enumerate()
+                            .find_map(|(index, endpoint)| {
+                                endpoint.when.as_ref().map(|_| {
+                                    ProgramVersionGatedSyntax::ConditionalEndpoint {
+                                        location,
+                                        index,
+                                    }
+                                })
+                            })
+                    })
+                })
+        })
+    }
+
+    pub(crate) fn first_variadic_syntax(&self) -> Option<ProgramVersionGatedSyntax<'_>> {
+        self.first_command_or_env_syntax(false).or_else(|| {
+            let location = match self {
+                Self::Vm(_) => ProgramFieldLocation::Vm,
+                Self::Image(_) | Self::Path(_) => ProgramFieldLocation::Common,
+            };
+            self.mounts()
+                .iter()
+                .enumerate()
+                .find_map(|(index, mount)| {
+                    mount
+                        .each
+                        .as_ref()
+                        .map(|_| ProgramVersionGatedSyntax::VariadicMount { location, index })
+                })
+                .or_else(|| {
+                    self.network().and_then(|network| {
+                        network
+                            .endpoints()
+                            .iter()
+                            .enumerate()
+                            .find_map(|(index, endpoint)| {
+                                endpoint.each.as_ref().map(|_| {
+                                    ProgramVersionGatedSyntax::VariadicEndpoint { location, index }
+                                })
+                            })
+                    })
+                })
+        })
+    }
+
+    fn first_command_or_env_syntax<'a>(
+        &'a self,
+        conditional: bool,
+    ) -> Option<ProgramVersionGatedSyntax<'a>> {
+        let (kind, command, env) = match self {
+            Self::Image(program) => (
+                Some(ProgramCommandKind::Entrypoint),
+                Some(&program.entrypoint),
+                Some(&program.common.env),
+            ),
+            Self::Path(program) => (
+                Some(ProgramCommandKind::Args),
+                Some(&program.args),
+                Some(&program.common.env),
+            ),
+            Self::Vm(_) => (None, None, None),
+        };
+
+        if let (Some(kind), Some(command)) = (kind, command)
+            && let Some(index) = command.0.iter().position(|item| {
+                if conditional {
+                    item.when().is_some()
+                } else {
+                    item.each().is_some()
+                }
+            })
+        {
+            return Some(if conditional {
+                ProgramVersionGatedSyntax::ConditionalCommandItem { kind, index }
+            } else {
+                ProgramVersionGatedSyntax::VariadicCommandItem { kind, index }
+            });
+        }
+
+        env.and_then(|env| {
+            env.iter().find_map(|(name, value)| {
+                if conditional {
+                    value
+                        .when()
+                        .map(|_| ProgramVersionGatedSyntax::ConditionalEnvValue { name })
+                } else {
+                    value
+                        .each()
+                        .map(|_| ProgramVersionGatedSyntax::VariadicEnvValue { name })
+                }
+            })
+        })
+    }
+
+    /// Visit config paths referenced anywhere in the program.
+    pub fn visit_config_uses(&self, mut visit: impl FnMut(ProgramConfigUseSite<'_>, &str)) {
+        fn visit_raw_string_config_uses(
+            raw: &str,
+            location: ProgramConfigUseSite<'_>,
+            visit: &mut impl FnMut(ProgramConfigUseSite<'_>, &str),
+        ) {
+            let Ok(parsed) = raw.parse::<InterpolatedString>() else {
+                return;
+            };
+            parsed.visit_config_uses(|query| visit(location, query));
+        }
+
+        fn visit_vm_scalar_config_uses(
+            scalar: &VmScalarU32,
+            location: ProgramConfigUseSite<'_>,
+            visit: &mut impl FnMut(ProgramConfigUseSite<'_>, &str),
+        ) {
+            let VmScalarU32::Interpolated(raw) = scalar else {
+                return;
+            };
+            visit_raw_string_config_uses(raw, location, visit);
+        }
+
+        fn visit_command_config_uses(
+            kind: ProgramCommandKind,
+            command: &ProgramEntrypoint,
+            visit: &mut impl FnMut(ProgramConfigUseSite<'_>, &str),
+        ) {
+            for (index, item) in command.0.iter().enumerate() {
+                if let Some(when) = item.when()
+                    && when.source() == InterpolationSource::Config
+                {
+                    visit(
+                        ProgramConfigUseSite::CommandWhen { kind, index },
+                        when.query(),
+                    );
+                }
+                if let Some(each) = item.each()
+                    && let Some(path) = each.config_path()
+                {
+                    visit(ProgramConfigUseSite::CommandEach { kind, index }, path);
+                }
+                item.visit_values(|value| {
+                    value.visit_config_uses(|query| {
+                        visit(ProgramConfigUseSite::CommandValue { kind, index }, query)
+                    });
+                });
+            }
+        }
+
+        fn visit_env_config_uses(
+            env: &BTreeMap<String, ProgramEnvValue>,
+            visit: &mut impl FnMut(ProgramConfigUseSite<'_>, &str),
+        ) {
+            for (name, value) in env {
+                if let Some(when) = value.when()
+                    && when.source() == InterpolationSource::Config
+                {
+                    visit(ProgramConfigUseSite::EnvWhen { name }, when.query());
+                }
+                if let Some(path) = value.each().and_then(|each| each.config_path()) {
+                    visit(ProgramConfigUseSite::EnvEach { name }, path);
+                }
+                let wrapped = value.when().is_some() || value.each().is_some();
+                value.value().visit_config_uses(|query| {
+                    visit(ProgramConfigUseSite::EnvValue { name, wrapped }, query)
+                });
+            }
+        }
+
+        fn visit_network_config_uses(
+            network: ProgramNetworkRef<'_>,
+            visit: &mut impl FnMut(ProgramConfigUseSite<'_>, &str),
+        ) {
+            for (index, endpoint) in network.endpoints().iter().enumerate() {
+                if let Some(when) = &endpoint.when
+                    && when.source() == InterpolationSource::Config
+                {
+                    visit(ProgramConfigUseSite::EndpointWhen { index }, when.query());
+                }
+                if let Some(path) = endpoint
+                    .each
+                    .as_ref()
+                    .and_then(crate::EachPath::config_path)
+                {
+                    visit(ProgramConfigUseSite::EndpointEach { index }, path);
+                }
+                endpoint.name.visit_config_uses(|query| {
+                    visit(ProgramConfigUseSite::EndpointName { index }, query)
+                });
+                if let EndpointPort::Interpolated(port) = &endpoint.port {
+                    port.visit_config_uses(|query| {
+                        visit(ProgramConfigUseSite::EndpointPort { index }, query)
+                    });
+                }
+                endpoint.protocol.visit_config_uses(|query| {
+                    visit(ProgramConfigUseSite::EndpointProtocol { index }, query)
+                });
+            }
+        }
+
+        fn visit_mount_config_uses(
+            mounts: &[ProgramMount],
+            visit: &mut impl FnMut(ProgramConfigUseSite<'_>, &str),
+        ) {
+            for (index, mount) in mounts.iter().enumerate() {
+                if let Some(when) = &mount.when
+                    && when.source() == InterpolationSource::Config
+                {
+                    visit(ProgramConfigUseSite::MountWhen { index }, when.query());
+                }
+                if let Some(path) = mount.each.as_ref().and_then(crate::EachPath::config_path) {
+                    visit(ProgramConfigUseSite::MountEach { index }, path);
+                }
+                if let Some(name) = &mount.name {
+                    name.visit_config_uses(|query| {
+                        visit(ProgramConfigUseSite::MountName { index }, query)
+                    });
+                }
+                mount.path.visit_config_uses(|query| {
+                    visit(ProgramConfigUseSite::MountPath { index }, query)
+                });
+                if let Some(source) = mount.literal_source() {
+                    match source {
+                        MountSource::Config(path) | MountSource::Secret(path) => {
+                            visit(ProgramConfigUseSite::MountSource { index }, &path);
+                        }
+                        MountSource::Resource(_)
+                        | MountSource::Slot(_)
+                        | MountSource::Framework(_) => {}
+                    }
+                }
+                mount.source.visit_config_uses(|query| {
+                    visit(ProgramConfigUseSite::MountSource { index }, query)
+                });
+            }
+        }
+
+        match self {
+            Self::Image(program) => {
+                visit_raw_string_config_uses(
+                    &program.image,
+                    ProgramConfigUseSite::Image,
+                    &mut visit,
+                );
+                visit_command_config_uses(
+                    ProgramCommandKind::Entrypoint,
+                    &program.entrypoint,
+                    &mut visit,
+                );
+                visit_env_config_uses(&program.common.env, &mut visit);
+            }
+            Self::Path(program) => {
+                visit_raw_string_config_uses(&program.path, ProgramConfigUseSite::Path, &mut visit);
+                visit_command_config_uses(ProgramCommandKind::Args, &program.args, &mut visit);
+                visit_env_config_uses(&program.common.env, &mut visit);
+            }
+            Self::Vm(program) => {
+                visit_raw_string_config_uses(
+                    &program.0.image,
+                    ProgramConfigUseSite::VmImage,
+                    &mut visit,
+                );
+                visit_vm_scalar_config_uses(
+                    &program.0.cpus,
+                    ProgramConfigUseSite::VmCpus,
+                    &mut visit,
+                );
+                visit_vm_scalar_config_uses(
+                    &program.0.memory_mib,
+                    ProgramConfigUseSite::VmMemoryMib,
+                    &mut visit,
+                );
+                if let Some(raw) = program.0.cloud_init.user_data.as_deref() {
+                    visit_raw_string_config_uses(
+                        raw,
+                        ProgramConfigUseSite::VmCloudInitUserData,
+                        &mut visit,
+                    );
+                }
+                if let Some(raw) = program.0.cloud_init.vendor_data.as_deref() {
+                    visit_raw_string_config_uses(
+                        raw,
+                        ProgramConfigUseSite::VmCloudInitVendorData,
+                        &mut visit,
+                    );
+                }
+            }
+        }
+
+        if let Some(network) = self.network() {
+            visit_network_config_uses(network, &mut visit);
+        }
+        visit_mount_config_uses(self.mounts(), &mut visit);
+    }
+
     /// Visit slot names referenced anywhere in the program. Returns `true` if the program
     /// references all slots.
     pub fn visit_slot_uses(&self, mut visit: impl FnMut(&str)) -> bool {
@@ -304,6 +843,20 @@ impl Program {
 
         for value in self.env().values() {
             if value.visit_slot_uses(&mut visit) {
+                return true;
+            }
+        }
+
+        if let Some(network) = self.network() {
+            for endpoint in network.endpoints() {
+                if endpoint.visit_slot_uses(&mut visit) {
+                    return true;
+                }
+            }
+        }
+
+        for mount in self.mounts() {
+            if mount.visit_slot_uses(&mut visit) {
                 return true;
             }
         }
@@ -745,10 +1298,10 @@ pub enum ProgramNetworkRef<'a> {
 }
 
 impl<'a> ProgramNetworkRef<'a> {
-    pub fn endpoints(self) -> &'a BTreeSet<Endpoint> {
+    pub fn endpoints(self) -> &'a [Endpoint] {
         match self {
-            Self::Common(network) => &network.endpoints,
-            Self::Vm(network) => &network.endpoints,
+            Self::Common(network) => network.endpoints.as_slice(),
+            Self::Vm(network) => network.endpoints.as_slice(),
         }
     }
 }
@@ -858,8 +1411,8 @@ impl<'de> Deserialize<'de> for VmScalarU32 {
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct VmNetwork {
-    #[serde(default, deserialize_with = "deserialize_endpoints")]
-    pub endpoints: BTreeSet<Endpoint>,
+    #[serde(default)]
+    pub endpoints: Vec<Endpoint>,
     #[serde(default)]
     pub egress: VmEgress,
 }
@@ -912,10 +1465,75 @@ pub struct ProgramCommon {
 #[non_exhaustive]
 pub struct ProgramMount {
     #[serde(default)]
-    pub name: Option<String>,
-    pub path: String,
+    pub when: Option<crate::WhenPath>,
+    #[serde(default)]
+    pub each: Option<crate::EachPath>,
+    #[serde(default)]
+    pub name: Option<InterpolatedString>,
+    pub path: InterpolatedString,
     #[serde(rename = "from")]
-    pub source: MountSource,
+    pub source: InterpolatedString,
+}
+
+impl ProgramMount {
+    pub fn is_variadic(&self) -> bool {
+        self.when.is_some() || self.each.is_some()
+    }
+
+    pub fn literal_name(&self) -> Option<&str> {
+        self.name.as_ref().and_then(InterpolatedString::as_literal)
+    }
+
+    pub fn literal_path(&self) -> Option<&str> {
+        self.path.as_literal()
+    }
+
+    pub fn literal_source(&self) -> Option<MountSource> {
+        self.source.as_literal()?.parse().ok()
+    }
+
+    pub fn visit_slot_uses(&self, mut visit: impl FnMut(&str)) -> bool {
+        if let Some(when) = &self.when
+            && when.visit_slot_uses(&mut visit)
+        {
+            return true;
+        }
+        if let Some(each) = &self.each {
+            each.visit_slot_uses(&mut visit);
+        }
+        if let Some(name) = &self.name
+            && name.visit_slot_uses(&mut visit)
+        {
+            return true;
+        }
+        if self.path.visit_slot_uses(&mut visit) || self.source.visit_slot_uses(&mut visit) {
+            return true;
+        }
+        if let Some(MountSource::Slot(slot)) = self.literal_source() {
+            visit(&slot);
+        }
+        false
+    }
+
+    pub fn visit_config_uses(&self, mut visit: impl FnMut(&str)) {
+        if let Some(when) = &self.when {
+            when.visit_config_uses(&mut visit);
+        }
+        if let Some(each) = &self.each {
+            each.visit_config_uses(&mut visit);
+        }
+        if let Some(name) = &self.name {
+            name.visit_config_uses(&mut visit);
+        }
+        self.path.visit_config_uses(&mut visit);
+        self.source.visit_config_uses(&mut visit);
+        if let Some(source) = self.literal_source() {
+            match source {
+                MountSource::Config(path) | MountSource::Secret(path) => visit(&path),
+                MountSource::Resource(_) | MountSource::Slot(_) | MountSource::Framework(_) => {}
+            }
+        }
+    }
 }
 
 #[derive(
@@ -1162,40 +1780,69 @@ fn display_file_reference_path(raw: &str, resolved: &Path) -> String {
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Network {
-    #[serde(default, deserialize_with = "deserialize_endpoints")]
+    #[serde(default)]
     #[builder(default)]
-    pub endpoints: BTreeSet<Endpoint>,
+    pub endpoints: Vec<Endpoint>,
 }
 
-fn deserialize_endpoints<'de, D>(deserializer: D) -> Result<BTreeSet<Endpoint>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let endpoints = Vec::<Endpoint>::deserialize(deserializer)?;
-    let mut names = BTreeSet::new();
-    for endpoint in &endpoints {
-        if !names.insert(endpoint.name.as_str()) {
-            return Err(serde::de::Error::custom(Error::DuplicateEndpointName {
-                name: endpoint.name.clone(),
-            }));
-        }
-    }
-    Ok(endpoints.into_iter().collect())
-}
-
-#[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, bon::Builder,
-)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, bon::Builder)]
 #[builder(on(String, into))]
-#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Endpoint {
-    pub name: String,
-    // TODO: this should be an enum tagged by `NetworkProtocol` and carrying appropriate data for the protocol
-    pub port: u16,
-    #[serde(default = "default_protocol")]
-    #[builder(default = default_protocol())]
-    pub protocol: NetworkProtocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<crate::WhenPath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub each: Option<crate::EachPath>,
+    pub name: InterpolatedString,
+    pub port: EndpointPort,
+    #[serde(default = "default_protocol_template")]
+    #[builder(default = default_protocol_template())]
+    pub protocol: InterpolatedString,
+}
+
+impl Endpoint {
+    pub fn is_variadic(&self) -> bool {
+        self.when.is_some() || self.each.is_some()
+    }
+
+    pub fn literal_name(&self) -> Option<&str> {
+        self.name.as_literal()
+    }
+
+    pub fn literal_port(&self) -> Option<u16> {
+        self.port.as_literal()
+    }
+
+    pub fn literal_protocol(&self) -> Option<NetworkProtocol> {
+        self.protocol.as_literal()?.parse().ok()
+    }
+
+    pub fn visit_slot_uses(&self, mut visit: impl FnMut(&str)) -> bool {
+        if let Some(when) = &self.when
+            && when.visit_slot_uses(&mut visit)
+        {
+            return true;
+        }
+        if let Some(each) = &self.each {
+            each.visit_slot_uses(&mut visit);
+        }
+        if self.name.visit_slot_uses(&mut visit) || self.protocol.visit_slot_uses(&mut visit) {
+            return true;
+        }
+        self.port.visit_slot_uses(visit)
+    }
+
+    pub fn visit_config_uses(&self, mut visit: impl FnMut(&str)) {
+        if let Some(when) = &self.when {
+            when.visit_config_uses(&mut visit);
+        }
+        if let Some(each) = &self.each {
+            each.visit_config_uses(&mut visit);
+        }
+        self.name.visit_config_uses(&mut visit);
+        self.protocol.visit_config_uses(&mut visit);
+        self.port.visit_config_uses(visit);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -1218,8 +1865,130 @@ impl fmt::Display for NetworkProtocol {
     }
 }
 
+impl FromStr for NetworkProtocol {
+    type Err = String;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        match input {
+            "http" => Ok(Self::Http),
+            "https" => Ok(Self::Https),
+            "tcp" => Ok(Self::Tcp),
+            other => Err(format!("unknown network protocol `{other}`")),
+        }
+    }
+}
+
 fn default_protocol() -> NetworkProtocol {
     NetworkProtocol::Http
+}
+
+fn default_protocol_template() -> InterpolatedString {
+    InterpolatedString::from_literal(default_protocol().to_string())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum EndpointPort {
+    Literal(u16),
+    Interpolated(InterpolatedString),
+}
+
+impl EndpointPort {
+    pub fn as_literal(&self) -> Option<u16> {
+        match self {
+            Self::Literal(value) => Some(*value),
+            Self::Interpolated(_) => None,
+        }
+    }
+
+    pub fn visit_slot_uses(&self, visit: impl FnMut(&str)) -> bool {
+        match self {
+            Self::Literal(_) => false,
+            Self::Interpolated(value) => value.visit_slot_uses(visit),
+        }
+    }
+
+    pub fn visit_config_uses(&self, visit: impl FnMut(&str)) {
+        if let Self::Interpolated(value) = self {
+            value.visit_config_uses(visit);
+        }
+    }
+}
+
+impl fmt::Display for EndpointPort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Literal(value) => write!(f, "{value}"),
+            Self::Interpolated(value) => f.write_str(
+                value
+                    .as_literal()
+                    .expect("interpolated endpoint port is not concrete here"),
+            ),
+        }
+    }
+}
+
+impl Serialize for EndpointPort {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Literal(value) => serializer.serialize_u16(*value),
+            Self::Interpolated(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EndpointPort {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum PortValue {
+            Literal(u16),
+            Interpolated(String),
+        }
+
+        match PortValue::deserialize(deserializer)? {
+            PortValue::Literal(value) => Ok(Self::Literal(value)),
+            PortValue::Interpolated(value) => value
+                .parse::<InterpolatedString>()
+                .map(Self::Interpolated)
+                .map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Endpoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct EndpointFields {
+            #[serde(default)]
+            when: Option<crate::WhenPath>,
+            #[serde(default)]
+            each: Option<crate::EachPath>,
+            name: InterpolatedString,
+            port: EndpointPort,
+            #[serde(default = "default_protocol_template")]
+            protocol: InterpolatedString,
+        }
+
+        let endpoint = EndpointFields::deserialize(deserializer)?;
+        Ok(Self {
+            when: endpoint.when,
+            each: endpoint.each,
+            name: endpoint.name,
+            port: endpoint.port,
+            protocol: endpoint.protocol,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
