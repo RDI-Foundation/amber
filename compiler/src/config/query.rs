@@ -176,7 +176,12 @@ pub(crate) fn resolve_config_presence_with_root_schema(
             };
 
             match resolution {
-                QueryResolution::RuntimePath(_) => resolve_root_schema_presence(root_schema, query),
+                QueryResolution::RuntimePath(path) => {
+                    resolve_root_schema_presence(root_schema, &path)
+                }
+                QueryResolution::Node(rc::ConfigNode::ConfigRef(path)) => {
+                    resolve_root_schema_presence(root_schema, path)
+                }
                 QueryResolution::Node(node) => {
                     if node.contains_runtime() {
                         return Ok(ConfigPresence::Runtime);
@@ -482,6 +487,65 @@ mod tests {
             resolve_config_presence_with_root_schema(
                 Some(&template),
                 Some(&component_schema),
+                "settings.mode"
+            )
+            .unwrap(),
+            ConfigPresence::Present
+        );
+    }
+
+    #[test]
+    fn resolve_config_presence_with_root_schema_uses_config_ref_leaf_schema_presence() {
+        let template = amber_config::ConfigNode::Object(BTreeMap::from([(
+            "enabled".to_string(),
+            amber_config::ConfigNode::ConfigRef("root_enabled".to_string()),
+        )]));
+        let root_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "root_enabled": {
+                    "type": "boolean",
+                    "default": false
+                }
+            }
+        });
+
+        assert_eq!(
+            resolve_config_presence_with_root_schema(
+                Some(&template),
+                Some(&root_schema),
+                "enabled"
+            )
+            .unwrap(),
+            ConfigPresence::Present
+        );
+    }
+
+    #[test]
+    fn resolve_config_presence_with_root_schema_uses_resolved_runtime_paths() {
+        let template = amber_config::ConfigNode::Object(BTreeMap::from([(
+            "settings".to_string(),
+            amber_config::ConfigNode::ConfigRef("root_settings".to_string()),
+        )]));
+        let root_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "root_settings": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {
+                            "type": "string",
+                            "default": "safe"
+                        }
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            resolve_config_presence_with_root_schema(
+                Some(&template),
+                Some(&root_schema),
                 "settings.mode"
             )
             .unwrap(),

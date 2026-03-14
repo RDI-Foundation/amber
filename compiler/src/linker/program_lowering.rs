@@ -1160,6 +1160,56 @@ mod tests {
     }
 
     #[test]
+    fn lower_program_uses_root_schema_defaults_for_config_ref_leaf_endpoint_when() {
+        let manifest: Manifest = r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                image: "app",
+                entrypoint: ["app"],
+                network: {
+                  endpoints: [
+                    {
+                      name: "http",
+                      port: 8080,
+                      protocol: "http",
+                      when: "config.enabled",
+                    },
+                  ],
+                },
+              },
+            }
+        "#
+        .parse()
+        .expect("manifest");
+        let template = ConfigNode::Object(BTreeMap::from([(
+            "enabled".to_string(),
+            ConfigNode::ConfigRef("root_enabled".to_string()),
+        )]));
+        let root_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "root_enabled": {
+                    "type": "boolean",
+                    "default": false
+                }
+            }
+        });
+
+        let lowered = lower_program_with_origins_and_root_schema(
+            amber_scenario::ComponentId(12),
+            manifest.program().expect("program"),
+            Some(&template),
+            Some(&root_schema),
+        )
+        .expect("program should lower");
+
+        let endpoints = &lowered.program.network().expect("network").endpoints;
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].name, "http");
+    }
+
+    #[test]
     fn lower_program_keeps_nullable_ancestor_endpoint_when_runtime() {
         let manifest: Manifest = r#"
             {
