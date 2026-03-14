@@ -268,6 +268,107 @@ fn conditional_program_env_is_accepted_in_manifest_version_0_2_0() {
 }
 
 #[test]
+fn conditional_vm_mounts_require_manifest_version_0_2_0() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              enabled: { type: "boolean" },
+              value: { type: "string" },
+            },
+          },
+          program: {
+            vm: {
+              image: "debian-13",
+              cpus: 1,
+              memory_mib: 512,
+              mounts: [
+                {
+                  when: "config.enabled",
+                  path: "/run/app.txt",
+                  from: "config.value",
+                },
+              ],
+            },
+          },
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::UnsupportedProgramSyntaxForManifestVersion {
+            manifest_version,
+            required_version,
+            feature,
+            pointer,
+        } => {
+            assert_eq!(*manifest_version, Version::new(0, 1, 0));
+            assert_eq!(required_version, "0.2.0");
+            assert_eq!(feature, "conditional mounts");
+            assert_eq!(pointer, "/program/vm/mounts/0");
+        }
+        other => panic!("expected UnsupportedProgramSyntaxForManifestVersion error, got: {other}"),
+    }
+}
+
+#[test]
+fn variadic_vm_endpoints_require_manifest_version_0_3_0() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.2.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              listeners: {
+                type: "array",
+                items: { type: "string" },
+              },
+            },
+          },
+          program: {
+            vm: {
+              image: "debian-13",
+              cpus: 1,
+              memory_mib: 512,
+              network: {
+                endpoints: [
+                  {
+                    each: "config.listeners",
+                    name: "${item}",
+                    port: 8080,
+                    protocol: "http",
+                  },
+                ],
+              },
+            },
+          },
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::UnsupportedProgramSyntaxForManifestVersion {
+            manifest_version,
+            required_version,
+            feature,
+            pointer,
+        } => {
+            assert_eq!(*manifest_version, Version::new(0, 2, 0));
+            assert_eq!(required_version, "0.3.0");
+            assert_eq!(feature, "variadic endpoints");
+            assert_eq!(pointer, "/program/vm/network/endpoints/0");
+        }
+        other => panic!("expected UnsupportedProgramSyntaxForManifestVersion error, got: {other}"),
+    }
+}
+
+#[test]
 fn program_entrypoint_string_sugar_splits() {
     let m: Manifest = r#"
         {
@@ -1724,6 +1825,97 @@ fn conditional_mounts_still_validate_storage_sources() {
         Error::UnknownMountSlot { slot } => assert_eq!(slot, "state"),
         other => panic!("expected UnknownMountSlot error, got: {other}"),
     }
+}
+
+#[test]
+fn interpolated_mount_paths_still_validate_literal_storage_sources() {
+    let err = r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              filename: { type: "string" },
+            },
+          },
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [
+              { path: "/var/${config.filename}", from: "slots.state" },
+            ]
+          }
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    match err {
+        Error::UnknownMountSlot { slot } => assert_eq!(slot, "state"),
+        other => panic!("expected UnknownMountSlot error, got: {other}"),
+    }
+}
+
+#[test]
+fn interpolated_non_file_mount_sources_are_preserved_for_link_time_resolution() {
+    let manifest = r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              source_kind: { type: "string" },
+            },
+          },
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [
+              { path: "/var/lib/app", from: "resources.${config.source_kind}" },
+            ]
+          }
+        }
+        "#
+    .parse::<Manifest>()
+    .expect("manifest");
+
+    assert_eq!(
+        manifest.program().expect("program").mounts()[0]
+            .source
+            .to_string(),
+        "resources.${config.source_kind}"
+    );
+}
+
+#[test]
+fn fully_dynamic_mount_sources_are_preserved_for_link_time_resolution() {
+    let manifest = r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              mount_source: { type: "string" },
+            },
+          },
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [
+              { path: "/var/lib/app", from: "${config.mount_source}" },
+            ]
+          }
+        }
+        "#
+    .parse::<Manifest>()
+    .expect("manifest");
+
+    assert_eq!(
+        manifest.program().expect("program").mounts()[0]
+            .source
+            .to_string(),
+        "${config.mount_source}"
+    );
 }
 
 #[test]

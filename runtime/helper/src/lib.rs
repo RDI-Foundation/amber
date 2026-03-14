@@ -295,34 +295,13 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
                 HelperError::Interp(format!("invalid component config template: {err}"))
             })?;
 
-        // 1) Parse and validate root config from AMBER_CONFIG_* using the root schema.
-        let root_config = config::build_root_config(&root_schema, &config_env)?;
-
-        // 2) Resolve component config from template.
-        let component_config = config::eval_config_template_partial_with_context(
+        let component_config = config::resolve_runtime_component_config(
+            &root_schema,
+            &component_schema,
             &component_template,
-            &root_config,
+            &config_env,
             &runtime_template_context,
         )?;
-
-        if !component_config.is_object() {
-            return Err(HelperError::Schema(
-                "resolved component config must be an object".to_string(),
-            ));
-        }
-
-        // 3) Validate component config against component schema.
-        {
-            let validator = jsonschema::validator_for(&component_schema).map_err(|e| {
-                HelperError::Schema(format!("failed to compile component schema: {e}"))
-            })?;
-            let mut it = validator.iter_errors(&component_config);
-            if let Some(first) = it.next() {
-                let mut msgs = vec![first.to_string()];
-                msgs.extend(it.take(7).map(|e| e.to_string()));
-                return Err(HelperError::Validation(msgs.join("; ")));
-            }
-        }
 
         (Some(component_config), Some(component_schema))
     } else {

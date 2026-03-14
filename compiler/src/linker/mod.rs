@@ -29,6 +29,7 @@ use thiserror::Error;
 
 use self::program_lowering::{
     ProgramLoweringError, ProgramLoweringSite, lower_program_with_origins,
+    validate_lowered_program_mounts,
 };
 use crate::{
     DigestStore,
@@ -977,6 +978,24 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
             .and_then(rc::RootConfigTemplate::node);
         match lower_program_with_origins(id, program, template_opt) {
             Ok(lowered) => {
+                if let Err(program_errors) = validate_lowered_program_mounts(
+                    &lowered.program,
+                    &lowered.mount_source_indices,
+                    manifest.config_schema(),
+                    manifest.resources(),
+                    manifest.slots(),
+                    manifest.experimental_features(),
+                ) {
+                    record_program_lowering_errors(
+                        id,
+                        &component_path_for(&components, id),
+                        &program_errors,
+                        &provenance,
+                        store,
+                        &mut errors,
+                    );
+                    continue;
+                }
                 mount_source_indices_by_component.insert(id, lowered.mount_source_indices);
                 component.program = Some(lowered.program);
             }

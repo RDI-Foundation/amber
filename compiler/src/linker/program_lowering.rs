@@ -1,8 +1,11 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use amber_config as rc;
 use amber_manifest::{
-    Endpoint as ManifestEndpoint, EndpointPort, InterpolatedPart, InterpolatedString,
-    InterpolationSource, MountSource, Program as ManifestProgram, ProgramMount as ManifestMount,
-    WhenPath,
+    CapabilityKind, ConfigSchema, Endpoint as ManifestEndpoint, EndpointPort, ExperimentalFeature,
+    FrameworkCapabilityName, InterpolatedPart, InterpolatedString, InterpolationSource,
+    MountSource, Program as ManifestProgram, ProgramMount as ManifestMount, ResourceDecl,
+    ResourceName, SlotDecl, SlotName, WhenPath, framework_capability,
 };
 use amber_scenario::{
     ComponentId, Endpoint, FileMount, FileMountSource, Program, ProgramCommon, ProgramCondition,
@@ -12,7 +15,8 @@ use amber_template::{TemplatePart, TemplateString};
 use serde_json::Value;
 
 use crate::config::query::{
-    QueryResolution, parse_query_segments, resolve_config_query_node, validate_config_query_syntax,
+    ConfigEachResolution, ConfigPresence, QueryResolution, resolve_config_each_values,
+    resolve_config_presence, resolve_config_query_node, validate_config_query_syntax,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,19 +29,6 @@ pub(crate) enum ProgramLoweringSite {
 pub(crate) struct ProgramLoweringError {
     pub(crate) site: ProgramLoweringSite,
     pub(crate) message: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConditionPresence {
-    Present,
-    Absent,
-    Runtime,
-}
-
-#[derive(Clone, Debug)]
-enum ConfigEachResolution {
-    Static(Vec<Value>),
-    Runtime,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -164,6 +155,170 @@ pub(crate) fn lower_program_with_origins(
         }
         _ => unreachable!("unsupported manifest program variant"),
     }
+}
+
+pub(crate) fn validate_lowered_program_mounts(
+    program: &Program,
+    mount_source_indices: &[usize],
+    config_schema: Option<&ConfigSchema>,
+    resources: &BTreeMap<ResourceName, ResourceDecl>,
+    slots: &BTreeMap<SlotName, SlotDecl>,
+    enabled_features: &BTreeSet<ExperimentalFeature>,
+) -> Result<(), Vec<ProgramLoweringError>> {
+    let mut errors = Vec::new();
+    let mut seen_paths = BTreeSet::new();
+
+    for (lowered_index, mount) in program.mounts().iter().enumerate() {
+        let authored_index = mount_source_indices[lowered_index];
+        if let Some(message) =
+            validate_lowered_mount(mount, config_schema, resources, slots, enabled_features)
+        {
+            errors.push(ProgramLoweringError {
+                site: ProgramLoweringSite::Mount(authored_index),
+                message,
+            });
+            continue;
+        }
+
+        if let Some(path) = lowered_mount_static_path(mount)
+            && !seen_paths.insert(path.clone())
+        {
+            errors.push(ProgramLoweringError {
+                site: ProgramLoweringSite::Mount(authored_index),
+                message: format!("duplicate mount path `{path}` after mount expansion"),
+            });
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn validate_lowered_mount(
+    mount: &ProgramMount,
+    config_schema: Option<&ConfigSchema>,
+    resources: &BTreeMap<ResourceName, ResourceDecl>,
+    slots: &BTreeMap<SlotName, SlotDecl>,
+    enabled_features: &BTreeSet<ExperimentalFeature>,
+) -> Option<String> {
+    match mount {
+        ProgramMount::File(file_mount) => validate_lowered_file_mount(file_mount, config_schema),
+        ProgramMount::Slot { slot, .. } => match slots.get(slot.as_str()) {
+            Some(slot_decl) if slot_decl.decl.kind == CapabilityKind::Storage => None,
+            Some(slot_decl) => Some(format!(
+                "mount source resolved to `slots.{slot}`, but `{slot}` is `{}` instead of \
+                 `storage`",
+                slot_decl.decl.kind
+            )),
+            None => Some(format!(
+                "mount source resolved to `slots.{slot}`, but no such slot exists on the component"
+            )),
+        },
+        ProgramMount::Resource { resource, .. } => (!resources.contains_key(resource.as_str()))
+            .then(|| {
+                format!(
+                    "mount source resolved to `resources.{resource}`, but no such resource exists \
+                     on the component"
+                )
+            }),
+        ProgramMount::Framework { capability, .. } => {
+            validate_lowered_framework_mount(capability, enabled_features)
+        }
+    }
+}
+
+fn validate_lowered_file_mount(
+    mount: &FileMount,
+    config_schema: Option<&ConfigSchema>,
+) -> Option<String> {
+    if let Some(path) = render_template_string_static_opt(&mount.path)
+        && let Err(message) = validate_static_mount_path(&path)
+    {
+        return Some(format!("{message}: `{path}`"));
+    }
+
+    let Some(component_schema) = config_schema.map(|schema| &schema.0) else {
+        return Some(format!(
+            "mount source `{}` requires `config_schema`, but the component does not declare one",
+            describe_file_mount_source(&mount.source)
+        ));
+    };
+
+    let source = render_static_file_mount_source(&mount.source)?;
+    let source = rc::parse_rendered_file_mount_source(&source)
+        .expect("lowering should only produce valid rendered file mount sources");
+    rc::validate_rendered_file_mount_source(component_schema, source)
+        .err()
+        .map(|err| err.to_string())
+}
+
+fn validate_lowered_framework_mount(
+    capability: &FrameworkCapabilityName,
+    enabled_features: &BTreeSet<ExperimentalFeature>,
+) -> Option<String> {
+    let Some(spec) = framework_capability(capability.as_str()) else {
+        return Some(format!(
+            "mount source resolved to unknown framework capability `framework.{capability}`"
+        ));
+    };
+
+    let required = spec.required_experimental_feature?;
+    (!enabled_features.contains(&required)).then(|| {
+        format!(
+            "framework capability `framework.{capability}` requires experimental feature \
+             `{required}`"
+        )
+    })
+}
+
+fn lowered_mount_static_path(mount: &ProgramMount) -> Option<String> {
+    match mount {
+        ProgramMount::File(file_mount) => render_template_string_static_opt(&file_mount.path),
+        ProgramMount::Slot { path, .. }
+        | ProgramMount::Resource { path, .. }
+        | ProgramMount::Framework { path, .. } => Some(path.clone()),
+    }
+}
+
+fn describe_file_mount_source(source: &FileMountSource) -> String {
+    render_static_file_mount_source(source).unwrap_or_else(|| match source {
+        FileMountSource::Config { .. } => "config.<dynamic path>".to_string(),
+        FileMountSource::Secret { .. } => "secret.<dynamic path>".to_string(),
+    })
+}
+
+fn render_static_file_mount_source(source: &FileMountSource) -> Option<String> {
+    match source {
+        FileMountSource::Config { path } => Some(render_prefixed_mount_source(
+            "config",
+            render_template_string_static_opt(path)?,
+        )),
+        FileMountSource::Secret { path } => Some(render_prefixed_mount_source(
+            "secret",
+            render_template_string_static_opt(path)?,
+        )),
+    }
+}
+
+fn render_prefixed_mount_source(prefix: &str, path: String) -> String {
+    if path.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}.{path}")
+    }
+}
+
+fn validate_static_mount_path(path: &str) -> Result<(), &'static str> {
+    if !path.starts_with('/') {
+        return Err("mount path must be absolute");
+    }
+    if path.split('/').any(|segment| segment == "..") {
+        return Err("mount path must not contain `..`");
+    }
+    Ok(())
 }
 
 fn lower_common(
@@ -302,10 +457,10 @@ fn lower_endpoint_when(
 
     match when.source() {
         InterpolationSource::Config => match resolve_config_presence(template_opt, when.query())? {
-            ConditionPresence::Present => Ok(LoweredWhen::Present),
-            ConditionPresence::Absent => Ok(LoweredWhen::Absent),
-            ConditionPresence::Runtime => Err("depends on runtime config, but endpoints must \
-                                               resolve entirely at compile time"
+            ConfigPresence::Present => Ok(LoweredWhen::Present),
+            ConfigPresence::Absent => Ok(LoweredWhen::Absent),
+            ConfigPresence::Runtime => Err("depends on runtime config, but endpoints must \
+                                            resolve entirely at compile time"
                 .to_string()),
         },
         InterpolationSource::Slots => Err(format!(
@@ -508,9 +663,9 @@ fn lower_mount_when(
 
     match when.source() {
         InterpolationSource::Config => match resolve_config_presence(template_opt, when.query())? {
-            ConditionPresence::Present => Ok(LoweredWhen::Present),
-            ConditionPresence::Absent => Ok(LoweredWhen::Absent),
-            ConditionPresence::Runtime => Ok(LoweredWhen::Runtime(ProgramCondition::Config {
+            ConfigPresence::Present => Ok(LoweredWhen::Present),
+            ConfigPresence::Absent => Ok(LoweredWhen::Absent),
+            ConfigPresence::Runtime => Ok(LoweredWhen::Runtime(ProgramCondition::Config {
                 path: when.query().to_string(),
             })),
         },
@@ -733,103 +888,6 @@ fn resolve_config_string(
     }
 }
 
-fn resolve_config_presence(
-    template_opt: Option<&rc::ConfigNode>,
-    query: &str,
-) -> Result<ConditionPresence, String> {
-    let Some(template) = template_opt else {
-        validate_config_query_syntax(query)?;
-        return Ok(ConditionPresence::Runtime);
-    };
-
-    let Some(resolution) = resolve_optional_config_query_node(template, query)? else {
-        return Ok(ConditionPresence::Absent);
-    };
-
-    match resolution {
-        QueryResolution::RuntimePath(_) => Ok(ConditionPresence::Runtime),
-        QueryResolution::Node(node) => {
-            if node.contains_runtime() {
-                return Ok(ConditionPresence::Runtime);
-            }
-            let value = node.evaluate_static().map_err(|err| err.to_string())?;
-            if value.is_null() {
-                Ok(ConditionPresence::Absent)
-            } else {
-                Ok(ConditionPresence::Present)
-            }
-        }
-    }
-}
-
-fn resolve_config_each_values(
-    template_opt: Option<&rc::ConfigNode>,
-    query: &str,
-    location: &str,
-) -> Result<ConfigEachResolution, String> {
-    let Some(template) = template_opt else {
-        validate_config_query_syntax(query)?;
-        return Ok(ConfigEachResolution::Runtime);
-    };
-
-    let Some(resolution) = resolve_optional_config_query_node(template, query)? else {
-        return Ok(ConfigEachResolution::Static(Vec::new()));
-    };
-
-    match resolution {
-        QueryResolution::RuntimePath(_) => Ok(ConfigEachResolution::Runtime),
-        QueryResolution::Node(node) => {
-            if node.contains_runtime() {
-                return Ok(ConfigEachResolution::Runtime);
-            }
-            let value = node.evaluate_static().map_err(|err| err.to_string())?;
-            match value {
-                Value::Null => Ok(ConfigEachResolution::Static(Vec::new())),
-                Value::Array(items) => Ok(ConfigEachResolution::Static(items)),
-                other => Err(format!(
-                    "{location} uses `each: \"config.{query}\"`, but config.{query} resolves to \
-                     {} instead of an array",
-                    value_kind(&other)
-                )),
-            }
-        }
-    }
-}
-
-fn resolve_optional_config_query_node<'a>(
-    template: &'a rc::ConfigNode,
-    query: &str,
-) -> Result<Option<QueryResolution<'a>>, String> {
-    if query.is_empty() {
-        return Ok(Some(QueryResolution::Node(template)));
-    }
-
-    let segments = parse_query_segments(query)?;
-    let mut current = template;
-    for (index, segment) in segments.iter().enumerate() {
-        match current {
-            rc::ConfigNode::Object(map) => {
-                let Some(next) = map.get(*segment) else {
-                    return Ok(None);
-                };
-                current = next;
-            }
-            rc::ConfigNode::ConfigRef(path) => {
-                let suffix = segments[index..].join(".");
-                let full = if path.is_empty() {
-                    suffix
-                } else {
-                    format!("{path}.{suffix}")
-                };
-                return Ok(Some(QueryResolution::RuntimePath(full)));
-            }
-            _ => return Ok(None),
-        }
-    }
-
-    Ok(Some(QueryResolution::Node(current)))
-}
-
 fn resolve_item_interpolation(
     item: &Value,
     query: &str,
@@ -946,17 +1004,6 @@ fn push_template_literal(out: &mut TemplateString, value: &str) {
     }
 }
 
-fn value_kind(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -966,7 +1013,10 @@ mod tests {
     use amber_scenario::{FileMountSource, ProgramMount};
     use amber_template::TemplatePart;
 
-    use super::{ProgramLoweringSite, lower_program, lower_program_with_origins};
+    use super::{
+        ProgramLoweringSite, lower_program, lower_program_with_origins,
+        validate_lowered_program_mounts,
+    };
 
     #[test]
     fn lower_program_expands_static_config_endpoints() {
@@ -1285,5 +1335,118 @@ mod tests {
 
         assert_eq!(lowered.program.mounts().len(), 2);
         assert_eq!(lowered.mount_source_indices, vec![0, 0]);
+    }
+
+    #[test]
+    fn validate_lowered_program_mounts_rejects_duplicate_paths_after_static_expansion() {
+        let manifest: Manifest = r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                image: "app",
+                entrypoint: ["app"],
+                mounts: [
+                  {
+                    each: "config.mounts",
+                    path: "/${item}",
+                    from: "resources.state",
+                  },
+                ],
+              },
+              config_schema: {
+                type: "object",
+                properties: {
+                  mounts: {
+                    type: "array",
+                    items: { type: "string" },
+                  },
+                },
+              },
+              resources: {
+                state: { kind: "storage" },
+              },
+            }
+        "#
+        .parse()
+        .expect("manifest");
+        let template = ConfigNode::Object(BTreeMap::from([(
+            "mounts".to_string(),
+            ConfigNode::Array(vec![
+                ConfigNode::String("same".to_string()),
+                ConfigNode::String("same".to_string()),
+            ]),
+        )]));
+
+        let lowered = lower_program_with_origins(
+            amber_scenario::ComponentId(10),
+            manifest.program().expect("program"),
+            Some(&template),
+        )
+        .expect("program should lower");
+        let errors = validate_lowered_program_mounts(
+            &lowered.program,
+            &lowered.mount_source_indices,
+            manifest.config_schema(),
+            manifest.resources(),
+            manifest.slots(),
+            manifest.experimental_features(),
+        )
+        .expect_err("duplicate concrete mount paths must be rejected");
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].site, ProgramLoweringSite::Mount(0));
+        assert!(
+            errors[0]
+                .message
+                .contains("duplicate mount path `/same` after mount expansion")
+        );
+    }
+
+    #[test]
+    fn validate_lowered_program_mounts_rejects_dynamic_file_mounts_without_config_schema() {
+        let manifest: Manifest = r#"
+            {
+              manifest_version: "0.3.0",
+              slots: {
+                api: { kind: "http" },
+              },
+              program: {
+                image: "app",
+                entrypoint: ["app"],
+                mounts: [
+                  {
+                    path: "/tmp/value",
+                    from: "config.${slots.api.url}",
+                  },
+                ],
+              },
+            }
+        "#
+        .parse()
+        .expect("manifest");
+
+        let lowered = lower_program_with_origins(
+            amber_scenario::ComponentId(11),
+            manifest.program().expect("program"),
+            None,
+        )
+        .expect("program should lower");
+        let errors = validate_lowered_program_mounts(
+            &lowered.program,
+            &lowered.mount_source_indices,
+            manifest.config_schema(),
+            manifest.resources(),
+            manifest.slots(),
+            manifest.experimental_features(),
+        )
+        .expect_err("dynamic file mounts without config_schema must be rejected");
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].site, ProgramLoweringSite::Mount(0));
+        assert!(
+            errors[0]
+                .message
+                .contains("requires `config_schema`, but the component does not declare one")
+        );
     }
 }

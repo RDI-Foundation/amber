@@ -1568,6 +1568,9 @@ mod tests {
         let input = r#"
         {
           manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+          },
           slots: { api: { kind: "http" } },
           program: {
             image: "app",

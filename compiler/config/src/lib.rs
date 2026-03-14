@@ -19,9 +19,9 @@ pub use template::{
     eval_config_template_partial_with_context, eval_config_template_with_context, get_by_path,
     get_by_path_opt, parse_rendered_file_mount_source, render_mount_specs, render_template_string,
     render_template_string_with_context, render_template_string_with_current_item,
-    repeated_config_items, resolve_rendered_file_mount_value, stringify_for_interpolation,
-    stringify_for_mount, template_string_is_runtime, validate_rendered_file_mount_source,
-    value_kind,
+    repeated_config_items, resolve_rendered_file_mount_value, resolve_runtime_component_config,
+    stringify_for_interpolation, stringify_for_mount, template_string_is_runtime,
+    validate_rendered_file_mount_source, value_kind,
 };
 
 #[cfg(test)]

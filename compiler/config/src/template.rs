@@ -1,10 +1,14 @@
+use std::collections::BTreeMap;
+
 use amber_template::{
     ConfigTemplate, ConfigTemplatePayload, MountSpec, MountTemplateSpec, RepeatedTemplateSource,
     RuntimeTemplateContext, TemplatePart, TemplateString,
 };
 use serde_json::Value;
 
-use crate::{ConfigError, Result, SchemaLookup, collect_schema_leaves, schema_lookup};
+use crate::{
+    ConfigError, Result, SchemaLookup, build_root_config, collect_schema_leaves, schema_lookup,
+};
 
 #[derive(Clone, Copy)]
 enum MissingConfigBehavior {
@@ -255,6 +259,41 @@ pub fn eval_config_template_partial_with_context(
         )?
         .unwrap_or(Value::Object(Default::default()))),
     }
+}
+
+pub fn resolve_runtime_component_config(
+    root_schema: &Value,
+    component_schema: &Value,
+    component_template: &ConfigTemplatePayload,
+    config_env: &BTreeMap<String, String>,
+    runtime_context: &RuntimeTemplateContext,
+) -> Result<Value> {
+    let root_config = build_root_config(root_schema, config_env)?;
+    let component_config = eval_config_template_partial_with_context(
+        component_template,
+        &root_config,
+        runtime_context,
+    )?;
+
+    if !component_config.is_object() {
+        return Err(ConfigError::schema(
+            "resolved component config must be an object".to_string(),
+        ));
+    }
+
+    {
+        let validator = jsonschema::validator_for(component_schema).map_err(|err| {
+            ConfigError::schema(format!("failed to compile component schema: {err}"))
+        })?;
+        let mut errors = validator.iter_errors(&component_config);
+        if let Some(first) = errors.next() {
+            let mut messages = vec![first.to_string()];
+            messages.extend(errors.take(7).map(|err| err.to_string()));
+            return Err(ConfigError::validation(messages.join("; ")));
+        }
+    }
+
+    Ok(component_config)
 }
 
 fn eval_config_node_with_behavior(

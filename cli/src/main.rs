@@ -1906,6 +1906,7 @@ fn component_program_spec(
                     b64,
                     runtime_config.as_ref(),
                     &runtime_template_context,
+                    &env,
                 )?);
             }
             Ok(ProcessSpec {
@@ -2251,20 +2252,16 @@ fn decode_mount_parent_dirs(
     raw_b64: &str,
     runtime_config: Option<&DirectRuntimeConfigPayload>,
     runtime_template_context: &RuntimeTemplateContext,
+    env_map: &BTreeMap<String, String>,
 ) -> Result<Vec<PathBuf>> {
-    decode_mount_parent_dirs_with_env(
-        raw_b64,
-        runtime_config,
-        runtime_template_context,
-        env::vars_os(),
-    )
+    decode_mount_parent_dirs_with_env(raw_b64, runtime_config, runtime_template_context, env_map)
 }
 
 fn decode_mount_parent_dirs_with_env(
     raw_b64: &str,
     runtime_config: Option<&DirectRuntimeConfigPayload>,
     runtime_template_context: &RuntimeTemplateContext,
-    env_vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    env_map: &BTreeMap<String, String>,
 ) -> Result<Vec<PathBuf>> {
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(raw_b64.as_bytes())
@@ -2272,7 +2269,7 @@ fn decode_mount_parent_dirs_with_env(
     let mounts: Vec<MountSpec> = serde_json::from_slice(&decoded)
         .map_err(|err| miette::miette!("invalid mount spec payload: {err}"))?;
     let mut parents = BTreeSet::new();
-    for path in rendered_mount_paths(&mounts, runtime_config, runtime_template_context, env_vars)? {
+    for path in rendered_mount_paths(&mounts, runtime_config, runtime_template_context, env_map)? {
         let path = PathBuf::from(path);
         if !path.is_absolute() {
             return Err(miette::miette!(
@@ -2295,7 +2292,7 @@ fn rendered_mount_paths(
     mounts: &[MountSpec],
     runtime_config: Option<&DirectRuntimeConfigPayload>,
     runtime_template_context: &RuntimeTemplateContext,
-    env_vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    env_map: &BTreeMap<String, String>,
 ) -> Result<Vec<String>> {
     if mounts
         .iter()
@@ -2314,7 +2311,7 @@ fn rendered_mount_paths(
         miette::miette!("mount specs require runtime config to resolve mount paths")
     })?;
     let (component_config, component_schema) =
-        resolve_runtime_component_config(runtime_config, runtime_template_context, env_vars)?;
+        resolve_runtime_component_config(runtime_config, runtime_template_context, env_map)?;
     config::render_mount_specs(
         mounts,
         Some(&component_config),
@@ -2328,7 +2325,7 @@ fn rendered_mount_paths(
 fn resolve_runtime_component_config(
     runtime_config: &DirectRuntimeConfigPayload,
     runtime_template_context: &RuntimeTemplateContext,
-    env_vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    env_map: &BTreeMap<String, String>,
 ) -> Result<(serde_json::Value, serde_json::Value)> {
     let root_schema = decode_runtime_json_b64(
         "runtime root config schema",
@@ -2343,57 +2340,30 @@ fn resolve_runtime_component_config(
         runtime_config.component_cfg_template_b64.as_str(),
     )?)
     .map_err(|err| miette::miette!("invalid runtime component config template: {err}"))?;
-    let config_env = collect_runtime_config_env(env_vars)?;
-    let root_config = config::build_root_config(&root_schema, &config_env)
-        .map_err(|err| miette::miette!(err.to_string()))?;
-    let component_config = config::eval_config_template_partial_with_context(
+    let config_env = collect_runtime_config_env(env_map);
+    let component_config = config::resolve_runtime_component_config(
+        &root_schema,
+        &component_schema,
         &component_template,
-        &root_config,
+        &config_env,
         runtime_template_context,
     )
-    .map_err(|err| miette::miette!(err.to_string()))?;
-
-    if !component_config.is_object() {
-        return Err(miette::miette!(
-            "resolved component config must be an object"
-        ));
-    }
-
-    {
-        let validator = jsonschema::validator_for(&component_schema)
-            .map_err(|err| miette::miette!("failed to compile component schema: {err}"))?;
-        let mut errors = validator.iter_errors(&component_config);
-        if let Some(first) = errors.next() {
-            let mut messages = vec![first.to_string()];
-            messages.extend(errors.take(7).map(|err| err.to_string()));
-            return Err(miette::miette!(
-                "invalid runtime component config while resolving mount paths: {}",
-                messages.join("; ")
-            ));
-        }
-    }
+    .map_err(|err| {
+        miette::miette!("failed to resolve runtime component config for mount paths: {err}")
+    })?;
 
     Ok((component_config, component_schema))
 }
 
-fn collect_runtime_config_env(
-    env_vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
-) -> Result<BTreeMap<String, String>> {
+fn collect_runtime_config_env(env_map: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut config_env = BTreeMap::new();
-    for (key, value) in env_vars {
-        let Some(key_str) = key.to_str() else {
-            continue;
-        };
-        if !key_str.starts_with(CONFIG_ENV_PREFIX) {
+    for (key, value) in env_map {
+        if !key.starts_with(CONFIG_ENV_PREFIX) {
             continue;
         }
-
-        let value = value
-            .into_string()
-            .map_err(|_| miette::miette!("{key_str} must be valid UTF-8"))?;
-        config_env.insert(key_str.to_string(), value);
+        config_env.insert(key.clone(), value.clone());
     }
-    Ok(config_env)
+    config_env
 }
 
 fn decode_runtime_json_b64(name: &str, raw_b64: &str) -> Result<serde_json::Value> {
@@ -6036,10 +6006,7 @@ exit 1
             &encode_mount_specs_b64(&mounts),
             Some(&runtime_config),
             &RuntimeTemplateContext::default(),
-            [(
-                std::ffi::OsString::from("AMBER_CONFIG_APP"),
-                std::ffi::OsString::from("hello"),
-            )],
+            &BTreeMap::from([("AMBER_CONFIG_APP".to_string(), "hello".to_string())]),
         )
         .expect("literal template mount path should resolve");
 
@@ -6071,16 +6038,10 @@ exit 1
             &encode_mount_specs_b64(&mounts),
             Some(&runtime_config),
             &RuntimeTemplateContext::default(),
-            [
-                (
-                    std::ffi::OsString::from("AMBER_CONFIG_APP"),
-                    std::ffi::OsString::from("hello"),
-                ),
-                (
-                    std::ffi::OsString::from("AMBER_CONFIG_MOUNT_DIR"),
-                    std::ffi::OsString::from("service"),
-                ),
-            ],
+            &BTreeMap::from([
+                ("AMBER_CONFIG_APP".to_string(), "hello".to_string()),
+                ("AMBER_CONFIG_MOUNT_DIR".to_string(), "service".to_string()),
+            ]),
         )
         .expect("config template mount path should resolve");
 

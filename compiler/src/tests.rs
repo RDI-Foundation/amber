@@ -68,6 +68,46 @@ fn optimized_compile_options() -> CompileOptions {
     CompileOptions::testing(true)
 }
 
+async fn compile_single_child_fixture_error(
+    dir_prefix: &str,
+    child_manifest: &str,
+    child_config: &str,
+) -> crate::Error {
+    let dir = tmp_dir(dir_prefix);
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+
+    write_file(&child_path, child_manifest);
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.3.0",
+              components: {{
+                child: {{
+                  manifest: "{child}",
+                  config: {{
+                    {child_config}
+                  }}
+                }}
+              }},
+              exports: {{ http: "#child.http" }}
+            }}
+            "##,
+            child = file_url(&child_path),
+        ),
+    );
+
+    default_compiler()
+        .compile(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .expect_err("fixture should fail to compile")
+}
+
 fn compiled_scenario(output: &crate::CompileOutput) -> crate::reporter::CompiledScenario {
     crate::reporter::CompiledScenario::from_compile_output(output)
         .expect("test compiler output should convert to compiled Scenario")
@@ -1505,12 +1545,8 @@ async fn mounted_storage_slot_requires_resource_binding_at_link_time() {
 
 #[tokio::test]
 async fn config_expanded_storage_mount_slot_requires_resource_binding_at_link_time() {
-    let dir = tmp_dir("config-expanded-storage-slot-requires-resource-binding");
-    let root_path = dir.path().join("root.json5");
-    let child_path = dir.path().join("child.json5");
-
-    write_file(
-        &child_path,
+    let err = compile_single_child_fixture_error(
+        "config-expanded-storage-slot-requires-resource-binding",
         r#"
         {
           manifest_version: "0.3.0",
@@ -1542,37 +1578,11 @@ async fn config_expanded_storage_mount_slot_requires_resource_binding_at_link_ti
           },
         }
         "#,
-    );
-    write_file(
-        &root_path,
-        &format!(
-            r##"
-            {{
-              manifest_version: "0.3.0",
-              components: {{
-                child: {{
-                  manifest: "{child}",
-                  config: {{
-                    mount_source: "slots.state"
-                  }}
-                }}
-              }},
-              exports: {{ http: "#child.http" }}
-            }}
-            "##,
-            child = file_url(&child_path),
-        ),
-    );
-
-    let err = default_compiler()
-        .compile(
-            manifest_ref_for_path(&root_path),
-            standard_compile_options(),
-        )
-        .await
-        .expect_err(
-            "config-expanded storage slot without resource binding should fail during linking",
-        );
+        r#"
+        mount_source: "slots.state"
+        "#,
+    )
+    .await;
 
     let crate::Error::Linker(crate::linker::Error::Multiple { errors, .. }) = err else {
         panic!("expected linker error, got {err}");
@@ -1590,6 +1600,233 @@ async fn config_expanded_storage_mount_slot_requires_resource_binding_at_link_ti
             .any(|error| matches!(error, crate::linker::Error::UnboundSlot { slot, .. } if slot == "state")),
         "config-expanded storage mount should not be reported as a generic unbound slot: {errors:?}"
     );
+}
+
+#[tokio::test]
+async fn config_expanded_mount_unknown_slot_is_rejected_at_link_time() {
+    let err = compile_single_child_fixture_error(
+        "config-expanded-unknown-slot-mount",
+        r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              mount_source: { type: "string" },
+            },
+            required: ["mount_source"],
+          },
+          program: {
+            image: "busybox:1.36.1",
+            entrypoint: ["sh", "-lc", "sleep 3600"],
+            mounts: [
+              { path: "/var/lib/app", from: "${config.mount_source}" },
+            ],
+            network: {
+              endpoints: [{ name: "http", port: 8080 }],
+            },
+          },
+          provides: {
+            http: { kind: "http", endpoint: "http" },
+          },
+          exports: {
+            http: "http",
+          },
+        }
+        "#,
+        r#"
+        mount_source: "slots.missing"
+        "#,
+    )
+    .await;
+
+    assert!(error_contains(
+        &err,
+        "mount source resolved to `slots.missing`"
+    ));
+    assert!(error_contains(&err, "no such slot exists on the component"));
+}
+
+#[tokio::test]
+async fn config_expanded_mount_unknown_resource_is_rejected_at_link_time() {
+    let err = compile_single_child_fixture_error(
+        "config-expanded-unknown-resource-mount",
+        r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              mount_source: { type: "string" },
+            },
+            required: ["mount_source"],
+          },
+          program: {
+            image: "busybox:1.36.1",
+            entrypoint: ["sh", "-lc", "sleep 3600"],
+            mounts: [
+              { path: "/var/lib/app", from: "${config.mount_source}" },
+            ],
+            network: {
+              endpoints: [{ name: "http", port: 8080 }],
+            },
+          },
+          provides: {
+            http: { kind: "http", endpoint: "http" },
+          },
+          exports: {
+            http: "http",
+          },
+        }
+        "#,
+        r#"
+        mount_source: "resources.state"
+        "#,
+    )
+    .await;
+
+    assert!(error_contains(
+        &err,
+        "mount source resolved to `resources.state`"
+    ));
+    assert!(error_contains(
+        &err,
+        "no such resource exists on the component"
+    ));
+}
+
+#[tokio::test]
+async fn config_expanded_framework_mount_requires_experimental_feature_at_link_time() {
+    let err = compile_single_child_fixture_error(
+        "config-expanded-framework-mount-feature",
+        r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              mount_source: { type: "string" },
+            },
+            required: ["mount_source"],
+          },
+          program: {
+            image: "busybox:1.36.1",
+            entrypoint: ["sh", "-lc", "sleep 3600"],
+            mounts: [
+              { path: "/var/run/docker.sock", from: "${config.mount_source}" },
+            ],
+            network: {
+              endpoints: [{ name: "http", port: 8080 }],
+            },
+          },
+          provides: {
+            http: { kind: "http", endpoint: "http" },
+          },
+          exports: {
+            http: "http",
+          },
+        }
+        "#,
+        r#"
+        mount_source: "framework.docker"
+        "#,
+    )
+    .await;
+
+    assert!(error_contains(
+        &err,
+        "framework capability `framework.docker` requires experimental feature `docker`"
+    ));
+}
+
+#[tokio::test]
+async fn config_expanded_framework_mount_unknown_capability_is_rejected_at_link_time() {
+    let err = compile_single_child_fixture_error(
+        "config-expanded-framework-mount-unknown",
+        r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              mount_source: { type: "string" },
+            },
+            required: ["mount_source"],
+          },
+          program: {
+            image: "busybox:1.36.1",
+            entrypoint: ["sh", "-lc", "sleep 3600"],
+            mounts: [
+              { path: "/var/run/cap.sock", from: "${config.mount_source}" },
+            ],
+            network: {
+              endpoints: [{ name: "http", port: 8080 }],
+            },
+          },
+          provides: {
+            http: { kind: "http", endpoint: "http" },
+          },
+          exports: {
+            http: "http",
+          },
+        }
+        "#,
+        r#"
+        mount_source: "framework.unknown"
+        "#,
+    )
+    .await;
+
+    assert!(error_contains(
+        &err,
+        "mount source resolved to unknown framework capability `framework.unknown`"
+    ));
+}
+
+#[tokio::test]
+async fn config_expanded_static_mount_paths_are_validated_at_link_time() {
+    let err = compile_single_child_fixture_error(
+        "config-expanded-static-mount-path-validation",
+        r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              mount_path: { type: "string" },
+              mount_source: { type: "string" },
+              value: { type: "string" },
+            },
+            required: ["mount_path", "mount_source", "value"],
+          },
+          program: {
+            image: "busybox:1.36.1",
+            entrypoint: ["sh", "-lc", "sleep 3600"],
+            mounts: [
+              { path: "${config.mount_path}", from: "${config.mount_source}" },
+            ],
+            network: {
+              endpoints: [{ name: "http", port: 8080 }],
+            },
+          },
+          provides: {
+            http: { kind: "http", endpoint: "http" },
+          },
+          exports: {
+            http: "http",
+          },
+        }
+        "#,
+        r#"
+        mount_path: "relative/path",
+        mount_source: "config.value",
+        value: "hello"
+        "#,
+    )
+    .await;
+
+    assert!(error_contains(&err, "mount path must be absolute"), "{err}");
+    assert!(error_contains(&err, "relative/path"), "{err}");
 }
 
 #[tokio::test]

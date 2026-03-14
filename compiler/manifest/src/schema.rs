@@ -59,6 +59,13 @@ impl ProgramCommandKind {
             Self::Args => "program.args",
         }
     }
+
+    fn json_pointer(self) -> &'static str {
+        match self {
+            Self::Entrypoint => "/program/entrypoint",
+            Self::Args => "/program/args",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +166,110 @@ impl fmt::Display for ProgramConfigUseSite<'_> {
             Self::MountName { index } => write!(f, "program.mounts[{index}].name"),
             Self::MountPath { index } => write!(f, "program.mounts[{index}].path"),
             Self::MountSource { index } => write!(f, "program.mounts[{index}].from"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProgramFieldLocation {
+    Common,
+    Vm,
+}
+
+impl ProgramFieldLocation {
+    fn mounts_pointer(self) -> &'static str {
+        match self {
+            Self::Common => "/program/mounts",
+            Self::Vm => "/program/vm/mounts",
+        }
+    }
+
+    fn endpoints_pointer(self) -> &'static str {
+        match self {
+            Self::Common => "/program/network/endpoints",
+            Self::Vm => "/program/vm/network/endpoints",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProgramVersionGatedSyntax<'a> {
+    ConditionalCommandItem {
+        kind: ProgramCommandKind,
+        index: usize,
+    },
+    VariadicCommandItem {
+        kind: ProgramCommandKind,
+        index: usize,
+    },
+    ConditionalEnvValue {
+        name: &'a str,
+    },
+    VariadicEnvValue {
+        name: &'a str,
+    },
+    ConditionalMount {
+        location: ProgramFieldLocation,
+        index: usize,
+    },
+    VariadicMount {
+        location: ProgramFieldLocation,
+        index: usize,
+    },
+    ConditionalEndpoint {
+        location: ProgramFieldLocation,
+        index: usize,
+    },
+    VariadicEndpoint {
+        location: ProgramFieldLocation,
+        index: usize,
+    },
+}
+
+impl ProgramVersionGatedSyntax<'_> {
+    pub(crate) fn required_version(self) -> &'static str {
+        match self {
+            Self::ConditionalCommandItem { .. }
+            | Self::ConditionalEnvValue { .. }
+            | Self::ConditionalMount { .. }
+            | Self::ConditionalEndpoint { .. } => "0.2.0",
+            Self::VariadicCommandItem { .. }
+            | Self::VariadicEnvValue { .. }
+            | Self::VariadicMount { .. }
+            | Self::VariadicEndpoint { .. } => "0.3.0",
+        }
+    }
+
+    pub(crate) fn feature(self) -> &'static str {
+        match self {
+            Self::ConditionalCommandItem { .. } => "conditional argument items",
+            Self::VariadicCommandItem { .. } => "variadic argument expansion",
+            Self::ConditionalEnvValue { .. } => "conditional environment values",
+            Self::VariadicEnvValue { .. } => "variadic environment expansion",
+            Self::ConditionalMount { .. } => "conditional mounts",
+            Self::VariadicMount { .. } => "variadic mounts",
+            Self::ConditionalEndpoint { .. } => "conditional endpoints",
+            Self::VariadicEndpoint { .. } => "variadic endpoints",
+        }
+    }
+
+    pub(crate) fn pointer(self) -> String {
+        match self {
+            Self::ConditionalCommandItem { kind, index }
+            | Self::VariadicCommandItem { kind, index } => {
+                format!("{}/{index}", kind.json_pointer())
+            }
+            Self::ConditionalEnvValue { name } | Self::VariadicEnvValue { name } => {
+                format!("/program/env/{name}")
+            }
+            Self::ConditionalMount { location, index }
+            | Self::VariadicMount { location, index } => {
+                format!("{}/{index}", location.mounts_pointer())
+            }
+            Self::ConditionalEndpoint { location, index }
+            | Self::VariadicEndpoint { location, index } => {
+                format!("{}/{index}", location.endpoints_pointer())
+            }
         }
     }
 }
@@ -363,6 +474,120 @@ impl Program {
             Self::Path(program) => &program.common.mounts,
             Self::Vm(program) => &program.0.mounts,
         }
+    }
+
+    pub(crate) fn first_conditional_syntax(&self) -> Option<ProgramVersionGatedSyntax<'_>> {
+        self.first_command_or_env_syntax(true).or_else(|| {
+            let location = match self {
+                Self::Vm(_) => ProgramFieldLocation::Vm,
+                Self::Image(_) | Self::Path(_) => ProgramFieldLocation::Common,
+            };
+            self.mounts()
+                .iter()
+                .enumerate()
+                .find_map(|(index, mount)| {
+                    mount
+                        .when
+                        .as_ref()
+                        .map(|_| ProgramVersionGatedSyntax::ConditionalMount { location, index })
+                })
+                .or_else(|| {
+                    self.network().and_then(|network| {
+                        network
+                            .endpoints()
+                            .iter()
+                            .enumerate()
+                            .find_map(|(index, endpoint)| {
+                                endpoint.when.as_ref().map(|_| {
+                                    ProgramVersionGatedSyntax::ConditionalEndpoint {
+                                        location,
+                                        index,
+                                    }
+                                })
+                            })
+                    })
+                })
+        })
+    }
+
+    pub(crate) fn first_variadic_syntax(&self) -> Option<ProgramVersionGatedSyntax<'_>> {
+        self.first_command_or_env_syntax(false).or_else(|| {
+            let location = match self {
+                Self::Vm(_) => ProgramFieldLocation::Vm,
+                Self::Image(_) | Self::Path(_) => ProgramFieldLocation::Common,
+            };
+            self.mounts()
+                .iter()
+                .enumerate()
+                .find_map(|(index, mount)| {
+                    mount
+                        .each
+                        .as_ref()
+                        .map(|_| ProgramVersionGatedSyntax::VariadicMount { location, index })
+                })
+                .or_else(|| {
+                    self.network().and_then(|network| {
+                        network
+                            .endpoints()
+                            .iter()
+                            .enumerate()
+                            .find_map(|(index, endpoint)| {
+                                endpoint.each.as_ref().map(|_| {
+                                    ProgramVersionGatedSyntax::VariadicEndpoint { location, index }
+                                })
+                            })
+                    })
+                })
+        })
+    }
+
+    fn first_command_or_env_syntax<'a>(
+        &'a self,
+        conditional: bool,
+    ) -> Option<ProgramVersionGatedSyntax<'a>> {
+        let (kind, command, env) = match self {
+            Self::Image(program) => (
+                Some(ProgramCommandKind::Entrypoint),
+                Some(&program.entrypoint),
+                Some(&program.common.env),
+            ),
+            Self::Path(program) => (
+                Some(ProgramCommandKind::Args),
+                Some(&program.args),
+                Some(&program.common.env),
+            ),
+            Self::Vm(_) => (None, None, None),
+        };
+
+        if let (Some(kind), Some(command)) = (kind, command)
+            && let Some(index) = command.0.iter().position(|item| {
+                if conditional {
+                    item.when().is_some()
+                } else {
+                    item.each().is_some()
+                }
+            })
+        {
+            return Some(if conditional {
+                ProgramVersionGatedSyntax::ConditionalCommandItem { kind, index }
+            } else {
+                ProgramVersionGatedSyntax::VariadicCommandItem { kind, index }
+            });
+        }
+
+        env.and_then(|env| {
+            env.iter().find_map(|(name, value)| {
+                if conditional {
+                    value
+                        .when()
+                        .map(|_| ProgramVersionGatedSyntax::ConditionalEnvValue { name })
+                } else {
+                    value
+                        .each()
+                        .map(|_| ProgramVersionGatedSyntax::VariadicEnvValue { name })
+                }
+            })
+        })
     }
 
     /// Visit config paths referenced anywhere in the program.

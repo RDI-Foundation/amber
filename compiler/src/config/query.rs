@@ -1,9 +1,23 @@
 use amber_config as rc;
 use amber_manifest::{InterpolatedPart, InterpolatedString, InterpolationSource};
+use serde_json::Value;
 
 pub(crate) enum QueryResolution<'a> {
     Node(&'a rc::ConfigNode),
     RuntimePath(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigPresence {
+    Present,
+    Absent,
+    Runtime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ConfigEachResolution {
+    Static(Vec<Value>),
+    Runtime,
 }
 
 pub(crate) fn validate_config_query_syntax(query: &str) -> Result<(), String> {
@@ -66,6 +80,115 @@ pub(crate) fn resolve_config_query_node<'a>(
     }
 
     Ok(QueryResolution::Node(current))
+}
+
+pub(crate) fn resolve_optional_config_query_node<'a>(
+    template: &'a rc::ConfigNode,
+    query: &str,
+) -> Result<Option<QueryResolution<'a>>, String> {
+    if query.is_empty() {
+        return Ok(Some(QueryResolution::Node(template)));
+    }
+
+    let segments = parse_query_segments(query)?;
+
+    let mut current = template;
+    for (idx, seg) in segments.iter().enumerate() {
+        match current {
+            rc::ConfigNode::Object(map) => {
+                let Some(next) = map.get(*seg) else {
+                    return Ok(None);
+                };
+                current = next;
+            }
+            rc::ConfigNode::ConfigRef(path) => {
+                let suffix = segments[idx..].join(".");
+                let full = if path.is_empty() {
+                    suffix
+                } else {
+                    format!("{path}.{suffix}")
+                };
+                return Ok(Some(QueryResolution::RuntimePath(full)));
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    Ok(Some(QueryResolution::Node(current)))
+}
+
+pub(crate) fn resolve_config_presence(
+    template: Option<&rc::ConfigNode>,
+    query: &str,
+) -> Result<ConfigPresence, String> {
+    let Some(template) = template else {
+        validate_config_query_syntax(query)?;
+        return Ok(ConfigPresence::Runtime);
+    };
+
+    let Some(resolution) = resolve_optional_config_query_node(template, query)? else {
+        return Ok(ConfigPresence::Absent);
+    };
+
+    match resolution {
+        QueryResolution::RuntimePath(_) => Ok(ConfigPresence::Runtime),
+        QueryResolution::Node(node) => {
+            if node.contains_runtime() {
+                return Ok(ConfigPresence::Runtime);
+            }
+            let value = node.evaluate_static().map_err(|err| err.to_string())?;
+            if value.is_null() {
+                Ok(ConfigPresence::Absent)
+            } else {
+                Ok(ConfigPresence::Present)
+            }
+        }
+    }
+}
+
+pub(crate) fn resolve_config_each_values(
+    template: Option<&rc::ConfigNode>,
+    query: &str,
+    location: &str,
+) -> Result<ConfigEachResolution, String> {
+    let Some(template) = template else {
+        validate_config_query_syntax(query)?;
+        return Ok(ConfigEachResolution::Runtime);
+    };
+
+    let Some(resolution) = resolve_optional_config_query_node(template, query)? else {
+        return Ok(ConfigEachResolution::Static(Vec::new()));
+    };
+
+    match resolution {
+        QueryResolution::RuntimePath(_) => Ok(ConfigEachResolution::Runtime),
+        QueryResolution::Node(node) => {
+            if node.contains_runtime() {
+                return Ok(ConfigEachResolution::Runtime);
+            }
+            let value = node.evaluate_static().map_err(|err| err.to_string())?;
+            match value {
+                Value::Null => Ok(ConfigEachResolution::Static(Vec::new())),
+                Value::Array(items) => Ok(ConfigEachResolution::Static(items)),
+                other => Err(format!(
+                    "{location} uses `each: \"config.{query}\"`, but config.{query} resolves to \
+                     {} instead of an array",
+                    value_kind(&other)
+                )),
+            }
+        }
+    }
+}
+
+pub(crate) fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 pub(crate) fn render_static_config_string(
@@ -138,8 +261,9 @@ mod tests {
     use amber_manifest::InterpolatedString;
 
     use super::{
-        parse_query_segments, render_static_config_string, resolve_config_query_node,
-        validate_config_query_syntax,
+        ConfigEachResolution, ConfigPresence, parse_query_segments, render_static_config_string,
+        resolve_config_each_values, resolve_config_presence, resolve_config_query_node,
+        resolve_optional_config_query_node, validate_config_query_syntax,
     };
 
     #[test]
@@ -163,6 +287,52 @@ mod tests {
         assert_eq!(
             parse_query_segments("storage.size").unwrap(),
             vec!["storage", "size"]
+        );
+    }
+
+    #[test]
+    fn resolve_optional_config_query_node_returns_none_for_missing_path() {
+        let node = amber_config::ConfigNode::Object(BTreeMap::from([(
+            "storage".to_string(),
+            amber_config::ConfigNode::String("10Gi".to_string()),
+        )]));
+        assert!(
+            resolve_optional_config_query_node(&node, "missing")
+                .unwrap()
+                .is_none(),
+            "missing query should return None"
+        );
+    }
+
+    #[test]
+    fn resolve_config_presence_treats_missing_and_null_as_absent() {
+        let node = amber_config::ConfigNode::Object(BTreeMap::from([
+            ("missing".to_string(), amber_config::ConfigNode::Null),
+            (
+                "present".to_string(),
+                amber_config::ConfigNode::String("x".to_string()),
+            ),
+        ]));
+        assert_eq!(
+            resolve_config_presence(Some(&node), "missing").unwrap(),
+            ConfigPresence::Absent
+        );
+        assert_eq!(
+            resolve_config_presence(Some(&node), "present").unwrap(),
+            ConfigPresence::Present
+        );
+        assert_eq!(
+            resolve_config_presence(Some(&node), "other").unwrap(),
+            ConfigPresence::Absent
+        );
+    }
+
+    #[test]
+    fn resolve_config_each_values_reuses_missing_as_empty() {
+        let node = amber_config::ConfigNode::Object(BTreeMap::new());
+        assert_eq!(
+            resolve_config_each_values(Some(&node), "items", "program.args[0]").unwrap(),
+            ConfigEachResolution::Static(Vec::new())
         );
     }
 

@@ -24,8 +24,9 @@ use serde_json::Value;
 use crate::{
     config::{
         query::{
-            QueryResolution, parse_query_segments, resolve_config_query_node,
-            validate_config_query_syntax,
+            ConfigEachResolution, ConfigPresence, QueryResolution,
+            resolve_config_each_values as resolve_shared_config_each_values,
+            resolve_config_presence, resolve_config_query_node, validate_config_query_syntax,
         },
         scope::{RuntimeConfigView, build_runtime_config_view},
         templates,
@@ -177,13 +178,6 @@ impl ProgramPlan {
             } => *needs_runtime_config,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ConfigPresence {
-    Present,
-    Absent,
-    Runtime,
 }
 
 #[derive(Clone, Debug)]
@@ -1351,27 +1345,7 @@ fn resolve_condition_presence_for_program(
 ) -> Result<ConfigPresence, MeshError> {
     match source {
         InterpolationSource::Config => {
-            let Some(template) = template_opt else {
-                return Ok(ConfigPresence::Runtime);
-            };
-            match resolve_optional_config_query_node(template, query)? {
-                None => Ok(ConfigPresence::Absent),
-                Some(QueryResolution::RuntimePath(_)) => Ok(ConfigPresence::Runtime),
-                Some(QueryResolution::Node(node)) => {
-                    if node.contains_runtime() {
-                        Ok(ConfigPresence::Runtime)
-                    } else {
-                        let value = node
-                            .evaluate_static()
-                            .map_err(|err| MeshError::new(err.to_string()))?;
-                        if value.is_null() {
-                            Ok(ConfigPresence::Absent)
-                        } else {
-                            Ok(ConfigPresence::Present)
-                        }
-                    }
-                }
-            }
+            resolve_config_presence(template_opt, query).map_err(MeshError::new)
         }
         InterpolationSource::Slots => Ok(
             if slot_query_is_present(slots, query).map_err(MeshError::new)? {
@@ -1384,39 +1358,6 @@ fn resolve_condition_presence_for_program(
             "unsupported conditional interpolation source for `{source}.{query}`"
         ))),
     }
-}
-
-fn resolve_optional_config_query_node<'a>(
-    template: &'a rc::ConfigNode,
-    query: &str,
-) -> Result<Option<QueryResolution<'a>>, MeshError> {
-    if query.is_empty() {
-        return Ok(Some(QueryResolution::Node(template)));
-    }
-
-    let segments = parse_query_segments(query)?;
-    let mut current = template;
-    for (idx, seg) in segments.iter().enumerate() {
-        match current {
-            rc::ConfigNode::Object(map) => {
-                let Some(next) = map.get(*seg) else {
-                    return Ok(None);
-                };
-                current = next;
-            }
-            rc::ConfigNode::ConfigRef(path) => {
-                let suffix = segments[idx..].join(".");
-                let full = if path.is_empty() {
-                    suffix
-                } else {
-                    format!("{path}.{suffix}")
-                };
-                return Ok(Some(QueryResolution::RuntimePath(full)));
-            }
-            _ => return Ok(None),
-        }
-    }
-    Ok(Some(QueryResolution::Node(current)))
 }
 
 #[derive(Debug)]
@@ -1434,12 +1375,6 @@ enum ImageConfigResolution {
 #[derive(Debug)]
 enum MountResolution {
     Static(Value),
-    Runtime,
-}
-
-#[derive(Debug)]
-enum ConfigEachResolution {
-    Static(Vec<Value>),
     Runtime,
 }
 
@@ -1599,36 +1534,7 @@ fn resolve_config_each_values(
     query: &str,
     location: &str,
 ) -> Result<ConfigEachResolution, MeshError> {
-    let Some(template) = template else {
-        validate_config_query_syntax(query).map_err(MeshError::new)?;
-        return Ok(ConfigEachResolution::Runtime);
-    };
-
-    let Some(resolution) = resolve_optional_config_query_node(template, query)? else {
-        return Ok(ConfigEachResolution::Static(Vec::new()));
-    };
-
-    match resolution {
-        QueryResolution::RuntimePath(_) => Ok(ConfigEachResolution::Runtime),
-        QueryResolution::Node(node) => {
-            if node.contains_runtime() {
-                return Ok(ConfigEachResolution::Runtime);
-            }
-
-            let value = node
-                .evaluate_static()
-                .map_err(|err| MeshError::new(err.to_string()))?;
-            match value {
-                Value::Null => Ok(ConfigEachResolution::Static(Vec::new())),
-                Value::Array(values) => Ok(ConfigEachResolution::Static(values)),
-                other => Err(MeshError::new(format!(
-                    "{location} uses `each: \"config.{query}\"`, but config.{query} resolves to \
-                     {} instead of an array",
-                    value_kind(&other)
-                ))),
-            }
-        }
-    }
+    resolve_shared_config_each_values(template, query, location).map_err(MeshError::new)
 }
 
 fn render_template_string_static(ts: &TemplateString) -> Result<String, MeshError> {
@@ -1738,17 +1644,6 @@ fn query_value_opt<'a>(root: &'a Value, query: &str) -> Option<&'a Value> {
         }
     }
     Some(current)
-}
-
-fn value_kind(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
 }
 
 fn resolve_item_interpolation_from_value(
