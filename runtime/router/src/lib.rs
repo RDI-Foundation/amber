@@ -261,6 +261,9 @@ struct HttpProxyState {
     client: HttpClient,
     target: ExternalTarget,
     labels: HttpExchangeLabels,
+    config: Arc<MeshConfig>,
+    external_overrides: ExternalOverrides,
+    mesh_upstream: Arc<Mutex<Option<MeshHttpUpstream>>>,
 }
 
 #[derive(Clone)]
@@ -627,6 +630,38 @@ struct MeshExternalTarget {
     peer_key: [u8; 32],
 }
 
+#[derive(Debug)]
+struct MeshHttpUpstream {
+    target_url: String,
+    sender: client_http1::SendRequest<BoxBody>,
+    conn_task: tokio::task::JoinHandle<()>,
+    bridge_task: tokio::task::JoinHandle<Result<(), RouterError>>,
+}
+
+impl MeshHttpUpstream {
+    fn is_reusable_for(&self, target_url: &str) -> bool {
+        self.target_url == target_url
+            && !self.conn_task.is_finished()
+            && !self.bridge_task.is_finished()
+    }
+}
+
+impl Drop for MeshHttpUpstream {
+    fn drop(&mut self) {
+        self.conn_task.abort();
+        self.bridge_task.abort();
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ResolvedHttpExternalTarget {
+    Http(Url),
+    Mesh {
+        target_url: String,
+        mesh: MeshExternalTarget,
+    },
+}
+
 type ExternalOverrides = Arc<RwLock<HashMap<String, String>>>;
 type ControlAllowlist = Arc<HashSet<IpAddr>>;
 type DynamicIssuers = Arc<RwLock<HashMap<String, HashSet<String>>>>;
@@ -965,31 +1000,10 @@ async fn handle_inbound(
         InboundTarget::External {
             ref url_env,
             optional,
-        } => {
-            let override_url = {
-                let overrides = external_overrides.read().await;
-                overrides.get(&route.capability).cloned()
-            }
-            .and_then(|value| {
-                let trimmed = value.trim().to_string();
-                (!trimmed.is_empty()).then_some(trimmed)
-            });
-            if let Some(override_url) = override_url {
-                if maybe_proxy_mesh_external(
+        } => match route.protocol {
+            MeshProtocol::Http => {
+                proxy_noise_to_external(
                     &mut session,
-                    &route.capability,
-                    route.protocol,
-                    &override_url,
-                    &config,
-                )
-                .await?
-                {
-                    return Ok(());
-                }
-
-                return proxy_by_external_protocol(
-                    &mut session,
-                    route.protocol,
                     HttpExchangeLabels::inbound_from_route(
                         config.identity.id.clone().into(),
                         remote_id.clone().into(),
@@ -1000,47 +1014,76 @@ async fn handle_inbound(
                         name: route.capability.clone(),
                         url_env: url_env.clone(),
                         optional,
-                        url_override: Some(override_url),
+                        url_override: None,
                     },
                     client.clone(),
+                    config.clone(),
+                    external_overrides.clone(),
                 )
-                .await;
+                .await?;
             }
+            MeshProtocol::Tcp => {
+                let override_url = {
+                    let overrides = external_overrides.read().await;
+                    overrides.get(&route.capability).cloned()
+                }
+                .and_then(|value| {
+                    let trimmed = value.trim().to_string();
+                    (!trimmed.is_empty()).then_some(trimmed)
+                });
+                if let Some(override_url) = override_url {
+                    if maybe_proxy_mesh_external(
+                        &mut session,
+                        &route.capability,
+                        route.protocol,
+                        &override_url,
+                        &config,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
 
-            if let Ok(raw) = env::var(url_env) {
-                let trimmed = raw.trim();
-                if maybe_proxy_mesh_external(
-                    &mut session,
-                    &route.capability,
-                    route.protocol,
-                    trimmed,
-                    &config,
-                )
-                .await?
-                {
+                    proxy_noise_to_external_tcp(
+                        &mut session,
+                        ExternalTarget {
+                            name: route.capability.clone(),
+                            url_env: url_env.clone(),
+                            optional,
+                            url_override: Some(override_url),
+                        },
+                    )
+                    .await?;
                     return Ok(());
                 }
-            }
 
-            proxy_by_external_protocol(
-                &mut session,
-                route.protocol,
-                HttpExchangeLabels::inbound_from_route(
-                    config.identity.id.clone().into(),
-                    remote_id.clone().into(),
-                    &route,
-                    &open,
-                ),
-                ExternalTarget {
-                    name: route.capability.clone(),
-                    url_env: url_env.clone(),
-                    optional,
-                    url_override: None,
-                },
-                client.clone(),
-            )
-            .await?;
-        }
+                if let Ok(raw) = env::var(url_env) {
+                    let trimmed = raw.trim();
+                    if maybe_proxy_mesh_external(
+                        &mut session,
+                        &route.capability,
+                        route.protocol,
+                        trimmed,
+                        &config,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                }
+
+                proxy_noise_to_external_tcp(
+                    &mut session,
+                    ExternalTarget {
+                        name: route.capability.clone(),
+                        url_env: url_env.clone(),
+                        optional,
+                        url_override: None,
+                    },
+                )
+                .await?;
+            }
+        },
         InboundTarget::MeshForward {
             ref peer_addr,
             ref peer_id,
@@ -1112,19 +1155,6 @@ async fn maybe_proxy_mesh_external(
     outbound.send_open(&open).await?;
     proxy_noise_to_noise(session, outbound).await?;
     Ok(true)
-}
-
-async fn proxy_by_external_protocol(
-    session: &mut NoiseSession,
-    protocol: MeshProtocol,
-    labels: HttpExchangeLabels,
-    target: ExternalTarget,
-    client: Arc<HttpClient>,
-) -> Result<(), RouterError> {
-    match protocol {
-        MeshProtocol::Http => proxy_noise_to_external(session, labels, target, client).await,
-        MeshProtocol::Tcp => proxy_noise_to_external_tcp(session, target).await,
-    }
 }
 
 async fn run_outbound_listener(
@@ -2048,6 +2078,8 @@ async fn proxy_noise_to_external(
     labels: HttpExchangeLabels,
     target: ExternalTarget,
     client: Arc<HttpClient>,
+    config: Arc<MeshConfig>,
+    external_overrides: ExternalOverrides,
 ) -> Result<(), RouterError> {
     let (local, remote) = duplex(64 * 1024);
     let mut noise_session = session.clone();
@@ -2058,6 +2090,9 @@ async fn proxy_noise_to_external(
         client: (*client).clone(),
         target,
         labels,
+        config,
+        external_overrides,
+        mesh_upstream: Arc::new(Mutex::new(None)),
     };
 
     let service = service_fn(move |req: Request<Incoming>| {
@@ -4444,7 +4479,7 @@ async fn proxy_http_request_to_noise(
         let proxied = Request::from_parts(request_parts, request_body);
         let response = {
             let mut upstream = state.upstream.lock().await;
-            match upstream.send_request(proxied).await {
+            match send_http1_request(&mut upstream, proxied).await {
                 Ok(resp) => resp,
                 Err(err) => {
                     let error_detail = err.to_string();
@@ -4626,9 +4661,12 @@ async fn proxy_http_request(state: HttpProxyState, req: Request<Incoming>) -> Re
     let status_telemetry = telemetry.clone();
 
     let response = async move {
-        let target_url = match resolve_target_url(&state.target, &req) {
-            Ok(url) => url,
-            Err(err) => return err,
+        let resolved_target = match resolve_http_external_target(&state, req.uri()).await {
+            Ok(target) => target,
+            Err(err) => {
+                clear_mesh_http_upstream(&state).await;
+                return err;
+            }
         };
 
         let mut parts = req.into_parts();
@@ -4649,18 +4687,12 @@ async fn proxy_http_request(state: HttpProxyState, req: Request<Incoming>) -> Re
                 .and_then(|value| value.to_str().ok()),
             &parts.0.headers,
         );
-        let Some(host) = target_url.host_str() else {
-            return error_response(StatusCode::BAD_GATEWAY, "target url missing host");
-        };
-
-        let host_header = match target_url.port() {
-            Some(port) => format!("{host}:{port}"),
-            None => host.to_string(),
-        };
-
-        parts.0.uri = match Uri::try_from(target_url.as_str()) {
-            Ok(uri) => uri,
-            Err(_) => return error_response(StatusCode::BAD_GATEWAY, "invalid target url"),
+        let host_header = match configure_http_external_request(&mut parts.0, &resolved_target) {
+            Ok(host_header) => host_header,
+            Err(err) => {
+                clear_mesh_http_upstream(&state).await;
+                return err;
+            }
         };
 
         sanitize_request_headers(&mut parts.0.headers, &host_header);
@@ -4687,27 +4719,33 @@ async fn proxy_http_request(state: HttpProxyState, req: Request<Incoming>) -> Re
         );
         let proxied = Request::from_parts(parts.0, request_body);
         let upstream_uri = proxied.uri().to_string();
-
-        let response = match state.client.request(proxied).await {
-            Ok(resp) => resp,
-            Err(err) => {
-                let error_detail = err.to_string();
-                tracing::warn!(
-                    target: "amber.internal",
-                    upstream_uri = %upstream_uri,
-                    error = %error_detail,
-                    "router request failed"
-                );
-                emit_binding_failure_event(
-                    &span,
-                    &telemetry,
-                    StatusCode::BAD_GATEWAY,
-                    "upstream request failed",
-                    Some(error_detail),
-                );
-                return error_response(StatusCode::BAD_GATEWAY, "upstream request failed");
-            }
+        let external_target = match &resolved_target {
+            ResolvedHttpExternalTarget::Http(url) => url.as_str().to_string(),
+            ResolvedHttpExternalTarget::Mesh { target_url, .. } => target_url.clone(),
         };
+
+        let response =
+            match send_request_to_http_external_target(&state, &resolved_target, proxied).await {
+                Ok(resp) => resp,
+                Err(err) => {
+                    let error_detail = err.to_string();
+                    tracing::warn!(
+                        target: "amber.internal",
+                        upstream_uri = %upstream_uri,
+                        external_target = %external_target,
+                        error = %error_detail,
+                        "router request failed"
+                    );
+                    emit_binding_failure_event(
+                        &span,
+                        &telemetry,
+                        StatusCode::BAD_GATEWAY,
+                        "upstream request failed",
+                        Some(error_detail),
+                    );
+                    return error_response(StatusCode::BAD_GATEWAY, "upstream request failed");
+                }
+            };
 
         let mut parts = response.into_parts();
         emit_headers_event(
@@ -4752,6 +4790,143 @@ async fn proxy_http_request(state: HttpProxyState, req: Request<Incoming>) -> Re
     .instrument(instrument_span)
     .await;
     finalize_http_exchange_response(&status_span, &status_telemetry, response)
+}
+
+#[allow(clippy::result_large_err)]
+fn configure_http_external_request(
+    request_parts: &mut http::request::Parts,
+    target: &ResolvedHttpExternalTarget,
+) -> Result<String, Response<BoxBody>> {
+    match target {
+        ResolvedHttpExternalTarget::Http(target_url) => {
+            let Some(host) = target_url.host_str() else {
+                return Err(error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "target url missing host",
+                ));
+            };
+            request_parts.uri = Uri::try_from(target_url.as_str())
+                .map_err(|_| error_response(StatusCode::BAD_GATEWAY, "invalid target url"))?;
+            Ok(match target_url.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_string(),
+            })
+        }
+        ResolvedHttpExternalTarget::Mesh { .. } => Ok(outgoing_host_header(
+            &request_parts.uri,
+            &request_parts.headers,
+        )),
+    }
+}
+
+async fn send_request_to_http_external_target(
+    state: &HttpProxyState,
+    target: &ResolvedHttpExternalTarget,
+    request: Request<BoxBody>,
+) -> Result<Response<Incoming>, String> {
+    match target {
+        ResolvedHttpExternalTarget::Http(_) => {
+            clear_mesh_http_upstream(state).await;
+            state
+                .client
+                .request(request)
+                .await
+                .map_err(|err| err.to_string())
+        }
+        ResolvedHttpExternalTarget::Mesh { target_url, mesh } => {
+            send_request_to_mesh_http_upstream(state, target_url, mesh, request).await
+        }
+    }
+}
+
+async fn clear_mesh_http_upstream(state: &HttpProxyState) {
+    state.mesh_upstream.lock().await.take();
+}
+
+async fn send_http1_request(
+    sender: &mut client_http1::SendRequest<BoxBody>,
+    request: Request<BoxBody>,
+) -> hyper::Result<Response<Incoming>> {
+    sender.ready().await?;
+    sender.send_request(request).await
+}
+
+async fn send_request_to_mesh_http_upstream(
+    state: &HttpProxyState,
+    target_url: &str,
+    mesh: &MeshExternalTarget,
+    request: Request<BoxBody>,
+) -> Result<Response<Incoming>, String> {
+    let mut upstream = state.mesh_upstream.lock().await;
+    if !upstream
+        .as_ref()
+        .is_some_and(|cached| cached.is_reusable_for(target_url))
+    {
+        *upstream = Some(
+            connect_mesh_http_upstream(
+                target_url.to_string(),
+                mesh,
+                &state.target.name,
+                state.config.as_ref(),
+            )
+            .await
+            .map_err(|err| err.to_string())?,
+        );
+    }
+
+    let response = {
+        let cached = upstream
+            .as_mut()
+            .expect("mesh upstream must exist after initialization");
+        send_http1_request(&mut cached.sender, request).await
+    };
+    if response.is_err() {
+        upstream.take();
+    }
+    response.map_err(|err| err.to_string())
+}
+
+async fn connect_mesh_http_upstream(
+    target_url: String,
+    mesh: &MeshExternalTarget,
+    capability: &str,
+    config: &MeshConfig,
+) -> Result<MeshHttpUpstream, RouterError> {
+    let mut outbound =
+        connect_noise_with_key(&mesh.peer_addr, &mesh.peer_id, mesh.peer_key, config).await?;
+    let open = OpenFrame {
+        route_id: component_route_id(&mesh.peer_id, capability, MeshProtocol::Http),
+        capability: capability.to_string(),
+        protocol: MeshProtocol::Http,
+        slot: None,
+        capability_kind: None,
+        capability_profile: None,
+    };
+    outbound.send_open(&open).await?;
+
+    let (local, remote) = duplex(64 * 1024);
+    let bridge_task =
+        tokio::spawn(async move { proxy_noise_to_plain(&mut outbound, remote).await });
+    let (sender, conn) = client_http1::handshake(TokioIo::new(local))
+        .await
+        .map_err(|err| {
+            RouterError::Transport(format!("external mesh upstream handshake failed: {err}"))
+        })?;
+    let conn_task = tokio::spawn(async move {
+        if let Err(err) = conn.await {
+            tracing::warn!(
+                target: "amber.internal",
+                "external mesh upstream connection failed: {err}"
+            );
+        }
+    });
+
+    Ok(MeshHttpUpstream {
+        target_url,
+        sender,
+        conn_task,
+        bridge_task,
+    })
 }
 
 async fn proxy_outbound_http_request(
@@ -4946,30 +5121,48 @@ fn apply_response_filters(
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
 
 #[allow(clippy::result_large_err)]
-fn resolve_target_url(
-    target: &ExternalTarget,
-    req: &Request<Incoming>,
-) -> Result<Url, Response<BoxBody>> {
-    let url = match target.url_override.clone() {
-        Some(value) if !value.trim().is_empty() => value,
-        _ => match env::var(&target.url_env) {
-            Ok(value) if !value.trim().is_empty() => value,
-            _ => {
-                let message = if target.optional {
-                    format!(
-                        "external slot {} is optional and not configured",
-                        target.name
-                    )
-                } else {
-                    format!("external slot {} is not configured", target.name)
-                };
-                return Err(error_response(StatusCode::SERVICE_UNAVAILABLE, &message));
-            }
-        },
+async fn resolve_http_external_target(
+    state: &HttpProxyState,
+    uri: &Uri,
+) -> Result<ResolvedHttpExternalTarget, Response<BoxBody>> {
+    let override_url = {
+        let overrides = state.external_overrides.read().await;
+        overrides.get(&state.target.name).cloned()
     };
+    resolve_http_external_target_with_override(&state.target, override_url.as_deref(), uri)
+}
 
-    let base = Url::parse(&url)
-        .map_err(|_| error_response(StatusCode::BAD_GATEWAY, "external slot url is invalid"))?;
+#[allow(clippy::result_large_err)]
+fn resolve_http_external_target_with_override(
+    target: &ExternalTarget,
+    override_url: Option<&str>,
+    uri: &Uri,
+) -> Result<ResolvedHttpExternalTarget, Response<BoxBody>> {
+    let url = configured_external_url(target, override_url).ok_or_else(|| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &external_slot_not_configured_message(target),
+        )
+    })?;
+    if url.starts_with("mesh://") {
+        let mesh = parse_mesh_external(&url).map_err(|err| {
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("external slot url is invalid: {err}"),
+            )
+        })?;
+        return Ok(ResolvedHttpExternalTarget::Mesh {
+            target_url: url,
+            mesh,
+        });
+    }
+
+    let base = Url::parse(&url).map_err(|err| {
+        error_response(
+            StatusCode::BAD_GATEWAY,
+            &format!("external slot url is invalid: {err}"),
+        )
+    })?;
 
     if !is_http_scheme(&base) {
         return Err(error_response(
@@ -4978,27 +5171,12 @@ fn resolve_target_url(
         ));
     }
 
-    Ok(join_url(&base, req.uri()))
+    Ok(ResolvedHttpExternalTarget::Http(join_url(&base, uri)))
 }
 
 fn resolve_tcp_target(target: &ExternalTarget) -> Result<(String, u16), RouterError> {
-    let url = match target.url_override.as_ref() {
-        Some(value) if !value.trim().is_empty() => value.trim().to_string(),
-        _ => match env::var(&target.url_env) {
-            Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
-            _ => {
-                let message = if target.optional {
-                    format!(
-                        "external slot {} is optional and not configured",
-                        target.name
-                    )
-                } else {
-                    format!("external slot {} is not configured", target.name)
-                };
-                return Err(RouterError::InvalidConfig(message));
-            }
-        },
-    };
+    let url = configured_external_url(target, target.url_override.as_deref())
+        .ok_or_else(|| RouterError::InvalidConfig(external_slot_not_configured_message(target)))?;
 
     let parsed = Url::parse(&url).map_err(|err| {
         RouterError::InvalidConfig(format!("external slot url is invalid: {err}"))
@@ -5106,6 +5284,30 @@ fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
                     .boxed(),
             )
         })
+}
+
+fn configured_external_url(target: &ExternalTarget, override_url: Option<&str>) -> Option<String> {
+    override_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            env::var(&target.url_env).ok().and_then(|value| {
+                let trimmed = value.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            })
+        })
+}
+
+fn external_slot_not_configured_message(target: &ExternalTarget) -> String {
+    if target.optional {
+        format!(
+            "external slot {} is optional and not configured",
+            target.name
+        )
+    } else {
+        format!("external slot {} is not configured", target.name)
+    }
 }
 
 fn sanitize_request_headers(headers: &mut HeaderMap, host_header: &str) {
@@ -5299,6 +5501,111 @@ mod tests {
             target,
             allowed_issuers: allowed_issuers.iter().map(ToString::to_string).collect(),
         }
+    }
+
+    fn test_http_exchange_labels() -> HttpExchangeLabels {
+        HttpExchangeLabels {
+            kind: HttpEdgeKind::ExternalSlot,
+            emit_telemetry: true,
+            slot: Some(Arc::<str>::from("matrix")),
+            capability: Arc::<str>::from("matrix"),
+            capability_kind: Some(Arc::<str>::from("http")),
+            capability_profile: None,
+            source_component: Some(Arc::<str>::from("/bot")),
+            source_endpoint: Arc::<str>::from("matrix"),
+            destination_component: None,
+            destination_endpoint: Arc::<str>::from("matrix"),
+        }
+    }
+
+    fn empty_box_body() -> BoxBody {
+        Full::new(Bytes::new())
+            .map_err(|never| match never {})
+            .boxed()
+    }
+
+    async fn response_text(response: Response<Incoming>) -> String {
+        String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("response body should collect")
+                .to_bytes()
+                .to_vec(),
+        )
+        .expect("response body should be utf-8")
+    }
+
+    async fn spawn_test_mesh_http_server(
+        router_identity: &MeshIdentity,
+        connection_count: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let peer_identity = MeshIdentity::generate("proxy", Some("test-scope".to_string()));
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("mesh server should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have local addr");
+        let server_config = MeshConfig {
+            identity: peer_identity.clone(),
+            peers: vec![MeshPeer {
+                id: router_identity.id.clone(),
+                public_key: router_identity.public_key,
+            }],
+            ..test_mesh_config()
+        };
+        let trust = Arc::new(TrustBundle::new(&server_config).expect("mesh server trust"));
+        let noise_keys = noise_keys_for_identity(&server_config.identity).expect("noise keys");
+
+        let server_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("mesh peer should accept");
+                connection_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let trust = trust.clone();
+                let noise_keys = noise_keys.clone();
+                tokio::spawn(async move {
+                    let mut session = accept_noise(stream, &noise_keys, trust.as_ref())
+                        .await
+                        .expect("mesh peer should accept noise");
+                    let open = session.recv_open().await.expect("open frame");
+                    assert_eq!(open.capability, "matrix");
+
+                    let (local, remote) = duplex(64 * 1024);
+                    let bridge =
+                        tokio::spawn(
+                            async move { proxy_noise_to_plain(&mut session, local).await },
+                        );
+                    let service = service_fn(|req: Request<Incoming>| async move {
+                        assert_eq!(req.uri().path(), "/_matrix/client/v3/sync");
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .body(
+                                    Full::new(Bytes::from_static(b"mesh ok"))
+                                        .map_err(|never| match never {})
+                                        .boxed(),
+                                )
+                                .expect("mesh response should build"),
+                        )
+                    });
+                    http1::Builder::new()
+                        .serve_connection(TokioIo::new(remote), service)
+                        .await
+                        .expect("mesh http server should complete");
+                    let _ = bridge.await;
+                });
+            }
+        });
+
+        let peer_key = base64::engine::general_purpose::STANDARD.encode(peer_identity.public_key);
+        let mesh_url = format!(
+            "mesh://127.0.0.1:{}?peer_id={}&peer_key={peer_key}",
+            addr.port(),
+            peer_identity.id
+        );
+        (mesh_url, server_task)
     }
 
     #[test]
@@ -5960,5 +6267,212 @@ mod tests {
             otel_status_code_for_http(StatusCode::INTERNAL_SERVER_ERROR),
             "error"
         );
+    }
+
+    #[test]
+    fn resolve_http_external_target_with_override_returns_service_unavailable_when_missing() {
+        let target = ExternalTarget {
+            name: "matrix".to_string(),
+            url_env: "MATRIX_URL".to_string(),
+            optional: false,
+            url_override: None,
+        };
+
+        let response = resolve_http_external_target_with_override(
+            &target,
+            None,
+            &Uri::from_static("/_matrix/client/v3/sync"),
+        )
+        .expect_err("missing external slot should fail");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn resolve_http_external_target_with_override_joins_http_targets_per_request() {
+        let target = ExternalTarget {
+            name: "matrix".to_string(),
+            url_env: "MATRIX_URL".to_string(),
+            optional: false,
+            url_override: None,
+        };
+
+        let resolved = resolve_http_external_target_with_override(
+            &target,
+            Some("http://127.0.0.1:6167/base"),
+            &Uri::from_static("/_matrix/client/v3/sync?timeout=30000"),
+        )
+        .expect("http target should resolve");
+
+        let ResolvedHttpExternalTarget::Http(url) = resolved else {
+            panic!("expected direct http target");
+        };
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:6167/base/_matrix/client/v3/sync?timeout=30000"
+        );
+    }
+
+    #[test]
+    fn resolve_http_external_target_with_override_preserves_mesh_targets() {
+        let peer_key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let mesh_url =
+            format!("mesh://host.docker.internal:61662?peer_id=/proxy&peer_key={peer_key}");
+        let target = ExternalTarget {
+            name: "matrix".to_string(),
+            url_env: "MATRIX_URL".to_string(),
+            optional: false,
+            url_override: None,
+        };
+
+        let resolved = resolve_http_external_target_with_override(
+            &target,
+            Some(mesh_url.as_str()),
+            &Uri::from_static("/_matrix/client/v3/sync"),
+        )
+        .expect("mesh target should resolve");
+
+        let ResolvedHttpExternalTarget::Mesh { target_url, mesh } = resolved else {
+            panic!("expected mesh target");
+        };
+        assert_eq!(target_url, mesh_url);
+        assert_eq!(mesh.peer_addr, "host.docker.internal:61662");
+        assert_eq!(mesh.peer_id, "/proxy");
+    }
+
+    #[tokio::test]
+    async fn resolve_http_external_target_reads_live_overrides() {
+        let external_overrides: ExternalOverrides = Arc::new(RwLock::new(HashMap::new()));
+        let state = HttpProxyState {
+            client: build_client(),
+            target: ExternalTarget {
+                name: "matrix".to_string(),
+                url_env: "MATRIX_URL".to_string(),
+                optional: false,
+                url_override: None,
+            },
+            labels: test_http_exchange_labels(),
+            config: Arc::new(test_mesh_config()),
+            external_overrides: external_overrides.clone(),
+            mesh_upstream: Arc::new(Mutex::new(None)),
+        };
+        let uri = Uri::from_static("/_matrix/client/v3/sync");
+
+        let first = resolve_http_external_target(&state, &uri)
+            .await
+            .expect_err("unconfigured external slot should fail");
+        assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        external_overrides
+            .write()
+            .await
+            .insert("matrix".to_string(), "http://127.0.0.1:6167".to_string());
+
+        let second = resolve_http_external_target(&state, &uri)
+            .await
+            .expect("new override should be visible");
+        let ResolvedHttpExternalTarget::Http(url) = second else {
+            panic!("expected direct http target after override registration");
+        };
+        assert_eq!(url.as_str(), "http://127.0.0.1:6167/_matrix/client/v3/sync");
+    }
+
+    #[tokio::test]
+    async fn late_mesh_slot_registration_succeeds_on_same_http_connection() {
+        let config = Arc::new(test_mesh_config());
+        let external_overrides: ExternalOverrides = Arc::new(RwLock::new(HashMap::new()));
+        let connection_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mesh_url, mesh_server_task) =
+            spawn_test_mesh_http_server(&config.identity, connection_count.clone()).await;
+        let state = HttpProxyState {
+            client: build_client(),
+            target: ExternalTarget {
+                name: "matrix".to_string(),
+                url_env: "MATRIX_URL".to_string(),
+                optional: false,
+                url_override: None,
+            },
+            labels: test_http_exchange_labels(),
+            config: config.clone(),
+            external_overrides: external_overrides.clone(),
+            mesh_upstream: Arc::new(Mutex::new(None)),
+        };
+        let (client_side, server_side) = duplex(64 * 1024);
+        let proxy_state = state.clone();
+        let proxy_task = tokio::spawn(async move {
+            let service = service_fn(move |req: Request<Incoming>| {
+                let state = proxy_state.clone();
+                async move { Ok::<_, std::convert::Infallible>(proxy_http_request(state, req).await) }
+            });
+            http1::Builder::new()
+                .serve_connection(TokioIo::new(server_side), service)
+                .await
+                .expect("proxy http server should complete");
+        });
+        let (mut sender, conn) = client_http1::handshake(TokioIo::new(client_side))
+            .await
+            .expect("client handshake should succeed");
+        let client_task = tokio::spawn(async move {
+            conn.await.expect("client connection should complete");
+        });
+
+        let first = sender
+            .send_request(
+                Request::builder()
+                    .uri("/_matrix/client/v3/sync")
+                    .header(header::HOST, "tuwunel.test")
+                    .body(empty_box_body())
+                    .expect("first request should build"),
+            )
+            .await
+            .expect("first response should arrive");
+        assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_text(first).await,
+            "external slot matrix is not configured"
+        );
+
+        external_overrides
+            .write()
+            .await
+            .insert("matrix".to_string(), mesh_url);
+
+        let second = sender
+            .send_request(
+                Request::builder()
+                    .uri("/_matrix/client/v3/sync")
+                    .header(header::HOST, "tuwunel.test")
+                    .body(empty_box_body())
+                    .expect("second request should build"),
+            )
+            .await
+            .expect("second response should arrive");
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(response_text(second).await, "mesh ok");
+
+        let third = sender
+            .send_request(
+                Request::builder()
+                    .uri("/_matrix/client/v3/sync")
+                    .header(header::HOST, "tuwunel.test")
+                    .body(empty_box_body())
+                    .expect("third request should build"),
+            )
+            .await
+            .expect("third response should arrive");
+        assert_eq!(third.status(), StatusCode::OK);
+        assert_eq!(response_text(third).await, "mesh ok");
+        assert_eq!(
+            connection_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "mesh upstream should be reused once registered"
+        );
+
+        drop(sender);
+        drop(state);
+        let _ = client_task.await;
+        let _ = proxy_task.await;
+        mesh_server_task.abort();
+        let _ = mesh_server_task.await;
     }
 }
