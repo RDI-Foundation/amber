@@ -154,14 +154,9 @@ pub fn build_root_config(
             continue;
         }
         let leaf_schema = schema_lookup_ref(root_schema, &leaf.path)?;
-        let default_value = if let Some(v) = leaf_schema.get("default") {
-            v.clone()
-        } else if leaf_schema.get("type").and_then(|t| t.as_str()) == Some("string") {
-            Value::String(String::new())
-        } else {
-            continue;
-        };
-        insert_path(&mut obj, &leaf.path, default_value)?;
+        if let Some(default_value) = leaf_schema.get("default") {
+            insert_path(&mut obj, &leaf.path, default_value.clone())?;
+        }
     }
 
     let out = Value::Object(obj);

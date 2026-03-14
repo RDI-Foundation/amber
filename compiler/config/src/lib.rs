@@ -313,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_optional_without_default() {
+    fn missing_optional_without_default_is_omitted() {
         let schema = json!({
             "type": "object",
             "properties": {
@@ -331,7 +331,7 @@ mod tests {
 
         let config = build_root_config(&schema, &env).expect("config should parse");
         assert_eq!(get_by_path(&config, "required_key").unwrap(), "hello");
-        assert_eq!(get_by_path(&config, "optional_key").unwrap(), "");
+        assert!(get_by_path(&config, "optional_key").is_err());
     }
 
     #[test]
