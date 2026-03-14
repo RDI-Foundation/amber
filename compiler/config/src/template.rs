@@ -499,6 +499,7 @@ pub fn render_mount_specs(
     for mount in mounts {
         match mount {
             MountSpec::Literal { path, content } => {
+                validate_rendered_mount_target_path(path)?;
                 rendered.push((path.clone(), content.clone()));
             }
             MountSpec::Template(spec) => {
@@ -554,6 +555,7 @@ fn render_mount_template_once(
         runtime_context,
         current_item,
     )?;
+    validate_rendered_mount_target_path(&path)?;
     let source = render_template_string_with_current_item(
         &spec.source,
         component_config,
@@ -563,6 +565,20 @@ fn render_mount_template_once(
     let value = resolve_rendered_file_mount_value(component_config, component_schema, &source)?;
     let content = stringify_for_mount(value)?;
     Ok((path, content))
+}
+
+fn validate_rendered_mount_target_path(path: &str) -> Result<()> {
+    if !path.starts_with('/') {
+        return Err(ConfigError::interp(format!(
+            "mount path must be absolute, got `{path}`"
+        )));
+    }
+    if path.split('/').any(|segment| segment == "..") {
+        return Err(ConfigError::interp(format!(
+            "mount path must not contain `..`, got `{path}`"
+        )));
+    }
+    Ok(())
 }
 
 pub fn value_kind(value: &Value) -> &'static str {
@@ -843,5 +859,77 @@ mod tests {
                 .contains("secret mount path `public` is not secret"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn render_mount_specs_rejects_relative_rendered_mount_paths() {
+        let mounts = vec![MountSpec::Template(MountTemplateSpec {
+            when: None,
+            each: None,
+            path: vec![TemplatePart::config("mount_path")],
+            source: vec![TemplatePart::lit("config.value")],
+        })];
+        let component_config = json!({
+            "mount_path": "relative/path",
+            "value": "hello"
+        });
+        let component_schema = json!({
+            "type": "object",
+            "properties": {
+                "mount_path": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["mount_path", "value"]
+        });
+
+        let err = render_mount_specs(
+            &mounts,
+            Some(&component_config),
+            Some(&component_schema),
+            &RuntimeTemplateContext::default(),
+        )
+        .expect_err("relative rendered mount paths should fail");
+
+        assert!(
+            err.to_string().contains("mount path must be absolute"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("relative/path"), "{err}");
+    }
+
+    #[test]
+    fn render_mount_specs_rejects_rendered_mount_paths_with_parent_traversal() {
+        let mounts = vec![MountSpec::Template(MountTemplateSpec {
+            when: None,
+            each: None,
+            path: vec![TemplatePart::config("mount_path")],
+            source: vec![TemplatePart::lit("config.value")],
+        })];
+        let component_config = json!({
+            "mount_path": "/tmp/../escape",
+            "value": "hello"
+        });
+        let component_schema = json!({
+            "type": "object",
+            "properties": {
+                "mount_path": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["mount_path", "value"]
+        });
+
+        let err = render_mount_specs(
+            &mounts,
+            Some(&component_config),
+            Some(&component_schema),
+            &RuntimeTemplateContext::default(),
+        )
+        .expect_err("rendered mount paths with parent traversal should fail");
+
+        assert!(
+            err.to_string().contains("mount path must not contain `..`"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("/tmp/../escape"), "{err}");
     }
 }
