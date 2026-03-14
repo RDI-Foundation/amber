@@ -30,6 +30,7 @@ struct GuideRootInput {
     env_var: String,
     required: bool,
     secret: bool,
+    default_value: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -61,13 +62,27 @@ pub(crate) fn build_execution_guide(
         })?;
         leaves.retain(|leaf| runtime_root_paths.contains(&leaf.path));
         for leaf in leaves {
-            let env_var = rc::env_var_for_path(&leaf.path)
+            let path = leaf.path.clone();
+            let env_var = rc::env_var_for_path(&path)
                 .map_err(|err| ReporterError::new(format!("failed to map config path: {err}")))?;
+            let required = leaf.runtime_required();
+            let default_value = leaf
+                .default
+                .as_ref()
+                .map(rc::encode_env_value)
+                .transpose()
+                .map_err(|err| {
+                    ReporterError::new(format!(
+                        "failed to render default for config input {}: {err}",
+                        path
+                    ))
+                })?;
             root_inputs.push(GuideRootInput {
-                path: leaf.path,
+                path,
                 env_var,
-                required: leaf.required,
+                required,
                 secret: leaf.secret,
+                default_value,
             });
         }
     }
@@ -154,8 +169,13 @@ impl ExecutionGuide {
                     "optional"
                 };
                 let secret = if input.secret { "secret" } else { "config" };
+                let default = input
+                    .default_value
+                    .as_ref()
+                    .map(|value| format!(" (default: {value})"))
+                    .unwrap_or_default();
                 out.push_str(&format!(
-                    "# {required} {secret} config.{}\n{}=\n",
+                    "# {required} {secret} config.{}{default}\n{}=\n",
                     input.path, input.env_var
                 ));
             }
@@ -569,9 +589,14 @@ fn push_root_inputs_markdown(out: &mut String, guide: &ExecutionGuide) {
             "optional"
         };
         let secret = if input.secret { "secret" } else { "config" };
+        let default = input
+            .default_value
+            .as_ref()
+            .map(|value| format!(" (default: `{value}`)"))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "- `{}`: {} {} value for `config.{}`\n",
-            input.env_var, required, secret, input.path
+            "- `{}`: {} {} value for `config.{}`{}\n",
+            input.env_var, required, secret, input.path, default
         ));
     }
 }
@@ -664,12 +689,14 @@ mod tests {
                     env_var: "AMBER_CONFIG_API__KEY".to_string(),
                     required: true,
                     secret: true,
+                    default_value: None,
                 },
                 GuideRootInput {
                     path: "api.base_url".to_string(),
                     env_var: "AMBER_CONFIG_API__BASE_URL".to_string(),
                     required: false,
                     secret: false,
+                    default_value: Some("\"https://example.invalid\"".to_string()),
                 },
             ],
             external_slots: vec![GuideExternalSlot {
@@ -691,6 +718,10 @@ mod tests {
     fn compose_env_sample_mentions_root_inputs_and_slots() {
         let env = sample_guide().render_env_sample(true, "docker-compose");
         assert!(env.contains("AMBER_CONFIG_API__KEY="), "{env}");
+        assert!(
+            env.contains("default: \"https://example.invalid\""),
+            "{env}"
+        );
         assert!(env.contains("AMBER_EXTERNAL_SLOT_UPSTREAM_URL="), "{env}");
     }
 
@@ -704,6 +735,13 @@ mod tests {
         assert!(
             readme
                 .contains("- `AMBER_CONFIG_API__KEY`: required secret value for `config.api.key`")
+        );
+        assert!(
+            readme.contains(
+                "- `AMBER_CONFIG_API__BASE_URL`: optional config value for `config.api.base_url` \
+                 (default: `\"https://example.invalid\"`)"
+            ),
+            "{readme}"
         );
         assert!(
             readme

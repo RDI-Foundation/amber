@@ -5,14 +5,16 @@ mod schema;
 mod template;
 
 pub use env::{
-    CONFIG_ENV_PREFIX, build_root_config, env_var_for_path, env_var_to_path, parse_env_value,
+    CONFIG_ENV_PREFIX, build_root_config, encode_env_value, env_var_for_path, env_var_to_path,
+    parse_env_value,
 };
 pub use error::{ConfigError, Result};
 pub use node::{ConfigNode, RootConfigTemplate, compose_config_template};
 pub use schema::{
-    SchemaLeaf, SchemaLookup, SchemaWalkResult, canonical_json, collect_leaf_paths,
-    collect_schema_leaves, is_valid_config_key, prune_schema, schema_lookup, schema_lookup_ref,
-    validate_config_schema,
+    SchemaLeaf, SchemaLookup, SchemaPresence, SchemaWalkResult, apply_schema_defaults,
+    apply_schema_defaults_to_node, canonical_json, collect_leaf_paths, collect_schema_leaves,
+    is_valid_config_key, prune_schema, schema_lookup, schema_lookup_ref, schema_path_accepts_null,
+    schema_path_may_accept_non_null, schema_path_presence, validate_config_schema,
 };
 pub use template::{
     RenderedFileMountSource, config_path_is_present, eval_config_template,
@@ -60,6 +62,91 @@ mod tests {
         let url = get_by_path(&config, "db.url").expect("db.url should exist");
         assert_eq!(url, "postgres://db");
         assert!(get_by_path(&config, "db.pool").is_err());
+    }
+
+    #[test]
+    fn root_config_applies_schema_defaults() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "api_key": { "type": "string" },
+                "system_prompt": {
+                    "type": "string",
+                    "default": "You are an agent."
+                }
+            },
+            "required": ["api_key", "system_prompt"],
+            "additionalProperties": false
+        });
+
+        let env = std::collections::BTreeMap::from([(
+            "AMBER_CONFIG_API_KEY".to_string(),
+            "demo-key".to_string(),
+        )]);
+
+        let config = build_root_config(&schema, &env).expect("config should parse");
+        assert_eq!(
+            config,
+            json!({
+                "api_key": "demo-key",
+                "system_prompt": "You are an agent."
+            })
+        );
+    }
+
+    #[test]
+    fn root_config_explicit_values_override_defaults_within_same_object() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "model": {
+                    "type": "object",
+                    "properties": {
+                        "reasoning_effort": {
+                            "type": "string",
+                            "default": "low"
+                        },
+                        "temperature": {
+                            "type": "number",
+                            "default": 0.2
+                        }
+                    }
+                }
+            }
+        });
+
+        let env = std::collections::BTreeMap::from([
+            (
+                "AMBER_CONFIG_MODEL__REASONING_EFFORT".to_string(),
+                "high".to_string(),
+            ),
+            (
+                "AMBER_CONFIG_MODEL__TEMPERATURE".to_string(),
+                "0.7".to_string(),
+            ),
+        ]);
+
+        let config = build_root_config(&schema, &env).expect("config should parse");
+        assert_eq!(
+            config,
+            json!({
+                "model": {
+                    "reasoning_effort": "high",
+                    "temperature": 0.7
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn encode_env_value_round_trips_multiline_strings() {
+        let schema = json!({
+            "type": "string"
+        });
+        let encoded = encode_env_value(&json!("line one\nline two")).expect("encode env value");
+        let decoded = parse_env_value(&encoded, &schema).expect("parse env value");
+
+        assert_eq!(decoded, json!("line one\nline two"));
     }
 
     #[test]

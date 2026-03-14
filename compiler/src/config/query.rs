@@ -146,6 +146,57 @@ pub(crate) fn resolve_config_presence(
     }
 }
 
+fn resolve_root_schema_presence(
+    root_schema: &Value,
+    query: &str,
+) -> Result<ConfigPresence, String> {
+    validate_config_query_syntax(query)?;
+    rc::schema_path_presence(root_schema, query)
+        .map(|presence| match presence {
+            rc::SchemaPresence::Present => ConfigPresence::Present,
+            rc::SchemaPresence::Absent => ConfigPresence::Absent,
+            rc::SchemaPresence::Runtime => ConfigPresence::Runtime,
+        })
+        .map_err(|err| err.to_string())
+}
+
+pub(crate) fn resolve_config_presence_with_root_schema(
+    template: Option<&rc::ConfigNode>,
+    root_schema: Option<&Value>,
+    query: &str,
+) -> Result<ConfigPresence, String> {
+    match template {
+        Some(template) => {
+            let Some(root_schema) = root_schema else {
+                return resolve_config_presence(Some(template), query);
+            };
+
+            let Some(resolution) = resolve_optional_config_query_node(template, query)? else {
+                return Ok(ConfigPresence::Absent);
+            };
+
+            match resolution {
+                QueryResolution::RuntimePath(_) => resolve_root_schema_presence(root_schema, query),
+                QueryResolution::Node(node) => {
+                    if node.contains_runtime() {
+                        return Ok(ConfigPresence::Runtime);
+                    }
+                    let value = node.evaluate_static().map_err(|err| err.to_string())?;
+                    if value.is_null() {
+                        Ok(ConfigPresence::Absent)
+                    } else {
+                        Ok(ConfigPresence::Present)
+                    }
+                }
+            }
+        }
+        None => match root_schema {
+            Some(root_schema) => resolve_root_schema_presence(root_schema, query),
+            None => resolve_config_presence(None, query),
+        },
+    }
+}
+
 pub(crate) fn resolve_config_each_values(
     template: Option<&rc::ConfigNode>,
     query: &str,
@@ -262,7 +313,8 @@ mod tests {
 
     use super::{
         ConfigEachResolution, ConfigPresence, parse_query_segments, render_static_config_string,
-        resolve_config_each_values, resolve_config_presence, resolve_config_query_node,
+        resolve_config_each_values, resolve_config_presence,
+        resolve_config_presence_with_root_schema, resolve_config_query_node,
         resolve_optional_config_query_node, validate_config_query_syntax,
     };
 
@@ -324,6 +376,116 @@ mod tests {
         assert_eq!(
             resolve_config_presence(Some(&node), "other").unwrap(),
             ConfigPresence::Absent
+        );
+    }
+
+    #[test]
+    fn resolve_config_presence_with_root_schema_uses_defaults_and_requiredness() {
+        let root_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "defaulted": {
+                    "type": "string",
+                    "default": "x"
+                },
+                "required_string": {
+                    "type": "string"
+                },
+                "optional": {
+                    "type": "string"
+                },
+                "nullable_default": {
+                    "type": ["string", "null"],
+                    "default": "x"
+                },
+                "nested": {
+                    "type": "object",
+                    "properties": {
+                        "child": {
+                            "type": "string",
+                            "default": "y"
+                        }
+                    }
+                }
+            },
+            "required": ["required_string"]
+        });
+
+        assert_eq!(
+            resolve_config_presence_with_root_schema(None, Some(&root_schema), "defaulted")
+                .unwrap(),
+            ConfigPresence::Present
+        );
+        assert_eq!(
+            resolve_config_presence_with_root_schema(None, Some(&root_schema), "required_string")
+                .unwrap(),
+            ConfigPresence::Present
+        );
+        assert_eq!(
+            resolve_config_presence_with_root_schema(None, Some(&root_schema), "optional").unwrap(),
+            ConfigPresence::Runtime
+        );
+        assert_eq!(
+            resolve_config_presence_with_root_schema(None, Some(&root_schema), "nullable_default")
+                .unwrap(),
+            ConfigPresence::Runtime
+        );
+        assert_eq!(
+            resolve_config_presence_with_root_schema(None, Some(&root_schema), "nested").unwrap(),
+            ConfigPresence::Present
+        );
+    }
+
+    #[test]
+    fn resolve_config_presence_with_root_schema_treats_defaulted_objects_as_present() {
+        let root_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "settings": {
+                    "type": "object",
+                    "default": {},
+                    "properties": {
+                        "profile": { "type": "string" }
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            resolve_config_presence_with_root_schema(None, Some(&root_schema), "settings").unwrap(),
+            ConfigPresence::Present
+        );
+    }
+
+    #[test]
+    fn resolve_config_presence_with_root_schema_uses_component_defaults_behind_runtime_refs() {
+        let template = amber_config::ConfigNode::Object(BTreeMap::from([(
+            "settings".to_string(),
+            amber_config::ConfigNode::ConfigRef("settings".to_string()),
+        )]));
+        let component_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "settings": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {
+                            "type": "string",
+                            "default": "safe"
+                        }
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            resolve_config_presence_with_root_schema(
+                Some(&template),
+                Some(&component_schema),
+                "settings.mode"
+            )
+            .unwrap(),
+            ConfigPresence::Present
         );
     }
 

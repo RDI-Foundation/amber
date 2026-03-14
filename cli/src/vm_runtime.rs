@@ -18,8 +18,8 @@ use amber_compiler::reporter::{
     },
 };
 use amber_config::{
-    build_root_config, env_var_for_path, eval_config_template_partial_with_context,
-    render_mount_specs, render_template_string_with_context,
+    env_var_for_path, render_mount_specs, render_template_string_with_context,
+    resolve_runtime_component_config,
 };
 use amber_mesh::{
     InboundTarget, MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MESH_PROVISION_PLAN_VERSION,
@@ -1032,34 +1032,14 @@ fn build_component_config(
             config_env.insert(env_var, value);
         }
     }
-    let root_config = build_root_config(&root_schema, &config_env)
-        .map_err(|err| miette::miette!("failed to build root config: {err}"))?;
-    let component_config = eval_config_template_partial_with_context(
+    let component_config = resolve_runtime_component_config(
+        &root_schema,
+        &component_schema,
         &component_template,
-        &root_config,
+        &config_env,
         runtime_context,
     )
-    .map_err(|err| miette::miette!("failed to render component config: {err}"))?;
-
-    if !component_config.is_object() {
-        return Err(miette::miette!(
-            "resolved component config must be an object"
-        ));
-    }
-
-    let validator = jsonschema::validator_for(&component_schema)
-        .map_err(|err| miette::miette!("failed to compile component schema: {err}"))?;
-    {
-        let mut errors = validator.iter_errors(&component_config);
-        if let Some(first) = errors.next() {
-            let mut messages = vec![first.to_string()];
-            messages.extend(errors.take(7).map(|err| err.to_string()));
-            return Err(miette::miette!(
-                "resolved component config does not satisfy its schema: {}",
-                messages.join("; ")
-            ));
-        }
-    }
+    .map_err(|err| miette::miette!("failed to resolve runtime component config: {err}"))?;
 
     Ok(Some((component_config, component_schema)))
 }

@@ -26,7 +26,8 @@ use crate::{
         query::{
             ConfigEachResolution, ConfigPresence, QueryResolution,
             resolve_config_each_values as resolve_shared_config_each_values,
-            resolve_config_presence, resolve_config_query_node, validate_config_query_syntax,
+            resolve_config_presence_with_root_schema, resolve_config_query_node,
+            validate_config_query_syntax,
         },
         scope::{RuntimeConfigView, build_runtime_config_view},
         templates,
@@ -942,7 +943,12 @@ fn build_mount_specs(
                 continue;
             };
 
-            let when = resolve_file_mount_when(mount.when.as_ref(), template_opt, slots)?;
+            let when = resolve_file_mount_when(
+                mount.when.as_ref(),
+                template_opt,
+                component_schema,
+                slots,
+            )?;
             if matches!(when, ResolvedWhen::Absent) {
                 continue;
             }
@@ -1099,6 +1105,7 @@ fn build_mount_specs(
 fn resolve_file_mount_when(
     when: Option<&ProgramCondition>,
     template_opt: Option<&rc::ConfigNode>,
+    root_schema: Option<&Value>,
     slots: &BTreeMap<String, SlotValue>,
 ) -> Result<ResolvedWhen, MeshError> {
     let Some(when) = when else {
@@ -1111,6 +1118,7 @@ fn resolve_file_mount_when(
                 InterpolationSource::Config,
                 path,
                 template_opt,
+                root_schema,
                 slots,
             )? {
                 ConfigPresence::Present => Ok(ResolvedWhen::Present),
@@ -1123,6 +1131,7 @@ fn resolve_file_mount_when(
                 InterpolationSource::Slots,
                 query,
                 template_opt,
+                root_schema,
                 slots,
             )? {
                 ConfigPresence::Present => Ok(ResolvedWhen::Present),
@@ -1341,11 +1350,13 @@ fn resolve_condition_presence_for_program(
     source: InterpolationSource,
     query: &str,
     template_opt: Option<&rc::ConfigNode>,
+    root_schema: Option<&Value>,
     slots: &BTreeMap<String, SlotValue>,
 ) -> Result<ConfigPresence, MeshError> {
     match source {
         InterpolationSource::Config => {
-            resolve_config_presence(template_opt, query).map_err(MeshError::new)
+            resolve_config_presence_with_root_schema(template_opt, root_schema, query)
+                .map_err(MeshError::new)
         }
         InterpolationSource::Slots => Ok(
             if slot_query_is_present(slots, query).map_err(MeshError::new)? {
@@ -1870,14 +1881,20 @@ enum ResolvedWhen {
 fn resolve_program_when(
     when: Option<&amber_manifest::WhenPath>,
     template_opt: Option<&rc::ConfigNode>,
+    root_schema: Option<&Value>,
     slots: &BTreeMap<String, SlotValue>,
 ) -> Result<ResolvedWhen, MeshError> {
     let Some(when) = when else {
         return Ok(ResolvedWhen::Present);
     };
 
-    match resolve_condition_presence_for_program(when.source(), when.query(), template_opt, slots)?
-    {
+    match resolve_condition_presence_for_program(
+        when.source(),
+        when.query(),
+        template_opt,
+        root_schema,
+        slots,
+    )? {
         ConfigPresence::Present => Ok(ResolvedWhen::Present),
         ConfigPresence::Absent => Ok(ResolvedWhen::Absent),
         ConfigPresence::Runtime => {
@@ -1924,11 +1941,12 @@ fn append_program_command_item_templates(
     runtime_address_resolution: RuntimeAddressResolution,
     slots: &BTreeMap<String, SlotValue>,
     template_opt: Option<&rc::ConfigNode>,
+    root_schema: Option<&Value>,
     needs_helper_for_program_templates: &mut bool,
     needs_runtime_config_for_program_templates: &mut bool,
     out: &mut Vec<ProgramArgTemplate>,
 ) -> Result<(), MeshError> {
-    let when = resolve_program_when(item.when(), template_opt, slots)?;
+    let when = resolve_program_when(item.when(), template_opt, root_schema, slots)?;
     if matches!(when, ResolvedWhen::Absent) {
         return Ok(());
     }
@@ -2310,6 +2328,7 @@ fn build_program_plan(
                     runtime_address_resolution,
                     slots,
                     template_opt,
+                    component_schema,
                     &mut needs_helper_for_program_templates,
                     &mut needs_runtime_config_for_program_templates,
                     &mut entrypoint_ts,
@@ -2382,6 +2401,7 @@ fn build_program_plan(
                     runtime_address_resolution,
                     slots,
                     template_opt,
+                    component_schema,
                     &mut needs_helper_for_program_templates,
                     &mut needs_runtime_config_for_program_templates,
                     &mut entrypoint_ts,
@@ -2489,7 +2509,7 @@ fn build_program_plan(
 
     let mut env_ts: BTreeMap<String, ProgramEnvTemplate> = BTreeMap::new();
     for (k, v) in program_env {
-        let when = resolve_program_when(v.when(), template_opt, slots)?;
+        let when = resolve_program_when(v.when(), template_opt, component_schema, slots)?;
         if matches!(when, ResolvedWhen::Absent) {
             continue;
         }

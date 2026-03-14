@@ -269,7 +269,7 @@ pub fn resolve_runtime_component_config(
     runtime_context: &RuntimeTemplateContext,
 ) -> Result<Value> {
     let root_config = build_root_config(root_schema, config_env)?;
-    let component_config = eval_config_template_partial_with_context(
+    let mut component_config = eval_config_template_partial_with_context(
         component_template,
         &root_config,
         runtime_context,
@@ -280,6 +280,8 @@ pub fn resolve_runtime_component_config(
             "resolved component config must be an object".to_string(),
         ));
     }
+
+    crate::apply_schema_defaults(component_schema, &mut component_config)?;
 
     {
         let validator = jsonschema::validator_for(component_schema).map_err(|err| {
@@ -931,5 +933,51 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("/tmp/../escape"), "{err}");
+    }
+
+    #[test]
+    fn resolve_runtime_component_config_applies_component_defaults() {
+        let root_schema = json!({
+            "type": "object",
+            "properties": {
+                "api_key": { "type": "string" }
+            },
+            "required": ["api_key"]
+        });
+        let component_schema = json!({
+            "type": "object",
+            "properties": {
+                "api_key": { "type": "string" },
+                "system_prompt": {
+                    "type": "string",
+                    "default": "You are an agent."
+                }
+            },
+            "required": ["api_key", "system_prompt"],
+            "additionalProperties": false
+        });
+        let component_template = ConfigTemplatePayload::from_value(json!({
+            "api_key": { "$config": "api_key" }
+        }))
+        .expect("component template");
+        let config_env =
+            BTreeMap::from([("AMBER_CONFIG_API_KEY".to_string(), "demo-key".to_string())]);
+
+        let component_config = resolve_runtime_component_config(
+            &root_schema,
+            &component_schema,
+            &component_template,
+            &config_env,
+            &RuntimeTemplateContext::default(),
+        )
+        .expect("resolved component config");
+
+        assert_eq!(
+            component_config,
+            json!({
+                "api_key": "demo-key",
+                "system_prompt": "You are an agent."
+            })
+        );
     }
 }

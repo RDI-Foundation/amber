@@ -28,7 +28,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use self::program_lowering::{
-    ProgramLoweringError, ProgramLoweringSite, lower_program_with_origins,
+    ProgramLoweringError, ProgramLoweringSite, lower_program_with_origins_and_root_schema,
     validate_lowered_program_mounts,
 };
 use crate::{
@@ -976,7 +976,12 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
             .templates
             .get(&id)
             .and_then(rc::RootConfigTemplate::node);
-        match lower_program_with_origins(id, program, template_opt) {
+        match lower_program_with_origins_and_root_schema(
+            id,
+            program,
+            template_opt,
+            manifest.config_schema().map(|schema| &schema.0),
+        ) {
             Ok(lowered) => {
                 if let Err(program_errors) = validate_lowered_program_mounts(
                     &lowered.program,

@@ -691,8 +691,15 @@ pub fn lint_manifest(
         let optional_leaf_paths: BTreeSet<String> = schema_lints
             .leaves
             .iter()
-            .filter(|leaf| !leaf.required)
-            .map(|leaf| leaf.path.clone())
+            .filter_map(
+                |leaf| match rc::schema_path_presence(&schema.0, &leaf.path) {
+                    Ok(rc::SchemaPresence::Present) => None,
+                    Ok(rc::SchemaPresence::Absent | rc::SchemaPresence::Runtime) => {
+                        Some(leaf.path.clone())
+                    }
+                    Err(_) => None,
+                },
+            )
             .collect();
 
         if !schema_lints.unsupported.is_empty() {
@@ -1413,6 +1420,58 @@ mod tests {
             type: "object",
             properties: {
               profile: { type: "string" },
+            },
+          },
+          program: {
+            path: "/bin/echo",
+            args: ["--profile", "${config.profile}"],
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::OptionalCommandConfig { path, .. } if path == "profile"
+        )));
+    }
+
+    #[test]
+    fn defaulted_command_config_is_not_linted_for_unguarded_args() {
+        let input = r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              profile: { type: "string", default: "dev" },
+            },
+          },
+          program: {
+            path: "/bin/echo",
+            args: ["--profile", "${config.profile}"],
+          },
+        }
+        "#;
+        let raw = parse_raw(input);
+        let manifest = raw.validate().unwrap();
+        let lints = lint_for(input, &manifest);
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::OptionalCommandConfig { path, .. } if path == "profile"
+        )));
+    }
+
+    #[test]
+    fn null_default_command_config_is_still_linted_for_unguarded_args() {
+        let input = r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              profile: { type: ["string", "null"], default: null },
             },
           },
           program: {

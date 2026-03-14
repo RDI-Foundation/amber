@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use amber_config as rc;
 use amber_manifest::ManifestRef;
 use amber_mesh::{
     MeshConfig, MeshConfigPublic, MeshIdentity, MeshIdentityPublic, MeshIdentitySecret, MeshPeer,
@@ -58,6 +59,36 @@ fn render_artifact(output: &crate::CompileOutput) -> super::KubernetesArtifact {
     KubernetesReporter
         .emit(&compiled_scenario(output))
         .expect("render kubernetes output")
+}
+
+#[test]
+fn render_root_config_env_content_materializes_defaults() {
+    let leaves = [
+        rc::SchemaLeaf {
+            path: "base_image".to_string(),
+            required: true,
+            default: Some(json!("line one\nline two")),
+            secret: false,
+            pointer: "/properties/base_image".to_string(),
+        },
+        rc::SchemaLeaf {
+            path: "replicas".to_string(),
+            required: false,
+            default: Some(json!(2)),
+            secret: false,
+            pointer: "/properties/replicas".to_string(),
+        },
+    ];
+    let refs: Vec<&rc::SchemaLeaf> = leaves.iter().collect();
+
+    let rendered = super::render_root_config_env_content(
+        &refs,
+        "# Root config values - fill in values before deploying",
+    )
+    .expect("root env content should render");
+
+    assert!(rendered.contains("AMBER_CONFIG_BASE_IMAGE=\"line one\\nline two\""));
+    assert!(rendered.contains("AMBER_CONFIG_REPLICAS=2"));
 }
 
 fn storage_claim_name_for_prefix(

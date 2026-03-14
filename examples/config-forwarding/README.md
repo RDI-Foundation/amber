@@ -2,33 +2,38 @@
 summary: Show how root config_schema becomes backend runtime inputs and forwarded child config.
 -->
 
-# Config forwarding
+# Config forwarding and defaults
 
 This example shows how a root `config_schema` turns into runtime config that you pass in from
 outside the compiled scenario.
 
 In this example, the root `api_key` is supplied at runtime and forwarded into the child
-component's `config`, while the child's `system_prompt` stays fixed in the manifest.
+component's `config`, while `system_prompt` comes from a `config_schema` default unless you
+override it.
 
 ## Files
 
-- `scenario.json5`: root manifest. Declares the root `config_schema` and forwards `api_key` into
-  `api_client`.
+- `scenario.json5`: root manifest. Declares the root `config_schema`, including a defaulted
+  `system_prompt`, and forwards both config values into `api_client`.
 - `api-client.json5`: child manifest. Declares the child's own `config_schema` and prints the
   rendered `${config}` object on startup.
 
 ## What gets rendered
 
-The root manifest says "this scenario needs an `api_key`, and that value should become
-`api_client.config.api_key`":
+The root manifest says "this scenario needs an `api_key`, has a defaulted `system_prompt`, and
+both values should become `api_client.config.*`":
 
 ```json5
 config_schema: {
   type: "object",
   properties: {
     api_key: { type: "string" },
+    system_prompt: {
+      type: "string",
+      default: "You are an agent.",
+    },
   },
-  required: ["api_key"],
+  required: ["api_key", "system_prompt"],
   additionalProperties: false,
 },
 
@@ -37,7 +42,7 @@ components: {
     manifest: "./api-client.json5",
     config: {
       api_key: "${config.api_key}",
-      system_prompt: "You are an agent.",
+      system_prompt: "${config.system_prompt}",
     },
   },
 },
@@ -66,7 +71,7 @@ program: {
 },
 ```
 
-If you supply:
+If you supply only:
 
 ```text
 AMBER_CONFIG_API_KEY=demo-key
@@ -76,7 +81,8 @@ Amber reconstructs the root config as:
 
 ```json
 {
-  "api_key": "demo-key"
+  "api_key": "demo-key",
+  "system_prompt": "You are an agent."
 }
 ```
 
@@ -117,9 +123,10 @@ services:
   c1-api-client:
     environment:
       - AMBER_CONFIG_API_KEY=${AMBER_CONFIG_API_KEY?missing config.api_key}
+      - AMBER_CONFIG_SYSTEM_PROMPT=${AMBER_CONFIG_SYSTEM_PROMPT}
 ```
 
-Fill in the root config and start the stack:
+Fill in the required root config and start the stack:
 
 ```sh
 cat > "$OUT/.env" <<'EOF'
@@ -131,8 +138,9 @@ docker compose up -d
 docker compose logs c1-api-client
 ```
 
-The startup log will include the rendered child config, so you should see both the externally
-supplied `api_key` and the fixed `system_prompt`.
+The startup log will include the rendered child config, so you should see the externally supplied
+`api_key` and the defaulted `system_prompt`. If you also set `AMBER_CONFIG_SYSTEM_PROMPT`, that
+runtime value overrides the schema default.
 
 ## Kubernetes
 
@@ -144,11 +152,13 @@ rm -rf "$OUT"
 amber compile examples/config-forwarding/scenario.json5 --kubernetes "$OUT"
 ```
 
-Amber renders the root input as a generated env file:
+Amber renders the root input as a generated env file. Defaulted string values are written as
+JSON string literals so they round-trip through Amber's env parser:
 
 ```text
 # $OUT/root-config.env
 AMBER_CONFIG_API_KEY=
+AMBER_CONFIG_SYSTEM_PROMPT="You are an agent."
 ```
 
 and includes that file from `kustomization.yaml`:
@@ -160,7 +170,7 @@ configMapGenerator:
   - root-config.env
 ```
 
-Fill in the root config and apply the manifests:
+Fill in the required root config and apply the manifests:
 
 ```sh
 printf 'AMBER_CONFIG_API_KEY=demo-key\n' > "$OUT/root-config.env"

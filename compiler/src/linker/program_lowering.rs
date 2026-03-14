@@ -16,7 +16,8 @@ use serde_json::Value;
 
 use crate::config::query::{
     ConfigEachResolution, ConfigPresence, QueryResolution, resolve_config_each_values,
-    resolve_config_presence, resolve_config_query_node, validate_config_query_syntax,
+    resolve_config_presence_with_root_schema, resolve_config_query_node,
+    validate_config_query_syntax,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,10 +81,20 @@ pub(crate) fn lower_program(
     Ok(lower_program_with_origins(component_id, program, template_opt)?.program)
 }
 
+#[cfg(test)]
 pub(crate) fn lower_program_with_origins(
     component_id: ComponentId,
     program: &ManifestProgram,
     template_opt: Option<&rc::ConfigNode>,
+) -> Result<LoweredProgram, Vec<ProgramLoweringError>> {
+    lower_program_with_origins_and_root_schema(component_id, program, template_opt, None)
+}
+
+pub(crate) fn lower_program_with_origins_and_root_schema(
+    component_id: ComponentId,
+    program: &ManifestProgram,
+    template_opt: Option<&rc::ConfigNode>,
+    root_schema: Option<&Value>,
 ) -> Result<LoweredProgram, Vec<ProgramLoweringError>> {
     match program {
         ManifestProgram::Image(program) => {
@@ -91,6 +102,7 @@ pub(crate) fn lower_program_with_origins(
                 component_id,
                 &program.common,
                 template_opt,
+                root_schema,
                 "program.network.endpoints",
                 "program.mounts",
             )?;
@@ -108,6 +120,7 @@ pub(crate) fn lower_program_with_origins(
                 component_id,
                 &program.common,
                 template_opt,
+                root_schema,
                 "program.network.endpoints",
                 "program.mounts",
             )?;
@@ -128,12 +141,14 @@ pub(crate) fn lower_program_with_origins(
                     .as_ref()
                     .map_or(&[], |network| network.endpoints.as_slice()),
                 template_opt,
+                root_schema,
                 "program.vm.network.endpoints",
             )?;
             let mounts = lower_mounts(
                 component_id,
                 &program.0.mounts,
                 template_opt,
+                root_schema,
                 "program.vm.mounts",
             )?;
             Ok(LoweredProgram {
@@ -325,6 +340,7 @@ fn lower_common(
     component_id: ComponentId,
     common: &amber_manifest::ProgramCommon,
     template_opt: Option<&rc::ConfigNode>,
+    root_schema: Option<&Value>,
     network_location_prefix: &str,
     mount_location_prefix: &str,
 ) -> Result<LoweredCommon, Vec<ProgramLoweringError>> {
@@ -334,12 +350,14 @@ fn lower_common(
             .as_ref()
             .map_or(&[], |network| network.endpoints.as_slice()),
         template_opt,
+        root_schema,
         network_location_prefix,
     )?;
     let mounts = lower_mounts(
         component_id,
         &common.mounts,
         template_opt,
+        root_schema,
         mount_location_prefix,
     )?;
     Ok(LoweredCommon {
@@ -355,6 +373,7 @@ fn lower_common(
 fn lower_network(
     endpoints: &[ManifestEndpoint],
     template_opt: Option<&rc::ConfigNode>,
+    root_schema: Option<&Value>,
     location_prefix: &str,
 ) -> Result<Option<ProgramNetwork>, Vec<ProgramLoweringError>> {
     if endpoints.is_empty() {
@@ -366,7 +385,7 @@ fn lower_network(
     let mut errors = Vec::new();
 
     for (index, endpoint) in endpoints.iter().enumerate() {
-        let when = match lower_endpoint_when(endpoint.when.as_ref(), template_opt) {
+        let when = match lower_endpoint_when(endpoint.when.as_ref(), template_opt, root_schema) {
             Ok(when) => when,
             Err(message) => {
                 errors.push(ProgramLoweringError {
@@ -450,19 +469,23 @@ fn lower_network(
 fn lower_endpoint_when(
     when: Option<&WhenPath>,
     template_opt: Option<&rc::ConfigNode>,
+    root_schema: Option<&Value>,
 ) -> Result<LoweredWhen, String> {
     let Some(when) = when else {
         return Ok(LoweredWhen::Present);
     };
 
     match when.source() {
-        InterpolationSource::Config => match resolve_config_presence(template_opt, when.query())? {
-            ConfigPresence::Present => Ok(LoweredWhen::Present),
-            ConfigPresence::Absent => Ok(LoweredWhen::Absent),
-            ConfigPresence::Runtime => Err("depends on runtime config, but endpoints must \
-                                            resolve entirely at compile time"
-                .to_string()),
-        },
+        InterpolationSource::Config => {
+            match resolve_config_presence_with_root_schema(template_opt, root_schema, when.query())?
+            {
+                ConfigPresence::Present => Ok(LoweredWhen::Present),
+                ConfigPresence::Absent => Ok(LoweredWhen::Absent),
+                ConfigPresence::Runtime => Err("depends on runtime config, but endpoints must \
+                                                resolve entirely at compile time"
+                    .to_string()),
+            }
+        }
         InterpolationSource::Slots => Err(format!(
             "uses `when: \"{}\"`, but endpoints cannot depend on slots because port allocation \
              happens before slot values exist",
@@ -557,6 +580,7 @@ fn lower_mounts(
     component_id: ComponentId,
     mounts: &[ManifestMount],
     template_opt: Option<&rc::ConfigNode>,
+    root_schema: Option<&Value>,
     location_prefix: &str,
 ) -> Result<LoweredMounts, Vec<ProgramLoweringError>> {
     let mut lowered = Vec::new();
@@ -564,7 +588,7 @@ fn lower_mounts(
     let mut errors = Vec::new();
 
     for (index, mount) in mounts.iter().enumerate() {
-        let when = match lower_mount_when(mount.when.as_ref(), template_opt) {
+        let when = match lower_mount_when(mount.when.as_ref(), template_opt, root_schema) {
             Ok(when) => when,
             Err(message) => {
                 errors.push(ProgramLoweringError {
@@ -656,19 +680,23 @@ fn lower_mounts(
 fn lower_mount_when(
     when: Option<&WhenPath>,
     template_opt: Option<&rc::ConfigNode>,
+    root_schema: Option<&Value>,
 ) -> Result<LoweredWhen, String> {
     let Some(when) = when else {
         return Ok(LoweredWhen::Present);
     };
 
     match when.source() {
-        InterpolationSource::Config => match resolve_config_presence(template_opt, when.query())? {
-            ConfigPresence::Present => Ok(LoweredWhen::Present),
-            ConfigPresence::Absent => Ok(LoweredWhen::Absent),
-            ConfigPresence::Runtime => Ok(LoweredWhen::Runtime(ProgramCondition::Config {
-                path: when.query().to_string(),
-            })),
-        },
+        InterpolationSource::Config => {
+            match resolve_config_presence_with_root_schema(template_opt, root_schema, when.query())?
+            {
+                ConfigPresence::Present => Ok(LoweredWhen::Present),
+                ConfigPresence::Absent => Ok(LoweredWhen::Absent),
+                ConfigPresence::Runtime => Ok(LoweredWhen::Runtime(ProgramCondition::Config {
+                    path: when.query().to_string(),
+                })),
+            }
+        }
         InterpolationSource::Slots => Ok(LoweredWhen::Runtime(ProgramCondition::Slot {
             query: when.query().to_string(),
         })),
@@ -1015,7 +1043,7 @@ mod tests {
 
     use super::{
         ProgramLoweringSite, lower_program, lower_program_with_origins,
-        validate_lowered_program_mounts,
+        lower_program_with_origins_and_root_schema, validate_lowered_program_mounts,
     };
 
     #[test]
@@ -1083,6 +1111,52 @@ mod tests {
         assert_eq!(endpoints[0].port, 8080);
         assert_eq!(endpoints[1].name, "admin");
         assert_eq!(endpoints[1].port, 9090);
+    }
+
+    #[test]
+    fn lower_program_uses_root_schema_defaults_for_endpoint_when() {
+        let manifest: Manifest = r#"
+            {
+              manifest_version: "0.3.0",
+              config_schema: {
+                type: "object",
+                properties: {
+                  enabled: {
+                    type: "boolean",
+                    default: false,
+                  },
+                },
+              },
+              program: {
+                image: "app",
+                entrypoint: ["app"],
+                network: {
+                  endpoints: [
+                    {
+                      name: "http",
+                      port: 8080,
+                      protocol: "http",
+                      when: "config.enabled",
+                    },
+                  ],
+                },
+              },
+            }
+        "#
+        .parse()
+        .expect("manifest");
+
+        let lowered = lower_program_with_origins_and_root_schema(
+            amber_scenario::ComponentId(12),
+            manifest.program().expect("program"),
+            None,
+            manifest.config_schema().map(|schema| &schema.0),
+        )
+        .expect("program should lower");
+
+        let endpoints = &lowered.program.network().expect("network").endpoints;
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].name, "http");
     }
 
     #[test]

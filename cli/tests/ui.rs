@@ -37,7 +37,7 @@ fn collect_cases(dir: &Path, cases: &mut Vec<PathBuf>) -> std::io::Result<()> {
         if path.extension().and_then(|ext| ext.to_str()) != Some("json5") {
             continue;
         }
-        if path.with_extension("stderr").exists() {
+        if path.with_extension("stderr").exists() || path.with_extension("status").exists() {
             cases.push(path);
         }
     }
@@ -47,7 +47,12 @@ fn collect_cases(dir: &Path, cases: &mut Vec<PathBuf>) -> std::io::Result<()> {
 fn run_case(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let command = read_command(path)?;
     let args = read_args(path)?;
-    let expected_stderr = read_expected(&path.with_extension("stderr"))?;
+    let expect_success = read_expected_success(path)?;
+    let stderr_path = path.with_extension("stderr");
+    let expected_stderr = stderr_path
+        .exists()
+        .then(|| read_expected(&stderr_path))
+        .transpose()?;
     let stdout_path = path.with_extension("stdout");
     let expected_stdout = stdout_path
         .exists()
@@ -73,7 +78,17 @@ fn run_case(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     cmd.env("RUST_BACKTRACE", "0");
 
     let output = cmd.output()?;
-    if output.status.success() {
+    if expect_success {
+        if !output.status.success() {
+            let stdout = normalize_output(&output.stdout);
+            let stderr = normalize_output(&output.stderr);
+            return Err(format!(
+                "expected success for {} but command failed\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                path.display()
+            )
+            .into());
+        }
+    } else if output.status.success() {
         return Err(format!("expected failure for {}", path.display()).into());
     }
 
@@ -86,7 +101,11 @@ fn run_case(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("unexpected stdout for {}:\n{stdout}", path.display()).into());
     }
 
-    assert_text_matches(path, "stderr", &expected_stderr, &stderr);
+    if let Some(expected) = expected_stderr {
+        assert_text_matches(path, "stderr", &expected, &stderr);
+    } else if !stderr.is_empty() {
+        return Err(format!("unexpected stderr for {}:\n{stderr}", path.display()).into());
+    }
     Ok(())
 }
 
@@ -162,4 +181,28 @@ fn read_command(case: &Path) -> Result<String, Box<dyn std::error::Error>> {
         .find(|line| !line.is_empty() && !line.starts_with('#'))
         .ok_or_else(|| format!("empty ui test command file {}", cmd_path.display()))?;
     Ok(cmd.to_string())
+}
+
+fn read_expected_success(case: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+    let status_path = case.with_extension("status");
+    if !status_path.exists() {
+        return Ok(false);
+    }
+
+    let contents = fs::read_to_string(&status_path)?;
+    let status = contents
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .ok_or_else(|| format!("empty ui test status file {}", status_path.display()))?;
+
+    match status {
+        "success" => Ok(true),
+        "failure" => Ok(false),
+        other => Err(format!(
+            "unknown ui test status `{other}` in {}",
+            status_path.display()
+        )
+        .into()),
+    }
 }

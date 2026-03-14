@@ -121,6 +121,11 @@ pub fn parse_env_value(raw: &str, leaf_schema: &Value) -> Result<Value> {
     }
 }
 
+pub fn encode_env_value(value: &Value) -> Result<String> {
+    serde_json::to_string(value)
+        .map_err(|err| ConfigError::msg(format!("failed to encode env value: {err}")))
+}
+
 pub fn build_root_config(
     root_schema: &Value,
     config_env: &BTreeMap<String, String>,
@@ -150,7 +155,8 @@ pub fn build_root_config(
         insert_path(&mut obj, &path, parsed)?;
     }
 
-    let out = Value::Object(obj);
+    let mut out = Value::Object(obj);
+    crate::apply_schema_defaults(root_schema, &mut out)?;
 
     let validator = jsonschema::validator_for(root_schema)
         .map_err(|e| ConfigError::schema(format!("failed to compile root schema: {e}")))?;
