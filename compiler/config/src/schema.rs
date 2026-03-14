@@ -874,21 +874,32 @@ fn value_at_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
 #[derive(Clone, Copy, Debug, Default)]
 struct PossibleKinds {
     null: bool,
-    non_null: bool,
+    object: bool,
+    other_non_null: bool,
 }
 
 impl PossibleKinds {
     const fn any() -> Self {
         Self {
             null: true,
-            non_null: true,
+            object: true,
+            other_non_null: true,
         }
+    }
+
+    const fn may_accept_non_null(self) -> bool {
+        self.object || self.other_non_null
+    }
+
+    const fn must_be_non_null_object(self) -> bool {
+        self.object && !self.null && !self.other_non_null
     }
 
     fn intersect(self, other: Self) -> Self {
         Self {
             null: self.null && other.null,
-            non_null: self.non_null && other.non_null,
+            object: self.object && other.object,
+            other_non_null: self.other_non_null && other.other_non_null,
         }
     }
 }
@@ -898,11 +909,18 @@ fn possible_kinds_from_type(value: &Value) -> Result<PossibleKinds> {
         match ty {
             "null" => Ok(PossibleKinds {
                 null: true,
-                non_null: false,
+                object: false,
+                other_non_null: false,
             }),
-            "string" | "boolean" | "number" | "integer" | "array" | "object" => Ok(PossibleKinds {
+            "object" => Ok(PossibleKinds {
                 null: false,
-                non_null: true,
+                object: true,
+                other_non_null: false,
+            }),
+            "string" | "boolean" | "number" | "integer" | "array" => Ok(PossibleKinds {
+                null: false,
+                object: false,
+                other_non_null: true,
             }),
             other => Err(ConfigError::schema(format!(
                 "unsupported config_schema type {other:?}"
@@ -922,7 +940,8 @@ fn possible_kinds_from_type(value: &Value) -> Result<PossibleKinds> {
                 };
                 let kinds = kind_for_type(ty)?;
                 out.null |= kinds.null;
-                out.non_null |= kinds.non_null;
+                out.object |= kinds.object;
+                out.other_non_null |= kinds.other_non_null;
             }
             Ok(out)
         }
@@ -933,10 +952,15 @@ fn possible_kinds_from_type(value: &Value) -> Result<PossibleKinds> {
 }
 
 fn possible_kinds_from_values(values: &[Value]) -> PossibleKinds {
-    PossibleKinds {
-        null: values.iter().any(Value::is_null),
-        non_null: values.iter().any(|value| !value.is_null()),
+    let mut out = PossibleKinds::default();
+    for value in values {
+        match value {
+            Value::Null => out.null = true,
+            Value::Object(_) => out.object = true,
+            _ => out.other_non_null = true,
+        }
     }
+    out
 }
 
 fn schema_possible_kinds(
@@ -957,7 +981,8 @@ fn schema_possible_kinds(
     if let Some(value) = map.get("const") {
         return Ok(PossibleKinds {
             null: value.is_null(),
-            non_null: !value.is_null(),
+            object: value.is_object(),
+            other_non_null: !value.is_null() && !value.is_object(),
         });
     }
 
@@ -987,14 +1012,52 @@ pub fn schema_path_accepts_null(root_schema: &Value, path: &str) -> Result<bool>
 }
 
 pub fn schema_path_may_accept_non_null(root_schema: &Value, path: &str) -> Result<bool> {
-    Ok(schema_path_possible_kinds(root_schema, path)?.non_null)
+    Ok(schema_path_possible_kinds(root_schema, path)?.may_accept_non_null())
 }
 
-fn leaf_schema_presence(root_schema: &Value, leaf: &SchemaLeaf) -> Result<SchemaPresence> {
-    let allows_null = schema_path_accepts_null(root_schema, &leaf.path)?;
-    let may_accept_non_null = schema_path_may_accept_non_null(root_schema, &leaf.path)?;
+fn schema_path_ancestors_must_be_non_null_objects(root_schema: &Value, path: &str) -> Result<bool> {
+    let mut prefix = String::new();
+    let mut segments = path.split('.').peekable();
 
-    Ok(match leaf.default.as_ref() {
+    while let Some(segment) = segments.next() {
+        if segments.peek().is_none() {
+            break;
+        }
+
+        if !prefix.is_empty() {
+            prefix.push('.');
+        }
+        prefix.push_str(segment);
+
+        if !schema_path_possible_kinds(root_schema, &prefix)?.must_be_non_null_object() {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+fn downgrade_present_when_ancestors_are_runtime(
+    root_schema: &Value,
+    path: &str,
+    presence: SchemaPresence,
+) -> Result<SchemaPresence> {
+    if matches!(presence, SchemaPresence::Present)
+        && !schema_path_ancestors_must_be_non_null_objects(root_schema, path)?
+    {
+        return Ok(SchemaPresence::Runtime);
+    }
+
+    Ok(presence)
+}
+
+fn schema_value_presence(
+    default: Option<&Value>,
+    required: bool,
+    allows_null: bool,
+    may_accept_non_null: bool,
+) -> SchemaPresence {
+    match default {
         Some(default) if default.is_null() => {
             if may_accept_non_null {
                 SchemaPresence::Runtime
@@ -1009,7 +1072,7 @@ fn leaf_schema_presence(root_schema: &Value, leaf: &SchemaLeaf) -> Result<Schema
                 SchemaPresence::Present
             }
         }
-        None if leaf.required => {
+        None if required => {
             if allows_null {
                 SchemaPresence::Runtime
             } else {
@@ -1023,7 +1086,19 @@ fn leaf_schema_presence(root_schema: &Value, leaf: &SchemaLeaf) -> Result<Schema
                 SchemaPresence::Absent
             }
         }
-    })
+    }
+}
+
+fn leaf_schema_presence(root_schema: &Value, leaf: &SchemaLeaf) -> Result<SchemaPresence> {
+    let allows_null = schema_path_accepts_null(root_schema, &leaf.path)?;
+    let may_accept_non_null = schema_path_may_accept_non_null(root_schema, &leaf.path)?;
+    let presence = schema_value_presence(
+        leaf.default.as_ref(),
+        leaf.required,
+        allows_null,
+        may_accept_non_null,
+    );
+    downgrade_present_when_ancestors_are_runtime(root_schema, &leaf.path, presence)
 }
 
 enum RequiredLookup {
@@ -1131,29 +1206,21 @@ pub fn schema_path_presence(root_schema: &Value, path: &str) -> Result<SchemaPre
     let defaults = collect_schema_defaults(root_schema)?;
     let schema = schema_lookup_ref(root_schema, path)?;
     let is_container = schema_properties(schema).is_some();
+    let allows_null = schema_path_accepts_null(root_schema, path)?;
     let may_accept_non_null = schema_path_may_accept_non_null(root_schema, path)?;
 
     if let Some(default) = defaults
         .as_ref()
         .and_then(|defaults| value_at_path(defaults, path))
     {
-        return Ok(if default.is_null() {
-            if may_accept_non_null {
-                SchemaPresence::Runtime
-            } else {
-                SchemaPresence::Absent
-            }
-        } else if is_container {
-            SchemaPresence::Present
-        } else if schema_path_accepts_null(root_schema, path)? {
-            SchemaPresence::Runtime
-        } else {
-            SchemaPresence::Present
-        });
+        let presence =
+            schema_value_presence(Some(default), false, allows_null, may_accept_non_null);
+        return downgrade_present_when_ancestors_are_runtime(root_schema, path, presence);
     }
 
     if is_container && schema_path_is_required(root_schema, path)? {
-        return Ok(SchemaPresence::Present);
+        let presence = schema_value_presence(None, true, allows_null, may_accept_non_null);
+        return downgrade_present_when_ancestors_are_runtime(root_schema, path, presence);
     }
 
     let leaves = collect_leaf_paths(root_schema)?;
@@ -1772,6 +1839,73 @@ mod tests {
         assert_eq!(
             schema_path_presence(&schema, "settings").unwrap(),
             SchemaPresence::Present
+        );
+    }
+
+    #[test]
+    fn schema_path_presence_treats_nullable_defaulted_objects_as_runtime() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "settings": {
+                    "type": ["object", "null"],
+                    "default": {},
+                    "properties": {
+                        "profile": { "type": "string" }
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            schema_path_presence(&schema, "settings").unwrap(),
+            SchemaPresence::Runtime
+        );
+    }
+
+    #[test]
+    fn schema_path_presence_treats_defaulted_leaf_under_nullable_ancestor_as_runtime() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "settings": {
+                    "type": ["object", "null"],
+                    "properties": {
+                        "mode": {
+                            "type": "string",
+                            "default": "safe"
+                        }
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            schema_path_presence(&schema, "settings.mode").unwrap(),
+            SchemaPresence::Runtime
+        );
+    }
+
+    #[test]
+    fn schema_path_presence_treats_defaulted_leaf_under_non_object_ancestor_as_runtime() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "settings": {
+                    "type": ["object", "string"],
+                    "properties": {
+                        "mode": {
+                            "type": "string",
+                            "default": "safe"
+                        }
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            schema_path_presence(&schema, "settings.mode").unwrap(),
+            SchemaPresence::Runtime
         );
     }
 }

@@ -1160,6 +1160,59 @@ mod tests {
     }
 
     #[test]
+    fn lower_program_keeps_nullable_ancestor_endpoint_when_runtime() {
+        let manifest: Manifest = r#"
+            {
+              manifest_version: "0.3.0",
+              config_schema: {
+                type: "object",
+                properties: {
+                  settings: {
+                    type: ["object", "null"],
+                    properties: {
+                      enabled: {
+                        type: "boolean",
+                        default: false,
+                      },
+                    },
+                  },
+                },
+              },
+              program: {
+                image: "app",
+                entrypoint: ["app"],
+                network: {
+                  endpoints: [
+                    {
+                      name: "http",
+                      port: 8080,
+                      protocol: "http",
+                      when: "config.settings.enabled",
+                    },
+                  ],
+                },
+              },
+            }
+        "#
+        .parse()
+        .expect("manifest");
+
+        let errors = lower_program_with_origins_and_root_schema(
+            amber_scenario::ComponentId(12),
+            manifest.program().expect("program"),
+            None,
+            manifest.config_schema().map(|schema| &schema.0),
+        )
+        .expect_err("endpoint should remain runtime-conditional");
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].site, ProgramLoweringSite::Endpoint(0));
+        assert!(errors[0].message.contains(
+            "depends on runtime config, but endpoints must resolve entirely at compile time"
+        ));
+    }
+
+    #[test]
     fn lower_program_classifies_static_config_mount_sources() {
         let manifest: Manifest = r#"
             {
