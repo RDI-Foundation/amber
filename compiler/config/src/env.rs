@@ -48,77 +48,33 @@ pub fn env_var_to_path(var: &str) -> Result<String> {
 }
 
 pub fn parse_env_value(raw: &str, leaf_schema: &Value) -> Result<Value> {
-    let mut candidates: Vec<Value> = Vec::new();
-    let mut parsed_json = None;
-
-    if let Ok(v) = serde_json::from_str::<Value>(raw) {
-        parsed_json = Some(v.clone());
-        candidates.push(v);
-    }
-
-    if raw == "true" {
-        candidates.push(Value::Bool(true));
-    } else if raw == "false" {
-        candidates.push(Value::Bool(false));
-    }
-
-    let mut parsed_integer = false;
-    if let Ok(i) = raw.parse::<i64>() {
-        candidates.push(Value::Number(i.into()));
-        parsed_integer = true;
-    }
-
-    if !parsed_integer
-        && let Ok(f) = raw.parse::<f64>()
-        && let Some(n) = serde_json::Number::from_f64(f)
-    {
-        candidates.push(Value::Number(n));
-    }
-
-    let skip_raw_string = parsed_json
-        .as_ref()
-        .is_some_and(|value| matches!(value, Value::String(_)));
-    if !skip_raw_string {
-        candidates.push(Value::String(raw.to_string()));
-    }
-
-    let mut deduped: Vec<Value> = Vec::new();
-    for c in candidates {
-        if !deduped.contains(&c) {
-            deduped.push(c);
-        }
-    }
-
     let validator = jsonschema::validator_for(leaf_schema)
         .map_err(|e| ConfigError::schema(format!("failed to compile leaf schema: {e}")))?;
 
-    let mut valid: Vec<Value> = Vec::new();
-    for c in deduped {
-        let is_valid = {
-            let mut it = validator.iter_errors(&c);
-            it.next().is_none()
-        };
-        if is_valid {
-            valid.push(c);
-        }
+    let schema_accepts = |value: &Value| {
+        let mut it = validator.iter_errors(value);
+        it.next().is_none()
+    };
+
+    let parsed_json = serde_json::from_str::<Value>(raw).ok();
+    if let Some(value) = parsed_json.as_ref()
+        && schema_accepts(value)
+    {
+        return Ok(value.clone());
     }
 
-    match valid.len() {
-        1 => Ok(valid.remove(0)),
-        0 => {
-            let c = Value::String(raw.to_string());
-            let mut it = validator.iter_errors(&c);
-            let msg = it
-                .next()
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "value does not match schema".to_string());
-            Err(ConfigError::validation(msg))
-        }
-        _ => Err(ConfigError::validation(format!(
-            "ambiguous value {raw:?}: multiple interpretations match the schema; disambiguate by \
-             using an explicit JSON literal (e.g. \"\\\"123\\\"\" for strings)"
-        ))),
+    let string_value = Value::String(raw.to_string());
+    if schema_accepts(&string_value) {
+        return Ok(string_value);
     }
+
+    let msg = parsed_json
+        .as_ref()
+        .and_then(|value| validator.iter_errors(value).next())
+        .or_else(|| validator.iter_errors(&string_value).next())
+        .map(|err| err.to_string())
+        .unwrap_or_else(|| "value does not match schema".to_string());
+    Err(ConfigError::validation(msg))
 }
 
 pub fn encode_env_value(value: &Value) -> Result<String> {

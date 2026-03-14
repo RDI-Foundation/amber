@@ -61,6 +61,21 @@ fn render_artifact(output: &crate::CompileOutput) -> super::KubernetesArtifact {
         .expect("render kubernetes output")
 }
 
+fn parse_rendered_env(content: &str) -> std::collections::BTreeMap<String, String> {
+    content
+        .lines()
+        .filter_map(|line| {
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (key, value) = line
+                .split_once('=')
+                .expect("rendered env lines should contain '='");
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
 #[test]
 fn render_root_config_env_content_materializes_defaults() {
     let leaves = [
@@ -89,6 +104,44 @@ fn render_root_config_env_content_materializes_defaults() {
 
     assert!(rendered.contains("AMBER_CONFIG_BASE_IMAGE=\"line one\\nline two\""));
     assert!(rendered.contains("AMBER_CONFIG_REPLICAS=2"));
+}
+
+#[test]
+fn render_root_config_env_content_round_trips_union_defaults() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "flag": {
+                "type": ["boolean", "string"],
+                "default": true,
+            },
+            "count": {
+                "type": ["integer", "string"],
+                "default": 2,
+            },
+        },
+    });
+    let leaves = rc::collect_leaf_paths(&schema).expect("collect leaf paths");
+    let refs: Vec<&rc::SchemaLeaf> = leaves.iter().collect();
+
+    let rendered = super::render_root_config_env_content(
+        &refs,
+        "# Root config values - fill in values before deploying",
+    )
+    .expect("root env content should render");
+
+    assert!(rendered.contains("AMBER_CONFIG_FLAG=true"));
+    assert!(rendered.contains("AMBER_CONFIG_COUNT=2"));
+
+    let rebuilt =
+        rc::build_root_config(&schema, &parse_rendered_env(&rendered)).expect("build root config");
+    assert_eq!(
+        rebuilt,
+        json!({
+            "flag": true,
+            "count": 2,
+        })
+    );
 }
 
 fn storage_claim_name_for_prefix(

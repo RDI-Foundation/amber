@@ -150,26 +150,72 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_value_requires_disambiguation() {
-        let schema = json!({
-            "type": ["integer", "string"]
-        });
-
-        let err = parse_env_value("123", &schema).expect_err("ambiguous value should error");
-        assert!(
-            err.to_string().contains("ambiguous value"),
-            "unexpected error: {err}"
+    fn raw_json_scalars_prefer_typed_values_for_string_unions() {
+        assert_eq!(
+            parse_env_value("123", &json!({ "type": ["integer", "string"] }))
+                .expect("integer union should parse"),
+            json!(123)
+        );
+        assert_eq!(
+            parse_env_value("0.7", &json!({ "type": ["number", "string"] }))
+                .expect("number union should parse"),
+            json!(0.7)
+        );
+        assert_eq!(
+            parse_env_value("true", &json!({ "type": ["boolean", "string"] }))
+                .expect("boolean union should parse"),
+            json!(true)
+        );
+        assert_eq!(
+            parse_env_value("null", &json!({ "type": ["null", "string"] }))
+                .expect("null union should parse"),
+            json!(null)
         );
     }
 
     #[test]
-    fn json_string_literal_is_unambiguous() {
-        let schema = json!({
-            "type": ["integer", "string"]
-        });
+    fn raw_non_json_values_fall_back_to_strings() {
+        let value = parse_env_value("dev", &json!({ "type": ["boolean", "string"] }))
+            .expect("string fallback should parse");
+        assert_eq!(value, json!("dev"));
+    }
 
-        let value = parse_env_value("\"123\"", &schema).expect("json string literal should parse");
+    #[test]
+    fn json_string_literal_forces_string_for_scalar_unions() {
+        let value = parse_env_value("\"123\"", &json!({ "type": ["integer", "string"] }))
+            .expect("quoted string should parse");
         assert_eq!(value, serde_json::Value::String("123".to_string()));
+
+        let value = parse_env_value("\"true\"", &json!({ "type": ["boolean", "string"] }))
+            .expect("quoted boolean-like string should parse");
+        assert_eq!(value, serde_json::Value::String("true".to_string()));
+    }
+
+    #[test]
+    fn root_config_accepts_scalar_union_env_values() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": ["integer", "string"] },
+                "enabled": { "type": ["boolean", "string"] },
+                "profile": { "type": ["string", "null"] }
+            }
+        });
+        let env = std::collections::BTreeMap::from([
+            ("AMBER_CONFIG_COUNT".to_string(), "2".to_string()),
+            ("AMBER_CONFIG_ENABLED".to_string(), "true".to_string()),
+            ("AMBER_CONFIG_PROFILE".to_string(), "dev".to_string()),
+        ]);
+
+        let config = build_root_config(&schema, &env).expect("config should parse");
+        assert_eq!(
+            config,
+            json!({
+                "count": 2,
+                "enabled": true,
+                "profile": "dev"
+            })
+        );
     }
 
     #[test]
