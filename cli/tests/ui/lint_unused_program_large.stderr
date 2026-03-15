@@ -1,0 +1,13 @@
+manifest::unused_program
+
+  x program is never referenced by bindings or exports (in component /)
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/lint_unused_program_large.json5:3:3]
+ 2 |   manifest_version: "0.3.0",
+ 3 |   program: {
+   :   ^^^|^^^
+   :      `-- unused `program`
+ 4 |     image: "ghcr.io/example/unused-program",
+   `----
+  help: warning treated as error because it was denied via `-D warnings`
+        Remove the `program` block if it is not needed, or export/bind one of its provides.
+Error:   × check failed

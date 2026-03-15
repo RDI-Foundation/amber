@@ -1,0 +1,49 @@
+{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      auth_json: { type: "string" },
+      agents_md: { type: "string" },
+      model: { type: "string" },
+      theme: { type: "string" },
+      workspace: { type: "string" },
+      data_dir: { type: "string" },
+      cache_dir: { type: "string" },
+    },
+    required: [
+      "auth_json",
+      "agents_md",
+      "model",
+      "theme",
+      "workspace",
+      "data_dir",
+      "cache_dir",
+    ],
+    additionalProperties: false,
+  },
+  program: {
+    image: "ghcr.io/example/configured-agent",
+    entrypoint: ["/app/agent"],
+    env: {
+      AUTH_JSON: "${config.auth_json}",
+      AGENTS_MD: "${config.agents_md}",
+      MODEL: "${config.model}",
+      THEME: "${config.theme}",
+      WORKSPACE: "${config.workspace}",
+      DATA_DIR: "${config.data_dir}",
+      CACHE_DIR: "${config.cache_dir}",
+    },
+    network: {
+      endpoints: [
+        { name: "agent", port: 8080 },
+      ],
+    },
+  },
+  provides: {
+    agent: { kind: "a2a", endpoint: "agent" },
+  },
+  exports: {
+    agent: "self.agent",
+  },
+}
