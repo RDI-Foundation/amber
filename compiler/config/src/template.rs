@@ -6,9 +6,7 @@ use amber_template::{
 };
 use serde_json::Value;
 
-use crate::{
-    ConfigError, Result, SchemaLookup, build_root_config, collect_schema_leaves, schema_lookup,
-};
+use crate::{ConfigError, Result, SchemaLookup, build_root_config, schema_lookup};
 
 #[derive(Clone, Copy)]
 enum MissingConfigBehavior {
@@ -17,38 +15,26 @@ enum MissingConfigBehavior {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RenderedFileMountSource<'a> {
-    Config { path: &'a str },
-    Secret { path: &'a str },
+pub struct RenderedFileMountSource<'a> {
+    path: &'a str,
 }
 
 impl<'a> RenderedFileMountSource<'a> {
     pub fn path(self) -> &'a str {
-        match self {
-            Self::Config { path } | Self::Secret { path } => path,
-        }
+        self.path
     }
 }
 
 pub fn parse_rendered_file_mount_source(source: &str) -> Result<RenderedFileMountSource<'_>> {
     if source == "config" {
-        return Ok(RenderedFileMountSource::Config { path: "" });
+        return Ok(RenderedFileMountSource { path: "" });
     }
     if let Some(path) = source.strip_prefix("config.") {
-        validate_rendered_mount_path("config", path)?;
-        return Ok(RenderedFileMountSource::Config { path });
-    }
-    if let Some(path) = source.strip_prefix("secret.") {
-        validate_rendered_mount_path("secret", path)?;
-        return Ok(RenderedFileMountSource::Secret { path });
-    }
-    if source == "secret" {
-        return Err(ConfigError::interp(
-            "secret mounts require an explicit path (secret.<path>)".to_string(),
-        ));
+        validate_rendered_mount_path(path)?;
+        return Ok(RenderedFileMountSource { path });
     }
     Err(ConfigError::interp(format!(
-        "mount source must render to config.<path> or secret.<path>, got `{source}`"
+        "mount source must render to config.<path>, got `{source}`"
     )))
 }
 
@@ -56,30 +42,16 @@ pub fn validate_rendered_file_mount_source(
     component_schema: &Value,
     source: RenderedFileMountSource<'_>,
 ) -> Result<()> {
-    let (kind, path) = match source {
-        RenderedFileMountSource::Config { path } => ("config", path),
-        RenderedFileMountSource::Secret { path } => ("secret", path),
-    };
-
-    match schema_lookup(component_schema, path) {
+    match schema_lookup(component_schema, source.path) {
         Ok(SchemaLookup::Found) | Ok(SchemaLookup::Unknown) => {}
         Err(err) => {
             return Err(ConfigError::interp(format!(
-                "invalid {kind} mount path `{path}`: {err}"
+                "invalid config mount path `{}`: {err}",
+                source.path
             )));
         }
     }
-
-    let (any_secret, any_non_secret) = mount_secret_flags(component_schema, path);
-    match source {
-        RenderedFileMountSource::Config { path } if any_secret => Err(ConfigError::interp(
-            format!("config mount path `{path}` refers to secret config"),
-        )),
-        RenderedFileMountSource::Secret { path } if !any_secret || any_non_secret => Err(
-            ConfigError::interp(format!("secret mount path `{path}` is not secret")),
-        ),
-        RenderedFileMountSource::Config { .. } | RenderedFileMountSource::Secret { .. } => Ok(()),
-    }
+    Ok(())
 }
 
 pub fn resolve_rendered_file_mount_value<'a>(
@@ -92,50 +64,18 @@ pub fn resolve_rendered_file_mount_value<'a>(
     get_by_path(component_config, source.path())
 }
 
-fn validate_rendered_mount_path(kind: &str, path: &str) -> Result<()> {
+fn validate_rendered_mount_path(path: &str) -> Result<()> {
     if path.is_empty() {
-        return if kind == "config" {
-            Ok(())
-        } else {
-            Err(ConfigError::interp(
-                "secret mounts require an explicit path (secret.<path>)".to_string(),
-            ))
-        };
+        return Ok(());
     }
 
     if path.split('.').any(str::is_empty) {
         return Err(ConfigError::interp(format!(
-            "invalid {kind} mount path `{path}`: path contains an empty segment"
+            "invalid config mount path `{path}`: path contains an empty segment"
         )));
     }
 
     Ok(())
-}
-
-fn mount_secret_flags(schema: &Value, path: &str) -> (bool, bool) {
-    let walk = collect_schema_leaves(schema);
-    let prefix = if path.is_empty() {
-        None
-    } else {
-        Some(format!("{path}."))
-    };
-
-    let mut any_secret = false;
-    let mut any_non_secret = false;
-
-    for leaf in walk.leaves {
-        let matches = match &prefix {
-            None => true,
-            Some(prefix) => leaf.path == path || leaf.path.starts_with(prefix),
-        };
-        if !matches {
-            continue;
-        }
-        any_secret |= leaf.secret;
-        any_non_secret |= !leaf.secret;
-    }
-
-    (any_secret, any_non_secret)
 }
 
 pub fn template_string_is_runtime(ts: &TemplateString) -> bool {
@@ -750,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn render_mount_specs_rejects_empty_rendered_secret_source() {
+    fn render_mount_specs_rejects_rendered_secret_source_namespace() {
         let mounts = vec![MountSpec::Template(MountTemplateSpec {
             when: None,
             each: None,
@@ -758,7 +698,7 @@ mod tests {
             source: vec![TemplatePart::lit("secret."), TemplatePart::config("suffix")],
         })];
         let component_config = json!({
-            "suffix": "",
+            "suffix": "token",
             "token": "shh"
         });
         let component_schema = json!({
@@ -780,13 +720,13 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("secret mounts require an explicit path"),
+                .contains("mount source must render to config.<path>"),
             "{err}"
         );
     }
 
     #[test]
-    fn render_mount_specs_rejects_config_mount_to_secret_path() {
+    fn render_mount_specs_allows_config_mount_to_secret_path() {
         let mounts = vec![MountSpec::Template(MountTemplateSpec {
             when: None,
             each: None,
@@ -809,23 +749,22 @@ mod tests {
             "required": ["source_path", "token"]
         });
 
-        let err = render_mount_specs(
+        let rendered = render_mount_specs(
             &mounts,
             Some(&component_config),
             Some(&component_schema),
             &RuntimeTemplateContext::default(),
         )
-        .expect_err("config mount to a secret path should fail");
+        .expect("config mount to a secret path should succeed");
 
-        assert!(
-            err.to_string()
-                .contains("config mount path `token` refers to secret config"),
-            "{err}"
+        assert_eq!(
+            rendered,
+            vec![("/tmp/config.txt".to_string(), "shh".to_string())]
         );
     }
 
     #[test]
-    fn render_mount_specs_rejects_secret_mount_to_public_path() {
+    fn render_mount_specs_rejects_rendered_secret_source_for_public_path() {
         let mounts = vec![MountSpec::Template(MountTemplateSpec {
             when: None,
             each: None,
@@ -858,7 +797,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("secret mount path `public` is not secret"),
+                .contains("mount source must render to config.<path>"),
             "{err}"
         );
     }

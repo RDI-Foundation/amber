@@ -223,18 +223,12 @@ fn labels_for_manifest_error(
         ManifestError::InvalidMountPath { path, .. } => {
             labels_for_mount_path(spans, path, "invalid mount path")
         }
-        ManifestError::InvalidMountConfigPath { path, .. }
-        | ManifestError::MountConfigPathIsSecret { path } => {
+        ManifestError::InvalidMountConfigPath { path, .. } => {
             let source = if path.is_empty() {
                 "config".to_string()
             } else {
                 format!("config.{path}")
             };
-            labels_for_mount_source(spans, &source, "mount source here")
-        }
-        ManifestError::InvalidMountSecretPath { path, .. }
-        | ManifestError::MountSecretPathIsNotSecret { path } => {
-            let source = format!("secret.{path}");
             labels_for_mount_source(spans, &source, "mount source here")
         }
         ManifestError::UnknownMountSlot { slot }

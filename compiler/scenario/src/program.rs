@@ -551,15 +551,12 @@ impl FileMount {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FileMountSource {
     Config { path: TemplateString },
-    Secret { path: TemplateString },
 }
 
 impl FileMountSource {
     fn visit_slot_uses(&self, visit: &mut impl FnMut(&str)) -> bool {
         match self {
-            Self::Config { path } | Self::Secret { path } => {
-                visit_template_string_slot_uses(path, visit)
-            }
+            Self::Config { path } => visit_template_string_slot_uses(path, visit),
         }
     }
 }

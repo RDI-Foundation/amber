@@ -1440,7 +1440,7 @@ fn docker_capability_kind_parses_for_slots_and_provides() {
 }
 
 #[test]
-fn mounts_parse_config_and_secret_sources() {
+fn mounts_parse_config_sources_for_plain_and_secret_paths() {
     let m: Manifest = r#"
         {
           manifest_version: "0.1.0",
@@ -1457,7 +1457,7 @@ fn mounts_parse_config_and_secret_sources() {
             entrypoint: ["x"],
             mounts: [
               { path: "/run/app.txt", from: "config.app" },
-              { path: "/run/token.txt", from: "secret.token" },
+              { path: "/run/token.txt", from: "config.token" },
             ]
           }
         }
@@ -1718,8 +1718,8 @@ fn framework_docker_mount_is_allowed_with_experimental_feature() {
 }
 
 #[test]
-fn config_mount_rejects_secret_path() {
-    let err = r#"
+fn config_mount_accepts_secret_path() {
+    let manifest: Manifest = r#"
         {
           manifest_version: "0.1.0",
           config_schema: {
@@ -1737,15 +1737,17 @@ fn config_mount_rejects_secret_path() {
           }
         }
         "#
-    .parse::<Manifest>()
-    .unwrap_err();
+    .parse()
+    .unwrap();
 
-    assert!(err.to_string().contains("config mount path"));
-    assert!(err.to_string().contains("secret config"));
+    assert_eq!(
+        manifest.program.as_ref().expect("program").mounts().len(),
+        1
+    );
 }
 
 #[test]
-fn secret_mount_requires_secret_path() {
+fn secret_mount_source_is_rejected() {
     let err = r#"
         {
           manifest_version: "0.1.0",
@@ -1767,8 +1769,8 @@ fn secret_mount_requires_secret_path() {
     .parse::<Manifest>()
     .unwrap_err();
 
-    assert!(err.to_string().contains("secret mount path"));
-    assert!(err.to_string().contains("not secret"));
+    assert!(err.to_string().contains("invalid mount source"));
+    assert!(err.to_string().contains("unknown mount source"));
 }
 
 #[test]

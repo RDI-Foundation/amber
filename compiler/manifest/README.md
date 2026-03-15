@@ -214,7 +214,7 @@ program: {
   },
   mounts: [
     { path: "/run/config.json", from: "config.app" },
-    { path: "/run/secret.txt", from: "secret.api.token" },
+    { path: "/run/secret.txt", from: "config.api.token" },
   ],
   network: {
     endpoints: [
@@ -324,7 +324,7 @@ Rules:
 
 ### `program.mounts` and `program.vm.mounts`
 
-For image/path programs, `program.mounts` mounts config/secret values as files inside the runtime
+For image/path programs, `program.mounts` mounts config values as files inside the runtime
 environment, or mounts routed storage as a directory. VM programs use the same mount entry shape
 under `program.vm.mounts`. Each entry has:
 
@@ -334,8 +334,8 @@ under `program.vm.mounts`. Each entry has:
 
 Supported `from` sources (current):
 
-* `config` or `config.<path>`: mount the component config (whole object or a path).
-* `secret.<path>`: mount a config value marked `secret: true` in the component’s config schema.
+* `config` or `config.<path>`: mount the component config (whole object or a path), including
+  paths marked `secret: true` in the component’s config schema.
 * `slots.<name>`: mount a storage slot as a directory. The referenced slot must exist and have
   `kind: "storage"`.
 * `framework.docker`: requires `experimental_features: ["docker"]`. In Docker Compose output, this
@@ -354,8 +354,7 @@ Mount value formatting:
 Notes:
 
 * Mount paths must be absolute and must not include `..`.
-* `secret.<path>` requires the path to be secret in the component’s config schema.
-* `config.<path>` must not reference secret values.
+* Secret-marked config is mounted with the same `config.<path>` syntax as any other config path.
 * `resources.<name>` mounts a storage resource owned by the same component.
 * `slots.<name>` mounts storage routed in from another component. Use a directory path such as
   `/var/lib/app`, not a single file path.

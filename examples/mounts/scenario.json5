@@ -33,7 +33,7 @@
     mounts: [
       { path: "/run/app.json", from: "config.app" },
       { path: "/run/log_level.txt", from: "config.app.log_level" },
-      { path: "/run/token.txt", from: "secret.token" },
+      { path: "/run/token.txt", from: "config.token" },
     ],
   },
   provides: {

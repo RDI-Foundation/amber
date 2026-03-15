@@ -208,18 +208,6 @@ pub enum Error {
     #[diagnostic(code(manifest::invalid_mount_config_path))]
     InvalidMountConfigPath { path: String, message: String },
 
-    #[error("invalid secret mount path `{path}`: {message}")]
-    #[diagnostic(code(manifest::invalid_mount_secret_path))]
-    InvalidMountSecretPath { path: String, message: String },
-
-    #[error("config mount path `{path}` refers to secret config")]
-    #[diagnostic(code(manifest::mount_config_path_is_secret))]
-    MountConfigPathIsSecret { path: String },
-
-    #[error("secret mount path `{path}` is not secret")]
-    #[diagnostic(code(manifest::mount_secret_path_is_not_secret))]
-    MountSecretPathIsNotSecret { path: String },
-
     #[error("mount source `slots.{slot}` references unknown slot")]
     #[diagnostic(code(manifest::unknown_mount_slot))]
     UnknownMountSlot { slot: String },
