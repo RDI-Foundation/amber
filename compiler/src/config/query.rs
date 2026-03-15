@@ -82,6 +82,7 @@ pub(crate) fn resolve_config_query_node<'a>(
     Ok(QueryResolution::Node(current))
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_optional_config_query_node<'a>(
     template: &'a rc::ConfigNode,
     query: &str,
@@ -117,6 +118,7 @@ pub(crate) fn resolve_optional_config_query_node<'a>(
     Ok(Some(QueryResolution::Node(current)))
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_config_presence(
     template: Option<&rc::ConfigNode>,
     query: &str,
@@ -146,6 +148,7 @@ pub(crate) fn resolve_config_presence(
     }
 }
 
+#[cfg(test)]
 fn resolve_root_schema_presence(
     root_schema: &Value,
     query: &str,
@@ -160,6 +163,7 @@ fn resolve_root_schema_presence(
         .map_err(|err| err.to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_config_presence_with_root_schema(
     template: Option<&rc::ConfigNode>,
     root_schema: Option<&Value>,
@@ -199,40 +203,6 @@ pub(crate) fn resolve_config_presence_with_root_schema(
             Some(root_schema) => resolve_root_schema_presence(root_schema, query),
             None => resolve_config_presence(None, query),
         },
-    }
-}
-
-pub(crate) fn resolve_config_each_values(
-    template: Option<&rc::ConfigNode>,
-    query: &str,
-    location: &str,
-) -> Result<ConfigEachResolution, String> {
-    let Some(template) = template else {
-        validate_config_query_syntax(query)?;
-        return Ok(ConfigEachResolution::Runtime);
-    };
-
-    let Some(resolution) = resolve_optional_config_query_node(template, query)? else {
-        return Ok(ConfigEachResolution::Static(Vec::new()));
-    };
-
-    match resolution {
-        QueryResolution::RuntimePath(_) => Ok(ConfigEachResolution::Runtime),
-        QueryResolution::Node(node) => {
-            if node.contains_runtime() {
-                return Ok(ConfigEachResolution::Runtime);
-            }
-            let value = node.evaluate_static().map_err(|err| err.to_string())?;
-            match value {
-                Value::Null => Ok(ConfigEachResolution::Static(Vec::new())),
-                Value::Array(items) => Ok(ConfigEachResolution::Static(items)),
-                other => Err(format!(
-                    "{location} uses `each: \"config.{query}\"`, but config.{query} resolves to \
-                     {} instead of an array",
-                    value_kind(&other)
-                )),
-            }
-        }
     }
 }
 
@@ -317,8 +287,7 @@ mod tests {
     use amber_manifest::InterpolatedString;
 
     use super::{
-        ConfigEachResolution, ConfigPresence, parse_query_segments, render_static_config_string,
-        resolve_config_each_values, resolve_config_presence,
+        ConfigPresence, parse_query_segments, render_static_config_string, resolve_config_presence,
         resolve_config_presence_with_root_schema, resolve_config_query_node,
         resolve_optional_config_query_node, validate_config_query_syntax,
     };
@@ -550,15 +519,6 @@ mod tests {
             )
             .unwrap(),
             ConfigPresence::Present
-        );
-    }
-
-    #[test]
-    fn resolve_config_each_values_reuses_missing_as_empty() {
-        let node = amber_config::ConfigNode::Object(BTreeMap::new());
-        assert_eq!(
-            resolve_config_each_values(Some(&node), "items", "program.args[0]").unwrap(),
-            ConfigEachResolution::Static(Vec::new())
         );
     }
 

@@ -14,7 +14,8 @@ pub use schema::{
     SchemaLeaf, SchemaLookup, SchemaPresence, SchemaWalkResult, apply_schema_defaults,
     apply_schema_defaults_to_node, canonical_json, collect_leaf_paths, collect_schema_leaves,
     is_valid_config_key, prune_schema, schema_lookup, schema_lookup_ref, schema_path_accepts_null,
-    schema_path_may_accept_non_null, schema_path_presence, validate_config_schema,
+    schema_path_ancestors_must_be_non_null_objects, schema_path_may_accept_non_null,
+    schema_path_presence, validate_config_schema,
 };
 pub use template::{
     RenderedFileMountSource, config_path_is_present, eval_config_template,

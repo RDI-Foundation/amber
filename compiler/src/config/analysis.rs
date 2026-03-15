@@ -6,13 +6,13 @@ use std::{
 use amber_config as rc;
 use amber_manifest::InterpolatedString;
 use amber_scenario::{Component, ComponentId, Scenario};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::{
     query::{
-        ConfigEachResolution, ConfigPresence, QueryResolution, render_static_config_string,
-        resolve_config_each_values, resolve_config_presence_with_root_schema,
-        resolve_config_query_node, validate_config_query_syntax,
+        ConfigEachResolution, ConfigPresence, QueryResolution, parse_query_segments,
+        render_static_config_string, resolve_config_query_node, validate_config_query_syntax,
+        value_kind,
     },
     scope::{RuntimeConfigView, build_runtime_config_view},
     templates::{self, TemplateError},
@@ -58,12 +58,12 @@ impl ScenarioConfigAnalysis {
                 .and_then(|component| component.config_schema.clone());
             analyzed_components.insert(
                 id,
-                ComponentConfigAnalysis {
+                ComponentConfigAnalysis::new(
                     template,
                     component_schema,
-                    root_schema: root_schema.clone(),
-                    root_leaves: root_leaves.clone(),
-                },
+                    root_schema.clone(),
+                    root_leaves.clone(),
+                )?,
             );
         }
 
@@ -103,9 +103,26 @@ pub(crate) struct ComponentConfigAnalysis {
     component_schema: Option<Value>,
     root_schema: Option<Arc<Value>>,
     root_leaves: Arc<[rc::SchemaLeaf]>,
+    omission_defaults: Option<Value>,
 }
 
 impl ComponentConfigAnalysis {
+    fn new(
+        template: rc::RootConfigTemplate,
+        component_schema: Option<Value>,
+        root_schema: Option<Arc<Value>>,
+        root_leaves: Arc<[rc::SchemaLeaf]>,
+    ) -> Result<Self, String> {
+        let omission_defaults = omission_defaults_for_schema(component_schema.as_ref())?;
+        Ok(Self {
+            template,
+            component_schema,
+            root_schema,
+            root_leaves,
+            omission_defaults,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn standalone(
         template: Option<rc::ConfigNode>,
@@ -126,12 +143,7 @@ impl ComponentConfigAnalysis {
             None if root_schema.is_some() => rc::RootConfigTemplate::Root,
             None => rc::RootConfigTemplate::Node(rc::ConfigNode::empty_object()),
         };
-        Ok(Self {
-            template,
-            component_schema,
-            root_schema,
-            root_leaves,
-        })
+        Self::new(template, component_schema, root_schema, root_leaves)
     }
 
     pub(crate) fn template(&self) -> &rc::RootConfigTemplate {
@@ -165,7 +177,51 @@ impl ComponentConfigAnalysis {
     }
 
     pub(crate) fn resolve_presence(&self, query: &str) -> Result<ConfigPresence, String> {
-        resolve_config_presence_with_root_schema(self.template_node(), self.root_schema(), query)
+        validate_config_query_syntax(query)?;
+
+        let omission_presence = self.omission_presence(query)?;
+        let Some(template) = self.template_node() else {
+            return self.root_schema_presence(query);
+        };
+
+        match resolve_query_resolution(template, query)? {
+            DetailedQueryResolution::Missing => Ok(omission_presence),
+            DetailedQueryResolution::Node(node) => {
+                if node.contains_runtime() {
+                    return Ok(ConfigPresence::Runtime);
+                }
+                let value = node.evaluate_static().map_err(|err| err.to_string())?;
+                if value.is_null() {
+                    Ok(ConfigPresence::Absent)
+                } else {
+                    Ok(ConfigPresence::Present)
+                }
+            }
+            DetailedQueryResolution::RuntimeRef { full_path } => {
+                let root_presence = self.root_schema_presence(&full_path)?;
+                if matches!(omission_presence, ConfigPresence::Present) {
+                    return Ok(match root_presence {
+                        ConfigPresence::Present => ConfigPresence::Present,
+                        ConfigPresence::Absent
+                            if self
+                                .runtime_path_ancestors_must_be_non_null_objects(&full_path)? =>
+                        {
+                            ConfigPresence::Present
+                        }
+                        ConfigPresence::Runtime
+                            if self
+                                .runtime_path_ancestors_must_be_non_null_objects(&full_path)?
+                                && self
+                                    .runtime_path_defined_value_cannot_be_null(&full_path)? =>
+                        {
+                            ConfigPresence::Present
+                        }
+                        ConfigPresence::Absent | ConfigPresence::Runtime => ConfigPresence::Runtime,
+                    });
+                }
+                Ok(root_presence)
+            }
+        }
     }
 
     pub(crate) fn resolve_each_values(
@@ -173,7 +229,32 @@ impl ComponentConfigAnalysis {
         query: &str,
         location: &str,
     ) -> Result<ConfigEachResolution, String> {
-        resolve_config_each_values(self.template_node(), query, location)
+        validate_config_query_syntax(query)?;
+
+        let Some(template) = self.template_node() else {
+            return Ok(ConfigEachResolution::Runtime);
+        };
+
+        match resolve_query_resolution(template, query)? {
+            DetailedQueryResolution::Missing => {
+                self.resolve_each_values_from_value(self.omission_value(query)?, query, location)
+            }
+            DetailedQueryResolution::Node(node) => {
+                if node.contains_runtime() {
+                    return Ok(ConfigEachResolution::Runtime);
+                }
+                let value = node.evaluate_static().map_err(|err| err.to_string())?;
+                self.resolve_each_values_from_value(Some(&value), query, location)
+            }
+            DetailedQueryResolution::RuntimeRef { full_path } => {
+                if self.root_schema_presence(&full_path)? != ConfigPresence::Absent
+                    || !self.runtime_path_ancestors_must_be_non_null_objects(&full_path)?
+                {
+                    return Ok(ConfigEachResolution::Runtime);
+                }
+                self.resolve_each_values_from_value(self.omission_value(query)?, query, location)
+            }
+        }
     }
 
     pub(crate) fn render_static_string(
@@ -208,5 +289,501 @@ impl ComponentConfigAnalysis {
             used_component_paths,
         )
         .map_err(|err| err.to_string())
+    }
+
+    fn omission_presence(&self, query: &str) -> Result<ConfigPresence, String> {
+        match self.omission_value(query)? {
+            Some(value) if !value.is_null() => Ok(ConfigPresence::Present),
+            Some(_) | None => Ok(ConfigPresence::Absent),
+        }
+    }
+
+    fn omission_value(&self, query: &str) -> Result<Option<&Value>, String> {
+        let Some(defaults) = &self.omission_defaults else {
+            return Ok(None);
+        };
+        rc::get_by_path_opt(defaults, query).map_err(|err| err.to_string())
+    }
+
+    fn root_schema_presence(&self, query: &str) -> Result<ConfigPresence, String> {
+        let Some(root_schema) = self.root_schema() else {
+            return Ok(ConfigPresence::Runtime);
+        };
+        rc::schema_path_presence(root_schema, query)
+            .map(|presence| match presence {
+                rc::SchemaPresence::Present => ConfigPresence::Present,
+                rc::SchemaPresence::Absent => ConfigPresence::Absent,
+                rc::SchemaPresence::Runtime => ConfigPresence::Runtime,
+            })
+            .map_err(|err| err.to_string())
+    }
+
+    fn runtime_path_ancestors_must_be_non_null_objects(
+        &self,
+        full_path: &str,
+    ) -> Result<bool, String> {
+        let Some(root_schema) = self.root_schema() else {
+            return Ok(false);
+        };
+        match rc::schema_path_ancestors_must_be_non_null_objects(root_schema, full_path) {
+            Ok(must_be_objects) => Ok(must_be_objects),
+            Err(_) => Ok(false),
+        }
+    }
+
+    fn runtime_path_defined_value_cannot_be_null(&self, full_path: &str) -> Result<bool, String> {
+        let Some(root_schema) = self.root_schema() else {
+            return Ok(false);
+        };
+        match rc::schema_lookup(root_schema, full_path) {
+            Ok(rc::SchemaLookup::Found) => {
+                match rc::schema_path_accepts_null(root_schema, full_path) {
+                    Ok(accepts_null) => Ok(!accepts_null),
+                    Err(_) => Ok(false),
+                }
+            }
+            Ok(rc::SchemaLookup::Unknown) | Err(_) => Ok(false),
+        }
+    }
+
+    fn resolve_each_values_from_value(
+        &self,
+        value: Option<&Value>,
+        query: &str,
+        location: &str,
+    ) -> Result<ConfigEachResolution, String> {
+        match value {
+            None | Some(Value::Null) => Ok(ConfigEachResolution::Static(Vec::new())),
+            Some(Value::Array(items)) => Ok(ConfigEachResolution::Static(items.clone())),
+            Some(other) => Err(format!(
+                "{location} uses `each: \"config.{query}\"`, but config.{query} resolves to {} \
+                 instead of an array",
+                value_kind(other)
+            )),
+        }
+    }
+}
+
+fn omission_defaults_for_schema(component_schema: Option<&Value>) -> Result<Option<Value>, String> {
+    let Some(component_schema) = component_schema else {
+        return Ok(None);
+    };
+    let mut defaults = Value::Object(Map::new());
+    rc::apply_schema_defaults(component_schema, &mut defaults).map_err(|err| err.to_string())?;
+    Ok(Some(defaults))
+}
+
+enum DetailedQueryResolution<'a> {
+    Missing,
+    Node(&'a rc::ConfigNode),
+    RuntimeRef { full_path: String },
+}
+
+fn resolve_query_resolution<'a>(
+    template: &'a rc::ConfigNode,
+    query: &str,
+) -> Result<DetailedQueryResolution<'a>, String> {
+    if query.is_empty() {
+        return Ok(match template {
+            rc::ConfigNode::ConfigRef(path) => DetailedQueryResolution::RuntimeRef {
+                full_path: path.clone(),
+            },
+            _ => DetailedQueryResolution::Node(template),
+        });
+    }
+
+    let segments = parse_query_segments(query)?;
+    let mut current = template;
+    for (idx, seg) in segments.iter().enumerate() {
+        match current {
+            rc::ConfigNode::Object(map) => {
+                let Some(next) = map.get(*seg) else {
+                    return Ok(DetailedQueryResolution::Missing);
+                };
+                current = next;
+            }
+            rc::ConfigNode::ConfigRef(path) => {
+                let suffix = segments[idx..].join(".");
+                let full_path = if path.is_empty() {
+                    suffix
+                } else {
+                    format!("{path}.{suffix}")
+                };
+                return Ok(DetailedQueryResolution::RuntimeRef { full_path });
+            }
+            _ => return Ok(DetailedQueryResolution::Missing),
+        }
+    }
+
+    Ok(match current {
+        rc::ConfigNode::ConfigRef(path) => DetailedQueryResolution::RuntimeRef {
+            full_path: path.clone(),
+        },
+        _ => DetailedQueryResolution::Node(current),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn resolve_presence_uses_component_defaults_for_forwarded_object_children() {
+        let component = ComponentConfigAnalysis::standalone(
+            Some(rc::ConfigNode::Object(
+                [(
+                    "settings".to_string(),
+                    rc::ConfigNode::ConfigRef("settings".to_string()),
+                )]
+                .into_iter()
+                .collect(),
+            )),
+            Some(json!({
+                "type": "object",
+                "properties": {
+                    "settings": {
+                        "type": "object",
+                        "properties": {
+                            "mode": { "type": "string", "default": "enabled" }
+                        }
+                    }
+                }
+            })),
+            Some(json!({
+                "type": "object",
+                "properties": {
+                    "settings": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                }
+            })),
+        )
+        .expect("analysis");
+
+        assert_eq!(
+            component.resolve_presence("settings.mode").unwrap(),
+            ConfigPresence::Present
+        );
+    }
+
+    #[test]
+    fn resolve_presence_keeps_forwarded_object_defaults_runtime_when_root_can_be_null() {
+        let component = ComponentConfigAnalysis::standalone(
+            Some(rc::ConfigNode::Object(
+                [(
+                    "settings".to_string(),
+                    rc::ConfigNode::ConfigRef("settings".to_string()),
+                )]
+                .into_iter()
+                .collect(),
+            )),
+            Some(json!({
+                "type": "object",
+                "properties": {
+                    "settings": {
+                        "type": ["object", "null"],
+                        "properties": {
+                            "mode": { "type": "string", "default": "enabled" }
+                        }
+                    }
+                }
+            })),
+            Some(json!({
+                "type": "object",
+                "properties": {
+                    "settings": {
+                        "type": ["object", "null"],
+                        "properties": {}
+                    }
+                }
+            })),
+        )
+        .expect("analysis");
+
+        assert_eq!(
+            component.resolve_presence("settings.mode").unwrap(),
+            ConfigPresence::Runtime
+        );
+    }
+
+    #[test]
+    fn resolve_presence_keeps_forwarded_object_defaults_runtime_when_leaf_can_be_null() {
+        let component = ComponentConfigAnalysis::standalone(
+            Some(rc::ConfigNode::Object(
+                [(
+                    "settings".to_string(),
+                    rc::ConfigNode::ConfigRef("settings".to_string()),
+                )]
+                .into_iter()
+                .collect(),
+            )),
+            Some(json!({
+                "type": "object",
+                "properties": {
+                    "settings": {
+                        "type": "object",
+                        "properties": {
+                            "mode": { "type": "string", "default": "enabled" }
+                        }
+                    }
+                }
+            })),
+            Some(json!({
+                "type": "object",
+                "properties": {
+                    "settings": {
+                        "type": "object",
+                        "properties": {
+                            "mode": { "type": ["string", "null"] }
+                        }
+                    }
+                }
+            })),
+        )
+        .expect("analysis");
+
+        assert_eq!(
+            component.resolve_presence("settings.mode").unwrap(),
+            ConfigPresence::Runtime
+        );
+    }
+
+    #[test]
+    fn resolve_presence_keeps_forwarded_object_defaults_runtime_when_root_may_be_non_object() {
+        let component = ComponentConfigAnalysis::standalone(
+            Some(rc::ConfigNode::Object(
+                [(
+                    "settings".to_string(),
+                    rc::ConfigNode::ConfigRef("settings".to_string()),
+                )]
+                .into_iter()
+                .collect(),
+            )),
+            Some(json!({
+                "type": "object",
+                "properties": {
+                    "settings": {
+                        "type": "object",
+                        "properties": {
+                            "mode": { "type": "string", "default": "enabled" }
+                        }
+                    }
+                }
+            })),
+            Some(json!({
+                "type": "object",
+                "properties": {
+                    "settings": {
+                        "type": ["object", "string"],
+                        "properties": {
+                            "mode": { "type": "string" }
+                        }
+                    }
+                }
+            })),
+        )
+        .expect("analysis");
+
+        assert_eq!(
+            component.resolve_presence("settings.mode").unwrap(),
+            ConfigPresence::Runtime
+        );
+    }
+
+    #[test]
+    fn resolve_presence_uses_component_defaults_for_forwarded_leaf_queries() {
+        let component = ComponentConfigAnalysis::standalone(
+            Some(rc::ConfigNode::Object(
+                [(
+                    "child_enabled".to_string(),
+                    rc::ConfigNode::ConfigRef("root_enabled".to_string()),
+                )]
+                .into_iter()
+                .collect(),
+            )),
+            Some(json!({
+                "type": "object",
+                "properties": {
+                    "child_enabled": { "type": "string", "default": "enabled" }
+                }
+            })),
+            Some(json!({
+                "type": "object",
+                "properties": {
+                    "root_enabled": { "type": "string" }
+                }
+            })),
+        )
+        .expect("analysis");
+
+        assert_eq!(
+            component.resolve_presence("child_enabled").unwrap(),
+            ConfigPresence::Present
+        );
+    }
+
+    #[test]
+    fn resolve_each_values_uses_component_default_array_for_omitted_queries() {
+        let component = ComponentConfigAnalysis::standalone(
+            Some(rc::ConfigNode::empty_object()),
+            Some(json!({
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "default": ["alpha", "beta"]
+                    }
+                }
+            })),
+            None,
+        )
+        .expect("analysis");
+
+        assert_eq!(
+            component
+                .resolve_each_values("items", "program.args[0]")
+                .unwrap(),
+            ConfigEachResolution::Static(vec![json!("alpha"), json!("beta")])
+        );
+    }
+
+    #[test]
+    fn resolve_each_values_rejects_non_array_component_defaults() {
+        let component = ComponentConfigAnalysis::standalone(
+            Some(rc::ConfigNode::empty_object()),
+            Some(json!({
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "string",
+                        "default": "not-an-array"
+                    }
+                }
+            })),
+            None,
+        )
+        .expect("analysis");
+
+        let err = component
+            .resolve_each_values("items", "program.args[0]")
+            .expect_err("non-array defaults must fail");
+        assert!(err.contains("instead of an array"), "{err}");
+        assert!(err.contains("string"), "{err}");
+    }
+
+    #[test]
+    fn resolve_each_values_uses_component_defaults_for_forwarded_absent_paths() {
+        let component = ComponentConfigAnalysis::standalone(
+            Some(rc::ConfigNode::Object(
+                [(
+                    "items".to_string(),
+                    rc::ConfigNode::ConfigRef("root_items".to_string()),
+                )]
+                .into_iter()
+                .collect(),
+            )),
+            Some(json!({
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "default": ["alpha", "beta"]
+                    }
+                }
+            })),
+            Some(json!({
+                "type": "object",
+                "properties": {}
+            })),
+        )
+        .expect("analysis");
+
+        assert_eq!(
+            component
+                .resolve_each_values("items", "program.args[0]")
+                .unwrap(),
+            ConfigEachResolution::Static(vec![json!("alpha"), json!("beta")])
+        );
+    }
+
+    #[test]
+    fn resolve_each_values_treats_forwarded_absent_paths_without_defaults_as_empty() {
+        let component = ComponentConfigAnalysis::standalone(
+            Some(rc::ConfigNode::Object(
+                [(
+                    "items".to_string(),
+                    rc::ConfigNode::ConfigRef("root_items".to_string()),
+                )]
+                .into_iter()
+                .collect(),
+            )),
+            Some(json!({
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    }
+                }
+            })),
+            Some(json!({
+                "type": "object",
+                "properties": {}
+            })),
+        )
+        .expect("analysis");
+
+        assert_eq!(
+            component
+                .resolve_each_values("items", "program.args[0]")
+                .unwrap(),
+            ConfigEachResolution::Static(Vec::new())
+        );
+    }
+
+    #[test]
+    fn resolve_each_values_keeps_forwarded_defaults_runtime_when_root_can_supply_values() {
+        let component = ComponentConfigAnalysis::standalone(
+            Some(rc::ConfigNode::Object(
+                [(
+                    "items".to_string(),
+                    rc::ConfigNode::ConfigRef("root_items".to_string()),
+                )]
+                .into_iter()
+                .collect(),
+            )),
+            Some(json!({
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "default": ["alpha", "beta"]
+                    }
+                }
+            })),
+            Some(json!({
+                "type": "object",
+                "properties": {
+                    "root_items": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    }
+                }
+            })),
+        )
+        .expect("analysis");
+
+        assert_eq!(
+            component
+                .resolve_each_values("items", "program.args[0]")
+                .unwrap(),
+            ConfigEachResolution::Runtime
+        );
     }
 }

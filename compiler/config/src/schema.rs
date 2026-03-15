@@ -1015,7 +1015,10 @@ pub fn schema_path_may_accept_non_null(root_schema: &Value, path: &str) -> Resul
     Ok(schema_path_possible_kinds(root_schema, path)?.may_accept_non_null())
 }
 
-fn schema_path_ancestors_must_be_non_null_objects(root_schema: &Value, path: &str) -> Result<bool> {
+pub fn schema_path_ancestors_must_be_non_null_objects(
+    root_schema: &Value,
+    path: &str,
+) -> Result<bool> {
     let mut prefix = String::new();
     let mut segments = path.split('.').peekable();
 
