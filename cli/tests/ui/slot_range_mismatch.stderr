@@ -1,18 +1,13 @@
 manifest::unused_program
 
   ! program is never referenced by bindings or exports (in component /child)
-    ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_range_mismatch_child.json5:3:12]
-  2 |       manifest_version: "0.3.0",
-  3 | ,->   program: {
-  4 | |       image: "child",
-  5 | |       entrypoint: ["child"],
-  6 | |       env: {
-  7 | |         API_URL: "${slots.api.url}",
-  8 | |       },
-  9 | |->   },
-    : `---- unused `program`
- 10 |       slots: {
-    `----
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_range_mismatch_child.json5:3:3]
+ 2 |   manifest_version: "0.3.0",
+ 3 |   program: {
+   :   ^^^|^^^
+   :      `-- unused `program`
+ 4 |     image: "child",
+   `----
   help: Remove the `program` block if it is not needed, or export/bind one of its provides.
 linker::slot_range_mismatch
 

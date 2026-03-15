@@ -1,0 +1,28 @@
+{
+  manifest_version: "0.3.0",
+  program: {
+    image: "ghcr.io/example/unused-program",
+    entrypoint: ["/app/start", "--mode", "serve"],
+    env: {
+      LOG_LEVEL: "info",
+      FEATURE_FLAG: "true",
+      DATA_DIR: "/app/data",
+      CACHE_DIR: "/app/cache",
+      CONTROL_SOCKET: "/app/run/control.sock",
+    },
+    mounts: [
+      { path: "/app/data", from: "resources.data" },
+      { path: "/app/cache", from: "resources.cache" },
+    ],
+    network: {
+      endpoints: [
+        { name: "http", port: 8080 },
+        { name: "metrics", port: 9090 },
+      ],
+    },
+  },
+  resources: {
+    data: { kind: "storage", params: { size: "1Gi" } },
+    cache: { kind: "storage", params: { size: "1Gi" } },
+  },
+}

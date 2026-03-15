@@ -1,0 +1,26 @@
+{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      auth_json: { type: "string" },
+      agents_md: { type: "string" },
+    },
+    required: ["auth_json", "agents_md"],
+    additionalProperties: false,
+  },
+  components: {
+    child: {
+      manifest: "./invalid_config_missing_required_field_large_child.json5",
+      config: {
+        auth_json: "${config.auth_json}",
+        agents_md: "${config.agents_md}",
+        theme: "amber",
+        workspace: "/tmp/workspace",
+        data_dir: "/tmp/workspace/data",
+        cache_dir: "/tmp/workspace/cache",
+      },
+    },
+  },
+  exports: { agent: "#child.agent" },
+}

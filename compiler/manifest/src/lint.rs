@@ -618,7 +618,7 @@ pub fn lint_manifest(
         let span = spans
             .program
             .as_ref()
-            .map(|p| p.whole)
+            .map(|p| p.key)
             .unwrap_or((0usize, 0usize).into());
         lints.push(ManifestLint::UnusedProgram {
             component: component.clone(),

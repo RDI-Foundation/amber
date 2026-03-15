@@ -25,6 +25,7 @@ pub struct ManifestSpans {
 
 #[derive(Clone, Debug)]
 pub struct ProgramSpans {
+    pub key: SourceSpan,
     pub whole: SourceSpan,
     pub endpoints: Vec<EndpointSpans>,
     pub mounts: Vec<ProgramMountSpans>,
@@ -56,6 +57,7 @@ pub struct ComponentDeclSpans {
     pub manifest: Option<SourceSpan>,
     pub environment: Option<SourceSpan>,
     pub config: Option<SourceSpan>,
+    pub config_key: Option<SourceSpan>,
 }
 
 #[derive(Clone, Debug)]
@@ -176,6 +178,10 @@ impl<'a> SpanCursor<'a> {
         span_for_json_pointer(self.source, self.span, &pointer_for_key(key))
     }
 
+    fn child_key_span(&self, key: &str) -> Option<SourceSpan> {
+        span_for_object_key(self.source, self.span, key)
+    }
+
     fn child_cursor(&self, key: &str) -> Option<Self> {
         Some(Self::new(self.source, self.child_span(key)?))
     }
@@ -268,7 +274,11 @@ pub(crate) fn parse_manifest_spans(source: &str) -> Option<ManifestSpans> {
     if let Some(program_value) = root_obj.get("program")
         && let Some(program) = root.child_cursor("program")
     {
-        out.program = Some(extract_program_spans(program_value, program));
+        out.program = Some(extract_program_spans(
+            program_value,
+            root.child_key_span("program").unwrap_or(program.span),
+            program,
+        ));
     }
 
     collect_components(&root, root_obj, &mut out);
@@ -300,6 +310,7 @@ fn collect_components(
             manifest: None,
             environment: None,
             config: None,
+            config_key: None,
         };
 
         match value {
@@ -315,7 +326,14 @@ fn collect_components(
                     spans.environment = component.child_span("environment");
                 }
                 if obj.contains_key("config") {
-                    spans.config = component.child_span("config");
+                    let config_span = component.child_span("config");
+                    spans.config = config_span;
+                    spans.config_key = Some(
+                        component
+                            .child_key_span("config")
+                            .or(config_span)
+                            .unwrap_or(whole),
+                    );
                 }
             }
             _ => {}
@@ -540,12 +558,17 @@ impl ManifestSpans {
     }
 }
 
-fn extract_program_spans(program_value: &Value, program: SpanCursor<'_>) -> ProgramSpans {
+fn extract_program_spans(
+    program_value: &Value,
+    key: SourceSpan,
+    program: SpanCursor<'_>,
+) -> ProgramSpans {
     let mut endpoints = Vec::new();
     let mut mounts = Vec::new();
     let whole = program.span;
     let Some(program_obj) = program_value.as_object() else {
         return ProgramSpans {
+            key,
             whole,
             endpoints,
             mounts,
@@ -600,6 +623,7 @@ fn extract_program_spans(program_value: &Value, program: SpanCursor<'_>) -> Prog
     }
 
     ProgramSpans {
+        key,
         whole,
         endpoints,
         mounts,
@@ -679,5 +703,37 @@ mod tests {
             .map(|endpoint| endpoint.name_span)
             .expect("admin endpoint span");
         assert_eq!(span_text(source, admin_span), "\"admin\"");
+    }
+
+    #[test]
+    fn manifest_spans_capture_program_and_component_config_keys() {
+        let source = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "example",
+            entrypoint: ["example"],
+          },
+          components: {
+            child: {
+              manifest: "./child.json5",
+              config: {
+                model: "gpt-5",
+                temperature: 0.1,
+              },
+            },
+          },
+        }
+        "#;
+        let spans = ManifestSpans::parse(source);
+
+        let program = spans.program.expect("program spans");
+        assert_eq!(span_text(source, program.key), "program");
+
+        let child = spans.components.get("child").expect("child spans");
+        assert_eq!(
+            span_text(source, child.config_key.expect("config key span")),
+            "config"
+        );
     }
 }

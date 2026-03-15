@@ -291,7 +291,10 @@ fn config_site_for_component(
         let (src, spans) = source_for_component(provenance, store, parent)?;
         let component_spans = spans.components.get(component_local_name(component))?;
         if component.config.is_some() {
-            let span = component_spans.config.unwrap_or(component_spans.whole);
+            let span = component_spans
+                .config_key
+                .or(component_spans.config)
+                .unwrap_or(component_spans.whole);
             return Some(ConfigSite {
                 src,
                 span,

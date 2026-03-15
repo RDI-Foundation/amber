@@ -1,0 +1,11 @@
+linker::invalid_config
+
+  x invalid config for /child: missing required field config.model
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/invalid_config_missing_required_field_large.json5:15:7]
+ 14 |       manifest: "./invalid_config_missing_required_field_large_child.json5",
+ 15 |       config: {
+    :       ^^^|^^
+    :          `-- config provided here
+ 16 |         auth_json: "${config.auth_json}",
+    `----
+Error:   × check failed

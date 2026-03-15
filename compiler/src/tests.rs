@@ -779,6 +779,120 @@ async fn config_validation_error_points_to_invalid_value() {
 }
 
 #[tokio::test]
+async fn missing_required_config_field_points_to_config_key() {
+    use miette::Diagnostic;
+
+    let dir = tmp_dir("scenario-missing-config-field-span");
+    let root_path = dir.path().join("root.json5");
+    let child_path = dir.path().join("child.json5");
+
+    write_file(
+        &child_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              auth_json: { type: "string" },
+              agents_md: { type: "string" },
+              model: { type: "string" },
+              theme: { type: "string" },
+              workspace: { type: "string" },
+            },
+            required: ["auth_json", "agents_md", "model", "theme", "workspace"],
+            additionalProperties: false,
+          },
+          program: {
+            image: "child",
+            entrypoint: ["child"],
+            env: {
+              AUTH_JSON: "${config.auth_json}",
+              AGENTS_MD: "${config.agents_md}",
+              MODEL: "${config.model}",
+              THEME: "${config.theme}",
+              WORKSPACE: "${config.workspace}",
+            },
+            network: {
+              endpoints: [{ name: "agent", port: 8080 }],
+            },
+          },
+          provides: {
+            agent: { kind: "a2a", endpoint: "agent" },
+          },
+          exports: {
+            agent: "self.agent",
+          },
+        }
+        "#,
+    );
+
+    let root_source = format!(
+        r##"
+        {{
+          manifest_version: "0.1.0",
+          config_schema: {{
+            type: "object",
+            properties: {{
+              auth_json: {{ type: "string" }},
+              agents_md: {{ type: "string" }},
+            }},
+            required: ["auth_json", "agents_md"],
+            additionalProperties: false,
+          }},
+          components: {{
+            child: {{
+              manifest: "{child}",
+              config: {{
+                auth_json: "${{config.auth_json}}",
+                agents_md: "${{config.agents_md}}",
+                theme: "amber",
+                workspace: "/tmp/workspace",
+              }},
+            }},
+          }},
+          exports: {{ agent: "#child.agent" }},
+        }}
+        "##,
+        child = file_url(&child_path),
+    );
+    write_file(&root_path, &root_source);
+
+    let compiler = default_compiler();
+    let root_ref = manifest_ref_for_path(&root_path);
+    let output = compiler
+        .check(root_ref, standard_compile_options())
+        .await
+        .unwrap();
+
+    assert!(output.has_errors);
+
+    let report = output
+        .diagnostics
+        .iter()
+        .find(|report| {
+            let diag: &dyn Diagnostic = &***report;
+            diag.code()
+                .is_some_and(|c| c.to_string() == "linker::invalid_config")
+                && diag
+                    .to_string()
+                    .contains("missing required field config.model")
+        })
+        .expect("expected linker::invalid_config diagnostic for missing config.model");
+    let diag: &dyn Diagnostic = &**report;
+    let labels: Vec<_> = diag
+        .labels()
+        .expect("invalid_config should include a label")
+        .collect();
+    assert_eq!(labels.len(), 1);
+
+    let label = &labels[0];
+    let offset = root_source.find("config:").unwrap();
+    assert_eq!(label.offset(), offset);
+    assert_eq!(label.len(), "config".len());
+}
+
+#[tokio::test]
 async fn type_mismatch_reports_expected_and_got() {
     let dir = tmp_dir("scenario-type-mismatch-message");
     let root_path = dir.path().join("root.json5");
@@ -2772,6 +2886,74 @@ async fn compile_emits_manifest_lints() {
     assert!(diagnostics.iter().any(|diag| {
         diag.to_string() == "provide `api` is never used or exported (in component /)"
     }));
+}
+
+#[tokio::test]
+async fn unused_program_points_to_program_key() {
+    use miette::Diagnostic;
+
+    let dir = tmp_dir("unused-program-label");
+    let root_path = dir.path().join("root.json5");
+    let root_source = r#"
+        {
+          manifest_version: "0.3.0",
+          program: {
+            image: "unused-program",
+            entrypoint: ["/app/start", "--mode", "serve"],
+            env: {
+              LOG_LEVEL: "info",
+              FEATURE_FLAG: "true",
+              DATA_DIR: "/app/data",
+              CACHE_DIR: "/app/cache",
+            },
+            mounts: [
+              { path: "/app/data", from: "resources.data" },
+              { path: "/app/cache", from: "resources.cache" },
+            ],
+            network: {
+              endpoints: [
+                { name: "http", port: 8080 },
+                { name: "metrics", port: 9090 },
+              ],
+            },
+          },
+          resources: {
+            data: { kind: "storage", params: { size: "1Gi" } },
+            cache: { kind: "storage", params: { size: "1Gi" } },
+          },
+        }
+        "#;
+    write_file(&root_path, root_source);
+
+    let compiler = default_compiler();
+    let output = compiler
+        .compile(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .unwrap();
+
+    let report = output
+        .diagnostics
+        .iter()
+        .find(|report| {
+            let diag: &dyn Diagnostic = &***report;
+            diag.code()
+                .is_some_and(|c| c.to_string() == "manifest::unused_program")
+        })
+        .expect("expected manifest::unused_program diagnostic");
+    let diag: &dyn Diagnostic = &**report;
+    let labels: Vec<_> = diag
+        .labels()
+        .expect("unused_program should include a label")
+        .collect();
+    assert_eq!(labels.len(), 1);
+
+    let label = &labels[0];
+    let offset = root_source.find("program:").unwrap();
+    assert_eq!(label.offset(), offset);
+    assert_eq!(label.len(), "program".len());
 }
 
 #[tokio::test]
