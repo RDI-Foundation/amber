@@ -608,7 +608,7 @@ async fn binding_rejects_missing_child_slot() {
               }},
               provides: {{ api: {{ kind: "http", endpoint: "endpoint" }} }},
               bindings: [
-                {{ to: "#child.missing", from: "self.api" }},
+                {{ to: "#child.missing", from: "provides.api" }},
               ],
             }}
             "##,
@@ -984,7 +984,7 @@ async fn slot_forwarding_and_export_chain_resolve_to_provider() {
                 gateway: "{gateway}",
               }},
               bindings: [
-                {{ to: "#gateway.api", from: "self.api" }},
+                {{ to: "#gateway.api", from: "slots.api" }},
               ],
               exports: {{ public_api: "#gateway.public_api" }},
             }}
@@ -1018,7 +1018,7 @@ async fn slot_forwarding_and_export_chain_resolve_to_provider() {
                 consumer: "{consumer}",
               }},
               bindings: [
-                {{ to: "#router.api", from: "self.api" }},
+                {{ to: "#router.api", from: "provides.api" }},
                 {{ to: "#consumer.api", from: "#router.public_api" }},
               ],
             }}
@@ -1136,7 +1136,7 @@ async fn variadic_slot_forwarding_preserves_all_sources_and_authored_order() {
                 consumer: "{consumer}",
               }},
               bindings: [
-                {{ to: "#consumer.upstream", from: "self.upstream" }},
+                {{ to: "#consumer.upstream", from: "slots.upstream" }},
               ],
               exports: {{ http: "#consumer.http" }},
             }}
@@ -1300,7 +1300,7 @@ async fn external_root_slot_with_weak_binding_is_allowed() {
               slots: {{ api: {{ kind: "http" }} }},
               components: {{ client: "{client}" }},
               bindings: [
-                {{ to: "#client.api", from: "self.api", weak: true }}
+                {{ to: "#client.api", from: "slots.api", weak: true }}
               ]
             }}
             "##,
@@ -1368,7 +1368,7 @@ async fn external_root_slot_requires_weak_binding() {
               slots: {{ api: {{ kind: "http" }} }},
               components: {{ client: "{client}" }},
               bindings: [
-                {{ to: "#client.api", from: "self.api" }}
+                {{ to: "#client.api", from: "slots.api" }}
               ]
             }}
             "##,
@@ -2985,7 +2985,7 @@ async fn optimized_compile_keeps_externally_rooted_child_without_exports() {
               slots: {{ api: {{ kind: "http" }} }},
               components: {{ child: "{child}" }},
               bindings: [
-                {{ to: "#child.api", from: "self.api", weak: true }}
+                {{ to: "#child.api", from: "slots.api", weak: true }}
               ]
             }}
             "##,
@@ -3098,7 +3098,7 @@ async fn optimized_compile_keeps_externally_rooted_child_with_repeated_each_with
               slots: {{ api: {{ kind: "http", optional: true, multiple: true }} }},
               components: {{ child: "{child}" }},
               bindings: [
-                {{ to: "#child.api", from: "self.api", weak: true }}
+                {{ to: "#child.api", from: "slots.api", weak: true }}
               ]
             }}
             "##,
@@ -3220,7 +3220,7 @@ async fn check_suppresses_unused_program_for_externally_rooted_child() {
               slots: {{ api: {{ kind: "http" }} }},
               components: {{ child: "{child}" }},
               bindings: [
-                {{ to: "#child.api", from: "self.api", weak: true }}
+                {{ to: "#child.api", from: "slots.api", weak: true }}
               ]
             }}
             "##,
@@ -3317,7 +3317,7 @@ async fn check_suppresses_unused_program_for_externally_rooted_child_with_repeat
               slots: {{ api: {{ kind: "http", optional: true, multiple: true }} }},
               components: {{ child: "{child}" }},
               bindings: [
-                {{ to: "#child.api", from: "self.api", weak: true }}
+                {{ to: "#child.api", from: "slots.api", weak: true }}
               ]
             }}
             "##,
@@ -3372,7 +3372,7 @@ async fn check_keeps_unused_program_for_external_binding_to_unused_slot() {
               slots: {{ api: {{ kind: "http" }} }},
               components: {{ child: "{child}" }},
               bindings: [
-                {{ to: "#child.api", from: "self.api", weak: true }}
+                {{ to: "#child.api", from: "slots.api", weak: true }}
               ]
             }}
             "##,
@@ -3432,7 +3432,7 @@ async fn check_suppresses_unused_program_but_not_unused_provide_for_externally_r
               slots: {{ api: {{ kind: "http" }} }},
               components: {{ child: "{child}" }},
               bindings: [
-                {{ to: "#child.api", from: "self.api", weak: true }}
+                {{ to: "#child.api", from: "slots.api", weak: true }}
               ]
             }}
             "##,
@@ -3533,7 +3533,7 @@ async fn check_treats_weak_binding_targets_as_optional_for_unused_slot_lint() {
               slots: {{ upstream: {{ kind: "http", optional: true }} }},
               components: {{ child: "{child}" }},
               bindings: [
-                {{ to: "#child.api", from: "self.upstream", weak: true }},
+                {{ to: "#child.api", from: "slots.upstream", weak: true }},
               ],
             }}
             "##,

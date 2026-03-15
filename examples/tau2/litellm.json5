@@ -25,7 +25,7 @@
     http: { kind: "http", endpoint: "http" },
   },
   bindings: [
-    { to: "#proxy.backend", from: "self.http" },
+    { to: "#proxy.backend", from: "provides.http" },
     { to: "#wrapper.litellm", from: "#proxy.admin_api" },
   ],
   exports: { llm: "#proxy.llm", admin_api: "#wrapper.admin_api" },

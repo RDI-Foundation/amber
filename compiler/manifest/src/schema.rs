@@ -2141,6 +2141,8 @@ impl FromStr for LocalComponentRef {
 #[non_exhaustive]
 pub enum BindingSourceRef {
     Component(LocalComponentRef),
+    Slots,
+    Provides,
     Framework,
     Resources,
 }
@@ -2149,6 +2151,8 @@ impl fmt::Display for BindingSourceRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Component(component) => component.fmt(f),
+            Self::Slots => f.write_str("slots"),
+            Self::Provides => f.write_str("provides"),
             Self::Framework => f.write_str("framework"),
             Self::Resources => f.write_str("resources"),
         }
@@ -2163,12 +2167,18 @@ impl FromStr for BindingSourceRef {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay, bon::Builder)]
-#[builder(on(String, into))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum LocalCapabilityRefKind {
+    Slot,
+    Provide,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, DeserializeFromStr, SerializeDisplay)]
 #[non_exhaustive]
 pub struct RawExportTarget {
     pub component: LocalComponentRef,
     pub name: String,
+    pub(crate) local_kind: Option<LocalCapabilityRefKind>,
 }
 
 impl RawExportTarget {
@@ -2179,12 +2189,20 @@ impl RawExportTarget {
 
 impl fmt::Display for RawExportTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.component {
-            LocalComponentRef::Self_ => {
+        match (&self.component, self.local_kind) {
+            (LocalComponentRef::Self_, Some(LocalCapabilityRefKind::Slot)) => {
+                f.write_str("slots.")?;
+                f.write_str(&self.name)
+            }
+            (LocalComponentRef::Self_, Some(LocalCapabilityRefKind::Provide)) => {
+                f.write_str("provides.")?;
+                f.write_str(&self.name)
+            }
+            (LocalComponentRef::Self_, None) => {
                 f.write_str("self.")?;
                 f.write_str(&self.name)
             }
-            LocalComponentRef::Child(child) => {
+            (LocalComponentRef::Child(child), _) => {
                 f.write_str("#")?;
                 f.write_str(child)?;
                 f.write_str(".")?;
@@ -2217,6 +2235,7 @@ impl FromStr for RawExportTarget {
                 Ok(Self {
                     component: LocalComponentRef::Self_,
                     name: input.to_string(),
+                    local_kind: None,
                 })
             }
             Some((left, right)) => {
@@ -2226,15 +2245,25 @@ impl FromStr for RawExportTarget {
                         message: "expected `<component-ref>.<name>`".to_string(),
                     });
                 }
-                let component =
-                    parse_component_ref(left).map_err(|err| Error::InvalidExportTarget {
-                        input: input.to_string(),
-                        message: err.message,
-                    })?;
+                let (component, local_kind) = match left {
+                    "slots" => (LocalComponentRef::Self_, Some(LocalCapabilityRefKind::Slot)),
+                    "provides" => (
+                        LocalComponentRef::Self_,
+                        Some(LocalCapabilityRefKind::Provide),
+                    ),
+                    _ => (
+                        parse_component_ref(left).map_err(|err| Error::InvalidExportTarget {
+                            input: input.to_string(),
+                            message: err.message,
+                        })?,
+                        None,
+                    ),
+                };
                 ensure_name_no_dot(right, "export target")?;
                 Ok(Self {
                     component,
                     name: right.to_string(),
+                    local_kind,
                 })
             }
         }
@@ -2504,11 +2533,11 @@ impl<'de> Deserialize<'de> for RawBinding {
             }
             (Some(_), None) => Err(serde::de::Error::custom(
                 "binding has `slot` but is missing `capability` (either add `capability`, or use \
-                 dot form `to: \"<component-ref>.<slot>\", from: \"<component-ref>.<provide>\"`)",
+                 dot form `to: \"<component-ref>.<slot>\", from: \"<source-ref>.<capability>\"`)",
             )),
             (None, Some(_)) => Err(serde::de::Error::custom(
                 "binding has `capability` but is missing `slot` (either add `slot`, or use dot \
-                 form `to: \"<component-ref>.<slot>\", from: \"<component-ref>.<provide>\"`)",
+                 form `to: \"<component-ref>.<slot>\", from: \"<source-ref>.<capability>\"`)",
             )),
         }
     }
@@ -2615,12 +2644,24 @@ fn is_framework_ref(input: &str) -> bool {
     input == "framework"
 }
 
+fn is_slots_ref(input: &str) -> bool {
+    input == "slots"
+}
+
+fn is_provides_ref(input: &str) -> bool {
+    input == "provides"
+}
+
 fn is_resources_ref(input: &str) -> bool {
     input == "resources"
 }
 
 fn parse_binding_target_ref(input: &str) -> Result<LocalComponentRef, Error> {
-    if is_framework_ref(input) || is_resources_ref(input) {
+    if is_framework_ref(input)
+        || is_resources_ref(input)
+        || is_slots_ref(input)
+        || is_provides_ref(input)
+    {
         return Err(Error::InvalidBinding {
             input: input.to_string(),
             message: format!("{input} cannot be a binding target"),
@@ -2638,6 +2679,12 @@ fn parse_binding_source_ref(input: &str) -> Result<BindingSourceRef, Error> {
     }
     if is_resources_ref(input) {
         return Ok(BindingSourceRef::Resources);
+    }
+    if is_slots_ref(input) {
+        return Ok(BindingSourceRef::Slots);
+    }
+    if is_provides_ref(input) {
+        return Ok(BindingSourceRef::Provides);
     }
     let component = parse_component_ref(input).map_err(|err| Error::InvalidBinding {
         input: err.input,

@@ -34,7 +34,7 @@
     },
   },
   bindings: [
-    { to: "#api.state", from: "self.state" },
+    { to: "#api.state", from: "slots.state" },
     { to: "#bound.api", from: "#api.http" },
   ],
   exports: {

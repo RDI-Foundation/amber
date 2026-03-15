@@ -7,6 +7,6 @@
     child: "./slot_range_mismatch_child.json5",
   },
   bindings: [
-    { to: "#child.api", from: "self.upstream" },
+    { to: "#child.api", from: "slots.upstream" },
   ],
 }

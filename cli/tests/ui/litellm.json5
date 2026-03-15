@@ -25,7 +25,7 @@
     wrapper: "./litellm-wrapper.json5",
   },
   bindings: [
-    { to: "#proxy.backend", from: "self.http" },
+    { to: "#proxy.backend", from: "provides.http" },
     { to: "#wrapper.litellm", from: "#proxy.admin_api" },
   ],
   provides: {

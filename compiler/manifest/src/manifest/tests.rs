@@ -782,6 +782,8 @@ fn binding_round_trip_through_canonical_json_parses() {
     .unwrap();
 
     let json = serde_json::to_string_pretty(&m).unwrap();
+    assert!(json.contains("\"from\": \"provides\""), "{json}");
+    assert!(json.contains("\"capability\": \"c\""), "{json}");
     let round_tripped: Manifest = json.parse().unwrap();
     assert_eq!(round_tripped, m);
 }
@@ -826,7 +828,13 @@ fn binding_from_self_requires_slot_or_provide() {
     let err = raw.validate().unwrap_err();
 
     match err {
-        Error::UnknownBindingSource { capability } => assert_eq!(capability, "api"),
+        Error::UnknownBindingSource {
+            reference,
+            expected,
+        } => {
+            assert_eq!(reference, "self.api");
+            assert_eq!(expected, "slot or provide");
+        }
         other => panic!("expected UnknownBindingSource error, got: {other}"),
     }
 }
@@ -857,6 +865,125 @@ fn binding_from_self_slot_is_allowed() {
     };
     let binding = find_binding(&manifest, &target);
     assert!(matches!(binding.from, BindingSource::SelfSlot(_)));
+}
+
+#[test]
+fn binding_from_explicit_slot_ref_is_allowed() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: {
+            api: { kind: "http" },
+          },
+          components: {
+            child: "https://example.com/child",
+          },
+          bindings: [
+            { to: "\#child.api", from: "slots.api" },
+          ],
+        }
+        "#,
+    );
+
+    let manifest = raw.validate().unwrap();
+    let target = BindingTarget::ChildSlot {
+        child: ChildName::try_from("child").unwrap(),
+        slot: SlotName::try_from("api").unwrap(),
+    };
+    let binding = find_binding(&manifest, &target);
+    assert!(matches!(binding.from, BindingSource::SelfSlot(_)));
+}
+
+#[test]
+fn binding_from_explicit_provide_ref_is_allowed() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          provides: {
+            api: { kind: "http", endpoint: "endpoint" },
+          },
+          components: {
+            child: "https://example.com/child",
+          },
+          bindings: [
+            { to: "\#child.api", from: "provides.api" },
+          ],
+        }
+        "#,
+    );
+
+    let manifest = raw.validate().unwrap();
+    let target = BindingTarget::ChildSlot {
+        child: ChildName::try_from("child").unwrap(),
+        slot: SlotName::try_from("api").unwrap(),
+    };
+    let binding = find_binding(&manifest, &target);
+    assert!(matches!(binding.from, BindingSource::SelfProvide(_)));
+}
+
+#[test]
+fn binding_from_slots_ref_requires_declared_slot() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            child: "https://example.com/child",
+          },
+          bindings: [
+            { to: "\#child.needs", from: "slots.api" },
+          ],
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::UnknownBindingSource {
+            reference,
+            expected,
+        } => {
+            assert_eq!(reference, "slots.api");
+            assert_eq!(expected, "slot");
+        }
+        other => panic!("expected UnknownBindingSource error, got: {other}"),
+    }
+}
+
+#[test]
+fn binding_from_provides_ref_requires_declared_provide() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            child: "https://example.com/child",
+          },
+          bindings: [
+            { to: "\#child.needs", from: "provides.api" },
+          ],
+        }
+        "#,
+    );
+    let err = raw.validate().unwrap_err();
+
+    match err {
+        Error::UnknownBindingSource {
+            reference,
+            expected,
+        } => {
+            assert_eq!(reference, "provides.api");
+            assert_eq!(expected, "provide");
+        }
+        other => panic!("expected UnknownBindingSource error, got: {other}"),
+    }
 }
 
 #[test]
@@ -2050,9 +2177,14 @@ fn export_target_unknown_capability_errors() {
     let err = raw.validate().unwrap_err();
 
     match err {
-        Error::UnknownExportTarget { export, target } => {
+        Error::UnknownExportTarget {
+            export,
+            target,
+            expected,
+        } => {
             assert_eq!(export, "api");
             assert_eq!(target, "missing");
+            assert_eq!(expected, "capability");
         }
         other => panic!("expected UnknownExportTarget error, got: {other}"),
     }
@@ -2073,6 +2205,45 @@ fn export_target_slot_is_allowed() {
     let export_name = ExportName::try_from("llm").unwrap();
     let target = manifest.exports().get(&export_name).expect("export target");
     assert!(matches!(target, ExportTarget::SelfSlot(_)));
+}
+
+#[test]
+fn export_target_explicit_slot_is_allowed() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: { llm: { kind: "llm" } },
+          exports: { llm: "slots.llm" },
+        }
+        "#,
+    );
+
+    let manifest = raw.validate().unwrap();
+    let target = manifest.exports().get("llm").unwrap();
+    assert!(matches!(target, ExportTarget::SelfSlot(_)));
+}
+
+#[test]
+fn export_target_explicit_provide_is_allowed() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          provides: { llm: { kind: "http", endpoint: "endpoint" } },
+          exports: { llm: "provides.llm" },
+        }
+        "#,
+    );
+
+    let manifest = raw.validate().unwrap();
+    let target = manifest.exports().get("llm").unwrap();
+    assert!(matches!(target, ExportTarget::SelfProvide(_)));
 }
 
 #[test]
@@ -2097,7 +2268,7 @@ fn export_target_unknown_child_errors() {
 }
 
 #[test]
-fn export_targets_serialize_with_self_prefix() {
+fn export_targets_serialize_with_explicit_local_prefixes() {
     let manifest: Manifest = r#"
         {
           manifest_version: "0.1.0",
@@ -2119,7 +2290,7 @@ fn export_targets_serialize_with_self_prefix() {
         .and_then(|exports| exports.get("api"))
         .and_then(|export| export.as_str());
 
-    assert_eq!(export, Some("self.api"));
+    assert_eq!(export, Some("provides.api"));
 }
 
 #[test]

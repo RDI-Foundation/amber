@@ -8,7 +8,7 @@
     consumer: "./consumer.json5",
   },
   bindings: [
-    { to: "#inlet.api", from: "self.api", weak: true },
+    { to: "#inlet.api", from: "slots.api", weak: true },
     { to: "#consumer.api", from: "#inlet.api", weak: true },
   ],
   exports: {

@@ -205,6 +205,41 @@ pub enum ManifestLint {
         #[label("duplicate resolver `{resolver}`")]
         span: SourceSpan,
     },
+
+    #[error(
+        "binding source `{legacy}` uses deprecated implicit local capability syntax (in component \
+         {component})"
+    )]
+    #[diagnostic(
+        code(manifest::deprecated_binding_self_source),
+        severity(Warning),
+        help("Replace `{legacy}` with `{replacement}`.")
+    )]
+    DeprecatedBindingSelfSource {
+        legacy: String,
+        replacement: String,
+        component: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label("deprecated binding source")]
+        span: SourceSpan,
+    },
+
+    #[error("export target `{legacy}` uses deprecated `self.*` syntax (in component {component})")]
+    #[diagnostic(
+        code(manifest::deprecated_export_self_target),
+        severity(Warning),
+        help("Replace `{legacy}` with `{replacement}`.")
+    )]
+    DeprecatedExportSelfTarget {
+        legacy: String,
+        replacement: String,
+        component: String,
+        #[source_code]
+        src: NamedSource<Arc<str>>,
+        #[label("deprecated export target")]
+        span: SourceSpan,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -572,6 +607,89 @@ fn collect_config_uses_from_value(value: &Value, uses: &mut ConfigUses) {
     }
 }
 
+fn canonical_local_capability(binding_source: &BindingSource) -> Option<String> {
+    match binding_source {
+        BindingSource::SelfProvide(name) => Some(format!("provides.{name}")),
+        BindingSource::SelfSlot(name) => Some(format!("slots.{name}")),
+        _ => None,
+    }
+}
+
+fn binding_source_deprecation_lints(
+    manifest: &Manifest,
+    component: &str,
+    src: &NamedSource<Arc<str>>,
+    spans: &ManifestSpans,
+) -> Vec<ManifestLint> {
+    manifest
+        .bindings()
+        .iter()
+        .zip(spans.bindings_by_index.iter())
+        .filter_map(|(binding, spans)| {
+            let replacement = canonical_local_capability(&binding.binding.from)?;
+            match (
+                spans.from_value.as_deref(),
+                spans.capability_value.as_deref(),
+            ) {
+                (Some(from), _) if from.starts_with("self.") => {
+                    Some(ManifestLint::DeprecatedBindingSelfSource {
+                        legacy: from.to_string(),
+                        replacement,
+                        component: component.to_string(),
+                        src: src.clone(),
+                        span: spans.from.unwrap_or(spans.whole),
+                    })
+                }
+                (Some("self"), Some(capability)) => {
+                    let from_ref = replacement
+                        .split_once('.')
+                        .map(|(prefix, _)| prefix)
+                        .expect("local capability sources always have a prefix");
+                    Some(ManifestLint::DeprecatedBindingSelfSource {
+                        legacy: format!("from: \"self\", capability: \"{capability}\""),
+                        replacement: format!("from: \"{from_ref}\", capability: \"{capability}\""),
+                        component: component.to_string(),
+                        src: src.clone(),
+                        span: spans.from.unwrap_or(spans.whole),
+                    })
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn export_target_deprecation_lints(
+    manifest: &Manifest,
+    component: &str,
+    src: &NamedSource<Arc<str>>,
+    spans: &ManifestSpans,
+) -> Vec<ManifestLint> {
+    manifest
+        .exports()
+        .iter()
+        .filter_map(|(name, target)| {
+            let spans = spans.exports.get(name.as_str())?;
+            let legacy = spans.target_value.as_deref()?;
+            let replacement = match target {
+                ExportTarget::SelfProvide(name) => format!("provides.{name}"),
+                ExportTarget::SelfSlot(name) => format!("slots.{name}"),
+                ExportTarget::ChildExport { .. } => return None,
+            };
+            if !legacy.starts_with("self.") {
+                return None;
+            }
+            Some(ManifestLint::DeprecatedExportSelfTarget {
+                legacy: legacy.to_string(),
+                replacement,
+                component: component.to_string(),
+                src: src.clone(),
+                span: spans.target,
+            })
+        })
+        .collect()
+}
+
 pub fn lint_manifest(
     manifest: &Manifest,
     component: &str,
@@ -580,6 +698,13 @@ pub fn lint_manifest(
 ) -> Vec<ManifestLint> {
     let mut lints = Vec::new();
     let component = component.to_string();
+
+    lints.extend(binding_source_deprecation_lints(
+        manifest, &component, &src, spans,
+    ));
+    lints.extend(export_target_deprecation_lints(
+        manifest, &component, &src, spans,
+    ));
 
     let mut bound_slots = BTreeSet::new();
     let mut bound_provides = BTreeSet::new();
@@ -1401,7 +1526,7 @@ mod tests {
           provides: {
             api: { kind: "http", endpoint: "endpoint" },
           },
-          exports: { public: "api" },
+          exports: { public: "provides.api" },
         }
         "#;
         let raw = parse_raw(input);
@@ -1409,6 +1534,163 @@ mod tests {
         let manifest = raw.validate().unwrap();
         let lints = lint_for(input, &manifest);
         assert!(lints.is_empty());
+    }
+
+    #[test]
+    fn legacy_self_binding_source_is_linted_with_explicit_replacement() {
+        let input = r##"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          components: {
+            child: "https://example.com/child",
+          },
+          provides: {
+            api: { kind: "http", endpoint: "endpoint" },
+          },
+          bindings: [
+            { to: "#child.api", from: "self.api" },
+          ],
+        }
+        "##;
+        let manifest = parse_raw(input).validate().unwrap();
+        let lints = lint_for(input, &manifest);
+
+        assert!(lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::DeprecatedBindingSelfSource {
+                legacy,
+                replacement,
+                ..
+            } if legacy == "self.api" && replacement == "provides.api"
+        )));
+    }
+
+    #[test]
+    fn legacy_self_explicit_binding_source_is_linted_with_explicit_replacement() {
+        let input = r##"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          components: {
+            child: "https://example.com/child",
+          },
+          provides: {
+            api: { kind: "http", endpoint: "endpoint" },
+          },
+          bindings: [
+            { to: "#child", slot: "api", from: "self", capability: "api" },
+          ],
+        }
+        "##;
+        let manifest = parse_raw(input).validate().unwrap();
+        let lints = lint_for(input, &manifest);
+
+        assert!(lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::DeprecatedBindingSelfSource {
+                legacy,
+                replacement,
+                ..
+            } if legacy == "from: \"self\", capability: \"api\""
+                && replacement == "from: \"provides\", capability: \"api\""
+        )));
+    }
+
+    #[test]
+    fn legacy_self_export_targets_are_linted_with_explicit_replacements() {
+        let input = r##"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          provides: {
+            api: { kind: "http", endpoint: "endpoint" },
+          },
+          exports: {
+            api: "self.api",
+          },
+        }
+        "##;
+        let manifest = parse_raw(input).validate().unwrap();
+        let lints = lint_for(input, &manifest);
+
+        assert!(lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::DeprecatedExportSelfTarget {
+                legacy,
+                replacement,
+                ..
+            } if legacy == "self.api" && replacement == "provides.api"
+        )));
+    }
+
+    #[test]
+    fn explicit_local_capability_refs_are_not_linted() {
+        let input = r##"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          components: {
+            child: "https://example.com/child",
+          },
+          provides: {
+            api: { kind: "http", endpoint: "endpoint" },
+          },
+          bindings: [
+            { to: "#child.api", from: "provides.api" },
+          ],
+          exports: { public: "provides.api" },
+        }
+        "##;
+        let manifest = parse_raw(input).validate().unwrap();
+        let lints = lint_for(input, &manifest);
+
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::DeprecatedBindingSelfSource { .. }
+                | crate::lint::ManifestLint::DeprecatedExportSelfTarget { .. }
+        )));
+    }
+
+    #[test]
+    fn bare_export_targets_are_not_linted() {
+        let input = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            network: { endpoints: [{ name: "endpoint", port: 80 }] },
+          },
+          provides: {
+            api: { kind: "http", endpoint: "endpoint" },
+          },
+          exports: { public: "api" },
+        }
+        "#;
+        let manifest = parse_raw(input).validate().unwrap();
+        let lints = lint_for(input, &manifest);
+
+        assert!(!lints.iter().any(|lint| matches!(
+            lint,
+            crate::lint::ManifestLint::DeprecatedExportSelfTarget { .. }
+        )));
     }
 
     #[test]

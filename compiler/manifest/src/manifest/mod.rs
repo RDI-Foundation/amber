@@ -20,9 +20,9 @@ use crate::{
     refs::{ManifestDigest, ManifestRef, ManifestUrl},
     schema::{
         Binding, BindingSource, BindingSourceRef, BindingTarget, CapabilityKind, ComponentDecl,
-        ConfigSchema, EnvironmentDecl, ExportTarget, LocalComponentRef, ManifestBinding,
-        MountSource, Program, ProvideDecl, RawBinding, RawExportTarget, RawProgram, ResourceDecl,
-        SlotDecl, VmScalarU32,
+        ConfigSchema, EnvironmentDecl, ExportTarget, LocalCapabilityRefKind, LocalComponentRef,
+        ManifestBinding, MountSource, Program, ProvideDecl, RawBinding, RawExportTarget,
+        RawProgram, ResourceDecl, SlotDecl, VmScalarU32,
     },
 };
 
@@ -372,6 +372,26 @@ fn resolve_binding_source(
     enabled_features: &BTreeSet<ExperimentalFeature>,
 ) -> Result<BindingSource, Error> {
     match from {
+        BindingSourceRef::Slots => {
+            let (slot_name, _) = ctx
+                .slots
+                .get_key_value(capability.as_str())
+                .ok_or_else(|| Error::UnknownBindingSource {
+                    reference: format!("slots.{capability}"),
+                    expected: "slot",
+                })?;
+            Ok(BindingSource::SelfSlot(slot_name.clone()))
+        }
+        BindingSourceRef::Provides => {
+            let (provide_name, _) =
+                ctx.provides
+                    .get_key_value(capability.as_str())
+                    .ok_or_else(|| Error::UnknownBindingSource {
+                        reference: format!("provides.{capability}"),
+                        expected: "provide",
+                    })?;
+            Ok(BindingSource::SelfProvide(provide_name.clone()))
+        }
         BindingSourceRef::Component(LocalComponentRef::Self_) => {
             if let Some((slot_name, _)) = ctx.slots.get_key_value(capability.as_str()) {
                 return Ok(BindingSource::SelfSlot(slot_name.clone()));
@@ -379,7 +399,10 @@ fn resolve_binding_source(
             if let Some((provide_name, _)) = ctx.provides.get_key_value(capability.as_str()) {
                 return Ok(BindingSource::SelfProvide(provide_name.clone()));
             }
-            Err(Error::UnknownBindingSource { capability })
+            Err(Error::UnknownBindingSource {
+                reference: format!("self.{capability}"),
+                expected: "slot or provide",
+            })
         }
         BindingSourceRef::Resources => {
             let (resource_name, _) = ctx
@@ -462,6 +485,28 @@ fn resolve_export_target(
     target: RawExportTarget,
 ) -> Result<ExportTarget, Error> {
     match target.component {
+        LocalComponentRef::Self_ if target.local_kind == Some(LocalCapabilityRefKind::Provide) => {
+            let (provide_name, _) = ctx
+                .provides
+                .get_key_value(target.name.as_str())
+                .ok_or_else(|| Error::UnknownExportTarget {
+                    export: export_name.to_string(),
+                    target: target.name.clone(),
+                    expected: "provide",
+                })?;
+            Ok(ExportTarget::SelfProvide(provide_name.clone()))
+        }
+        LocalComponentRef::Self_ if target.local_kind == Some(LocalCapabilityRefKind::Slot) => {
+            let (slot_name, _) =
+                ctx.slots
+                    .get_key_value(target.name.as_str())
+                    .ok_or_else(|| Error::UnknownExportTarget {
+                        export: export_name.to_string(),
+                        target: target.name.clone(),
+                        expected: "slot",
+                    })?;
+            Ok(ExportTarget::SelfSlot(slot_name.clone()))
+        }
         LocalComponentRef::Self_ => {
             if let Some((provide_name, _)) = ctx.provides.get_key_value(target.name.as_str()) {
                 return Ok(ExportTarget::SelfProvide(provide_name.clone()));
@@ -472,6 +517,7 @@ fn resolve_export_target(
             Err(Error::UnknownExportTarget {
                 export: export_name.to_string(),
                 target: target.name,
+                expected: "capability",
             })
         }
         LocalComponentRef::Child(child) => {
@@ -990,14 +1036,10 @@ impl From<&Manifest> for RawManifest {
                 };
 
                 let (from, capability) = match &manifest_binding.binding.from {
-                    BindingSource::SelfProvide(name) => (
-                        BindingSourceRef::Component(LocalComponentRef::Self_),
-                        name.to_string(),
-                    ),
-                    BindingSource::SelfSlot(name) => (
-                        BindingSourceRef::Component(LocalComponentRef::Self_),
-                        name.to_string(),
-                    ),
+                    BindingSource::SelfProvide(name) => {
+                        (BindingSourceRef::Provides, name.to_string())
+                    }
+                    BindingSource::SelfSlot(name) => (BindingSourceRef::Slots, name.to_string()),
                     BindingSource::Resource(name) => {
                         (BindingSourceRef::Resources, name.to_string())
                     }
@@ -1031,14 +1073,17 @@ impl From<&Manifest> for RawManifest {
                     ExportTarget::SelfProvide(provide) => RawExportTarget {
                         component: LocalComponentRef::Self_,
                         name: provide.to_string(),
+                        local_kind: Some(LocalCapabilityRefKind::Provide),
                     },
                     ExportTarget::SelfSlot(slot) => RawExportTarget {
                         component: LocalComponentRef::Self_,
                         name: slot.to_string(),
+                        local_kind: Some(LocalCapabilityRefKind::Slot),
                     },
                     ExportTarget::ChildExport { child, export } => RawExportTarget {
                         component: LocalComponentRef::Child(child.to_string()),
                         name: export.to_string(),
+                        local_kind: None,
                     },
                 };
 
