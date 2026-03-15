@@ -9,7 +9,8 @@ Compiles a root component manifest into a linked `Scenario` plus provenance and 
 - Run optional MIR optimizations (`mir`) such as binding canonicalization, pure-routing flattening, and dead-code elimination.
 
 ## Key types
-- `Compiler`: entry point; `compile` returns a `Scenario`, `Provenance`, and `DigestStore`, while `check` reports diagnostics without producing a scenario.
+- `Compiler`: entry point; `compile` returns `CompileOutput` (linked `Scenario`, `Provenance`, `DigestStore`, diagnostics, and config analysis), while `check` returns `CheckOutput`.
+- `CompileOutput` / `CheckOutput`: compiler results for artifact generation vs validation-only flows.
 - `CompileOptions` / `ResolveOptions`: control resolution limits and optimization behavior.
 - `DigestStore`: digest-keyed manifest store plus source/spans for diagnostics.
 - `Provenance`: resolution provenance per component instance: authored moniker, declared ref, resolved/observed URL, digest.
@@ -20,6 +21,6 @@ Compiles a root component manifest into a linked `Scenario` plus provenance and 
 - `frontend`: async resolver with caching, cycle detection, and environment handling.
 - `linker`: schema validation, binding resolution, and export verification.
 - `mir`: linked-scenario optimization pipeline (canonicalization + optional flatten/DCE) plus post-optimization binding interpolation verification.
-- `targets`: target-family planners and reporters (mesh-family planning + Docker Compose/Kubernetes, plus direct/native artifact planning).
-- `reporter`: transforms `CompileOutput` into artifacts (scenario IR JSON, DOT, Docker Compose YAML, Kubernetes YAML, and direct/native output directories); re-exports target reporters.
+- `targets`: target-family planners and reporters (mesh-family planning + Docker Compose/Kubernetes directory artifacts, plus direct/native and VM artifact planning).
+- `reporter`: transforms `CompileOutput` into artifacts (scenario IR JSON, DOT, metadata JSON, Docker Compose directories, Kubernetes directories, direct/native output directories, and VM output directories); re-exports target reporters.
 - `bundle`: bundle index parsing, manifest packing, and bundle-only resolver wiring.

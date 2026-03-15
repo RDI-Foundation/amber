@@ -44,15 +44,18 @@ Keep this terminal running. You will use its logs to confirm slot traffic.
 2. Terminal B: compile and start the scenario.
 
 ```sh
+OUT=/tmp/amber-external
+rm -rf "$OUT"
 amber compile examples/externalized-slots/scenario.json5 \
-  --docker-compose /tmp/amber-external.yaml
-docker compose -f /tmp/amber-external.yaml up -d
+  --docker-compose "$OUT"
+docker compose -f "$OUT/compose.yaml" up -d
 ```
 
 3. Terminal C: run one proxy for both mappings.
 
 ```sh
-amber proxy /tmp/amber-external.yaml \
+OUT=/tmp/amber-external
+amber proxy "$OUT" \
   --slot api=127.0.0.1:8081 \
   --export public=127.0.0.1:18080
 ```
@@ -79,7 +82,8 @@ That confirms the component is calling your local upstream through the externali
 ## Cleanup
 
 ```sh
-docker compose -f /tmp/amber-external.yaml down -v
+OUT=/tmp/amber-external
+docker compose -f "$OUT/compose.yaml" down -v
 ```
 
 Stop Terminal A and Terminal C with `Ctrl-C`.
@@ -87,14 +91,15 @@ Stop Terminal A and Terminal C with `Ctrl-C`.
 ## Troubleshooting
 
 - `address already in use`: change `8081` and/or `18080` consistently in commands above.
-- If you run Compose with `-p <name>`, set the same project name for proxy resolution:
+- If you run Compose with `-p <name>`, pass the same project name to `amber proxy`:
 
 ```sh
-docker compose -p amber-external-a -f /tmp/amber-external.yaml up -d
-COMPOSE_PROJECT_NAME=amber-external-a \
-  amber proxy /tmp/amber-external.yaml \
-    --slot api=127.0.0.1:8081 \
-    --export public=127.0.0.1:18080
+OUT=/tmp/amber-external
+docker compose -p amber-external-a -f "$OUT/compose.yaml" up -d
+amber proxy "$OUT" \
+  --project-name amber-external-a \
+  --slot api=127.0.0.1:8081 \
+  --export public=127.0.0.1:18080
 ```
 
 ## Kubernetes (advanced)

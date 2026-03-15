@@ -229,21 +229,6 @@ kubectl delete namespace amber-storage-demo
 
 That is the cleanest path when the namespace is dedicated to this example.
 
-## Direct output
-
-Direct mode is still useful for local development, so this example should stay available there:
-
-```sh
-amber compile examples/storage/01-persistence/scenario.json5 --direct /tmp/amber-storage-direct
-cd /tmp/amber-storage-direct
-./run.sh --storage-root /tmp/amber-storage-state
-```
-
-The issue I hit on macOS was not storage persistence itself. It was path remapping.
-This example mounts storage at `/var/lib/app`, and current macOS direct mode cannot bind a host
-storage directory into that different in-sandbox path the way Linux direct mode can.
-So the runtime rejects this example on macOS today.
-
 ## Files
 
 - `scenario.json5`: self-contained scenario that allocates the durable storage resource, mounts it

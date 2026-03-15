@@ -17,7 +17,7 @@ is Linux-only today.
 
 ## Prereqs
 
-- Linux: `bwrap` (bubblewrap), `nsenter` (util-linux), `slirp4netns`
+- Linux: `bwrap` (bubblewrap), `slirp4netns`
 - macOS: `/usr/bin/sandbox-exec`
 
 ## Run

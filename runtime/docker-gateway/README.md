@@ -39,7 +39,8 @@ Example config:
     {
       "host": "c2-client-net",
       "port": 41732,
-      "component": "component-a"
+      "component": "component-a",
+      "compose_service": "c2-client-net"
     }
   ]
 }
@@ -48,9 +49,9 @@ Example config:
 Notes:
 
 - `compose_project` is required. It is the Docker Compose project name for the scenario.
-- `callers` is required. Each entry maps a peer `host` (and optional `port`) to a component.
-  The gateway resolves caller hosts periodically and authenticates peers by the resolved source
-  IP (plus optional source port).
+- `callers` is required. Each entry maps a peer `host` (and optional `port`) to a component and
+  its Compose service name. The gateway resolves caller hosts periodically and authenticates peers
+  by the resolved source IP (plus optional source port).
 - If your TCP proxy uses ephemeral source ports, omit `port` and match by resolved IP only.
 - Ownership labels are fixed to `amber.component` and `amber.project`.
 
@@ -92,7 +93,7 @@ authorize it.
 ## Running locally (example)
 
 ```sh
-export AMBER_DOCKER_GATEWAY_CONFIG_JSON='{"listen":"0.0.0.0:23750","docker_sock":"/var/run/docker.sock","compose_project":"dev","callers":[{"host":"localhost","component":"dev"}]}'
+export AMBER_DOCKER_GATEWAY_CONFIG_JSON='{"listen":"0.0.0.0:23750","docker_sock":"/var/run/docker.sock","compose_project":"dev","callers":[{"host":"localhost","component":"dev","compose_service":"dev"}]}'
 ./target/debug/amber-docker-gateway
 ```
 
