@@ -44,6 +44,6 @@
     agent: { kind: "a2a", endpoint: "agent" },
   },
   exports: {
-    agent: "self.agent",
+    agent: "provides.agent",
   },
 }
