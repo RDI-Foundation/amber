@@ -715,7 +715,7 @@ impl Program {
                 });
                 if let Some(source) = mount.literal_source() {
                     match source {
-                        MountSource::Config(path) | MountSource::Secret(path) => {
+                        MountSource::Config(path) => {
                             visit(ProgramConfigUseSite::MountSource { index }, &path);
                         }
                         MountSource::Resource(_)
@@ -1529,7 +1529,7 @@ impl ProgramMount {
         self.source.visit_config_uses(&mut visit);
         if let Some(source) = self.literal_source() {
             match source {
-                MountSource::Config(path) | MountSource::Secret(path) => visit(&path),
+                MountSource::Config(path) => visit(&path),
                 MountSource::Resource(_) | MountSource::Slot(_) | MountSource::Framework(_) => {}
             }
         }
@@ -1542,7 +1542,6 @@ impl ProgramMount {
 #[non_exhaustive]
 pub enum MountSource {
     Config(String),
-    Secret(String),
     Resource(String),
     Slot(String),
     Framework(FrameworkCapabilityName),
@@ -1552,7 +1551,6 @@ impl fmt::Display for MountSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MountSource::Config(path) => write_prefixed(f, "config", path),
-            MountSource::Secret(path) => write_prefixed(f, "secret", path),
             MountSource::Resource(name) => write_prefixed(f, "resources", name),
             MountSource::Slot(name) => write_prefixed(f, "slots", name),
             MountSource::Framework(name) => write!(f, "framework.{name}"),
@@ -1585,15 +1583,6 @@ impl FromStr for MountSource {
         }
         if let Some(path) = input.strip_prefix("config.") {
             return Ok(MountSource::Config(ensure_path(input, path)?));
-        }
-        if let Some(path) = input.strip_prefix("secret.") {
-            return Ok(MountSource::Secret(ensure_path(input, path)?));
-        }
-        if input == "secret" {
-            return Err(Error::InvalidMountSource {
-                mount: input.to_string(),
-                message: "secret mounts require an explicit path (secret.<path>)".to_string(),
-            });
         }
         if let Some(name) = input.strip_prefix("resources.") {
             let name = ensure_path(input, name)?;

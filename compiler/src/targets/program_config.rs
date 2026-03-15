@@ -431,9 +431,7 @@ fn collect_mount_source_used_paths(source: &TemplateString, out: &mut BTreeSet<S
     collect_used_paths_from_template_string(source, out);
     match render_template_string_static(source) {
         Ok(rendered) => {
-            if let Ok(MountSource::Config(path) | MountSource::Secret(path)) =
-                rendered.parse::<MountSource>()
-            {
+            if let Ok(MountSource::Config(path)) = rendered.parse::<MountSource>() {
                 out.insert(path);
             }
         }
@@ -878,10 +876,7 @@ fn file_mount_uses_config(mount: &FileMount) -> bool {
             .as_ref()
             .is_some_and(|each| matches!(each, ProgramEach::Config { .. }))
         || template_string_uses_config(&mount.path)
-        || matches!(
-            &mount.source,
-            FileMountSource::Config { .. } | FileMountSource::Secret { .. }
-        )
+        || matches!(&mount.source, FileMountSource::Config { .. })
 }
 
 fn build_mount_specs(
@@ -1009,24 +1004,20 @@ fn build_mount_specs(
                         ))
                     },
                 )?;
-                match source {
-                    rc::RenderedFileMountSource::Config { path: path_query }
-                    | rc::RenderedFileMountSource::Secret { path: path_query } => {
-                        match resolve_config_query_for_mount(component_config, path_query)? {
-                            MountResolution::Static(value) => {
-                                let content = rc::stringify_for_mount(&value)
-                                    .map_err(|err| MeshError::new(err.to_string()))?;
-                                specs.push(MountSpec::Literal { path, content });
-                            }
-                            MountResolution::Runtime => {
-                                specs.push(MountSpec::Template(MountTemplateSpec {
-                                    when: runtime_when.clone(),
-                                    each: runtime_each,
-                                    path: path_ts,
-                                    source: source_ts,
-                                }));
-                            }
-                        }
+                let path_query = source.path();
+                match resolve_config_query_for_mount(component_config, path_query)? {
+                    MountResolution::Static(value) => {
+                        let content = rc::stringify_for_mount(&value)
+                            .map_err(|err| MeshError::new(err.to_string()))?;
+                        specs.push(MountSpec::Literal { path, content });
+                    }
+                    MountResolution::Runtime => {
+                        specs.push(MountSpec::Template(MountTemplateSpec {
+                            when: runtime_when.clone(),
+                            each: runtime_each,
+                            path: path_ts,
+                            source: source_ts,
+                        }));
                     }
                 }
                 Ok(())
@@ -1266,10 +1257,7 @@ fn resolve_lowered_mount_source(
     needs_runtime_config_for_program_templates: &mut bool,
     require_non_empty: bool,
 ) -> Result<TemplateString, MeshError> {
-    let (prefix, path) = match source {
-        FileMountSource::Config { path } => ("config", path),
-        FileMountSource::Secret { path } => ("secret", path),
-    };
+    let FileMountSource::Config { path } = source;
     let path = resolve_lowered_template_string(
         scenario,
         id,
@@ -1286,9 +1274,9 @@ fn resolve_lowered_mount_source(
 
     let mut full = Vec::new();
     if path.is_empty() {
-        full.push(TemplatePart::lit(prefix));
+        full.push(TemplatePart::lit("config"));
     } else {
-        full.push(TemplatePart::lit(format!("{prefix}.")));
+        full.push(TemplatePart::lit("config."));
         full.extend(path);
     }
     if require_non_empty && full.is_empty() {
@@ -3053,7 +3041,7 @@ mod tests {
     }
 
     #[test]
-    fn build_mount_specs_rejects_config_mount_source_that_resolves_to_secret_path() {
+    fn build_mount_specs_allows_config_mount_source_that_resolves_to_secret_path() {
         let child = component_with_config_and_program(
             1,
             Some(0),
@@ -3080,63 +3068,21 @@ mod tests {
         );
         let scenario = scenario_with_child(child);
         let config_analysis = config_analysis(&scenario);
-        let err = build_mount_specs(
+        let mount_specs = build_mount_specs(
             &scenario,
             &config_analysis,
             &[ComponentId(1)],
             RuntimeAddressResolution::Static,
             &HashMap::from([(ComponentId(1), BTreeMap::new())]),
         )
-        .expect_err("config mount to a secret path should fail");
+        .expect("config mount to a secret path should succeed");
 
-        assert!(
-            err.to_string()
-                .contains("config mount path `token` refers to secret config"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn build_mount_specs_rejects_secret_mount_source_that_resolves_to_public_path() {
-        let child = component_with_config_and_program(
-            1,
-            Some(0),
-            "/worker",
-            Some(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "source_path": { "type": "string" },
-                    "public": { "type": "string" }
-                },
-                "required": ["source_path", "public"]
-            })),
-            Some(serde_json::json!({
-                "source_path": "public",
-                "public": "hello"
-            })),
-            Some(serde_json::json!({
-                "image": "app",
-                "entrypoint": ["app"],
-                "mounts": [
-                    { "path": "/etc/app/secret.txt", "from": "secret.${config.source_path}" }
-                ],
-            })),
-        );
-        let scenario = scenario_with_child(child);
-        let config_analysis = config_analysis(&scenario);
-        let err = build_mount_specs(
-            &scenario,
-            &config_analysis,
-            &[ComponentId(1)],
-            RuntimeAddressResolution::Static,
-            &HashMap::from([(ComponentId(1), BTreeMap::new())]),
-        )
-        .expect_err("secret mount to a public path should fail");
-
-        assert!(
-            err.to_string()
-                .contains("secret mount path `public` is not secret"),
-            "{err}"
+        assert_eq!(
+            mount_specs.get(&ComponentId(1)),
+            Some(&vec![MountSpec::Literal {
+                path: "/etc/app/config.txt".to_string(),
+                content: "shh".to_string(),
+            }])
         );
     }
 

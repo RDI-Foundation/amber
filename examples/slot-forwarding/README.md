@@ -26,9 +26,11 @@ docker tag busybox:1.36 example/consumer:v1
 1. Compile and start:
 
 ```sh
+OUT=/tmp/amber-slot-forwarding
+rm -rf "$OUT"
 amber compile examples/slot-forwarding/scenario.json5 \
-  --docker-compose /tmp/amber-slot-forwarding.yaml
-docker compose -f /tmp/amber-slot-forwarding.yaml up -d
+  --docker-compose "$OUT"
+docker compose -f "$OUT/compose.yaml" up -d
 ```
 
 `amber proxy` auto-discovers router control from compile metadata.
@@ -38,14 +40,14 @@ and export mode also discovers the router's published host port at runtime.
 2. Start an HTTP server inside `c2-consumer` so the exported path has a concrete responder:
 
 ```sh
-docker compose -f /tmp/amber-slot-forwarding.yaml exec -d c2-consumer \
+docker compose -f "$OUT/compose.yaml" exec -d c2-consumer \
   sh -lc 'httpd -f -p 9000'
 ```
 
 3. In another terminal, run the export proxy:
 
 ```sh
-amber proxy /tmp/amber-slot-forwarding.yaml \
+amber proxy "$OUT" \
   --export api=127.0.0.1:18080
 ```
 
@@ -60,13 +62,11 @@ The default `busybox httpd` content may be `404` at `/`; any HTTP response here 
 
 ### Multiple local copies
 
-If you run the same compose file with `-p`, pass the same `COMPOSE_PROJECT_NAME` when running
-`amber proxy`:
+If you run the same compose output with `-p`, pass the same project name to `amber proxy`:
 
 ```sh
-docker compose -p amber-slot-forwarding-a -f /tmp/amber-slot-forwarding.yaml up -d
-COMPOSE_PROJECT_NAME=amber-slot-forwarding-a \
-  amber proxy /tmp/amber-slot-forwarding.yaml --export api=127.0.0.1:18080
+docker compose -p amber-slot-forwarding-a -f "$OUT/compose.yaml" up -d
+amber proxy "$OUT" --project-name amber-slot-forwarding-a --export api=127.0.0.1:18080
 ```
 
 You can run multiple proxy processes at once; each gets its own mesh identity.

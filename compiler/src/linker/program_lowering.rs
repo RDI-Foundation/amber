@@ -310,7 +310,6 @@ fn lowered_mount_static_path(mount: &ProgramMount) -> Option<String> {
 fn describe_file_mount_source(source: &FileMountSource) -> String {
     render_static_file_mount_source(source).unwrap_or_else(|| match source {
         FileMountSource::Config { .. } => "config.<dynamic path>".to_string(),
-        FileMountSource::Secret { .. } => "secret.<dynamic path>".to_string(),
     })
 }
 
@@ -318,10 +317,6 @@ fn render_static_file_mount_source(source: &FileMountSource) -> Option<String> {
     match source {
         FileMountSource::Config { path } => Some(render_prefixed_mount_source(
             "config",
-            render_template_string_static_opt(path)?,
-        )),
-        FileMountSource::Secret { path } => Some(render_prefixed_mount_source(
-            "secret",
             render_template_string_static_opt(path)?,
         )),
     }
@@ -872,11 +867,6 @@ fn classify_mount_source(source: TemplateString) -> Result<LoweredMountSource, S
                     path: literal_template(path),
                 }))
             }
-            Ok(MountSource::Secret(path)) => {
-                Ok(LoweredMountSource::File(FileMountSource::Secret {
-                    path: literal_template(path),
-                }))
-            }
             Ok(MountSource::Slot(slot)) => Ok(LoweredMountSource::Slot(slot)),
             Ok(MountSource::Resource(resource)) => Ok(LoweredMountSource::Resource(resource)),
             Ok(MountSource::Framework(capability)) => Ok(LoweredMountSource::Framework(capability)),
@@ -888,16 +878,9 @@ fn classify_mount_source(source: TemplateString) -> Result<LoweredMountSource, S
     if let Some(path) = strip_literal_prefix(&source, "config.") {
         return Ok(LoweredMountSource::File(FileMountSource::Config { path }));
     }
-    if let Some(path) = strip_literal_prefix(&source, "secret.") {
-        if path.is_empty() {
-            return Err("secret mounts require an explicit path (secret.<path>)".to_string());
-        }
-        return Ok(LoweredMountSource::File(FileMountSource::Secret { path }));
-    }
-
     Err(
         "mount source must resolve to a concrete `slots.*`, `resources.*`, or `framework.*` \
-         reference, or remain a `config.*` / `secret.*` file mount"
+         reference, or remain a `config.*` file mount"
             .to_string(),
     )
 }
@@ -1323,6 +1306,48 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    #[test]
+    fn lower_program_rejects_dynamic_mount_sources_outside_config_namespace() {
+        let manifest: Manifest = r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                image: "app",
+                entrypoint: ["app"],
+                mounts: [
+                  {
+                    path: "/cfg",
+                    from: "secret.${config.mount_path}",
+                  },
+                ],
+              },
+              config_schema: {
+                type: "object",
+                properties: {
+                  mount_path: { type: "string" },
+                },
+              },
+            }
+        "#
+        .parse()
+        .expect("manifest");
+        let template = ConfigNode::Object(BTreeMap::from([(
+            "mount_path".to_string(),
+            ConfigNode::String("token".to_string()),
+        )]));
+
+        let errors = lower_program(
+            amber_scenario::ComponentId(3),
+            manifest.program().expect("program"),
+            Some(&template),
+        )
+        .expect_err("program should fail to lower");
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].site, ProgramLoweringSite::Mount(0));
+        assert!(errors[0].message.contains("unknown mount source"));
     }
 
     #[test]

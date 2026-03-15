@@ -24,7 +24,9 @@ It demonstrates both forms:
 From the repository root:
 
 ```sh
-amber compile examples/framework-docker/scenario.json5 --docker-compose /tmp/framework-docker-compose.yaml
+OUT=/tmp/framework-docker-compose
+rm -rf "$OUT"
+amber compile examples/framework-docker/scenario.json5 --docker-compose "$OUT"
 ```
 
 If Docker is not using `/var/run/docker.sock` on your host (common on macOS), set
@@ -37,18 +39,18 @@ export AMBER_DOCKER_SOCK="$HOME/.docker/run/docker.sock"
 Run the scenario:
 
 ```sh
-docker compose -f /tmp/framework-docker-compose.yaml up -d
+docker compose -f "$OUT/compose.yaml" up -d
 ```
 
 Wait for `c1-worker` to finish and inspect the created container:
 
 ```sh
-docker compose -f /tmp/framework-docker-compose.yaml wait c1-worker
+docker compose -f "$OUT/compose.yaml" wait c1-worker
 docker inspect amber-framework-docker-demo
 ```
 
 Tear down and remove orphans (including containers created via `framework.docker`):
 
 ```sh
-docker compose -f /tmp/framework-docker-compose.yaml down -v --remove-orphans
+docker compose -f "$OUT/compose.yaml" down -v --remove-orphans
 ```

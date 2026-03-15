@@ -4,7 +4,7 @@ This document defines the **manifest file format** and the **validation/linting 
 
 A manifest describes **one component**. A component may:
 
-* Run a `program` (either container image + entrypoint or native path + args, plus env and optional network endpoints; required when providing capabilities).
+* Run a `program` (container image + entrypoint, native path + args, or VM guest config; required when providing capabilities).
 * Contain named child `components` (each points at another manifest).
 * Declare required inputs (`slots`) and produced outputs (`provides`).
 * Wire capabilities into slots (`bindings`).
@@ -20,7 +20,7 @@ Minimal leaf component exporting an HTTP API:
 
 ```json5
 {
-  manifest_version: "0.1.0",
+  manifest_version: "0.3.0",
   program: {
     image: "ghcr.io/acme/hello:v1",
     entrypoint: "--port 8080",
@@ -105,7 +105,7 @@ Top-level object:
 
 ```json5
 {
-  manifest_version: "0.1.0",   // required
+  manifest_version: "0.3.0",   // required
   experimental_features: ["docker"], // optional; default []
 
   program: { /* ... */ },      // optional
@@ -190,7 +190,7 @@ Example:
 
 ## `program`
 
-`program` is a tagged union with two variants:
+`program` is a tagged union with three variants:
 
 ### Container program (`image` + `entrypoint`)
 
@@ -207,14 +207,14 @@ program: {
   entrypoint: ["--port", "8080"],
   // entrypoint: "--port 8080",
 
-  // shared fields (env/mounts/network) are available on both program variants:
+  // shared fields (env/mounts/network) are available on image and path programs:
   env: {
     LOG_LEVEL: "debug",
     API_URL: "${slots.backend.url}",
   },
   mounts: [
     { path: "/run/config.json", from: "config.app" },
-    { path: "/run/secret.txt", from: "secret.api.token" },
+    { path: "/run/secret.txt", from: "config.api.token" },
   ],
   network: {
     endpoints: [
@@ -265,6 +265,30 @@ program: {
 }
 ```
 
+### VM program (`vm`)
+
+```json5
+program: {
+  vm: {
+    image: "${config.base_image}", // guest image path or other resolved base image string
+    cpus: 2,
+    memory_mib: 1024,
+    mounts: [
+      { path: "/var/lib/app", from: "slots.state" },
+    ],
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" },
+      ],
+      egress: "none",
+    },
+    cloud_init: {
+      user_data: { file: "./user-data.yaml" },
+    },
+  },
+}
+```
+
 Sidecar file references:
 
 * Any inline string accepted in `program.entrypoint`, `program.args`, or `program.env` may be
@@ -290,25 +314,28 @@ program: {
 
 Rules:
 
-* `program` must declare exactly one of `image` or `path`.
+* `program` must declare exactly one of `image`, `path`, or `vm`.
 * `program.entrypoint` is only valid with `program.image`.
 * `program.args` is only valid with `program.path`.
+* `program.env` is only valid with `program.image` or `program.path`. VM guest startup should be configured through `program.vm.cloud_init`.
+* `program.network` and `program.mounts` are only valid with `program.image` or `program.path`. VM programs use `program.vm.network` and `program.vm.mounts`.
 * `program.path` must be an explicit absolute path or a relative path containing a separator
   such as `./bin/server`; direct execution does not search `PATH`.
 
-### `program.mounts`
+### `program.mounts` and `program.vm.mounts`
 
-`mounts` mounts config/secret values as files inside the container, or mounts routed storage as a
-directory. Each entry has:
+For image/path programs, `program.mounts` mounts config values as files inside the runtime
+environment, or mounts routed storage as a directory. VM programs use the same mount entry shape
+under `program.vm.mounts`. Each entry has:
 
-* `path` (required): absolute path inside the container.
+* `path` (required): absolute path inside the container or VM guest.
 * `from` (required): source value.
 * `name` (optional): identifier for diagnostics.
 
 Supported `from` sources (current):
 
-* `config` or `config.<path>`: mount the component config (whole object or a path).
-* `secret.<path>`: mount a config value marked `secret: true` in the component’s config schema.
+* `config` or `config.<path>`: mount the component config (whole object or a path), including
+  paths marked `secret: true` in the component’s config schema.
 * `slots.<name>`: mount a storage slot as a directory. The referenced slot must exist and have
   `kind: "storage"`.
 * `framework.docker`: requires `experimental_features: ["docker"]`. In Docker Compose output, this
@@ -327,8 +354,7 @@ Mount value formatting:
 Notes:
 
 * Mount paths must be absolute and must not include `..`.
-* `secret.<path>` requires the path to be secret in the component’s config schema.
-* `config.<path>` must not reference secret values.
+* Secret-marked config is mounted with the same `config.<path>` syntax as any other config path.
 * `resources.<name>` mounts a storage resource owned by the same component.
 * `slots.<name>` mounts storage routed in from another component. Use a directory path such as
   `/var/lib/app`, not a single file path.
@@ -757,7 +783,7 @@ Amber does not interpret the contents. `metadata` is excluded from the manifest 
 
 ```json5
 {
-  manifest_version: "0.1.0",
+  manifest_version: "0.3.0",
   program: {
     image: "ghcr.io/acme/hello:v1",
     entrypoint: "--port 8080",
@@ -777,7 +803,7 @@ Because the component expects its **parent** to supply `llm`, the parent must bi
 
 ```json5
 {
-  manifest_version: "0.1.0",
+  manifest_version: "0.3.0",
   config_schema: {
     type: "object",
     properties: { domain: { type: "string" } },
@@ -805,7 +831,7 @@ This component:
 
 ```json5
 {
-  manifest_version: "0.1.0",
+  manifest_version: "0.3.0",
   program: {
     image: "docker.io/litellm/litellm:latest",
     network: {
@@ -833,7 +859,7 @@ When the program and the storage resource live on the same component, mount the 
 
 ```json5
 {
-  manifest_version: "0.1.0",
+  manifest_version: "0.3.0",
   resources: {
     app_state: {
       kind: "storage",
@@ -861,7 +887,7 @@ In this example, `a` and `b` both bind to each other. Marking one edge as `weak:
 
 ```json5
 {
-  manifest_version: "0.1.0",
+  manifest_version: "0.3.0",
   components: {
     a: "https://registry.example.org/a/v1",
     b: "https://registry.example.org/b/v1",

@@ -575,28 +575,15 @@ fn validate_mount_literal_path(path: &str) -> Result<(), Error> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProgramFileMountKind {
-    Config,
-    Secret,
-}
-
 fn validate_program_file_mount_source(
-    kind: ProgramFileMountKind,
     display_path: &str,
     literal_path: Option<&str>,
     config_schema: Option<&ConfigSchema>,
 ) -> Result<(), Error> {
     let Some(schema) = config_schema else {
-        return Err(match kind {
-            ProgramFileMountKind::Config => Error::InvalidMountConfigPath {
-                path: display_path.to_string(),
-                message: "component has no config_schema".to_string(),
-            },
-            ProgramFileMountKind::Secret => Error::InvalidMountSecretPath {
-                path: display_path.to_string(),
-                message: "component has no config_schema".to_string(),
-            },
+        return Err(Error::InvalidMountConfigPath {
+            path: display_path.to_string(),
+            message: "component has no config_schema".to_string(),
         });
     };
 
@@ -604,36 +591,10 @@ fn validate_program_file_mount_source(
         return Ok(());
     };
 
-    match kind {
-        ProgramFileMountKind::Config => {
-            validate_mount_path(&schema.0, path).map_err(|message| {
-                Error::InvalidMountConfigPath {
-                    path: path.to_string(),
-                    message,
-                }
-            })?;
-            let (any_secret, _) = mount_secret_flags(&schema.0, path)?;
-            if any_secret {
-                return Err(Error::MountConfigPathIsSecret {
-                    path: path.to_string(),
-                });
-            }
-        }
-        ProgramFileMountKind::Secret => {
-            validate_mount_path(&schema.0, path).map_err(|message| {
-                Error::InvalidMountSecretPath {
-                    path: path.to_string(),
-                    message,
-                }
-            })?;
-            let (any_secret, any_non_secret) = mount_secret_flags(&schema.0, path)?;
-            if !any_secret || any_non_secret {
-                return Err(Error::MountSecretPathIsNotSecret {
-                    path: path.to_string(),
-                });
-            }
-        }
-    }
+    validate_mount_path(&schema.0, path).map_err(|message| Error::InvalidMountConfigPath {
+        path: path.to_string(),
+        message,
+    })?;
 
     Ok(())
 }
@@ -673,23 +634,10 @@ fn validate_mounts(
             }
         }
 
-        if let Some(source) = mount.literal_source() {
-            match source {
+        if let Some(source) = mount.source.as_literal() {
+            match source.parse::<MountSource>()? {
                 MountSource::Config(path) => {
-                    validate_program_file_mount_source(
-                        ProgramFileMountKind::Config,
-                        &path,
-                        Some(&path),
-                        config_schema,
-                    )?;
-                }
-                MountSource::Secret(path) => {
-                    validate_program_file_mount_source(
-                        ProgramFileMountKind::Secret,
-                        &path,
-                        Some(&path),
-                        config_schema,
-                    )?;
+                    validate_program_file_mount_source(&path, Some(&path), config_schema)?;
                 }
                 MountSource::Resource(resource) => {
                     if !resources.contains_key(resource.as_str()) {
@@ -733,35 +681,6 @@ fn validate_mount_path(schema: &Value, path: &str) -> Result<(), String> {
         Ok(rc::SchemaLookup::Found) | Ok(rc::SchemaLookup::Unknown) => Ok(()),
         Err(err) => Err(err.to_string()),
     }
-}
-
-fn mount_secret_flags(schema: &Value, path: &str) -> Result<(bool, bool), Error> {
-    let walk = rc::collect_schema_leaves(schema);
-    let prefix = if path.is_empty() {
-        None
-    } else {
-        Some(format!("{path}."))
-    };
-
-    let mut any_secret = false;
-    let mut any_non_secret = false;
-
-    for leaf in walk.leaves {
-        let matches = match &prefix {
-            None => true,
-            Some(prefix) => leaf.path == path || leaf.path.starts_with(prefix),
-        };
-        if !matches {
-            continue;
-        }
-        if leaf.secret {
-            any_secret = true;
-        } else {
-            any_non_secret = true;
-        }
-    }
-
-    Ok((any_secret, any_non_secret))
 }
 
 impl RawManifest {

@@ -31,9 +31,10 @@ Dashboard UI: `http://127.0.0.1:18888`
 ## 2) Compile + start the scenario
 
 ```sh
-amber compile examples/observability-debug/scenario.json5   --docker-compose examples/observability-debug/amber-observability-debug.yaml
-
-COMPOSE_PROJECT_NAME=amberdemo docker compose -f examples/observability-debug/amber-observability-debug.yaml up -d
+OUT=/tmp/amber-observability-debug
+rm -rf "$OUT"
+amber compile examples/observability-debug/scenario.json5 --docker-compose "$OUT"
+COMPOSE_PROJECT_NAME=amberdemo docker compose -f "$OUT/compose.yaml" up -d
 ```
 
 If you are validating local framework changes, set `AMBER_DEV_IMAGE_TAGS` when you run `amber compile`. For this example, router-only changes need `router=<tag>`. If your changes affect provisioning or generated mesh config metadata, use `router=<tag>,provisioner=<tag>` so the provisioned sidecar config matches the runtime you are testing.
@@ -47,8 +48,9 @@ python3 examples/observability-debug/upstream-sse.py --port 38081
 ## 4) Wire the external slot and export (Terminal B)
 
 ```sh
-COMPOSE_PROJECT_NAME=amberdemo \
-amber proxy examples/observability-debug/amber-observability-debug.yaml \
+OUT=/tmp/amber-observability-debug
+amber proxy "$OUT" \
+  --project-name amberdemo \
   --slot ext_api=127.0.0.1:38081 \
   --export public=127.0.0.1:38080
 ```
@@ -162,8 +164,9 @@ curl -sS 'http://127.0.0.1:18888/api/telemetry/traces?resource=amber.amberdemo.b
 ## Cleanup
 
 ```sh
-COMPOSE_PROJECT_NAME=amberdemo docker compose -f examples/observability-debug/amber-observability-debug.yaml down -v
+OUT=/tmp/amber-observability-debug
+COMPOSE_PROJECT_NAME=amberdemo docker compose -f "$OUT/compose.yaml" down -v
 docker rm -f amber-dashboard >/dev/null 2>&1 || true
 pkill -f 'upstream-sse.py --port 38081' >/dev/null 2>&1 || true
-pkill -f 'amber proxy examples/observability-debug/amber-observability-debug.yaml' >/dev/null 2>&1 || true
+pkill -f 'amber proxy /tmp/amber-observability-debug' >/dev/null 2>&1 || true
 ```

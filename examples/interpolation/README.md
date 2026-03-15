@@ -32,10 +32,12 @@ What it demonstrates:
 ## Docker Compose loop
 
 ```sh
+OUT=/tmp/amber-interpolation
+rm -rf "$OUT"
 amber compile examples/interpolation/scenario.json5 \
-  --docker-compose /tmp/amber-interpolation.yaml
-docker compose -f /tmp/amber-interpolation.yaml up -d
-amber proxy /tmp/amber-interpolation.yaml \
+  --docker-compose "$OUT"
+docker compose -f "$OUT/compose.yaml" up -d
+amber proxy "$OUT" \
   --export with_upstreams=127.0.0.1:18080 \
   --export without_upstreams=127.0.0.1:18081
 curl http://127.0.0.1:18080
