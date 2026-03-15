@@ -16,7 +16,7 @@ attaches it. In practice, the clearest approach is usually to make the first bin
 
 ```json5
 bindings: [
-  { to: "#router.api", from: "self.api", weak: true },
+  { to: "#router.api", from: "slots.api", weak: true },
   { to: "#client.api", from: "#router.api" },
 ]
 ```

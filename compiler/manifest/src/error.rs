@@ -101,9 +101,13 @@ pub enum Error {
     #[diagnostic(code(manifest::invalid_vm_memory_mib))]
     InvalidVmMemoryMib,
 
-    #[error("export `{export}` references unknown capability `{target}`")]
+    #[error("export `{export}` references unknown {expected} `{target}`")]
     #[diagnostic(code(manifest::unknown_export_target))]
-    UnknownExportTarget { export: String, target: String },
+    UnknownExportTarget {
+        export: String,
+        target: String,
+        expected: &'static str,
+    },
 
     #[error("export `{export}` references unknown child `#{child}`")]
     #[diagnostic(code(manifest::unknown_export_child))]
@@ -132,9 +136,12 @@ pub enum Error {
     )]
     BindingTargetSelfSlot { slot: String },
 
-    #[error("binding source `self.{capability}` references unknown slot or provide")]
+    #[error("binding source `{reference}` references unknown {expected}")]
     #[diagnostic(code(manifest::unknown_binding_source))]
-    UnknownBindingSource { capability: String },
+    UnknownBindingSource {
+        reference: String,
+        expected: &'static str,
+    },
 
     #[error("binding source `resources.{resource}` references unknown resource")]
     #[diagnostic(code(manifest::unknown_binding_resource))]

@@ -165,7 +165,7 @@ fn proxy_accepts_llm_external_slot_bindings() {
     consumer: "./consumer.json5"
   },
   bindings: [
-    { to: "#consumer.llm", from: "self.llm", weak: true }
+    { to: "#consumer.llm", from: "slots.llm", weak: true }
   ],
   exports: {
     status: "#consumer.status"

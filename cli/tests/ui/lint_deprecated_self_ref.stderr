@@ -1,0 +1,25 @@
+manifest::deprecated_binding_self_source
+
+  x binding source `self.api` uses deprecated implicit local capability syntax (in component /)
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/lint_deprecated_self_ref.json5:19:31]
+ 18 |   bindings: [
+ 19 |     { to: "#child.api", from: "self.api" },
+    :                               ^^^^^|^^^^
+    :                                    `-- deprecated binding source
+ 20 |   ],
+    `----
+  help: warning treated as error because it was denied via `-D warnings`
+        Replace `self.api` with `provides.api`.
+manifest::deprecated_export_self_target
+
+  x export target `self.api` uses deprecated `self.*` syntax (in component /)
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/lint_deprecated_self_ref.json5:22:13]
+ 21 |   exports: {
+ 22 |     public: "self.api",
+    :             ^^^^^|^^^^
+    :                  `-- deprecated export target
+ 23 |   },
+    `----
+  help: warning treated as error because it was denied via `-D warnings`
+        Replace `self.api` with `provides.api`.
+Error:   × check failed

@@ -14,7 +14,7 @@
     router: "./router.json5",
   },
   bindings: [
-    { to: "#router.api", from: "self.api" },
+    { to: "#router.api", from: "provides.api" },
   ],
   exports: {
     api: "#router.api",

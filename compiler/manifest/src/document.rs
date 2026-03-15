@@ -178,8 +178,8 @@ fn labels_for_manifest_error(
         ManifestError::BindingTargetSelfSlot { slot } => {
             labels_for_binding_target_self(spans, slot)
         }
-        ManifestError::UnknownBindingSource { capability } => {
-            labels_for_unknown_binding_source(spans, capability)
+        ManifestError::UnknownBindingSource { reference, .. } => {
+            labels_for_unknown_binding_source(spans, reference)
         }
         ManifestError::UnknownBindingResource { resource } => {
             labels_for_unknown_binding_resource(spans, resource)
@@ -545,17 +545,15 @@ fn binding_span_or_default(
         .unwrap_or_else(default_span)
 }
 
-fn labels_for_unknown_binding_source(spans: &ManifestSpans, capability: &str) -> Vec<LabeledSpan> {
+fn labels_for_unknown_binding_source(spans: &ManifestSpans, source: &str) -> Vec<LabeledSpan> {
+    let expected = source.split_once('.').unwrap_or((source, ""));
     let span = binding_span_or_default(spans, |binding| {
-        if binding.capability_value.as_deref() == Some(capability) {
+        if binding.from_value.as_deref() == Some(expected.0)
+            && binding.capability_value.as_deref() == Some(expected.1)
+        {
             return binding.capability.or(binding.from).or(Some(binding.whole));
         }
-        if binding
-            .from_value
-            .as_deref()
-            .and_then(|from| from.strip_prefix("self."))
-            .is_some_and(|name| name == capability)
-        {
+        if binding.from_value.as_deref() == Some(source) {
             return binding.from.or(Some(binding.whole));
         }
         None

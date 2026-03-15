@@ -31,7 +31,7 @@ Minimal leaf component exporting an HTTP API:
   provides: {
     api: { kind: "http", endpoint: "http" },
   },
-  exports: { api: "api" },
+  exports: { api: "provides.api" },
 }
 ```
 
@@ -53,12 +53,17 @@ This crate **parses JSON5**, deserializes into Rust types, and validates:
   * export names (keys in `exports`)
   * child refs (`#<name>`) in bindings and export targets
 * A name cannot be declared in **both** `slots` and `provides`.
-* `exports` targets that point at `self` must refer to something declared in `slots` or `provides`.
+* `exports` targets that point at `slots` / `provides` must refer to something declared in those
+  sections.
+* Legacy `exports` targets that point at `self` are still accepted before 1.0, but they lint with
+  an explicit replacement.
 * `exports` targets that point at `#child` must refer to a declared child.
 * Binding references must be locally well-formed:
 
   * `to` must reference a child component (`#<child>`)
-  * `from: "self"` requires `capability` exist in `slots` or `provides`
+  * `from: "slots"` requires `capability` exist in `slots`
+  * `from: "provides"` requires `capability` exist in `provides`
+  * legacy `from: "self"` is still accepted before 1.0, but it lints with an explicit replacement
   * `from: "framework"` requires a known framework capability name
   * `#child` used in a binding must exist in `components`
 * `framework` is only valid as a binding source; it cannot appear in `to` or `exports`.
@@ -73,12 +78,12 @@ This crate also provides `manifest::lint::lint_manifest` for non-fatal checks:
 
   * **referenced by the program** (via `${slots.<name>...}` in `program.entrypoint` or `program.env`), or
   * **mounted by the program** (via `program.mounts: [{ from: "slots.<name>", ... }]` for storage slots), or
-  * **exported** (some export target points at `self.<name>` or `<name>`), or
-  * **used as a binding source from `self`** (some binding has `from: "self"` and `capability: "<name>"`)
+  * **exported** (some export target points at `slots.<name>`, or legacy `self.<name>` / `<name>`), or
+  * **used as a binding source from `slots`** (some binding has `from: "slots"` and `capability: "<name>"`, or legacy `from: "self"` for the same slot)
 * Every declared **provide** should be either:
 
-  * **exported** (some export target points at `self.<name>` or `<name>`), or
-  * **used as a binding source from `self`** (some binding has `from: "self"` and `capability: "<name>"`)
+  * **exported** (some export target points at `provides.<name>`, or legacy `self.<name>` / `<name>`), or
+  * **used as a binding source from `provides`** (some binding has `from: "provides"` and `capability: "<name>"`, or legacy `from: "self"` for the same provide)
 * If a **`program`** is declared, it should be referenced by a **provide binding or export** (otherwise the program is likely unused).
 * Resolver names in each environment should be unique.
 * `config_schema` properties should be referenced by `${config.*}` in `program` or in child `components.<name>.config` templates (unused properties are linted). If the schema contains `$ref` cycles or unresolvable refs, the unused-property lint is incomplete and a warning is emitted; unsupported schema features are rejected at parse time.
@@ -655,8 +660,8 @@ exports.
 
 ```json5
 exports: {
-  llm: "llm",
-  api: "self.api",
+  llm: "provides.llm",
+  api: "slots.api",
   tool: "#router.tool",
 }
 ```
@@ -666,10 +671,14 @@ Rules enforced:
 * Export names (keys) must not contain `.`.
 * Targets must be one of:
 
-  * `<name>` (shorthand for `self.<provide-or-slot>`)
-  * `self.<provide-or-slot>`
+  * `provides.<provide>`
+  * `slots.<slot>`
   * `#<child>.<export>`
-* Targets pointing at `self` must refer to a declared slot or provide.
+* Legacy `self.<provide-or-slot>` syntax is still accepted before 1.0, but it lints with an
+  explicit replacement.
+* Bare export shorthand like `<name>` is still accepted, but `provides.<name>` / `slots.<name>`
+  is the canonical spelling.
+* Targets pointing at `slots` / `provides` must refer to a declared slot or provide.
 * Targets pointing at `#child` must refer to a declared child.
 
 ---
@@ -681,10 +690,15 @@ export, or framework):
 
 `(<to>.<slot>) <- (<from>.<capability>)`
 
-Component refs (for component-sourced `from`):
+Component refs (for child-sourced `from`):
 
-* `"self"` for the current manifest
 * `"#<child>"` for a key in `components`
+
+Local capability refs (for current-manifest `from`):
+
+* `"slots"` for the current manifest's slots
+* `"provides"` for the current manifest's provides
+* legacy `"self"` is still accepted before 1.0, but it lints with an explicit replacement
 
 Framework refs (binding sources only):
 
@@ -695,7 +709,7 @@ Framework refs (binding sources only):
 normal child ref.
 
 To satisfy a child slot, create a binding with `to: "#<child>.<slot>"` and a source capability
-(`from: "self.<provide>"`, `from: "self.<slot>"`, `from: "resources.<name>"`, or
+(`from: "provides.<provide>"`, `from: "slots.<slot>"`, `from: "resources.<name>"`, or
 `from: "#<other>.<export>"`).
 
 Forwarding a slot to a child:
@@ -703,9 +717,9 @@ Forwarding a slot to a child:
 ```json5
 slots: { api: { kind: "http" } },
 bindings: [
-  { to: "#gateway.api", from: "self.api" },
+  { to: "#gateway.api", from: "slots.api" },
 ],
-exports: { public_api: "api" },
+exports: { public_api: "slots.api" },
 ```
 
 Bindings forms:
@@ -731,7 +745,9 @@ Bindings forms:
 Rules enforced by this crate:
 
 * `to` must reference a child (`#<child>`).
-* `from: "self"` requires `capability` exist in `slots` or `provides`.
+* `from: "slots"` requires `capability` exist in `slots`.
+* `from: "provides"` requires `capability` exist in `provides`.
+* Legacy `from: "self"` is still accepted before 1.0, but it lints with an explicit replacement.
 * `from: "resources"` requires the named resource exist in `resources`.
 * `from: "framework"` requires a known framework capability name (see below).
 * `framework` is only valid as a binding source; it cannot appear in `to` or `exports`.
@@ -792,7 +808,7 @@ Amber does not interpret the contents. `metadata` is excluded from the manifest 
   provides: {
     api: { kind: "http", endpoint: "http" },
   },
-  exports: { api: "api" },
+  exports: { api: "provides.api" },
 }
 ```
 
@@ -847,7 +863,7 @@ This component:
     admin_api: { kind: "http", endpoint: "admin" },
   },
   bindings: [
-    { to: "#wrapper.admin_api", from: "self.admin_api" },
+    { to: "#wrapper.admin_api", from: "provides.admin_api" },
   ],
   exports: { llm: "#wrapper.llm" },
 }

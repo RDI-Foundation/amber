@@ -103,6 +103,7 @@ pub struct ResourceParamsSpans {
 pub struct ExportSpans {
     pub name: SourceSpan,
     pub target: SourceSpan,
+    pub target_value: Option<Arc<str>>,
 }
 
 #[derive(Clone, Debug)]
@@ -539,11 +540,16 @@ fn collect_exports(root: &SpanCursor<'_>, root_obj: &Map<String, Value>, out: &m
     for (export_name, _export_value) in exports_obj {
         let name_span = key_span(root.source, exports.span, export_name);
         let target = span_or_default(exports.child_span(export_name));
+        let target_value = exports_obj
+            .get(export_name)
+            .and_then(|value| value.as_str())
+            .map(Into::into);
         out.exports.insert(
             export_name.as_str().into(),
             ExportSpans {
                 name: name_span,
                 target,
+                target_value,
             },
         );
     }

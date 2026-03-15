@@ -14,9 +14,9 @@ linker::slot_range_mismatch
   x slot range mismatch for `/child.api`: target accepts 0..1, source may provide 0..*
     ,-[<CARGO_MANIFEST_DIR>/tests/ui/slot_range_mismatch.json5:10:5]
   9 |   bindings: [
- 10 |     { to: "#child.api", from: "self.upstream" },
-    :     ^^^^^^^^^^^^^^^^^^^^^|^^^^^^^^^^^^^^^^^^^^^
-    :                          `-- binding forwards 0..* into slot accepting 0..1
+ 10 |     { to: "#child.api", from: "slots.upstream" },
+    :     ^^^^^^^^^^^^^^^^^^^^^^|^^^^^^^^^^^^^^^^^^^^^
+    :                           `-- binding forwards 0..* into slot accepting 0..1
  11 |   ],
     `----
   help: The target slot range must cover the source slot range. Adjust `optional`/`multiple` on the source or target slot so the forwarded fan-in is always valid.

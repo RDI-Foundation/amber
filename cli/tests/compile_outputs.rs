@@ -1479,7 +1479,7 @@ fn compile_compose_resolves_optional_slot_when_before_backend_emission() {
     api: { kind: "http", endpoint: "api" }
   },
   bindings: [
-    { to: "#child.api", from: "self.api" }
+    { to: "#child.api", from: "provides.api" }
   ],
   exports: {
     http: "#child.http"
@@ -4544,7 +4544,7 @@ fn compile_direct_preserves_authored_order_signal_for_mixed_source_repeated_slot
     upstream: { kind: "http", optional: true }
   },
   bindings: [
-    { to: "#consumer.upstream", from: "self.upstream", weak: true },
+    { to: "#consumer.upstream", from: "slots.upstream", weak: true },
     { to: "#consumer.upstream", from: "#provider.api" }
   ],
   exports: {
@@ -5038,7 +5038,7 @@ fn compile_direct_rejects_invalid_scenario_ir_before_backend_lowering() {
     client: "{}"
   }},
   bindings: [
-    {{ to: "#client.api", from: "self.api", weak: true }}
+    {{ to: "#client.api", from: "slots.api", weak: true }}
   ],
   exports: {{
     http: "#client.http"

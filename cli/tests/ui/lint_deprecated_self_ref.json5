@@ -5,20 +5,20 @@
     entrypoint: ["root"],
     network: {
       endpoints: [
-        { name: "http", port: 8080, protocol: "http" },
+        { name: "http", port: 80 },
       ],
     },
   },
   components: {
-    child: "./lint_required_slot_when_child.json5",
+    child: "./lint_deprecated_self_ref_child.json5",
   },
   provides: {
     api: { kind: "http", endpoint: "http" },
   },
   bindings: [
-    { to: "#child.api", from: "provides.api" },
+    { to: "#child.api", from: "self.api" },
   ],
   exports: {
-    api: "provides.api",
+    public: "self.api",
   },
 }
