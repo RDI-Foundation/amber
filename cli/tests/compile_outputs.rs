@@ -1041,6 +1041,138 @@ fn check_rejects_invalid_vm_scalar_config_ref() {
 }
 
 #[test]
+fn compile_compose_rejects_whole_config_program_image_ref() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("program-image-whole-config-check-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let manifest = outputs_dir.path().join("scenario.json5");
+    fs::write(
+        &manifest,
+        r##"{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      image: { type: "string" }
+    }
+  },
+  program: {
+    image: "${config}",
+    entrypoint: ["run"],
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    )
+    .expect("failed to write manifest");
+
+    let artifact_dir = outputs_dir.path().join("compose");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--docker-compose")
+        .arg(&artifact_dir)
+        .arg(&manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --docker-compose: {err}"));
+
+    assert!(
+        !output.status.success(),
+        "amber compile --docker-compose unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("program.image cannot reference the entire runtime config object"),
+        "expected whole-config image rejection in stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn compile_vm_rejects_whole_config_vm_image_ref() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("vm-image-whole-config-check-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let manifest = outputs_dir.path().join("scenario.json5");
+    fs::write(
+        &manifest,
+        r##"{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      image: { type: "string" }
+    }
+  },
+  program: {
+    vm: {
+      image: "${config}",
+      cpus: 1,
+      memory_mib: 512,
+      network: {
+        endpoints: [
+          { name: "http", port: 8080, protocol: "http" }
+        ],
+        egress: "none"
+      }
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    )
+    .expect("failed to write manifest");
+
+    let artifact_dir = outputs_dir.path().join("vm");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--vm")
+        .arg(&artifact_dir)
+        .arg(&manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --vm: {err}"));
+
+    assert!(
+        !output.status.success(),
+        "amber compile --vm unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("program.vm.image cannot reference the entire runtime config object"),
+        "expected whole-config vm image rejection in stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
 fn compile_direct_rejects_program_path_without_separator() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

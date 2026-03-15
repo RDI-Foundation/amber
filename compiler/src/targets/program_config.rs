@@ -1386,14 +1386,15 @@ fn resolve_config_query_for_program(
 
 fn resolve_program_image_runtime_node(
     node: &rc::ConfigNode,
+    field_name: &str,
 ) -> Result<ImageConfigResolution, MeshError> {
     match node {
         rc::ConfigNode::ConfigRef(path) => {
             if path.is_empty() {
-                return Err(MeshError::new(
-                    "program.image cannot reference the entire runtime config object; reference a \
-                     string leaf like ${config.image}",
-                ));
+                return Err(MeshError::new(format!(
+                    "{field_name} cannot reference the entire runtime config object; reference a \
+                     string leaf like ${{config.image}}"
+                )));
             }
             Ok(ImageConfigResolution::RuntimeTemplate(vec![
                 ProgramImagePart::RootConfigPath(path.clone()),
@@ -1410,10 +1411,10 @@ fn resolve_program_image_runtime_node(
                     }
                     TemplatePart::Config { config } => {
                         if config.is_empty() {
-                            return Err(MeshError::new(
-                                "program.image cannot reference the entire runtime config object; \
-                                 reference a string leaf like ${config.image}",
-                            ));
+                            return Err(MeshError::new(format!(
+                                "{field_name} cannot reference the entire runtime config object; \
+                                 reference a string leaf like ${{config.image}}"
+                            )));
                         }
                         out.push(ProgramImagePart::RootConfigPath(config.clone()));
                     }
@@ -1454,6 +1455,7 @@ fn resolve_program_image_runtime_node(
 fn resolve_config_query_for_program_image(
     component_config: &ComponentConfigAnalysis,
     query: &str,
+    field_name: &str,
 ) -> Result<ImageConfigResolution, MeshError> {
     match component_config
         .resolve_runtime_value_source(query)
@@ -1463,11 +1465,17 @@ fn resolve_config_query_for_program_image(
             rc::stringify_for_interpolation(&value).map_err(|e| MeshError::new(e.to_string()))?,
         )),
         RuntimeValueSource::RuntimeRootPath(path) => {
+            if path.is_empty() {
+                return Err(MeshError::new(format!(
+                    "{field_name} cannot reference the entire runtime config object; reference a \
+                     string leaf like ${{config.image}}"
+                )));
+            }
             Ok(ImageConfigResolution::RuntimeTemplate(vec![
                 ProgramImagePart::RootConfigPath(path),
             ]))
         }
-        RuntimeValueSource::RuntimeNode(cur) => resolve_program_image_runtime_node(cur),
+        RuntimeValueSource::RuntimeNode(cur) => resolve_program_image_runtime_node(cur, field_name),
     }
 }
 
@@ -2223,7 +2231,11 @@ fn build_program_plan(
                             push_image_literal(&mut image_parts, value);
                             continue;
                         }
-                        match resolve_config_query_for_program_image(component_config, query)? {
+                        match resolve_config_query_for_program_image(
+                            component_config,
+                            query,
+                            "program.image",
+                        )? {
                             ImageConfigResolution::Static(value) => {
                                 push_image_literal(&mut image_parts, value);
                             }
@@ -2392,7 +2404,11 @@ fn build_program_plan(
                             push_image_literal(&mut image_parts, value);
                             continue;
                         }
-                        match resolve_config_query_for_program_image(component_config, query)? {
+                        match resolve_config_query_for_program_image(
+                            component_config,
+                            query,
+                            "program.vm.image",
+                        )? {
                             ImageConfigResolution::Static(value) => {
                                 push_image_literal(&mut image_parts, value);
                             }

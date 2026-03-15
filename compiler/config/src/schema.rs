@@ -601,7 +601,11 @@ pub fn collect_leaf_paths(schema: &Value) -> Result<Vec<SchemaLeaf>> {
         )?;
     }
     let defaults = collect_schema_defaults(schema)?;
-    Ok(finalize_leaves(out, defaults.as_ref()))
+    let mut leaves = finalize_leaves(out, defaults.as_ref());
+    for leaf in &mut leaves {
+        leaf.required = schema_path_is_required(schema, &leaf.path)?;
+    }
+    Ok(leaves)
 }
 
 pub fn apply_schema_defaults(schema: &Value, value: &mut Value) -> Result<()> {
@@ -1117,6 +1121,12 @@ enum RequiredLookup {
     Missing,
 }
 
+#[derive(Default)]
+struct RequiredChildLookup<'a> {
+    children: Vec<&'a Value>,
+    required_here: bool,
+}
+
 pub fn schema_path_is_required(root_schema: &Value, path: &str) -> Result<bool> {
     if path.is_empty() {
         return Ok(true);
@@ -1153,52 +1163,83 @@ fn lookup_required(
     visited: &mut BTreeSet<String>,
     full_path: &str,
 ) -> Result<RequiredLookup> {
-    let schema = resolve_schema_ref(schema, root, visited)?;
-    ensure_schema_supported(schema)?;
-
     let seg = segments[0];
     let rest = &segments[1..];
+    let Some(child_lookup) = lookup_required_children(schema, root, seg, visited, full_path)?
+    else {
+        return Ok(RequiredLookup::Missing);
+    };
+    if child_lookup.children.is_empty() {
+        return Ok(RequiredLookup::Missing);
+    }
 
-    if let Some(props) = schema_properties(schema)
-        && let Some(child) = props.get(seg)
-    {
-        let required_here = required_so_far && schema_required_set(schema).contains_key(seg);
-        if rest.is_empty() {
-            return Ok(RequiredLookup::Found(required_here));
-        }
+    let required_here = required_so_far && child_lookup.required_here;
+    if rest.is_empty() {
+        return Ok(RequiredLookup::Found(required_here));
+    }
+
+    for child in &child_lookup.children {
         if schema_type_includes(child, "array") {
             return Err(ConfigError::schema(format!(
                 "cannot descend into array schema at segment {seg:?} for path {full_path:?}"
             )));
         }
-        return lookup_required(child, root, rest, required_here, visited, full_path);
+    }
+
+    let merged_child = merge_all_of_children(child_lookup.children);
+    lookup_required(&merged_child, root, rest, required_here, visited, full_path)
+}
+
+fn lookup_required_children<'a>(
+    schema: &'a Value,
+    root: &'a Value,
+    segment: &str,
+    visited: &mut BTreeSet<String>,
+    _full_path: &str,
+) -> Result<Option<RequiredChildLookup<'a>>> {
+    let schema = resolve_schema_ref(schema, root, visited)?;
+    ensure_schema_supported(schema)?;
+
+    let mut out = RequiredChildLookup::default();
+    out.required_here |= schema_required_set(schema).contains_key(segment);
+
+    if let Some(props) = schema_properties(schema)
+        && let Some(child) = props.get(segment)
+    {
+        out.children.push(child);
     }
 
     if let Some(all_of) = schema.get("allOf").and_then(Value::as_array) {
-        let mut found = false;
-        let mut required = false;
         for subschema in all_of {
-            match lookup_required(
-                subschema,
-                root,
-                segments,
-                required_so_far,
-                visited,
-                full_path,
-            )? {
-                RequiredLookup::Found(subschema_required) => {
-                    found = true;
-                    required |= subschema_required;
-                }
-                RequiredLookup::Missing => {}
+            if let Some(sub_lookup) =
+                lookup_required_children(subschema, root, segment, visited, _full_path)?
+            {
+                out.required_here |= sub_lookup.required_here;
+                out.children.extend(sub_lookup.children);
             }
-        }
-        if found {
-            return Ok(RequiredLookup::Found(required));
         }
     }
 
-    Ok(RequiredLookup::Missing)
+    if out.children.is_empty() && !out.required_here {
+        Ok(None)
+    } else {
+        Ok(Some(out))
+    }
+}
+
+fn merge_all_of_children(children: Vec<&Value>) -> Value {
+    match children.as_slice() {
+        [] => Value::Object(Map::new()),
+        [child] => (*child).clone(),
+        _ => {
+            let mut merged = Map::new();
+            merged.insert(
+                "allOf".to_string(),
+                Value::Array(children.into_iter().cloned().collect()),
+            );
+            Value::Object(merged)
+        }
+    }
 }
 
 pub fn schema_path_presence(root_schema: &Value, path: &str) -> Result<SchemaPresence> {
@@ -1918,5 +1959,62 @@ mod tests {
             schema_path_presence(&schema, "settings.mode").unwrap(),
             SchemaPresence::Runtime
         );
+    }
+
+    #[test]
+    fn schema_path_is_required_combines_all_of_required_constraints_across_levels() {
+        let schema = json!({
+            "type": "object",
+            "allOf": [
+                {
+                    "required": ["settings"]
+                },
+                {
+                    "properties": {
+                        "settings": {
+                            "type": "object",
+                            "required": ["mode"],
+                            "properties": {
+                                "mode": { "type": "string" }
+                            }
+                        }
+                    }
+                }
+            ]
+        });
+
+        assert!(schema_path_is_required(&schema, "settings").unwrap());
+        assert!(schema_path_is_required(&schema, "settings.mode").unwrap());
+    }
+
+    #[test]
+    fn collect_leaf_paths_combines_all_of_required_constraints_across_levels() {
+        let schema = json!({
+            "type": "object",
+            "allOf": [
+                {
+                    "required": ["settings"]
+                },
+                {
+                    "properties": {
+                        "settings": {
+                            "type": "object",
+                            "required": ["mode"],
+                            "properties": {
+                                "mode": { "type": "string" }
+                            }
+                        }
+                    }
+                }
+            ]
+        });
+
+        let leaves = collect_leaf_paths(&schema).expect("collect leaf paths");
+        let by_path = leaves
+            .into_iter()
+            .map(|leaf| (leaf.path.clone(), leaf))
+            .collect::<BTreeMap<_, _>>();
+
+        assert!(by_path["settings.mode"].required);
     }
 }
