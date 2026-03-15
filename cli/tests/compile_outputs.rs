@@ -1927,7 +1927,7 @@ fn compile_primary_output_preserves_forwarded_root_runtime_mount_condition() {
 }
 
 #[test]
-fn check_rejects_forwarded_root_condition_hidden_behind_nullable_ancestor() {
+fn check_accepts_forwarded_root_defaulted_leaf_under_nullable_ancestor() {
     let outputs_dir = cli_test_outputs_dir("forwarded-root-nullable-endpoint-");
 
     let worker_manifest = outputs_dir.path().join("worker.json5");
@@ -2003,18 +2003,10 @@ fn check_rejects_forwarded_root_condition_hidden_behind_nullable_ancestor() {
         .unwrap_or_else(|err| panic!("failed to run amber check: {err}"));
 
     assert!(
-        !output.status.success(),
-        "amber check unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        output.status.success(),
+        "amber check failed unexpectedly\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(
-            "depends on runtime config, but endpoints must resolve entirely at compile time"
-        ),
-        "expected runtime-dependent endpoint error, got:\n{stderr}"
     );
 }
 
@@ -2240,6 +2232,118 @@ fn check_rejects_forwarded_object_default_condition_hidden_behind_non_object_for
       manifest: "./bridge.json5",
       config: {
         bridge_settings: "${config.settings}"
+      }
+    }
+  },
+  exports: {
+    http: "#bridge.http"
+  }
+}
+"##,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("check")
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber check: {err}"));
+
+    assert!(
+        !output.status.success(),
+        "amber check unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "depends on runtime config, but endpoints must resolve entirely at compile time"
+        ),
+        "expected runtime-dependent endpoint error, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn check_rejects_forwarded_null_only_leaf_condition_even_with_component_default() {
+    let outputs_dir = cli_test_outputs_dir("forwarded-null-only-endpoint-");
+
+    let worker_manifest = outputs_dir.path().join("worker.json5");
+    let bridge_manifest = outputs_dir.path().join("bridge.json5");
+    let root_manifest = outputs_dir.path().join("root.json5");
+
+    write_fixture(
+        &worker_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      child_enabled: { type: "string", default: "enabled" }
+    }
+  },
+  program: {
+    image: "busybox:stable",
+    entrypoint: ["sh", "-lc", "sleep infinity"],
+    network: {
+      endpoints: [
+        {
+          name: "http",
+          port: 8080,
+          protocol: "http",
+          when: "config.child_enabled"
+        }
+      ]
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &bridge_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      bridge_enabled: { type: "null" }
+    }
+  },
+  components: {
+    worker: {
+      manifest: "./worker.json5",
+      config: {
+        child_enabled: "${config.bridge_enabled}"
+      }
+    }
+  },
+  exports: {
+    http: "#worker.http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      root_enabled: { type: "null" }
+    }
+  },
+  components: {
+    bridge: {
+      manifest: "./bridge.json5",
+      config: {
+        bridge_enabled: "${config.root_enabled}"
       }
     }
   },
@@ -3468,6 +3572,175 @@ fn compile_direct_preserves_multi_hop_forwarded_config_each_runtime_and_scope() 
     assert_eq!(
         allowed_root_leaf_paths,
         vec!["env_values".to_string(), "extra_args".to_string()]
+    );
+}
+
+#[test]
+fn compile_direct_preserves_forwarded_null_overridable_config_each_runtime_and_scope() {
+    let outputs_dir = cli_test_outputs_dir("forwarded-null-only-config-each-direct-");
+
+    let worker_manifest = outputs_dir.path().join("worker.json5");
+    let bridge_manifest = outputs_dir.path().join("bridge.json5");
+    let root_manifest = outputs_dir.path().join("root.json5");
+
+    write_fixture(
+        &worker_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      items: {
+        type: ["array", "null"],
+        items: { type: "string" },
+        default: ["alpha", "beta"]
+      }
+    }
+  },
+  program: {
+    path: "/usr/bin/env",
+    args: [
+      "worker",
+      {
+        each: "config.items",
+        arg: "${item}"
+      }
+    ],
+    env: {
+      ITEMS: {
+        each: "config.items",
+        value: "${item}",
+        join: ","
+      }
+    },
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &bridge_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      bridge_items: { type: "null" }
+    }
+  },
+  components: {
+    worker: {
+      manifest: "./worker.json5",
+      config: {
+        items: "${config.bridge_items}"
+      }
+    }
+  },
+  exports: {
+    http: "#worker.http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      root_items: { type: "null" }
+    }
+  },
+  components: {
+    bridge: {
+      manifest: "./bridge.json5",
+      config: {
+        bridge_items: "${config.root_items}"
+      }
+    }
+  },
+  exports: {
+    http: "#bridge.http"
+  }
+}
+"##,
+    );
+
+    let direct_out = outputs_dir.path().join("direct");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&direct_out)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    assert!(
+        output.status.success(),
+        "amber compile --direct failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan = parse_json_file(&direct_out.join("direct-plan.json"));
+    let worker = find_component(&plan, "/bridge/worker");
+    let execution = &worker["program"]["execution"];
+    assert_eq!(
+        execution["kind"].as_str(),
+        Some("helper_runner"),
+        "{worker:#}"
+    );
+
+    let template_spec = decode_template_spec(
+        execution["template_spec_b64"]
+            .as_str()
+            .expect("forwarded null-overridable config each should emit a template spec"),
+    );
+    assert_eq!(
+        template_spec.program.entrypoint,
+        vec![
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("/usr/bin/env")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("worker")]),
+            ProgramArgTemplate::Repeated(RepeatedProgramArgTemplate {
+                when: None,
+                each: RepeatedTemplateSource::Config {
+                    path: "items".to_string()
+                },
+                arg: Some(vec![TemplatePart::current_item("")]),
+                argv: Vec::new(),
+                join: None,
+            }),
+        ]
+    );
+    assert_eq!(
+        template_spec.program.env.get("ITEMS"),
+        Some(&ProgramEnvTemplate::Repeated(RepeatedProgramEnvTemplate {
+            when: None,
+            each: RepeatedTemplateSource::Config {
+                path: "items".to_string()
+            },
+            value: vec![TemplatePart::current_item("")],
+            join: ",".to_string(),
+        }))
+    );
+
+    let allowed_root_leaf_paths = execution["runtime_config"]["allowed_root_leaf_paths"]
+        .as_array()
+        .expect("runtime helper should scope root config");
+    assert_eq!(
+        allowed_root_leaf_paths,
+        &vec![Value::String("root_items".to_string())]
     );
 }
 

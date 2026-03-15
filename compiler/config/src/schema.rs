@@ -1011,6 +1011,14 @@ pub fn schema_path_accepts_null(root_schema: &Value, path: &str) -> Result<bool>
     Ok(schema_path_possible_kinds(root_schema, path)?.null)
 }
 
+pub fn schema_path_may_be_object(root_schema: &Value, path: &str) -> Result<bool> {
+    Ok(schema_path_possible_kinds(root_schema, path)?.object)
+}
+
+pub fn schema_path_may_be_other_non_null(root_schema: &Value, path: &str) -> Result<bool> {
+    Ok(schema_path_possible_kinds(root_schema, path)?.other_non_null)
+}
+
 pub fn schema_path_may_accept_non_null(root_schema: &Value, path: &str) -> Result<bool> {
     Ok(schema_path_possible_kinds(root_schema, path)?.may_accept_non_null())
 }
@@ -1109,7 +1117,7 @@ enum RequiredLookup {
     Missing,
 }
 
-fn schema_path_is_required(root_schema: &Value, path: &str) -> Result<bool> {
+pub fn schema_path_is_required(root_schema: &Value, path: &str) -> Result<bool> {
     if path.is_empty() {
         return Ok(true);
     }
