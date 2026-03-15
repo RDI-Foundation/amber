@@ -154,11 +154,14 @@ fn compile_output_with_manifest_overrides(
             .collect(),
     };
 
+    let config_analysis = crate::config::analysis::ScenarioConfigAnalysis::from_scenario(&scenario)
+        .expect("config analysis");
     crate::CompileOutput {
         scenario,
         store,
         provenance,
         diagnostics: Vec::new(),
+        config_analysis,
     }
 }
 

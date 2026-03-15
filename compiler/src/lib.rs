@@ -141,12 +141,15 @@ impl Compiler {
             &self.store,
             mir::OptimizeOptions { dce: opts.dce },
         )?;
+        let config_analysis = config::analysis::ScenarioConfigAnalysis::from_scenario(&scenario)
+            .expect("linked scenario should produce valid config analysis");
 
         Ok(CompileOutput {
             scenario,
             store: self.store.clone(),
             provenance,
             diagnostics,
+            config_analysis,
         })
     }
 
@@ -212,9 +215,14 @@ pub struct CompileOutput {
     pub store: DigestStore,
     pub provenance: Provenance,
     pub diagnostics: Vec<Report>,
+    pub(crate) config_analysis: config::analysis::ScenarioConfigAnalysis,
 }
 
 impl CompileOutput {
+    pub(crate) fn config_analysis(&self) -> &config::analysis::ScenarioConfigAnalysis {
+        &self.config_analysis
+    }
+
     pub fn manifest_for_component(&self, id: ComponentId) -> Option<Arc<Manifest>> {
         let component = self.scenario.components.get(id.0)?.as_ref()?;
         self.store.get(&component.digest)

@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::{
-    config::templates,
     reporter::{
         CompiledScenario, Reporter, ReporterError,
         execution_guide::{
@@ -241,6 +240,7 @@ fn render_vm(compiled: &CompiledScenario) -> Result<VmArtifact, MeshError> {
     let address_plan = build_address_plan(&mesh_plan, addressing)?;
     let config_plan = build_config_plan(
         scenario,
+        compiled.config_analysis(),
         program_components,
         ProgramSupport::Vm {
             backend_label: "vm output",
@@ -404,15 +404,7 @@ fn build_component_plans(
         program_components,
         slot_values_by_component,
     } = inputs;
-
-    let composed = templates::compose_root_config_templates(scenario.root, &scenario.components);
-    if let Some(err) = composed.errors.first() {
-        return Err(MeshError::new(format!(
-            "failed to compose component config templates: {}",
-            err.message
-        )));
-    }
-    let resolved_templates = composed.templates;
+    let config_analysis = compiled.config_analysis();
 
     let mut out = Vec::with_capacity(program_components.len());
     for id in program_components {
@@ -436,13 +428,12 @@ fn build_component_plans(
                 component_label(scenario, *id)
             ))
         })?;
-        let component_template = resolved_templates.get(id).ok_or_else(|| {
+        let component_config = config_analysis.component(*id).ok_or_else(|| {
             MeshError::new(format!(
-                "internal error: missing config template for {}",
+                "internal error: missing config analysis for {}",
                 component.moniker.as_str()
             ))
         })?;
-        let template_opt = component_template.node();
         let slots = slot_values_by_component.get(id).ok_or_else(|| {
             MeshError::new(format!(
                 "internal error: missing slot values for {}",
@@ -457,7 +448,7 @@ fn build_component_plans(
                 program.cloud_init.user_data.as_deref(),
                 RuntimeAddressResolution::Deferred,
                 slots,
-                template_opt,
+                component_config,
             )?);
         let (cloud_init_vendor_data, vendor_data_needs_runtime_config) =
             build_vm_template_string_plan(build_vm_cloud_init_template_string(
@@ -467,7 +458,7 @@ fn build_component_plans(
                 program.cloud_init.vendor_data.as_deref(),
                 RuntimeAddressResolution::Deferred,
                 slots,
-                template_opt,
+                component_config,
             )?);
         let cloud_init_needs_runtime_config =
             user_data_needs_runtime_config || vendor_data_needs_runtime_config;
@@ -509,13 +500,13 @@ fn build_component_plans(
             mesh_config_path: mesh_config_relative_path(&names.mesh_dir),
             mesh_identity_path: mesh_identity_relative_path(&names.mesh_dir),
             cpus: build_vm_scalar_plan(resolve_vm_scalar_u32(
-                template_opt,
+                component_config,
                 &program.cpus,
                 component.moniker.as_str(),
                 "program.vm.cpus",
             )?),
             memory_mib: build_vm_scalar_plan(resolve_vm_scalar_u32(
-                template_opt,
+                component_config,
                 &program.memory_mib,
                 component.moniker.as_str(),
                 "program.vm.memory_mib",

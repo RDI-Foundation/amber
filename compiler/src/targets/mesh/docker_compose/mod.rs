@@ -19,6 +19,7 @@ use framework_docker_injection::{
 };
 
 use crate::{
+    config::analysis::ScenarioConfigAnalysis,
     reporter::{
         CompiledScenario, Reporter, ReporterError,
         execution_guide::{
@@ -450,11 +451,13 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
         provisioner_mounts.push((volume, mount_dir));
     }
     let needs_provisioner = !provisioner_mounts.is_empty();
+    let config_analysis = ScenarioConfigAnalysis::from_scenario(s).map_err(dc_other)?;
 
     // Compose YAML
     // ---- runtime config / helper decision ----
     let config_plan = build_config_plan(
         s,
+        &config_analysis,
         program_components,
         ProgramSupport::Image {
             backend_label: "docker-compose output",

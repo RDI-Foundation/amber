@@ -28,12 +28,12 @@ use serde_json::Value;
 use thiserror::Error;
 
 use self::program_lowering::{
-    ProgramLoweringError, ProgramLoweringSite, lower_program_with_origins_and_root_schema,
+    ProgramLoweringError, ProgramLoweringSite, lower_program_with_config_analysis,
     validate_lowered_program_mounts,
 };
 use crate::{
     DigestStore,
-    config::{query::render_static_config_string, templates},
+    config::analysis::ScenarioConfigAnalysis,
     frontend::{ResolvedNode, ResolvedTree, store::display_url},
 };
 
@@ -932,7 +932,7 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
     let mut schema_cache: HashMap<ManifestDigest, Arc<Validator>> = HashMap::new();
     let mut errors = Vec::new();
 
-    let composed = validate_config_tree(
+    let config_analysis = validate_config_tree(
         root,
         &components,
         &manifests,
@@ -944,7 +944,7 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
     resolve_resource_params(
         &mut components,
         &manifests,
-        &composed,
+        &config_analysis,
         &provenance,
         store,
         &mut errors,
@@ -972,16 +972,8 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         let Some(program) = manifest.program() else {
             continue;
         };
-        let template_opt = composed
-            .templates
-            .get(&id)
-            .and_then(rc::RootConfigTemplate::node);
-        match lower_program_with_origins_and_root_schema(
-            id,
-            program,
-            template_opt,
-            manifest.config_schema().map(|schema| &schema.0),
-        ) {
+        let component_config = config_analysis.expect_component(id);
+        match lower_program_with_config_analysis(id, program, component_config) {
             Ok(lowered) => {
                 if let Err(program_errors) = validate_lowered_program_mounts(
                     &lowered.program,
@@ -1328,7 +1320,7 @@ fn validate_config_tree(
     store: &DigestStore,
     schema_cache: &mut HashMap<ManifestDigest, Arc<Validator>>,
     errors: &mut Vec<Error>,
-) -> templates::ComposedTemplates {
+) -> ScenarioConfigAnalysis {
     fn invalid_config_error(
         component_path: String,
         site: &ConfigSite,
@@ -1698,9 +1690,10 @@ fn validate_config_tree(
         validate_resource_config_refs(id, components, manifests, provenance, store, schema, errors);
     }
 
-    let composed = templates::compose_root_config_templates(root, components);
+    let analysis = ScenarioConfigAnalysis::from_components(root, components)
+        .expect("validated component tree should produce config analysis");
 
-    for err in &composed.errors {
+    for err in analysis.template_errors() {
         let component_path = component_path_for(components, err.component);
         let site = ConfigErrorSite::new(components, provenance, store, err.component).config_site();
         errors.push(invalid_config_error(
@@ -1733,7 +1726,7 @@ fn validate_config_tree(
             continue;
         };
 
-        let template = composed.templates.get(&id).expect("template should exist");
+        let template = analysis.expect_component(id).template();
         let rc::RootConfigTemplate::Node(composed) = template else {
             // Root config is a runtime input when schema exists.
             continue;
@@ -1803,19 +1796,22 @@ fn validate_config_tree(
             }
         }
     }
-    composed
+    analysis
 }
 
 fn resolve_resource_params(
     components: &mut [Option<Component>],
     manifests: &[Option<Arc<Manifest>>],
-    composed: &templates::ComposedTemplates,
+    config_analysis: &ScenarioConfigAnalysis,
     provenance: &Provenance,
     store: &DigestStore,
     errors: &mut Vec<Error>,
 ) {
-    let components_with_template_errors: HashSet<ComponentId> =
-        composed.errors.iter().map(|err| err.component).collect();
+    let components_with_template_errors: HashSet<ComponentId> = config_analysis
+        .template_errors()
+        .iter()
+        .map(|err| err.component)
+        .collect();
 
     for id in (0..components.len()).map(ComponentId) {
         if components[id.0].is_none() {
@@ -1824,14 +1820,8 @@ fn resolve_resource_params(
         let manifest = manifests[id.0].as_ref().expect("manifest should exist");
         let component_path = component_path_for(components, id);
         let site = ConfigErrorSite::new(components, provenance, store, id);
-        let template = (!components_with_template_errors.contains(&id))
-            .then(|| {
-                composed
-                    .templates
-                    .get(&id)
-                    .and_then(rc::RootConfigTemplate::node)
-            })
-            .flatten();
+        let component_config = (!components_with_template_errors.contains(&id))
+            .then(|| config_analysis.expect_component(id));
         let mut resolved_resources = BTreeMap::new();
 
         for (resource_name, resource) in manifest.resources() {
@@ -1858,7 +1848,10 @@ fn resolve_resource_params(
                     {
                         return;
                     }
-                    match render_static_config_string(value, template) {
+                    let Some(component_config) = component_config else {
+                        return;
+                    };
+                    match component_config.render_static_string(value) {
                         Ok(rendered) => *out = Some(rendered),
                         Err(err) => {
                             let param_site = site

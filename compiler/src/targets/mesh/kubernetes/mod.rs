@@ -288,6 +288,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
 
     let config_plan = build_config_plan(
         s,
+        compiled.config_analysis(),
         program_components,
         ProgramSupport::Image {
             backend_label: "kubernetes output",

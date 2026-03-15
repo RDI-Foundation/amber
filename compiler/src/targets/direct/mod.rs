@@ -247,6 +247,7 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
     let address_plan = build_address_plan(&mesh_plan, addressing)?;
     let config_plan = build_config_plan(
         scenario,
+        compiled.config_analysis(),
         program_components,
         ProgramSupport::Path {
             backend_label: "direct output",
