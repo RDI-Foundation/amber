@@ -7,8 +7,12 @@
     type: "object",
     properties: {
       api_key: { type: "string" },
+      system_prompt: {
+        type: "string",
+        default: "You are an agent.",
+      },
     },
-    required: ["api_key"],
+    required: ["api_key", "system_prompt"],
     additionalProperties: false,
   },
 
@@ -18,8 +22,8 @@
       config: {
         // Forward the externally supplied root config into the child's config object.
         api_key: "${config.api_key}",
-        // Static parent-authored config stays compiled into the child config template.
-        system_prompt: "You are an agent.",
+        // Defaults on the root config schema are materialized before the child config is rendered.
+        system_prompt: "${config.system_prompt}",
       },
     },
   },

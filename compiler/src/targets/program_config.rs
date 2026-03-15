@@ -23,13 +23,9 @@ use serde_json::Value;
 
 use crate::{
     config::{
-        query::{
-            ConfigEachResolution, ConfigPresence, QueryResolution,
-            resolve_config_each_values as resolve_shared_config_each_values,
-            resolve_config_presence, resolve_config_query_node, validate_config_query_syntax,
-        },
-        scope::{RuntimeConfigView, build_runtime_config_view},
-        templates,
+        analysis::{ComponentConfigAnalysis, RuntimeValueSource, ScenarioConfigAnalysis},
+        query::{ConfigEachResolution, ConfigPresence},
+        scope::RuntimeConfigView,
     },
     slots::{
         SlotObject, SlotTarget, SlotValue, parse_slot_query, resolve_slot_query,
@@ -218,48 +214,27 @@ pub(crate) struct ComponentRuntimePlan<'a> {
     pub(crate) execution: ComponentExecutionPlan<'a>,
 }
 
-fn compose_component_config_templates(
-    scenario: &Scenario,
-) -> Result<HashMap<ComponentId, rc::RootConfigTemplate>, MeshError> {
-    let composed = templates::compose_root_config_templates(scenario.root, &scenario.components);
-    if let Some(err) = composed.errors.first() {
-        return Err(MeshError::new(format!(
-            "failed to compose component config templates: {}",
-            err.message
-        )));
-    }
-    Ok(composed.templates)
-}
-
 pub(crate) fn build_config_plan(
     scenario: &Scenario,
+    config_analysis: &ScenarioConfigAnalysis,
     program_components: &[ComponentId],
     program_support: ProgramSupport,
     runtime_address_resolution: RuntimeAddressResolution,
     slot_values_by_component: &HashMap<ComponentId, BTreeMap<String, SlotValue>>,
 ) -> Result<ConfigPlan, MeshError> {
-    let resolved_templates = compose_component_config_templates(scenario)?;
+    if let Some(err) = config_analysis.template_errors().first() {
+        return Err(MeshError::new(format!(
+            "failed to compose component config templates: {}",
+            err.message
+        )));
+    }
 
-    let root_schema = scenario
-        .component(scenario.root)
-        .config_schema
-        .as_ref()
-        .cloned();
-
-    let root_leaves = if let Some(schema) = &root_schema {
-        rc::collect_leaf_paths(schema).map_err(|e| {
-            MeshError::new(format!(
-                "failed to enumerate root config definition leaf paths: {e}"
-            ))
-        })?
-    } else {
-        Vec::new()
-    };
+    let root_leaves = config_analysis.root_leaves().to_vec();
     let root_leaf_paths: BTreeSet<&str> =
         root_leaves.iter().map(|leaf| leaf.path.as_str()).collect();
 
     let mut program_plans = HashMap::new();
-    let mut vm_cloud_init_paths_by_component = HashMap::new();
+    let mut vm_runtime_paths_by_component = HashMap::new();
     let mut needs_helper = false;
     let mut needs_runtime_config = false;
 
@@ -273,15 +248,12 @@ pub(crate) fn build_config_plan(
                 component_label(scenario, *id)
             ))
         })?;
-        let component_template = resolved_templates.get(id).ok_or_else(|| {
+        let component_config = config_analysis.component(*id).ok_or_else(|| {
             MeshError::new(format!(
-                "no config template for component {}",
+                "no config analysis for component {}",
                 component_label(scenario, *id)
             ))
         })?;
-        let template_opt = component_template.node();
-
-        let component_schema = scenario.component(*id).config_schema.as_ref().cloned();
 
         let plan = build_program_plan(
             scenario,
@@ -290,8 +262,7 @@ pub(crate) fn build_config_plan(
             program_support,
             runtime_address_resolution,
             slots,
-            template_opt,
-            component_schema.as_ref(),
+            component_config,
         )?;
         if matches!(plan, ProgramPlan::Helper { .. }) {
             needs_helper = true;
@@ -320,10 +291,22 @@ pub(crate) fn build_config_plan(
         collect_vm_scalar_runtime_paths(
             program,
             &component_label(scenario, *id),
-            template_opt,
+            component_config,
             &mut vm_scalar_paths,
         )?;
         if !vm_scalar_paths.is_empty() {
+            needs_runtime_config = true;
+        }
+        let mut vm_image_paths = BTreeSet::new();
+        collect_vm_image_runtime_paths(
+            scenario,
+            *id,
+            program,
+            slots,
+            component_config,
+            &mut vm_image_paths,
+        )?;
+        if !vm_image_paths.is_empty() {
             needs_runtime_config = true;
         }
         let mut vm_cloud_init_paths = BTreeSet::new();
@@ -332,21 +315,24 @@ pub(crate) fn build_config_plan(
             *id,
             program,
             slots,
-            template_opt,
+            component_config,
             &mut vm_cloud_init_paths,
         )?;
         if !vm_cloud_init_paths.is_empty() {
             needs_runtime_config = true;
         }
-        vm_cloud_init_paths_by_component.insert(*id, vm_cloud_init_paths);
+        let mut vm_runtime_paths = vm_scalar_paths;
+        vm_runtime_paths.extend(vm_image_paths);
+        vm_runtime_paths.extend(vm_cloud_init_paths);
+        vm_runtime_paths_by_component.insert(*id, vm_runtime_paths);
         program_plans.insert(*id, plan);
     }
 
     let mount_specs = build_mount_specs(
         scenario,
+        config_analysis,
         program_components,
         runtime_address_resolution,
-        &resolved_templates,
         slot_values_by_component,
     )?;
     let mounts_need_runtime = mount_specs
@@ -357,7 +343,7 @@ pub(crate) fn build_config_plan(
         needs_helper = true;
     }
 
-    if needs_runtime_config && root_schema.is_none() {
+    if needs_runtime_config && config_analysis.root_schema().is_none() {
         return Err(MeshError::new(
             "root component must declare `config_schema` when runtime config interpolation is \
              required",
@@ -366,47 +352,33 @@ pub(crate) fn build_config_plan(
 
     let mut runtime_views = HashMap::new();
     if needs_runtime_config {
-        let root_schema = root_schema
-            .as_ref()
-            .expect("root schema required for runtime config");
         for id in program_components {
             let program_plan = program_plans
                 .get(id)
                 .expect("program plan should exist for program component");
             let mount_specs = mount_specs.get(id);
-            let vm_cloud_init_paths = vm_cloud_init_paths_by_component
+            let vm_runtime_paths = vm_runtime_paths_by_component
                 .get(id)
-                .expect("vm cloud-init path set should exist for program component");
+                .expect("vm runtime path set should exist for program component");
             let needs_config_payload = program_plan.needs_runtime_config()
                 || mount_specs.is_some_and(|specs| mount_specs_need_config(specs))
-                || !vm_cloud_init_paths.is_empty();
+                || !vm_runtime_paths.is_empty();
             if !needs_config_payload {
                 continue;
             }
 
-            let component_schema = scenario
+            let component_config = config_analysis
                 .component(*id)
-                .config_schema
-                .as_ref()
-                .expect("component config schema required");
-            let component_template = resolved_templates
-                .get(id)
-                .expect("component template should exist");
+                .expect("component config analysis should exist");
             let used_paths = used_component_paths(
                 program_plan,
                 mount_specs.map(|specs| specs.as_slice()),
-                Some(vm_cloud_init_paths),
+                Some(vm_runtime_paths),
             );
 
-            let view = build_runtime_config_view(
-                &component_label(scenario, *id),
-                root_schema,
-                &root_leaves,
-                component_template,
-                component_schema,
-                &used_paths,
-            )
-            .map_err(|e| MeshError::new(e.to_string()))?;
+            let view = component_config
+                .build_runtime_view(&component_label(scenario, *id), &used_paths)
+                .map_err(MeshError::new)?;
             runtime_views.insert(*id, view);
         }
     }
@@ -478,7 +450,7 @@ fn collect_vm_cloud_init_runtime_paths(
     id: ComponentId,
     program: &Program,
     slots: &BTreeMap<String, SlotValue>,
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     out: &mut BTreeSet<String>,
 ) -> Result<(), MeshError> {
     let Program::Vm(program) = program else {
@@ -504,7 +476,7 @@ fn collect_vm_cloud_init_runtime_paths(
             Some(raw),
             RuntimeAddressResolution::Deferred,
             slots,
-            template_opt,
+            component_config,
         )?
         else {
             continue;
@@ -518,10 +490,50 @@ fn collect_vm_cloud_init_runtime_paths(
     Ok(())
 }
 
+fn collect_vm_image_runtime_paths(
+    scenario: &Scenario,
+    id: ComponentId,
+    program: &Program,
+    slots: &BTreeMap<String, SlotValue>,
+    component_config: &ComponentConfigAnalysis,
+    out: &mut BTreeSet<String>,
+) -> Result<(), MeshError> {
+    let Program::Vm(program) = program else {
+        return Ok(());
+    };
+    let image = program
+        .image
+        .parse::<amber_manifest::InterpolatedString>()
+        .map_err(|err| {
+            MeshError::new(format!(
+                "failed to parse program.vm.image interpolation in {}: {err}",
+                component_label(scenario, id)
+            ))
+        })?;
+    for part in &image.parts {
+        let InterpolatedPart::Interpolation { source, query } = part else {
+            continue;
+        };
+        if resolve_slot_interpolation(scenario, id, "program.vm.image", source, query, slots)?
+            .is_some()
+        {
+            continue;
+        }
+        if component_config
+            .resolve_static_string_query(query)
+            .map_err(MeshError::new)?
+            .is_none()
+        {
+            out.insert(query.clone());
+        }
+    }
+    Ok(())
+}
+
 fn collect_vm_scalar_runtime_paths(
     program: &Program,
     component: &str,
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     out: &mut BTreeSet<String>,
 ) -> Result<(), MeshError> {
     let Program::Vm(program) = program else {
@@ -532,7 +544,7 @@ fn collect_vm_scalar_runtime_paths(
         ("program.vm.memory_mib", &program.memory_mib),
     ] {
         if let VmScalarResolutionU32::RuntimeConfig(path) =
-            resolve_vm_scalar_u32(template_opt, scalar, component, field_name)?
+            resolve_vm_scalar_u32(component_config, scalar, component, field_name)?
         {
             out.insert(path);
         }
@@ -547,7 +559,7 @@ pub(crate) fn build_vm_cloud_init_template_string(
     raw: Option<&str>,
     runtime_address_resolution: RuntimeAddressResolution,
     slots: &BTreeMap<String, SlotValue>,
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
 ) -> Result<Option<TemplateString>, MeshError> {
     let Some(raw) = raw else {
         return Ok(None);
@@ -569,7 +581,7 @@ pub(crate) fn build_vm_cloud_init_template_string(
         &parsed,
         runtime_address_resolution,
         slots,
-        template_opt,
+        component_config,
         ItemResolution::NotAllowed,
         &mut needs_helper,
         &mut needs_runtime_config,
@@ -579,7 +591,7 @@ pub(crate) fn build_vm_cloud_init_template_string(
 }
 
 pub(crate) fn resolve_vm_scalar_u32(
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     scalar: &VmScalarU32,
     component: &str,
     field_name: &str,
@@ -616,7 +628,7 @@ pub(crate) fn resolve_vm_scalar_u32(
                      `${{config...}}` is supported there"
                 )));
             }
-            resolve_vm_scalar_query(template_opt, query, field_name)
+            resolve_vm_scalar_query(component_config, query, field_name)
         }
         _ => Err(MeshError::new(format!(
             "component {component} uses an unsupported scalar form in {field_name}"
@@ -625,7 +637,7 @@ pub(crate) fn resolve_vm_scalar_u32(
 }
 
 fn resolve_vm_scalar_query(
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     query: &str,
     field_name: &str,
 ) -> Result<VmScalarResolutionU32, MeshError> {
@@ -643,17 +655,11 @@ fn resolve_vm_scalar_query(
         )));
     }
 
-    let Some(template) = template_opt else {
-        validate_config_query_syntax(query).map_err(MeshError::new)?;
-        return Ok(VmScalarResolutionU32::RuntimeConfig(query.to_string()));
-    };
-
-    match resolve_config_query_node(template, query).map_err(MeshError::new)? {
-        QueryResolution::RuntimePath(path) => Ok(VmScalarResolutionU32::RuntimeConfig(path)),
-        QueryResolution::Node(node) if !node.contains_runtime() => {
-            let value = node
-                .evaluate_static()
-                .map_err(|err| MeshError::new(err.to_string()))?;
+    match component_config
+        .resolve_static_value(query)
+        .map_err(MeshError::new)?
+    {
+        Some(value) => {
             let Some(value) = value.as_u64() else {
                 return Err(render_error());
             };
@@ -664,16 +670,7 @@ fn resolve_vm_scalar_query(
             }
             Ok(VmScalarResolutionU32::Static(value as u32))
         }
-        QueryResolution::Node(rc::ConfigNode::ConfigRef(path)) => {
-            if path.is_empty() {
-                return Err(MeshError::new(format!(
-                    "{field_name} cannot reference the entire runtime config object; reference an \
-                     integer leaf like `${{config.resources.cpus}}`"
-                )));
-            }
-            Ok(VmScalarResolutionU32::RuntimeConfig(path.clone()))
-        }
-        QueryResolution::Node(_) => Err(render_error()),
+        None => Ok(VmScalarResolutionU32::RuntimeConfig(query.to_string())),
     }
 }
 
@@ -889,9 +886,9 @@ fn file_mount_uses_config(mount: &FileMount) -> bool {
 
 fn build_mount_specs(
     scenario: &Scenario,
+    config_analysis: &ScenarioConfigAnalysis,
     program_components: &[ComponentId],
     runtime_address_resolution: RuntimeAddressResolution,
-    resolved_templates: &HashMap<ComponentId, rc::RootConfigTemplate>,
     slot_values_by_component: &HashMap<ComponentId, BTreeMap<String, SlotValue>>,
 ) -> Result<HashMap<ComponentId, Vec<MountSpec>>, MeshError> {
     let mut out = HashMap::new();
@@ -923,18 +920,12 @@ fn build_mount_specs(
             )));
         }
 
-        let template_opt = if needs_component_config {
-            let template = resolved_templates.get(id).ok_or_else(|| {
-                MeshError::new(format!(
-                    "no config template for component {}",
-                    component_label(scenario, *id)
-                ))
-            })?;
-            template.node()
-        } else {
-            None
-        };
-        let component_schema = component.config_schema.as_ref();
+        let component_config = config_analysis.component(*id).ok_or_else(|| {
+            MeshError::new(format!(
+                "no config analysis for component {}",
+                component_label(scenario, *id)
+            ))
+        })?;
 
         let mut specs = Vec::new();
         for (mount_idx, mount) in program.mounts().iter().enumerate() {
@@ -942,7 +933,7 @@ fn build_mount_specs(
                 continue;
             };
 
-            let when = resolve_file_mount_when(mount.when.as_ref(), template_opt, slots)?;
+            let when = resolve_file_mount_when(mount.when.as_ref(), component_config, slots)?;
             if matches!(when, ResolvedWhen::Absent) {
                 continue;
             }
@@ -965,7 +956,7 @@ fn build_mount_specs(
                     runtime_address_resolution,
                     &mount.path,
                     slots,
-                    template_opt,
+                    component_config,
                     item_resolution,
                     &mut needs_helper_for_mount,
                     &mut needs_runtime_config_for_mount,
@@ -978,7 +969,7 @@ fn build_mount_specs(
                     runtime_address_resolution,
                     &mount.source,
                     slots,
-                    template_opt,
+                    component_config,
                     item_resolution,
                     &mut needs_helper_for_mount,
                     &mut needs_runtime_config_for_mount,
@@ -1007,7 +998,9 @@ fn build_mount_specs(
                         component_label(scenario, *id)
                     ))
                 })?;
-                let component_schema = component_schema.expect("file mounts require config_schema");
+                let component_schema = component_config
+                    .component_schema()
+                    .expect("file mounts require config_schema");
                 rc::validate_rendered_file_mount_source(component_schema, source).map_err(
                     |err| {
                         MeshError::new(format!(
@@ -1019,7 +1012,7 @@ fn build_mount_specs(
                 match source {
                     rc::RenderedFileMountSource::Config { path: path_query }
                     | rc::RenderedFileMountSource::Secret { path: path_query } => {
-                        match resolve_config_query_for_mount(template_opt, path_query)? {
+                        match resolve_config_query_for_mount(component_config, path_query)? {
                             MountResolution::Static(value) => {
                                 let content = rc::stringify_for_mount(&value)
                                     .map_err(|err| MeshError::new(err.to_string()))?;
@@ -1065,7 +1058,7 @@ fn build_mount_specs(
                         }
                     }
                     ProgramEach::Config { path } => {
-                        match resolve_config_each_values(template_opt, path, &location)? {
+                        match resolve_config_each_values(component_config, path, &location)? {
                             ConfigEachResolution::Static(items) => {
                                 for item in &items {
                                     emit_spec(
@@ -1098,7 +1091,7 @@ fn build_mount_specs(
 
 fn resolve_file_mount_when(
     when: Option<&ProgramCondition>,
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     slots: &BTreeMap<String, SlotValue>,
 ) -> Result<ResolvedWhen, MeshError> {
     let Some(when) = when else {
@@ -1110,7 +1103,7 @@ fn resolve_file_mount_when(
             match resolve_condition_presence_for_program(
                 InterpolationSource::Config,
                 path,
-                template_opt,
+                component_config,
                 slots,
             )? {
                 ConfigPresence::Present => Ok(ResolvedWhen::Present),
@@ -1122,7 +1115,7 @@ fn resolve_file_mount_when(
             match resolve_condition_presence_for_program(
                 InterpolationSource::Slots,
                 query,
-                template_opt,
+                component_config,
                 slots,
             )? {
                 ConfigPresence::Present => Ok(ResolvedWhen::Present),
@@ -1143,7 +1136,7 @@ fn resolve_lowered_template_string(
     runtime_address_resolution: RuntimeAddressResolution,
     value: &TemplateString,
     slots: &BTreeMap<String, SlotValue>,
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     item_resolution: ItemResolution<'_>,
     needs_helper_for_program_templates: &mut bool,
     needs_runtime_config_for_program_templates: &mut bool,
@@ -1155,7 +1148,7 @@ fn resolve_lowered_template_string(
         match part {
             TemplatePart::Lit { lit } => ts.push(TemplatePart::lit(lit)),
             TemplatePart::Config { config } => {
-                match resolve_config_query_for_program(template_opt, config)? {
+                match resolve_config_query_for_program(component_config, config)? {
                     ConfigResolution::Static(value) => ts.push(TemplatePart::lit(value)),
                     ConfigResolution::Runtime => {
                         ts.push(TemplatePart::config(config.clone()));
@@ -1267,7 +1260,7 @@ fn resolve_lowered_mount_source(
     runtime_address_resolution: RuntimeAddressResolution,
     source: &FileMountSource,
     slots: &BTreeMap<String, SlotValue>,
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     item_resolution: ItemResolution<'_>,
     needs_helper_for_program_templates: &mut bool,
     needs_runtime_config_for_program_templates: &mut bool,
@@ -1284,7 +1277,7 @@ fn resolve_lowered_mount_source(
         runtime_address_resolution,
         path,
         slots,
-        template_opt,
+        component_config,
         item_resolution,
         needs_helper_for_program_templates,
         needs_runtime_config_for_program_templates,
@@ -1340,13 +1333,13 @@ pub(crate) fn build_endpoint_plan(scenario: &Scenario) -> Result<EndpointPlan, M
 fn resolve_condition_presence_for_program(
     source: InterpolationSource,
     query: &str,
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     slots: &BTreeMap<String, SlotValue>,
 ) -> Result<ConfigPresence, MeshError> {
     match source {
-        InterpolationSource::Config => {
-            resolve_config_presence(template_opt, query).map_err(MeshError::new)
-        }
+        InterpolationSource::Config => component_config
+            .resolve_presence(query)
+            .map_err(MeshError::new),
         InterpolationSource::Slots => Ok(
             if slot_query_is_present(slots, query).map_err(MeshError::new)? {
                 ConfigPresence::Present
@@ -1379,40 +1372,29 @@ enum MountResolution {
 }
 
 fn resolve_config_query_for_program(
-    template: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     query: &str,
 ) -> Result<ConfigResolution, MeshError> {
-    let Some(template) = template else {
-        return Ok(ConfigResolution::Runtime);
-    };
-
-    let cur = match resolve_config_query_node(template, query).map_err(MeshError::new)? {
-        QueryResolution::Node(cur) => cur,
-        QueryResolution::RuntimePath(_) => return Ok(ConfigResolution::Runtime),
-    };
-
-    if !cur.contains_runtime() {
-        let v = cur
-            .evaluate_static()
-            .map_err(|e| MeshError::new(e.to_string()))?;
-        Ok(ConfigResolution::Static(
-            rc::stringify_for_interpolation(&v).map_err(|e| MeshError::new(e.to_string()))?,
-        ))
-    } else {
-        Ok(ConfigResolution::Runtime)
+    match component_config
+        .resolve_static_string_query(query)
+        .map_err(MeshError::new)?
+    {
+        Some(value) => Ok(ConfigResolution::Static(value)),
+        None => Ok(ConfigResolution::Runtime),
     }
 }
 
 fn resolve_program_image_runtime_node(
     node: &rc::ConfigNode,
+    field_name: &str,
 ) -> Result<ImageConfigResolution, MeshError> {
     match node {
         rc::ConfigNode::ConfigRef(path) => {
             if path.is_empty() {
-                return Err(MeshError::new(
-                    "program.image cannot reference the entire runtime config object; reference a \
-                     string leaf like ${config.image}",
-                ));
+                return Err(MeshError::new(format!(
+                    "{field_name} cannot reference the entire runtime config object; reference a \
+                     string leaf like ${{config.image}}"
+                )));
             }
             Ok(ImageConfigResolution::RuntimeTemplate(vec![
                 ProgramImagePart::RootConfigPath(path.clone()),
@@ -1429,10 +1411,10 @@ fn resolve_program_image_runtime_node(
                     }
                     TemplatePart::Config { config } => {
                         if config.is_empty() {
-                            return Err(MeshError::new(
-                                "program.image cannot reference the entire runtime config object; \
-                                 reference a string leaf like ${config.image}",
-                            ));
+                            return Err(MeshError::new(format!(
+                                "{field_name} cannot reference the entire runtime config object; \
+                                 reference a string leaf like ${{config.image}}"
+                            )));
                         }
                         out.push(ProgramImagePart::RootConfigPath(config.clone()));
                     }
@@ -1471,70 +1453,53 @@ fn resolve_program_image_runtime_node(
 }
 
 fn resolve_config_query_for_program_image(
-    template: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     query: &str,
+    field_name: &str,
 ) -> Result<ImageConfigResolution, MeshError> {
-    let Some(template) = template else {
-        if query.is_empty() {
-            return Err(MeshError::new(
-                "program.image cannot reference the entire runtime config object; reference a \
-                 string leaf like ${config.image}",
-            ));
-        }
-        validate_config_query_syntax(query).map_err(MeshError::new)?;
-        return Ok(ImageConfigResolution::RuntimeTemplate(vec![
-            ProgramImagePart::RootConfigPath(query.to_string()),
-        ]));
-    };
-
-    match resolve_config_query_node(template, query).map_err(MeshError::new)? {
-        QueryResolution::RuntimePath(path) => Ok(ImageConfigResolution::RuntimeTemplate(vec![
-            ProgramImagePart::RootConfigPath(path),
-        ])),
-        QueryResolution::Node(cur) => {
-            if !cur.contains_runtime() {
-                let v = cur
-                    .evaluate_static()
-                    .map_err(|e| MeshError::new(e.to_string()))?;
-                Ok(ImageConfigResolution::Static(
-                    rc::stringify_for_interpolation(&v)
-                        .map_err(|e| MeshError::new(e.to_string()))?,
-                ))
-            } else {
-                resolve_program_image_runtime_node(cur)
+    match component_config
+        .resolve_runtime_value_source(query)
+        .map_err(MeshError::new)?
+    {
+        RuntimeValueSource::Static(value) => Ok(ImageConfigResolution::Static(
+            rc::stringify_for_interpolation(&value).map_err(|e| MeshError::new(e.to_string()))?,
+        )),
+        RuntimeValueSource::RuntimeRootPath(path) => {
+            if path.is_empty() {
+                return Err(MeshError::new(format!(
+                    "{field_name} cannot reference the entire runtime config object; reference a \
+                     string leaf like ${{config.image}}"
+                )));
             }
+            Ok(ImageConfigResolution::RuntimeTemplate(vec![
+                ProgramImagePart::RootConfigPath(path),
+            ]))
         }
+        RuntimeValueSource::RuntimeNode(cur) => resolve_program_image_runtime_node(cur, field_name),
     }
 }
 
 fn resolve_config_query_for_mount(
-    template: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     query: &str,
 ) -> Result<MountResolution, MeshError> {
-    let Some(template) = template else {
-        return Ok(MountResolution::Runtime);
-    };
-
-    let cur = match resolve_config_query_node(template, query).map_err(MeshError::new)? {
-        QueryResolution::Node(cur) => cur,
-        QueryResolution::RuntimePath(_) => return Ok(MountResolution::Runtime),
-    };
-
-    if cur.contains_runtime() {
-        Ok(MountResolution::Runtime)
-    } else {
-        cur.evaluate_static()
-            .map(MountResolution::Static)
-            .map_err(|e| MeshError::new(e.to_string()))
+    match component_config
+        .resolve_static_value(query)
+        .map_err(MeshError::new)?
+    {
+        Some(value) => Ok(MountResolution::Static(value)),
+        None => Ok(MountResolution::Runtime),
     }
 }
 
 fn resolve_config_each_values(
-    template: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     query: &str,
     location: &str,
 ) -> Result<ConfigEachResolution, MeshError> {
-    resolve_shared_config_each_values(template, query, location).map_err(MeshError::new)
+    component_config
+        .resolve_each_values(query, location)
+        .map_err(MeshError::new)
 }
 
 fn render_template_string_static(ts: &TemplateString) -> Result<String, MeshError> {
@@ -1694,7 +1659,7 @@ fn join_template_strings(values: Vec<TemplateString>, separator: &str) -> Templa
     out
 }
 
-fn resolve_slot_interpolation(
+pub(crate) fn resolve_slot_interpolation(
     scenario: &Scenario,
     id: ComponentId,
     location: &str,
@@ -1770,7 +1735,7 @@ fn resolve_program_template_string(
     value: &amber_manifest::InterpolatedString,
     runtime_address_resolution: RuntimeAddressResolution,
     slots: &BTreeMap<String, SlotValue>,
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     item_resolution: ItemResolution<'_>,
     needs_helper_for_program_templates: &mut bool,
     needs_runtime_config_for_program_templates: &mut bool,
@@ -1836,7 +1801,7 @@ fn resolve_program_template_string(
                     ts.push(TemplatePart::lit(value));
                     continue;
                 }
-                match resolve_config_query_for_program(template_opt, query)? {
+                match resolve_config_query_for_program(component_config, query)? {
                     ConfigResolution::Static(value) => ts.push(TemplatePart::lit(value)),
                     ConfigResolution::Runtime => {
                         ts.push(TemplatePart::config(query.clone()));
@@ -1869,15 +1834,19 @@ enum ResolvedWhen {
 
 fn resolve_program_when(
     when: Option<&amber_manifest::WhenPath>,
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     slots: &BTreeMap<String, SlotValue>,
 ) -> Result<ResolvedWhen, MeshError> {
     let Some(when) = when else {
         return Ok(ResolvedWhen::Present);
     };
 
-    match resolve_condition_presence_for_program(when.source(), when.query(), template_opt, slots)?
-    {
+    match resolve_condition_presence_for_program(
+        when.source(),
+        when.query(),
+        component_config,
+        slots,
+    )? {
         ConfigPresence::Present => Ok(ResolvedWhen::Present),
         ConfigPresence::Absent => Ok(ResolvedWhen::Absent),
         ConfigPresence::Runtime => {
@@ -1923,12 +1892,12 @@ fn append_program_command_item_templates(
     item: &ProgramArgItem,
     runtime_address_resolution: RuntimeAddressResolution,
     slots: &BTreeMap<String, SlotValue>,
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     needs_helper_for_program_templates: &mut bool,
     needs_runtime_config_for_program_templates: &mut bool,
     out: &mut Vec<ProgramArgTemplate>,
 ) -> Result<(), MeshError> {
-    let when = resolve_program_when(item.when(), template_opt, slots)?;
+    let when = resolve_program_when(item.when(), component_config, slots)?;
     if matches!(when, ResolvedWhen::Absent) {
         return Ok(());
     }
@@ -1952,7 +1921,7 @@ fn append_program_command_item_templates(
             value,
             runtime_address_resolution,
             slots,
-            template_opt,
+            component_config,
             item_resolution,
             needs_helper_for_program_templates,
             needs_runtime_config_for_program_templates,
@@ -2075,7 +2044,7 @@ fn append_program_command_item_templates(
                 Ok(())
             }
             InterpolationSource::Config => {
-                match resolve_config_each_values(template_opt, each.query(), &location)? {
+                match resolve_config_each_values(component_config, each.query(), &location)? {
                     ConfigEachResolution::Static(items) => {
                         if items.is_empty() {
                             return Ok(());
@@ -2199,8 +2168,7 @@ fn build_program_plan(
     program_support: ProgramSupport,
     runtime_address_resolution: RuntimeAddressResolution,
     slots: &BTreeMap<String, SlotValue>,
-    template_opt: Option<&rc::ConfigNode>,
-    component_schema: Option<&Value>,
+    component_config: &ComponentConfigAnalysis,
 ) -> Result<ProgramPlan, MeshError> {
     let component = component_label(scenario, id);
     let mut entrypoint_ts: Vec<ProgramArgTemplate> = Vec::new();
@@ -2263,7 +2231,11 @@ fn build_program_plan(
                             push_image_literal(&mut image_parts, value);
                             continue;
                         }
-                        match resolve_config_query_for_program_image(template_opt, query)? {
+                        match resolve_config_query_for_program_image(
+                            component_config,
+                            query,
+                            "program.image",
+                        )? {
                             ImageConfigResolution::Static(value) => {
                                 push_image_literal(&mut image_parts, value);
                             }
@@ -2309,7 +2281,7 @@ fn build_program_plan(
                     item,
                     runtime_address_resolution,
                     slots,
-                    template_opt,
+                    component_config,
                     &mut needs_helper_for_program_templates,
                     &mut needs_runtime_config_for_program_templates,
                     &mut entrypoint_ts,
@@ -2357,7 +2329,7 @@ fn build_program_plan(
                 &path,
                 runtime_address_resolution,
                 slots,
-                template_opt,
+                component_config,
                 ItemResolution::NotAllowed,
                 &mut needs_helper_for_program_templates,
                 &mut needs_runtime_config_for_program_templates,
@@ -2381,7 +2353,7 @@ fn build_program_plan(
                     item,
                     runtime_address_resolution,
                     slots,
-                    template_opt,
+                    component_config,
                     &mut needs_helper_for_program_templates,
                     &mut needs_runtime_config_for_program_templates,
                     &mut entrypoint_ts,
@@ -2432,7 +2404,11 @@ fn build_program_plan(
                             push_image_literal(&mut image_parts, value);
                             continue;
                         }
-                        match resolve_config_query_for_program_image(template_opt, query)? {
+                        match resolve_config_query_for_program_image(
+                            component_config,
+                            query,
+                            "program.vm.image",
+                        )? {
                             ImageConfigResolution::Static(value) => {
                                 push_image_literal(&mut image_parts, value);
                             }
@@ -2489,7 +2465,7 @@ fn build_program_plan(
 
     let mut env_ts: BTreeMap<String, ProgramEnvTemplate> = BTreeMap::new();
     for (k, v) in program_env {
-        let when = resolve_program_when(v.when(), template_opt, slots)?;
+        let when = resolve_program_when(v.when(), component_config, slots)?;
         if matches!(when, ResolvedWhen::Absent) {
             continue;
         }
@@ -2508,7 +2484,7 @@ fn build_program_plan(
                     v.value(),
                     runtime_address_resolution,
                     slots,
-                    template_opt,
+                    component_config,
                     ItemResolution::NotAllowed,
                     &mut needs_helper_for_program_templates,
                     &mut needs_runtime_config_for_program_templates,
@@ -2567,7 +2543,7 @@ fn build_program_plan(
                             v.value(),
                             runtime_address_resolution,
                             slots,
-                            template_opt,
+                            component_config,
                             item_resolution,
                             &mut needs_helper_for_program_templates,
                             &mut needs_runtime_config_for_program_templates,
@@ -2593,7 +2569,7 @@ fn build_program_plan(
                     }
                 }
                 InterpolationSource::Config => {
-                    match resolve_config_each_values(template_opt, each.query(), &location)? {
+                    match resolve_config_each_values(component_config, each.query(), &location)? {
                         ConfigEachResolution::Static(items) => {
                             if items.is_empty() {
                                 continue;
@@ -2608,7 +2584,7 @@ fn build_program_plan(
                                     v.value(),
                                     runtime_address_resolution,
                                     slots,
-                                    template_opt,
+                                    component_config,
                                     ItemResolution::StaticConfig(item),
                                     &mut needs_helper_for_program_templates,
                                     &mut needs_runtime_config_for_program_templates,
@@ -2649,7 +2625,7 @@ fn build_program_plan(
                                         v.value(),
                                         runtime_address_resolution,
                                         slots,
-                                        template_opt,
+                                        component_config,
                                         ItemResolution::RuntimeCurrentItem,
                                         &mut needs_helper_for_program_templates,
                                         &mut needs_runtime_config_for_program_templates,
@@ -2672,7 +2648,7 @@ fn build_program_plan(
 
     if needs_helper_for_program_templates {
         if needs_runtime_config_for_program_templates {
-            component_schema.ok_or_else(|| {
+            component_config.component_schema().ok_or_else(|| {
                 MeshError::new(format!(
                     "component {} requires config_schema when using runtime config interpolation",
                     component
@@ -2745,7 +2721,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::template::parse_instance_config_template, linker::program_lowering::lower_program,
+        config::{analysis::ScenarioConfigAnalysis, template::parse_instance_config_template},
+        linker::program_lowering::lower_program,
     };
 
     fn test_scenario() -> Scenario {
@@ -2845,6 +2822,10 @@ mod tests {
         }
     }
 
+    fn config_analysis(scenario: &Scenario) -> ScenarioConfigAnalysis {
+        ScenarioConfigAnalysis::from_scenario(scenario).expect("config analysis")
+    }
+
     #[test]
     fn build_mount_specs_materializes_literal_config_mounts() {
         let child = component_with_config_and_program(
@@ -2870,12 +2851,12 @@ mod tests {
             })),
         );
         let scenario = scenario_with_child(child);
-        let templates = compose_component_config_templates(&scenario).expect("templates");
+        let config_analysis = config_analysis(&scenario);
         let mount_specs = build_mount_specs(
             &scenario,
+            &config_analysis,
             &[ComponentId(1)],
             RuntimeAddressResolution::Static,
-            &templates,
             &HashMap::from([(ComponentId(1), BTreeMap::new())]),
         )
         .expect("mount specs");
@@ -2952,12 +2933,12 @@ mod tests {
             children: Vec::new(),
         };
         let scenario = scenario_with_child(child);
-        let templates = compose_component_config_templates(&scenario).expect("templates");
+        let config_analysis = config_analysis(&scenario);
         let mount_specs = build_mount_specs(
             &scenario,
+            &config_analysis,
             &[ComponentId(1)],
             RuntimeAddressResolution::Deferred,
-            &templates,
             &HashMap::from([(ComponentId(1), test_slot_values())]),
         )
         .expect("mount specs");
@@ -3044,12 +3025,12 @@ mod tests {
             children: Vec::new(),
         };
         let scenario = scenario_with_child(child);
-        let templates = compose_component_config_templates(&scenario).expect("templates");
+        let config_analysis = config_analysis(&scenario);
         let mount_specs = build_mount_specs(
             &scenario,
+            &config_analysis,
             &[ComponentId(1)],
             RuntimeAddressResolution::Deferred,
-            &templates,
             &HashMap::from([(ComponentId(1), test_slot_values())]),
         )
         .expect("mount specs");
@@ -3098,12 +3079,12 @@ mod tests {
             })),
         );
         let scenario = scenario_with_child(child);
-        let templates = compose_component_config_templates(&scenario).expect("templates");
+        let config_analysis = config_analysis(&scenario);
         let err = build_mount_specs(
             &scenario,
+            &config_analysis,
             &[ComponentId(1)],
             RuntimeAddressResolution::Static,
-            &templates,
             &HashMap::from([(ComponentId(1), BTreeMap::new())]),
         )
         .expect_err("config mount to a secret path should fail");
@@ -3142,12 +3123,12 @@ mod tests {
             })),
         );
         let scenario = scenario_with_child(child);
-        let templates = compose_component_config_templates(&scenario).expect("templates");
+        let config_analysis = config_analysis(&scenario);
         let err = build_mount_specs(
             &scenario,
+            &config_analysis,
             &[ComponentId(1)],
             RuntimeAddressResolution::Static,
-            &templates,
             &HashMap::from([(ComponentId(1), BTreeMap::new())]),
         )
         .expect_err("secret mount to a public path should fail");

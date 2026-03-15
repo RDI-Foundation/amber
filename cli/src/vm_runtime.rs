@@ -18,8 +18,8 @@ use amber_compiler::reporter::{
     },
 };
 use amber_config::{
-    build_root_config, env_var_for_path, eval_config_template_partial_with_context,
-    render_mount_specs, render_template_string_with_context,
+    env_var_for_path, get_by_path_opt, render_mount_specs, render_template_string_with_context,
+    resolve_runtime_component_config,
 };
 use amber_mesh::{
     InboundTarget, MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MESH_PROVISION_PLAN_VERSION,
@@ -1032,34 +1032,14 @@ fn build_component_config(
             config_env.insert(env_var, value);
         }
     }
-    let root_config = build_root_config(&root_schema, &config_env)
-        .map_err(|err| miette::miette!("failed to build root config: {err}"))?;
-    let component_config = eval_config_template_partial_with_context(
+    let component_config = resolve_runtime_component_config(
+        &root_schema,
+        &component_schema,
         &component_template,
-        &root_config,
+        &config_env,
         runtime_context,
     )
-    .map_err(|err| miette::miette!("failed to render component config: {err}"))?;
-
-    if !component_config.is_object() {
-        return Err(miette::miette!(
-            "resolved component config must be an object"
-        ));
-    }
-
-    let validator = jsonschema::validator_for(&component_schema)
-        .map_err(|err| miette::miette!("failed to compile component schema: {err}"))?;
-    {
-        let mut errors = validator.iter_errors(&component_config);
-        if let Some(first) = errors.next() {
-            let mut messages = vec![first.to_string()];
-            messages.extend(errors.take(7).map(|err| err.to_string()));
-            return Err(miette::miette!(
-                "resolved component config does not satisfy its schema: {}",
-                messages.join("; ")
-            ));
-        }
-    }
+    .map_err(|err| miette::miette!("failed to resolve runtime component config: {err}"))?;
 
     Ok(Some((component_config, component_schema)))
 }
@@ -1214,7 +1194,7 @@ fn build_vm_launch_plan(
             )
         })?;
 
-    let base_image = resolve_vm_base_image(&component.base_image)?;
+    let base_image = resolve_vm_base_image(&component.base_image, component_config)?;
     let overlay_path = vm_root.join("root-overlay.qcow2");
     create_overlay_image(host.qemu_img, &base_image, &overlay_path)?;
 
@@ -1262,8 +1242,12 @@ fn build_vm_launch_plan(
         persistent_paths.push((mount, disk_path));
     }
 
-    let cpus = resolve_vm_scalar(&component.cpus, "program.vm.cpus")?;
-    let memory_mib = resolve_vm_scalar(&component.memory_mib, "program.vm.memory_mib")?;
+    let cpus = resolve_vm_scalar(&component.cpus, "program.vm.cpus", component_config)?;
+    let memory_mib = resolve_vm_scalar(
+        &component.memory_mib,
+        "program.vm.memory_mib",
+        component_config,
+    )?;
     let netdev_arg = build_qemu_user_netdev_arg(host.amber_cli, component, port_assignments)?;
     let qmp_socket = vm_root.join("qmp.sock");
     let serial_log = vm_root.join("serial.log");
@@ -1389,28 +1373,45 @@ fn cloud_init_hostname(log_name: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-fn resolve_vm_scalar(plan: &VmScalarPlanU32, field_name: &str) -> Result<u32> {
+fn resolve_vm_scalar(
+    plan: &VmScalarPlanU32,
+    field_name: &str,
+    component_config: Option<&Value>,
+) -> Result<u32> {
     let value = match plan {
         VmScalarPlanU32::Literal { value } => *value,
         VmScalarPlanU32::RuntimeConfig { query } => {
-            let env_var = env_var_for_path(query).map_err(|err| {
-                miette::miette!("failed to map {field_name} query {}: {err}", query)
-            })?;
-            let raw = env::var(&env_var).map_err(|_| {
+            let component_config = component_config.ok_or_else(|| {
                 miette::miette!(
-                    "{field_name} references config path {}, but {} is not set",
+                    "{field_name} references config path {}, but no runtime component config was \
+                     provided",
+                    query
+                )
+            })?;
+            let value = get_by_path_opt(component_config, query)
+                .map_err(|err| {
+                    miette::miette!("failed to read {field_name} config path {}: {err}", query)
+                })?
+                .ok_or_else(|| {
+                    miette::miette!(
+                        "{field_name} references config path {}, but that path is missing at \
+                         runtime",
+                        query
+                    )
+                })?;
+            let Some(value) = value.as_u64() else {
+                return Err(miette::miette!(
+                    "{field_name} expected an unsigned integer at config.{}, got {}",
                     query,
-                    env_var
-                )
-            })?;
-            raw.trim().parse::<u32>().map_err(|err| {
-                miette::miette!(
-                    "{field_name} expected an unsigned integer from {}={}, got {} ({err})",
-                    env_var,
-                    raw,
-                    raw
-                )
-            })?
+                    value
+                ));
+            };
+            if value > u32::MAX as u64 {
+                return Err(miette::miette!(
+                    "{field_name} must fit in a 32-bit unsigned integer"
+                ));
+            }
+            value as u32
         }
     };
     if value == 0 {
@@ -1419,44 +1420,67 @@ fn resolve_vm_scalar(plan: &VmScalarPlanU32, field_name: &str) -> Result<u32> {
     Ok(value)
 }
 
-fn resolve_vm_base_image(plan: &VmHostPathPlan) -> Result<PathBuf> {
+fn resolve_vm_base_image(
+    plan: &VmHostPathPlan,
+    component_config: Option<&Value>,
+) -> Result<PathBuf> {
     let raw_path = match plan {
         VmHostPathPlan::Static { path } => path.clone(),
         VmHostPathPlan::RuntimeConfig { query, source_dir } => {
-            let path = resolve_vm_runtime_config(query, "program.vm.image")?;
+            let path = resolve_vm_runtime_config(component_config, query, "program.vm.image")?;
             return resolve_vm_runtime_host_path(&path, source_dir.as_deref());
         }
         VmHostPathPlan::RuntimeTemplate { parts, source_dir } => {
-            let rendered = render_vm_host_path_template(parts)?;
+            let rendered =
+                render_vm_host_path_template(parts, component_config, "program.vm.image")?;
             return resolve_vm_runtime_host_path(&rendered, source_dir.as_deref());
         }
     };
     resolve_vm_runtime_host_path(&raw_path, None)
 }
 
-fn render_vm_host_path_template(parts: &[VmHostPathPart]) -> Result<String> {
+fn render_vm_host_path_template(
+    parts: &[VmHostPathPart],
+    component_config: Option<&Value>,
+    field_name: &str,
+) -> Result<String> {
     let mut rendered = String::new();
     for part in parts {
         match part {
             VmHostPathPart::Literal { value } => rendered.push_str(value),
             VmHostPathPart::RuntimeConfig { query } => {
-                rendered.push_str(&resolve_vm_runtime_config(query, "program.vm.image")?);
+                rendered.push_str(&resolve_vm_runtime_config(
+                    component_config,
+                    query,
+                    field_name,
+                )?);
             }
         }
     }
     Ok(rendered)
 }
 
-fn resolve_vm_runtime_config(query: &str, field_name: &str) -> Result<String> {
-    let env_var = env_var_for_path(query)
-        .map_err(|err| miette::miette!("failed to map {field_name} query {}: {err}", query))?;
-    env::var(&env_var).map_err(|_| {
+fn resolve_vm_runtime_config(
+    component_config: Option<&Value>,
+    query: &str,
+    field_name: &str,
+) -> Result<String> {
+    let component_config = component_config.ok_or_else(|| {
         miette::miette!(
-            "{field_name} references config path {}, but {} is not set",
-            query,
-            env_var
+            "{field_name} references config path {}, but no runtime component config was provided",
+            query
         )
-    })
+    })?;
+    let value = get_by_path_opt(component_config, query)
+        .map_err(|err| miette::miette!("failed to read {field_name} config path {}: {err}", query))?
+        .ok_or_else(|| {
+            miette::miette!(
+                "{field_name} references config path {}, but that path is missing at runtime",
+                query
+            )
+        })?;
+    amber_config::stringify_for_interpolation(value)
+        .map_err(|err| miette::miette!("failed to render config.{} for {field_name}: {err}", query))
 }
 
 fn resolve_vm_runtime_host_path(raw_path: &str, source_dir: Option<&str>) -> Result<PathBuf> {
@@ -3026,20 +3050,18 @@ mod tests {
         let image_path = image_dir.join("base.qcow2");
         fs::write(&image_path, []).expect("image file");
 
-        unsafe {
-            env::set_var("AMBER_CONFIG_CONFIG__VM_IMAGE", "images/base.qcow2");
-        }
-
-        let resolved = resolve_vm_base_image(&VmHostPathPlan::RuntimeConfig {
-            query: "config.vm_image".to_string(),
-            source_dir: Some(temp.path().display().to_string()),
-        })
+        let component_config = serde_json::json!({
+            "vm_image": "images/base.qcow2"
+        });
+        let resolved = resolve_vm_base_image(
+            &VmHostPathPlan::RuntimeConfig {
+                query: "vm_image".to_string(),
+                source_dir: Some(temp.path().display().to_string()),
+            },
+            Some(&component_config),
+        )
         .expect("base image");
 
         assert_eq!(resolved, image_path);
-
-        unsafe {
-            env::remove_var("AMBER_CONFIG_CONFIG__VM_IMAGE");
-        }
     }
 }

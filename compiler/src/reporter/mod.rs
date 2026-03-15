@@ -5,7 +5,7 @@ use miette::{Diagnostic, LabeledSpan, NamedSource, Severity};
 use thiserror::Error;
 use url::Url;
 
-use crate::{CompileOutput, DigestStore, Provenance};
+use crate::{CompileOutput, DigestStore, Provenance, config::analysis::ScenarioConfigAnalysis};
 
 pub mod dot;
 pub(crate) mod execution_guide;
@@ -27,12 +27,14 @@ pub struct CompiledScenario {
     scenario: Scenario,
     scenario_ir: ScenarioIr,
     resolved_urls: Vec<Option<Url>>,
+    config_analysis: ScenarioConfigAnalysis,
     source_context: Option<CompiledScenarioSourceContext>,
 }
 
 impl CompiledScenario {
     pub fn from_compile_output(output: &CompileOutput) -> Result<Self, CompiledScenarioError> {
         let mut compiled = Self::from_ir(scenario_ir::scenario_ir_from_compile_output(output))?;
+        compiled.config_analysis = output.config_analysis().clone();
         compiled.source_context = Some(CompiledScenarioSourceContext {
             store: output.store.clone(),
             provenance: output.provenance.clone(),
@@ -63,10 +65,13 @@ impl CompiledScenario {
         }
         let scenario = Scenario::try_from(scenario_ir.clone())
             .map_err(CompiledScenarioError::InvalidScenarioIr)?;
+        let config_analysis = ScenarioConfigAnalysis::from_scenario(&scenario)
+            .map_err(CompiledScenarioError::InvalidConfigAnalysis)?;
         Ok(Self {
             scenario,
             scenario_ir,
             resolved_urls,
+            config_analysis,
             source_context: None,
         })
     }
@@ -77,6 +82,10 @@ impl CompiledScenario {
 
     pub fn scenario_ir(&self) -> &ScenarioIr {
         &self.scenario_ir
+    }
+
+    pub(crate) fn config_analysis(&self) -> &ScenarioConfigAnalysis {
+        &self.config_analysis
     }
 
     pub fn resolved_url_for_component(&self, id: ComponentId) -> Option<&Url> {
@@ -110,6 +119,9 @@ pub enum CompiledScenarioError {
         raw: String,
         source: url::ParseError,
     },
+
+    #[error("invalid config analysis for Scenario IR: {0}")]
+    InvalidConfigAnalysis(String),
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -229,11 +229,14 @@ fn flatten_removes_pure_routing_nodes_and_preserves_debug_data() {
         "/parent/child"
     );
 
+    let config_analysis = crate::config::analysis::ScenarioConfigAnalysis::from_scenario(&scenario)
+        .expect("config analysis");
     let output = CompileOutput {
         scenario,
         store,
         provenance,
         diagnostics: Vec::new(),
+        config_analysis,
     };
     let dot = DotReporter
         .emit(&crate::reporter::CompiledScenario::from_compile_output(&output).unwrap())

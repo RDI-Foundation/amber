@@ -14,9 +14,9 @@ use amber_scenario::{
 use amber_template::{TemplatePart, TemplateString};
 use serde_json::Value;
 
-use crate::config::query::{
-    ConfigEachResolution, ConfigPresence, QueryResolution, resolve_config_each_values,
-    resolve_config_presence, resolve_config_query_node, validate_config_query_syntax,
+use crate::config::{
+    analysis::ComponentConfigAnalysis,
+    query::{ConfigEachResolution, ConfigPresence},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,17 +80,41 @@ pub(crate) fn lower_program(
     Ok(lower_program_with_origins(component_id, program, template_opt)?.program)
 }
 
+#[cfg(test)]
 pub(crate) fn lower_program_with_origins(
     component_id: ComponentId,
     program: &ManifestProgram,
     template_opt: Option<&rc::ConfigNode>,
+) -> Result<LoweredProgram, Vec<ProgramLoweringError>> {
+    let component_config = ComponentConfigAnalysis::standalone(template_opt.cloned(), None, None)
+        .expect("test config analysis should build");
+    lower_program_with_config_analysis(component_id, program, &component_config)
+}
+
+#[cfg(test)]
+pub(crate) fn lower_program_with_origins_and_root_schema(
+    component_id: ComponentId,
+    program: &ManifestProgram,
+    template_opt: Option<&rc::ConfigNode>,
+    root_schema: Option<&Value>,
+) -> Result<LoweredProgram, Vec<ProgramLoweringError>> {
+    let component_config =
+        ComponentConfigAnalysis::standalone(template_opt.cloned(), None, root_schema.cloned())
+            .expect("test config analysis should build");
+    lower_program_with_config_analysis(component_id, program, &component_config)
+}
+
+pub(crate) fn lower_program_with_config_analysis(
+    component_id: ComponentId,
+    program: &ManifestProgram,
+    component_config: &ComponentConfigAnalysis,
 ) -> Result<LoweredProgram, Vec<ProgramLoweringError>> {
     match program {
         ManifestProgram::Image(program) => {
             let common = lower_common(
                 component_id,
                 &program.common,
-                template_opt,
+                component_config,
                 "program.network.endpoints",
                 "program.mounts",
             )?;
@@ -107,7 +131,7 @@ pub(crate) fn lower_program_with_origins(
             let common = lower_common(
                 component_id,
                 &program.common,
-                template_opt,
+                component_config,
                 "program.network.endpoints",
                 "program.mounts",
             )?;
@@ -127,13 +151,13 @@ pub(crate) fn lower_program_with_origins(
                     .network
                     .as_ref()
                     .map_or(&[], |network| network.endpoints.as_slice()),
-                template_opt,
+                component_config,
                 "program.vm.network.endpoints",
             )?;
             let mounts = lower_mounts(
                 component_id,
                 &program.0.mounts,
-                template_opt,
+                component_config,
                 "program.vm.mounts",
             )?;
             Ok(LoweredProgram {
@@ -324,7 +348,7 @@ fn validate_static_mount_path(path: &str) -> Result<(), &'static str> {
 fn lower_common(
     component_id: ComponentId,
     common: &amber_manifest::ProgramCommon,
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     network_location_prefix: &str,
     mount_location_prefix: &str,
 ) -> Result<LoweredCommon, Vec<ProgramLoweringError>> {
@@ -333,13 +357,13 @@ fn lower_common(
             .network
             .as_ref()
             .map_or(&[], |network| network.endpoints.as_slice()),
-        template_opt,
+        component_config,
         network_location_prefix,
     )?;
     let mounts = lower_mounts(
         component_id,
         &common.mounts,
-        template_opt,
+        component_config,
         mount_location_prefix,
     )?;
     Ok(LoweredCommon {
@@ -354,7 +378,7 @@ fn lower_common(
 
 fn lower_network(
     endpoints: &[ManifestEndpoint],
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     location_prefix: &str,
 ) -> Result<Option<ProgramNetwork>, Vec<ProgramLoweringError>> {
     if endpoints.is_empty() {
@@ -366,7 +390,7 @@ fn lower_network(
     let mut errors = Vec::new();
 
     for (index, endpoint) in endpoints.iter().enumerate() {
-        let when = match lower_endpoint_when(endpoint.when.as_ref(), template_opt) {
+        let when = match lower_endpoint_when(endpoint.when.as_ref(), component_config) {
             Ok(when) => when,
             Err(message) => {
                 errors.push(ProgramLoweringError {
@@ -381,32 +405,36 @@ fn lower_network(
         }
 
         let location = format!("{location_prefix}[{index}]");
-        let mut emit =
-            |item: Option<&Value>| match lower_endpoint(endpoint, template_opt, item, &location) {
-                Ok(lowered_endpoint) => {
-                    if !seen_names.insert(lowered_endpoint.name.clone()) {
-                        errors.push(ProgramLoweringError {
-                            site: ProgramLoweringSite::Endpoint(index),
-                            message: format!(
-                                "duplicate endpoint name `{}` after endpoint expansion",
-                                lowered_endpoint.name
-                            ),
-                        });
-                        return;
-                    }
-                    lowered.push(lowered_endpoint);
+        let mut emit = |item: Option<&Value>| match lower_endpoint(
+            endpoint,
+            component_config,
+            item,
+            &location,
+        ) {
+            Ok(lowered_endpoint) => {
+                if !seen_names.insert(lowered_endpoint.name.clone()) {
+                    errors.push(ProgramLoweringError {
+                        site: ProgramLoweringSite::Endpoint(index),
+                        message: format!(
+                            "duplicate endpoint name `{}` after endpoint expansion",
+                            lowered_endpoint.name
+                        ),
+                    });
+                    return;
                 }
-                Err(message) => errors.push(ProgramLoweringError {
-                    site: ProgramLoweringSite::Endpoint(index),
-                    message,
-                }),
-            };
+                lowered.push(lowered_endpoint);
+            }
+            Err(message) => errors.push(ProgramLoweringError {
+                site: ProgramLoweringSite::Endpoint(index),
+                message,
+            }),
+        };
 
         match endpoint.each.as_ref() {
             None => emit(None),
             Some(each) => match each.source() {
                 InterpolationSource::Config => {
-                    match resolve_config_each_values(template_opt, each.query(), &location) {
+                    match component_config.resolve_each_values(each.query(), &location) {
                         Ok(ConfigEachResolution::Static(items)) => {
                             for item in &items {
                                 emit(Some(item));
@@ -449,14 +477,14 @@ fn lower_network(
 
 fn lower_endpoint_when(
     when: Option<&WhenPath>,
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
 ) -> Result<LoweredWhen, String> {
     let Some(when) = when else {
         return Ok(LoweredWhen::Present);
     };
 
     match when.source() {
-        InterpolationSource::Config => match resolve_config_presence(template_opt, when.query())? {
+        InterpolationSource::Config => match component_config.resolve_presence(when.query())? {
             ConfigPresence::Present => Ok(LoweredWhen::Present),
             ConfigPresence::Absent => Ok(LoweredWhen::Absent),
             ConfigPresence::Runtime => Err("depends on runtime config, but endpoints must \
@@ -475,22 +503,27 @@ fn lower_endpoint_when(
 
 fn lower_endpoint(
     endpoint: &ManifestEndpoint,
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     item: Option<&Value>,
     location: &str,
 ) -> Result<Endpoint, String> {
-    let name = lower_endpoint_string(location, "name", &endpoint.name, template_opt, item)?;
+    let name = lower_endpoint_string(location, "name", &endpoint.name, component_config, item)?;
     if name.is_empty() {
         return Err(format!("{location}.name resolves to an empty string"));
     }
-    let protocol =
-        lower_endpoint_string(location, "protocol", &endpoint.protocol, template_opt, item)?
-            .parse::<amber_manifest::NetworkProtocol>()
-            .map_err(|err| err.to_string())?;
+    let protocol = lower_endpoint_string(
+        location,
+        "protocol",
+        &endpoint.protocol,
+        component_config,
+        item,
+    )?
+    .parse::<amber_manifest::NetworkProtocol>()
+    .map_err(|err| err.to_string())?;
     let port = match &endpoint.port {
         EndpointPort::Literal(port) => *port,
         EndpointPort::Interpolated(value) => {
-            lower_endpoint_string(location, "port", value, template_opt, item)?
+            lower_endpoint_string(location, "port", value, component_config, item)?
                 .parse::<u16>()
                 .map_err(|err| err.to_string())?
         }
@@ -508,7 +541,7 @@ fn lower_endpoint_string(
     location: &str,
     field: &str,
     value: &InterpolatedString,
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     item: Option<&Value>,
 ) -> Result<String, String> {
     let mut rendered = String::new();
@@ -516,15 +549,17 @@ fn lower_endpoint_string(
         match part {
             InterpolatedPart::Literal(lit) => rendered.push_str(lit),
             InterpolatedPart::Interpolation { source, query } => match source {
-                InterpolationSource::Config => match resolve_config_string(template_opt, query)? {
-                    Some(value) => rendered.push_str(&value),
-                    None => {
-                        return Err(format!(
-                            "{location}.{field} depends on runtime config, but endpoints must \
-                             resolve entirely at compile time"
-                        ));
+                InterpolationSource::Config => {
+                    match resolve_config_string(component_config, query)? {
+                        Some(value) => rendered.push_str(&value),
+                        None => {
+                            return Err(format!(
+                                "{location}.{field} depends on runtime config, but endpoints must \
+                                 resolve entirely at compile time"
+                            ));
+                        }
                     }
-                },
+                }
                 InterpolationSource::Item => {
                     let item = item.ok_or_else(|| {
                         format!(
@@ -556,7 +591,7 @@ fn lower_endpoint_string(
 fn lower_mounts(
     component_id: ComponentId,
     mounts: &[ManifestMount],
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     location_prefix: &str,
 ) -> Result<LoweredMounts, Vec<ProgramLoweringError>> {
     let mut lowered = Vec::new();
@@ -564,7 +599,7 @@ fn lower_mounts(
     let mut errors = Vec::new();
 
     for (index, mount) in mounts.iter().enumerate() {
-        let when = match lower_mount_when(mount.when.as_ref(), template_opt) {
+        let when = match lower_mount_when(mount.when.as_ref(), component_config) {
             Ok(when) => when,
             Err(message) => {
                 errors.push(ProgramLoweringError {
@@ -588,7 +623,7 @@ fn lower_mounts(
             match lower_mount_iteration(
                 component_id,
                 mount,
-                template_opt,
+                component_config,
                 item,
                 runtime_when.clone(),
                 runtime_each,
@@ -610,7 +645,7 @@ fn lower_mounts(
             None => emit(ItemLowering::None, None),
             Some(each) => match each.source() {
                 InterpolationSource::Config => {
-                    match resolve_config_each_values(template_opt, each.query(), &location) {
+                    match component_config.resolve_each_values(each.query(), &location) {
                         Ok(ConfigEachResolution::Static(items)) => {
                             for item in &items {
                                 emit(ItemLowering::Static(item), None);
@@ -655,14 +690,14 @@ fn lower_mounts(
 
 fn lower_mount_when(
     when: Option<&WhenPath>,
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
 ) -> Result<LoweredWhen, String> {
     let Some(when) = when else {
         return Ok(LoweredWhen::Present);
     };
 
     match when.source() {
-        InterpolationSource::Config => match resolve_config_presence(template_opt, when.query())? {
+        InterpolationSource::Config => match component_config.resolve_presence(when.query())? {
             ConfigPresence::Present => Ok(LoweredWhen::Present),
             ConfigPresence::Absent => Ok(LoweredWhen::Absent),
             ConfigPresence::Runtime => Ok(LoweredWhen::Runtime(ProgramCondition::Config {
@@ -680,7 +715,7 @@ fn lower_mount_when(
 fn lower_mount_iteration(
     component_id: ComponentId,
     mount: &ManifestMount,
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     item: ItemLowering<'_>,
     when: Option<ProgramCondition>,
     each: Option<ProgramEach>,
@@ -690,14 +725,14 @@ fn lower_mount_iteration(
         component_id,
         &format!("{location}.path"),
         &mount.path,
-        template_opt,
+        component_config,
         item,
     )?;
     let source = lower_template_string(
         component_id,
         &format!("{location}.from"),
         &mount.source,
-        template_opt,
+        component_config,
         item,
     )?;
     let source = classify_mount_source(source)?;
@@ -787,7 +822,7 @@ fn lower_template_string(
     component_id: ComponentId,
     location: &str,
     value: &InterpolatedString,
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     item: ItemLowering<'_>,
 ) -> Result<TemplateString, String> {
     let mut out = Vec::new();
@@ -795,10 +830,12 @@ fn lower_template_string(
         match part {
             InterpolatedPart::Literal(lit) => push_template_literal(&mut out, lit),
             InterpolatedPart::Interpolation { source, query } => match source {
-                InterpolationSource::Config => match resolve_config_string(template_opt, query)? {
-                    Some(value) => push_template_literal(&mut out, &value),
-                    None => out.push(TemplatePart::config(query.clone())),
-                },
+                InterpolationSource::Config => {
+                    match resolve_config_string(component_config, query)? {
+                        Some(value) => push_template_literal(&mut out, &value),
+                        None => out.push(TemplatePart::config(query.clone())),
+                    }
+                }
                 InterpolationSource::Slots => {
                     out.push(TemplatePart::slot(component_id.0 as u64, query.clone()))
                 }
@@ -866,26 +903,10 @@ fn classify_mount_source(source: TemplateString) -> Result<LoweredMountSource, S
 }
 
 fn resolve_config_string(
-    template_opt: Option<&rc::ConfigNode>,
+    component_config: &ComponentConfigAnalysis,
     query: &str,
 ) -> Result<Option<String>, String> {
-    let Some(template) = template_opt else {
-        validate_config_query_syntax(query)?;
-        return Ok(None);
-    };
-
-    match resolve_config_query_node(template, query)? {
-        QueryResolution::RuntimePath(_) => Ok(None),
-        QueryResolution::Node(node) => {
-            if node.contains_runtime() {
-                return Ok(None);
-            }
-            let value = node.evaluate_static().map_err(|err| err.to_string())?;
-            rc::stringify_for_interpolation(&value)
-                .map(Some)
-                .map_err(|err| err.to_string())
-        }
-    }
+    component_config.resolve_static_string_query(query)
 }
 
 fn resolve_item_interpolation(
@@ -1015,7 +1036,7 @@ mod tests {
 
     use super::{
         ProgramLoweringSite, lower_program, lower_program_with_origins,
-        validate_lowered_program_mounts,
+        lower_program_with_origins_and_root_schema, validate_lowered_program_mounts,
     };
 
     #[test]
@@ -1083,6 +1104,155 @@ mod tests {
         assert_eq!(endpoints[0].port, 8080);
         assert_eq!(endpoints[1].name, "admin");
         assert_eq!(endpoints[1].port, 9090);
+    }
+
+    #[test]
+    fn lower_program_uses_root_schema_defaults_for_endpoint_when() {
+        let manifest: Manifest = r#"
+            {
+              manifest_version: "0.3.0",
+              config_schema: {
+                type: "object",
+                properties: {
+                  enabled: {
+                    type: "boolean",
+                    default: false,
+                  },
+                },
+              },
+              program: {
+                image: "app",
+                entrypoint: ["app"],
+                network: {
+                  endpoints: [
+                    {
+                      name: "http",
+                      port: 8080,
+                      protocol: "http",
+                      when: "config.enabled",
+                    },
+                  ],
+                },
+              },
+            }
+        "#
+        .parse()
+        .expect("manifest");
+
+        let lowered = lower_program_with_origins_and_root_schema(
+            amber_scenario::ComponentId(12),
+            manifest.program().expect("program"),
+            None,
+            manifest.config_schema().map(|schema| &schema.0),
+        )
+        .expect("program should lower");
+
+        let endpoints = &lowered.program.network().expect("network").endpoints;
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].name, "http");
+    }
+
+    #[test]
+    fn lower_program_uses_root_schema_defaults_for_config_ref_leaf_endpoint_when() {
+        let manifest: Manifest = r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                image: "app",
+                entrypoint: ["app"],
+                network: {
+                  endpoints: [
+                    {
+                      name: "http",
+                      port: 8080,
+                      protocol: "http",
+                      when: "config.enabled",
+                    },
+                  ],
+                },
+              },
+            }
+        "#
+        .parse()
+        .expect("manifest");
+        let template = ConfigNode::Object(BTreeMap::from([(
+            "enabled".to_string(),
+            ConfigNode::ConfigRef("root_enabled".to_string()),
+        )]));
+        let root_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "root_enabled": {
+                    "type": "boolean",
+                    "default": false
+                }
+            }
+        });
+
+        let lowered = lower_program_with_origins_and_root_schema(
+            amber_scenario::ComponentId(12),
+            manifest.program().expect("program"),
+            Some(&template),
+            Some(&root_schema),
+        )
+        .expect("program should lower");
+
+        let endpoints = &lowered.program.network().expect("network").endpoints;
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].name, "http");
+    }
+
+    #[test]
+    fn lower_program_keeps_nullable_ancestor_endpoint_when_runtime() {
+        let manifest: Manifest = r#"
+            {
+              manifest_version: "0.3.0",
+              config_schema: {
+                type: "object",
+                properties: {
+                  settings: {
+                    type: ["object", "null"],
+                    properties: {
+                      enabled: {
+                        type: "boolean",
+                        default: false,
+                      },
+                    },
+                  },
+                },
+              },
+              program: {
+                image: "app",
+                entrypoint: ["app"],
+                network: {
+                  endpoints: [
+                    {
+                      name: "http",
+                      port: 8080,
+                      protocol: "http",
+                      when: "config.settings.enabled",
+                    },
+                  ],
+                },
+              },
+            }
+        "#
+        .parse()
+        .expect("manifest");
+
+        let errors = lower_program_with_origins_and_root_schema(
+            amber_scenario::ComponentId(12),
+            manifest.program().expect("program"),
+            None,
+            manifest.config_schema().map(|schema| &schema.0),
+        )
+        .expect_err("endpoint should remain runtime-conditional");
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].site, ProgramLoweringSite::Endpoint(0));
+        assert!(errors[0].message.contains(
+            "depends on runtime config, but endpoints must resolve entirely at compile time"
+        ));
     }
 
     #[test]

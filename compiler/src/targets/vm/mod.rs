@@ -3,15 +3,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use amber_manifest::VmEgress;
+use amber_manifest::{InterpolatedPart, VmEgress};
 use amber_mesh::{MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProvisionOutput};
-use amber_scenario::{ComponentId, Program, Scenario};
+use amber_scenario::{ComponentId, Program, ProgramVm, Scenario};
 use amber_template::{TemplatePart, TemplateString};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::{
-    config::templates,
+    config::analysis::ComponentConfigAnalysis,
     reporter::{
         CompiledScenario, Reporter, ReporterError,
         execution_guide::{
@@ -42,10 +42,9 @@ use crate::{
             },
         },
         program_config::{
-            ComponentExecutionPlan, ProgramImagePart, ProgramImagePlan, ProgramSupport,
-            RuntimeAddressResolution, RuntimeConfigPayload, VmScalarResolutionU32,
-            build_component_runtime_plan, build_config_plan, build_vm_cloud_init_template_string,
-            resolve_vm_scalar_u32,
+            ComponentExecutionPlan, ProgramSupport, RuntimeAddressResolution, RuntimeConfigPayload,
+            VmScalarResolutionU32, build_component_runtime_plan, build_config_plan,
+            build_vm_cloud_init_template_string, resolve_slot_interpolation, resolve_vm_scalar_u32,
         },
         storage::{StorageIdentity, StorageMount, StoragePlan, build_storage_plan},
     },
@@ -241,6 +240,7 @@ fn render_vm(compiled: &CompiledScenario) -> Result<VmArtifact, MeshError> {
     let address_plan = build_address_plan(&mesh_plan, addressing)?;
     let config_plan = build_config_plan(
         scenario,
+        compiled.config_analysis(),
         program_components,
         ProgramSupport::Vm {
             backend_label: "vm output",
@@ -404,15 +404,7 @@ fn build_component_plans(
         program_components,
         slot_values_by_component,
     } = inputs;
-
-    let composed = templates::compose_root_config_templates(scenario.root, &scenario.components);
-    if let Some(err) = composed.errors.first() {
-        return Err(MeshError::new(format!(
-            "failed to compose component config templates: {}",
-            err.message
-        )));
-    }
-    let resolved_templates = composed.templates;
+    let config_analysis = compiled.config_analysis();
 
     let mut out = Vec::with_capacity(program_components.len());
     for id in program_components {
@@ -436,13 +428,12 @@ fn build_component_plans(
                 component_label(scenario, *id)
             ))
         })?;
-        let component_template = resolved_templates.get(id).ok_or_else(|| {
+        let component_config = config_analysis.component(*id).ok_or_else(|| {
             MeshError::new(format!(
-                "internal error: missing config template for {}",
+                "internal error: missing config analysis for {}",
                 component.moniker.as_str()
             ))
         })?;
-        let template_opt = component_template.node();
         let slots = slot_values_by_component.get(id).ok_or_else(|| {
             MeshError::new(format!(
                 "internal error: missing slot values for {}",
@@ -457,7 +448,7 @@ fn build_component_plans(
                 program.cloud_init.user_data.as_deref(),
                 RuntimeAddressResolution::Deferred,
                 slots,
-                template_opt,
+                component_config,
             )?);
         let (cloud_init_vendor_data, vendor_data_needs_runtime_config) =
             build_vm_template_string_plan(build_vm_cloud_init_template_string(
@@ -467,17 +458,18 @@ fn build_component_plans(
                 program.cloud_init.vendor_data.as_deref(),
                 RuntimeAddressResolution::Deferred,
                 slots,
-                template_opt,
+                component_config,
             )?);
         let cloud_init_needs_runtime_config =
             user_data_needs_runtime_config || vendor_data_needs_runtime_config;
+        let vm_runtime_config_required = config_plan.runtime_views.contains_key(id);
         let runtime_plan = build_component_runtime_plan(
             component.moniker.as_str(),
             program_plan,
             config_plan.mount_specs.get(id).map(Vec::as_slice),
             config_plan.runtime_views.get(id),
-            cloud_init_needs_runtime_config,
-            cloud_init_needs_runtime_config,
+            cloud_init_needs_runtime_config || vm_runtime_config_required,
+            cloud_init_needs_runtime_config || vm_runtime_config_required,
         )?;
         let names = component_names.get(id).ok_or_else(|| {
             MeshError::new(format!(
@@ -509,24 +501,23 @@ fn build_component_plans(
             mesh_config_path: mesh_config_relative_path(&names.mesh_dir),
             mesh_identity_path: mesh_identity_relative_path(&names.mesh_dir),
             cpus: build_vm_scalar_plan(resolve_vm_scalar_u32(
-                template_opt,
+                component_config,
                 &program.cpus,
                 component.moniker.as_str(),
                 "program.vm.cpus",
             )?),
             memory_mib: build_vm_scalar_plan(resolve_vm_scalar_u32(
-                template_opt,
+                component_config,
                 &program.memory_mib,
                 component.moniker.as_str(),
                 "program.vm.memory_mib",
             )?),
             base_image: build_vm_base_image_plan(
-                program_plan.image().ok_or_else(|| {
-                    MeshError::new(format!(
-                        "internal error: missing VM base image plan for {}",
-                        component.moniker.as_str()
-                    ))
-                })?,
+                scenario,
+                *id,
+                program,
+                slots,
+                component_config,
                 source_dir.as_deref(),
                 component.moniker.as_str(),
             )?,
@@ -625,38 +616,91 @@ fn build_vm_scalar_plan(resolution: VmScalarResolutionU32) -> VmScalarPlanU32 {
 }
 
 fn build_vm_base_image_plan(
-    image: &ProgramImagePlan,
+    scenario: &Scenario,
+    id: ComponentId,
+    program: &ProgramVm,
+    slots: &BTreeMap<String, crate::slots::SlotValue>,
+    component_config: &ComponentConfigAnalysis,
     source_dir: Option<&Path>,
     component_moniker: &str,
 ) -> Result<VmHostPathPlan, MeshError> {
-    match image {
-        ProgramImagePlan::Static(path) => Ok(VmHostPathPlan::Static {
-            path: resolve_vm_host_path(path, source_dir, component_moniker)?,
-        }),
-        ProgramImagePlan::RuntimeTemplate(parts) => {
-            let [ProgramImagePart::RootConfigPath(query)] = parts.as_slice() else {
-                return Ok(VmHostPathPlan::RuntimeTemplate {
-                    parts: parts
-                        .iter()
-                        .map(|part| match part {
-                            ProgramImagePart::Literal(lit) => {
-                                VmHostPathPart::Literal { value: lit.clone() }
-                            }
-                            ProgramImagePart::RootConfigPath(query) => {
-                                VmHostPathPart::RuntimeConfig {
-                                    query: query.clone(),
-                                }
-                            }
-                        })
-                        .collect(),
-                    source_dir: source_dir.map(|path| path.display().to_string()),
-                });
-            };
-            Ok(VmHostPathPlan::RuntimeConfig {
-                query: query.clone(),
-                source_dir: source_dir.map(|path| path.display().to_string()),
-            })
+    let image = program
+        .image
+        .parse::<amber_manifest::InterpolatedString>()
+        .map_err(|err| {
+            MeshError::new(format!(
+                "failed to parse program.vm.image interpolation in {}: {err}",
+                component_label(scenario, id)
+            ))
+        })?;
+
+    let mut parts = Vec::new();
+    for part in &image.parts {
+        match part {
+            InterpolatedPart::Literal(lit) => push_vm_host_path_literal(&mut parts, lit.clone()),
+            InterpolatedPart::Interpolation { source, query } => {
+                if let Some(value) = resolve_slot_interpolation(
+                    scenario,
+                    id,
+                    "program.vm.image",
+                    source,
+                    query,
+                    slots,
+                )? {
+                    push_vm_host_path_literal(&mut parts, value);
+                    continue;
+                }
+
+                match component_config
+                    .resolve_static_string_query(query)
+                    .map_err(MeshError::new)?
+                {
+                    Some(value) => push_vm_host_path_literal(&mut parts, value),
+                    None => parts.push(VmHostPathPart::RuntimeConfig {
+                        query: query.clone(),
+                    }),
+                }
+            }
+            _ => {
+                return Err(MeshError::new(format!(
+                    "unsupported interpolation part in {} program.vm.image",
+                    component_label(scenario, id)
+                )));
+            }
         }
+    }
+
+    if parts.is_empty() {
+        return Err(MeshError::new(format!(
+            "internal error: produced empty image template for {} program.vm.image",
+            component_label(scenario, id)
+        )));
+    }
+
+    let runtime_source_dir = source_dir.map(|path| path.display().to_string());
+    match parts.as_slice() {
+        [VmHostPathPart::Literal { value }] => Ok(VmHostPathPlan::Static {
+            path: resolve_vm_host_path(value, source_dir, component_moniker)?,
+        }),
+        [VmHostPathPart::RuntimeConfig { query }] => Ok(VmHostPathPlan::RuntimeConfig {
+            query: query.clone(),
+            source_dir: runtime_source_dir,
+        }),
+        _ => Ok(VmHostPathPlan::RuntimeTemplate {
+            parts,
+            source_dir: runtime_source_dir,
+        }),
+    }
+}
+
+fn push_vm_host_path_literal(parts: &mut Vec<VmHostPathPart>, lit: String) {
+    if lit.is_empty() {
+        return;
+    }
+
+    match parts.last_mut() {
+        Some(VmHostPathPart::Literal { value }) => value.push_str(&lit),
+        _ => parts.push(VmHostPathPart::Literal { value: lit }),
     }
 }
 

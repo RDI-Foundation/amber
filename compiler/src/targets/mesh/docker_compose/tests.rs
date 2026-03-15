@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use amber_config as rc;
 use amber_manifest::{
     CapabilityKind, FrameworkCapabilityName, Manifest, ManifestDigest, ManifestRef,
     Program as ManifestProgram, ProvideDecl, SlotDecl,
@@ -49,6 +50,66 @@ fn render_compose(
     output: &crate::CompileOutput,
 ) -> Result<super::DockerComposeArtifact, crate::reporter::ReporterError> {
     DockerComposeReporter.emit(&compiled_scenario(output))
+}
+
+#[test]
+fn render_compose_image_uses_root_default_fallback() {
+    let leaves = [rc::SchemaLeaf {
+        path: "base_image".to_string(),
+        required: true,
+        default: Some(json!("ghcr.io/example/default:1")),
+        secret: false,
+        pointer: "/properties/base_image".to_string(),
+    }];
+    let root_leaf_by_path: BTreeMap<&str, &rc::SchemaLeaf> = leaves
+        .iter()
+        .map(|leaf| (leaf.path.as_str(), leaf))
+        .collect();
+
+    let rendered = super::render_compose_image(
+        &crate::targets::program_config::ProgramImagePlan::RuntimeTemplate(vec![
+            crate::targets::program_config::ProgramImagePart::RootConfigPath(
+                "base_image".to_string(),
+            ),
+        ]),
+        &root_leaf_by_path,
+    )
+    .expect("compose image should render");
+
+    assert_eq!(
+        rendered,
+        "${AMBER_CONFIG_BASE_IMAGE:-ghcr.io/example/default:1}"
+    );
+}
+
+#[test]
+fn render_compose_image_rejects_null_root_default() {
+    let leaves = [rc::SchemaLeaf {
+        path: "base_image".to_string(),
+        required: false,
+        default: Some(Value::Null),
+        secret: false,
+        pointer: "/properties/base_image".to_string(),
+    }];
+    let root_leaf_by_path: BTreeMap<&str, &rc::SchemaLeaf> = leaves
+        .iter()
+        .map(|leaf| (leaf.path.as_str(), leaf))
+        .collect();
+
+    let err = super::render_compose_image(
+        &crate::targets::program_config::ProgramImagePlan::RuntimeTemplate(vec![
+            crate::targets::program_config::ProgramImagePart::RootConfigPath(
+                "base_image".to_string(),
+            ),
+        ]),
+        &root_leaf_by_path,
+    )
+    .expect_err("null default should be rejected for runtime image interpolation");
+
+    assert!(
+        err.contains("cannot be interpolated into an image string"),
+        "{err}"
+    );
 }
 
 fn compile_output_with_manifest_overrides(
@@ -93,11 +154,14 @@ fn compile_output_with_manifest_overrides(
             .collect(),
     };
 
+    let config_analysis = crate::config::analysis::ScenarioConfigAnalysis::from_scenario(&scenario)
+        .expect("config analysis");
     crate::CompileOutput {
         scenario,
         store,
         provenance,
         diagnostics: Vec::new(),
+        config_analysis,
     }
 }
 

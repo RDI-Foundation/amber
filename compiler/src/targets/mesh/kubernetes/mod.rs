@@ -288,6 +288,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
 
     let config_plan = build_config_plan(
         s,
+        compiled.config_analysis(),
         program_components,
         ProgramSupport::Image {
             backend_label: "kubernetes output",
@@ -550,14 +551,13 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
                 }),
             });
 
-            let mut env_content = String::new();
-            env_content.push_str("# Root config secrets - fill in values before deploying\n");
-            for leaf in &secret_leaves {
-                let env_var = rc::env_var_for_path(&leaf.path)
-                    .map_err(|e| ReporterError::new(format!("failed to map config path: {e}")))?;
-                env_content.push_str(&format!("{}=\n", env_var));
-            }
-            files.insert(PathBuf::from("root-config-secret.env"), env_content);
+            files.insert(
+                PathBuf::from("root-config-secret.env"),
+                render_root_config_env_content(
+                    &secret_leaves,
+                    "# Root config secrets - fill in values before deploying",
+                )?,
+            );
         }
 
         if !config_leaves.is_empty() {
@@ -571,14 +571,13 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
                 }),
             });
 
-            let mut env_content = String::new();
-            env_content.push_str("# Root config values - fill in values before deploying\n");
-            for leaf in &config_leaves {
-                let env_var = rc::env_var_for_path(&leaf.path)
-                    .map_err(|e| ReporterError::new(format!("failed to map config path: {e}")))?;
-                env_content.push_str(&format!("{}=\n", env_var));
-            }
-            files.insert(PathBuf::from("root-config.env"), env_content);
+            files.insert(
+                PathBuf::from("root-config.env"),
+                render_root_config_env_content(
+                    &config_leaves,
+                    "# Root config values - fill in values before deploying",
+                )?,
+            );
         }
 
         // Don't insert kustomization yet - we'll do it at the end after collecting all resource paths
@@ -1321,7 +1320,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
         input_metadata.insert(
             leaf.path.clone(),
             InputMetadata {
-                required: leaf.required,
+                required: leaf.runtime_required(),
                 secret: leaf.secret,
             },
         );
@@ -1751,6 +1750,35 @@ fn render_kubernetes_image(
             Ok((format!("amber-runtime-image-{service_name}"), Some(env_var)))
         }
     }
+}
+
+fn render_root_config_env_content(
+    leaves: &[&rc::SchemaLeaf],
+    heading: &str,
+) -> KubernetesResult<String> {
+    let mut env_content = String::new();
+    env_content.push_str(heading);
+    env_content.push('\n');
+
+    for leaf in leaves {
+        let env_var = rc::env_var_for_path(&leaf.path)
+            .map_err(|e| ReporterError::new(format!("failed to map config path: {e}")))?;
+        let value = leaf
+            .default
+            .as_ref()
+            .map(rc::encode_env_value)
+            .transpose()
+            .map_err(|err| {
+                ReporterError::new(format!(
+                    "failed to render default for config.{}: {err}",
+                    leaf.path
+                ))
+            })?
+            .unwrap_or_default();
+        env_content.push_str(&format!("{env_var}={value}\n"));
+    }
+
+    Ok(env_content)
 }
 
 fn program_image_source(

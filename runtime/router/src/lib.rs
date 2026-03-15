@@ -5560,52 +5560,49 @@ mod tests {
         let noise_keys = noise_keys_for_identity(&server_config.identity).expect("noise keys");
 
         let server_task = tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.expect("mesh peer should accept");
-                connection_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let trust = trust.clone();
-                let noise_keys = noise_keys.clone();
-                tokio::spawn(async move {
-                    let mut session = accept_noise(stream, &noise_keys, trust.as_ref())
-                        .await
-                        .expect("mesh peer should accept noise");
-                    let open = session.recv_open().await.expect("open frame");
-                    assert_eq!(open.capability, "matrix");
+            let (stream, _) = listener.accept().await.expect("mesh peer should accept");
+            connection_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-                    let (local, remote) = duplex(64 * 1024);
-                    let bridge =
-                        tokio::spawn(
-                            async move { proxy_noise_to_plain(&mut session, local).await },
-                        );
-                    let service = service_fn(|req: Request<Incoming>| async move {
-                        assert_eq!(req.uri().path(), "/_matrix/client/v3/sync");
-                        Ok::<_, std::convert::Infallible>(
-                            Response::builder()
-                                .status(StatusCode::OK)
-                                .body(
-                                    Full::new(Bytes::from_static(b"mesh ok"))
-                                        .map_err(|never| match never {})
-                                        .boxed(),
-                                )
-                                .expect("mesh response should build"),
+            let mut session = accept_noise(stream, &noise_keys, trust.as_ref())
+                .await
+                .expect("mesh peer should accept noise");
+            let open = session.recv_open().await.expect("open frame");
+            assert_eq!(open.capability, "matrix");
+
+            let (local, remote) = duplex(64 * 1024);
+            let bridge =
+                tokio::spawn(async move { proxy_noise_to_plain(&mut session, local).await });
+            let service = service_fn(|req: Request<Incoming>| async move {
+                assert_eq!(req.uri().path(), "/_matrix/client/v3/sync");
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(
+                            Full::new(Bytes::from_static(b"mesh ok"))
+                                .map_err(|never| match never {})
+                                .boxed(),
                         )
-                    });
-                    http1::Builder::new()
-                        .serve_connection(TokioIo::new(remote), service)
-                        .await
-                        .expect("mesh http server should complete");
-                    let _ = bridge.await;
-                });
-            }
+                        .expect("mesh response should build"),
+                )
+            });
+            http1::Builder::new()
+                .serve_connection(TokioIo::new(remote), service)
+                .await
+                .expect("mesh http server should complete");
+            bridge
+                .await
+                .expect("mesh bridge task should complete")
+                .expect("mesh bridge should succeed");
         });
 
         let peer_key = base64::engine::general_purpose::STANDARD.encode(peer_identity.public_key);
-        let mesh_url = format!(
-            "mesh://127.0.0.1:{}?peer_id={}&peer_key={peer_key}",
-            addr.port(),
-            peer_identity.id
-        );
-        (mesh_url, server_task)
+        let mut mesh_url = Url::parse(&format!("mesh://127.0.0.1:{}", addr.port()))
+            .expect("mesh url should parse");
+        mesh_url
+            .query_pairs_mut()
+            .append_pair("peer_id", &peer_identity.id)
+            .append_pair("peer_key", &peer_key);
+        (mesh_url.to_string(), server_task)
     }
 
     #[test]
@@ -6315,9 +6312,18 @@ mod tests {
 
     #[test]
     fn resolve_http_external_target_with_override_preserves_mesh_targets() {
-        let peer_key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
-        let mesh_url =
-            format!("mesh://host.docker.internal:61662?peer_id=/proxy&peer_key={peer_key}");
+        let peer_key = base64::engine::general_purpose::STANDARD.encode([251u8; 32]);
+        assert!(
+            peer_key.contains('+'),
+            "regression test requires a base64 peer key with '+'"
+        );
+        let mut mesh_url =
+            Url::parse("mesh://host.docker.internal:61662").expect("mesh url should parse");
+        mesh_url
+            .query_pairs_mut()
+            .append_pair("peer_id", "/proxy")
+            .append_pair("peer_key", &peer_key);
+        let mesh_url = mesh_url.to_string();
         let target = ExternalTarget {
             name: "matrix".to_string(),
             url_env: "MATRIX_URL".to_string(),
@@ -6447,8 +6453,14 @@ mod tests {
             )
             .await
             .expect("second response should arrive");
-        assert_eq!(second.status(), StatusCode::OK);
-        assert_eq!(response_text(second).await, "mesh ok");
+        let second_status = second.status();
+        let second_body = response_text(second).await;
+        assert_eq!(
+            second_status,
+            StatusCode::OK,
+            "second response body: {second_body}"
+        );
+        assert_eq!(second_body, "mesh ok");
 
         let third = sender
             .send_request(
@@ -6460,8 +6472,14 @@ mod tests {
             )
             .await
             .expect("third response should arrive");
-        assert_eq!(third.status(), StatusCode::OK);
-        assert_eq!(response_text(third).await, "mesh ok");
+        let third_status = third.status();
+        let third_body = response_text(third).await;
+        assert_eq!(
+            third_status,
+            StatusCode::OK,
+            "third response body: {third_body}"
+        );
+        assert_eq!(third_body, "mesh ok");
         assert_eq!(
             connection_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -6472,7 +6490,6 @@ mod tests {
         drop(state);
         let _ = client_task.await;
         let _ = proxy_task.await;
-        mesh_server_task.abort();
         let _ = mesh_server_task.await;
     }
 }

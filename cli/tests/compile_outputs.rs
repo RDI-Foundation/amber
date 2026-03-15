@@ -1,4 +1,8 @@
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use amber_compiler::reporter::{
     direct::{DIRECT_CONTROL_SOCKET_RELATIVE_PATH, DIRECT_PLAN_VERSION},
@@ -6,7 +10,10 @@ use amber_compiler::reporter::{
 };
 use amber_images::AMBER_ROUTER;
 use amber_manifest::ManifestDigest;
-use amber_template::{ProgramArgTemplate, ProgramEnvTemplate, TemplatePart, TemplateSpec};
+use amber_template::{
+    ProgramArgTemplate, ProgramEnvTemplate, RepeatedProgramArgTemplate, RepeatedProgramEnvTemplate,
+    RepeatedTemplateSource, TemplatePart, TemplateSpec,
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::Value;
 use serde_yaml::Value as YamlValue;
@@ -25,6 +32,59 @@ fn env_value(service: &YamlValue, key: &str) -> Option<String> {
         }),
         _ => None,
     }
+}
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root")
+        .to_path_buf()
+}
+
+fn cli_test_outputs_dir(prefix: &str) -> tempfile::TempDir {
+    let outputs_root = workspace_root().join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory")
+}
+
+fn write_fixture(path: &Path, contents: &str) {
+    fs::write(path, contents).unwrap_or_else(|err| {
+        panic!("failed to write fixture {}: {err}", path.display());
+    });
+}
+
+fn parse_json_file(path: &Path) -> Value {
+    serde_json::from_str(
+        &fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display())),
+    )
+    .unwrap_or_else(|err| panic!("failed to parse {} as json: {err}", path.display()))
+}
+
+fn decode_json_b64(raw: &str) -> Value {
+    let bytes = STANDARD
+        .decode(raw)
+        .unwrap_or_else(|err| panic!("base64 payload should decode: {err}"));
+    serde_json::from_slice(&bytes).expect("payload should contain valid JSON")
+}
+
+fn decode_template_spec(raw: &str) -> TemplateSpec {
+    let bytes = STANDARD
+        .decode(raw)
+        .unwrap_or_else(|err| panic!("template spec should decode: {err}"));
+    serde_json::from_slice(&bytes).expect("template spec should contain valid JSON")
+}
+
+fn find_component<'a>(plan: &'a Value, moniker: &str) -> &'a Value {
+    plan["components"]
+        .as_array()
+        .expect("components should be an array")
+        .iter()
+        .find(|component| component["moniker"].as_str() == Some(moniker))
+        .unwrap_or_else(|| panic!("expected component {moniker} in plan: {plan:#}"))
 }
 
 #[test]
@@ -435,10 +495,17 @@ fn compile_writes_vm_artifact() {
     let component = components[0]
         .as_object()
         .expect("vm component should serialize as an object");
+    let allowed_root_leaf_paths = component["runtime_config"]["allowed_root_leaf_paths"]
+        .as_array()
+        .expect("runtime_config.allowed_root_leaf_paths should be an array")
+        .iter()
+        .map(|value| value.as_str().expect("allowed path should be a string"))
+        .collect::<Vec<_>>();
     assert!(
-        !component.contains_key("runtime_config"),
-        "vm component should omit runtime_config when it is unused"
+        component.contains_key("runtime_config"),
+        "vm component should carry runtime_config when the base image depends on runtime config"
     );
+    assert_eq!(allowed_root_leaf_paths, vec!["base_image"]);
     assert!(
         !component.contains_key("mount_spec_b64"),
         "vm component should omit mount_spec_b64 when it is unused"
@@ -583,9 +650,21 @@ fn compile_vm_artifact_supports_runtime_templates() {
             .any(|part| part["slot"] == "api.url"),
         "cloud-init template should retain slot interpolation"
     );
+    let mut allowed_root_leaf_paths = component["runtime_config"]["allowed_root_leaf_paths"]
+        .as_array()
+        .expect("runtime_config.allowed_root_leaf_paths should be an array")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("allowed_root_leaf_paths should contain strings")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    allowed_root_leaf_paths.sort();
     assert_eq!(
-        component["runtime_config"]["allowed_root_leaf_paths"][0],
-        "message"
+        allowed_root_leaf_paths,
+        vec!["base_image".to_string(), "message".to_string()]
     );
 }
 
@@ -845,11 +924,49 @@ fn compile_vm_artifact_rewrites_runtime_scalar_paths_through_child_config() {
         .expect("vm plan should contain one component");
 
     assert_eq!(component["base_image"]["kind"], "runtime_config");
-    assert_eq!(component["base_image"]["query"], "vm.image");
+    assert_eq!(component["base_image"]["query"], "image");
     assert_eq!(component["cpus"]["kind"], "runtime_config");
-    assert_eq!(component["cpus"]["query"], "vm.cpu");
+    assert_eq!(component["cpus"]["query"], "cpu_count");
     assert_eq!(component["memory_mib"]["kind"], "runtime_config");
-    assert_eq!(component["memory_mib"]["query"], "vm.memory");
+    assert_eq!(component["memory_mib"]["query"], "memory");
+    let mut allowed_root_leaf_paths = component["runtime_config"]["allowed_root_leaf_paths"]
+        .as_array()
+        .expect("runtime_config.allowed_root_leaf_paths should be an array")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("allowed_root_leaf_paths should contain strings")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    allowed_root_leaf_paths.sort();
+    assert_eq!(
+        allowed_root_leaf_paths,
+        vec![
+            "vm.cpu".to_string(),
+            "vm.image".to_string(),
+            "vm.memory".to_string(),
+        ]
+    );
+    assert!(
+        component.get("runtime_config").is_some(),
+        "runtime child config should carry runtime_config payload"
+    );
+    let env_example = fs::read_to_string(artifact_dir.join("env.example"))
+        .expect("failed to read vm env example");
+    assert!(
+        env_example.contains("AMBER_CONFIG_VM__IMAGE"),
+        "vm env example should mention runtime config for the forwarded base image"
+    );
+    assert!(
+        env_example.contains("AMBER_CONFIG_VM__CPU"),
+        "vm env example should mention runtime config for the forwarded cpu count"
+    );
+    assert!(
+        env_example.contains("AMBER_CONFIG_VM__MEMORY"),
+        "vm env example should mention runtime config for the forwarded memory size"
+    );
 }
 
 #[test]
@@ -868,7 +985,7 @@ fn check_rejects_invalid_vm_scalar_config_ref() {
     let manifest = outputs_dir.path().join("scenario.json5");
     fs::write(
         &manifest,
-        r#"{
+        r##"{
   manifest_version: "0.1.0",
   config_schema: {
     type: "object",
@@ -898,7 +1015,7 @@ fn check_rejects_invalid_vm_scalar_config_ref() {
     http: "http"
   }
 }
-"#,
+"##,
     )
     .expect("failed to write manifest");
 
@@ -924,6 +1041,138 @@ fn check_rejects_invalid_vm_scalar_config_ref() {
 }
 
 #[test]
+fn compile_compose_rejects_whole_config_program_image_ref() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("program-image-whole-config-check-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let manifest = outputs_dir.path().join("scenario.json5");
+    fs::write(
+        &manifest,
+        r##"{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      image: { type: "string" }
+    }
+  },
+  program: {
+    image: "${config}",
+    entrypoint: ["run"],
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    )
+    .expect("failed to write manifest");
+
+    let artifact_dir = outputs_dir.path().join("compose");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--docker-compose")
+        .arg(&artifact_dir)
+        .arg(&manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --docker-compose: {err}"));
+
+    assert!(
+        !output.status.success(),
+        "amber compile --docker-compose unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("program.image cannot reference the entire runtime config object"),
+        "expected whole-config image rejection in stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn compile_vm_rejects_whole_config_vm_image_ref() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("vm-image-whole-config-check-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let manifest = outputs_dir.path().join("scenario.json5");
+    fs::write(
+        &manifest,
+        r##"{
+  manifest_version: "0.1.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      image: { type: "string" }
+    }
+  },
+  program: {
+    vm: {
+      image: "${config}",
+      cpus: 1,
+      memory_mib: 512,
+      network: {
+        endpoints: [
+          { name: "http", port: 8080, protocol: "http" }
+        ],
+        egress: "none"
+      }
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    )
+    .expect("failed to write manifest");
+
+    let artifact_dir = outputs_dir.path().join("vm");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--vm")
+        .arg(&artifact_dir)
+        .arg(&manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --vm: {err}"));
+
+    assert!(
+        !output.status.success(),
+        "amber compile --vm unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("program.vm.image cannot reference the entire runtime config object"),
+        "expected whole-config vm image rejection in stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
 fn compile_direct_rejects_program_path_without_separator() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -939,7 +1188,7 @@ fn compile_direct_rejects_program_path_without_separator() {
     let manifest = outputs_dir.path().join("scenario.json5");
     fs::write(
         &manifest,
-        r#"{
+        r##"{
   manifest_version: "0.1.0",
   program: {
     path: "python3",
@@ -957,7 +1206,7 @@ fn compile_direct_rejects_program_path_without_separator() {
     http: "http"
   }
 }
-"#,
+"##,
     )
     .expect("failed to write manifest");
 
@@ -1075,7 +1324,7 @@ fn compile_compose_preserves_runtime_conditional_entrypoint_item_in_template_spe
     let manifest = outputs_dir.path().join("scenario.json5");
     fs::write(
         &manifest,
-        r#"{
+        r##"{
   manifest_version: "0.2.0",
   config_schema: {
     type: "object",
@@ -1111,7 +1360,7 @@ fn compile_compose_preserves_runtime_conditional_entrypoint_item_in_template_spe
     http: "http"
   }
 }
-"#,
+"##,
     )
     .expect("failed to write manifest");
 
@@ -1242,7 +1491,7 @@ fn compile_compose_resolves_optional_slot_when_before_backend_emission() {
 
     fs::write(
         &child_manifest,
-        r#"{
+        r##"{
   manifest_version: "0.2.0",
   slots: {
     api: { kind: "http", optional: true }
@@ -1269,7 +1518,7 @@ fn compile_compose_resolves_optional_slot_when_before_backend_emission() {
     http: "http"
   }
 }
-"#,
+"##,
     )
     .expect("failed to write child manifest");
 
@@ -1342,7 +1591,7 @@ fn compile_direct_preserves_runtime_conditional_program_arg_item_in_template_spe
     let manifest = outputs_dir.path().join("scenario.json5");
     fs::write(
         &manifest,
-        r#"{
+        r##"{
   manifest_version: "0.2.0",
   config_schema: {
     type: "object",
@@ -1378,7 +1627,7 @@ fn compile_direct_preserves_runtime_conditional_program_arg_item_in_template_spe
     http: "http"
   }
 }
-"#,
+"##,
     )
     .expect("failed to write manifest");
 
@@ -1457,6 +1706,2231 @@ fn compile_direct_preserves_runtime_conditional_program_arg_item_in_template_spe
         }
         None => panic!("expected PROFILE env template"),
     }
+}
+
+#[test]
+fn compile_primary_output_keeps_forwarded_root_defaulted_endpoint_and_mount_conditions() {
+    let outputs_dir = cli_test_outputs_dir("forwarded-root-primary-defaults-");
+
+    let worker_manifest = outputs_dir.path().join("worker.json5");
+    let bridge_manifest = outputs_dir.path().join("bridge.json5");
+    let root_manifest = outputs_dir.path().join("root.json5");
+
+    write_fixture(
+        &worker_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      child_enabled: { type: "string" },
+      mount_text: { type: "string" }
+    }
+  },
+  program: {
+    image: "busybox:stable",
+    entrypoint: ["sh", "-lc", "sleep infinity"],
+    network: {
+      endpoints: [
+        {
+          name: "http",
+          port: 8080,
+          protocol: "http",
+          when: "config.child_enabled"
+        }
+      ]
+    },
+    mounts: [
+      {
+        path: "/etc/feature.txt",
+        from: "config.mount_text",
+        when: "config.child_enabled"
+      }
+    ]
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &bridge_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      bridge_enabled: { type: "string" },
+      bridge_mount_text: { type: "string" }
+    }
+  },
+  components: {
+    worker: {
+      manifest: "./worker.json5",
+      config: {
+        child_enabled: "${config.bridge_enabled}",
+        mount_text: "${config.bridge_mount_text}"
+      }
+    }
+  },
+  exports: {
+    http: "#worker.http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      root_enabled: { type: "string", default: "enabled" },
+      root_mount_text: { type: "string", default: "hello from root" }
+    }
+  },
+  components: {
+    bridge: {
+      manifest: "./bridge.json5",
+      config: {
+        bridge_enabled: "${config.root_enabled}",
+        bridge_mount_text: "${config.root_mount_text}"
+      }
+    }
+  },
+  exports: {
+    http: "#bridge.http"
+  }
+}
+"##,
+    );
+
+    let primary_output = outputs_dir.path().join("scenario.ir.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--output")
+        .arg(&primary_output)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile: {err}"));
+
+    assert!(
+        output.status.success(),
+        "amber compile failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan = parse_json_file(&primary_output);
+    let worker = find_component(&plan, "/bridge/worker");
+
+    let endpoints = worker["program"]["network"]["endpoints"]
+        .as_array()
+        .expect("forwarded defaulted endpoint should survive linker lowering");
+    assert_eq!(endpoints.len(), 1, "{worker:#}");
+    assert_eq!(endpoints[0]["name"].as_str(), Some("http"));
+
+    let mounts = worker["program"]["mounts"]
+        .as_array()
+        .expect("forwarded defaulted mount should survive linker lowering");
+    assert_eq!(mounts.len(), 1, "{worker:#}");
+    assert_eq!(mounts[0]["kind"].as_str(), Some("file"));
+    assert!(mounts[0]["when"].is_null(), "{worker:#}");
+}
+
+#[test]
+fn compile_primary_output_keeps_forwarded_object_defaulted_endpoint_and_mount_conditions() {
+    let outputs_dir = cli_test_outputs_dir("forwarded-object-primary-defaults-");
+
+    let worker_manifest = outputs_dir.path().join("worker.json5");
+    let bridge_manifest = outputs_dir.path().join("bridge.json5");
+    let root_manifest = outputs_dir.path().join("root.json5");
+
+    write_fixture(
+        &worker_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      settings: {
+        type: "object",
+        properties: {
+          mode: { type: "string", default: "enabled" },
+          mount_text: { type: "string", default: "hello from worker defaults" }
+        }
+      }
+    }
+  },
+  program: {
+    image: "busybox:stable",
+    entrypoint: ["sh", "-lc", "sleep infinity"],
+    network: {
+      endpoints: [
+        {
+          name: "http",
+          port: 8080,
+          protocol: "http",
+          when: "config.settings.mode"
+        }
+      ]
+    },
+    mounts: [
+      {
+        path: "/etc/feature.txt",
+        from: "config.settings.mount_text",
+        when: "config.settings.mode"
+      }
+    ]
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &bridge_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      bridge_settings: {
+        type: "object",
+        properties: {
+          mode: { type: "string" },
+          mount_text: { type: "string" }
+        }
+      }
+    }
+  },
+  components: {
+    worker: {
+      manifest: "./worker.json5",
+      config: {
+        settings: "${config.bridge_settings}"
+      }
+    }
+  },
+  exports: {
+    http: "#worker.http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      settings: {
+        type: "object",
+        properties: {
+          mode: { type: "string" },
+          mount_text: { type: "string" }
+        }
+      }
+    }
+  },
+  components: {
+    bridge: {
+      manifest: "./bridge.json5",
+      config: {
+        bridge_settings: "${config.settings}"
+      }
+    }
+  },
+  exports: {
+    http: "#bridge.http"
+  }
+}
+"##,
+    );
+
+    let primary_output = outputs_dir.path().join("scenario.ir.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--output")
+        .arg(&primary_output)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile: {err}"));
+
+    assert!(
+        output.status.success(),
+        "amber compile failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan = parse_json_file(&primary_output);
+    let worker = find_component(&plan, "/bridge/worker");
+
+    let endpoints = worker["program"]["network"]["endpoints"]
+        .as_array()
+        .expect("forwarded object defaulted endpoint should survive linker lowering");
+    assert_eq!(endpoints.len(), 1, "{worker:#}");
+    assert_eq!(endpoints[0]["name"].as_str(), Some("http"));
+
+    let mounts = worker["program"]["mounts"]
+        .as_array()
+        .expect("forwarded object defaulted mount should survive linker lowering");
+    assert_eq!(mounts.len(), 1, "{worker:#}");
+    assert_eq!(mounts[0]["kind"].as_str(), Some("file"));
+    assert!(mounts[0]["when"].is_null(), "{worker:#}");
+}
+
+#[test]
+fn compile_primary_output_preserves_forwarded_root_runtime_mount_condition() {
+    let outputs_dir = cli_test_outputs_dir("forwarded-root-primary-runtime-mount-");
+
+    let worker_manifest = outputs_dir.path().join("worker.json5");
+    let bridge_manifest = outputs_dir.path().join("bridge.json5");
+    let root_manifest = outputs_dir.path().join("root.json5");
+
+    write_fixture(
+        &worker_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      child_enabled: { type: "string" },
+      mount_text: { type: "string" }
+    }
+  },
+  program: {
+    image: "busybox:stable",
+    entrypoint: ["sh", "-lc", "sleep infinity"],
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    },
+    mounts: [
+      {
+        path: "/etc/runtime.txt",
+        from: "config.mount_text",
+        when: "config.child_enabled"
+      }
+    ]
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &bridge_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      bridge_enabled: { type: "string" },
+      bridge_mount_text: { type: "string" }
+    }
+  },
+  components: {
+    worker: {
+      manifest: "./worker.json5",
+      config: {
+        child_enabled: "${config.bridge_enabled}",
+        mount_text: "${config.bridge_mount_text}"
+      }
+    }
+  },
+  exports: {
+    http: "#worker.http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      root_enabled: { type: "string" },
+      root_mount_text: { type: "string", default: "hello from root" }
+    }
+  },
+  components: {
+    bridge: {
+      manifest: "./bridge.json5",
+      config: {
+        bridge_enabled: "${config.root_enabled}",
+        bridge_mount_text: "${config.root_mount_text}"
+      }
+    }
+  },
+  exports: {
+    http: "#bridge.http"
+  }
+}
+"##,
+    );
+
+    let primary_output = outputs_dir.path().join("scenario.ir.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--output")
+        .arg(&primary_output)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile: {err}"));
+
+    assert!(
+        output.status.success(),
+        "amber compile failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan = parse_json_file(&primary_output);
+    let worker = find_component(&plan, "/bridge/worker");
+    let mounts = worker["program"]["mounts"]
+        .as_array()
+        .expect("forwarded runtime mount condition should survive linker lowering");
+    assert_eq!(mounts.len(), 1, "{worker:#}");
+    assert_eq!(mounts[0]["kind"].as_str(), Some("file"));
+    assert_eq!(mounts[0]["when"]["kind"].as_str(), Some("config"));
+    assert_eq!(mounts[0]["when"]["path"].as_str(), Some("child_enabled"));
+}
+
+#[test]
+fn check_accepts_forwarded_root_defaulted_leaf_under_nullable_ancestor() {
+    let outputs_dir = cli_test_outputs_dir("forwarded-root-nullable-endpoint-");
+
+    let worker_manifest = outputs_dir.path().join("worker.json5");
+    let root_manifest = outputs_dir.path().join("root.json5");
+
+    write_fixture(
+        &worker_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      child_enabled: { type: "string" }
+    }
+  },
+  program: {
+    image: "busybox:stable",
+    entrypoint: ["sh", "-lc", "sleep infinity"],
+    network: {
+      endpoints: [
+        {
+          name: "http",
+          port: 8080,
+          protocol: "http",
+          when: "config.child_enabled"
+        }
+      ]
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      settings: {
+        type: ["object", "null"],
+        properties: {
+          root_enabled: { type: "string", default: "enabled" }
+        }
+      }
+    }
+  },
+  components: {
+    worker: {
+      manifest: "./worker.json5",
+      config: {
+        child_enabled: "${config.settings.root_enabled}"
+      }
+    }
+  },
+  exports: {
+    http: "#worker.http"
+  }
+}
+"##,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("check")
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber check: {err}"));
+
+    assert!(
+        output.status.success(),
+        "amber check failed unexpectedly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn check_rejects_forwarded_object_default_condition_hidden_behind_nullable_forwarding() {
+    let outputs_dir = cli_test_outputs_dir("forwarded-object-nullable-endpoint-");
+
+    let worker_manifest = outputs_dir.path().join("worker.json5");
+    let bridge_manifest = outputs_dir.path().join("bridge.json5");
+    let root_manifest = outputs_dir.path().join("root.json5");
+
+    write_fixture(
+        &worker_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      settings: {
+        type: ["object", "null"],
+        properties: {
+          mode: { type: "string", default: "enabled" }
+        }
+      }
+    }
+  },
+  program: {
+    image: "busybox:stable",
+    entrypoint: ["sh", "-lc", "sleep infinity"],
+    network: {
+      endpoints: [
+        {
+          name: "http",
+          port: 8080,
+          protocol: "http",
+          when: "config.settings.mode"
+        }
+      ]
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &bridge_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      bridge_settings: {
+        type: ["object", "null"],
+        properties: {
+          mode: { type: "string" }
+        }
+      }
+    }
+  },
+  components: {
+    worker: {
+      manifest: "./worker.json5",
+      config: {
+        settings: "${config.bridge_settings}"
+      }
+    }
+  },
+  exports: {
+    http: "#worker.http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      settings: {
+        type: ["object", "null"],
+        properties: {
+          mode: { type: "string" }
+        }
+      }
+    }
+  },
+  components: {
+    bridge: {
+      manifest: "./bridge.json5",
+      config: {
+        bridge_settings: "${config.settings}"
+      }
+    }
+  },
+  exports: {
+    http: "#bridge.http"
+  }
+}
+"##,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("check")
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber check: {err}"));
+
+    assert!(
+        !output.status.success(),
+        "amber check unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "depends on runtime config, but endpoints must resolve entirely at compile time"
+        ),
+        "expected runtime-dependent endpoint error, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn check_rejects_forwarded_object_default_condition_hidden_behind_non_object_forwarding() {
+    let outputs_dir = cli_test_outputs_dir("forwarded-object-non-object-endpoint-");
+
+    let worker_manifest = outputs_dir.path().join("worker.json5");
+    let bridge_manifest = outputs_dir.path().join("bridge.json5");
+    let root_manifest = outputs_dir.path().join("root.json5");
+
+    write_fixture(
+        &worker_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      settings: {
+        type: "object",
+        properties: {
+          mode: { type: "string", default: "enabled" }
+        }
+      }
+    }
+  },
+  program: {
+    image: "busybox:stable",
+    entrypoint: ["sh", "-lc", "sleep infinity"],
+    network: {
+      endpoints: [
+        {
+          name: "http",
+          port: 8080,
+          protocol: "http",
+          when: "config.settings.mode"
+        }
+      ]
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &bridge_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      bridge_settings: {
+        type: ["object", "string"],
+        properties: {
+          mode: { type: "string" }
+        }
+      }
+    }
+  },
+  components: {
+    worker: {
+      manifest: "./worker.json5",
+      config: {
+        settings: "${config.bridge_settings}"
+      }
+    }
+  },
+  exports: {
+    http: "#worker.http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      settings: {
+        type: ["object", "string"],
+        properties: {
+          mode: { type: "string" }
+        }
+      }
+    }
+  },
+  components: {
+    bridge: {
+      manifest: "./bridge.json5",
+      config: {
+        bridge_settings: "${config.settings}"
+      }
+    }
+  },
+  exports: {
+    http: "#bridge.http"
+  }
+}
+"##,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("check")
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber check: {err}"));
+
+    assert!(
+        !output.status.success(),
+        "amber check unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "depends on runtime config, but endpoints must resolve entirely at compile time"
+        ),
+        "expected runtime-dependent endpoint error, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn check_rejects_forwarded_null_only_leaf_condition_even_with_component_default() {
+    let outputs_dir = cli_test_outputs_dir("forwarded-null-only-endpoint-");
+
+    let worker_manifest = outputs_dir.path().join("worker.json5");
+    let bridge_manifest = outputs_dir.path().join("bridge.json5");
+    let root_manifest = outputs_dir.path().join("root.json5");
+
+    write_fixture(
+        &worker_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      child_enabled: { type: "string", default: "enabled" }
+    }
+  },
+  program: {
+    image: "busybox:stable",
+    entrypoint: ["sh", "-lc", "sleep infinity"],
+    network: {
+      endpoints: [
+        {
+          name: "http",
+          port: 8080,
+          protocol: "http",
+          when: "config.child_enabled"
+        }
+      ]
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &bridge_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      bridge_enabled: { type: "null" }
+    }
+  },
+  components: {
+    worker: {
+      manifest: "./worker.json5",
+      config: {
+        child_enabled: "${config.bridge_enabled}"
+      }
+    }
+  },
+  exports: {
+    http: "#worker.http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      root_enabled: { type: "null" }
+    }
+  },
+  components: {
+    bridge: {
+      manifest: "./bridge.json5",
+      config: {
+        bridge_enabled: "${config.root_enabled}"
+      }
+    }
+  },
+  exports: {
+    http: "#bridge.http"
+  }
+}
+"##,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("check")
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber check: {err}"));
+
+    assert!(
+        !output.status.success(),
+        "amber check unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "depends on runtime config, but endpoints must resolve entirely at compile time"
+        ),
+        "expected runtime-dependent endpoint error, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn compile_direct_preserves_forwarded_root_runtime_conditionals_and_scope() {
+    let outputs_dir = cli_test_outputs_dir("forwarded-root-direct-runtime-");
+
+    let worker_manifest = outputs_dir.path().join("worker.json5");
+    let bridge_manifest = outputs_dir.path().join("bridge.json5");
+    let root_manifest = outputs_dir.path().join("root.json5");
+
+    write_fixture(
+        &worker_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      child_enabled: { type: "string" }
+    }
+  },
+  program: {
+    path: "/usr/bin/env",
+    args: [
+      "worker",
+      {
+        when: "config.child_enabled",
+        argv: ["--feature", "${config.child_enabled}"]
+      }
+    ],
+    env: {
+      FEATURE: {
+        when: "config.child_enabled",
+        value: "${config.child_enabled}"
+      }
+    },
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &bridge_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      bridge_enabled: { type: "string" }
+    }
+  },
+  components: {
+    worker: {
+      manifest: "./worker.json5",
+      config: {
+        child_enabled: "${config.bridge_enabled}"
+      }
+    }
+  },
+  exports: {
+    http: "#worker.http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      root_enabled: { type: "string" },
+      unused_secret: { type: "string" }
+    }
+  },
+  components: {
+    bridge: {
+      manifest: "./bridge.json5",
+      config: {
+        bridge_enabled: "${config.root_enabled}"
+      }
+    }
+  },
+  exports: {
+    http: "#bridge.http"
+  }
+}
+"##,
+    );
+
+    let direct_out = outputs_dir.path().join("direct");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&direct_out)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    assert!(
+        output.status.success(),
+        "amber compile --direct failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan = parse_json_file(&direct_out.join("direct-plan.json"));
+    let worker = find_component(&plan, "/bridge/worker");
+    let execution = &worker["program"]["execution"];
+    assert_eq!(
+        execution["kind"].as_str(),
+        Some("helper_runner"),
+        "{worker:#}"
+    );
+
+    let template_spec = decode_template_spec(
+        execution["template_spec_b64"]
+            .as_str()
+            .expect("runtime forwarded conditional should emit a template spec"),
+    );
+    assert_eq!(
+        template_spec.program.entrypoint[0],
+        ProgramArgTemplate::Arg(vec![TemplatePart::lit("/usr/bin/env")])
+    );
+    assert_eq!(
+        template_spec.program.entrypoint[1],
+        ProgramArgTemplate::Arg(vec![TemplatePart::lit("worker")])
+    );
+    match &template_spec.program.entrypoint[2] {
+        ProgramArgTemplate::Conditional(group) => {
+            assert_eq!(group.when, "child_enabled");
+            assert_eq!(
+                group.argv,
+                vec![
+                    vec![TemplatePart::lit("--feature")],
+                    vec![TemplatePart::config("child_enabled")],
+                ]
+            );
+        }
+        other => panic!("expected conditional forwarded arg, got {other:?}"),
+    }
+    match template_spec.program.env.get("FEATURE") {
+        Some(ProgramEnvTemplate::Conditional(group)) => {
+            assert_eq!(group.when, "child_enabled");
+            assert_eq!(group.value, vec![TemplatePart::config("child_enabled")]);
+        }
+        other => panic!("expected conditional forwarded env, got {other:?}"),
+    }
+
+    let runtime_config = &execution["runtime_config"];
+    let allowed_root_leaf_paths = runtime_config["allowed_root_leaf_paths"]
+        .as_array()
+        .expect("runtime helper should scope root config");
+    assert_eq!(
+        allowed_root_leaf_paths,
+        &vec![Value::String("root_enabled".to_string())]
+    );
+
+    let pruned_root_schema = decode_json_b64(
+        runtime_config["root_schema_b64"]
+            .as_str()
+            .expect("runtime helper should include a pruned root schema"),
+    );
+    assert!(pruned_root_schema["properties"]["root_enabled"].is_object());
+    assert!(pruned_root_schema["properties"]["unused_secret"].is_null());
+
+    let component_template = decode_json_b64(
+        runtime_config["component_cfg_template_b64"]
+            .as_str()
+            .expect("runtime helper should include a component config template"),
+    );
+    let component_template_text =
+        serde_json::to_string(&component_template).expect("component template should serialize");
+    assert!(
+        component_template_text.contains("child_enabled"),
+        "{component_template:#}"
+    );
+    assert!(
+        component_template_text.contains("root_enabled"),
+        "{component_template:#}"
+    );
+}
+
+#[test]
+fn compile_direct_resolves_forwarded_root_defaulted_conditionals_but_keeps_runtime_values_scoped() {
+    let outputs_dir = cli_test_outputs_dir("forwarded-root-direct-defaults-");
+
+    let worker_manifest = outputs_dir.path().join("worker.json5");
+    let bridge_manifest = outputs_dir.path().join("bridge.json5");
+    let root_manifest = outputs_dir.path().join("root.json5");
+
+    write_fixture(
+        &worker_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      child_enabled: { type: "string" }
+    }
+  },
+  program: {
+    path: "/usr/bin/env",
+    args: [
+      "worker",
+      {
+        when: "config.child_enabled",
+        argv: ["--feature", "${config.child_enabled}"]
+      }
+    ],
+    env: {
+      FEATURE: {
+        when: "config.child_enabled",
+        value: "${config.child_enabled}"
+      }
+    },
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &bridge_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      bridge_enabled: { type: "string" }
+    }
+  },
+  components: {
+    worker: {
+      manifest: "./worker.json5",
+      config: {
+        child_enabled: "${config.bridge_enabled}"
+      }
+    }
+  },
+  exports: {
+    http: "#worker.http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      root_enabled: { type: "string", default: "enabled" }
+    }
+  },
+  components: {
+    bridge: {
+      manifest: "./bridge.json5",
+      config: {
+        bridge_enabled: "${config.root_enabled}"
+      }
+    }
+  },
+  exports: {
+    http: "#bridge.http"
+  }
+}
+"##,
+    );
+
+    let direct_out = outputs_dir.path().join("direct");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&direct_out)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    assert!(
+        output.status.success(),
+        "amber compile --direct failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan = parse_json_file(&direct_out.join("direct-plan.json"));
+    let worker = find_component(&plan, "/bridge/worker");
+    let execution = &worker["program"]["execution"];
+    assert_eq!(
+        execution["kind"].as_str(),
+        Some("helper_runner"),
+        "{worker:#}"
+    );
+
+    let template_spec = decode_template_spec(
+        execution["template_spec_b64"]
+            .as_str()
+            .expect("forwarded defaulted value should still emit a template spec"),
+    );
+    assert_eq!(
+        template_spec.program.entrypoint,
+        vec![
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("/usr/bin/env")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("worker")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("--feature")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::config("child_enabled")]),
+        ]
+    );
+    assert_eq!(
+        template_spec.program.env.get("FEATURE"),
+        Some(&ProgramEnvTemplate::Value(vec![TemplatePart::config(
+            "child_enabled"
+        )]))
+    );
+
+    let runtime_config = &execution["runtime_config"];
+    let allowed_root_leaf_paths = runtime_config["allowed_root_leaf_paths"]
+        .as_array()
+        .expect("runtime helper should scope root config");
+    assert_eq!(
+        allowed_root_leaf_paths,
+        &vec![Value::String("root_enabled".to_string())]
+    );
+}
+
+#[test]
+fn compile_direct_resolves_forwarded_root_defaulted_literal_conditionals_without_helper() {
+    let outputs_dir = cli_test_outputs_dir("forwarded-root-direct-literal-defaults-");
+
+    let worker_manifest = outputs_dir.path().join("worker.json5");
+    let bridge_manifest = outputs_dir.path().join("bridge.json5");
+    let root_manifest = outputs_dir.path().join("root.json5");
+
+    write_fixture(
+        &worker_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      child_enabled: { type: "string" }
+    }
+  },
+  program: {
+    path: "/usr/bin/env",
+    args: [
+      "worker",
+      {
+        when: "config.child_enabled",
+        argv: ["--feature", "enabled"]
+      }
+    ],
+    env: {
+      FEATURE: {
+        when: "config.child_enabled",
+        value: "enabled"
+      }
+    },
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &bridge_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      bridge_enabled: { type: "string" }
+    }
+  },
+  components: {
+    worker: {
+      manifest: "./worker.json5",
+      config: {
+        child_enabled: "${config.bridge_enabled}"
+      }
+    }
+  },
+  exports: {
+    http: "#worker.http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      root_enabled: { type: "string", default: "enabled" }
+    }
+  },
+  components: {
+    bridge: {
+      manifest: "./bridge.json5",
+      config: {
+        bridge_enabled: "${config.root_enabled}"
+      }
+    }
+  },
+  exports: {
+    http: "#bridge.http"
+  }
+}
+"##,
+    );
+
+    let direct_out = outputs_dir.path().join("direct");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&direct_out)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    assert!(
+        output.status.success(),
+        "amber compile --direct failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan = parse_json_file(&direct_out.join("direct-plan.json"));
+    let worker = find_component(&plan, "/bridge/worker");
+    let execution = &worker["program"]["execution"];
+    assert_eq!(execution["kind"].as_str(), Some("direct"), "{worker:#}");
+    assert_eq!(
+        execution["entrypoint"].as_array(),
+        Some(&vec![
+            Value::String("/usr/bin/env".to_string()),
+            Value::String("worker".to_string()),
+            Value::String("--feature".to_string()),
+            Value::String("enabled".to_string()),
+        ])
+    );
+    assert_eq!(execution["env"]["FEATURE"].as_str(), Some("enabled"));
+    assert!(execution["template_spec_b64"].is_null(), "{worker:#}");
+    assert!(execution["runtime_config"].is_null(), "{worker:#}");
+}
+
+#[test]
+fn compile_direct_resolves_forwarded_object_defaulted_literal_conditionals_without_helper() {
+    let outputs_dir = cli_test_outputs_dir("forwarded-object-direct-literal-defaults-");
+
+    let worker_manifest = outputs_dir.path().join("worker.json5");
+    let bridge_manifest = outputs_dir.path().join("bridge.json5");
+    let root_manifest = outputs_dir.path().join("root.json5");
+
+    write_fixture(
+        &worker_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      settings: {
+        type: "object",
+        properties: {
+          mode: { type: "string", default: "enabled" }
+        }
+      }
+    }
+  },
+  program: {
+    path: "/usr/bin/env",
+    args: [
+      "worker",
+      {
+        when: "config.settings.mode",
+        argv: ["--feature", "enabled"]
+      }
+    ],
+    env: {
+      FEATURE: {
+        when: "config.settings.mode",
+        value: "enabled"
+      }
+    },
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &bridge_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      bridge_settings: {
+        type: "object",
+        properties: {
+          mode: { type: "string" },
+          unused_secret: { type: "string" }
+        }
+      }
+    }
+  },
+  components: {
+    worker: {
+      manifest: "./worker.json5",
+      config: {
+        settings: "${config.bridge_settings}"
+      }
+    }
+  },
+  exports: {
+    http: "#worker.http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      settings: {
+        type: "object",
+        properties: {
+          mode: { type: "string" },
+          unused_secret: { type: "string" }
+        }
+      }
+    }
+  },
+  components: {
+    bridge: {
+      manifest: "./bridge.json5",
+      config: {
+        bridge_settings: "${config.settings}"
+      }
+    }
+  },
+  exports: {
+    http: "#bridge.http"
+  }
+}
+"##,
+    );
+
+    let direct_out = outputs_dir.path().join("direct");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&direct_out)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    assert!(
+        output.status.success(),
+        "amber compile --direct failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan = parse_json_file(&direct_out.join("direct-plan.json"));
+    let worker = find_component(&plan, "/bridge/worker");
+    let execution = &worker["program"]["execution"];
+    assert_eq!(execution["kind"].as_str(), Some("direct"), "{worker:#}");
+    assert_eq!(
+        execution["entrypoint"].as_array(),
+        Some(&vec![
+            Value::String("/usr/bin/env".to_string()),
+            Value::String("worker".to_string()),
+            Value::String("--feature".to_string()),
+            Value::String("enabled".to_string()),
+        ])
+    );
+    assert_eq!(execution["env"]["FEATURE"].as_str(), Some("enabled"));
+    assert!(execution["template_spec_b64"].is_null(), "{worker:#}");
+    assert!(execution["runtime_config"].is_null(), "{worker:#}");
+}
+
+#[test]
+fn compile_direct_preserves_forwarded_object_defaulted_runtime_values_and_scope() {
+    let outputs_dir = cli_test_outputs_dir("forwarded-object-direct-runtime-defaults-");
+
+    let worker_manifest = outputs_dir.path().join("worker.json5");
+    let bridge_manifest = outputs_dir.path().join("bridge.json5");
+    let root_manifest = outputs_dir.path().join("root.json5");
+
+    write_fixture(
+        &worker_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      settings: {
+        type: "object",
+        properties: {
+          mode: { type: "string", default: "enabled" }
+        }
+      }
+    }
+  },
+  program: {
+    path: "/usr/bin/env",
+    args: [
+      "worker",
+      {
+        when: "config.settings.mode",
+        argv: ["--feature", "${config.settings.mode}"]
+      }
+    ],
+    env: {
+      FEATURE: {
+        when: "config.settings.mode",
+        value: "${config.settings.mode}"
+      }
+    },
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &bridge_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      bridge_settings: {
+        type: "object",
+        properties: {
+          mode: { type: "string" },
+          unused_secret: { type: "string" }
+        }
+      }
+    }
+  },
+  components: {
+    worker: {
+      manifest: "./worker.json5",
+      config: {
+        settings: "${config.bridge_settings}"
+      }
+    }
+  },
+  exports: {
+    http: "#worker.http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      settings: {
+        type: "object",
+        properties: {
+          mode: { type: "string" },
+          unused_secret: { type: "string" }
+        }
+      }
+    }
+  },
+  components: {
+    bridge: {
+      manifest: "./bridge.json5",
+      config: {
+        bridge_settings: "${config.settings}"
+      }
+    }
+  },
+  exports: {
+    http: "#bridge.http"
+  }
+}
+"##,
+    );
+
+    let direct_out = outputs_dir.path().join("direct");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&direct_out)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    assert!(
+        output.status.success(),
+        "amber compile --direct failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan = parse_json_file(&direct_out.join("direct-plan.json"));
+    let worker = find_component(&plan, "/bridge/worker");
+    let execution = &worker["program"]["execution"];
+    assert_eq!(
+        execution["kind"].as_str(),
+        Some("helper_runner"),
+        "{worker:#}"
+    );
+
+    let template_spec = decode_template_spec(
+        execution["template_spec_b64"]
+            .as_str()
+            .expect("forwarded object runtime value should emit a template spec"),
+    );
+    assert_eq!(
+        template_spec.program.entrypoint,
+        vec![
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("/usr/bin/env")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("worker")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("--feature")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::config("settings.mode")]),
+        ]
+    );
+    assert_eq!(
+        template_spec.program.env.get("FEATURE"),
+        Some(&ProgramEnvTemplate::Value(vec![TemplatePart::config(
+            "settings.mode"
+        )]))
+    );
+
+    let runtime_config = &execution["runtime_config"];
+    let allowed_root_leaf_paths = runtime_config["allowed_root_leaf_paths"]
+        .as_array()
+        .expect("runtime helper should scope root config");
+    assert_eq!(
+        allowed_root_leaf_paths,
+        &vec![Value::String("settings.mode".to_string())]
+    );
+}
+
+#[test]
+fn compile_primary_output_expands_local_defaulted_config_each_endpoints() {
+    let outputs_dir = cli_test_outputs_dir("defaulted-config-each-primary-");
+
+    let worker_manifest = outputs_dir.path().join("worker.json5");
+    let root_manifest = outputs_dir.path().join("root.json5");
+
+    write_fixture(
+        &worker_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      endpoints: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            name: { type: "string" },
+            port: { type: "integer" },
+            protocol: { type: "string" }
+          },
+          required: ["name", "port", "protocol"]
+        },
+        default: [
+          { name: "http", port: 8080, protocol: "http" },
+          { name: "admin", port: 9090, protocol: "tcp" }
+        ]
+      }
+    }
+  },
+  program: {
+    image: "busybox:stable",
+    entrypoint: ["sh", "-lc", "sleep infinity"],
+    network: {
+      endpoints: [
+        {
+          each: "config.endpoints",
+          name: "${item.name}",
+          port: "${item.port}",
+          protocol: "${item.protocol}"
+        }
+      ]
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  components: {
+    worker: {
+      manifest: "./worker.json5"
+    }
+  },
+  exports: {
+    http: "#worker.http"
+  }
+}
+"##,
+    );
+
+    let primary_output = outputs_dir.path().join("scenario.ir.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--output")
+        .arg(&primary_output)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile: {err}"));
+
+    assert!(
+        output.status.success(),
+        "amber compile failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan = parse_json_file(&primary_output);
+    let worker = find_component(&plan, "/worker");
+    let endpoints = worker["program"]["network"]["endpoints"]
+        .as_array()
+        .expect("defaulted config each should expand endpoints");
+    assert_eq!(endpoints.len(), 2, "{worker:#}");
+    assert_eq!(endpoints[0]["name"].as_str(), Some("http"));
+    assert_eq!(endpoints[0]["port"].as_u64(), Some(8080));
+    assert_eq!(endpoints[1]["name"].as_str(), Some("admin"));
+    assert_eq!(endpoints[1]["port"].as_u64(), Some(9090));
+}
+
+#[test]
+fn compile_direct_expands_local_defaulted_config_each_without_helper() {
+    let outputs_dir = cli_test_outputs_dir("defaulted-config-each-direct-");
+
+    let worker_manifest = outputs_dir.path().join("worker.json5");
+    let root_manifest = outputs_dir.path().join("root.json5");
+
+    write_fixture(
+        &worker_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      extra_args: {
+        type: "array",
+        items: { type: "string" },
+        default: ["--feature", "enabled"]
+      },
+      env_values: {
+        type: "array",
+        items: { type: "string" },
+        default: ["alpha", "beta"]
+      }
+    }
+  },
+  program: {
+    path: "/usr/bin/env",
+    args: [
+      "worker",
+      {
+        each: "config.extra_args",
+        arg: "${item}"
+      }
+    ],
+    env: {
+      FEATURES: {
+        each: "config.env_values",
+        value: "${item}",
+        join: ","
+      }
+    },
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  components: {
+    worker: {
+      manifest: "./worker.json5"
+    }
+  },
+  exports: {
+    http: "#worker.http"
+  }
+}
+"##,
+    );
+
+    let direct_out = outputs_dir.path().join("direct");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&direct_out)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    assert!(
+        output.status.success(),
+        "amber compile --direct failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan = parse_json_file(&direct_out.join("direct-plan.json"));
+    let worker = find_component(&plan, "/worker");
+    let execution = &worker["program"]["execution"];
+    assert_eq!(execution["kind"].as_str(), Some("direct"), "{worker:#}");
+    assert_eq!(
+        execution["entrypoint"].as_array(),
+        Some(&vec![
+            Value::String("/usr/bin/env".to_string()),
+            Value::String("worker".to_string()),
+            Value::String("--feature".to_string()),
+            Value::String("enabled".to_string()),
+        ])
+    );
+    assert_eq!(execution["env"]["FEATURES"].as_str(), Some("alpha,beta"));
+    assert!(execution["template_spec_b64"].is_null(), "{worker:#}");
+    assert!(execution["runtime_config"].is_null(), "{worker:#}");
+}
+
+#[test]
+fn compile_direct_preserves_multi_hop_forwarded_config_each_runtime_and_scope() {
+    let outputs_dir = cli_test_outputs_dir("forwarded-config-each-direct-runtime-");
+
+    let worker_manifest = outputs_dir.path().join("worker.json5");
+    let bridge_manifest = outputs_dir.path().join("bridge.json5");
+    let root_manifest = outputs_dir.path().join("root.json5");
+
+    write_fixture(
+        &worker_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      extra_args: {
+        type: "array",
+        items: { type: "string" },
+        default: ["--feature", "enabled"]
+      },
+      env_values: {
+        type: "array",
+        items: { type: "string" },
+        default: ["alpha", "beta"]
+      }
+    }
+  },
+  program: {
+    path: "/usr/bin/env",
+    args: [
+      "worker",
+      {
+        each: "config.extra_args",
+        arg: "${item}"
+      }
+    ],
+    env: {
+      FEATURES: {
+        each: "config.env_values",
+        value: "${item}",
+        join: ","
+      }
+    },
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &bridge_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      extra_args: {
+        type: "array",
+        items: { type: "string" }
+      },
+      env_values: {
+        type: "array",
+        items: { type: "string" }
+      }
+    }
+  },
+  components: {
+    worker: {
+      manifest: "./worker.json5",
+      config: {
+        extra_args: "${config.extra_args}",
+        env_values: "${config.env_values}"
+      }
+    }
+  },
+  exports: {
+    http: "#worker.http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      extra_args: {
+        type: "array",
+        items: { type: "string" }
+      },
+      env_values: {
+        type: "array",
+        items: { type: "string" }
+      }
+    }
+  },
+  components: {
+    bridge: {
+      manifest: "./bridge.json5",
+      config: {
+        extra_args: "${config.extra_args}",
+        env_values: "${config.env_values}"
+      }
+    }
+  },
+  exports: {
+    http: "#bridge.http"
+  }
+}
+"##,
+    );
+
+    let direct_out = outputs_dir.path().join("direct");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&direct_out)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    assert!(
+        output.status.success(),
+        "amber compile --direct failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan = parse_json_file(&direct_out.join("direct-plan.json"));
+    let worker = find_component(&plan, "/bridge/worker");
+    let execution = &worker["program"]["execution"];
+    assert_eq!(
+        execution["kind"].as_str(),
+        Some("helper_runner"),
+        "{worker:#}"
+    );
+
+    let template_spec = decode_template_spec(
+        execution["template_spec_b64"]
+            .as_str()
+            .expect("forwarded config each should emit a template spec"),
+    );
+    assert_eq!(
+        template_spec.program.entrypoint,
+        vec![
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("/usr/bin/env")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("worker")]),
+            ProgramArgTemplate::Repeated(RepeatedProgramArgTemplate {
+                when: None,
+                each: RepeatedTemplateSource::Config {
+                    path: "extra_args".to_string()
+                },
+                arg: Some(vec![TemplatePart::current_item("")]),
+                argv: Vec::new(),
+                join: None,
+            }),
+        ]
+    );
+    assert_eq!(
+        template_spec.program.env.get("FEATURES"),
+        Some(&ProgramEnvTemplate::Repeated(RepeatedProgramEnvTemplate {
+            when: None,
+            each: RepeatedTemplateSource::Config {
+                path: "env_values".to_string()
+            },
+            value: vec![TemplatePart::current_item("")],
+            join: ",".to_string(),
+        }))
+    );
+
+    let runtime_config = &execution["runtime_config"];
+    let mut allowed_root_leaf_paths = runtime_config["allowed_root_leaf_paths"]
+        .as_array()
+        .expect("runtime helper should scope root config")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("allowed root leaf paths should be strings")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    allowed_root_leaf_paths.sort();
+    assert_eq!(
+        allowed_root_leaf_paths,
+        vec!["env_values".to_string(), "extra_args".to_string()]
+    );
+}
+
+#[test]
+fn compile_direct_preserves_forwarded_null_overridable_config_each_runtime_and_scope() {
+    let outputs_dir = cli_test_outputs_dir("forwarded-null-only-config-each-direct-");
+
+    let worker_manifest = outputs_dir.path().join("worker.json5");
+    let bridge_manifest = outputs_dir.path().join("bridge.json5");
+    let root_manifest = outputs_dir.path().join("root.json5");
+
+    write_fixture(
+        &worker_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      items: {
+        type: ["array", "null"],
+        items: { type: "string" },
+        default: ["alpha", "beta"]
+      }
+    }
+  },
+  program: {
+    path: "/usr/bin/env",
+    args: [
+      "worker",
+      {
+        each: "config.items",
+        arg: "${item}"
+      }
+    ],
+    env: {
+      ITEMS: {
+        each: "config.items",
+        value: "${item}",
+        join: ","
+      }
+    },
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &bridge_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      bridge_items: { type: "null" }
+    }
+  },
+  components: {
+    worker: {
+      manifest: "./worker.json5",
+      config: {
+        items: "${config.bridge_items}"
+      }
+    }
+  },
+  exports: {
+    http: "#worker.http"
+  }
+}
+"##,
+    );
+    write_fixture(
+        &root_manifest,
+        r##"{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      root_items: { type: "null" }
+    }
+  },
+  components: {
+    bridge: {
+      manifest: "./bridge.json5",
+      config: {
+        bridge_items: "${config.root_items}"
+      }
+    }
+  },
+  exports: {
+    http: "#bridge.http"
+  }
+}
+"##,
+    );
+
+    let direct_out = outputs_dir.path().join("direct");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&direct_out)
+        .arg(&root_manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    assert!(
+        output.status.success(),
+        "amber compile --direct failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan = parse_json_file(&direct_out.join("direct-plan.json"));
+    let worker = find_component(&plan, "/bridge/worker");
+    let execution = &worker["program"]["execution"];
+    assert_eq!(
+        execution["kind"].as_str(),
+        Some("helper_runner"),
+        "{worker:#}"
+    );
+
+    let template_spec = decode_template_spec(
+        execution["template_spec_b64"]
+            .as_str()
+            .expect("forwarded null-overridable config each should emit a template spec"),
+    );
+    assert_eq!(
+        template_spec.program.entrypoint,
+        vec![
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("/usr/bin/env")]),
+            ProgramArgTemplate::Arg(vec![TemplatePart::lit("worker")]),
+            ProgramArgTemplate::Repeated(RepeatedProgramArgTemplate {
+                when: None,
+                each: RepeatedTemplateSource::Config {
+                    path: "items".to_string()
+                },
+                arg: Some(vec![TemplatePart::current_item("")]),
+                argv: Vec::new(),
+                join: None,
+            }),
+        ]
+    );
+    assert_eq!(
+        template_spec.program.env.get("ITEMS"),
+        Some(&ProgramEnvTemplate::Repeated(RepeatedProgramEnvTemplate {
+            when: None,
+            each: RepeatedTemplateSource::Config {
+                path: "items".to_string()
+            },
+            value: vec![TemplatePart::current_item("")],
+            join: ",".to_string(),
+        }))
+    );
+
+    let allowed_root_leaf_paths = execution["runtime_config"]["allowed_root_leaf_paths"]
+        .as_array()
+        .expect("runtime helper should scope root config");
+    assert_eq!(
+        allowed_root_leaf_paths,
+        &vec![Value::String("root_items".to_string())]
+    );
 }
 
 #[test]

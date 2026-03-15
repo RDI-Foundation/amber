@@ -19,6 +19,7 @@ use framework_docker_injection::{
 };
 
 use crate::{
+    config::analysis::ScenarioConfigAnalysis,
     reporter::{
         CompiledScenario, Reporter, ReporterError,
         execution_guide::{
@@ -450,11 +451,13 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
         provisioner_mounts.push((volume, mount_dir));
     }
     let needs_provisioner = !provisioner_mounts.is_empty();
+    let config_analysis = ScenarioConfigAnalysis::from_scenario(s).map_err(dc_other)?;
 
     // Compose YAML
     // ---- runtime config / helper decision ----
     let config_plan = build_config_plan(
         s,
+        &config_analysis,
         program_components,
         ProgramSupport::Image {
             backend_label: "docker-compose output",
@@ -1280,7 +1283,7 @@ fn build_root_env_entries(
                 leaf.path
             ))
         })?;
-        if leaf.required {
+        if leaf.runtime_required() {
             entries.push(format!("{var}=${{{var}?missing config.{}}}", leaf.path));
         } else {
             entries.push(var);
@@ -1351,7 +1354,19 @@ fn render_compose_image(
                         let env_var = rc::env_var_for_path(path).map_err(|err| {
                             format!("failed to map config path {path} to env var: {err}")
                         })?;
-                        if leaf.required {
+                        if let Some(default) = leaf.default.as_ref() {
+                            let default =
+                                rc::stringify_for_interpolation(default).map_err(|err| {
+                                    format!(
+                                        "runtime program.image path config.{path} has a default \
+                                         that cannot be interpolated into an image string: {err}"
+                                    )
+                                })?;
+                            rendered.push_str(&format!(
+                                "${{{env_var}:-{}}}",
+                                escape_compose_interpolation(&default)
+                            ));
+                        } else if leaf.runtime_required() {
                             rendered.push_str(&format!("${{{env_var}?missing config.{path}}}"));
                         } else {
                             rendered.push_str(&format!("${{{env_var}}}"));

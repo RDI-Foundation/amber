@@ -5,14 +5,18 @@ mod schema;
 mod template;
 
 pub use env::{
-    CONFIG_ENV_PREFIX, build_root_config, env_var_for_path, env_var_to_path, parse_env_value,
+    CONFIG_ENV_PREFIX, build_root_config, encode_env_value, env_var_for_path, env_var_to_path,
+    parse_env_value,
 };
 pub use error::{ConfigError, Result};
 pub use node::{ConfigNode, RootConfigTemplate, compose_config_template};
 pub use schema::{
-    SchemaLeaf, SchemaLookup, SchemaWalkResult, canonical_json, collect_leaf_paths,
-    collect_schema_leaves, is_valid_config_key, prune_schema, schema_lookup, schema_lookup_ref,
-    validate_config_schema,
+    SchemaLeaf, SchemaLookup, SchemaPresence, SchemaWalkResult, apply_schema_defaults,
+    apply_schema_defaults_to_node, canonical_json, collect_leaf_paths, collect_schema_leaves,
+    is_valid_config_key, prune_schema, schema_lookup, schema_lookup_ref, schema_path_accepts_null,
+    schema_path_ancestors_must_be_non_null_objects, schema_path_is_required,
+    schema_path_may_accept_non_null, schema_path_may_be_object, schema_path_may_be_other_non_null,
+    schema_path_presence, validate_config_schema,
 };
 pub use template::{
     RenderedFileMountSource, config_path_is_present, eval_config_template,
@@ -63,26 +67,157 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_value_requires_disambiguation() {
+    fn root_config_applies_schema_defaults() {
         let schema = json!({
-            "type": ["integer", "string"]
+            "type": "object",
+            "properties": {
+                "api_key": { "type": "string" },
+                "system_prompt": {
+                    "type": "string",
+                    "default": "You are an agent."
+                }
+            },
+            "required": ["api_key", "system_prompt"],
+            "additionalProperties": false
         });
 
-        let err = parse_env_value("123", &schema).expect_err("ambiguous value should error");
-        assert!(
-            err.to_string().contains("ambiguous value"),
-            "unexpected error: {err}"
+        let env = std::collections::BTreeMap::from([(
+            "AMBER_CONFIG_API_KEY".to_string(),
+            "demo-key".to_string(),
+        )]);
+
+        let config = build_root_config(&schema, &env).expect("config should parse");
+        assert_eq!(
+            config,
+            json!({
+                "api_key": "demo-key",
+                "system_prompt": "You are an agent."
+            })
         );
     }
 
     #[test]
-    fn json_string_literal_is_unambiguous() {
+    fn root_config_explicit_values_override_defaults_within_same_object() {
         let schema = json!({
-            "type": ["integer", "string"]
+            "type": "object",
+            "properties": {
+                "model": {
+                    "type": "object",
+                    "properties": {
+                        "reasoning_effort": {
+                            "type": "string",
+                            "default": "low"
+                        },
+                        "temperature": {
+                            "type": "number",
+                            "default": 0.2
+                        }
+                    }
+                }
+            }
         });
 
-        let value = parse_env_value("\"123\"", &schema).expect("json string literal should parse");
+        let env = std::collections::BTreeMap::from([
+            (
+                "AMBER_CONFIG_MODEL__REASONING_EFFORT".to_string(),
+                "high".to_string(),
+            ),
+            (
+                "AMBER_CONFIG_MODEL__TEMPERATURE".to_string(),
+                "0.7".to_string(),
+            ),
+        ]);
+
+        let config = build_root_config(&schema, &env).expect("config should parse");
+        assert_eq!(
+            config,
+            json!({
+                "model": {
+                    "reasoning_effort": "high",
+                    "temperature": 0.7
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn encode_env_value_round_trips_multiline_strings() {
+        let schema = json!({
+            "type": "string"
+        });
+        let encoded = encode_env_value(&json!("line one\nline two")).expect("encode env value");
+        let decoded = parse_env_value(&encoded, &schema).expect("parse env value");
+
+        assert_eq!(decoded, json!("line one\nline two"));
+    }
+
+    #[test]
+    fn raw_json_scalars_prefer_typed_values_for_string_unions() {
+        assert_eq!(
+            parse_env_value("123", &json!({ "type": ["integer", "string"] }))
+                .expect("integer union should parse"),
+            json!(123)
+        );
+        assert_eq!(
+            parse_env_value("0.7", &json!({ "type": ["number", "string"] }))
+                .expect("number union should parse"),
+            json!(0.7)
+        );
+        assert_eq!(
+            parse_env_value("true", &json!({ "type": ["boolean", "string"] }))
+                .expect("boolean union should parse"),
+            json!(true)
+        );
+        assert_eq!(
+            parse_env_value("null", &json!({ "type": ["null", "string"] }))
+                .expect("null union should parse"),
+            json!(null)
+        );
+    }
+
+    #[test]
+    fn raw_non_json_values_fall_back_to_strings() {
+        let value = parse_env_value("dev", &json!({ "type": ["boolean", "string"] }))
+            .expect("string fallback should parse");
+        assert_eq!(value, json!("dev"));
+    }
+
+    #[test]
+    fn json_string_literal_forces_string_for_scalar_unions() {
+        let value = parse_env_value("\"123\"", &json!({ "type": ["integer", "string"] }))
+            .expect("quoted string should parse");
         assert_eq!(value, serde_json::Value::String("123".to_string()));
+
+        let value = parse_env_value("\"true\"", &json!({ "type": ["boolean", "string"] }))
+            .expect("quoted boolean-like string should parse");
+        assert_eq!(value, serde_json::Value::String("true".to_string()));
+    }
+
+    #[test]
+    fn root_config_accepts_scalar_union_env_values() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": ["integer", "string"] },
+                "enabled": { "type": ["boolean", "string"] },
+                "profile": { "type": ["string", "null"] }
+            }
+        });
+        let env = std::collections::BTreeMap::from([
+            ("AMBER_CONFIG_COUNT".to_string(), "2".to_string()),
+            ("AMBER_CONFIG_ENABLED".to_string(), "true".to_string()),
+            ("AMBER_CONFIG_PROFILE".to_string(), "dev".to_string()),
+        ]);
+
+        let config = build_root_config(&schema, &env).expect("config should parse");
+        assert_eq!(
+            config,
+            json!({
+                "count": 2,
+                "enabled": true,
+                "profile": "dev"
+            })
+        );
     }
 
     #[test]
