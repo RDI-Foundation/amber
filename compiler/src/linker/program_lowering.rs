@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use crate::config::{
     analysis::ComponentConfigAnalysis,
-    query::{ConfigEachResolution, ConfigPresence, QueryResolution},
+    query::{ConfigEachResolution, ConfigPresence},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -906,18 +906,7 @@ fn resolve_config_string(
     component_config: &ComponentConfigAnalysis,
     query: &str,
 ) -> Result<Option<String>, String> {
-    match component_config.resolve_query(query)? {
-        QueryResolution::RuntimePath(_) => Ok(None),
-        QueryResolution::Node(node) => {
-            if node.contains_runtime() {
-                return Ok(None);
-            }
-            let value = node.evaluate_static().map_err(|err| err.to_string())?;
-            rc::stringify_for_interpolation(&value)
-                .map(Some)
-                .map_err(|err| err.to_string())
-        }
-    }
+    component_config.resolve_static_string_query(query)
 }
 
 fn resolve_item_interpolation(

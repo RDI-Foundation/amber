@@ -4,14 +4,13 @@ use std::{
 };
 
 use amber_config as rc;
-use amber_manifest::InterpolatedString;
+use amber_manifest::{InterpolatedPart, InterpolatedString, InterpolationSource};
 use amber_scenario::{Component, ComponentId, Scenario};
 use serde_json::{Map, Value};
 
 use super::{
     query::{
-        ConfigEachResolution, ConfigPresence, QueryResolution, parse_query_segments,
-        render_static_config_string, resolve_config_query_node, validate_config_query_syntax,
+        ConfigEachResolution, ConfigPresence, parse_query_segments, validate_config_query_syntax,
         value_kind,
     },
     scope::{RuntimeConfigView, build_runtime_config_view},
@@ -180,21 +179,27 @@ impl ComponentConfigAnalysis {
         &self.root_leaves
     }
 
-    pub(crate) fn resolve_query<'a>(&'a self, query: &str) -> Result<QueryResolution<'a>, String> {
-        match self.template_node() {
-            Some(template) => resolve_config_query_node(template, query),
-            None => {
-                validate_config_query_syntax(query)?;
-                Ok(QueryResolution::RuntimePath(query.to_string()))
-            }
-        }
-    }
-
     pub(crate) fn resolve_presence(&self, query: &str) -> Result<ConfigPresence, String> {
         match self.analyze_query(query)? {
             QuerySemantics::Known(outcomes) => Ok(outcomes.resolve_presence()),
             QuerySemantics::RuntimeUnknown => Ok(ConfigPresence::Runtime),
         }
+    }
+
+    pub(crate) fn resolve_static_value(&self, query: &str) -> Result<Option<Value>, String> {
+        match self.analyze_query(query)? {
+            QuerySemantics::Known(outcomes) => Ok(outcomes.resolve_static_value()),
+            QuerySemantics::RuntimeUnknown => Ok(None),
+        }
+    }
+
+    pub(crate) fn resolve_static_string_query(
+        &self,
+        query: &str,
+    ) -> Result<Option<String>, String> {
+        self.resolve_static_value(query)?
+            .map(|value| rc::stringify_for_interpolation(&value).map_err(|err| err.to_string()))
+            .transpose()
     }
 
     fn analyze_query(&self, query: &str) -> Result<QuerySemantics, String> {
@@ -238,7 +243,73 @@ impl ComponentConfigAnalysis {
         &self,
         value: &InterpolatedString,
     ) -> Result<String, String> {
-        render_static_config_string(value, self.template_node())
+        let mut rendered = String::new();
+        for part in &value.parts {
+            match part {
+                InterpolatedPart::Literal(lit) => rendered.push_str(lit),
+                InterpolatedPart::Interpolation { source, query } => match source {
+                    InterpolationSource::Config => {
+                        let Some(value) = self.resolve_static_string_query(query)? else {
+                            let path = if query.is_empty() {
+                                "config".to_string()
+                            } else {
+                                format!("config.{query}")
+                            };
+                            return Err(format!(
+                                "{path} depends on runtime root config, which is not available at \
+                                 compile time"
+                            ));
+                        };
+                        rendered.push_str(&value);
+                    }
+                    InterpolationSource::Slots => {
+                        return Err(
+                            "slot interpolation is not allowed in resource params".to_string()
+                        );
+                    }
+                    other => {
+                        return Err(format!(
+                            "unsupported interpolation source {other} in resource params"
+                        ));
+                    }
+                },
+                _ => return Err("unsupported interpolation syntax in resource params".to_string()),
+            }
+        }
+
+        Ok(rendered)
+    }
+
+    pub(crate) fn resolve_runtime_value_source<'a>(
+        &'a self,
+        query: &str,
+    ) -> Result<RuntimeValueSource<'a>, String> {
+        if let Some(value) = self.resolve_static_value(query)? {
+            return Ok(RuntimeValueSource::Static(value));
+        }
+
+        let Some(template) = self.template_node() else {
+            validate_config_query_syntax(query)?;
+            return Ok(RuntimeValueSource::RuntimeRootPath(query.to_string()));
+        };
+
+        match resolve_query_resolution(template, query)? {
+            DetailedQueryResolution::Missing => Err(format!(
+                "config.{query} is not defined in this component config"
+            )),
+            DetailedQueryResolution::Node(node) => {
+                if node.contains_runtime() {
+                    Ok(RuntimeValueSource::RuntimeNode(node))
+                } else {
+                    Err(format!(
+                        "config.{query} is not defined in this component config"
+                    ))
+                }
+            }
+            DetailedQueryResolution::RuntimeRef { root_path, suffix } => Ok(
+                RuntimeValueSource::RuntimeRootPath(join_query_path(&root_path, &suffix)),
+            ),
+        }
     }
 
     pub(crate) fn build_runtime_view(
@@ -416,6 +487,12 @@ impl ComponentConfigAnalysis {
     }
 }
 
+pub(crate) enum RuntimeValueSource<'a> {
+    Static(Value),
+    RuntimeRootPath(String),
+    RuntimeNode(&'a rc::ConfigNode),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum QuerySemantics {
     Known(QueryOutcomeSet),
@@ -527,6 +604,18 @@ impl QueryOutcomeSet {
             resolved_items.unwrap_or_default(),
         ))
     }
+
+    fn resolve_static_value(&self) -> Option<Value> {
+        if self.can_be_missing || self.can_be_dynamic_non_null {
+            return None;
+        }
+
+        match (self.can_be_null, self.static_non_null_values.as_slice()) {
+            (true, []) => Some(Value::Null),
+            (false, [value]) => Some(value.clone()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -590,6 +679,15 @@ enum DetailedQueryResolution<'a> {
     Missing,
     Node(&'a rc::ConfigNode),
     RuntimeRef { root_path: String, suffix: String },
+}
+
+fn join_query_path(prefix: &str, suffix: &str) -> String {
+    match (prefix.is_empty(), suffix.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => suffix.to_string(),
+        (false, true) => prefix.to_string(),
+        (false, false) => format!("{prefix}.{suffix}"),
+    }
 }
 
 fn resolve_query_resolution<'a>(

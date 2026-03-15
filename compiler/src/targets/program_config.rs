@@ -23,8 +23,8 @@ use serde_json::Value;
 
 use crate::{
     config::{
-        analysis::{ComponentConfigAnalysis, ScenarioConfigAnalysis},
-        query::{ConfigEachResolution, ConfigPresence, QueryResolution},
+        analysis::{ComponentConfigAnalysis, RuntimeValueSource, ScenarioConfigAnalysis},
+        query::{ConfigEachResolution, ConfigPresence},
         scope::RuntimeConfigView,
     },
     slots::{
@@ -234,7 +234,7 @@ pub(crate) fn build_config_plan(
         root_leaves.iter().map(|leaf| leaf.path.as_str()).collect();
 
     let mut program_plans = HashMap::new();
-    let mut vm_cloud_init_paths_by_component = HashMap::new();
+    let mut vm_runtime_paths_by_component = HashMap::new();
     let mut needs_helper = false;
     let mut needs_runtime_config = false;
 
@@ -297,6 +297,18 @@ pub(crate) fn build_config_plan(
         if !vm_scalar_paths.is_empty() {
             needs_runtime_config = true;
         }
+        let mut vm_image_paths = BTreeSet::new();
+        collect_vm_image_runtime_paths(
+            scenario,
+            *id,
+            program,
+            slots,
+            component_config,
+            &mut vm_image_paths,
+        )?;
+        if !vm_image_paths.is_empty() {
+            needs_runtime_config = true;
+        }
         let mut vm_cloud_init_paths = BTreeSet::new();
         collect_vm_cloud_init_runtime_paths(
             scenario,
@@ -309,7 +321,10 @@ pub(crate) fn build_config_plan(
         if !vm_cloud_init_paths.is_empty() {
             needs_runtime_config = true;
         }
-        vm_cloud_init_paths_by_component.insert(*id, vm_cloud_init_paths);
+        let mut vm_runtime_paths = vm_scalar_paths;
+        vm_runtime_paths.extend(vm_image_paths);
+        vm_runtime_paths.extend(vm_cloud_init_paths);
+        vm_runtime_paths_by_component.insert(*id, vm_runtime_paths);
         program_plans.insert(*id, plan);
     }
 
@@ -342,12 +357,12 @@ pub(crate) fn build_config_plan(
                 .get(id)
                 .expect("program plan should exist for program component");
             let mount_specs = mount_specs.get(id);
-            let vm_cloud_init_paths = vm_cloud_init_paths_by_component
+            let vm_runtime_paths = vm_runtime_paths_by_component
                 .get(id)
-                .expect("vm cloud-init path set should exist for program component");
+                .expect("vm runtime path set should exist for program component");
             let needs_config_payload = program_plan.needs_runtime_config()
                 || mount_specs.is_some_and(|specs| mount_specs_need_config(specs))
-                || !vm_cloud_init_paths.is_empty();
+                || !vm_runtime_paths.is_empty();
             if !needs_config_payload {
                 continue;
             }
@@ -358,7 +373,7 @@ pub(crate) fn build_config_plan(
             let used_paths = used_component_paths(
                 program_plan,
                 mount_specs.map(|specs| specs.as_slice()),
-                Some(vm_cloud_init_paths),
+                Some(vm_runtime_paths),
             );
 
             let view = component_config
@@ -470,6 +485,46 @@ fn collect_vm_cloud_init_runtime_paths(
             if let TemplatePart::Config { config } = part {
                 out.insert(config);
             }
+        }
+    }
+    Ok(())
+}
+
+fn collect_vm_image_runtime_paths(
+    scenario: &Scenario,
+    id: ComponentId,
+    program: &Program,
+    slots: &BTreeMap<String, SlotValue>,
+    component_config: &ComponentConfigAnalysis,
+    out: &mut BTreeSet<String>,
+) -> Result<(), MeshError> {
+    let Program::Vm(program) = program else {
+        return Ok(());
+    };
+    let image = program
+        .image
+        .parse::<amber_manifest::InterpolatedString>()
+        .map_err(|err| {
+            MeshError::new(format!(
+                "failed to parse program.vm.image interpolation in {}: {err}",
+                component_label(scenario, id)
+            ))
+        })?;
+    for part in &image.parts {
+        let InterpolatedPart::Interpolation { source, query } = part else {
+            continue;
+        };
+        if resolve_slot_interpolation(scenario, id, "program.vm.image", source, query, slots)?
+            .is_some()
+        {
+            continue;
+        }
+        if component_config
+            .resolve_static_string_query(query)
+            .map_err(MeshError::new)?
+            .is_none()
+        {
+            out.insert(query.clone());
         }
     }
     Ok(())
@@ -601,14 +656,10 @@ fn resolve_vm_scalar_query(
     }
 
     match component_config
-        .resolve_query(query)
+        .resolve_static_value(query)
         .map_err(MeshError::new)?
     {
-        QueryResolution::RuntimePath(path) => Ok(VmScalarResolutionU32::RuntimeConfig(path)),
-        QueryResolution::Node(node) if !node.contains_runtime() => {
-            let value = node
-                .evaluate_static()
-                .map_err(|err| MeshError::new(err.to_string()))?;
+        Some(value) => {
             let Some(value) = value.as_u64() else {
                 return Err(render_error());
             };
@@ -619,16 +670,7 @@ fn resolve_vm_scalar_query(
             }
             Ok(VmScalarResolutionU32::Static(value as u32))
         }
-        QueryResolution::Node(rc::ConfigNode::ConfigRef(path)) => {
-            if path.is_empty() {
-                return Err(MeshError::new(format!(
-                    "{field_name} cannot reference the entire runtime config object; reference an \
-                     integer leaf like `${{config.resources.cpus}}`"
-                )));
-            }
-            Ok(VmScalarResolutionU32::RuntimeConfig(path.clone()))
-        }
-        QueryResolution::Node(_) => Err(render_error()),
+        None => Ok(VmScalarResolutionU32::RuntimeConfig(query.to_string())),
     }
 }
 
@@ -1333,23 +1375,12 @@ fn resolve_config_query_for_program(
     component_config: &ComponentConfigAnalysis,
     query: &str,
 ) -> Result<ConfigResolution, MeshError> {
-    let cur = match component_config
-        .resolve_query(query)
+    match component_config
+        .resolve_static_string_query(query)
         .map_err(MeshError::new)?
     {
-        QueryResolution::Node(cur) => cur,
-        QueryResolution::RuntimePath(_) => return Ok(ConfigResolution::Runtime),
-    };
-
-    if !cur.contains_runtime() {
-        let v = cur
-            .evaluate_static()
-            .map_err(|e| MeshError::new(e.to_string()))?;
-        Ok(ConfigResolution::Static(
-            rc::stringify_for_interpolation(&v).map_err(|e| MeshError::new(e.to_string()))?,
-        ))
-    } else {
-        Ok(ConfigResolution::Runtime)
+        Some(value) => Ok(ConfigResolution::Static(value)),
+        None => Ok(ConfigResolution::Runtime),
     }
 }
 
@@ -1425,25 +1456,18 @@ fn resolve_config_query_for_program_image(
     query: &str,
 ) -> Result<ImageConfigResolution, MeshError> {
     match component_config
-        .resolve_query(query)
+        .resolve_runtime_value_source(query)
         .map_err(MeshError::new)?
     {
-        QueryResolution::RuntimePath(path) => Ok(ImageConfigResolution::RuntimeTemplate(vec![
-            ProgramImagePart::RootConfigPath(path),
-        ])),
-        QueryResolution::Node(cur) => {
-            if !cur.contains_runtime() {
-                let v = cur
-                    .evaluate_static()
-                    .map_err(|e| MeshError::new(e.to_string()))?;
-                Ok(ImageConfigResolution::Static(
-                    rc::stringify_for_interpolation(&v)
-                        .map_err(|e| MeshError::new(e.to_string()))?,
-                ))
-            } else {
-                resolve_program_image_runtime_node(cur)
-            }
+        RuntimeValueSource::Static(value) => Ok(ImageConfigResolution::Static(
+            rc::stringify_for_interpolation(&value).map_err(|e| MeshError::new(e.to_string()))?,
+        )),
+        RuntimeValueSource::RuntimeRootPath(path) => {
+            Ok(ImageConfigResolution::RuntimeTemplate(vec![
+                ProgramImagePart::RootConfigPath(path),
+            ]))
         }
+        RuntimeValueSource::RuntimeNode(cur) => resolve_program_image_runtime_node(cur),
     }
 }
 
@@ -1451,20 +1475,12 @@ fn resolve_config_query_for_mount(
     component_config: &ComponentConfigAnalysis,
     query: &str,
 ) -> Result<MountResolution, MeshError> {
-    let cur = match component_config
-        .resolve_query(query)
+    match component_config
+        .resolve_static_value(query)
         .map_err(MeshError::new)?
     {
-        QueryResolution::Node(cur) => cur,
-        QueryResolution::RuntimePath(_) => return Ok(MountResolution::Runtime),
-    };
-
-    if cur.contains_runtime() {
-        Ok(MountResolution::Runtime)
-    } else {
-        cur.evaluate_static()
-            .map(MountResolution::Static)
-            .map_err(|e| MeshError::new(e.to_string()))
+        Some(value) => Ok(MountResolution::Static(value)),
+        None => Ok(MountResolution::Runtime),
     }
 }
 
@@ -1635,7 +1651,7 @@ fn join_template_strings(values: Vec<TemplateString>, separator: &str) -> Templa
     out
 }
 
-fn resolve_slot_interpolation(
+pub(crate) fn resolve_slot_interpolation(
     scenario: &Scenario,
     id: ComponentId,
     location: &str,

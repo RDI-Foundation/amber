@@ -495,10 +495,17 @@ fn compile_writes_vm_artifact() {
     let component = components[0]
         .as_object()
         .expect("vm component should serialize as an object");
+    let allowed_root_leaf_paths = component["runtime_config"]["allowed_root_leaf_paths"]
+        .as_array()
+        .expect("runtime_config.allowed_root_leaf_paths should be an array")
+        .iter()
+        .map(|value| value.as_str().expect("allowed path should be a string"))
+        .collect::<Vec<_>>();
     assert!(
-        !component.contains_key("runtime_config"),
-        "vm component should omit runtime_config when it is unused"
+        component.contains_key("runtime_config"),
+        "vm component should carry runtime_config when the base image depends on runtime config"
     );
+    assert_eq!(allowed_root_leaf_paths, vec!["base_image"]);
     assert!(
         !component.contains_key("mount_spec_b64"),
         "vm component should omit mount_spec_b64 when it is unused"
@@ -643,9 +650,21 @@ fn compile_vm_artifact_supports_runtime_templates() {
             .any(|part| part["slot"] == "api.url"),
         "cloud-init template should retain slot interpolation"
     );
+    let mut allowed_root_leaf_paths = component["runtime_config"]["allowed_root_leaf_paths"]
+        .as_array()
+        .expect("runtime_config.allowed_root_leaf_paths should be an array")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("allowed_root_leaf_paths should contain strings")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    allowed_root_leaf_paths.sort();
     assert_eq!(
-        component["runtime_config"]["allowed_root_leaf_paths"][0],
-        "message"
+        allowed_root_leaf_paths,
+        vec!["base_image".to_string(), "message".to_string()]
     );
 }
 
@@ -905,11 +924,49 @@ fn compile_vm_artifact_rewrites_runtime_scalar_paths_through_child_config() {
         .expect("vm plan should contain one component");
 
     assert_eq!(component["base_image"]["kind"], "runtime_config");
-    assert_eq!(component["base_image"]["query"], "vm.image");
+    assert_eq!(component["base_image"]["query"], "image");
     assert_eq!(component["cpus"]["kind"], "runtime_config");
-    assert_eq!(component["cpus"]["query"], "vm.cpu");
+    assert_eq!(component["cpus"]["query"], "cpu_count");
     assert_eq!(component["memory_mib"]["kind"], "runtime_config");
-    assert_eq!(component["memory_mib"]["query"], "vm.memory");
+    assert_eq!(component["memory_mib"]["query"], "memory");
+    let mut allowed_root_leaf_paths = component["runtime_config"]["allowed_root_leaf_paths"]
+        .as_array()
+        .expect("runtime_config.allowed_root_leaf_paths should be an array")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("allowed_root_leaf_paths should contain strings")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    allowed_root_leaf_paths.sort();
+    assert_eq!(
+        allowed_root_leaf_paths,
+        vec![
+            "vm.cpu".to_string(),
+            "vm.image".to_string(),
+            "vm.memory".to_string(),
+        ]
+    );
+    assert!(
+        component.get("runtime_config").is_some(),
+        "runtime child config should carry runtime_config payload"
+    );
+    let env_example = fs::read_to_string(artifact_dir.join("env.example"))
+        .expect("failed to read vm env example");
+    assert!(
+        env_example.contains("AMBER_CONFIG_VM__IMAGE"),
+        "vm env example should mention runtime config for the forwarded base image"
+    );
+    assert!(
+        env_example.contains("AMBER_CONFIG_VM__CPU"),
+        "vm env example should mention runtime config for the forwarded cpu count"
+    );
+    assert!(
+        env_example.contains("AMBER_CONFIG_VM__MEMORY"),
+        "vm env example should mention runtime config for the forwarded memory size"
+    );
 }
 
 #[test]
