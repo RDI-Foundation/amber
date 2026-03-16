@@ -42,7 +42,6 @@ use tokio::{
 };
 
 const VM_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(150);
-const VM_RUNTIME_STATE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const VM_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(15);
 const VM_GUESTFWD_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const VM_QMP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -346,38 +345,6 @@ pub(crate) fn vm_current_control_socket_path(plan_root: &Path) -> PathBuf {
 
 pub(crate) fn vm_runtime_control_socket_path(runtime_root: &Path) -> PathBuf {
     hashed_temp_socket_path("amber-vm-control", "runtime", runtime_root)
-}
-
-pub(crate) fn load_vm_runtime_state(plan_root: &Path) -> Result<Option<VmRuntimeState>> {
-    let path = vm_runtime_state_path(plan_root);
-    if !path.is_file() {
-        return Ok(None);
-    }
-    read_json_file(&path, "vm runtime state").map(Some)
-}
-
-pub(crate) async fn wait_for_vm_runtime_router_port(
-    plan_root: &Path,
-    timeout: Duration,
-) -> Result<u16> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(port) =
-            load_vm_runtime_state(plan_root)?.and_then(|state| state.router_mesh_port)
-        {
-            return Ok(port);
-        }
-
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        sleep((deadline - now).min(VM_RUNTIME_STATE_POLL_INTERVAL)).await;
-    }
-
-    Err(miette::miette!(
-        "vm runtime router mesh port is unavailable; start `amber run` first or pass --router-addr"
-    ))
 }
 
 fn canonicalize_path(path: &Path, description: &str) -> Result<PathBuf> {

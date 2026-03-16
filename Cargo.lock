@@ -105,6 +105,7 @@ dependencies = [
  "amber-images",
  "amber-manifest",
  "amber-mesh",
+ "amber-proxy",
  "amber-resolver",
  "amber-router",
  "amber-scenario",
@@ -294,6 +295,25 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "amber-proxy"
+version = "0.1.0"
+dependencies = [
+ "amber-compiler",
+ "amber-manifest",
+ "amber-mesh",
+ "amber-router",
+ "base64",
+ "miette",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
