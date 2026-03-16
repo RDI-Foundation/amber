@@ -12,6 +12,7 @@ amber-compiler = { workspace = true }
 amber-config = { workspace = true }
 amber-manifest = { workspace = true }
 amber-mesh = { workspace = true }
+amber-proxy = { workspace = true }
 amber-resolver = { workspace = true }
 amber-router = { workspace = true }
 amber-scenario = { workspace = true }

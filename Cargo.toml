@@ -13,6 +13,7 @@ members = [
   "runtime/docker-gateway",
   "runtime/helper",
   "runtime/mesh",
+  "runtime/proxy",
   "runtime/provisioner",
   "runtime/router",
 ]
@@ -25,6 +26,7 @@ amber-images = { path = "images" }
 amber-json5 = { path = "compiler/json5" }
 amber-manifest = { path = "compiler/manifest" }
 amber-mesh = { path = "runtime/mesh" }
+amber-proxy = { path = "runtime/proxy" }
 amber-resolver = { path = "compiler/resolver" }
 amber-router = { path = "runtime/router" }
 amber-scenario = { path = "compiler/scenario" }
