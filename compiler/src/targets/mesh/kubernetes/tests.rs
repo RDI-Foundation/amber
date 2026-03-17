@@ -79,22 +79,28 @@ fn parse_rendered_env(content: &str) -> std::collections::BTreeMap<String, Strin
 #[test]
 fn render_root_config_env_content_materializes_defaults() {
     let leaves = [
-        rc::SchemaLeaf {
-            path: "base_image".to_string(),
-            required: true,
-            default: Some(json!("line one\nline two")),
-            secret: false,
-            pointer: "/properties/base_image".to_string(),
-        },
-        rc::SchemaLeaf {
-            path: "replicas".to_string(),
-            required: false,
-            default: Some(json!(2)),
-            secret: false,
-            pointer: "/properties/replicas".to_string(),
-        },
+        (
+            "base_image".to_string(),
+            crate::runtime_interface::RootInputDescriptor {
+                env_var: "AMBER_CONFIG_BASE_IMAGE".to_string(),
+                required: true,
+                secret: false,
+                default_value: Some(json!("line one\nline two")),
+                runtime_used: true,
+            },
+        ),
+        (
+            "replicas".to_string(),
+            crate::runtime_interface::RootInputDescriptor {
+                env_var: "AMBER_CONFIG_REPLICAS".to_string(),
+                required: false,
+                secret: false,
+                default_value: Some(json!(2)),
+                runtime_used: true,
+            },
+        ),
     ];
-    let refs: Vec<&rc::SchemaLeaf> = leaves.iter().collect();
+    let refs: Vec<_> = leaves.iter().map(|(path, input)| (path, input)).collect();
 
     let rendered = super::render_root_config_env_content(
         &refs,
@@ -121,8 +127,18 @@ fn render_root_config_env_content_round_trips_union_defaults() {
             },
         },
     });
-    let leaves = rc::collect_leaf_paths(&schema).expect("collect leaf paths");
-    let refs: Vec<&rc::SchemaLeaf> = leaves.iter().collect();
+    let inputs = crate::runtime_interface::collect_root_inputs(
+        &crate::targets::program_config::ConfigPlan {
+            root_leaves: rc::collect_leaf_paths(&schema).expect("collect leaf paths"),
+            program_plans: std::collections::HashMap::new(),
+            mount_specs: std::collections::HashMap::new(),
+            needs_helper: false,
+            needs_runtime_config: false,
+            runtime_views: std::collections::HashMap::new(),
+        },
+    )
+    .expect("collect root inputs");
+    let refs: Vec<_> = inputs.iter().collect();
 
     let rendered = super::render_root_config_env_content(
         &refs,

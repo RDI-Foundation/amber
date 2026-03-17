@@ -1,15 +1,9 @@
-use std::collections::BTreeSet;
-
-use amber_config as rc;
 use amber_scenario::Scenario;
 
 use super::ReporterError;
-use crate::targets::{
-    mesh::{
-        plan::{MeshPlan, component_label},
-        proxy_metadata::collect_external_slot_metadata,
-    },
-    program_config::ConfigPlan,
+use crate::{
+    runtime_interface::build_runtime_interface,
+    targets::{mesh::plan::MeshPlan, program_config::ConfigPlan},
 };
 
 pub(crate) const GENERATED_README_FILENAME: &str = "README.md";
@@ -54,61 +48,48 @@ pub(crate) fn build_execution_guide(
     config_plan: &ConfigPlan,
     has_storage: bool,
 ) -> Result<ExecutionGuide, ReporterError> {
-    let runtime_root_paths = runtime_root_paths(config_plan);
-    let mut root_inputs = Vec::new();
-    if let Some(schema) = scenario.component(scenario.root).config_schema.as_ref() {
-        let mut leaves = rc::collect_leaf_paths(schema).map_err(|err| {
-            ReporterError::new(format!("failed to enumerate config inputs: {err}"))
-        })?;
-        leaves.retain(|leaf| runtime_root_paths.contains(&leaf.path));
-        for leaf in leaves {
-            let path = leaf.path.clone();
-            let env_var = rc::env_var_for_path(&path)
-                .map_err(|err| ReporterError::new(format!("failed to map config path: {err}")))?;
-            let required = leaf.runtime_required();
-            let default_value = leaf
-                .default
-                .as_ref()
-                .map(rc::encode_env_value)
-                .transpose()
-                .map_err(|err| {
-                    ReporterError::new(format!(
-                        "failed to render default for config input {}: {err}",
-                        path
-                    ))
-                })?;
-            root_inputs.push(GuideRootInput {
-                path,
-                env_var,
-                required,
-                secret: leaf.secret,
-                default_value,
-            });
-        }
-    }
-    root_inputs.sort_by(|left, right| left.path.cmp(&right.path));
+    let iface = build_runtime_interface(scenario, mesh_plan, config_plan)
+        .map_err(|err| ReporterError::new(err.to_string()))?;
 
-    let mut external_slots: Vec<_> = collect_external_slot_metadata(scenario, mesh_plan)
+    let root_inputs: Vec<_> = iface
+        .root_inputs
         .into_iter()
-        .map(|(name, meta)| GuideExternalSlot {
-            name,
-            env_var: meta.url_env,
-            required: meta.required,
-            kind: meta.kind.to_string(),
-        })
-        .collect();
-    external_slots.sort_by(|left, right| left.name.cmp(&right.name));
+        .filter_map(|(path, input)| input.runtime_used.then_some((path, input)))
+        .map(
+            |(path, input)| -> Result<GuideRootInput, crate::runtime_interface::RuntimeInterfaceError> {
+                let default_value = input.default_env_value(&path)?;
+                Ok(GuideRootInput {
+                    path: path.clone(),
+                    env_var: input.env_var,
+                    required: input.required,
+                    secret: input.secret,
+                    default_value,
+                })
+            },
+        )
+        .collect::<Result<_, _>>()
+        .map_err(|err| ReporterError::new(err.to_string()))?;
 
-    let mut exports: Vec<_> = mesh_plan
-        .exports()
-        .iter()
-        .map(|export| GuideExport {
-            name: export.name.clone(),
-            component: component_label(scenario, export.provider),
-            protocol: export.endpoint.protocol.to_string(),
+    let external_slots: Vec<_> = iface
+        .external_slots
+        .into_iter()
+        .map(|(name, slot)| GuideExternalSlot {
+            name,
+            env_var: slot.url_env,
+            required: slot.required,
+            kind: slot.decl.kind.to_string(),
         })
         .collect();
-    exports.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let exports: Vec<_> = iface
+        .exports
+        .into_iter()
+        .map(|(name, export)| GuideExport {
+            name,
+            component: export.component,
+            protocol: export.protocol.to_string(),
+        })
+        .collect();
 
     Ok(ExecutionGuide {
         root_inputs,
@@ -116,19 +97,6 @@ pub(crate) fn build_execution_guide(
         exports,
         has_storage,
     })
-}
-
-fn runtime_root_paths(config_plan: &ConfigPlan) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    for view in config_plan.runtime_views.values() {
-        out.extend(view.allowed_root_leaf_paths.iter().cloned());
-    }
-    for plan in config_plan.program_plans.values() {
-        if let Some(image) = plan.image() {
-            image.collect_runtime_root_paths(&mut out);
-        }
-    }
-    out
 }
 
 impl ExecutionGuide {

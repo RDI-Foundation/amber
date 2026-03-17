@@ -27,6 +27,7 @@ use crate::{
             build_execution_guide,
         },
     },
+    runtime_interface::{RootInputDescriptor, collect_root_inputs},
     targets::{
         mesh::{
             addressing::{
@@ -468,6 +469,8 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
     .map_err(dc_other)?;
 
     let root_leaves = &config_plan.root_leaves;
+    let root_inputs = collect_root_inputs(&config_plan)
+        .map_err(|err| DockerComposeError::Other(err.to_string()))?;
     let root_leaf_by_path: BTreeMap<&str, &rc::SchemaLeaf> = root_leaves
         .iter()
         .map(|leaf| (leaf.path.as_str(), leaf))
@@ -801,7 +804,7 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
                 if let Some(runtime_config) = runtime_config {
                     // Security: only expose root config leaves needed for used component paths.
                     let root_env_entries = build_root_env_entries(
-                        root_leaves,
+                        &root_inputs,
                         runtime_config.allowed_root_leaf_paths,
                     )?;
                     env_entries.extend(root_env_entries);
@@ -1269,24 +1272,19 @@ fn detect_default_host_docker_sock() -> PathBuf {
 }
 
 fn build_root_env_entries(
-    root_leaves: &[rc::SchemaLeaf],
+    root_inputs: &BTreeMap<String, RootInputDescriptor>,
     allowed_leaf_paths: &BTreeSet<String>,
 ) -> Result<Vec<String>, DockerComposeError> {
     let mut entries = Vec::new();
-    for leaf in root_leaves {
-        if !allowed_leaf_paths.contains(&leaf.path) {
+    for (path, input) in root_inputs {
+        if !allowed_leaf_paths.contains(path) {
             continue;
         }
-        let var = rc::env_var_for_path(&leaf.path).map_err(|e| {
-            DockerComposeError::Other(format!(
-                "failed to map config path {} to env var: {e}",
-                leaf.path
-            ))
-        })?;
-        if leaf.runtime_required() {
-            entries.push(format!("{var}=${{{var}?missing config.{}}}", leaf.path));
+        let var = &input.env_var;
+        if input.required {
+            entries.push(format!("{var}=${{{var}?missing config.{path}}}"));
         } else {
-            entries.push(var);
+            entries.push(var.clone());
         }
     }
     Ok(entries)
