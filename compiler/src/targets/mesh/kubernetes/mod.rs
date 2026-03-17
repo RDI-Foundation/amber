@@ -21,6 +21,7 @@ use crate::{
         CompiledScenario, Reporter, ReporterError,
         execution_guide::{GENERATED_README_FILENAME, build_execution_guide},
     },
+    runtime_interface::{RootInputDescriptor, build_runtime_interface},
     targets::{
         mesh::{
             addressing::{
@@ -38,7 +39,6 @@ use crate::{
             proxy_metadata::{
                 DEFAULT_EXTERNAL_ENV_FILE, ExportMetadata, ExternalSlotMetadata,
                 PROXY_METADATA_FILENAME, PROXY_METADATA_VERSION, ProxyMetadata, RouterMetadata,
-                collect_exports_metadata, collect_external_slot_metadata,
             },
         },
         program_config::{
@@ -297,6 +297,11 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
         &address_plan.slot_values_by_component,
     )
     .map_err(|e| ReporterError::new(e.to_string()))?;
+    let runtime_interface = build_runtime_interface(s, &mesh_plan, &config_plan)
+        .map_err(|err| ReporterError::new(err.to_string()))?;
+    let root_inputs = runtime_interface.root_inputs;
+    let export_descriptors = runtime_interface.exports;
+    let external_slot_descriptors = runtime_interface.external_slots;
     let storage_plan = build_storage_plan(s, program_components);
     let scenario_digest_label = encode_scenario_digest(&scenario_digest);
     let scenario_labels = |extra: &[(&str, &str)]| -> BTreeMap<String, String> {
@@ -497,7 +502,6 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
         PathBuf::from("04-services/amber-otelcol.yaml"),
         to_yaml(&otelcol_service)?,
     );
-
     let root_leaves = &config_plan.root_leaves;
     let root_leaf_by_path: BTreeMap<&str, &rc::SchemaLeaf> = root_leaves
         .iter()
@@ -536,9 +540,9 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
 
     // If runtime config is needed, generate root config Secret/ConfigMap and .env templates.
     if config_plan.needs_runtime_config {
-        // Separate root leaves into secret and non-secret.
+        // Separate root inputs into secret and non-secret.
         let (secret_leaves, config_leaves): (Vec<_>, Vec<_>) =
-            root_leaves.iter().partition(|l| l.secret);
+            root_inputs.iter().partition(|(_, input)| input.secret);
 
         if !secret_leaves.is_empty() {
             kustomization.secret_generator.push(SecretGenerator {
@@ -748,7 +752,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
                 }
                 if let Some(runtime_config) = runtime_config {
                     let mut config_env = build_component_config_env(
-                        root_leaves,
+                        &root_inputs,
                         runtime_config.allowed_root_leaf_paths,
                     )?;
                     container_env.append(&mut config_env);
@@ -1313,20 +1317,45 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
         );
     }
 
-    let export_metadata = collect_exports_metadata(s, &mesh_plan, router_mesh_port);
+    let export_metadata: BTreeMap<String, ExportMetadata> = export_descriptors
+        .into_iter()
+        .map(|(name, export)| {
+            (
+                name,
+                ExportMetadata {
+                    component: export.component,
+                    provide: export.provide,
+                    protocol: export.protocol.to_string(),
+                    router_mesh_port,
+                },
+            )
+        })
+        .collect();
 
     let mut input_metadata: BTreeMap<String, InputMetadata> = BTreeMap::new();
-    for leaf in root_leaves {
+    for (path, input) in root_inputs {
         input_metadata.insert(
-            leaf.path.clone(),
+            path.clone(),
             InputMetadata {
-                required: leaf.runtime_required(),
-                secret: leaf.secret,
+                required: input.required,
+                secret: input.secret,
             },
         );
     }
 
-    let external_slot_metadata = collect_external_slot_metadata(s, &mesh_plan);
+    let external_slot_metadata: BTreeMap<String, ExternalSlotMetadata> = external_slot_descriptors
+        .into_iter()
+        .map(|(name, slot)| {
+            (
+                name,
+                ExternalSlotMetadata {
+                    required: slot.required,
+                    kind: slot.decl.kind,
+                    url_env: slot.url_env,
+                },
+            )
+        })
+        .collect();
 
     let scenario_metadata = ScenarioMetadata {
         version: "1",
@@ -1753,29 +1782,19 @@ fn render_kubernetes_image(
 }
 
 fn render_root_config_env_content(
-    leaves: &[&rc::SchemaLeaf],
+    leaves: &[(&String, &RootInputDescriptor)],
     heading: &str,
 ) -> KubernetesResult<String> {
     let mut env_content = String::new();
     env_content.push_str(heading);
     env_content.push('\n');
 
-    for leaf in leaves {
-        let env_var = rc::env_var_for_path(&leaf.path)
-            .map_err(|e| ReporterError::new(format!("failed to map config path: {e}")))?;
-        let value = leaf
-            .default
-            .as_ref()
-            .map(rc::encode_env_value)
-            .transpose()
-            .map_err(|err| {
-                ReporterError::new(format!(
-                    "failed to render default for config.{}: {err}",
-                    leaf.path
-                ))
-            })?
+    for (path, input) in leaves {
+        let value = input
+            .default_env_value(path)
+            .map_err(|err| ReporterError::new(err.to_string()))?
             .unwrap_or_default();
-        env_content.push_str(&format!("{env_var}={value}\n"));
+        env_content.push_str(&format!("{}={value}\n", input.env_var));
     }
 
     Ok(env_content)
@@ -2009,30 +2028,27 @@ fn sanitize_port_name(s: &str) -> String {
 }
 
 fn build_component_config_env(
-    root_leaves: &[rc::SchemaLeaf],
+    root_inputs: &BTreeMap<String, RootInputDescriptor>,
     allowed_leaf_paths: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<EnvVar>, ReporterError> {
     let mut env = Vec::new();
 
-    for leaf in root_leaves {
-        if !allowed_leaf_paths.contains(&leaf.path) {
+    for (path, input) in root_inputs {
+        if !allowed_leaf_paths.contains(path) {
             continue;
         }
 
-        let env_var = rc::env_var_for_path(&leaf.path)
-            .map_err(|e| ReporterError::new(format!("failed to map config path: {e}")))?;
-
-        if leaf.secret {
+        if input.secret {
             env.push(EnvVar::from_secret(
-                &env_var,
+                &input.env_var,
                 ROOT_CONFIG_SECRET_NAME,
-                &env_var,
+                &input.env_var,
             ));
         } else {
             env.push(EnvVar::from_config_map(
-                &env_var,
+                &input.env_var,
                 ROOT_CONFIG_CONFIGMAP_NAME,
-                &env_var,
+                &input.env_var,
             ));
         }
     }

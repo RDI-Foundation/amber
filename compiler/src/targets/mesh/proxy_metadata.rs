@@ -1,14 +1,16 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use amber_manifest::CapabilityKind;
 use amber_scenario::Scenario;
 use serde::{Deserialize, Serialize};
 
-use super::plan::{MeshPlan, component_label};
+use super::plan::MeshPlan;
+use crate::runtime_interface::{collect_exports, collect_external_slots};
 
 pub const PROXY_METADATA_VERSION: &str = "1";
 pub const PROXY_METADATA_FILENAME: &str = "amber-proxy.json";
 pub const DEFAULT_EXTERNAL_ENV_FILE: &str = "router-external.env";
+pub use crate::runtime_interface::external_slot_env_var;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ProxyMetadata {
@@ -70,59 +72,42 @@ pub fn collect_exports_metadata(
     mesh_plan: &MeshPlan,
     router_mesh_port: u16,
 ) -> BTreeMap<String, ExportMetadata> {
-    let mut exports = BTreeMap::new();
-    for ex in mesh_plan.exports() {
-        exports.insert(
-            ex.name.clone(),
-            ExportMetadata {
-                component: component_label(scenario, ex.provider),
-                provide: ex.provide.clone(),
-                protocol: ex.endpoint.protocol.to_string(),
-                router_mesh_port,
-            },
-        );
-    }
-    exports
+    collect_exports(scenario, mesh_plan)
+        .into_iter()
+        .map(|(name, export)| {
+            (
+                name,
+                ExportMetadata {
+                    component: export.component,
+                    provide: export.provide,
+                    protocol: export.protocol.to_string(),
+                    router_mesh_port,
+                },
+            )
+        })
+        .collect()
 }
 
 pub fn collect_external_slot_metadata(
     scenario: &Scenario,
     mesh_plan: &MeshPlan,
 ) -> BTreeMap<String, ExternalSlotMetadata> {
-    let root_component = scenario.component(scenario.root);
-    let mut external_slot_names = BTreeSet::new();
-    for binding in mesh_plan.external_bindings() {
-        external_slot_names.insert(binding.external_slot.clone());
-    }
-
-    let mut external_slots = BTreeMap::new();
-    for slot_name in external_slot_names {
-        let decl = root_component
-            .slots
-            .get(slot_name.as_str())
-            .expect("external slot should exist on root");
-        external_slots.insert(
-            slot_name.clone(),
+    collect_external_slots(
+        scenario,
+        mesh_plan
+            .external_bindings()
+            .map(|binding| binding.external_slot.as_str()),
+    )
+    .into_iter()
+    .map(|(name, slot)| {
+        (
+            name,
             ExternalSlotMetadata {
-                required: !decl.optional,
-                kind: decl.decl.kind,
-                url_env: external_slot_env_var(&slot_name),
+                required: slot.required,
+                kind: slot.decl.kind,
+                url_env: slot.url_env,
             },
-        );
-    }
-
-    external_slots
-}
-
-pub fn external_slot_env_var(slot: &str) -> String {
-    let mut out = String::from("AMBER_EXTERNAL_SLOT_");
-    for ch in slot.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_uppercase());
-        } else {
-            out.push('_');
-        }
-    }
-    out.push_str("_URL");
-    out
+        )
+    })
+    .collect()
 }

@@ -11,10 +11,10 @@ use base64::Engine as _;
 use sha2::Digest as _;
 
 use super::{
-    plan::{MeshError, MeshPlan, ResolvedExternalBinding, component_label},
+    plan::{MeshError, MeshPlan, component_label},
     ports::LocalRoutePorts,
-    proxy_metadata::external_slot_env_var,
 };
+use crate::runtime_interface::collect_external_slots;
 
 pub(crate) const DEFAULT_ROUTER_ID: &str = "/router";
 
@@ -356,11 +356,16 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
         let router_mesh_port = router_ports.mesh;
         let mut inbound = Vec::new();
 
-        let external_slots = build_router_external_slots(scenario, mesh_plan.external_bindings());
-        for slot in &external_slots {
+        let external_slots = collect_external_slots(
+            scenario,
+            mesh_plan
+                .external_bindings()
+                .map(|binding| binding.external_slot.as_str()),
+        );
+        for (slot_name, slot) in &external_slots {
             router_env_passthrough.push(slot.url_env.clone());
             let mut issuers = BTreeSet::new();
-            if let Some(consumers) = external_consumers.get(&slot.name) {
+            if let Some(consumers) = external_consumers.get(slot_name) {
                 for consumer in consumers {
                     let consumer_id = identities_by_component
                         .get(consumer)
@@ -374,15 +379,15 @@ pub(crate) fn build_mesh_config_plan<A: MeshAddressing + ?Sized>(
                 continue;
             }
             inbound.push(InboundRoute {
-                route_id: router_external_route_id(&slot.name),
-                capability: slot.name.clone(),
+                route_id: router_external_route_id(slot_name),
+                capability: slot_name.clone(),
                 capability_kind: Some(slot.decl.kind.to_string()),
                 capability_profile: slot.decl.profile.clone(),
                 protocol: MeshProtocol::Http,
                 http_plugins: Vec::new(),
                 target: InboundTarget::External {
                     url_env: slot.url_env.clone(),
-                    optional: slot.optional,
+                    optional: !slot.required,
                 },
                 allowed_issuers: issuers.into_iter().collect(),
             });
@@ -494,39 +499,6 @@ fn required_peers(
         .into_iter()
         .map(|id| MeshPeerTemplate { id })
         .collect()
-}
-
-struct RouterExternalSlot {
-    name: String,
-    decl: amber_manifest::CapabilityDecl,
-    url_env: String,
-    optional: bool,
-}
-
-fn build_router_external_slots<'a>(
-    scenario: &Scenario,
-    bindings: impl IntoIterator<Item = &'a ResolvedExternalBinding>,
-) -> Vec<RouterExternalSlot> {
-    let root_component = scenario.component(scenario.root);
-    let mut slot_names = BTreeSet::new();
-    for binding in bindings {
-        slot_names.insert(binding.external_slot.clone());
-    }
-
-    let mut out = Vec::with_capacity(slot_names.len());
-    for name in slot_names {
-        let decl = root_component
-            .slots
-            .get(name.as_str())
-            .expect("external slot should exist on root");
-        out.push(RouterExternalSlot {
-            name: name.clone(),
-            decl: decl.decl.clone(),
-            url_env: external_slot_env_var(&name),
-            optional: decl.optional,
-        });
-    }
-    out
 }
 
 pub(crate) fn scenario_ir_digest(scenario: &Scenario) -> Result<[u8; 32], MeshError> {
