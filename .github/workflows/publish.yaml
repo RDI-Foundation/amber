@@ -88,6 +88,8 @@ jobs:
     name: Create Multi-Arch Manifests
     runs-on: ubuntu-latest
     needs: build-push
+    outputs:
+      amber_cli_version: ${{ steps.cli_version.outputs.version }}
     permissions:
       contents: read
       packages: write
@@ -133,10 +135,12 @@ jobs:
           while IFS= read -r image; do
             [ -z "$image" ] && continue
             docker buildx imagetools create \
+              --annotation "index:org.opencontainers.image.revision=${GITHUB_SHA}" \
               -t "${image}:main" \
               "${image}:main-amd64" \
               "${image}:main-arm64"
             docker buildx imagetools create \
+              --annotation "index:org.opencontainers.image.revision=${GITHUB_SHA}" \
               -t "${image}:${GITHUB_SHA}" \
               "${image}:${GITHUB_SHA}-amd64" \
               "${image}:${GITHUB_SHA}-arm64"
@@ -191,6 +195,10 @@ jobs:
               end
             '
           }
+          manifest_revision() {
+            local ref="$1"
+            docker buildx imagetools inspect --raw "$ref" | jq -r '.annotations["org.opencontainers.image.revision"] // ""'
+          }
 
           version_tags_json='${{ steps.version_tags.outputs.json }}'
           while IFS= read -r entry; do
@@ -201,15 +209,21 @@ jobs:
             sha_ref="${IMAGE_REGISTRY}/${name}:${GITHUB_SHA}"
 
             if docker buildx imagetools inspect "$release_ref" >/dev/null 2>&1; then
-              release_sig="$(manifest_signature "$release_ref")"
-              sha_sig="$(manifest_signature "$sha_ref")"
-              if [ "$release_sig" != "$sha_sig" ]; then
-                echo "::error::Release tag ${release_ref} already exists but does not match ${sha_ref}. Update docker/images.json version template for ${name} to a higher range."
-                exit 1
+              release_revision="$(manifest_revision "$release_ref")"
+              if [ "$release_revision" = "$GITHUB_SHA" ]; then
+                echo "release tag already exists and points at current revision: $release_ref"
+              else
+                release_sig="$(manifest_signature "$release_ref")"
+                sha_sig="$(manifest_signature "$sha_ref")"
+                if [ "$release_sig" != "$sha_sig" ]; then
+                  echo "::error::Release tag ${release_ref} already exists but does not match ${sha_ref}. Update docker/images.json version template for ${name} to a higher range."
+                  exit 1
+                fi
+                echo "release tag already exists and matches current sha: $release_ref"
               fi
-              echo "release tag already exists and matches current sha: $release_ref"
             else
               docker buildx imagetools create \
+                --annotation "index:org.opencontainers.image.revision=${GITHUB_SHA}" \
                 -t "$release_ref" \
                 "$sha_ref"
             fi
@@ -217,6 +231,7 @@ jobs:
             while IFS= read -r tag; do
               [ -z "$tag" ] && continue
               docker buildx imagetools create \
+                --annotation "index:org.opencontainers.image.revision=${GITHUB_SHA}" \
                 -t "${IMAGE_REGISTRY}/${name}:${tag}" \
                 "$release_ref"
             done < <(jq -r '.floating_tags[]' <<< "$entry")
@@ -395,26 +410,6 @@ jobs:
         with:
           toolchain: nightly-2025-10-30
       - uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Read image registry
-        id: registry
-        shell: bash
-        run: |
-          set -euo pipefail
-          image_registry="$(jq -r '.registry' docker/images.json)"
-          if [ -z "$image_registry" ] || [ "$image_registry" = "null" ]; then
-            echo "docker/images.json registry is missing" >&2
-            exit 1
-          fi
-          image_registry="${image_registry%/}"
-          echo "IMAGE_REGISTRY=${image_registry}" >> "$GITHUB_ENV"
-      - name: Resolve amber-cli release version
-        id: cli_version
-        shell: bash
-        run: |
-          set -euo pipefail
-          json="$(cargo run -q -p amber-images --bin version_tags -- --resolve --registry "$IMAGE_REGISTRY" --sha "$GITHUB_SHA" docker/images.json)"
-          version="$(jq -re '.images[] | select(.name == "amber-cli") | .version' <<< "$json")"
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
       - name: Install musl toolchain
         if: contains(matrix.target, 'linux-musl')
         run: |
@@ -424,7 +419,7 @@ jobs:
         run: rustup target add ${{ matrix.target }}
       - name: Build amber-cli
         env:
-          AMBER_BUILD_VERSION: ${{ steps.cli_version.outputs.version }}
+          AMBER_BUILD_VERSION: ${{ needs.merge-manifests.outputs.amber_cli_version }}
         run: cargo build -p amber-cli --release --target ${{ matrix.target }}
       - name: Package artifact
         run: |
