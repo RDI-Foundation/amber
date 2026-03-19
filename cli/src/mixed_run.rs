@@ -1042,12 +1042,15 @@ fn external_slot_env_for_site(
         if link.consumer_site != site_id {
             continue;
         }
-        let provider = launched_by_site.get(&link.provider_site).ok_or_else(|| {
-            miette::miette!(
+        let Some(provider) = launched_by_site.get(&link.provider_site) else {
+            if link.weak {
+                continue;
+            }
+            return Err(miette::miette!(
                 "provider site `{}` has not been launched before consumer site `{site_id}`",
                 link.provider_site
-            )
-        })?;
+            ));
+        };
         env.insert(
             amber_compiler::mesh::external_slot_env_var(&link.external_slot_name),
             external_slot_url(provider, link, consumer_kind)?,
@@ -1236,27 +1239,74 @@ async fn register_new_site_links(
     state_root: &Path,
 ) -> Result<()> {
     for link in links {
-        if link.consumer_site != site_id {
+        if link.consumer_site == site_id {
+            let Some(provider) = launched_by_site.get(&link.provider_site) else {
+                if link.weak {
+                    continue;
+                }
+                return Err(miette::miette!(
+                    "provider site `{}` is not active",
+                    link.provider_site
+                ));
+            };
+            let external_url = external_slot_url(provider, link, launched.receipt.kind)?;
+            let consumer_key = base64::engine::general_purpose::STANDARD
+                .encode(launched.router_identity.public_key);
+
+            register_external_slot_with_retry(
+                &launched.router_control,
+                &link.external_slot_name,
+                &external_url,
+                ROUTER_CONTROL_TIMEOUT,
+            )
+            .await?;
+            register_export_peer_with_retry(
+                &provider.router_control,
+                &link.export_name,
+                &launched.router_identity.id,
+                &consumer_key,
+                &link.protocol.to_string(),
+                ROUTER_CONTROL_TIMEOUT,
+            )
+            .await?;
+
+            update_desired_links_for_consumer(
+                &state_root.join(site_id),
+                &link.external_slot_name,
+                &external_url,
+            )?;
+            update_desired_links_for_provider(
+                &state_root.join(&link.provider_site),
+                DesiredExportPeer {
+                    export_name: link.export_name.clone(),
+                    peer_id: launched.router_identity.id.clone(),
+                    peer_key_b64: consumer_key,
+                    protocol: link.protocol.to_string(),
+                },
+            )?;
             continue;
         }
-        let provider = launched_by_site.get(&link.provider_site).ok_or_else(|| {
-            miette::miette!("provider site `{}` is not active", link.provider_site)
-        })?;
-        let external_url = external_slot_url(provider, link, launched.receipt.kind)?;
+        if link.provider_site != site_id {
+            continue;
+        }
+        let Some(consumer) = launched_by_site.get(&link.consumer_site) else {
+            continue;
+        };
+        let external_url = external_slot_url(launched, link, consumer.receipt.kind)?;
         let consumer_key =
-            base64::engine::general_purpose::STANDARD.encode(launched.router_identity.public_key);
+            base64::engine::general_purpose::STANDARD.encode(consumer.router_identity.public_key);
 
         register_external_slot_with_retry(
-            &launched.router_control,
+            &consumer.router_control,
             &link.external_slot_name,
             &external_url,
             ROUTER_CONTROL_TIMEOUT,
         )
         .await?;
         register_export_peer_with_retry(
-            &provider.router_control,
+            &launched.router_control,
             &link.export_name,
-            &launched.router_identity.id,
+            &consumer.router_identity.id,
             &consumer_key,
             &link.protocol.to_string(),
             ROUTER_CONTROL_TIMEOUT,
@@ -1264,15 +1314,15 @@ async fn register_new_site_links(
         .await?;
 
         update_desired_links_for_consumer(
-            &state_root.join(site_id),
+            &state_root.join(&link.consumer_site),
             &link.external_slot_name,
             &external_url,
         )?;
         update_desired_links_for_provider(
-            &state_root.join(&link.provider_site),
+            &state_root.join(site_id),
             DesiredExportPeer {
                 export_name: link.export_name.clone(),
-                peer_id: launched.router_identity.id.clone(),
+                peer_id: consumer.router_identity.id.clone(),
                 peer_key_b64: consumer_key,
                 protocol: link.protocol.to_string(),
             },

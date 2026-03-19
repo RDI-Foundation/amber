@@ -430,6 +430,7 @@ mod tests {
                         protocol: NetworkProtocol::Http,
                     },
                     slot: "upstream".to_string(),
+                    weak: false,
                 }),
                 ResolvedBinding::Component(ResolvedComponentBinding {
                     provider: ComponentId(2),
@@ -440,6 +441,7 @@ mod tests {
                         protocol: NetworkProtocol::Http,
                     },
                     slot: "upstream".to_string(),
+                    weak: false,
                 }),
             ],
             Vec::new(),
@@ -542,6 +544,7 @@ mod tests {
                         protocol: NetworkProtocol::Http,
                     },
                     slot: "upstream".to_string(),
+                    weak: false,
                 }),
             ],
             Vec::new(),
