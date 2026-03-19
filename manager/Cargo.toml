@@ -1,0 +1,37 @@
+[package]
+name = "amber-manager"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "amber-manager"
+path = "src/main.rs"
+
+[dependencies]
+amber-compiler = { workspace = true }
+amber-config = { workspace = true }
+amber-images = { workspace = true }
+amber-manifest = { workspace = true }
+amber-proxy = { workspace = true }
+amber-resolver = { workspace = true }
+amber-scenario = { workspace = true }
+jsonschema = { workspace = true, default-features = false }
+miette = { workspace = true, features = ["fancy"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true, features = ["serde"] }
+axum = { version = "0.8.6", features = ["http1", "json", "tokio"] }
+clap = { version = "4.5.46", features = ["derive"] }
+libc = "0.2.177"
+sqlx = { version = "0.8.6", features = ["macros", "migrate", "runtime-tokio-rustls", "sqlite"] }
+tower-http = { version = "0.6.6", features = ["trace"] }
+uuid = { version = "1.18.1", features = ["serde", "v7"] }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+tempfile = { workspace = true }
