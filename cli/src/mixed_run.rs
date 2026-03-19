@@ -1522,11 +1522,15 @@ async fn try_discover_direct_site(
         let control_endpoint =
             ControlEndpoint::Unix(direct_current_control_socket_path(&artifact_dir));
         if let Ok(router_identity) = fetch_router_identity(&control_endpoint).await {
+            let router_addr = SocketAddr::from(([127, 0, 0, 1], router_mesh_port));
+            if !router_mesh_listener_ready(router_addr).await {
+                return Ok(None);
+            }
             let _ = site_process;
             return Ok(Some(RouterDiscovery {
                 control_endpoint,
                 router_identity,
-                router_addr: Some(SocketAddr::from(([127, 0, 0, 1], router_mesh_port))),
+                router_addr: Some(router_addr),
             }));
         }
     }
@@ -1552,10 +1556,14 @@ async fn try_discover_vm_site(
     };
     let control_endpoint = ControlEndpoint::Unix(vm_current_control_socket_path(&artifact_dir));
     if let Ok(router_identity) = fetch_router_identity(&control_endpoint).await {
+        let router_addr = SocketAddr::from(([127, 0, 0, 1], router_mesh_port));
+        if !router_mesh_listener_ready(router_addr).await {
+            return Ok(None);
+        }
         return Ok(Some(RouterDiscovery {
             control_endpoint,
             router_identity,
-            router_addr: Some(SocketAddr::from(([127, 0, 0, 1], router_mesh_port))),
+            router_addr: Some(router_addr),
         }));
     }
     Ok(None)
@@ -2175,6 +2183,17 @@ fn coordinator_lock_path(run_root: &Path) -> PathBuf {
 
 fn stop_marker_path(run_root: &Path) -> PathBuf {
     run_root.join("stop-requested")
+}
+
+async fn router_mesh_listener_ready(addr: SocketAddr) -> bool {
+    matches!(
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            tokio::net::TcpStream::connect(addr)
+        )
+        .await,
+        Ok(Ok(_))
+    )
 }
 
 fn observability_plan_path(run_root: &Path) -> PathBuf {

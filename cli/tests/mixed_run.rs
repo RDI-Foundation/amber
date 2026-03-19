@@ -126,6 +126,12 @@ struct TestTempDir {
     _guard: Option<tempfile::TempDir>,
 }
 
+struct SpawnedProxy {
+    child: std::process::Child,
+    log_path: PathBuf,
+    output_dir: PathBuf,
+}
+
 impl TestTempDir {
     fn path(&self) -> &Path {
         &self.path
@@ -266,19 +272,41 @@ fn http_get(port: u16, path: &str) -> Option<(u16, String)> {
     Some((status.trim().parse().ok()?, body.trim().to_string()))
 }
 
-fn wait_for_body(port: u16, path: &str, timeout: Duration) -> String {
+fn wait_for_body(proxy: &mut SpawnedProxy, port: u16, path: &str, timeout: Duration) -> String {
     let deadline = Instant::now() + timeout;
+    let mut last_response = None;
     while Instant::now() < deadline {
-        if let Some((200, body)) = http_get(port, path) {
-            return body;
+        if let Some((status, body)) = http_get(port, path) {
+            if status == 200 {
+                return body;
+            }
+            last_response = Some((status, body));
+        }
+        if let Ok(Some(status)) = proxy.child.try_wait() {
+            panic!(
+                "amber proxy exited before http://127.0.0.1:{port}{path} became ready\nstatus: \
+                 {status}\noutput dir: {}\nlog ({}):\n{}",
+                proxy.output_dir.display(),
+                proxy.log_path.display(),
+                fs::read_to_string(&proxy.log_path).unwrap_or_default()
+            );
         }
         thread::sleep(Duration::from_millis(250));
     }
-    panic!("timed out waiting for http://127.0.0.1:{port}{path}");
+    let last_response = last_response
+        .map(|(status, body)| format!("last http response: {status}\n{body}\n"))
+        .unwrap_or_else(|| "last http response: <none>\n".to_string());
+    panic!(
+        "timed out waiting for http://127.0.0.1:{port}{path}\noutput dir: {}\n{last_response}log \
+         ({}):\n{}",
+        proxy.output_dir.display(),
+        proxy.log_path.display(),
+        fs::read_to_string(&proxy.log_path).unwrap_or_default()
+    );
 }
 
-fn wait_for_path(port: u16, path: &str, timeout: Duration) {
-    let _ = wait_for_body(port, path, timeout);
+fn wait_for_path(proxy: &mut SpawnedProxy, port: u16, path: &str, timeout: Duration) {
+    let _ = wait_for_body(proxy, port, path, timeout);
 }
 
 fn wait_for_condition(timeout: Duration, mut predicate: impl FnMut() -> bool, label: &str) {
@@ -378,7 +406,7 @@ fn spawn_proxy(
     export: &str,
     local_port: u16,
     extra_args: &[String],
-) -> std::process::Child {
+) -> SpawnedProxy {
     spawn_proxy_with_exports(output_dir, &[(export, local_port)], extra_args)
 }
 
@@ -386,17 +414,41 @@ fn spawn_proxy_with_exports(
     output_dir: &Path,
     exports: &[(&str, u16)],
     extra_args: &[String],
-) -> std::process::Child {
-    let stdout = Stdio::null();
-    let stderr = Stdio::null();
+) -> SpawnedProxy {
+    fs::create_dir_all(outputs_root()).expect("failed to create cli test outputs root");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be available")
+        .as_nanos();
+    let log_path = outputs_root().join(format!(
+        "mixed-run-proxy-{}-{nonce}.log",
+        std::process::id()
+    ));
+    let log = fs::File::create(&log_path).expect("failed to create amber proxy log");
+    let log_err = log
+        .try_clone()
+        .expect("failed to clone amber proxy log handle");
     let mut cmd = amber_command();
     cmd.arg("proxy").arg(output_dir);
     for (export, local_port) in exports {
         cmd.arg("--export")
             .arg(format!("{export}=127.0.0.1:{local_port}"));
     }
-    cmd.args(extra_args).stdout(stdout).stderr(stderr);
-    cmd.spawn().expect("failed to start amber proxy")
+    let child = cmd
+        .args(extra_args)
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .spawn()
+        .expect("failed to start amber proxy");
+    SpawnedProxy {
+        child,
+        log_path,
+        output_dir: output_dir.to_path_buf(),
+    }
+}
+
+fn stop_proxy(proxy: &mut SpawnedProxy) {
+    stop_child(&mut proxy.child);
 }
 
 fn stop_child(child: &mut std::process::Child) {
@@ -1023,7 +1075,11 @@ impl HostHttpServer {
             .stderr(Stdio::null())
             .spawn()
             .expect("failed to start host http server");
-        wait_for_path(port, "/", Duration::from_secs(10));
+        wait_for_condition(
+            Duration::from_secs(10),
+            || matches!(http_get(port, "/"), Some((200, _))),
+            &format!("host http server on 127.0.0.1:{port}"),
+        );
         Self { child }
     }
 }
@@ -1803,39 +1859,49 @@ fn mixed_run_five_site_startup_state_and_teardown() {
     let mut d_proxy = spawn_proxy(&run.site_artifact_dir("vm_d"), "d_http", d_port, &[]);
     let mut e_proxy = spawn_proxy(&run.site_artifact_dir("compose_e"), "e_http", e_port, &[]);
 
-    wait_for_path(a_port, "/id", Duration::from_secs(180));
-    wait_for_path(b_port, "/id", Duration::from_secs(180));
-    wait_for_path(c_port, "/id", Duration::from_secs(180));
-    wait_for_path(d_port, "/id", Duration::from_secs(300));
-    wait_for_path(e_port, "/id", Duration::from_secs(180));
+    wait_for_path(&mut a_proxy, a_port, "/id", Duration::from_secs(180));
+    wait_for_path(&mut b_proxy, b_port, "/id", Duration::from_secs(180));
+    wait_for_path(&mut c_proxy, c_port, "/id", Duration::from_secs(180));
+    wait_for_path(&mut d_proxy, d_port, "/id", Duration::from_secs(300));
+    wait_for_path(&mut e_proxy, e_port, "/id", Duration::from_secs(180));
 
     assert_eq!(
-        wait_for_body(a_port, "/call/b", Duration::from_secs(120)),
+        wait_for_body(&mut a_proxy, a_port, "/call/b", Duration::from_secs(120)),
         "B"
     );
     assert_eq!(
-        wait_for_body(a_port, "/call/c", Duration::from_secs(120)),
+        wait_for_body(&mut a_proxy, a_port, "/call/c", Duration::from_secs(120)),
         "C"
     );
     assert_eq!(
-        wait_for_body(b_port, "/call/c", Duration::from_secs(120)),
+        wait_for_body(&mut b_proxy, b_port, "/call/c", Duration::from_secs(120)),
         "C"
     );
     assert_eq!(
-        wait_for_body(b_port, "/call/d", Duration::from_secs(120)),
+        wait_for_body(&mut b_proxy, b_port, "/call/d", Duration::from_secs(120)),
         "D"
     );
     assert_eq!(
-        wait_for_body(c_port, "/call/d", Duration::from_secs(120)),
+        wait_for_body(&mut c_proxy, c_port, "/call/d", Duration::from_secs(120)),
         "D"
     );
     assert_eq!(
-        wait_for_body(d_port, "/call/e", Duration::from_secs(120)),
+        wait_for_body(&mut d_proxy, d_port, "/call/e", Duration::from_secs(120)),
         "E"
     );
 
-    let b_adversarial = wait_for_body(b_port, "/adversarial-host", Duration::from_secs(60));
-    let e_adversarial = wait_for_body(e_port, "/adversarial-host", Duration::from_secs(60));
+    let b_adversarial = wait_for_body(
+        &mut b_proxy,
+        b_port,
+        "/adversarial-host",
+        Duration::from_secs(60),
+    );
+    let e_adversarial = wait_for_body(
+        &mut e_proxy,
+        e_port,
+        "/adversarial-host",
+        Duration::from_secs(60),
+    );
     assert!(
         b_adversarial.starts_with("blocked:"),
         "compose site should not bypass Amber via host, got {b_adversarial}"
@@ -1845,11 +1911,11 @@ fn mixed_run_five_site_startup_state_and_teardown() {
         "compose site should not bypass Amber via host, got {e_adversarial}"
     );
 
-    stop_child(&mut a_proxy);
-    stop_child(&mut b_proxy);
-    stop_child(&mut c_proxy);
-    stop_child(&mut d_proxy);
-    stop_child(&mut e_proxy);
+    stop_proxy(&mut a_proxy);
+    stop_proxy(&mut b_proxy);
+    stop_proxy(&mut c_proxy);
+    stop_proxy(&mut d_proxy);
+    stop_proxy(&mut e_proxy);
 
     let direct_pid = direct_state["process_pid"]
         .as_u64()
@@ -2055,9 +2121,9 @@ fn mixed_run_recovers_direct_component_failure_after_setup() {
         proxy_port,
         &[],
     );
-    wait_for_path(proxy_port, "/id", Duration::from_secs(60));
+    wait_for_path(&mut proxy, proxy_port, "/id", Duration::from_secs(60));
     let _ = http_get(proxy_port, "/crash");
-    stop_child(&mut proxy);
+    stop_proxy(&mut proxy);
 
     let recovered = wait_for_state_pid_change(
         &run.run_root,
@@ -2087,10 +2153,10 @@ fn mixed_run_recovers_direct_component_failure_after_setup() {
         &[],
     );
     assert_eq!(
-        wait_for_body(proxy_port, "/id", Duration::from_secs(60)),
+        wait_for_body(&mut proxy, proxy_port, "/id", Duration::from_secs(60)),
         "A"
     );
-    stop_child(&mut proxy);
+    stop_proxy(&mut proxy);
     run.stop();
 }
 
@@ -2120,8 +2186,8 @@ fn mixed_run_recovers_vm_site_failure_after_setup() {
         proxy_port,
         &[],
     );
-    wait_for_path(proxy_port, "/id", Duration::from_secs(300));
-    stop_child(&mut proxy);
+    wait_for_path(&mut proxy, proxy_port, "/id", Duration::from_secs(300));
+    stop_proxy(&mut proxy);
 
     kill_pid(first_pid);
     let recovered = wait_for_state_pid_change(
@@ -2152,10 +2218,10 @@ fn mixed_run_recovers_vm_site_failure_after_setup() {
         &[],
     );
     assert_eq!(
-        wait_for_body(proxy_port, "/id", Duration::from_secs(300)),
+        wait_for_body(&mut proxy, proxy_port, "/id", Duration::from_secs(300)),
         "A"
     );
-    stop_child(&mut proxy);
+    stop_proxy(&mut proxy);
     run.stop();
 }
 
@@ -2200,8 +2266,8 @@ fn mixed_run_recovers_when_kubernetes_site_is_temporarily_unreachable() {
         proxy_port,
         &proxy_args,
     );
-    wait_for_path(proxy_port, "/id", Duration::from_secs(120));
-    stop_child(&mut proxy);
+    wait_for_path(&mut proxy, proxy_port, "/id", Duration::from_secs(120));
+    stop_proxy(&mut proxy);
 
     kill_pid(first_forward_pid);
     let recovered = wait_for_state_pid_change(
@@ -2232,10 +2298,10 @@ fn mixed_run_recovers_when_kubernetes_site_is_temporarily_unreachable() {
         &proxy_args,
     );
     assert_eq!(
-        wait_for_body(proxy_port, "/id", Duration::from_secs(120)),
+        wait_for_body(&mut proxy, proxy_port, "/id", Duration::from_secs(120)),
         "A"
     );
-    stop_child(&mut proxy);
+    stop_proxy(&mut proxy);
     run.stop();
 }
 
@@ -2268,10 +2334,10 @@ fn mixed_run_direct_compose_proxy_smoke() {
     let direct_artifact = run.site_artifact_dir("direct_local");
     let proxy_port = pick_free_port();
     let mut proxy = spawn_proxy(&direct_artifact, "a_http", proxy_port, &[]);
-    wait_for_path(proxy_port, "/id", Duration::from_secs(60));
-    let body = wait_for_body(proxy_port, "/call/b", Duration::from_secs(60));
+    wait_for_path(&mut proxy, proxy_port, "/id", Duration::from_secs(60));
+    let body = wait_for_body(&mut proxy, proxy_port, "/call/b", Duration::from_secs(60));
     assert_eq!(body, "B");
-    stop_child(&mut proxy);
+    stop_proxy(&mut proxy);
 
     run.stop();
     assert!(
@@ -2292,12 +2358,12 @@ fn mixed_run_detached_stop_smoke() {
     let direct_artifact = run.site_artifact_dir("direct_local");
     let proxy_port = pick_free_port();
     let mut proxy = spawn_proxy(&direct_artifact, "a_http", proxy_port, &[]);
-    wait_for_path(proxy_port, "/id", Duration::from_secs(60));
+    wait_for_path(&mut proxy, proxy_port, "/id", Duration::from_secs(60));
     assert_eq!(
-        wait_for_body(proxy_port, "/call/b", Duration::from_secs(60)),
+        wait_for_body(&mut proxy, proxy_port, "/call/b", Duration::from_secs(60)),
         "B"
     );
-    stop_child(&mut proxy);
+    stop_proxy(&mut proxy);
 
     run.stop();
     wait_for_condition(
@@ -2334,9 +2400,9 @@ fn mixed_run_local_observability_scenario_smoke() {
     let direct_artifact = run.site_artifact_dir("direct_local");
     let proxy_port = pick_free_port();
     let mut proxy = spawn_proxy(&direct_artifact, "a_http", proxy_port, &[]);
-    wait_for_path(proxy_port, "/id", Duration::from_secs(60));
+    wait_for_path(&mut proxy, proxy_port, "/id", Duration::from_secs(60));
     assert_eq!(
-        wait_for_body(proxy_port, "/call/b", Duration::from_secs(60)),
+        wait_for_body(&mut proxy, proxy_port, "/call/b", Duration::from_secs(60)),
         "B"
     );
     wait_for_condition(
@@ -2348,7 +2414,7 @@ fn mixed_run_local_observability_scenario_smoke() {
         },
         "scenario telemetry after routed traffic",
     );
-    stop_child(&mut proxy);
+    stop_proxy(&mut proxy);
     run.stop();
 }
 
