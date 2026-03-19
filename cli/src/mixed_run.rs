@@ -517,9 +517,9 @@ pub(crate) async fn stop_run(run_id: &str, storage_root_override: Option<&Path>)
         send_sigterm(site.supervisor_pid);
     }
 
-    let deadline = Instant::now() + PROCESS_SHUTDOWN_GRACE_PERIOD;
     for (site_id, site) in &receipt.sites {
         let state_path = site_state_path(&run_root.join("state"), site_id);
+        let deadline = Instant::now() + PROCESS_SHUTDOWN_GRACE_PERIOD;
         while Instant::now() < deadline {
             if let Ok(state) = read_json::<SiteManagerState>(&state_path, "site state")
                 && matches!(

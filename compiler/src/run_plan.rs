@@ -142,6 +142,9 @@ pub enum RunPlanError {
          mixed-site execution requires storage consumers to stay on one site"
     )]
     StorageSpansSites { storage: String, sites: Vec<String> },
+
+    #[error("cyclic strong cross-site dependencies prevent startup ordering for sites {sites:?}")]
+    CyclicSiteDependencies { sites: Vec<String> },
 }
 
 pub fn parse_placement_file(contents: &str) -> Result<PlacementFile, PlacementParseError> {
@@ -184,7 +187,7 @@ pub fn build_run_plan(
     let mesh_scope = scenario_mesh_scope(compiled.scenario_ir())?;
     let links = build_cross_site_links(scenario, &mesh_plan, &assignments_by_component);
     let site_dependencies = build_site_dependencies(&mesh_plan, &assignments_by_component);
-    let startup_waves = topo_waves(&site_dependencies);
+    let startup_waves = topo_waves(&site_dependencies)?;
 
     let links_by_provider_site =
         links
@@ -514,7 +517,9 @@ fn build_site_dependencies(
     site_dependencies
 }
 
-fn topo_waves(site_dependencies: &BTreeMap<String, BTreeSet<String>>) -> Vec<Vec<String>> {
+fn topo_waves(
+    site_dependencies: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<Vec<Vec<String>>, RunPlanError> {
     let mut indegree = BTreeMap::<String, usize>::new();
     let mut outgoing = BTreeMap::<String, BTreeSet<String>>::new();
 
@@ -558,7 +563,18 @@ fn topo_waves(site_dependencies: &BTreeMap<String, BTreeSet<String>>) -> Vec<Vec
         wave.sort();
         waves.push(wave);
     }
-    waves
+
+    let blocked_sites = indegree
+        .into_iter()
+        .filter_map(|(site, degree)| (degree > 0).then_some(site))
+        .collect::<Vec<_>>();
+    if blocked_sites.is_empty() {
+        Ok(waves)
+    } else {
+        Err(RunPlanError::CyclicSiteDependencies {
+            sites: blocked_sites,
+        })
+    }
 }
 
 fn build_site_scenario(
