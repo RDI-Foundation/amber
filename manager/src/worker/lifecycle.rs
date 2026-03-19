@@ -18,6 +18,7 @@ use crate::{
         CreateScenarioRequest, DesiredState, ExportRequest, ExternalSlotBindingRequest,
         ObservedState, ScenarioTelemetryRequest, UpgradeScenarioRequest,
     },
+    json::merge_json,
     runtime::RunningScenarioSpec,
     store::{
         ClaimedScenarioWork, NewScenarioRevision, ScenarioRevisionApplication, StoredOperation,
@@ -333,7 +334,7 @@ impl OperationWorker {
                     .load_secret_config(&scenario.id)
                     .await
                     .map_err(retryable_error)?;
-                merge_json_values(
+                merge_json(
                     scenario.root_config.clone().unwrap_or_else(empty_object),
                     secret_root_config,
                 )
@@ -379,11 +380,10 @@ impl OperationWorker {
         let dependency_hints = self
             .state
             .store
-            .list_dependencies()
+            .list_dependencies_for_consumer(scenario_id)
             .await
             .map_err(retryable_error)?
             .into_iter()
-            .filter(|dependency| dependency.consumer_scenario_id == scenario_id)
             .map(|dependency| {
                 (
                     dependency.bindable_service_id.clone(),
@@ -478,7 +478,8 @@ impl OperationWorker {
             || async { self.state.store.clear_export_services(&scenario.id).await },
             &format!("clear export services for paused scenario {}", scenario.id),
         )
-        .await;
+        .await
+        .map_err(retryable_error)?;
         self.retry_store_until_ok(
             || async {
                 self.state
@@ -494,7 +495,8 @@ impl OperationWorker {
             },
             &format!("set paused scenario state for {}", scenario.id),
         )
-        .await;
+        .await
+        .map_err(retryable_error)?;
         Ok(())
     }
 
@@ -515,6 +517,20 @@ impl OperationWorker {
                     scenario.id, revision
                 ))
             })?;
+        if stored_revision.manager_version != crate::store::MANAGER_STORAGE_VERSION
+            || stored_revision.amber_version != crate::store::AMBER_COMPAT_VERSION
+        {
+            warn!(
+                "materializing stored revision {} for {} built with manager {} / amber {} on \
+                 current manager {} / amber {}",
+                revision,
+                scenario.id,
+                stored_revision.manager_version,
+                stored_revision.amber_version,
+                crate::store::MANAGER_STORAGE_VERSION,
+                crate::store::AMBER_COMPAT_VERSION
+            );
+        }
         let secret_root_config = self
             .state
             .store
@@ -561,25 +577,33 @@ impl OperationWorker {
             let backoff_until =
                 now.saturating_add(backoff_ms(self.state.config.base_backoff_ms(), next_retry));
             if let Some(observed_state) = err.observed_state {
-                self.retry_store_until_ok(
-                    || async {
-                        self.state
-                            .store
-                            .set_scenario_retry_state(
-                                &work.scenario_id,
-                                observed_state,
-                                next_retry,
-                                Some(backoff_until),
-                                &err.message,
-                                now,
-                            )
-                            .await
-                    },
-                    &format!("set scenario retry state for {}", work.scenario_id),
-                )
-                .await;
-            } else {
-                self.retry_store_until_ok(
+                if let Err(store_err) = self
+                    .retry_store_until_ok(
+                        || async {
+                            self.state
+                                .store
+                                .set_scenario_retry_state(
+                                    &work.scenario_id,
+                                    observed_state,
+                                    next_retry,
+                                    Some(backoff_until),
+                                    &err.message,
+                                    now,
+                                )
+                                .await
+                        },
+                        &format!("set scenario retry state for {}", work.scenario_id),
+                    )
+                    .await
+                {
+                    error!(
+                        "failed to persist retry state for {}: {}",
+                        work.scenario_id, store_err
+                    );
+                    return;
+                }
+            } else if let Err(store_err) = self
+                .retry_store_until_ok(
                     || async {
                         self.state
                             .store
@@ -588,36 +612,49 @@ impl OperationWorker {
                     },
                     &format!("set scenario backoff for {}", work.scenario_id),
                 )
-                .await;
-            }
-            self.retry_store_until_ok(
-                || async {
-                    self.state
-                        .store
-                        .release_work_for_retry(&work.scenario_id, now)
-                        .await
-                },
-                &format!("release scenario work for retry on {}", work.scenario_id),
-            )
-            .await;
-
-            if let Some(operation) = operation
-                && let Err(store_err) = self
-                    .state
-                    .store
-                    .reschedule_operation(
-                        &operation.id,
-                        next_retry,
-                        "backing_off",
-                        backoff_until,
-                        &err.message,
-                        now,
-                    )
-                    .await
+                .await
             {
                 error!(
-                    "failed to reschedule operation {}: {}",
-                    operation.id, store_err
+                    "failed to persist backoff for {}: {}",
+                    work.scenario_id, store_err
+                );
+                return;
+            }
+
+            let release_retry = if let Some(operation) = operation {
+                self.retry_store_until_ok(
+                    || async {
+                        self.state
+                            .store
+                            .retry_operation_and_release_work(
+                                &work.scenario_id,
+                                &operation.id,
+                                next_retry,
+                                backoff_until,
+                                &err.message,
+                                now,
+                            )
+                            .await
+                    },
+                    &format!("release retry work for operation {}", operation.id),
+                )
+                .await
+            } else {
+                self.retry_store_until_ok(
+                    || async {
+                        self.state
+                            .store
+                            .release_work_for_retry(&work.scenario_id, now)
+                            .await
+                    },
+                    &format!("release scenario work for retry on {}", work.scenario_id),
+                )
+                .await
+            };
+            if let Err(store_err) = release_retry {
+                error!(
+                    "failed to release retry work for {}: {}",
+                    work.scenario_id, store_err
                 );
             }
             return;
@@ -626,25 +663,33 @@ impl OperationWorker {
         if err.affects_scenario {
             let observed_state = err.observed_state.unwrap_or(ObservedState::Failed);
             if err.retryable {
-                self.retry_store_until_ok(
-                    || async {
-                        self.state
-                            .store
-                            .set_scenario_retry_state(
-                                &work.scenario_id,
-                                observed_state,
-                                next_retry,
-                                None,
-                                &err.message,
-                                now,
-                            )
-                            .await
-                    },
-                    &format!("set final scenario retry state for {}", work.scenario_id),
-                )
-                .await;
-            } else {
-                self.retry_store_until_ok(
+                if let Err(store_err) = self
+                    .retry_store_until_ok(
+                        || async {
+                            self.state
+                                .store
+                                .set_scenario_retry_state(
+                                    &work.scenario_id,
+                                    observed_state,
+                                    next_retry,
+                                    None,
+                                    &err.message,
+                                    now,
+                                )
+                                .await
+                        },
+                        &format!("set final scenario retry state for {}", work.scenario_id),
+                    )
+                    .await
+                {
+                    error!(
+                        "failed to persist final retry state for {}: {}",
+                        work.scenario_id, store_err
+                    );
+                    return;
+                }
+            } else if let Err(store_err) = self
+                .retry_store_until_ok(
                     || async {
                         self.state
                             .store
@@ -658,10 +703,16 @@ impl OperationWorker {
                     },
                     &format!("set final scenario state for {}", work.scenario_id),
                 )
-                .await;
+                .await
+            {
+                error!(
+                    "failed to persist final scenario state for {}: {}",
+                    work.scenario_id, store_err
+                );
+                return;
             }
-        } else {
-            self.retry_store_until_ok(
+        } else if let Err(store_err) = self
+            .retry_store_until_ok(
                 || async {
                     self.state
                         .store
@@ -670,31 +721,49 @@ impl OperationWorker {
                 },
                 &format!("clear scenario backoff for {}", work.scenario_id),
             )
-            .await;
+            .await
+        {
+            error!(
+                "failed to clear scenario backoff for {}: {}",
+                work.scenario_id, store_err
+            );
+            return;
         }
 
-        self.retry_store_until_ok(
-            || async {
-                self.state
-                    .store
-                    .complete_scenario_work(&work.scenario_id, work.generation, now)
-                    .await
-            },
-            &format!("complete failed scenario work for {}", work.scenario_id),
-        )
-        .await;
-
-        if let Some(operation) = operation {
+        let finalize_failure = if let Some(operation) = operation {
             self.retry_store_until_ok(
                 || async {
                     self.state
                         .store
-                        .mark_operation_failed(&operation.id, &err.message, now)
+                        .fail_operation_and_complete_work(
+                            &work.scenario_id,
+                            work.generation,
+                            &operation.id,
+                            &err.message,
+                            now,
+                        )
                         .await
                 },
-                &format!("mark operation {} failed", operation.id),
+                &format!("finalize failed operation {}", operation.id),
             )
-            .await;
+            .await
+        } else {
+            self.retry_store_until_ok(
+                || async {
+                    self.state
+                        .store
+                        .complete_scenario_work(&work.scenario_id, work.generation, now)
+                        .await
+                },
+                &format!("complete failed scenario work for {}", work.scenario_id),
+            )
+            .await
+        };
+        if let Err(store_err) = finalize_failure {
+            error!(
+                "failed to finalize failed work for {}: {}",
+                work.scenario_id, store_err
+            );
         }
     }
 
@@ -786,20 +855,4 @@ fn decode_external_slots(
 
 fn decode_exports(value: &Value) -> Result<BTreeMap<String, ExportRequest>, OperationError> {
     serde_json::from_value(value.clone()).map_err(|err| invalid_scenario_error(err.to_string()))
-}
-
-fn merge_json_values(mut left: Value, right: Value) -> Value {
-    merge_json_value(&mut left, right);
-    left
-}
-
-fn merge_json_value(left: &mut Value, right: Value) {
-    match (left, right) {
-        (Value::Object(left_obj), Value::Object(right_obj)) => {
-            for (key, value) in right_obj {
-                merge_json_value(left_obj.entry(key).or_insert(Value::Null), value);
-            }
-        }
-        (slot, value) => *slot = value,
-    }
 }

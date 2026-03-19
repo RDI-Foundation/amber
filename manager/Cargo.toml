@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 amber-compiler = { workspace = true }
 amber-config = { workspace = true }
+amber-images = { workspace = true }
 amber-manifest = { workspace = true }
 amber-proxy = { workspace = true }
 amber-resolver = { workspace = true }
@@ -32,6 +33,5 @@ tower-http = { version = "0.6.6", features = ["trace"] }
 uuid = { version = "1.18.1", features = ["serde", "v7"] }
 
 [dev-dependencies]
-amber-images = { workspace = true }
 reqwest = { workspace = true }
 tempfile = { workspace = true }

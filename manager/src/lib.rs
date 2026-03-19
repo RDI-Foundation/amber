@@ -4,6 +4,7 @@ mod config;
 mod domain;
 mod ids;
 mod instance_lock;
+mod json;
 mod runtime;
 mod store;
 mod worker;

@@ -175,8 +175,179 @@ impl Store {
         operation_id: &str,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        sqlx::query(
-            r#"
+        mark_operation_running_in_executor(&self.pool, operation_id, now_ms).await
+    }
+
+    pub async fn succeed_operation_and_complete_work(
+        &self,
+        scenario_id: &str,
+        generation: i64,
+        operation_id: &str,
+        result: Option<&serde_json::Value>,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::Database)?;
+        mark_operation_succeeded_in_executor(&mut *tx, operation_id, result, now_ms).await?;
+        complete_scenario_work_in_executor(&mut *tx, scenario_id, generation, now_ms).await?;
+        tx.commit().await.map_err(StoreError::Database)
+    }
+
+    pub async fn fail_operation_and_complete_work(
+        &self,
+        scenario_id: &str,
+        generation: i64,
+        operation_id: &str,
+        error: &str,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::Database)?;
+        mark_operation_failed_in_executor(&mut *tx, operation_id, error, now_ms).await?;
+        complete_scenario_work_in_executor(&mut *tx, scenario_id, generation, now_ms).await?;
+        tx.commit().await.map_err(StoreError::Database)
+    }
+
+    pub async fn retry_operation_and_release_work(
+        &self,
+        scenario_id: &str,
+        operation_id: &str,
+        retry_count: u32,
+        backoff_until_ms: i64,
+        error: &str,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::Database)?;
+        reschedule_operation_in_executor(
+            &mut *tx,
+            operation_id,
+            retry_count,
+            "backing_off",
+            backoff_until_ms,
+            error,
+            now_ms,
+        )
+        .await?;
+        release_work_for_retry_in_executor(&mut *tx, scenario_id, now_ms).await?;
+        tx.commit().await.map_err(StoreError::Database)
+    }
+
+    pub async fn requeue_interrupted_operation(
+        &self,
+        scenario_id: &str,
+        operation_id: &str,
+        retry_count: u32,
+        error: &str,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::Database)?;
+        reschedule_operation_in_executor(
+            &mut *tx,
+            operation_id,
+            retry_count,
+            "requeued_after_manager_restart",
+            now_ms,
+            error,
+            now_ms,
+        )
+        .await?;
+        requeue_interrupted_work_in_executor(&mut *tx, scenario_id, Some(operation_id), now_ms)
+            .await?;
+        tx.commit().await.map_err(StoreError::Database)
+    }
+}
+
+pub(super) async fn requeue_interrupted_work_in_executor<'e, E>(
+    executor: E,
+    scenario_id: &str,
+    operation_id: Option<&str>,
+    now_ms: i64,
+) -> Result<(), StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        r#"
+            UPDATE scenarios
+            SET work_status = 'idle',
+                processing_generation = NULL,
+                pending_operation_id = COALESCE(pending_operation_id, ?),
+                running_operation_id = NULL,
+                updated_at_ms = ?
+            WHERE id = ?
+            "#,
+    )
+    .bind(operation_id)
+    .bind(now_ms)
+    .bind(scenario_id)
+    .execute(executor)
+    .await
+    .map_err(StoreError::Database)?;
+    Ok(())
+}
+
+pub(super) async fn release_work_for_retry_in_executor<'e, E>(
+    executor: E,
+    scenario_id: &str,
+    now_ms: i64,
+) -> Result<(), StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        r#"
+            UPDATE scenarios
+            SET work_status = 'idle',
+                processing_generation = NULL,
+                updated_at_ms = ?
+            WHERE id = ?
+            "#,
+    )
+    .bind(now_ms)
+    .bind(scenario_id)
+    .execute(executor)
+    .await
+    .map_err(StoreError::Database)?;
+    Ok(())
+}
+
+pub(super) async fn complete_scenario_work_in_executor<'e, E>(
+    executor: E,
+    scenario_id: &str,
+    generation: i64,
+    now_ms: i64,
+) -> Result<(), StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        r#"
+            UPDATE scenarios
+            SET work_status = 'idle',
+                processing_generation = NULL,
+                running_operation_id = NULL,
+                applied_generation = MAX(applied_generation, ?),
+                updated_at_ms = ?
+            WHERE id = ?
+            "#,
+    )
+    .bind(generation)
+    .bind(now_ms)
+    .bind(scenario_id)
+    .execute(executor)
+    .await
+    .map_err(StoreError::Database)?;
+    Ok(())
+}
+
+pub(super) async fn mark_operation_running_in_executor<'e, E>(
+    executor: E,
+    operation_id: &str,
+    now_ms: i64,
+) -> Result<(), StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        r#"
             UPDATE operations
             SET status = 'running',
                 phase = 'running',
@@ -184,104 +355,112 @@ impl Store {
                 started_at_ms = COALESCE(started_at_ms, ?)
             WHERE id = ?
             "#,
-        )
-        .bind(now_ms)
-        .bind(now_ms)
-        .bind(operation_id)
-        .execute(&self.pool)
-        .await
-        .map_err(StoreError::Database)?;
-        Ok(())
-    }
+    )
+    .bind(now_ms)
+    .bind(now_ms)
+    .bind(operation_id)
+    .execute(executor)
+    .await
+    .map_err(StoreError::Database)?;
+    Ok(())
+}
 
-    pub async fn mark_operation_succeeded(
-        &self,
-        operation_id: &str,
-        result: Option<&serde_json::Value>,
-        now_ms: i64,
-    ) -> Result<(), StoreError> {
-        sqlx::query(
-            r#"
-            UPDATE operations
-            SET status = 'succeeded',
-                phase = 'completed',
-                backoff_until_ms = NULL,
-                last_error = NULL,
-                result_json = ?,
-                updated_at_ms = ?,
-                finished_at_ms = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(result.map(encode_json).transpose()?)
-        .bind(now_ms)
-        .bind(now_ms)
-        .bind(operation_id)
-        .execute(&self.pool)
-        .await
-        .map_err(StoreError::Database)?;
-        Ok(())
-    }
+pub(super) async fn mark_operation_succeeded_in_executor<'e, E>(
+    executor: E,
+    operation_id: &str,
+    result: Option<&serde_json::Value>,
+    now_ms: i64,
+) -> Result<(), StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        r#"
+        UPDATE operations
+        SET status = 'succeeded',
+            phase = 'completed',
+            backoff_until_ms = NULL,
+            last_error = NULL,
+            result_json = ?,
+            updated_at_ms = ?,
+            finished_at_ms = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(result.map(encode_json).transpose()?)
+    .bind(now_ms)
+    .bind(now_ms)
+    .bind(operation_id)
+    .execute(executor)
+    .await
+    .map_err(StoreError::Database)?;
+    Ok(())
+}
 
-    pub async fn reschedule_operation(
-        &self,
-        operation_id: &str,
-        retry_count: u32,
-        phase: &str,
-        backoff_until_ms: i64,
-        error: &str,
-        now_ms: i64,
-    ) -> Result<(), StoreError> {
-        sqlx::query(
-            r#"
-            UPDATE operations
-            SET status = 'queued',
-                phase = ?,
-                retry_count = ?,
-                backoff_until_ms = ?,
-                last_error = ?,
-                updated_at_ms = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(phase)
-        .bind(i64::from(retry_count))
-        .bind(backoff_until_ms)
-        .bind(error)
-        .bind(now_ms)
-        .bind(operation_id)
-        .execute(&self.pool)
-        .await
-        .map_err(StoreError::Database)?;
-        Ok(())
-    }
+pub(super) async fn reschedule_operation_in_executor<'e, E>(
+    executor: E,
+    operation_id: &str,
+    retry_count: u32,
+    phase: &str,
+    backoff_until_ms: i64,
+    error: &str,
+    now_ms: i64,
+) -> Result<(), StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        r#"
+        UPDATE operations
+        SET status = 'queued',
+            phase = ?,
+            retry_count = ?,
+            backoff_until_ms = ?,
+            last_error = ?,
+            updated_at_ms = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(phase)
+    .bind(i64::from(retry_count))
+    .bind(backoff_until_ms)
+    .bind(error)
+    .bind(now_ms)
+    .bind(operation_id)
+    .execute(executor)
+    .await
+    .map_err(StoreError::Database)?;
+    Ok(())
+}
 
-    pub async fn mark_operation_failed(
-        &self,
-        operation_id: &str,
-        error: &str,
-        now_ms: i64,
-    ) -> Result<(), StoreError> {
-        sqlx::query(
-            r#"
-            UPDATE operations
-            SET status = 'failed',
-                phase = 'failed',
-                last_error = ?,
-                updated_at_ms = ?,
-                finished_at_ms = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(error)
-        .bind(now_ms)
-        .bind(now_ms)
-        .bind(operation_id)
-        .execute(&self.pool)
-        .await
-        .map_err(StoreError::Database)?;
-        Ok(())
-    }
+pub(super) async fn mark_operation_failed_in_executor<'e, E>(
+    executor: E,
+    operation_id: &str,
+    error: &str,
+    now_ms: i64,
+) -> Result<(), StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        r#"
+        UPDATE operations
+        SET status = 'failed',
+            phase = 'failed',
+            last_error = ?,
+            updated_at_ms = ?,
+            finished_at_ms = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(error)
+    .bind(now_ms)
+    .bind(now_ms)
+    .bind(operation_id)
+    .execute(executor)
+    .await
+    .map_err(StoreError::Database)?;
+    Ok(())
 }
 
 async fn insert_operation<'e, E>(executor: E, op: OperationInsert<'_>) -> Result<(), StoreError>

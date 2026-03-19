@@ -43,10 +43,6 @@ impl ObservedState {
             Self::Failed => "failed",
         }
     }
-
-    pub fn blocks_dependency_changes(self) -> bool {
-        matches!(self, Self::Starting | Self::Running | Self::Degraded)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

@@ -25,6 +25,7 @@ use crate::{
     domain::{
         CreateScenarioRequest, ExportRequest, ExternalSlotBindingRequest, ScenarioTelemetryRequest,
     },
+    json::merge_json,
     runtime::ProxyPlan,
 };
 
@@ -459,22 +460,6 @@ fn split_secret_paths(schema: &Value, effective: &Value) -> Result<(Value, Value
 fn normalize_json_object(value: &mut Value) {
     if value.is_null() {
         *value = Value::Object(Map::new());
-    }
-}
-
-fn merge_json(mut left: Value, right: Value) -> Value {
-    merge_value(&mut left, right);
-    left
-}
-
-fn merge_value(left: &mut Value, right: Value) {
-    match (left, right) {
-        (Value::Object(left_obj), Value::Object(right_obj)) => {
-            for (key, value) in right_obj {
-                merge_value(left_obj.entry(key).or_insert(Value::Null), value);
-            }
-        }
-        (slot, value) => *slot = value,
     }
 }
 

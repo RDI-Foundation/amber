@@ -1,12 +1,16 @@
 use serde_json::{Map, Value};
 
 use super::{
-    AMBER_VERSION, MANAGER_VERSION, Store,
+    AMBER_COMPAT_VERSION, MANAGER_STORAGE_VERSION, Store,
     models::{
         ClaimedScenarioWork, ExportServiceRow, InterruptedScenarioWork, NewDependency,
         NewExportService, NewScenarioRevision, RevisionRow, ScenarioRevisionApplication,
         ScenarioRow, StoreError, StoredDependency, StoredExportService, StoredRevision,
         StoredRevisionSummary, StoredScenario, decode_json_with_context, encode_json,
+    },
+    operations::{
+        complete_scenario_work_in_executor, release_work_for_retry_in_executor,
+        requeue_interrupted_work_in_executor,
     },
 };
 use crate::domain::ObservedState;
@@ -138,8 +142,8 @@ impl Store {
         .bind(new_revision.source_url)
         .bind(new_revision.scenario_ir_json)
         .bind(new_revision.bundle_root)
-        .bind(MANAGER_VERSION)
-        .bind(AMBER_VERSION)
+        .bind(MANAGER_STORAGE_VERSION)
+        .bind(AMBER_COMPAT_VERSION)
         .bind(new_revision.ir_version)
         .bind(new_revision.created_at_ms)
         .execute(&mut *tx)
@@ -399,7 +403,7 @@ impl Store {
         loop {
             let mut tx = match self.pool.begin().await {
                 Ok(tx) => tx,
-                Err(err) if is_sqlite_lock_error(&err) => {
+                Err(err) if super::is_retryable_database_error(&err) => {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     continue;
                 }
@@ -424,7 +428,7 @@ impl Store {
 
             let row = match row {
                 Ok(row) => row,
-                Err(err) if is_sqlite_lock_error(&err) => {
+                Err(err) if super::is_retryable_database_error(&err) => {
                     drop(tx);
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     continue;
@@ -435,7 +439,7 @@ impl Store {
             let Some(row) = row else {
                 match tx.commit().await {
                     Ok(()) => {}
-                    Err(err) if is_sqlite_lock_error(&err) => {
+                    Err(err) if super::is_retryable_database_error(&err) => {
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                         continue;
                     }
@@ -465,7 +469,7 @@ impl Store {
 
             let claim = match claim {
                 Ok(claim) => claim,
-                Err(err) if is_sqlite_lock_error(&err) => {
+                Err(err) if super::is_retryable_database_error(&err) => {
                     drop(tx);
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     continue;
@@ -475,7 +479,7 @@ impl Store {
 
             match tx.commit().await {
                 Ok(()) => {}
-                Err(err) if is_sqlite_lock_error(&err) => {
+                Err(err) if super::is_retryable_database_error(&err) => {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     continue;
                 }
@@ -523,24 +527,7 @@ impl Store {
         operation_id: Option<&str>,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        sqlx::query(
-            r#"
-            UPDATE scenarios
-            SET work_status = 'idle',
-                processing_generation = NULL,
-                pending_operation_id = COALESCE(pending_operation_id, ?),
-                running_operation_id = NULL,
-                updated_at_ms = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(operation_id)
-        .bind(now_ms)
-        .bind(scenario_id)
-        .execute(&self.pool)
-        .await
-        .map_err(StoreError::Database)?;
-        Ok(())
+        requeue_interrupted_work_in_executor(&self.pool, scenario_id, operation_id, now_ms).await
     }
 
     pub async fn release_work_for_retry(
@@ -548,21 +535,7 @@ impl Store {
         scenario_id: &str,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        sqlx::query(
-            r#"
-            UPDATE scenarios
-            SET work_status = 'idle',
-                processing_generation = NULL,
-                updated_at_ms = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(now_ms)
-        .bind(scenario_id)
-        .execute(&self.pool)
-        .await
-        .map_err(StoreError::Database)?;
-        Ok(())
+        release_work_for_retry_in_executor(&self.pool, scenario_id, now_ms).await
     }
 
     pub async fn complete_scenario_work(
@@ -571,24 +544,7 @@ impl Store {
         generation: i64,
         now_ms: i64,
     ) -> Result<(), StoreError> {
-        sqlx::query(
-            r#"
-            UPDATE scenarios
-            SET work_status = 'idle',
-                processing_generation = NULL,
-                running_operation_id = NULL,
-                applied_generation = MAX(applied_generation, ?),
-                updated_at_ms = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(generation)
-        .bind(now_ms)
-        .bind(scenario_id)
-        .execute(&self.pool)
-        .await
-        .map_err(StoreError::Database)?;
-        Ok(())
+        complete_scenario_work_in_executor(&self.pool, scenario_id, generation, now_ms).await
     }
 
     pub async fn set_export_services(
@@ -677,14 +633,71 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()
     }
 
+    pub async fn list_export_services_for_scenario(
+        &self,
+        scenario_id: &str,
+    ) -> Result<Vec<StoredExportService>, StoreError> {
+        let rows = sqlx::query_as::<_, ExportServiceRow>(
+            r#"
+            SELECT service_id, scenario_id, export_name, protocol, listen_addr, listen_port, available
+            FROM scenario_export_services
+            WHERE scenario_id = ?
+            ORDER BY export_name
+            "#,
+        )
+        .bind(scenario_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StoreError::Database)?;
+        rows.into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()
+    }
+
     pub async fn list_dependencies(&self) -> Result<Vec<StoredDependency>, StoreError> {
         sqlx::query_as::<_, StoredDependency>(
             r#"
-            SELECT consumer_scenario_id, slot_name, bindable_service_id, provider_scenario_id, created_at_ms
+            SELECT consumer_scenario_id, slot_name, bindable_service_id, provider_scenario_id
             FROM scenario_dependencies
             ORDER BY consumer_scenario_id, slot_name
             "#,
         )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StoreError::Database)
+    }
+
+    pub async fn list_dependencies_for_consumer(
+        &self,
+        scenario_id: &str,
+    ) -> Result<Vec<StoredDependency>, StoreError> {
+        sqlx::query_as::<_, StoredDependency>(
+            r#"
+            SELECT consumer_scenario_id, slot_name, bindable_service_id, provider_scenario_id
+            FROM scenario_dependencies
+            WHERE consumer_scenario_id = ?
+            ORDER BY slot_name
+            "#,
+        )
+        .bind(scenario_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StoreError::Database)
+    }
+
+    pub async fn list_dependencies_for_provider(
+        &self,
+        scenario_id: &str,
+    ) -> Result<Vec<StoredDependency>, StoreError> {
+        sqlx::query_as::<_, StoredDependency>(
+            r#"
+            SELECT consumer_scenario_id, slot_name, bindable_service_id, provider_scenario_id
+            FROM scenario_dependencies
+            WHERE provider_scenario_id = ?
+            ORDER BY consumer_scenario_id, slot_name
+            "#,
+        )
+        .bind(scenario_id)
         .fetch_all(&self.pool)
         .await
         .map_err(StoreError::Database)
@@ -737,11 +750,4 @@ struct InterruptedWorkRow {
     id: String,
     processing_generation: Option<i64>,
     running_operation_id: Option<String>,
-}
-
-fn is_sqlite_lock_error(err: &sqlx::Error) -> bool {
-    match err {
-        sqlx::Error::Database(err) => err.message().contains("locked"),
-        _ => false,
-    }
 }

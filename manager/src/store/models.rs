@@ -82,6 +82,8 @@ pub struct StoredScenario {
 pub struct StoredRevision {
     pub scenario_ir_json: String,
     pub bundle_root: Option<String>,
+    pub manager_version: String,
+    pub amber_version: String,
     pub ir_version: i64,
 }
 
@@ -179,6 +181,12 @@ pub enum StoreError {
     InvalidEnum { kind: &'static str, value: String },
 }
 
+impl StoreError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Database(err) if super::is_retryable_database_error(err))
+    }
+}
+
 #[derive(Debug, FromRow)]
 pub(super) struct ScenarioRow {
     id: String,
@@ -271,11 +279,11 @@ impl TryFrom<RevisionRow> for StoredRevision {
     type Error = StoreError;
 
     fn try_from(row: RevisionRow) -> Result<Self, Self::Error> {
-        let _ = row.manager_version;
-        let _ = row.amber_version;
         Ok(Self {
             scenario_ir_json: row.scenario_ir_json,
             bundle_root: row.bundle_root,
+            manager_version: row.manager_version,
+            amber_version: row.amber_version,
             ir_version: row.ir_version,
         })
     }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
@@ -12,7 +12,7 @@ use super::{
     errors::{
         OperationError, degraded_error, invalid_error, invalid_scenario_error, retryable_error,
     },
-    graph::add_edge,
+    graph::ScenarioGraph,
     now_ms,
 };
 use crate::{
@@ -161,15 +161,11 @@ impl OperationWorker {
         &self,
         scenario_id: &str,
     ) -> Result<Vec<StoredExportService>, OperationError> {
-        Ok(self
-            .state
+        self.state
             .store
-            .list_export_services()
+            .list_export_services_for_scenario(scenario_id)
             .await
-            .map_err(retryable_error)?
-            .into_iter()
-            .filter(|service| service.scenario_id == scenario_id)
-            .collect())
+            .map_err(retryable_error)
     }
 
     async fn existing_export_listeners(
@@ -197,34 +193,27 @@ impl OperationWorker {
         let active_consumers = self
             .state
             .store
-            .list_scenarios()
+            .list_dependency_blockers(provider_scenario_id)
             .await
             .map_err(retryable_error)?
             .into_iter()
-            .filter(|scenario| scenario.observed_state.blocks_dependency_changes())
-            .map(|scenario| scenario.id)
             .collect::<BTreeSet<_>>();
         let current_exports = self
             .state
             .store
-            .list_export_services()
+            .list_export_services_for_scenario(provider_scenario_id)
             .await
             .map_err(retryable_error)?
             .into_iter()
-            .filter(|service| service.scenario_id == provider_scenario_id)
             .map(|service| (service.service_id.clone(), service))
             .collect::<BTreeMap<_, _>>();
 
         for dependency in self
             .state
             .store
-            .list_dependencies()
+            .list_dependencies_for_provider(provider_scenario_id)
             .await
             .map_err(retryable_error)?
-            .into_iter()
-            .filter(|dependency| {
-                dependency.provider_scenario_id.as_deref() == Some(provider_scenario_id)
-            })
         {
             if !active_consumers.contains(&dependency.consumer_scenario_id) {
                 continue;
@@ -274,61 +263,28 @@ impl OperationWorker {
             .list_dependencies()
             .await
             .map_err(retryable_error)?;
-
-        let mut edges = BTreeMap::<String, BTreeSet<String>>::new();
-        let mut in_degree = BTreeMap::<String, usize>::new();
-        for scenario in &scenarios {
-            in_degree.entry(scenario.id.clone()).or_insert(0);
-        }
-        in_degree.entry(scenario_id.to_string()).or_insert(0);
+        let mut graph = ScenarioGraph::new(
+            scenarios
+                .into_iter()
+                .map(|scenario| scenario.id)
+                .chain(std::iter::once(scenario_id.to_string())),
+        );
 
         for dependency in dependencies
             .into_iter()
             .filter(|dependency| dependency.consumer_scenario_id != scenario_id)
         {
             if let Some(provider) = dependency.provider_scenario_id {
-                add_edge(
-                    &mut edges,
-                    &mut in_degree,
-                    provider,
-                    dependency.consumer_scenario_id,
-                );
+                graph.add_edge(provider, dependency.consumer_scenario_id);
             }
         }
         for dependency in replacement_dependencies {
             if let Some(provider) = dependency.provider_scenario_id.clone() {
-                add_edge(
-                    &mut edges,
-                    &mut in_degree,
-                    provider,
-                    scenario_id.to_string(),
-                );
+                graph.add_edge(provider, scenario_id.to_string());
             }
         }
 
-        let mut queue = in_degree
-            .iter()
-            .filter(|(_, count)| **count == 0)
-            .map(|(node, _)| node.clone())
-            .collect::<VecDeque<_>>();
-        let mut visited = 0usize;
-
-        while let Some(node) = queue.pop_front() {
-            visited += 1;
-            if let Some(consumers) = edges.get(&node) {
-                for consumer in consumers {
-                    let count = in_degree
-                        .get_mut(consumer)
-                        .expect("consumer must already exist in graph");
-                    *count -= 1;
-                    if *count == 0 {
-                        queue.push_back(consumer.clone());
-                    }
-                }
-            }
-        }
-
-        if visited == in_degree.len() {
+        if graph.is_acyclic() {
             return Ok(());
         }
 
@@ -400,7 +356,12 @@ impl OperationWorker {
     }
 
     pub(super) async fn enqueue_dependent_reconciles(&self, provider_scenario_id: &str) {
-        let dependencies = match self.state.store.list_dependencies().await {
+        let dependencies = match self
+            .state
+            .store
+            .list_dependencies_for_provider(provider_scenario_id)
+            .await
+        {
             Ok(dependencies) => dependencies,
             Err(err) => {
                 warn!(
@@ -413,9 +374,6 @@ impl OperationWorker {
         let now = now_ms();
         for scenario_id in dependencies
             .into_iter()
-            .filter(|dependency| {
-                dependency.provider_scenario_id.as_deref() == Some(provider_scenario_id)
-            })
             .map(|dependency| dependency.consumer_scenario_id)
             .collect::<BTreeSet<_>>()
         {

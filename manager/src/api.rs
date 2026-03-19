@@ -175,19 +175,15 @@ async fn get_scenario(
         .map_err(ApiError::internal)?;
     let dependencies = state
         .store()
-        .list_dependencies()
+        .list_dependencies_for_consumer(&scenario_id)
         .await
-        .map_err(ApiError::internal)?
-        .into_iter()
-        .filter(|dependency| dependency.consumer_scenario_id == scenario_id)
-        .collect::<Vec<_>>();
+        .map_err(ApiError::internal)?;
     let export_services = state
         .store()
-        .list_export_services()
+        .list_export_services_for_scenario(&scenario_id)
         .await
         .map_err(ApiError::internal)?
         .into_iter()
-        .filter(|service| service.scenario_id == scenario_id)
         .map(|service| (service.export_name.clone(), service))
         .collect::<BTreeMap<_, _>>();
 

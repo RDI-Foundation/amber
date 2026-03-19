@@ -213,18 +213,13 @@ impl OperationWorker {
                 {
                     self.state
                         .store
-                        .reschedule_operation(
+                        .requeue_interrupted_operation(
+                            &work.scenario_id,
                             &operation.id,
                             operation.retry_count,
-                            "requeued_after_manager_restart",
-                            now_ms,
                             restart_message,
                             now_ms,
                         )
-                        .await?;
-                    self.state
-                        .store
-                        .requeue_interrupted_work(&work.scenario_id, Some(&operation.id), now_ms)
                         .await?;
                     info!(
                         "requeued interrupted create operation {} for {} after manager restart",
@@ -233,11 +228,13 @@ impl OperationWorker {
                 } else {
                     self.state
                         .store
-                        .mark_operation_failed(&operation.id, restart_message, now_ms)
-                        .await?;
-                    self.state
-                        .store
-                        .complete_scenario_work(&work.scenario_id, work.generation, now_ms)
+                        .fail_operation_and_complete_work(
+                            &work.scenario_id,
+                            work.generation,
+                            &operation.id,
+                            restart_message,
+                            now_ms,
+                        )
                         .await?;
                     info!(
                         "failed interrupted create operation {} for {} after manager restart",
@@ -249,18 +246,13 @@ impl OperationWorker {
                 if scenario.is_some() {
                     self.state
                         .store
-                        .reschedule_operation(
+                        .requeue_interrupted_operation(
+                            &work.scenario_id,
                             &operation.id,
                             operation.retry_count,
-                            "requeued_after_manager_restart",
-                            now_ms,
                             restart_message,
                             now_ms,
                         )
-                        .await?;
-                    self.state
-                        .store
-                        .requeue_interrupted_work(&work.scenario_id, Some(&operation.id), now_ms)
                         .await?;
                     info!(
                         "requeued interrupted {} operation {} for {} after manager restart",
@@ -275,11 +267,13 @@ impl OperationWorker {
                     });
                     self.state
                         .store
-                        .mark_operation_succeeded(&operation.id, Some(&result), now_ms)
-                        .await?;
-                    self.state
-                        .store
-                        .complete_scenario_work(&work.scenario_id, work.generation, now_ms)
+                        .succeed_operation_and_complete_work(
+                            &work.scenario_id,
+                            work.generation,
+                            &operation.id,
+                            Some(&result),
+                            now_ms,
+                        )
                         .await?;
                     info!(
                         "completed interrupted {} operation {} after manager restart",
@@ -291,11 +285,13 @@ impl OperationWorker {
             OperationKind::Upgrade => {
                 self.state
                     .store
-                    .mark_operation_failed(&operation.id, restart_message, now_ms)
-                    .await?;
-                self.state
-                    .store
-                    .complete_scenario_work(&work.scenario_id, work.generation, now_ms)
+                    .fail_operation_and_complete_work(
+                        &work.scenario_id,
+                        work.generation,
+                        &operation.id,
+                        restart_message,
+                        now_ms,
+                    )
                     .await?;
                 info!(
                     "failed interrupted upgrade operation {} for {} after manager restart",
@@ -305,18 +301,13 @@ impl OperationWorker {
             OperationKind::Reconcile => {
                 self.state
                     .store
-                    .reschedule_operation(
+                    .requeue_interrupted_operation(
+                        &work.scenario_id,
                         &operation.id,
                         operation.retry_count,
-                        "requeued_after_manager_restart",
-                        now_ms,
                         restart_message,
                         now_ms,
                     )
-                    .await?;
-                self.state
-                    .store
-                    .requeue_interrupted_work(&work.scenario_id, Some(&operation.id), now_ms)
                     .await?;
             }
         }
@@ -340,7 +331,16 @@ impl OperationWorker {
     }
 
     async fn process_claimed_work(&self, work: ClaimedScenarioWork) {
-        let operation = self.load_claimed_operation(&work).await;
+        let operation = match self.load_claimed_operation(&work).await {
+            Ok(operation) => operation,
+            Err(err) => {
+                error!(
+                    "failed to load claimed scenario work for {}: {}",
+                    work.scenario_id, err
+                );
+                return;
+            }
+        };
 
         let cleanup_runtime = work.cleanup_runtime
             || operation.as_ref().is_some_and(|operation| {
@@ -373,28 +373,44 @@ impl OperationWorker {
 
         match result {
             Ok(result) => {
-                self.retry_store_until_ok(
-                    || async {
-                        self.state
-                            .store
-                            .complete_scenario_work(&work.scenario_id, work.generation, now_ms())
-                            .await
-                    },
-                    &format!("complete scenario work for {}", work.scenario_id),
-                )
-                .await;
-
-                if let Some(operation) = operation.as_ref() {
+                let finalize_result = if let Some(operation) = operation.as_ref() {
                     self.retry_store_until_ok(
                         || async {
                             self.state
                                 .store
-                                .mark_operation_succeeded(&operation.id, result.as_ref(), now_ms())
+                                .succeed_operation_and_complete_work(
+                                    &work.scenario_id,
+                                    work.generation,
+                                    &operation.id,
+                                    result.as_ref(),
+                                    now_ms(),
+                                )
                                 .await
                         },
-                        &format!("mark operation {} succeeded", operation.id),
+                        &format!("finalize succeeded operation {}", operation.id),
                     )
-                    .await;
+                    .await
+                } else {
+                    self.retry_store_until_ok(
+                        || async {
+                            self.state
+                                .store
+                                .complete_scenario_work(
+                                    &work.scenario_id,
+                                    work.generation,
+                                    now_ms(),
+                                )
+                                .await
+                        },
+                        &format!("complete scenario work for {}", work.scenario_id),
+                    )
+                    .await
+                };
+                if let Err(err) = finalize_result {
+                    error!(
+                        "failed to finalize successful work for {}: {}",
+                        work.scenario_id, err
+                    );
                 }
             }
             Err(err) => self.handle_work_error(&work, operation.as_ref(), err).await,
@@ -420,40 +436,55 @@ impl OperationWorker {
         }
     }
 
-    async fn retry_store_until_ok<F, Fut>(&self, mut op: F, description: &str)
+    async fn retry_store_until_ok<F, Fut>(
+        &self,
+        mut op: F,
+        description: &str,
+    ) -> Result<(), StoreError>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<(), StoreError>>,
     {
         loop {
             match op().await {
-                Ok(()) => return,
-                Err(err) => {
+                Ok(()) => return Ok(()),
+                Err(err) if err.is_retryable() => {
                     error!("failed to {}: {}", description, err);
                     tokio::time::sleep(IDLE_WAIT).await;
                 }
+                Err(err) => return Err(err),
             }
         }
     }
 
-    async fn retry_store_until_value<F, Fut, T>(&self, mut op: F, description: &str) -> T
+    async fn retry_store_until_value<F, Fut, T>(
+        &self,
+        mut op: F,
+        description: &str,
+    ) -> Result<T, StoreError>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<T, StoreError>>,
     {
         loop {
             match op().await {
-                Ok(value) => return value,
-                Err(err) => {
+                Ok(value) => return Ok(value),
+                Err(err) if err.is_retryable() => {
                     error!("failed to {}: {}", description, err);
                     tokio::time::sleep(IDLE_WAIT).await;
                 }
+                Err(err) => return Err(err),
             }
         }
     }
 
-    async fn load_claimed_operation(&self, work: &ClaimedScenarioWork) -> Option<StoredOperation> {
-        let operation_id = work.operation_id.as_deref()?;
+    async fn load_claimed_operation(
+        &self,
+        work: &ClaimedScenarioWork,
+    ) -> Result<Option<StoredOperation>, StoreError> {
+        let Some(operation_id) = work.operation_id.as_deref() else {
+            return Ok(None);
+        };
 
         self.retry_store_until_ok(
             || async {
@@ -464,7 +495,7 @@ impl OperationWorker {
             },
             &format!("mark operation {} running", operation_id),
         )
-        .await;
+        .await?;
 
         let operation = self
             .retry_store_until_value(
@@ -474,14 +505,14 @@ impl OperationWorker {
                     operation_id, work.scenario_id
                 ),
             )
-            .await;
+            .await?;
         if operation.is_none() {
             error!(
                 "claimed scenario work for {} referenced missing operation {}",
                 work.scenario_id, operation_id
             );
         }
-        operation
+        Ok(operation)
     }
 }
 
