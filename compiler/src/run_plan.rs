@@ -455,7 +455,18 @@ fn build_cross_site_links(
     mesh_plan: &crate::targets::mesh::plan::MeshPlan,
     assignments_by_component: &BTreeMap<ComponentId, String>,
 ) -> Vec<RunLink> {
-    let mut links = BTreeMap::<(String, String, String, String, NetworkProtocol), RunLink>::new();
+    let mut links = BTreeMap::<
+        (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            NetworkProtocol,
+        ),
+        RunLink,
+    >::new();
 
     for binding in mesh_plan.component_bindings() {
         let provider_site = assignments_by_component
@@ -470,11 +481,14 @@ fn build_cross_site_links(
 
         let export_name = synthetic_export_name(binding);
         let external_slot_name = synthetic_external_slot_name(binding, consumer_site);
+        let consumer_component = graph::component_path(scenario, binding.consumer);
         let key = (
             provider_site.clone(),
             consumer_site.clone(),
             export_name.clone(),
             external_slot_name.clone(),
+            consumer_component.clone(),
+            binding.slot.clone(),
             binding.endpoint.protocol,
         );
         links.entry(key).or_insert_with(|| RunLink {
@@ -482,7 +496,7 @@ fn build_cross_site_links(
             consumer_site: consumer_site.clone(),
             provider_component: graph::component_path(scenario, binding.provider),
             provide: binding.provide.clone(),
-            consumer_component: graph::component_path(scenario, binding.consumer),
+            consumer_component,
             slot: binding.slot.clone(),
             protocol: binding.endpoint.protocol,
             export_name,

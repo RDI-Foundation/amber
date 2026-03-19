@@ -1634,6 +1634,8 @@ async fn apply_desired_links(plan: &SiteSupervisorPlan, endpoint: &ControlEndpoi
         let slot = env_var
             .strip_prefix("AMBER_EXTERNAL_SLOT_")
             .unwrap_or(env_var.as_str())
+            .strip_suffix("_URL")
+            .unwrap_or(env_var.as_str())
             .to_ascii_lowercase();
         register_external_slot_with_retry(endpoint, &slot, url, Duration::from_secs(2)).await?;
     }
