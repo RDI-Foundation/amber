@@ -336,32 +336,125 @@ impl Store {
         cleanup_runtime: bool,
         now_ms: i64,
     ) -> Result<Option<String>, StoreError> {
-        let existing = sqlx::query_scalar::<_, String>(
+        let op_id = crate::ids::new_operation_id();
+        let result = sqlx::query(
             r#"
-            SELECT id
-            FROM operations
-            WHERE scenario_id = ?
-              AND kind = 'reconcile'
-              AND status IN ('queued', 'running')
-            LIMIT 1
+            INSERT OR IGNORE INTO operations (
+                id,
+                owner_id,
+                kind,
+                scenario_id,
+                payload_json,
+                status,
+                phase,
+                retry_count,
+                backoff_until_ms,
+                last_error,
+                result_json,
+                created_at_ms,
+                updated_at_ms,
+                started_at_ms,
+                finished_at_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, ?, NULL, NULL)
             "#,
         )
+        .bind(&op_id)
+        .bind(IMPLICIT_OWNER_ID)
+        .bind(OperationKind::Reconcile.as_str())
         .bind(scenario_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(StoreError::Database)?;
-        if existing.is_some() {
-            return Ok(None);
-        }
-        let op_id = crate::ids::new_operation_id();
-        self.enqueue_operation(
-            &op_id,
-            OperationKind::Reconcile,
-            Some(scenario_id),
-            &OperationPayload::Reconcile { cleanup_runtime },
-            now_ms,
-        )
+        .bind(encode_json(&OperationPayload::Reconcile { cleanup_runtime })?)
+        .bind(OperationStatus::Queued.as_str())
+        .bind("queued")
+        .bind(now_ms)
+        .bind(now_ms)
+        .execute(&self.pool)
         .await?;
-        Ok(Some(op_id))
+        Ok((result.rows_affected() == 1).then_some(op_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    async fn test_store() -> (TempDir, Store) {
+        let tempdir = TempDir::new().expect("tempdir");
+        let db_path = tempdir.path().join("operations-test.db");
+        std::fs::File::create(&db_path).expect("create sqlite db");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect(&format!("sqlite://{}", db_path.display()))
+            .await
+            .expect("connect sqlite");
+        let store = Store::new(pool);
+        store.migrate().await.expect("run migrations");
+        (tempdir, store)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enqueue_reconcile_if_absent_returns_none_for_duplicate_inflight_work() {
+        let (_tempdir, store) = test_store().await;
+
+        let first = store
+            .enqueue_reconcile_if_absent("scn_test", false, 1)
+            .await
+            .expect("enqueue first reconcile");
+        let second = store
+            .enqueue_reconcile_if_absent("scn_test", true, 2)
+            .await
+            .expect("dedupe duplicate reconcile");
+
+        assert!(first.is_some());
+        assert_eq!(second, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconcile_uniqueness_only_applies_to_inflight_operations() {
+        let (_tempdir, store) = test_store().await;
+        let payload = OperationPayload::Reconcile {
+            cleanup_runtime: false,
+        };
+
+        store
+            .enqueue_operation(
+                "op_reconcile_1",
+                OperationKind::Reconcile,
+                Some("scn_test"),
+                &payload,
+                1,
+            )
+            .await
+            .expect("enqueue first reconcile");
+
+        let err = store
+            .enqueue_operation(
+                "op_reconcile_2",
+                OperationKind::Reconcile,
+                Some("scn_test"),
+                &payload,
+                2,
+            )
+            .await
+            .expect_err("duplicate inflight reconcile should be rejected");
+        assert!(matches!(err, StoreError::Database(_)));
+
+        store
+            .mark_operation_failed("op_reconcile_1", "failed", 3)
+            .await
+            .expect("mark first reconcile failed");
+
+        store
+            .enqueue_operation(
+                "op_reconcile_2",
+                OperationKind::Reconcile,
+                Some("scn_test"),
+                &payload,
+                4,
+            )
+            .await
+            .expect("enqueue reconcile after inflight operation finishes");
     }
 }

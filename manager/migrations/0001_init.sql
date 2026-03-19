@@ -83,6 +83,10 @@ CREATE TABLE operations (
 CREATE INDEX operations_queue_idx
     ON operations(status, backoff_until_ms, created_at_ms);
 
+CREATE UNIQUE INDEX operations_inflight_reconcile_scenario_idx
+    ON operations(scenario_id)
+    WHERE kind = 'reconcile' AND status IN ('queued', 'running');
+
 CREATE INDEX scenario_dependencies_provider_idx
     ON scenario_dependencies(provider_scenario_id);
 
