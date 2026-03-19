@@ -61,6 +61,7 @@ const DEFAULT_K8S_OTEL_UPSTREAM: &str = "http://host.docker.internal:18890";
 const CONTAINER_HOST_ALIAS: &str = "host.docker.internal";
 
 static MANAGER_OBSERVABILITY_ENDPOINT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static KUBERNETES_CONTAINER_HOST_IP: OnceLock<Option<String>> = OnceLock::new();
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct RunReceipt {
@@ -2059,10 +2060,7 @@ fn external_slot_url(
     link: &RunLink,
     consumer_kind: SiteKind,
 ) -> Result<String> {
-    let host = match consumer_kind {
-        SiteKind::Direct | SiteKind::Vm => "127.0.0.1",
-        SiteKind::Compose | SiteKind::Kubernetes => "host.docker.internal",
-    };
+    let host = container_host_for_consumer(consumer_kind);
     let mut mesh_url = Url::parse(&format!("mesh://{}:{}", host, provider.router_addr.port()))
         .into_diagnostic()
         .wrap_err("failed to build mesh link url")?;
@@ -2078,6 +2076,49 @@ fn external_slot_url(
         )
         .append_pair("capability", &link.export_name);
     Ok(mesh_url.to_string())
+}
+
+fn container_host_for_consumer(kind: SiteKind) -> String {
+    let kubernetes_host_ip = kubernetes_container_host_ip();
+    container_host_from_resolved_ip(kind, kubernetes_host_ip.as_deref())
+}
+
+fn container_host_from_resolved_ip(kind: SiteKind, kubernetes_host_ip: Option<&str>) -> String {
+    match kind {
+        SiteKind::Direct | SiteKind::Vm => "127.0.0.1".to_string(),
+        SiteKind::Compose => CONTAINER_HOST_ALIAS.to_string(),
+        SiteKind::Kubernetes => kubernetes_host_ip
+            .unwrap_or(CONTAINER_HOST_ALIAS)
+            .to_string(),
+    }
+}
+
+fn kubernetes_container_host_ip() -> Option<String> {
+    KUBERNETES_CONTAINER_HOST_IP
+        .get_or_init(resolve_kubernetes_container_host_ip)
+        .clone()
+}
+
+fn resolve_kubernetes_container_host_ip() -> Option<String> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+
+    let output = Command::new("docker")
+        .arg("network")
+        .arg("inspect")
+        .arg("bridge")
+        .arg("--format")
+        .arg("{{(index .IPAM.Config 0).Gateway}}")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let host = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    host.parse::<std::net::IpAddr>().ok()?;
+    Some(host)
 }
 
 fn mesh_protocol(protocol: NetworkProtocol) -> Result<MeshProtocol> {
@@ -2173,7 +2214,8 @@ fn observability_endpoint_for_site(kind: SiteKind, endpoint: &str) -> Result<Str
                 .unwrap_or(false)
     });
     if should_rewrite {
-        url.set_host(Some(CONTAINER_HOST_ALIAS))
+        let host = container_host_for_consumer(kind);
+        url.set_host(Some(&host))
             .map_err(|_| miette::miette!("failed to rewrite observability endpoint {endpoint}"))?;
     }
     Ok(url.to_string())
@@ -2695,5 +2737,29 @@ mod tests {
 
         assert!(!forwarded_endpoint_ready(addr));
         handle.join().expect("listener thread should finish");
+    }
+
+    #[test]
+    fn container_host_from_resolved_ip_matches_consumer_kind() {
+        assert_eq!(
+            container_host_from_resolved_ip(SiteKind::Direct, Some("172.17.0.1")),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            container_host_from_resolved_ip(SiteKind::Vm, Some("172.17.0.1")),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            container_host_from_resolved_ip(SiteKind::Compose, Some("172.17.0.1")),
+            CONTAINER_HOST_ALIAS
+        );
+        assert_eq!(
+            container_host_from_resolved_ip(SiteKind::Kubernetes, Some("172.17.0.1")),
+            "172.17.0.1"
+        );
+        assert_eq!(
+            container_host_from_resolved_ip(SiteKind::Kubernetes, None),
+            CONTAINER_HOST_ALIAS
+        );
     }
 }

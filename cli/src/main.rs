@@ -1926,7 +1926,10 @@ fn assign_direct_runtime_ports(
         let mut config = read_mesh_config_public(path.as_path())?;
         let mesh_port = allocate_direct_runtime_port(&mut reserved, fixed_router_mesh_port)?;
         mesh_port_by_peer_id.insert(config.identity.id.clone(), mesh_port);
-        config.mesh_listen = SocketAddr::new(config.mesh_listen.ip(), mesh_port);
+        config.mesh_listen = SocketAddr::new(
+            cross_site_router_mesh_bind_ip(config.mesh_listen.ip(), fixed_router_mesh_port),
+            mesh_port,
+        );
         state.router_mesh_port = Some(mesh_port);
         Some((path, config))
     } else {
@@ -1948,6 +1951,19 @@ fn assign_direct_runtime_ports(
     }
 
     Ok(state)
+}
+
+pub(crate) fn cross_site_router_mesh_bind_ip(
+    current_ip: IpAddr,
+    fixed_router_mesh_port: Option<u16>,
+) -> IpAddr {
+    if fixed_router_mesh_port.is_none() {
+        return current_ip;
+    }
+    match current_ip {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+    }
 }
 
 fn allocate_direct_runtime_port(

@@ -41,7 +41,10 @@ use tokio::{
     time::{Duration, Instant, sleep, timeout},
 };
 
-use crate::tcp_readiness::{wait_for_http_response, wait_for_stable_endpoint};
+use crate::{
+    cross_site_router_mesh_bind_ip,
+    tcp_readiness::{wait_for_http_response, wait_for_stable_endpoint},
+};
 
 const VM_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const VM_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(15);
@@ -546,7 +549,10 @@ fn assign_vm_runtime_ports(
         let mut config = read_mesh_config_public(&path)?;
         let mesh_port = allocate_runtime_port(&mut reserved, fixed_router_mesh_port)?;
         mesh_port_by_peer_id.insert(config.identity.id.clone(), mesh_port);
-        config.mesh_listen = SocketAddr::new(config.mesh_listen.ip(), mesh_port);
+        config.mesh_listen = SocketAddr::new(
+            cross_site_router_mesh_bind_ip(config.mesh_listen.ip(), fixed_router_mesh_port),
+            mesh_port,
+        );
         state.router_mesh_port = Some(mesh_port);
         Some((path, config))
     } else {
