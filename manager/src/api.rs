@@ -17,13 +17,14 @@ use serde_json::{Value, json};
 use crate::{
     compiler::root_schema_from_ir,
     domain::{
-        CreateScenarioRequest, DeleteScenarioQuery, EnqueueOperationResponse, ErrorResponse,
-        ExportResponse, ExternalSlotBindingRequest, ExternalSlotBindingResponse, OperationKind,
-        OperationPayload, OperationStatusResponse, ScenarioDetailResponse,
-        ScenarioRevisionSummaryResponse, ScenarioSummaryResponse, UpgradeScenarioRequest,
+        CreateScenarioRequest, DeleteScenarioQuery, DesiredState, EnqueueOperationResponse,
+        ErrorResponse, ExportResponse, ExternalSlotBindingRequest, ExternalSlotBindingResponse,
+        ObservedState, OperationKind, OperationPayload, OperationStatusResponse,
+        ScenarioDetailResponse, ScenarioRevisionSummaryResponse, ScenarioSummaryResponse,
+        UpgradeScenarioRequest,
     },
     ids,
-    store::{NewPendingScenario, StoreError, StoredOperation},
+    store::{NewPendingScenario, ScenarioStateUpdate, StoreError, StoredOperation},
     worker::AppState,
 };
 
@@ -305,11 +306,15 @@ async fn pause_scenario(
     State(state): State<Arc<AppState>>,
     Path(scenario_id): Path<String>,
 ) -> Result<Json<EnqueueOperationResponse>, ApiError> {
-    enqueue_simple_operation(
+    ensure_scenario_exists(&state, &scenario_id).await?;
+    ensure_scenario_has_no_running_dependents(&state, &scenario_id).await?;
+    enqueue_scenario_operation(
         &state,
         &scenario_id,
         OperationKind::Pause,
         OperationPayload::Pause,
+        Some(DesiredState::Paused),
+        None,
     )
     .await
 }
@@ -318,11 +323,20 @@ async fn resume_scenario(
     State(state): State<Arc<AppState>>,
     Path(scenario_id): Path<String>,
 ) -> Result<Json<EnqueueOperationResponse>, ApiError> {
-    enqueue_simple_operation(
+    let scenario = load_scenario(&state, &scenario_id).await?;
+    if scenario.active_revision.is_none() {
+        return Err(ApiError::bad_request(format!(
+            "scenario {} has no active revision to resume",
+            scenario_id
+        )));
+    }
+    enqueue_scenario_operation(
         &state,
         &scenario_id,
         OperationKind::Resume,
         OperationPayload::Resume,
+        Some(DesiredState::Running),
+        Some(ObservedState::Starting),
     )
     .await
 }
@@ -334,17 +348,24 @@ async fn upgrade_scenario(
 ) -> Result<Json<EnqueueOperationResponse>, ApiError> {
     ensure_scenario_exists(&state, &scenario_id).await?;
     let operation_id = ids::new_operation_id();
-    state
+    let staged = state
         .store()
-        .enqueue_operation(
+        .stage_scenario_operation(
+            &scenario_id,
             &operation_id,
             OperationKind::Upgrade,
-            Some(&scenario_id),
             &OperationPayload::Upgrade { request },
+            ScenarioStateUpdate::default(),
             now_ms(),
         )
         .await
         .map_err(ApiError::internal)?;
+    if !staged {
+        return Err(ApiError::conflict(format!(
+            "scenario {} already has an operation in progress",
+            scenario_id
+        )));
+    }
     state.wake_worker();
     Ok(Json(EnqueueOperationResponse {
         scenario_id,
@@ -358,20 +379,28 @@ async fn delete_scenario(
     Query(query): Query<DeleteScenarioQuery>,
 ) -> Result<Json<EnqueueOperationResponse>, ApiError> {
     ensure_scenario_exists(&state, &scenario_id).await?;
+    ensure_scenario_has_no_running_dependents(&state, &scenario_id).await?;
     let operation_id = ids::new_operation_id();
-    state
+    let staged = state
         .store()
-        .enqueue_operation(
+        .stage_scenario_operation(
+            &scenario_id,
             &operation_id,
             OperationKind::Delete,
-            Some(&scenario_id),
             &OperationPayload::Delete {
                 destroy_storage: query.destroy_storage,
             },
+            ScenarioStateUpdate::default(),
             now_ms(),
         )
         .await
         .map_err(ApiError::internal)?;
+    if !staged {
+        return Err(ApiError::conflict(format!(
+            "scenario {} already has an operation in progress",
+            scenario_id
+        )));
+    }
     state.wake_worker();
     Ok(Json(EnqueueOperationResponse {
         scenario_id,
@@ -392,19 +421,36 @@ async fn get_operation(
     Ok(Json(operation_response(operation)))
 }
 
-async fn enqueue_simple_operation(
+async fn enqueue_scenario_operation(
     state: &Arc<AppState>,
     scenario_id: &str,
     kind: OperationKind,
     payload: OperationPayload,
+    desired_state: Option<DesiredState>,
+    observed_state: Option<ObservedState>,
 ) -> Result<Json<EnqueueOperationResponse>, ApiError> {
-    ensure_scenario_exists(state, scenario_id).await?;
     let operation_id = ids::new_operation_id();
-    state
+    let staged = state
         .store()
-        .enqueue_operation(&operation_id, kind, Some(scenario_id), &payload, now_ms())
+        .stage_scenario_operation(
+            scenario_id,
+            &operation_id,
+            kind,
+            &payload,
+            ScenarioStateUpdate {
+                desired_state,
+                observed_state,
+            },
+            now_ms(),
+        )
         .await
         .map_err(ApiError::internal)?;
+    if !staged {
+        return Err(ApiError::conflict(format!(
+            "scenario {} already has an operation in progress",
+            scenario_id
+        )));
+    }
     state.wake_worker();
     Ok(Json(EnqueueOperationResponse {
         scenario_id: scenario_id.to_string(),
@@ -413,18 +459,43 @@ async fn enqueue_simple_operation(
 }
 
 async fn ensure_scenario_exists(state: &Arc<AppState>, scenario_id: &str) -> Result<(), ApiError> {
-    let exists = state
+    load_scenario(state, scenario_id).await.map(|_| ())
+}
+
+async fn load_scenario(
+    state: &Arc<AppState>,
+    scenario_id: &str,
+) -> Result<crate::store::StoredScenario, ApiError> {
+    if let Some(scenario) = state
         .store()
         .load_scenario(scenario_id)
         .await
         .map_err(ApiError::internal)?
-        .is_some();
-    if exists {
-        return Ok(());
+    {
+        return Ok(scenario);
     }
     Err(ApiError::not_found(format!(
         "scenario {} does not exist",
         scenario_id
+    )))
+}
+
+async fn ensure_scenario_has_no_running_dependents(
+    state: &Arc<AppState>,
+    scenario_id: &str,
+) -> Result<(), ApiError> {
+    let blockers = state
+        .store()
+        .list_running_dependency_blockers(scenario_id)
+        .await
+        .map_err(ApiError::internal)?;
+    if blockers.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::conflict(format!(
+        "scenario {} cannot be modified because running scenarios depend on its exports: {}",
+        scenario_id,
+        blockers.join(", ")
     )))
 }
 
@@ -490,6 +561,13 @@ impl ApiError {
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
             message: message.into(),
         }
     }

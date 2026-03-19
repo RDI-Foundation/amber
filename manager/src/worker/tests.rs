@@ -26,7 +26,7 @@ use crate::{
         ServiceProtocol, UpgradeScenarioRequest,
     },
     runtime::RuntimeSupervisor,
-    store::{NewPendingScenario, Store, StoredDependency, StoredScenario},
+    store::{NewPendingScenario, ScenarioStateUpdate, Store, StoredDependency, StoredScenario},
 };
 
 #[test]
@@ -290,11 +290,11 @@ async fn startup_recovery_does_not_replay_interrupted_upgrade() {
         .expect("seed pending scenario");
     let create_operation = state
         .store()
-        .claim_next_operation(1)
+        .claim_next_scenario_work(1)
         .await
-        .expect("claim create operation")
-        .expect("seed create operation");
-    worker.process_claimed_operation(create_operation).await;
+        .expect("claim create work")
+        .expect("seed create work");
+    worker.process_claimed_work(create_operation).await;
 
     let created = state
         .store()
@@ -315,25 +315,34 @@ async fn startup_recovery_does_not_replay_interrupted_upgrade() {
             store_bundle: false,
         },
     };
-    state
+    let staged = state
         .store()
-        .enqueue_operation(
+        .stage_scenario_operation(
+            scenario_id,
             upgrade_operation_id,
             OperationKind::Upgrade,
-            Some(scenario_id),
             &upgrade_payload,
+            ScenarioStateUpdate::default(),
             2,
         )
         .await
-        .expect("enqueue interrupted upgrade");
+        .expect("stage interrupted upgrade");
+    assert!(staged);
     let claimed_upgrade = state
         .store()
-        .claim_next_operation(2)
+        .claim_next_scenario_work(2)
         .await
-        .expect("claim upgrade operation")
-        .expect("running upgrade operation");
-    assert_eq!(claimed_upgrade.id, upgrade_operation_id);
-    assert_eq!(claimed_upgrade.status, OperationStatus::Running);
+        .expect("claim upgrade work")
+        .expect("running upgrade work");
+    state
+        .store()
+        .mark_operation_running(upgrade_operation_id, 2)
+        .await
+        .expect("mark interrupted upgrade running");
+    assert_eq!(
+        claimed_upgrade.operation_id.as_deref(),
+        Some(upgrade_operation_id)
+    );
 
     worker.enqueue_startup_reconciles().await;
 
@@ -353,12 +362,12 @@ async fn startup_recovery_does_not_replay_interrupted_upgrade() {
 
     let reconcile_operation = state
         .store()
-        .claim_next_operation(3)
+        .claim_next_scenario_work(3)
         .await
         .expect("claim startup reconcile")
-        .expect("startup reconcile operation");
-    assert_eq!(reconcile_operation.kind, OperationKind::Reconcile);
-    worker.process_claimed_operation(reconcile_operation).await;
+        .expect("startup reconcile work");
+    assert_eq!(reconcile_operation.operation_id, None);
+    worker.process_claimed_work(reconcile_operation).await;
 
     let revisions = state
         .store()

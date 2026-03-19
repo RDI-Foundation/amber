@@ -1,8 +1,11 @@
 use super::{
     Store,
-    models::{OperationRow, StoreError, StoredOperation, encode_json},
+    models::{OperationRow, ScenarioStateUpdate, StoreError, StoredOperation, encode_json},
 };
-use crate::domain::{IMPLICIT_OWNER_ID, OperationKind, OperationPayload, OperationStatus};
+use crate::domain::{
+    DesiredState, IMPLICIT_OWNER_ID, ObservedState, OperationKind, OperationPayload,
+    OperationStatus,
+};
 
 impl Store {
     pub async fn create_pending_scenario_with_operation(
@@ -10,6 +13,27 @@ impl Store {
         new_scenario: super::NewPendingScenario<'_>,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await.map_err(StoreError::Database)?;
+        insert_operation(
+            &mut *tx,
+            OperationInsert {
+                operation_id: new_scenario.operation_id,
+                kind: OperationKind::Create,
+                scenario_id: Some(new_scenario.scenario_id),
+                payload: new_scenario.payload,
+                status: OperationStatus::Queued,
+                phase: "queued",
+                retry_count: 0,
+                backoff_until_ms: None,
+                last_error: None,
+                result: None,
+                created_at_ms: new_scenario.now_ms,
+                updated_at_ms: new_scenario.now_ms,
+                started_at_ms: None,
+                finished_at_ms: None,
+            },
+        )
+        .await?;
+
         sqlx::query(
             r#"
             INSERT INTO scenarios (
@@ -29,8 +53,15 @@ impl Store {
                 backoff_until_ms,
                 last_error,
                 created_at_ms,
-                updated_at_ms
-            ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?)
+                updated_at_ms,
+                desired_generation,
+                applied_generation,
+                processing_generation,
+                work_status,
+                cleanup_generation,
+                pending_operation_id,
+                running_operation_id
+            ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, 1, 0, NULL, 'idle', 0, ?, NULL)
             "#,
         )
         .bind(new_scenario.scenario_id)
@@ -46,40 +77,7 @@ impl Store {
         .bind(encode_json(new_scenario.exports)?)
         .bind(new_scenario.now_ms)
         .bind(new_scenario.now_ms)
-        .execute(&mut *tx)
-        .await
-        .map_err(StoreError::Database)?;
-
-        sqlx::query(
-            r#"
-            INSERT INTO operations (
-                id,
-                owner_id,
-                kind,
-                scenario_id,
-                payload_json,
-                status,
-                phase,
-                retry_count,
-                backoff_until_ms,
-                last_error,
-                result_json,
-                created_at_ms,
-                updated_at_ms,
-                started_at_ms,
-                finished_at_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, ?, NULL, NULL)
-            "#,
-        )
         .bind(new_scenario.operation_id)
-        .bind(IMPLICIT_OWNER_ID)
-        .bind(OperationKind::Create.as_str())
-        .bind(new_scenario.scenario_id)
-        .bind(encode_json(new_scenario.payload)?)
-        .bind(OperationStatus::Queued.as_str())
-        .bind("queued")
-        .bind(new_scenario.now_ms)
-        .bind(new_scenario.now_ms)
         .execute(&mut *tx)
         .await
         .map_err(StoreError::Database)?;
@@ -88,48 +86,68 @@ impl Store {
         Ok(())
     }
 
-    pub async fn enqueue_operation(
+    pub async fn stage_scenario_operation(
         &self,
+        scenario_id: &str,
         operation_id: &str,
         kind: OperationKind,
-        scenario_id: Option<&str>,
         payload: &OperationPayload,
+        state_update: ScenarioStateUpdate,
         now_ms: i64,
-    ) -> Result<(), StoreError> {
-        sqlx::query(
-            r#"
-            INSERT INTO operations (
-                id,
-                owner_id,
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::Database)?;
+        insert_operation(
+            &mut *tx,
+            OperationInsert {
+                operation_id,
                 kind,
-                scenario_id,
-                payload_json,
-                status,
-                phase,
-                retry_count,
-                backoff_until_ms,
-                last_error,
-                result_json,
-                created_at_ms,
-                updated_at_ms,
-                started_at_ms,
-                finished_at_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, ?, NULL, NULL)
+                scenario_id: Some(scenario_id),
+                payload,
+                status: OperationStatus::Queued,
+                phase: "queued",
+                retry_count: 0,
+                backoff_until_ms: None,
+                last_error: None,
+                result: None,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                started_at_ms: None,
+                finished_at_ms: None,
+            },
+        )
+        .await?;
+
+        let update = sqlx::query(
+            r#"
+            UPDATE scenarios
+            SET desired_state = COALESCE(?, desired_state),
+                observed_state = COALESCE(?, observed_state),
+                failure_count = 0,
+                backoff_until_ms = NULL,
+                last_error = NULL,
+                desired_generation = desired_generation + 1,
+                updated_at_ms = ?,
+                pending_operation_id = ?
+            WHERE id = ?
+              AND pending_operation_id IS NULL
+              AND running_operation_id IS NULL
             "#,
         )
+        .bind(state_update.desired_state.map(DesiredState::as_str))
+        .bind(state_update.observed_state.map(ObservedState::as_str))
+        .bind(now_ms)
         .bind(operation_id)
-        .bind(IMPLICIT_OWNER_ID)
-        .bind(kind.as_str())
         .bind(scenario_id)
-        .bind(encode_json(payload)?)
-        .bind(OperationStatus::Queued.as_str())
-        .bind("queued")
-        .bind(now_ms)
-        .bind(now_ms)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(StoreError::Database)?;
-        Ok(())
+
+        if update.rows_affected() == 0 {
+            return Ok(false);
+        }
+
+        tx.commit().await.map_err(StoreError::Database)?;
+        Ok(true)
     }
 
     pub async fn get_operation(
@@ -152,123 +170,28 @@ impl Store {
         row.map(TryInto::try_into).transpose()
     }
 
-    pub async fn claim_next_operation(
+    pub async fn mark_operation_running(
         &self,
+        operation_id: &str,
         now_ms: i64,
-    ) -> Result<Option<StoredOperation>, StoreError> {
-        loop {
-            let mut tx = match self.pool.begin().await {
-                Ok(tx) => tx,
-                Err(err) if is_sqlite_lock_error(&err) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    continue;
-                }
-                Err(err) => return Err(StoreError::Database(err)),
-            };
-            let row = sqlx::query_as::<_, OperationRow>(
-                r#"
-                SELECT id, kind, scenario_id, payload_json, status, phase, retry_count,
-                       backoff_until_ms, last_error, result_json, created_at_ms, updated_at_ms,
-                       started_at_ms, finished_at_ms
-                FROM operations
-                WHERE status = 'queued'
-                  AND (backoff_until_ms IS NULL OR backoff_until_ms <= ?)
-                ORDER BY created_at_ms, id
-                LIMIT 1
-                "#,
-            )
-            .bind(now_ms)
-            .fetch_optional(&mut *tx)
-            .await;
-
-            let row = match row {
-                Ok(row) => row,
-                Err(err) if is_sqlite_lock_error(&err) => {
-                    drop(tx);
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    continue;
-                }
-                Err(err) => return Err(StoreError::Database(err)),
-            };
-
-            let Some(row) = row else {
-                match tx.commit().await {
-                    Ok(()) => {}
-                    Err(err) if is_sqlite_lock_error(&err) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                        continue;
-                    }
-                    Err(err) => return Err(StoreError::Database(err)),
-                }
-                return Ok(None);
-            };
-
-            let claim = sqlx::query(
-                r#"
-                UPDATE operations
-                SET status = 'running',
-                    phase = 'running',
-                    updated_at_ms = ?,
-                    started_at_ms = COALESCE(started_at_ms, ?)
-                WHERE id = ?
-                  AND status = 'queued'
-                "#,
-            )
-            .bind(now_ms)
-            .bind(now_ms)
-            .bind(&row.id)
-            .execute(&mut *tx)
-            .await;
-
-            let claim = match claim {
-                Ok(claim) => claim,
-                Err(err) if is_sqlite_lock_error(&err) => {
-                    drop(tx);
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    continue;
-                }
-                Err(err) => return Err(StoreError::Database(err)),
-            };
-
-            match tx.commit().await {
-                Ok(()) => {}
-                Err(err) if is_sqlite_lock_error(&err) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    continue;
-                }
-                Err(err) => return Err(StoreError::Database(err)),
-            }
-
-            if claim.rows_affected() == 0 {
-                continue;
-            }
-
-            let mut stored: StoredOperation = row.try_into()?;
-            stored.status = OperationStatus::Running;
-            stored.phase = "running".to_string();
-            stored.started_at_ms = Some(now_ms);
-            stored.updated_at_ms = now_ms;
-            return Ok(Some(stored));
-        }
-    }
-
-    pub async fn list_running_operations(&self) -> Result<Vec<StoredOperation>, StoreError> {
-        let rows = sqlx::query_as::<_, OperationRow>(
+    ) -> Result<(), StoreError> {
+        sqlx::query(
             r#"
-            SELECT id, kind, scenario_id, payload_json, status, phase, retry_count,
-                   backoff_until_ms, last_error, result_json, created_at_ms, updated_at_ms,
-                   started_at_ms, finished_at_ms
-            FROM operations
-            WHERE status = 'running'
-            ORDER BY created_at_ms, id
+            UPDATE operations
+            SET status = 'running',
+                phase = 'running',
+                updated_at_ms = ?,
+                started_at_ms = COALESCE(started_at_ms, ?)
+            WHERE id = ?
             "#,
         )
-        .fetch_all(&self.pool)
+        .bind(now_ms)
+        .bind(now_ms)
+        .bind(operation_id)
+        .execute(&self.pool)
         .await
         .map_err(StoreError::Database)?;
-        rows.into_iter()
-            .map(TryInto::try_into)
-            .collect::<Result<Vec<_>, _>>()
+        Ok(())
     }
 
     pub async fn mark_operation_succeeded(
@@ -359,80 +282,76 @@ impl Store {
         .map_err(StoreError::Database)?;
         Ok(())
     }
-
-    pub async fn has_inflight_operation(&self, scenario_id: &str) -> Result<bool, StoreError> {
-        let existing = sqlx::query_scalar::<_, String>(
-            r#"
-            SELECT id
-            FROM operations
-            WHERE scenario_id = ?
-              AND status IN ('queued', 'running')
-            LIMIT 1
-            "#,
-        )
-        .bind(scenario_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(StoreError::Database)?;
-        Ok(existing.is_some())
-    }
-
-    pub async fn enqueue_reconcile_if_absent(
-        &self,
-        scenario_id: &str,
-        cleanup_runtime: bool,
-        now_ms: i64,
-    ) -> Result<Option<String>, StoreError> {
-        let op_id = crate::ids::new_operation_id();
-        let result = sqlx::query(
-            r#"
-            INSERT OR IGNORE INTO operations (
-                id,
-                owner_id,
-                kind,
-                scenario_id,
-                payload_json,
-                status,
-                phase,
-                retry_count,
-                backoff_until_ms,
-                last_error,
-                result_json,
-                created_at_ms,
-                updated_at_ms,
-                started_at_ms,
-                finished_at_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, ?, NULL, NULL)
-            "#,
-        )
-        .bind(&op_id)
-        .bind(IMPLICIT_OWNER_ID)
-        .bind(OperationKind::Reconcile.as_str())
-        .bind(scenario_id)
-        .bind(encode_json(&OperationPayload::Reconcile {
-            cleanup_runtime,
-        })?)
-        .bind(OperationStatus::Queued.as_str())
-        .bind("queued")
-        .bind(now_ms)
-        .bind(now_ms)
-        .execute(&self.pool)
-        .await?;
-        Ok((result.rows_affected() == 1).then_some(op_id))
-    }
 }
 
-fn is_sqlite_lock_error(err: &sqlx::Error) -> bool {
-    match err {
-        sqlx::Error::Database(err) => err.message().contains("locked"),
-        _ => false,
-    }
+async fn insert_operation<'e, E>(executor: E, op: OperationInsert<'_>) -> Result<(), StoreError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query(
+        r#"
+        INSERT INTO operations (
+            id,
+            owner_id,
+            kind,
+            scenario_id,
+            payload_json,
+            status,
+            phase,
+            retry_count,
+            backoff_until_ms,
+            last_error,
+            result_json,
+            created_at_ms,
+            updated_at_ms,
+            started_at_ms,
+            finished_at_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(op.operation_id)
+    .bind(IMPLICIT_OWNER_ID)
+    .bind(op.kind.as_str())
+    .bind(op.scenario_id)
+    .bind(encode_json(op.payload)?)
+    .bind(op.status.as_str())
+    .bind(op.phase)
+    .bind(i64::from(op.retry_count))
+    .bind(op.backoff_until_ms)
+    .bind(op.last_error)
+    .bind(op.result.map(encode_json).transpose()?)
+    .bind(op.created_at_ms)
+    .bind(op.updated_at_ms)
+    .bind(op.started_at_ms)
+    .bind(op.finished_at_ms)
+    .execute(executor)
+    .await
+    .map_err(StoreError::Database)?;
+    Ok(())
+}
+
+struct OperationInsert<'a> {
+    operation_id: &'a str,
+    kind: OperationKind,
+    scenario_id: Option<&'a str>,
+    payload: &'a OperationPayload,
+    status: OperationStatus,
+    phase: &'a str,
+    retry_count: u32,
+    backoff_until_ms: Option<i64>,
+    last_error: Option<&'a str>,
+    result: Option<&'a serde_json::Value>,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    started_at_ms: Option<i64>,
+    finished_at_ms: Option<i64>,
 }
 
 #[cfg(test)]
 mod tests {
     use std::{path::Path, time::Duration};
 
+    use serde_json::json;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use tempfile::TempDir;
 
@@ -466,68 +385,111 @@ mod tests {
         (tempdir, store)
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn enqueue_reconcile_if_absent_returns_none_for_duplicate_inflight_work() {
-        let (_tempdir, store) = test_store().await;
-
-        let first = store
-            .enqueue_reconcile_if_absent("scn_test", false, 1)
-            .await
-            .expect("enqueue first reconcile");
-        let second = store
-            .enqueue_reconcile_if_absent("scn_test", true, 2)
-            .await
-            .expect("dedupe duplicate reconcile");
-
-        assert!(first.is_some());
-        assert_eq!(second, None);
+    async fn seed_scenario(store: &Store, seed: ScenarioSeed<'_>) {
+        sqlx::query(
+            r#"
+            INSERT INTO scenarios (
+                id,
+                owner_id,
+                source_url,
+                active_revision,
+                compose_project,
+                desired_state,
+                observed_state,
+                metadata_json,
+                root_config_json,
+                telemetry_json,
+                external_slots_json,
+                exports_json,
+                failure_count,
+                backoff_until_ms,
+                last_error,
+                created_at_ms,
+                updated_at_ms,
+                desired_generation,
+                applied_generation,
+                processing_generation,
+                work_status,
+                cleanup_generation,
+                pending_operation_id,
+                running_operation_id
+            ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            "#,
+        )
+        .bind(seed.scenario_id)
+        .bind(IMPLICIT_OWNER_ID)
+        .bind("https://example.com/scenario")
+        .bind(format!("amber_{}", seed.scenario_id))
+        .bind(DesiredState::Running.as_str())
+        .bind(ObservedState::Running.as_str())
+        .bind("{}")
+        .bind(Some(json!({})).map(|value| serde_json::to_string(&value).expect("root config")))
+        .bind(encode_json(&crate::domain::ScenarioTelemetryRequest::default()).expect("telemetry"))
+        .bind("{}")
+        .bind("{}")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(seed.desired_generation)
+        .bind(seed.applied_generation)
+        .bind(seed.processing_generation)
+        .bind(seed.work_status)
+        .bind(seed.pending_operation_id)
+        .bind(seed.running_operation_id)
+        .execute(&store.pool)
+        .await
+        .expect("seed scenario");
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn reconcile_uniqueness_only_applies_to_inflight_operations() {
+    async fn stage_scenario_operation_rejects_second_explicit_operation() {
         let (_tempdir, store) = test_store().await;
-        let payload = OperationPayload::Reconcile {
-            cleanup_runtime: false,
-        };
+        seed_scenario(&store, ScenarioSeed::idle("scn_test")).await;
 
-        store
-            .enqueue_operation(
-                "op_reconcile_1",
-                OperationKind::Reconcile,
-                Some("scn_test"),
-                &payload,
+        let first = store
+            .stage_scenario_operation(
+                "scn_test",
+                "op_pause",
+                OperationKind::Pause,
+                &OperationPayload::Pause,
+                ScenarioStateUpdate {
+                    desired_state: Some(DesiredState::Paused),
+                    observed_state: None,
+                },
                 1,
             )
             .await
-            .expect("enqueue first reconcile");
-
-        let err = store
-            .enqueue_operation(
-                "op_reconcile_2",
-                OperationKind::Reconcile,
-                Some("scn_test"),
-                &payload,
+            .expect("stage pause operation");
+        let second = store
+            .stage_scenario_operation(
+                "scn_test",
+                "op_resume",
+                OperationKind::Resume,
+                &OperationPayload::Resume,
+                ScenarioStateUpdate {
+                    desired_state: Some(DesiredState::Running),
+                    observed_state: Some(ObservedState::Starting),
+                },
                 2,
             )
             .await
-            .expect_err("duplicate inflight reconcile should be rejected");
-        assert!(matches!(err, StoreError::Database(_)));
+            .expect("attempt second explicit operation");
 
-        store
-            .mark_operation_failed("op_reconcile_1", "failed", 3)
-            .await
-            .expect("mark first reconcile failed");
-
-        store
-            .enqueue_operation(
-                "op_reconcile_2",
-                OperationKind::Reconcile,
-                Some("scn_test"),
-                &payload,
-                4,
-            )
-            .await
-            .expect("enqueue reconcile after inflight operation finishes");
+        assert!(first);
+        assert!(!second);
+        assert!(
+            store
+                .get_operation("op_pause")
+                .await
+                .expect("load first operation")
+                .is_some()
+        );
+        assert!(
+            store
+                .get_operation("op_resume")
+                .await
+                .expect("load second operation")
+                .is_none()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -538,20 +500,23 @@ mod tests {
         first_store.migrate().await.expect("run migrations");
         let second_store = open_test_store(&db_path, 1).await;
 
-        first_store
-            .enqueue_operation(
-                "op_claim_once",
-                OperationKind::Pause,
-                Some("scn_test"),
-                &OperationPayload::Pause,
-                1,
-            )
-            .await
-            .expect("enqueue operation");
+        seed_scenario(
+            &first_store,
+            ScenarioSeed {
+                scenario_id: "scn_claim_once",
+                desired_generation: 1,
+                applied_generation: 0,
+                processing_generation: None,
+                work_status: "idle",
+                pending_operation_id: None,
+                running_operation_id: None,
+            },
+        )
+        .await;
 
         let (first_claim, second_claim) = tokio::join!(
-            first_store.claim_next_operation(2),
-            second_store.claim_next_operation(2)
+            first_store.claim_next_scenario_work(2),
+            second_store.claim_next_scenario_work(2)
         );
         let claimed = [first_claim, second_claim]
             .into_iter()
@@ -560,5 +525,128 @@ mod tests {
             .count();
 
         assert_eq!(claimed, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multiple_reconcile_requests_coalesce_into_a_single_claim() {
+        let (_tempdir, store) = test_store().await;
+        seed_scenario(&store, ScenarioSeed::idle("scn_reconcile")).await;
+
+        assert!(
+            store
+                .schedule_reconcile("scn_reconcile", true, 1)
+                .await
+                .expect("schedule first reconcile")
+        );
+        assert!(
+            store
+                .schedule_reconcile("scn_reconcile", false, 2)
+                .await
+                .expect("schedule second reconcile")
+        );
+
+        let claimed = store
+            .claim_next_scenario_work(2)
+            .await
+            .expect("claim coalesced reconcile")
+            .expect("coalesced reconcile work");
+        assert_eq!(claimed.scenario_id, "scn_reconcile");
+        assert_eq!(claimed.generation, 2);
+        assert!(claimed.cleanup_runtime);
+        assert_eq!(claimed.operation_id, None);
+
+        store
+            .complete_scenario_work("scn_reconcile", claimed.generation, 3)
+            .await
+            .expect("complete reconcile");
+        assert!(
+            store
+                .claim_next_scenario_work(3)
+                .await
+                .expect("check for extra reconcile")
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_running_operation_rows_do_not_block_future_scheduling() {
+        let (_tempdir, store) = test_store().await;
+        insert_operation(
+            &store.pool,
+            OperationInsert {
+                operation_id: "op_stale",
+                kind: OperationKind::Pause,
+                scenario_id: Some("scn_stale"),
+                payload: &OperationPayload::Pause,
+                status: OperationStatus::Running,
+                phase: "running",
+                retry_count: 0,
+                backoff_until_ms: None,
+                last_error: None,
+                result: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                started_at_ms: Some(1),
+                finished_at_ms: None,
+            },
+        )
+        .await
+        .expect("seed stale operation");
+        seed_scenario(
+            &store,
+            ScenarioSeed {
+                scenario_id: "scn_stale",
+                desired_generation: 1,
+                applied_generation: 0,
+                processing_generation: Some(1),
+                work_status: "running",
+                pending_operation_id: None,
+                running_operation_id: Some("op_stale"),
+            },
+        )
+        .await;
+
+        store
+            .complete_scenario_work("scn_stale", 1, 2)
+            .await
+            .expect("complete stale work");
+        assert!(
+            store
+                .schedule_reconcile("scn_stale", false, 3)
+                .await
+                .expect("schedule follow-up reconcile")
+        );
+
+        let claimed = store
+            .claim_next_scenario_work(3)
+            .await
+            .expect("claim follow-up work")
+            .expect("follow-up work");
+        assert_eq!(claimed.scenario_id, "scn_stale");
+        assert_eq!(claimed.generation, 2);
+    }
+
+    struct ScenarioSeed<'a> {
+        scenario_id: &'a str,
+        desired_generation: i64,
+        applied_generation: i64,
+        processing_generation: Option<i64>,
+        work_status: &'a str,
+        pending_operation_id: Option<&'a str>,
+        running_operation_id: Option<&'a str>,
+    }
+
+    impl<'a> ScenarioSeed<'a> {
+        fn idle(scenario_id: &'a str) -> Self {
+            Self {
+                scenario_id,
+                desired_generation: 0,
+                applied_generation: 0,
+                processing_generation: None,
+                work_status: "idle",
+                pending_operation_id: None,
+                running_operation_id: None,
+            }
+        }
     }
 }

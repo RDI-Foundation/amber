@@ -1,5 +1,26 @@
 PRAGMA foreign_keys = ON;
 
+CREATE TABLE operations (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    scenario_id TEXT,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    backoff_until_ms INTEGER,
+    last_error TEXT,
+    result_json TEXT,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    started_at_ms INTEGER,
+    finished_at_ms INTEGER
+);
+
+CREATE INDEX operations_queue_idx
+    ON operations(status, backoff_until_ms, created_at_ms);
+
 CREATE TABLE scenarios (
     id TEXT PRIMARY KEY,
     owner_id TEXT NOT NULL,
@@ -17,7 +38,15 @@ CREATE TABLE scenarios (
     backoff_until_ms INTEGER,
     last_error TEXT,
     created_at_ms INTEGER NOT NULL,
-    updated_at_ms INTEGER NOT NULL
+    updated_at_ms INTEGER NOT NULL,
+    desired_generation INTEGER NOT NULL DEFAULT 0,
+    applied_generation INTEGER NOT NULL DEFAULT 0,
+    processing_generation INTEGER,
+    work_status TEXT NOT NULL DEFAULT 'idle'
+        CHECK (work_status IN ('idle', 'running')),
+    cleanup_generation INTEGER NOT NULL DEFAULT 0,
+    pending_operation_id TEXT REFERENCES operations(id),
+    running_operation_id TEXT REFERENCES operations(id)
 );
 
 CREATE TABLE scenario_secrets (
@@ -62,33 +91,11 @@ CREATE TABLE scenario_dependencies (
     PRIMARY KEY (consumer_scenario_id, slot_name)
 );
 
-CREATE TABLE operations (
-    id TEXT PRIMARY KEY,
-    owner_id TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    scenario_id TEXT,
-    payload_json TEXT NOT NULL,
-    status TEXT NOT NULL,
-    phase TEXT NOT NULL,
-    retry_count INTEGER NOT NULL DEFAULT 0,
-    backoff_until_ms INTEGER,
-    last_error TEXT,
-    result_json TEXT,
-    created_at_ms INTEGER NOT NULL,
-    updated_at_ms INTEGER NOT NULL,
-    started_at_ms INTEGER,
-    finished_at_ms INTEGER
-);
-
-CREATE INDEX operations_queue_idx
-    ON operations(status, backoff_until_ms, created_at_ms);
-
-CREATE UNIQUE INDEX operations_inflight_reconcile_scenario_idx
-    ON operations(scenario_id)
-    WHERE kind = 'reconcile' AND status IN ('queued', 'running');
-
 CREATE INDEX scenario_dependencies_provider_idx
     ON scenario_dependencies(provider_scenario_id);
 
 CREATE INDEX scenario_export_services_scenario_idx
     ON scenario_export_services(scenario_id);
+
+CREATE INDEX scenarios_pending_work_idx
+    ON scenarios(work_status, backoff_until_ms, updated_at_ms, id);

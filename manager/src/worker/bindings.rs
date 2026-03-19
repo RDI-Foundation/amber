@@ -381,16 +381,18 @@ impl OperationWorker {
             .map(|dependency| dependency.consumer_scenario_id)
             .collect::<BTreeSet<_>>()
         {
-            if let Err(err) = self
+            match self
                 .state
                 .store
-                .enqueue_reconcile_if_absent(&scenario_id, false, now)
+                .schedule_reconcile(&scenario_id, false, now)
                 .await
             {
-                warn!(
+                Ok(true) => self.state.wake_worker(),
+                Ok(false) => {}
+                Err(err) => warn!(
                     "failed to enqueue dependent reconcile for {} after provider {} changed: {}",
                     scenario_id, provider_scenario_id, err
-                );
+                ),
             }
         }
     }

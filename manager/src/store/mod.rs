@@ -3,9 +3,9 @@ mod operations;
 mod scenarios;
 
 pub use models::{
-    NewDependency, NewExportService, NewPendingScenario, NewScenarioRevision,
-    ScenarioRevisionApplication, StoreError, StoredDependency, StoredOperation, StoredRevision,
-    StoredScenario,
+    ClaimedScenarioWork, InterruptedScenarioWork, NewDependency, NewExportService,
+    NewPendingScenario, NewScenarioRevision, ScenarioRevisionApplication, ScenarioStateUpdate,
+    StoreError, StoredDependency, StoredOperation, StoredRevision, StoredScenario,
 };
 use sqlx::SqlitePool;
 

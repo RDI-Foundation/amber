@@ -3,7 +3,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::{
     compiler,
     domain::{ObservedState, ServiceProtocol},
-    store::StoredOperation,
 };
 
 #[derive(Clone, Debug)]
@@ -13,15 +12,6 @@ pub(super) struct OperationError {
     pub(super) cleanup_runtime: bool,
     pub(super) observed_state: Option<ObservedState>,
     pub(super) affects_scenario: bool,
-}
-
-pub(super) fn operation_scenario_id(operation: &StoredOperation) -> Result<&str, OperationError> {
-    operation.scenario_id.as_deref().ok_or_else(|| {
-        invalid_error(format!(
-            "{} operation is missing scenario id",
-            operation.kind.as_str()
-        ))
-    })
 }
 
 pub(super) fn parse_protocol(raw: &str) -> Result<ServiceProtocol, OperationError> {

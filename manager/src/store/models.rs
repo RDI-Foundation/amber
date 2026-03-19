@@ -36,6 +36,12 @@ pub struct NewScenarioRevision<'a> {
     pub created_at_ms: i64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScenarioStateUpdate {
+    pub desired_state: Option<DesiredState>,
+    pub observed_state: Option<ObservedState>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ScenarioRevisionApplication<'a> {
     pub scenario_id: &'a str,
@@ -102,6 +108,21 @@ pub struct StoredOperation {
     pub updated_at_ms: i64,
     pub started_at_ms: Option<i64>,
     pub finished_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClaimedScenarioWork {
+    pub scenario_id: String,
+    pub generation: i64,
+    pub cleanup_runtime: bool,
+    pub operation_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct InterruptedScenarioWork {
+    pub scenario_id: String,
+    pub generation: i64,
+    pub operation_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]

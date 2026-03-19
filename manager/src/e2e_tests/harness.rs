@@ -323,6 +323,18 @@ impl TestHarness {
         Self::decode_success(response).await
     }
 
+    pub(super) async fn delete_raw(&self, path: &str) -> (StatusCode, String) {
+        let response = self
+            .client
+            .delete(format!("{}{}", self.base_url, path))
+            .send()
+            .await
+            .expect("send raw DELETE");
+        let status = response.status();
+        let body = response.text().await.expect("read raw DELETE body");
+        (status, body)
+    }
+
     pub(super) async fn get_raw(&self, path: &str) -> (StatusCode, String) {
         let response = self
             .client

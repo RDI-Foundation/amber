@@ -8,7 +8,7 @@ use super::{
     errors::{
         OperationError, backoff_ms, classify_create_compile_error,
         classify_reconcile_compile_error, classify_upgrade_compile_error, invalid_error,
-        invalid_scenario_error, now_ms, operation_scenario_id, retryable_error,
+        invalid_scenario_error, now_ms, retryable_error,
     },
 };
 use crate::{
@@ -19,18 +19,17 @@ use crate::{
     },
     runtime::RunningScenarioSpec,
     store::{
-        NewScenarioRevision, ScenarioRevisionApplication, StoredOperation, StoredRevision,
-        StoredScenario,
+        ClaimedScenarioWork, NewScenarioRevision, ScenarioRevisionApplication, StoredOperation,
+        StoredRevision, StoredScenario,
     },
 };
 
 impl OperationWorker {
     pub(super) async fn handle_create(
         &self,
-        operation: &StoredOperation,
+        scenario_id: &str,
         request: &CreateScenarioRequest,
     ) -> Result<Option<Value>, OperationError> {
-        let scenario_id = operation_scenario_id(operation)?;
         let scenario = self.load_scenario(scenario_id).await?;
         let revision = self
             .state
@@ -89,9 +88,9 @@ impl OperationWorker {
 
     pub(super) async fn handle_pause(
         &self,
-        operation: &StoredOperation,
+        scenario_id: &str,
     ) -> Result<Option<Value>, OperationError> {
-        let scenario = self.load_operation_scenario(operation).await?;
+        let scenario = self.load_scenario(scenario_id).await?;
         self.ensure_provider_not_required(&scenario.id).await?;
         self.state
             .store
@@ -113,9 +112,9 @@ impl OperationWorker {
 
     pub(super) async fn handle_resume(
         &self,
-        operation: &StoredOperation,
+        scenario_id: &str,
     ) -> Result<Option<Value>, OperationError> {
-        let scenario = self.load_operation_scenario(operation).await?;
+        let scenario = self.load_scenario(scenario_id).await?;
         if scenario.active_revision.is_none() {
             return Err(invalid_scenario_error(format!(
                 "scenario {} has no active revision to resume",
@@ -142,10 +141,10 @@ impl OperationWorker {
 
     pub(super) async fn handle_upgrade(
         &self,
-        operation: &StoredOperation,
+        scenario_id: &str,
         request: &UpgradeScenarioRequest,
     ) -> Result<Option<Value>, OperationError> {
-        let scenario = self.load_operation_scenario(operation).await?;
+        let scenario = self.load_scenario(scenario_id).await?;
         let resolved = self.resolve_upgrade_request(&scenario, request).await?;
         let revision = self
             .state
@@ -209,10 +208,10 @@ impl OperationWorker {
 
     pub(super) async fn handle_delete(
         &self,
-        operation: &StoredOperation,
+        scenario_id: &str,
         destroy_storage: bool,
     ) -> Result<Option<Value>, OperationError> {
-        let scenario = self.load_operation_scenario(operation).await?;
+        let scenario = self.load_scenario(scenario_id).await?;
         self.ensure_provider_not_required(&scenario.id).await?;
         if let Some(revision) = scenario.active_revision {
             let compose_dir = self.state.runtime.runtime_dir(&scenario.id, revision);
@@ -247,12 +246,8 @@ impl OperationWorker {
 
     pub(super) async fn handle_reconcile(
         &self,
-        operation: &StoredOperation,
-        cleanup_runtime: bool,
+        scenario_id: &str,
     ) -> Result<Option<Value>, OperationError> {
-        let Some(scenario_id) = operation.scenario_id.as_deref() else {
-            return Err(invalid_error("reconcile operation is missing scenario id"));
-        };
         let Some(scenario) = self
             .state
             .store
@@ -267,12 +262,7 @@ impl OperationWorker {
         };
 
         match scenario.desired_state {
-            DesiredState::Running => {
-                if cleanup_runtime {
-                    self.cleanup_runtime(&scenario.id).await;
-                }
-                self.reconcile_running(&scenario.id).await
-            }
+            DesiredState::Running => self.reconcile_running(&scenario.id).await,
             DesiredState::Paused => {
                 self.apply_paused_state(&scenario.id).await?;
                 Ok(Some(json!({
@@ -539,41 +529,79 @@ impl OperationWorker {
         Ok((compiled, stored_revision))
     }
 
-    pub(super) async fn handle_operation_error(
+    pub(super) async fn handle_work_error(
         &self,
-        operation: &StoredOperation,
+        work: &ClaimedScenarioWork,
+        operation: Option<&StoredOperation>,
         err: OperationError,
     ) {
         let now = now_ms();
-        if let Some(scenario_id) = operation.scenario_id.as_deref() {
-            let next_retry = operation.retry_count.saturating_add(1);
-            if err.cleanup_runtime {
-                self.cleanup_runtime(scenario_id).await;
-            }
+        if err.cleanup_runtime {
+            self.cleanup_runtime(&work.scenario_id).await;
+        }
 
-            if err.retryable && next_retry <= self.state.config.max_restart_attempts() {
-                let backoff_until =
-                    now.saturating_add(backoff_ms(self.state.config.base_backoff_ms(), next_retry));
-                if let Some(observed_state) = err.observed_state
-                    && let Err(store_err) = self
-                        .state
-                        .store
-                        .set_scenario_retry_state(
-                            scenario_id,
-                            observed_state,
-                            next_retry,
-                            Some(backoff_until),
-                            &err.message,
-                            now,
-                        )
-                        .await
-                {
+        let current_retry = match operation {
+            Some(operation) => operation.retry_count,
+            None => match self.state.store.load_scenario(&work.scenario_id).await {
+                Ok(Some(scenario)) => scenario.failure_count,
+                Ok(None) => 0,
+                Err(store_err) => {
                     error!(
-                        "failed to set scenario retry state for {}: {}",
-                        scenario_id, store_err
+                        "failed to load scenario {} retry state after work failure: {}",
+                        work.scenario_id, store_err
                     );
+                    0
                 }
-                if let Err(store_err) = self
+            },
+        };
+        let next_retry = current_retry.saturating_add(1);
+
+        if err.retryable && next_retry <= self.state.config.max_restart_attempts() {
+            let backoff_until =
+                now.saturating_add(backoff_ms(self.state.config.base_backoff_ms(), next_retry));
+            if let Some(observed_state) = err.observed_state {
+                self.retry_store_until_ok(
+                    || async {
+                        self.state
+                            .store
+                            .set_scenario_retry_state(
+                                &work.scenario_id,
+                                observed_state,
+                                next_retry,
+                                Some(backoff_until),
+                                &err.message,
+                                now,
+                            )
+                            .await
+                    },
+                    &format!("set scenario retry state for {}", work.scenario_id),
+                )
+                .await;
+            } else {
+                self.retry_store_until_ok(
+                    || async {
+                        self.state
+                            .store
+                            .set_scenario_backoff(&work.scenario_id, next_retry, backoff_until, now)
+                            .await
+                    },
+                    &format!("set scenario backoff for {}", work.scenario_id),
+                )
+                .await;
+            }
+            self.retry_store_until_ok(
+                || async {
+                    self.state
+                        .store
+                        .release_work_for_retry(&work.scenario_id, now)
+                        .await
+                },
+                &format!("release scenario work for retry on {}", work.scenario_id),
+            )
+            .await;
+
+            if let Some(operation) = operation
+                && let Err(store_err) = self
                     .state
                     .store
                     .reschedule_operation(
@@ -585,49 +613,82 @@ impl OperationWorker {
                         now,
                     )
                     .await
-                {
-                    error!(
-                        "failed to reschedule operation {}: {}",
-                        operation.id, store_err
-                    );
-                }
-                return;
+            {
+                error!(
+                    "failed to reschedule operation {}: {}",
+                    operation.id, store_err
+                );
             }
-
-            if err.affects_scenario {
-                let observed_state = err.observed_state.unwrap_or(ObservedState::Failed);
-                let update_result = if err.retryable {
-                    self.state
-                        .store
-                        .set_scenario_retry_state(
-                            scenario_id,
-                            observed_state,
-                            next_retry,
-                            None,
-                            &err.message,
-                            now,
-                        )
-                        .await
-                } else {
-                    self.state
-                        .store
-                        .set_observed_state(scenario_id, observed_state, Some(&err.message), now)
-                        .await
-                };
-                if let Err(store_err) = update_result {
-                    error!(
-                        "failed to set final scenario state for {} after operation failure: {}",
-                        scenario_id, store_err
-                    );
-                }
-            }
+            return;
         }
 
-        if let Err(store_err) = self
-            .state
-            .store
-            .mark_operation_failed(&operation.id, &err.message, now)
-            .await
+        if err.affects_scenario {
+            let observed_state = err.observed_state.unwrap_or(ObservedState::Failed);
+            if err.retryable {
+                self.retry_store_until_ok(
+                    || async {
+                        self.state
+                            .store
+                            .set_scenario_retry_state(
+                                &work.scenario_id,
+                                observed_state,
+                                next_retry,
+                                None,
+                                &err.message,
+                                now,
+                            )
+                            .await
+                    },
+                    &format!("set final scenario retry state for {}", work.scenario_id),
+                )
+                .await;
+            } else {
+                self.retry_store_until_ok(
+                    || async {
+                        self.state
+                            .store
+                            .set_observed_state(
+                                &work.scenario_id,
+                                observed_state,
+                                Some(&err.message),
+                                now,
+                            )
+                            .await
+                    },
+                    &format!("set final scenario state for {}", work.scenario_id),
+                )
+                .await;
+            }
+        } else {
+            self.retry_store_until_ok(
+                || async {
+                    self.state
+                        .store
+                        .clear_scenario_backoff(&work.scenario_id, now)
+                        .await
+                },
+                &format!("clear scenario backoff for {}", work.scenario_id),
+            )
+            .await;
+        }
+
+        self.retry_store_until_ok(
+            || async {
+                self.state
+                    .store
+                    .complete_scenario_work(&work.scenario_id, work.generation, now)
+                    .await
+            },
+            &format!("complete failed scenario work for {}", work.scenario_id),
+        )
+        .await;
+
+        if let Some(operation) = operation
+            && let Err(store_err) = self
+                .state
+                .store
+                .mark_operation_failed(&operation.id, &err.message, now)
+                .await
         {
             error!(
                 "failed to mark operation {} failed: {}",
@@ -691,14 +752,6 @@ impl OperationWorker {
             .await
             .map_err(retryable_error)?
             .ok_or_else(|| invalid_error(format!("scenario {} does not exist", scenario_id)))
-    }
-
-    async fn load_operation_scenario(
-        &self,
-        operation: &StoredOperation,
-    ) -> Result<StoredScenario, OperationError> {
-        let scenario_id = operation_scenario_id(operation)?;
-        self.load_scenario(scenario_id).await
     }
 }
 

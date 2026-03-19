@@ -373,16 +373,13 @@ async fn consumer_binds_to_provider_export_and_blocks_provider_delete() {
         Some(provider.scenario_id.as_str())
     );
 
-    let delete: EnqueueOperationResponse = harness
-        .delete_json(&format!("/v1/scenarios/{}", provider.scenario_id))
+    let (status, body) = harness
+        .delete_raw(&format!("/v1/scenarios/{}", provider.scenario_id))
         .await;
-    let delete_op = harness.wait_for_operation(&delete.operation_id).await;
-    assert_eq!(delete_op.status, OperationStatus::Failed);
+    assert_eq!(status, StatusCode::CONFLICT, "unexpected body: {body}");
     assert!(
-        delete_op
-            .last_error
-            .as_deref()
-            .is_some_and(|message| message.contains("depend on its exports"))
+        body.contains("depend on its exports"),
+        "unexpected body: {body}"
     );
 
     let provider_detail = harness.scenario_detail(&provider.scenario_id).await;

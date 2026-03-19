@@ -55,18 +55,6 @@ impl HealthMonitor {
                 continue;
             }
 
-            match self.state.store.has_inflight_operation(&scenario.id).await {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(err) => {
-                    warn!(
-                        "health monitor failed to check inflight operation for {}: {}",
-                        scenario.id, err
-                    );
-                    continue;
-                }
-            }
-
             let compose_dir = self.state.runtime.runtime_dir(&scenario.id, revision);
             match self
                 .state
@@ -96,11 +84,11 @@ impl HealthMonitor {
                     match self
                         .state
                         .store
-                        .enqueue_reconcile_if_absent(&scenario.id, true, now)
+                        .schedule_reconcile(&scenario.id, true, now)
                         .await
                     {
-                        Ok(Some(_)) => self.state.wake_worker(),
-                        Ok(None) => {}
+                        Ok(true) => self.state.wake_worker(),
+                        Ok(false) => {}
                         Err(err) => warn!(
                             "health monitor failed to enqueue reconcile for {}: {}",
                             scenario.id, err
