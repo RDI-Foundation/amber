@@ -131,7 +131,7 @@ fn example_backend(example: &example_catalog::Example) -> ExampleBackend {
         ExampleBackend::Direct
     } else if example.name == "vm-network-storage" {
         ExampleBackend::Vm
-    } else if example.name == "interpolation" {
+    } else if matches!(example.name.as_str(), "interpolation" | "mixed-site") {
         ExampleBackend::CheckOnly
     } else {
         ExampleBackend::DockerCompose

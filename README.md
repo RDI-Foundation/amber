@@ -10,14 +10,16 @@ multi-agent prototyping.
 ## What Amber does
 
 - **Inputs:** a root component manifest (plus any referenced child manifests).
-- **Outputs:** a linked scenario plus artifacts like Scenario IR JSON, Graphviz DOT, Docker
-  Compose runtime directories, Kubernetes directories, direct/native runtime directories,
-  VM runtime directories, metadata JSON, and offline bundles.
+- **Outputs:** a linked scenario plus artifacts like Scenario IR JSON, mixed-site run plans,
+  Graphviz DOT, Docker Compose runtime directories, Kubernetes directories, direct/native runtime
+  directories, VM runtime directories, metadata JSON, and offline bundles.
 - **Behavior:** resolves manifests from local files and `http(s)://` URLs, validates structure
-  and wiring, and produces deterministic, inspectable outputs.
+  and wiring, produces deterministic, inspectable outputs, and can coordinate mixed-site runs
+  across direct/native, VM, Docker Compose, and Kubernetes sites.
 
-Amber can run direct/native and VM artifacts locally (`amber run <output-dir>`), and can also
-compile artifacts for environments like Docker Compose and Kubernetes.
+Amber can run manifests directly with `amber run <manifest>`, can start compiled mixed-site run
+plans, and can still emit raw backend artifacts when you want to inspect or operate a site
+without the Amber coordinator.
 
 ## Core concepts
 
@@ -146,6 +148,19 @@ amber compile examples/vm-network-storage/scenario.json5 --vm /tmp/amber-vm
 amber run /tmp/amber-vm
 ```
 
+### 3d) Run a mixed-site manifest directly
+
+```sh
+amber run examples/mixed-site/scenario.json5 \
+  --placement examples/mixed-site/local-placement.json5 \
+  --observability local \
+  --detach
+```
+
+This starts one scenario across a direct/native site, a Docker Compose site, and a VM site.
+Use `amber compile --run-plan` first when you want to inspect the exact site assignment and
+startup waves before launch.
+
 Depending on the scenario and backend, generated runtime outputs may reference Amber's internal
 images:
 
@@ -188,6 +203,35 @@ You can also use an existing Scenario IR as input for `amber compile` to produce
 (for example, Docker Compose, Kubernetes, direct/native runtime artifacts, or VM runtime
 artifacts). Scenario IR input is graph-only, so `--bundle` still requires a manifest or bundle
 input with manifest source bytes.
+
+### Compile to a mixed-site run plan
+
+```sh
+amber compile path/to/root.json5 --placement path/to/sites.json5 --run-plan /tmp/run-plan.json
+```
+
+Run plans are the primary lowered execution artifact for `amber run`. They capture site
+assignment, cross-site links, and startup waves without freezing machine-local launch details.
+
+### Run a manifest directly
+
+```sh
+amber run path/to/root.json5
+amber run path/to/root.json5 --placement path/to/sites.json5 --detach
+```
+
+This is the default mixed-site workflow. Amber compiles the manifest, builds the run plan,
+materializes site artifacts, and coordinates the site managers for you.
+
+### Run a compiled mixed-site plan
+
+```sh
+amber compile path/to/root.json5 --run-plan /tmp/run-plan.json
+amber run /tmp/run-plan.json --detach
+```
+
+Use this when you want an inspectable execution plan in version control, CI artifacts, or a
+debugging workflow before launch.
 
 ### Check-only (linting + diagnostics)
 
@@ -239,13 +283,15 @@ Use these commands when you want the repo docs from the binary itself:
 Top-level command guide:
 
 - `amber check <manifest-or-bundle>`: resolve manifests, run validation and linting, and print diagnostics without writing any artifacts.
-- `amber compile <input> [output flags]`: compile a manifest, bundle, or Scenario IR and emit one or more outputs such as Scenario IR, Graphviz DOT, Docker Compose runtime directories, Kubernetes manifests, direct/native artifacts, VM artifacts, metadata, or an offline bundle.
-- `amber run <output>`: start a direct/native artifact produced by `amber compile --direct` or a VM artifact produced by `amber compile --vm`. You can pass the output directory, its `direct-plan.json`, or its `vm-plan.json`.
+- `amber compile <input> [output flags]`: compile a manifest, bundle, or Scenario IR and emit one or more outputs such as Scenario IR, mixed-site run plans, Graphviz DOT, Docker Compose runtime directories, Kubernetes manifests, direct/native artifacts, VM artifacts, metadata, or an offline bundle.
+- `amber run <input>`: start a manifest, bundle, mixed-site run plan, direct/native artifact, or VM artifact. Use `--placement` when you want an explicit site layout and `--observability` when you want Amber-managed OTLP export for a mixed-site run.
 - `amber proxy <output> --export name=127.0.0.1:PORT`: expose a scenario export on localhost. Add `--slot name=127.0.0.1:PORT` to connect a scenario slot to a local upstream at the same time.
 - `amber dashboard [--detach]`: start the local Aspire dashboard that Amber examples use for observability and tracing workflows.
 
 Output-specific pointers:
 
+- Run-plan output is the main lowered execution artifact for mixed-site runs. Inspect it when you
+  want to understand placement, cross-site links, and startup ordering before launch.
 - Docker Compose output is the easiest way to get a runnable multi-container scenario quickly. The generated directory contains `compose.yaml`, `env.example`, and `README.md`.
 - Direct output is the easiest way to run local host binaries that use `program.path`.
 - VM output packages a local VM runtime for `amber run`.

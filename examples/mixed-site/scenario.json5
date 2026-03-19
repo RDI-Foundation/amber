@@ -1,0 +1,34 @@
+{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      base_image: { type: "string" },
+    },
+    required: ["base_image"],
+    additionalProperties: false,
+  },
+  components: {
+    console: {
+      manifest: "./console.json5",
+    },
+    queue: {
+      manifest: "./queue.json5",
+    },
+    vault: {
+      manifest: "./vault.json5",
+      config: {
+        base_image: "${config.base_image}",
+      },
+    },
+  },
+  bindings: [
+    { to: "#console.queue", from: "#queue.http" },
+    { to: "#queue.vault", from: "#vault.http" },
+  ],
+  exports: {
+    console_http: "#console.http",
+    queue_http: "#queue.http",
+    vault_http: "#vault.http",
+  },
+}

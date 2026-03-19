@@ -296,6 +296,235 @@ jobs:
             kind delete cluster --name "${AMBER_TEST_KIND_CLUSTER_NAME}" --kubeconfig "${AMBER_TEST_KIND_KUBECONFIG}"
           fi
 
+  mixed-site-tests:
+    name: Mixed-Site E2E Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    needs: docker-merge
+    if: ${{ always() && (github.event_name != 'pull_request' || needs.docker-merge.result == 'success') }}
+    permissions:
+      contents: read
+      packages: read
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      AMBER_VM_FORCE_TCG: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure mixed-site VM image path
+        run: |
+          set -euo pipefail
+          echo "AMBER_MIXED_RUN_BASE_IMAGE=${RUNNER_TEMP}/ubuntu-24.04-minimal-cloudimg-arm64.img" >> "$GITHUB_ENV"
+      - name: Relax AppArmor user namespace restrictions when present
+        run: |
+          set -euo pipefail
+
+          if sysctl kernel.apparmor_restrict_unprivileged_unconfined >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0
+          fi
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Ensure bubblewrap is available and usable
+        run: |
+          set -euo pipefail
+          probe_bwrap() {
+            bwrap \
+              --die-with-parent \
+              --new-session \
+              --unshare-pid \
+              --unshare-ipc \
+              --unshare-net \
+              --unshare-uts \
+              --ro-bind / / \
+              --proc /proc \
+              --dev /dev \
+              --tmpfs /tmp \
+              --tmpfs /run \
+              -- /usr/bin/true >/dev/null 2>&1
+          }
+          probe_bwrap_verbose() {
+            bwrap \
+              --die-with-parent \
+              --new-session \
+              --unshare-pid \
+              --unshare-ipc \
+              --unshare-net \
+              --unshare-uts \
+              --ro-bind / / \
+              --proc /proc \
+              --dev /dev \
+              --tmpfs /tmp \
+              --tmpfs /run \
+              -- /usr/bin/true
+          }
+
+          if ! command -v bwrap >/dev/null 2>&1 || ! probe_bwrap; then
+            sudo apt-get update
+            sudo apt-get install -y --reinstall bubblewrap
+          fi
+
+          if ! probe_bwrap; then
+            echo "bubblewrap is installed but unusable on this runner" >&2
+            bwrap --version || true
+            ls -l "$(command -v bwrap)" || true
+            sysctl kernel.apparmor_restrict_unprivileged_unconfined || true
+            sysctl kernel.apparmor_restrict_unprivileged_userns || true
+            probe_bwrap_verbose || true
+            exit 1
+          fi
+      - name: Ensure slirp4netns is available
+        run: |
+          set -euo pipefail
+
+          if ! command -v slirp4netns >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y slirp4netns
+          fi
+
+          slirp4netns --version
+      - name: Ensure mixed-site VM runtime packages are available
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm qemu-utils qemu-efi-aarch64 xorriso
+      - name: Fetch Ubuntu minimal ARM64 cloud image
+        run: |
+          set -euo pipefail
+          image_url="https://cloud-images.ubuntu.com/minimal/releases/noble/release-20240709/ubuntu-24.04-minimal-cloudimg-arm64.img"
+          if [ ! -f "$AMBER_MIXED_RUN_BASE_IMAGE" ]; then
+            curl --fail --show-error --silent --location \
+              --retry 5 \
+              --retry-all-errors \
+              --output "$AMBER_MIXED_RUN_BASE_IMAGE" \
+              "$image_url"
+          fi
+          qemu-img info "$AMBER_MIXED_RUN_BASE_IMAGE"
+      - name: Ensure KinD is available
+        run: |
+          if ! command -v kind >/dev/null 2>&1; then
+            curl -fsSL -o /tmp/kind https://kind.sigs.k8s.io/dl/v0.22.0/kind-linux-amd64
+            chmod +x /tmp/kind
+            sudo mv /tmp/kind /usr/local/bin/kind
+          fi
+      - name: Ensure kubectl is available
+        run: |
+          if ! command -v kubectl >/dev/null 2>&1; then
+            curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            chmod +x /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+          fi
+      - name: Create shared KinD cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+          cluster_name="amber-mixed-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          kubeconfig="${RUNNER_TEMP}/amber-mixed-kind-kubeconfig"
+          kind create cluster --name "$cluster_name" --kubeconfig "$kubeconfig" --wait 120s
+          echo "AMBER_TEST_KIND_CLUSTER_NAME=${cluster_name}" >> "$GITHUB_ENV"
+          echo "AMBER_TEST_KIND_KUBECONFIG=${kubeconfig}" >> "$GITHUB_ENV"
+      - name: Compute image registries
+        if: github.event_name == 'pull_request'
+        id: registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner_lc="$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          ci_registry="ghcr.io/${owner_lc}"
+          code_registry="$(jq -r '.registry' docker/images.json)"
+          if [ -z "$code_registry" ] || [ "$code_registry" = "null" ]; then
+            echo "docker/images.json registry is missing" >&2
+            exit 1
+          fi
+          code_registry="${code_registry%/}"
+          echo "CI_IMAGE_REGISTRY=${ci_registry}" >> "$GITHUB_ENV"
+          echo "CODE_IMAGE_REGISTRY=${code_registry}" >> "$GITHUB_ENV"
+      - name: Compute semver tag metadata
+        if: github.event_name == 'pull_request'
+        id: version_tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          json="$(cargo run -q -p amber-images --bin version_tags -- docker/images.json)"
+          {
+            echo "json<<EOF"
+            echo "$json"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        if: github.event_name == 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull and retag images for mixed-site tests
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version_tags_json='${{ steps.version_tags.outputs.json }}'
+          while IFS= read -r spec; do
+            [ -z "$spec" ] && continue
+            name="$(jq -r '.name' <<< "$spec")"
+            version="$(jq -r '.version' <<< "$spec")"
+            runtime_tag="$(jq -r '.runtime_tag' <<< "$spec")"
+            src="${CI_IMAGE_REGISTRY}/${name}:${GITHUB_SHA}"
+            docker pull "$src"
+            docker tag "$src" "${CODE_IMAGE_REGISTRY}/${name}:${version}"
+            if [ "$runtime_tag" != "$version" ]; then
+              docker tag "$src" "${CODE_IMAGE_REGISTRY}/${name}:${runtime_tag}"
+            fi
+            if [ "$name" = "amber-helper" ]; then
+              docker tag "$src" "amber-helper:e2e"
+            fi
+          done < <(jq -c '.images[]' <<< "$version_tags_json")
+      - name: Run mixed-site e2e tests (prebuilt images)
+        if: github.event_name == 'pull_request'
+        env:
+          AMBER_TEST_USE_PREBUILT_IMAGES: "1"
+        run: |
+          set -euo pipefail
+          run_test() {
+            cargo test -p amber-cli --test mixed_run "$1" -- --ignored --nocapture --test-threads=1
+          }
+          run_test mixed_run_cleanup_after_coordinator_dies_during_setup
+          run_test mixed_run_detached_stop_smoke
+          run_test mixed_run_direct_compose_proxy_smoke
+          run_test mixed_run_five_site_startup_state_and_teardown
+          run_test mixed_run_local_observability_manager_smoke
+          run_test mixed_run_local_observability_scenario_smoke
+          run_test mixed_run_partial_site_failure_during_launch_cleans_up
+          run_test mixed_run_recovers_direct_component_failure_after_setup
+          run_test mixed_run_recovers_vm_site_failure_after_setup
+          run_test mixed_run_recovers_when_kubernetes_site_is_temporarily_unreachable
+      - name: Run mixed-site e2e tests
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          run_test() {
+            cargo test -p amber-cli --test mixed_run "$1" -- --ignored --nocapture --test-threads=1
+          }
+          run_test mixed_run_cleanup_after_coordinator_dies_during_setup
+          run_test mixed_run_detached_stop_smoke
+          run_test mixed_run_direct_compose_proxy_smoke
+          run_test mixed_run_five_site_startup_state_and_teardown
+          run_test mixed_run_local_observability_manager_smoke
+          run_test mixed_run_local_observability_scenario_smoke
+          run_test mixed_run_partial_site_failure_during_launch_cleans_up
+          run_test mixed_run_recovers_direct_component_failure_after_setup
+          run_test mixed_run_recovers_vm_site_failure_after_setup
+          run_test mixed_run_recovers_when_kubernetes_site_is_temporarily_unreachable
+      - name: Delete shared KinD cluster
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${AMBER_TEST_KIND_CLUSTER_NAME:-}" ]; then
+            kind delete cluster --name "${AMBER_TEST_KIND_CLUSTER_NAME}" --kubeconfig "${AMBER_TEST_KIND_KUBECONFIG}"
+          fi
+
   image-matrix:
     name: Image Matrix
     runs-on: ubuntu-latest

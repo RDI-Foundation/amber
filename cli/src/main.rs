@@ -1,4 +1,5 @@
 mod docs;
+mod mixed_run;
 mod vm_runtime;
 
 #[cfg(target_os = "linux")]
@@ -34,6 +35,7 @@ use amber_compiler::{
         scenario_ir::ScenarioIrReporter,
         vm::{VM_PLAN_FILENAME, VmArtifact, VmReporter},
     },
+    run_plan::{PlacementFile, RUN_PLAN_SCHEMA, RunPlan, build_run_plan, parse_placement_file},
 };
 use amber_config::{self as config, CONFIG_ENV_PREFIX};
 use amber_manifest::ManifestRef;
@@ -83,6 +85,9 @@ Common workflows:
   amber check path/to/root.json5
       Validate manifests and print diagnostics without writing outputs.
 
+  amber compile path/to/root.json5 --run-plan /tmp/amber-run-plan.json
+      Generate the mixed-site run plan consumed by `amber run`.
+
   amber compile path/to/root.json5 --docker-compose /tmp/amber-compose
       Generate runtime artifacts. `amber compile --help` lists every output format.
 
@@ -113,6 +118,9 @@ Outputs:
   --output FILE
       Scenario IR JSON for inspection or downstream tooling.
 
+  --run-plan FILE
+      Mixed-site execution plan JSON for `amber run`.
+
   --dot FILE
       Graphviz DOT for visualizing the resolved graph.
 
@@ -136,6 +144,7 @@ Outputs:
 
 Examples:
   amber compile path/to/root.json5 --output /tmp/scenario.json
+  amber compile path/to/root.json5 --run-plan /tmp/run-plan.json
   amber compile path/to/root.json5 --docker-compose /tmp/amber-compose
   amber compile path/to/root.json5 --direct /tmp/amber-direct
   amber compile path/to/root.json5 --vm /tmp/amber-vm";
@@ -194,13 +203,18 @@ Print the manifest schema README that ships inside the CLI.
 Use this for the detailed manifest format, field semantics, and authoring examples.";
 
 const RUN_LONG_ABOUT: &str = "\
-Start a previously compiled runnable Amber output directory.
+Start a compiled Amber runtime artifact, a mixed-site run plan, or a manifest/bundle.
 
-This command understands direct/native artifacts from `amber compile --direct` and VM artifacts \
-                              from `amber compile --vm`.";
+This command understands direct/native artifacts from `amber compile --direct`, VM artifacts from \
+                              `amber compile --vm`, mixed-site run plans from `amber compile \
+                              --run-plan`, and manifest or bundle inputs that Amber can compile \
+                              into a run plan on the fly.";
 
 const RUN_AFTER_HELP: &str = "\
 Examples:
+  amber run path/to/root.json5
+  amber run path/to/root.json5 --placement local-sites.json
+  amber run /tmp/amber-run-plan.json
   amber run /tmp/amber-direct
   amber run /tmp/amber-direct/direct-plan.json
   amber run /tmp/amber-vm
@@ -298,11 +312,13 @@ enum Command {
     )]
     Docs(DocsArgs),
     #[command(
-        about = "Run a direct/native Amber artifact locally",
+        about = "Run a manifest, run plan, or Amber runtime artifact",
         long_about = RUN_LONG_ABOUT,
         after_help = RUN_AFTER_HELP
     )]
     Run(RunArgs),
+    #[command(about = "Stop a mixed-site run by run id")]
+    Stop(StopArgs),
     #[command(
         about = "Bridge scenario exports and external slots to the host",
         long_about = PROXY_LONG_ABOUT,
@@ -317,6 +333,14 @@ enum Command {
     Dashboard(DashboardArgs),
     #[command(hide = true, name = "run-direct-init")]
     RunDirectInit(RunDirectInitArgs),
+    #[command(hide = true, name = "run-vm-init")]
+    RunVmInit(RunVmInitArgs),
+    #[command(hide = true, name = "run-site-supervisor")]
+    RunSiteSupervisor(RunSiteSupervisorArgs),
+    #[command(hide = true, name = "run-detached-coordinator")]
+    RunDetachedCoordinator(RunDetachedCoordinatorArgs),
+    #[command(hide = true, name = "run-observability-sink")]
+    RunObservabilitySink(RunObservabilitySinkArgs),
     #[command(hide = true, name = "run-vm-guestfwd-bridge")]
     RunVmGuestfwdBridge(RunVmGuestfwdBridgeArgs),
 }
@@ -343,6 +367,10 @@ struct CompileArgs {
     #[arg(long = "metadata", value_name = "FILE", allow_hyphen_values = true)]
     metadata: Option<PathBuf>,
 
+    /// Write a mixed-site run plan JSON file.
+    #[arg(long = "run-plan", value_name = "FILE")]
+    run_plan: Option<PathBuf>,
+
     /// Write a manifest bundle to this directory.
     #[arg(long = "bundle", value_name = "DIR")]
     bundle: Option<PathBuf>,
@@ -362,6 +390,10 @@ struct CompileArgs {
     /// Disable compiler optimizations.
     #[arg(long = "no-opt")]
     no_opt: bool,
+
+    /// Placement file used when building the mixed-site run plan.
+    #[arg(long = "placement", value_name = "FILE")]
+    placement: Option<PathBuf>,
 
     /// Root manifest, bundle, or Scenario IR to compile (URL or local path).
     #[arg(value_name = "MANIFEST")]
@@ -416,13 +448,25 @@ struct DocsExamplesArgs {
 
 #[derive(Args)]
 struct RunArgs {
-    /// Runnable output directory, `direct-plan.json`, or `vm-plan.json` from `amber compile`.
+    /// Manifest, bundle, mixed-site run plan, or direct/vm runnable output from `amber compile`.
     #[arg(value_name = "OUTPUT")]
     output: String,
 
     /// Override where Amber stores persistent runtime state.
     #[arg(long = "storage-root", value_name = "DIR")]
     storage_root: Option<PathBuf>,
+
+    /// Placement file used when compiling a manifest or bundle into a mixed-site run plan.
+    #[arg(long = "placement", value_name = "FILE")]
+    placement: Option<PathBuf>,
+
+    /// Start a mixed-site run in detached mode.
+    #[arg(long = "detach")]
+    detach: bool,
+
+    /// Managed observability mode for mixed-site runs (`local` or an OTLP/HTTP endpoint URL).
+    #[arg(long = "observability", value_name = "local|URL")]
+    observability: Option<String>,
 }
 
 #[derive(Args)]
@@ -434,6 +478,14 @@ struct RunDirectInitArgs {
     /// Override where Amber stores persistent direct runtime state.
     #[arg(long = "storage-root", value_name = "DIR")]
     storage_root: Option<PathBuf>,
+
+    /// Persistent runtime workspace used by the mixed-site supervisor.
+    #[arg(long = "runtime-root", value_name = "DIR", hide = true)]
+    runtime_root: Option<PathBuf>,
+
+    /// Fixed router mesh port used by the mixed-site supervisor.
+    #[arg(long = "router-mesh-port", value_name = "PORT", hide = true)]
+    router_mesh_port: Option<u16>,
 }
 
 #[derive(Args)]
@@ -441,6 +493,73 @@ struct RunVmGuestfwdBridgeArgs {
     /// Loopback upstream that receives one forwarded guest connection.
     #[arg(value_name = "ADDR:PORT")]
     upstream: SocketAddr,
+}
+
+#[derive(Args)]
+struct RunVmInitArgs {
+    /// Path to a VM runtime plan JSON file.
+    #[arg(long = "plan", value_name = "FILE")]
+    plan: PathBuf,
+
+    /// Override where Amber stores persistent VM runtime state.
+    #[arg(long = "storage-root", value_name = "DIR")]
+    storage_root: Option<PathBuf>,
+
+    /// Persistent runtime workspace used by the mixed-site supervisor.
+    #[arg(long = "runtime-root", value_name = "DIR", hide = true)]
+    runtime_root: Option<PathBuf>,
+
+    /// Fixed router mesh port used by the mixed-site supervisor.
+    #[arg(long = "router-mesh-port", value_name = "PORT", hide = true)]
+    router_mesh_port: Option<u16>,
+}
+
+#[derive(Args)]
+struct RunSiteSupervisorArgs {
+    /// Path to a mixed-site supervisor plan JSON file.
+    #[arg(long = "plan", value_name = "FILE")]
+    plan: PathBuf,
+}
+
+#[derive(Args)]
+struct RunDetachedCoordinatorArgs {
+    /// Path to a mixed-site run plan JSON file.
+    #[arg(long = "plan", value_name = "FILE")]
+    plan: PathBuf,
+
+    /// Run id reserved by the foreground CLI before detaching.
+    #[arg(long = "run-id", value_name = "RUN_ID")]
+    run_id: String,
+
+    /// Override where Amber stores persistent runtime state.
+    #[arg(long = "storage-root", value_name = "DIR")]
+    storage_root: Option<PathBuf>,
+
+    /// Original user-supplied plan path when detaching from an existing run plan.
+    #[arg(long = "source-plan", value_name = "FILE")]
+    source_plan: Option<PathBuf>,
+
+    /// Managed observability mode for mixed-site runs (`local` or an OTLP/HTTP endpoint URL).
+    #[arg(long = "observability", value_name = "local|URL")]
+    observability: Option<String>,
+}
+
+#[derive(Args)]
+struct RunObservabilitySinkArgs {
+    /// Path to an observability sink plan JSON file.
+    #[arg(long = "plan", value_name = "FILE")]
+    plan: PathBuf,
+}
+
+#[derive(Args)]
+struct StopArgs {
+    /// Run id to stop.
+    #[arg(value_name = "RUN_ID")]
+    run_id: String,
+
+    /// Override where Amber stores persistent mixed-run state.
+    #[arg(long = "storage-root", value_name = "DIR")]
+    storage_root: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -525,6 +644,7 @@ struct DashboardArgs {
 enum RunTargetKind {
     Direct,
     Vm,
+    MixedRunPlan,
 }
 
 struct RunTarget {
@@ -548,15 +668,30 @@ async fn main() -> Result<()> {
                 Command::Check(args) => check(args).await,
                 Command::Docs(args) => docs(args),
                 Command::Run(args) => run(args).await,
+                Command::Stop(args) => stop(args).await,
                 Command::Dashboard(args) => dashboard(args).await,
                 Command::RunDirectInit(args) => run_direct_init(args).await,
+                Command::RunVmInit(args) => {
+                    vm_runtime::run_vm_init(
+                        args.plan,
+                        args.storage_root,
+                        args.runtime_root,
+                        args.router_mesh_port,
+                    )
+                    .await
+                }
+                Command::RunSiteSupervisor(args) => mixed_run::run_site_supervisor(args.plan).await,
+                Command::RunDetachedCoordinator(args) => run_detached_coordinator(args).await,
+                Command::RunObservabilitySink(args) => {
+                    mixed_run::run_observability_sink(args.plan).await
+                }
                 Command::RunVmGuestfwdBridge(_) => unreachable!("handled above"),
                 Command::Proxy(_) => unreachable!("handled above"),
             }
         }
     };
 
-    shutdown_tracer_provider();
+    tokio::task::block_in_place(shutdown_tracer_provider);
     result
 }
 
@@ -749,6 +884,7 @@ fn init_proxy_tracing(verbose: u8, identity: &MeshIdentityPublic) -> Result<()> 
 async fn compile(args: CompileArgs) -> Result<()> {
     ensure_outputs_requested(&args)?;
     let outputs = resolve_output_paths(&args)?;
+    let placement = load_placement_file(args.placement.as_deref())?;
 
     let mut bundle_tree = None;
     let mut bundle_store = None;
@@ -798,6 +934,13 @@ async fn compile(args: CompileArgs) -> Result<()> {
 
     if let Some(primary) = outputs.primary.as_ref() {
         write_primary_output(primary, &compiled)?;
+    }
+
+    if let Some(run_plan_path) = outputs.run_plan.as_ref() {
+        let run_plan = build_run_plan(&compiled, placement.as_ref())
+            .into_diagnostic()
+            .wrap_err("failed to build mixed-site run plan")?;
+        write_run_plan_output(run_plan_path, &run_plan)?;
     }
 
     if let Some(dot_dest) = outputs.dot {
@@ -878,66 +1021,229 @@ fn docs(args: DocsArgs) -> Result<()> {
 }
 
 async fn run(args: RunArgs) -> Result<()> {
-    let target = load_run_target(&args.output)?;
-    match target.kind {
-        RunTargetKind::Direct => {
-            run_direct_init(RunDirectInitArgs {
-                plan: target.plan,
-                storage_root: args.storage_root,
-            })
-            .await
-        }
-        RunTargetKind::Vm => vm_runtime::run_vm_init(target.plan, args.storage_root).await,
+    let placement = load_placement_file(args.placement.as_deref())?;
+    if let Some(target) = try_load_run_target(&args.output)? {
+        return match target.kind {
+            RunTargetKind::Direct => {
+                if args.detach {
+                    return Err(miette::miette!(
+                        "`amber run --detach` only supports mixed-site manifests and run plans"
+                    ));
+                }
+                run_direct_init(RunDirectInitArgs {
+                    plan: target.plan,
+                    storage_root: args.storage_root,
+                    runtime_root: None,
+                    router_mesh_port: None,
+                })
+                .await
+            }
+            RunTargetKind::Vm => {
+                if args.detach {
+                    return Err(miette::miette!(
+                        "`amber run --detach` only supports mixed-site manifests and run plans"
+                    ));
+                }
+                vm_runtime::run_vm_init(target.plan, args.storage_root, None, None).await
+            }
+            RunTargetKind::MixedRunPlan => {
+                let run_plan_raw = fs::read_to_string(&target.plan)
+                    .into_diagnostic()
+                    .wrap_err_with(|| {
+                        format!("failed to read run plan {}", target.plan.display())
+                    })?;
+                let run_plan: RunPlan = serde_json::from_str(&run_plan_raw).map_err(|err| {
+                    miette::miette!("invalid run plan {}: {err}", target.plan.display())
+                })?;
+                if args.detach {
+                    return run_detached(
+                        &run_plan,
+                        args.storage_root.as_deref(),
+                        Some(&target.plan),
+                        args.observability.as_deref(),
+                    )
+                    .await;
+                }
+                mixed_run::run_run_plan(
+                    Some(&target.plan),
+                    &run_plan,
+                    args.storage_root.as_deref(),
+                    args.observability.as_deref(),
+                )
+                .await
+                .map(|receipt| {
+                    println!("run_id={}", receipt.run_id);
+                    println!("run_root={}", receipt.run_root);
+                })
+            }
+        };
     }
+
+    let compiled = compile_for_run(&args.output).await?;
+    let run_plan = build_run_plan(&compiled, placement.as_ref())
+        .into_diagnostic()
+        .wrap_err("failed to build mixed-site run plan")?;
+    if args.detach {
+        return run_detached(
+            &run_plan,
+            args.storage_root.as_deref(),
+            None,
+            args.observability.as_deref(),
+        )
+        .await;
+    }
+    mixed_run::run_run_plan(
+        None,
+        &run_plan,
+        args.storage_root.as_deref(),
+        args.observability.as_deref(),
+    )
+    .await
+    .map(|receipt| {
+        println!("run_id={}", receipt.run_id);
+        println!("run_root={}", receipt.run_root);
+    })
 }
 
-fn load_run_target(output: &str) -> Result<RunTarget> {
+async fn run_detached(
+    run_plan: &RunPlan,
+    storage_root_override: Option<&Path>,
+    source_plan_path: Option<&Path>,
+    observability: Option<&str>,
+) -> Result<()> {
+    let storage_root = mixed_run::mixed_run_storage_root(storage_root_override)?;
+    let run_id = mixed_run::new_run_id();
+    let run_root = storage_root.join("runs").join(&run_id);
+    fs::create_dir_all(&run_root)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create detached run root {}", run_root.display()))?;
+
+    let plan_path = run_root.join("run-plan.json");
+    write_run_plan_output(&plan_path, run_plan)?;
+    let log_path = run_root.join("coordinator.log");
+    let source_plan = source_plan_path.map(|path| canonicalize_user_path(path, "source run plan"));
+    let source_plan = source_plan.transpose()?;
+    mixed_run::spawn_detached_child(&run_root, &log_path, |cmd| {
+        cmd.arg("run-detached-coordinator")
+            .arg("--plan")
+            .arg(&plan_path)
+            .arg("--run-id")
+            .arg(&run_id)
+            .arg("--storage-root")
+            .arg(&storage_root);
+        if let Some(source_plan) = source_plan.as_ref() {
+            cmd.arg("--source-plan").arg(source_plan);
+        }
+        if let Some(observability) = observability {
+            cmd.arg("--observability").arg(observability);
+        }
+    })?;
+
+    println!("run_id={run_id}");
+    println!("run_root={}", run_root.display());
+    Ok(())
+}
+
+async fn run_detached_coordinator(args: RunDetachedCoordinatorArgs) -> Result<()> {
+    let plan_path = canonicalize_user_path(&args.plan, "mixed-site run plan")?;
+    let run_plan_raw = fs::read_to_string(&plan_path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read run plan {}", plan_path.display()))?;
+    let run_plan: RunPlan = serde_json::from_str(&run_plan_raw)
+        .map_err(|err| miette::miette!("invalid run plan {}: {err}", plan_path.display()))?;
+    mixed_run::run_run_plan_with_id(
+        args.source_plan.as_deref(),
+        &run_plan,
+        args.storage_root.as_deref(),
+        args.observability.as_deref(),
+        &args.run_id,
+    )
+    .await
+    .map(|_| ())
+}
+
+fn try_load_run_target(output: &str) -> Result<Option<RunTarget>> {
     let output_path = Path::new(output);
     if !output_path.exists() {
-        return Err(miette::miette!("run target not found: {}", output));
+        return Ok(None);
     }
     let abs = canonicalize_user_path(output_path, "run target")?;
 
     if abs.is_dir() {
         let plan = abs.join(DIRECT_PLAN_FILENAME);
         if plan.is_file() {
-            return Ok(RunTarget {
+            return Ok(Some(RunTarget {
                 kind: RunTargetKind::Direct,
                 plan,
-            });
+            }));
         }
         let plan = abs.join(VM_PLAN_FILENAME);
         if plan.is_file() {
-            return Ok(RunTarget {
+            return Ok(Some(RunTarget {
                 kind: RunTargetKind::Vm,
                 plan,
-            });
+            }));
         }
-        return Err(miette::miette!(
-            "output directory {} is not a recognized runnable artifact (missing {} or {})",
-            abs.display(),
-            DIRECT_PLAN_FILENAME,
-            VM_PLAN_FILENAME
-        ));
+        let plan = abs.join("run-plan.json");
+        if plan.is_file() {
+            return Ok(Some(RunTarget {
+                kind: RunTargetKind::MixedRunPlan,
+                plan,
+            }));
+        }
+        return Ok(None);
     }
 
     if abs.file_name().and_then(|name| name.to_str()) == Some(DIRECT_PLAN_FILENAME) {
-        return Ok(RunTarget {
+        return Ok(Some(RunTarget {
             kind: RunTargetKind::Direct,
             plan: abs,
-        });
+        }));
     }
     if abs.file_name().and_then(|name| name.to_str()) == Some(VM_PLAN_FILENAME) {
-        return Ok(RunTarget {
+        return Ok(Some(RunTarget {
             kind: RunTargetKind::Vm,
             plan: abs,
-        });
+        }));
+    }
+    if is_run_plan_file(&abs)? {
+        return Ok(Some(RunTarget {
+            kind: RunTargetKind::MixedRunPlan,
+            plan: abs,
+        }));
     }
 
-    Err(miette::miette!(
-        "output path {} is not a direct or vm artifact directory or plan file",
-        abs.display()
-    ))
+    Ok(None)
+}
+
+async fn stop(_args: StopArgs) -> Result<()> {
+    mixed_run::stop_run(&_args.run_id, _args.storage_root.as_deref()).await
+}
+
+async fn compile_for_run(input: &str) -> Result<CompiledScenario> {
+    match resolve_compile_input(input).await? {
+        CompileInput::ScenarioIr(compiled) => Ok(compiled),
+        CompileInput::Manifest(resolved) => {
+            let compiler = Compiler::new(resolved.resolver, Default::default())
+                .with_registry(resolved.registry);
+            let output = compiler
+                .compile_from_tree(
+                    compiler
+                        .resolve_tree(resolved.manifest, CompileOptions::default().resolve)
+                        .await
+                        .wrap_err("compile failed")?,
+                    CompileOptions::default().optimize,
+                )
+                .wrap_err("compile failed")?;
+            let has_error = print_diagnostics(&output.diagnostics, &DenySet::default())?;
+            if has_error {
+                return Err(miette::miette!("compilation failed"));
+            }
+            CompiledScenario::from_compile_output(&output)
+                .into_diagnostic()
+                .wrap_err("failed to convert compiler output into Scenario IR")
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1035,12 +1341,30 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
         )
     })?;
 
-    let runtime_dir = tempfile::Builder::new()
-        .prefix("amber-direct-")
-        .tempdir()
-        .into_diagnostic()
-        .wrap_err("failed to create direct runtime workspace")?;
-    let runtime_root = runtime_dir.path().to_path_buf();
+    let runtime_dir = if let Some(runtime_root) = args.runtime_root.as_ref() {
+        fs::create_dir_all(runtime_root)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to create direct runtime workspace {}",
+                    runtime_root.display()
+                )
+            })?;
+        None
+    } else {
+        Some(
+            tempfile::Builder::new()
+                .prefix("amber-direct-")
+                .tempdir()
+                .into_diagnostic()
+                .wrap_err("failed to create direct runtime workspace")?,
+        )
+    };
+    let runtime_root = runtime_dir
+        .as_ref()
+        .map(|dir| dir.path().to_path_buf())
+        .or_else(|| args.runtime_root.clone())
+        .expect("runtime root should be available");
     let runtime_state_path = direct_runtime_state_path(&plan_root);
     let mut children = Vec::<ManagedChild>::new();
     let mut log_tasks = Vec::new();
@@ -1066,7 +1390,8 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                 "direct runtime requires `slirp4netns` on Linux for isolated component networking"
             )
         })?;
-        let runtime_state = assign_direct_runtime_ports(&runtime_root, &direct_plan)?;
+        let runtime_state =
+            assign_direct_runtime_ports(&runtime_root, &direct_plan, args.router_mesh_port)?;
         write_direct_runtime_state(&plan_root, &runtime_state)?;
         #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
         let mesh_network =
@@ -1437,7 +1762,7 @@ async fn cleanup_direct_runtime(
     log_tasks: Vec<tokio::task::JoinHandle<()>>,
     runtime_state_path: &Path,
     control_socket_paths: Option<&DirectControlSocketPaths>,
-    runtime_dir: tempfile::TempDir,
+    runtime_dir: Option<tempfile::TempDir>,
 ) {
     terminate_children(children).await;
     for task in log_tasks {
@@ -1476,6 +1801,7 @@ struct DirectMeshNetworkPlan {
 fn assign_direct_runtime_ports(
     runtime_root: &Path,
     direct_plan: &DirectPlan,
+    fixed_router_mesh_port: Option<u16>,
 ) -> Result<DirectRuntimeState> {
     let mut state = DirectRuntimeState::default();
     let mut reserved = BTreeSet::new();
@@ -1485,14 +1811,14 @@ fn assign_direct_runtime_ports(
     for component in &direct_plan.components {
         let path = runtime_root.join(&component.sidecar.mesh_config_path);
         let mut config = read_mesh_config_public(path.as_path())?;
-        let mesh_port = allocate_direct_runtime_port(&mut reserved)?;
+        let mesh_port = allocate_direct_runtime_port(&mut reserved, None)?;
         mesh_port_by_peer_id.insert(config.identity.id.clone(), mesh_port);
         config.mesh_listen = SocketAddr::new(config.mesh_listen.ip(), mesh_port);
 
         let mut slot_route_ports: BTreeMap<String, Vec<(u16, u16)>> = BTreeMap::new();
         for route in &mut config.outbound {
             let authored_port = route.listen_port;
-            let port = allocate_direct_runtime_port(&mut reserved)?;
+            let port = allocate_direct_runtime_port(&mut reserved, None)?;
             route.listen_port = port;
             slot_route_ports
                 .entry(route.slot.clone())
@@ -1538,7 +1864,7 @@ fn assign_direct_runtime_ports(
     let mut router_config = if let Some(router) = direct_plan.router.as_ref() {
         let path = runtime_root.join(&router.mesh_config_path);
         let mut config = read_mesh_config_public(path.as_path())?;
-        let mesh_port = allocate_direct_runtime_port(&mut reserved)?;
+        let mesh_port = allocate_direct_runtime_port(&mut reserved, fixed_router_mesh_port)?;
         mesh_port_by_peer_id.insert(config.identity.id.clone(), mesh_port);
         config.mesh_listen = SocketAddr::new(config.mesh_listen.ip(), mesh_port);
         state.router_mesh_port = Some(mesh_port);
@@ -1564,7 +1890,19 @@ fn assign_direct_runtime_ports(
     Ok(state)
 }
 
-fn allocate_direct_runtime_port(reserved: &mut BTreeSet<u16>) -> Result<u16> {
+fn allocate_direct_runtime_port(
+    reserved: &mut BTreeSet<u16>,
+    preferred: Option<u16>,
+) -> Result<u16> {
+    if let Some(preferred) = preferred {
+        if reserved.insert(preferred) {
+            return Ok(preferred);
+        }
+        return Err(miette::miette!(
+            "runtime port {} was requested twice in one direct runtime",
+            preferred
+        ));
+    }
     for _ in 0..256 {
         let port = pick_free_port()?;
         if reserved.insert(port) {
@@ -3916,6 +4254,24 @@ fn load_compiled_scenario_ir(path: &Path) -> Result<Option<CompiledScenario>> {
         .map(Some)
 }
 
+fn is_run_plan_file(path: &Path) -> Result<bool> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+
+    let bytes = fs::read(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read run plan candidate `{}`", path.display()))?;
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+    let Some(obj) = value.as_object() else {
+        return Ok(false);
+    };
+    Ok(obj.get("schema").and_then(serde_json::Value::as_str) == Some(RUN_PLAN_SCHEMA))
+}
+
 fn local_input_path(input: &str) -> Result<Option<PathBuf>> {
     if let Ok(url) = Url::parse(input) {
         if url.scheme() == "file" {
@@ -3944,6 +4300,7 @@ enum ArtifactOutput {
 
 struct OutputPaths {
     primary: Option<PathBuf>,
+    run_plan: Option<PathBuf>,
     dot: Option<ArtifactOutput>,
     docker_compose: Option<PathBuf>,
     metadata: Option<ArtifactOutput>,
@@ -3954,6 +4311,7 @@ struct OutputPaths {
 
 fn ensure_outputs_requested(args: &CompileArgs) -> Result<()> {
     if args.output.is_some()
+        || args.run_plan.is_some()
         || args.dot.is_some()
         || args.docker_compose.is_some()
         || args.metadata.is_some()
@@ -3966,14 +4324,16 @@ fn ensure_outputs_requested(args: &CompileArgs) -> Result<()> {
     }
 
     Err(miette::miette!(
-        help = "Request at least one output with `--output`, `--dot`, `--docker-compose`, \
-                `--metadata`, `--kubernetes`, `--direct`, `--vm`, or `--bundle`.",
+        help = "Request at least one output with `--output`, `--run-plan`, `--dot`, \
+                `--docker-compose`, `--metadata`, `--kubernetes`, `--direct`, `--vm`, or \
+                `--bundle`.",
         "no outputs requested for `amber compile`"
     ))
 }
 
 fn resolve_output_paths(args: &CompileArgs) -> Result<OutputPaths> {
     let primary = args.output.clone();
+    let run_plan = args.run_plan.clone();
     let dot = resolve_optional_output(&args.dot);
     let docker_compose = args.docker_compose.clone();
     let metadata = resolve_optional_output(&args.metadata);
@@ -3983,6 +4343,7 @@ fn resolve_output_paths(args: &CompileArgs) -> Result<OutputPaths> {
 
     let file_outputs = [
         ("primary output", primary.as_deref()),
+        ("run plan output", run_plan.as_deref()),
         ("dot output", artifact_file_path(dot.as_ref())),
         ("metadata output", artifact_file_path(metadata.as_ref())),
     ];
@@ -4047,6 +4408,7 @@ fn resolve_output_paths(args: &CompileArgs) -> Result<OutputPaths> {
 
     Ok(OutputPaths {
         primary,
+        run_plan,
         dot,
         docker_compose,
         metadata,
@@ -4107,6 +4469,27 @@ fn write_primary_output(path: &Path, compiled: &CompiledScenario) -> Result<()> 
         .map_err(miette::Report::new)?;
     write_artifact(path, ir.as_bytes())
         .wrap_err_with(|| format!("failed to write primary output `{}`", path.display()))
+}
+
+fn write_run_plan_output(path: &Path, run_plan: &RunPlan) -> Result<()> {
+    let json = serde_json::to_vec_pretty(run_plan)
+        .map_err(|err| miette::miette!("failed to serialize run plan: {err}"))?;
+    write_artifact(path, &json)
+        .wrap_err_with(|| format!("failed to write run plan output `{}`", path.display()))
+}
+
+fn load_placement_file(path: Option<&Path>) -> Result<Option<PlacementFile>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let path = canonicalize_user_path(path, "placement file")?;
+    let contents = fs::read_to_string(&path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read placement file `{}`", path.display()))?;
+    parse_placement_file(&contents)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("invalid placement file `{}`", path.display()))
+        .map(Some)
 }
 
 fn write_artifact(path: &Path, contents: &[u8]) -> Result<()> {
@@ -4569,8 +4952,8 @@ mod tests {
             router: None,
         };
 
-        let runtime_state =
-            assign_direct_runtime_ports(temp.path(), &direct_plan).expect("ports should assign");
+        let runtime_state = assign_direct_runtime_ports(temp.path(), &direct_plan, None)
+            .expect("ports should assign");
         let rewritten =
             read_mesh_config_public(&mesh_config_path).expect("mesh config should be rewritten");
         let runtime_ports = runtime_state
@@ -4731,7 +5114,7 @@ mod tests {
             Vec::new(),
             &runtime_state_path,
             Some(&control_socket_paths),
-            runtime_dir,
+            Some(runtime_dir),
         )
         .await;
 

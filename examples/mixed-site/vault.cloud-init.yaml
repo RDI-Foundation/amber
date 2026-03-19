@@ -1,0 +1,38 @@
+#cloud-config
+write_files:
+  - path: /usr/local/bin/mixed-site-vault.py
+    permissions: '0755'
+    content: |
+      from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+      class Handler(BaseHTTPRequestHandler):
+          def do_GET(self) -> None:
+              if self.path == "/id":
+                  body = b"vm-vault"
+                  self.send_response(200)
+                  self.send_header("content-type", "text/plain; charset=utf-8")
+                  self.send_header("content-length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+                  return
+              self.send_error(404)
+
+          def log_message(self, fmt: str, *args: object) -> None:
+              print(f"[vault] {fmt % args}", flush=True)
+
+      ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+  - path: /etc/systemd/system/mixed-site-vault.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Amber mixed-site example vault
+
+      [Service]
+      ExecStart=/usr/bin/python3 /usr/local/bin/mixed-site-vault.py
+      Restart=always
+
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, mixed-site-vault.service]

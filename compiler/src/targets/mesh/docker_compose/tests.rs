@@ -632,6 +632,10 @@ fn compose_emits_otelcol_agent_and_wires_router_otel_env() {
         "{yaml}"
     );
     assert!(
+        otelcol.networks.contains_key(super::BOUNDARY_NETWORK_NAME),
+        "{yaml}"
+    );
+    assert!(
         otelcol
             .extra_hosts
             .iter()
@@ -704,6 +708,17 @@ fn compose_emits_otelcol_agent_and_wires_router_otel_env() {
     ));
 
     let sidecar = service(&compose, "c0-component-net");
+    assert!(
+        compose
+            .networks
+            .get(super::MESH_NETWORK_NAME)
+            .is_some_and(|network| network.internal),
+        "{yaml}"
+    );
+    assert!(
+        !sidecar.networks.contains_key(super::BOUNDARY_NETWORK_NAME),
+        "{yaml}"
+    );
     assert_eq!(
         env_value(sidecar, "OTEL_TRACES_SAMPLER").as_deref(),
         Some("always_on"),
@@ -1629,6 +1644,16 @@ fn compose_routes_external_slots_through_router() {
     assert!(
         router_service.ports.is_empty(),
         "slot-only scenarios should not publish the router mesh port on the host"
+    );
+    assert!(
+        router_service
+            .networks
+            .contains_key(super::MESH_NETWORK_NAME)
+    );
+    assert!(
+        router_service
+            .networks
+            .contains_key(super::BOUNDARY_NETWORK_NAME)
     );
     assert!(
         router_service

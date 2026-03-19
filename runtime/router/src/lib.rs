@@ -628,6 +628,8 @@ struct MeshExternalTarget {
     peer_addr: String,
     peer_id: String,
     peer_key: [u8; 32],
+    route_id: Option<String>,
+    capability: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1145,8 +1147,14 @@ async fn maybe_proxy_mesh_external(
     let outbound =
         connect_noise_with_key(&mesh.peer_addr, &mesh.peer_id, mesh.peer_key, config).await?;
     let open = OpenFrame {
-        route_id: component_route_id(&mesh.peer_id, capability, protocol),
-        capability: capability.to_string(),
+        route_id: mesh
+            .route_id
+            .clone()
+            .unwrap_or_else(|| component_route_id(&mesh.peer_id, capability, protocol)),
+        capability: mesh
+            .capability
+            .clone()
+            .unwrap_or_else(|| capability.to_string()),
         protocol,
         slot: None,
         capability_kind: None,
@@ -1719,16 +1727,33 @@ fn resolve_inbound_route<'a>(
     remote_id: &str,
     dynamic_issuers: &HashMap<String, HashSet<String>>,
 ) -> Result<&'a InboundRoute, RouterError> {
-    let route = inbound_routes
-        .get(&open.route_id)
-        .ok_or_else(|| RouterError::Auth("unknown route".to_string()))?;
+    let route = inbound_routes.get(&open.route_id).ok_or_else(|| {
+        RouterError::Auth(format!(
+            "unknown route {} for peer {} capability {} protocol {}",
+            open.route_id,
+            remote_id,
+            open.capability,
+            protocol_string(open.protocol)
+        ))
+    })?;
 
     if open.capability != route.capability || open.protocol != route.protocol {
-        return Err(RouterError::Auth("open frame mismatch".to_string()));
+        return Err(RouterError::Auth(format!(
+            "open frame mismatch for route {} from peer {}: capability {} vs {}, protocol {} vs {}",
+            open.route_id,
+            remote_id,
+            open.capability,
+            route.capability,
+            protocol_string(open.protocol),
+            protocol_string(route.protocol)
+        )));
     }
 
     if !route_allowed(route, remote_id, dynamic_issuers.get(&route.route_id)) {
-        return Err(RouterError::Auth("peer not allowed".to_string()));
+        return Err(RouterError::Auth(format!(
+            "peer {} not allowed for route {}",
+            remote_id, open.route_id
+        )));
     }
 
     Ok(route)
@@ -4895,8 +4920,14 @@ async fn connect_mesh_http_upstream(
     let mut outbound =
         connect_noise_with_key(&mesh.peer_addr, &mesh.peer_id, mesh.peer_key, config).await?;
     let open = OpenFrame {
-        route_id: component_route_id(&mesh.peer_id, capability, MeshProtocol::Http),
-        capability: capability.to_string(),
+        route_id: mesh
+            .route_id
+            .clone()
+            .unwrap_or_else(|| component_route_id(&mesh.peer_id, capability, MeshProtocol::Http)),
+        capability: mesh
+            .capability
+            .clone()
+            .unwrap_or_else(|| capability.to_string()),
         protocol: MeshProtocol::Http,
         slot: None,
         capability_kind: None,
@@ -5249,10 +5280,14 @@ fn parse_mesh_external(value: &str) -> Result<MeshExternalTarget, RouterError> {
 
     let mut peer_id = None;
     let mut peer_key = None;
+    let mut route_id = None;
+    let mut capability = None;
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
             "peer_id" => peer_id = Some(value.to_string()),
             "peer_key" => peer_key = Some(value.to_string()),
+            "route_id" => route_id = Some(value.to_string()),
+            "capability" => capability = Some(value.to_string()),
             _ => {}
         }
     }
@@ -5266,6 +5301,8 @@ fn parse_mesh_external(value: &str) -> Result<MeshExternalTarget, RouterError> {
         peer_addr: format!("{host}:{port}"),
         peer_id,
         peer_key,
+        route_id,
+        capability,
     })
 }
 
@@ -5886,7 +5923,9 @@ mod tests {
             _ => panic!("peer-a should resolve to local route"),
         }
         match denied {
-            RouterError::Auth(message) => assert_eq!(message, "peer not allowed"),
+            RouterError::Auth(message) => {
+                assert_eq!(message, "peer peer-b not allowed for route route-a")
+            }
             other => panic!("unexpected error: {other}"),
         }
     }
@@ -5924,7 +5963,9 @@ mod tests {
         let denied = resolve_inbound_route(&inbound_routes, &spoofed, "peer-a", &HashMap::new())
             .expect_err("peer-a should not be able to use peer-b route id");
         match denied {
-            RouterError::Auth(message) => assert_eq!(message, "peer not allowed"),
+            RouterError::Auth(message) => {
+                assert_eq!(message, "peer peer-a not allowed for route route-b")
+            }
             other => panic!("unexpected error: {other}"),
         }
     }
@@ -5980,7 +6021,9 @@ mod tests {
             "dynamic issuers must only authorize mesh-forward exports"
         );
         match denied {
-            RouterError::Auth(message) => assert_eq!(message, "peer not allowed"),
+            RouterError::Auth(message) => {
+                assert_eq!(message, "peer consumer not allowed for route export-route")
+            }
             other => panic!("unexpected error: {other}"),
         }
     }
@@ -6344,6 +6387,42 @@ mod tests {
         assert_eq!(target_url, mesh_url);
         assert_eq!(mesh.peer_addr, "host.docker.internal:61662");
         assert_eq!(mesh.peer_id, "/proxy");
+        assert_eq!(mesh.route_id, None);
+        assert_eq!(mesh.capability, None);
+    }
+
+    #[test]
+    fn resolve_http_external_target_with_override_preserves_explicit_mesh_route() {
+        let peer_key = base64::engine::general_purpose::STANDARD.encode([251u8; 32]);
+        let mut mesh_url = Url::parse("mesh://127.0.0.1:61662").expect("mesh url should parse");
+        mesh_url
+            .query_pairs_mut()
+            .append_pair("peer_id", "/site/provider/router")
+            .append_pair("peer_key", &peer_key)
+            .append_pair("route_id", "router:export:public:http")
+            .append_pair("capability", "public");
+        let mesh_url = mesh_url.to_string();
+        let target = ExternalTarget {
+            name: "public".to_string(),
+            url_env: "PUBLIC_URL".to_string(),
+            optional: false,
+            url_override: None,
+        };
+
+        let resolved = resolve_http_external_target_with_override(
+            &target,
+            Some(mesh_url.as_str()),
+            &Uri::from_static("/"),
+        )
+        .expect("mesh target should resolve");
+
+        let ResolvedHttpExternalTarget::Mesh { mesh, .. } = resolved else {
+            panic!("expected mesh target");
+        };
+        assert_eq!(mesh.peer_addr, "127.0.0.1:61662");
+        assert_eq!(mesh.peer_id, "/site/provider/router");
+        assert_eq!(mesh.route_id.as_deref(), Some("router:export:public:http"));
+        assert_eq!(mesh.capability.as_deref(), Some("public"));
     }
 
     #[tokio::test]

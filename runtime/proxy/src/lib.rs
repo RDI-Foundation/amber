@@ -388,10 +388,17 @@ struct ProxyTarget {
 }
 
 #[derive(Clone, Debug)]
-enum ControlEndpoint {
+pub enum ControlEndpoint {
     Tcp(String),
     Unix(PathBuf),
     VolumeSocket { volume: String, socket_path: String },
+}
+
+#[derive(Clone, Debug)]
+pub struct RouterDiscovery {
+    pub control_endpoint: ControlEndpoint,
+    pub router_identity: MeshIdentityPublic,
+    pub router_addr: Option<SocketAddr>,
 }
 
 #[derive(Clone, Debug)]
@@ -453,6 +460,101 @@ impl fmt::Display for ControlEndpoint {
                 volume,
                 socket_path,
             } => write!(f, "volume://{volume}{socket_path}"),
+        }
+    }
+}
+
+pub async fn discover_router_for_output(
+    output: impl Into<PathBuf>,
+    project_name: Option<&str>,
+    requires_router_mesh: bool,
+) -> Result<RouterDiscovery> {
+    let output = output.into();
+    let target = load_proxy_target(&output)?;
+    let control_endpoint = resolve_control_endpoint(None, project_name, &target)?;
+    let router_identity = resolve_router_identity(None, &control_endpoint).await?;
+    let router_addr =
+        resolve_router_mesh_addr(None, project_name, &target, requires_router_mesh).await?;
+    Ok(RouterDiscovery {
+        control_endpoint,
+        router_identity,
+        router_addr,
+    })
+}
+
+pub async fn fetch_router_identity(endpoint: &ControlEndpoint) -> Result<MeshIdentityPublic> {
+    resolve_router_identity(None, endpoint).await
+}
+
+pub async fn register_external_slot_with_retry(
+    endpoint: &ControlEndpoint,
+    slot: &str,
+    url: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match try_send_control_update(endpoint, slot, url).await {
+            Ok(()) => return Ok(()),
+            Err(ControlUpdateError::Retryable) if Instant::now() < deadline => {
+                sleep(CONTROL_UPDATE_RETRY_INTERVAL).await;
+            }
+            Err(ControlUpdateError::Retryable) => {
+                return Err(miette::miette!(
+                    "timed out after {}s waiting to register slot {} via router control ({})",
+                    timeout.as_secs(),
+                    slot,
+                    endpoint
+                ));
+            }
+            Err(ControlUpdateError::Fatal(err)) => {
+                return Err(miette::miette!(
+                    "failed to register slot {} via router control ({}): {}",
+                    slot,
+                    endpoint,
+                    err
+                ));
+            }
+        }
+    }
+}
+
+pub async fn register_export_peer_with_retry(
+    endpoint: &ControlEndpoint,
+    export: &str,
+    peer_id: &str,
+    peer_key_b64: &str,
+    protocol: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let payload = ControlExportPayload {
+        peer_id: peer_id.to_string(),
+        peer_key: peer_key_b64.to_string(),
+        protocol: protocol.to_string(),
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match try_send_export_update(endpoint, export, &payload).await {
+            Ok(()) => return Ok(()),
+            Err(ControlUpdateError::Retryable) if Instant::now() < deadline => {
+                sleep(CONTROL_UPDATE_RETRY_INTERVAL).await;
+            }
+            Err(ControlUpdateError::Retryable) => {
+                return Err(miette::miette!(
+                    "timed out after {}s waiting to register export {} via router control ({})",
+                    timeout.as_secs(),
+                    export,
+                    endpoint
+                ));
+            }
+            Err(ControlUpdateError::Fatal(err)) => {
+                return Err(miette::miette!(
+                    "failed to register export {} via router control ({}): {}",
+                    export,
+                    endpoint,
+                    err
+                ));
+            }
         }
     }
 }
@@ -968,18 +1070,16 @@ fn resolve_control_endpoint(
         && let Some(volume) = router.control_socket_volume.as_ref()
     {
         let resolved_volume = expand_env_templates(volume, compose_project.as_deref())?;
-        let raw_socket_path = router
-            .control_socket
-            .as_deref()
-            .unwrap_or("/amber/control/router-control.sock");
-        let socket_path = Path::new(raw_socket_path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| format!("/{name}"))
-            .unwrap_or_else(|| raw_socket_path.to_string());
+        let resolved_socket_path = expand_env_templates(
+            router
+                .control_socket
+                .as_deref()
+                .unwrap_or("/amber/control/router-control.sock"),
+            compose_project.as_deref(),
+        )?;
         return Ok(ControlEndpoint::VolumeSocket {
             volume: resolved_volume,
-            socket_path,
+            socket_path: resolved_socket_path,
         });
     }
     if let Some(socket) = router.control_socket.as_ref() {
@@ -1411,15 +1511,7 @@ async fn send_control_request_via_volume(
             "invalid router control socket path (must be absolute): {socket_path}"
         )));
     }
-    let socket_file = Path::new(socket_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            ControlUpdateError::Fatal(format!(
-                "invalid router control socket path (missing filename): {socket_path}"
-            ))
-        })?;
-    let mounted_socket_path = format!("{CONTROL_SOCKET_MOUNT_DIR}/{socket_file}");
+    let mounted_socket_path = format!("{CONTROL_SOCKET_MOUNT_DIR}{socket_path}");
     send_control_request_via_mount(
         &format!("{volume}:{CONTROL_SOCKET_MOUNT_DIR}"),
         &mounted_socket_path,
@@ -1967,6 +2059,39 @@ exit 1
             "direct control alias should stay well below unix socket path limits: {}",
             path.display()
         );
+    }
+
+    #[test]
+    fn resolve_control_endpoint_preserves_nested_compose_volume_socket_path() {
+        let target = ProxyTarget {
+            kind: ProxyTargetKind::DockerCompose,
+            metadata: ProxyMetadata {
+                version: PROXY_METADATA_VERSION.to_string(),
+                router: Some(amber_compiler::mesh::RouterMetadata {
+                    mesh_port: 24000,
+                    control_port: 24100,
+                    control_socket: Some("/site/compose_local/router-control.sock".to_string()),
+                    control_socket_volume: Some(
+                        "${COMPOSE_PROJECT_NAME:-default}_amber-router-control".to_string(),
+                    ),
+                }),
+                ..Default::default()
+            },
+            source: PathBuf::from("/tmp/out/compose.yaml"),
+        };
+
+        let endpoint = resolve_control_endpoint(None, Some("mixed-stack"), &target)
+            .expect("endpoint should resolve");
+
+        let ControlEndpoint::VolumeSocket {
+            volume,
+            socket_path,
+        } = endpoint
+        else {
+            panic!("expected compose volume socket endpoint");
+        };
+        assert_eq!(volume, "mixed-stack_amber-router-control");
+        assert_eq!(socket_path, "/site/compose_local/router-control.sock");
     }
 
     #[test]

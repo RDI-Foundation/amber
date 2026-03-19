@@ -148,7 +148,12 @@ struct QemuImgInfo {
     format: String,
 }
 
-pub(crate) async fn run_vm_init(plan: PathBuf, storage_root: Option<PathBuf>) -> Result<()> {
+pub(crate) async fn run_vm_init(
+    plan: PathBuf,
+    storage_root: Option<PathBuf>,
+    runtime_root: Option<PathBuf>,
+    router_mesh_port: Option<u16>,
+) -> Result<()> {
     let plan_path = canonicalize_path(&plan, "vm plan")?;
     let plan_root = plan_path
         .parent()
@@ -179,12 +184,30 @@ pub(crate) async fn run_vm_init(plan: PathBuf, storage_root: Option<PathBuf>) ->
         ));
     }
 
-    let runtime_dir = tempfile::Builder::new()
-        .prefix("amber-vm-")
-        .tempdir()
-        .into_diagnostic()
-        .wrap_err("failed to create vm runtime workspace")?;
-    let runtime_root = runtime_dir.path().to_path_buf();
+    let runtime_dir = if let Some(runtime_root) = runtime_root.as_ref() {
+        fs::create_dir_all(runtime_root)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to create vm runtime workspace {}",
+                    runtime_root.display()
+                )
+            })?;
+        None
+    } else {
+        Some(
+            tempfile::Builder::new()
+                .prefix("amber-vm-")
+                .tempdir()
+                .into_diagnostic()
+                .wrap_err("failed to create vm runtime workspace")?,
+        )
+    };
+    let runtime_root = runtime_dir
+        .as_ref()
+        .map(|dir| dir.path().to_path_buf())
+        .or(runtime_root)
+        .expect("runtime root should be available");
     let runtime_state_path = vm_runtime_state_path(&plan_root);
     let mut children = Vec::<ManagedChild>::new();
     let mut log_tasks = Vec::new();
@@ -196,7 +219,7 @@ pub(crate) async fn run_vm_init(plan: PathBuf, storage_root: Option<PathBuf>) ->
             let _ = fs::remove_file(&runtime_state_path);
         }
 
-        let port_assignments = assign_vm_runtime_ports(&runtime_root, &vm_plan)?;
+        let port_assignments = assign_vm_runtime_ports(&runtime_root, &vm_plan, router_mesh_port)?;
         write_vm_runtime_state(&plan_root, &port_assignments.state)?;
 
         let router_binary = resolve_host_binary("amber-router")?;
@@ -416,7 +439,11 @@ fn hashed_temp_socket_path(namespace: &str, kind: &str, path: &Path) -> PathBuf 
         .join(format!("{kind}-{suffix:016x}.sock"))
 }
 
-fn assign_vm_runtime_ports(runtime_root: &Path, vm_plan: &VmPlan) -> Result<VmPortAssignments> {
+fn assign_vm_runtime_ports(
+    runtime_root: &Path,
+    vm_plan: &VmPlan,
+    fixed_router_mesh_port: Option<u16>,
+) -> Result<VmPortAssignments> {
     let mut state = VmRuntimeState::default();
     let mut reserved = BTreeSet::new();
     let mut mesh_port_by_peer_id = HashMap::<String, u16>::new();
@@ -426,14 +453,14 @@ fn assign_vm_runtime_ports(runtime_root: &Path, vm_plan: &VmPlan) -> Result<VmPo
     for component in &vm_plan.components {
         let path = runtime_root.join(&component.mesh_config_path);
         let mut config = read_mesh_config_public(&path)?;
-        let mesh_port = allocate_runtime_port(&mut reserved)?;
+        let mesh_port = allocate_runtime_port(&mut reserved, None)?;
         mesh_port_by_peer_id.insert(config.identity.id.clone(), mesh_port);
         config.mesh_listen = SocketAddr::new(config.mesh_listen.ip(), mesh_port);
 
         let mut route_guest_host_pairs = BTreeMap::<String, Vec<(u16, u16)>>::new();
         for route in &mut config.outbound {
             let guest_port = route.listen_port;
-            let host_port = allocate_runtime_port(&mut reserved)?;
+            let host_port = allocate_runtime_port(&mut reserved, None)?;
             route.listen_port = host_port;
             route_guest_host_pairs
                 .entry(route.slot.clone())
@@ -475,7 +502,7 @@ fn assign_vm_runtime_ports(runtime_root: &Path, vm_plan: &VmPlan) -> Result<VmPo
                 let host_port = if let Some(existing) = endpoint_forwards.get(&guest_port) {
                     *existing
                 } else {
-                    let host_port = allocate_runtime_port(&mut reserved)?;
+                    let host_port = allocate_runtime_port(&mut reserved, None)?;
                     endpoint_forwards.insert(guest_port, host_port);
                     host_port
                 };
@@ -507,7 +534,7 @@ fn assign_vm_runtime_ports(runtime_root: &Path, vm_plan: &VmPlan) -> Result<VmPo
     let mut router_config = if let Some(router) = vm_plan.router.as_ref() {
         let path = runtime_root.join(&router.mesh_config_path);
         let mut config = read_mesh_config_public(&path)?;
-        let mesh_port = allocate_runtime_port(&mut reserved)?;
+        let mesh_port = allocate_runtime_port(&mut reserved, fixed_router_mesh_port)?;
         mesh_port_by_peer_id.insert(config.identity.id.clone(), mesh_port);
         config.mesh_listen = SocketAddr::new(config.mesh_listen.ip(), mesh_port);
         state.router_mesh_port = Some(mesh_port);
@@ -536,7 +563,16 @@ fn assign_vm_runtime_ports(runtime_root: &Path, vm_plan: &VmPlan) -> Result<VmPo
     })
 }
 
-fn allocate_runtime_port(reserved: &mut BTreeSet<u16>) -> Result<u16> {
+fn allocate_runtime_port(reserved: &mut BTreeSet<u16>, preferred: Option<u16>) -> Result<u16> {
+    if let Some(preferred) = preferred {
+        if reserved.insert(preferred) {
+            return Ok(preferred);
+        }
+        return Err(miette::miette!(
+            "runtime port {} was requested twice in one vm runtime",
+            preferred
+        ));
+    }
     for _ in 0..256 {
         let port = pick_free_port()?;
         if reserved.insert(port) {
@@ -929,7 +965,7 @@ async fn cleanup_vm_runtime(
     log_tasks: Vec<tokio::task::JoinHandle<()>>,
     runtime_state_path: &Path,
     control_socket_paths: Option<&VmControlSocketPaths>,
-    runtime_dir: tempfile::TempDir,
+    runtime_dir: Option<tempfile::TempDir>,
 ) {
     terminate_children(children).await;
     for task in log_tasks {
@@ -1216,7 +1252,32 @@ fn build_vm_launch_plan(
         component_config,
     )?;
     let netdev_arg = build_qemu_user_netdev_arg(host.amber_cli, component, port_assignments)?;
-    let qmp_socket = vm_root.join("qmp.sock");
+    let qmp_socket = hashed_temp_socket_path(
+        "amber-vm-qmp",
+        &format!("component-{}", component.id),
+        &vm_root,
+    );
+    let qmp_socket_dir = qmp_socket
+        .parent()
+        .ok_or_else(|| miette::miette!("invalid vm qmp socket path {}", qmp_socket.display()))?;
+    fs::create_dir_all(qmp_socket_dir)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to create vm qmp socket directory {}",
+                qmp_socket_dir.display()
+            )
+        })?;
+    if qmp_socket.exists() {
+        fs::remove_file(&qmp_socket)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to remove stale vm qmp socket {}",
+                    qmp_socket.display()
+                )
+            })?;
+    }
     let serial_log = vm_root.join("serial.log");
     let mut command = vec![
         host.qemu_system.display().to_string(),
@@ -2874,7 +2935,7 @@ mod tests {
             router: None,
         };
 
-        let assignments = assign_vm_runtime_ports(temp.path(), &vm_plan).expect("ports");
+        let assignments = assign_vm_runtime_ports(temp.path(), &vm_plan, None).expect("ports");
         let runtime_ports = assignments
             .state
             .slot_route_ports_by_component
