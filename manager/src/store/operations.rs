@@ -156,53 +156,100 @@ impl Store {
         &self,
         now_ms: i64,
     ) -> Result<Option<StoredOperation>, StoreError> {
-        let mut tx = self.pool.begin().await.map_err(StoreError::Database)?;
-        let row = sqlx::query_as::<_, OperationRow>(
-            r#"
-            SELECT id, kind, scenario_id, payload_json, status, phase, retry_count,
-                   backoff_until_ms, last_error, result_json, created_at_ms, updated_at_ms,
-                   started_at_ms, finished_at_ms
-            FROM operations
-            WHERE status = 'queued'
-              AND (backoff_until_ms IS NULL OR backoff_until_ms <= ?)
-            ORDER BY created_at_ms, id
-            LIMIT 1
-            "#,
-        )
-        .bind(now_ms)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(StoreError::Database)?;
+        loop {
+            let mut tx = match self.pool.begin().await {
+                Ok(tx) => tx,
+                Err(err) if is_sqlite_lock_error(&err) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+                Err(err) => return Err(StoreError::Database(err)),
+            };
+            let row = sqlx::query_as::<_, OperationRow>(
+                r#"
+                SELECT id, kind, scenario_id, payload_json, status, phase, retry_count,
+                       backoff_until_ms, last_error, result_json, created_at_ms, updated_at_ms,
+                       started_at_ms, finished_at_ms
+                FROM operations
+                WHERE status = 'queued'
+                  AND (backoff_until_ms IS NULL OR backoff_until_ms <= ?)
+                ORDER BY created_at_ms, id
+                LIMIT 1
+                "#,
+            )
+            .bind(now_ms)
+            .fetch_optional(&mut *tx)
+            .await;
 
-        let Some(row) = row else {
-            tx.commit().await.map_err(StoreError::Database)?;
-            return Ok(None);
-        };
+            let row = match row {
+                Ok(row) => row,
+                Err(err) if is_sqlite_lock_error(&err) => {
+                    drop(tx);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+                Err(err) => return Err(StoreError::Database(err)),
+            };
 
-        sqlx::query(
-            r#"
-            UPDATE operations
-            SET status = 'running',
-                phase = 'running',
-                updated_at_ms = ?,
-                started_at_ms = COALESCE(started_at_ms, ?)
-            WHERE id = ?
-            "#,
-        )
-        .bind(now_ms)
-        .bind(now_ms)
-        .bind(&row.id)
-        .execute(&mut *tx)
-        .await
-        .map_err(StoreError::Database)?;
-        tx.commit().await.map_err(StoreError::Database)?;
+            let Some(row) = row else {
+                match tx.commit().await {
+                    Ok(()) => {}
+                    Err(err) if is_sqlite_lock_error(&err) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    Err(err) => return Err(StoreError::Database(err)),
+                }
+                return Ok(None);
+            };
 
-        let mut stored: StoredOperation = row.try_into()?;
-        stored.status = OperationStatus::Running;
-        stored.phase = "running".to_string();
-        stored.started_at_ms = Some(now_ms);
-        stored.updated_at_ms = now_ms;
-        Ok(Some(stored))
+            let claim = sqlx::query(
+                r#"
+                UPDATE operations
+                SET status = 'running',
+                    phase = 'running',
+                    updated_at_ms = ?,
+                    started_at_ms = COALESCE(started_at_ms, ?)
+                WHERE id = ?
+                  AND status = 'queued'
+                "#,
+            )
+            .bind(now_ms)
+            .bind(now_ms)
+            .bind(&row.id)
+            .execute(&mut *tx)
+            .await;
+
+            let claim = match claim {
+                Ok(claim) => claim,
+                Err(err) if is_sqlite_lock_error(&err) => {
+                    drop(tx);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+                Err(err) => return Err(StoreError::Database(err)),
+            };
+
+            match tx.commit().await {
+                Ok(()) => {}
+                Err(err) if is_sqlite_lock_error(&err) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                }
+                Err(err) => return Err(StoreError::Database(err)),
+            }
+
+            if claim.rows_affected() == 0 {
+                continue;
+            }
+
+            let mut stored: StoredOperation = row.try_into()?;
+            stored.status = OperationStatus::Running;
+            stored.phase = "running".to_string();
+            stored.started_at_ms = Some(now_ms);
+            stored.updated_at_ms = now_ms;
+            return Ok(Some(stored));
+        }
     }
 
     pub async fn list_running_operations(&self) -> Result<Vec<StoredOperation>, StoreError> {
@@ -362,7 +409,9 @@ impl Store {
         .bind(IMPLICIT_OWNER_ID)
         .bind(OperationKind::Reconcile.as_str())
         .bind(scenario_id)
-        .bind(encode_json(&OperationPayload::Reconcile { cleanup_runtime })?)
+        .bind(encode_json(&OperationPayload::Reconcile {
+            cleanup_runtime,
+        })?)
         .bind(OperationStatus::Queued.as_str())
         .bind("queued")
         .bind(now_ms)
@@ -373,23 +422,46 @@ impl Store {
     }
 }
 
+fn is_sqlite_lock_error(err: &sqlx::Error) -> bool {
+    match err {
+        sqlx::Error::Database(err) => err.message().contains("locked"),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use sqlx::sqlite::SqlitePoolOptions;
+    use std::{path::Path, time::Duration};
+
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use tempfile::TempDir;
 
     use super::*;
 
+    async fn open_test_store(db_path: &Path, max_connections: u32) -> Store {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(db_path)
+            .expect("create sqlite db");
+        let connect_options = SqliteConnectOptions::new()
+            .filename(db_path)
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(max_connections)
+            .connect_with(connect_options)
+            .await
+            .expect("connect sqlite");
+        Store::new(pool)
+    }
+
     async fn test_store() -> (TempDir, Store) {
         let tempdir = TempDir::new().expect("tempdir");
         let db_path = tempdir.path().join("operations-test.db");
-        std::fs::File::create(&db_path).expect("create sqlite db");
-        let pool = SqlitePoolOptions::new()
-            .max_connections(2)
-            .connect(&format!("sqlite://{}", db_path.display()))
-            .await
-            .expect("connect sqlite");
-        let store = Store::new(pool);
+        let store = open_test_store(&db_path, 2).await;
         store.migrate().await.expect("run migrations");
         (tempdir, store)
     }
@@ -456,5 +528,37 @@ mod tests {
             )
             .await
             .expect("enqueue reconcile after inflight operation finishes");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_claims_across_store_instances_only_claim_once() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let db_path = tempdir.path().join("operations-test.db");
+        let first_store = open_test_store(&db_path, 1).await;
+        first_store.migrate().await.expect("run migrations");
+        let second_store = open_test_store(&db_path, 1).await;
+
+        first_store
+            .enqueue_operation(
+                "op_claim_once",
+                OperationKind::Pause,
+                Some("scn_test"),
+                &OperationPayload::Pause,
+                1,
+            )
+            .await
+            .expect("enqueue operation");
+
+        let (first_claim, second_claim) = tokio::join!(
+            first_store.claim_next_operation(2),
+            second_store.claim_next_operation(2)
+        );
+        let claimed = [first_claim, second_claim]
+            .into_iter()
+            .map(|result| result.expect("claim should succeed"))
+            .filter(Option::is_some)
+            .count();
+
+        assert_eq!(claimed, 1);
     }
 }

@@ -3,6 +3,7 @@ mod compiler;
 mod config;
 mod domain;
 mod ids;
+mod instance_lock;
 mod runtime;
 mod store;
 mod worker;
@@ -27,6 +28,7 @@ pub async fn run(config: ManagerConfig) -> Result<(), config::ConfigError> {
     tokio::fs::create_dir_all(config.data_dir())
         .await
         .map_err(config::ConfigError::Io)?;
+    let _instance_lock = instance_lock::InstanceLock::acquire(config.data_dir())?;
 
     let pool = SqlitePoolOptions::new()
         .max_connections(1)

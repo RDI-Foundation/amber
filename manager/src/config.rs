@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     net::SocketAddr,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use clap::Parser;
@@ -61,6 +62,7 @@ impl ManagerConfig {
             .filename(self.data_dir.join("manager.sqlite"))
             .create_if_missing(true)
             .foreign_keys(true)
+            .busy_timeout(Duration::from_secs(5))
     }
 
     pub async fn load_file_config(&self) -> Result<ManagerFileConfig, ConfigError> {
@@ -108,4 +110,7 @@ pub enum ConfigError {
 
     #[error("database error: {0}")]
     Database(sqlx::Error),
+
+    #[error(transparent)]
+    InstanceLock(#[from] crate::instance_lock::InstanceLockError),
 }
