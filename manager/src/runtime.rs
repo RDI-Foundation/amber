@@ -233,25 +233,7 @@ impl RuntimeSupervisor {
                 }
 
                 let services = docker_compose_ps(compose_dir, compose_project).await?;
-                if services.is_empty() {
-                    return Ok(ScenarioHealth::Failed(
-                        "docker compose reports no services".to_string(),
-                    ));
-                }
-
-                for service in services {
-                    if is_expected_exited_service(&service) {
-                        continue;
-                    }
-                    if !service.state.starts_with("running") {
-                        return Ok(ScenarioHealth::Failed(format!(
-                            "service {} is {}",
-                            service.service_name(),
-                            service.state
-                        )));
-                    }
-                }
-                Ok(ScenarioHealth::Healthy)
+                Ok(classify_compose_services(&services))
             }
             #[cfg(test)]
             RuntimeBackend::Fake { state } => {
@@ -275,6 +257,7 @@ impl RuntimeSupervisor {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScenarioHealth {
     Healthy,
+    Transitioning(String),
     Failed(String),
 }
 
@@ -396,6 +379,44 @@ fn compose_file_exists(compose_dir: &Path) -> bool {
 fn is_expected_exited_service(service: &ComposePsEntry) -> bool {
     let name = service.service_name();
     EXPECTED_EXITED_SERVICES.contains(&name)
+}
+
+fn classify_compose_services(services: &[ComposePsEntry]) -> ScenarioHealth {
+    if services.is_empty() {
+        return ScenarioHealth::Transitioning("docker compose reports no services".to_string());
+    }
+
+    for service in services {
+        if is_expected_exited_service(service) {
+            continue;
+        }
+
+        let state = service.state.to_ascii_lowercase();
+        if state.starts_with("running") {
+            continue;
+        }
+        if is_transitional_service_state(&state) {
+            return ScenarioHealth::Transitioning(format!(
+                "service {} is {}",
+                service.service_name(),
+                service.state
+            ));
+        }
+        return ScenarioHealth::Failed(format!(
+            "service {} is {}",
+            service.service_name(),
+            service.state
+        ));
+    }
+
+    ScenarioHealth::Healthy
+}
+
+fn is_transitional_service_state(state: &str) -> bool {
+    state.starts_with("created")
+        || state.starts_with("starting")
+        || state.starts_with("restarting")
+        || state.starts_with("removing")
 }
 
 async fn run_docker_compose_up(
@@ -528,6 +549,68 @@ fn parse_compose_ps_entries(stdout: &str) -> Result<Vec<ComposePsEntry>, serde_j
     serde_json::Deserializer::from_str(stdout)
         .into_iter::<ComposePsEntry>()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ComposePsEntry, ScenarioHealth, classify_compose_services, parse_compose_ps_entries,
+    };
+
+    fn service(name: &str, state: &str) -> ComposePsEntry {
+        ComposePsEntry {
+            name: format!("project-{name}-1"),
+            service: name.to_string(),
+            state: state.to_string(),
+        }
+    }
+
+    #[test]
+    fn compose_health_treats_empty_project_as_transitioning() {
+        assert_eq!(
+            classify_compose_services(&[]),
+            ScenarioHealth::Transitioning("docker compose reports no services".to_string())
+        );
+    }
+
+    #[test]
+    fn compose_health_treats_created_service_as_transitioning() {
+        assert_eq!(
+            classify_compose_services(&[service("amber-otelcol", "created")]),
+            ScenarioHealth::Transitioning("service amber-otelcol is created".to_string())
+        );
+    }
+
+    #[test]
+    fn compose_health_treats_running_services_as_healthy() {
+        assert_eq!(
+            classify_compose_services(&[
+                service("controller", "running"),
+                service("amber-init", "exited (0)"),
+            ]),
+            ScenarioHealth::Healthy
+        );
+    }
+
+    #[test]
+    fn compose_health_treats_exited_primary_service_as_failed() {
+        assert_eq!(
+            classify_compose_services(&[service("controller", "exited (1)")]),
+            ScenarioHealth::Failed("service controller is exited (1)".to_string())
+        );
+    }
+
+    #[test]
+    fn compose_ps_parser_handles_newline_delimited_json() {
+        let stdout = concat!(
+            "{\"Service\":\"controller\",\"State\":\"running\"}\n",
+            "{\"Service\":\"amber-otelcol\",\"State\":\"created\"}\n"
+        );
+        let entries = parse_compose_ps_entries(stdout).expect("parse newline-delimited compose ps");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].service, "controller");
+        assert_eq!(entries[1].state, "created");
+    }
 }
 
 #[cfg(test)]

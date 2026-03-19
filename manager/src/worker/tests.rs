@@ -47,6 +47,7 @@ fn topological_order_places_provider_before_consumer() {
             failure_count: 0,
             backoff_until_ms: None,
             last_error: None,
+            updated_at_ms: 0,
         },
         StoredScenario {
             id: "provider".to_string(),
@@ -63,6 +64,7 @@ fn topological_order_places_provider_before_consumer() {
             failure_count: 0,
             backoff_until_ms: None,
             last_error: None,
+            updated_at_ms: 0,
         },
     ];
     let dependencies = vec![StoredDependency {

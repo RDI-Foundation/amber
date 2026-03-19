@@ -16,7 +16,7 @@ impl Store {
             r#"
             SELECT id, source_url, active_revision, compose_project, desired_state, observed_state,
                    metadata_json, root_config_json, telemetry_json, external_slots_json, exports_json,
-                   failure_count, backoff_until_ms, last_error
+                   failure_count, backoff_until_ms, last_error, updated_at_ms
             FROM scenarios
             ORDER BY created_at_ms, id
             "#,
@@ -37,7 +37,7 @@ impl Store {
             r#"
             SELECT id, source_url, active_revision, compose_project, desired_state, observed_state,
                    metadata_json, root_config_json, telemetry_json, external_slots_json, exports_json,
-                   failure_count, backoff_until_ms, last_error
+                   failure_count, backoff_until_ms, last_error, updated_at_ms
             FROM scenarios
             WHERE id = ?
             "#,

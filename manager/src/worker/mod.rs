@@ -35,6 +35,7 @@ use crate::{
 
 pub(super) const IDLE_WAIT: Duration = Duration::from_millis(250);
 pub(super) const HEALTH_MONITOR_INTERVAL: Duration = Duration::from_millis(250);
+pub(super) const STARTUP_HEALTH_GRACE: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 pub struct AppState {

@@ -75,6 +75,7 @@ pub struct StoredScenario {
     pub failure_count: u32,
     pub backoff_until_ms: Option<i64>,
     pub last_error: Option<String>,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -194,6 +195,7 @@ pub(super) struct ScenarioRow {
     failure_count: i64,
     backoff_until_ms: Option<i64>,
     last_error: Option<String>,
+    updated_at_ms: i64,
 }
 
 #[derive(Debug, FromRow)]
@@ -260,6 +262,7 @@ impl TryFrom<ScenarioRow> for StoredScenario {
             failure_count: u32::try_from(row.failure_count).unwrap_or_default(),
             backoff_until_ms: row.backoff_until_ms,
             last_error: row.last_error,
+            updated_at_ms: row.updated_at_ms,
         })
     }
 }

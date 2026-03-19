@@ -46,12 +46,16 @@ struct FailurePayload {
     error: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct WaitReleasePayload {
+    name: String,
+}
+
 #[derive(Default)]
 struct CheckpointGate {
     payload: Mutex<Option<CheckpointPayload>>,
     arrived: Notify,
     released: Mutex<bool>,
-    released_notify: Notify,
 }
 
 #[derive(Default)]
@@ -73,7 +77,6 @@ impl OrchestratorState {
     async fn release(&self, name: &str) {
         let gate = self.checkpoint(name).await;
         *gate.released.lock().await = true;
-        gate.released_notify.notify_waiters();
     }
 
     async fn failure(&self) -> Option<String> {
@@ -97,6 +100,7 @@ impl OrchestratorServer {
         let app = Router::new()
             .route("/healthz", get(orchestrator_healthz))
             .route("/checkpoint", post(orchestrator_checkpoint))
+            .route("/release-status", post(orchestrator_release_status))
             .route("/failure", post(orchestrator_failure))
             .with_state(state.clone());
         let task = tokio::spawn(async move {
@@ -178,12 +182,15 @@ async fn orchestrator_checkpoint(
     let gate = state.checkpoint(&payload.name).await;
     *gate.payload.lock().await = Some(payload);
     gate.arrived.notify_waiters();
-    loop {
-        if *gate.released.lock().await {
-            return Json(json!({ "ok": true }));
-        }
-        gate.released_notify.notified().await;
-    }
+    Json(json!({ "ok": true }))
+}
+
+async fn orchestrator_release_status(
+    State(state): State<Arc<OrchestratorState>>,
+    Json(payload): Json<WaitReleasePayload>,
+) -> Json<Value> {
+    let gate = state.checkpoint(&payload.name).await;
+    Json(json!({ "released": *gate.released.lock().await }))
 }
 
 async fn orchestrator_failure(
@@ -777,7 +784,7 @@ PROVIDER_V1 = "provider-v1"
 PROVIDER_V2 = "provider-v2"
 
 
-def json_request(base_url, method, path, body=None):
+def json_request(base_url, method, path, body=None, timeout=30):
     url = base_url + path
     headers = {}
     data = None
@@ -788,7 +795,7 @@ def json_request(base_url, method, path, body=None):
         data = b""
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read()
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -804,8 +811,8 @@ def manager_request(method, path, body=None):
     return json_request(MANAGER_URL, method, path, body)
 
 
-def orchestrator_request(method, path, body=None):
-    return json_request(ORCHESTRATOR_URL, method, path, body)
+def orchestrator_request(method, path, body=None, timeout=240):
+    return json_request(ORCHESTRATOR_URL, method, path, body, timeout=timeout)
 
 
 def wait_for_json_ready(name, request_fn, path, field):
@@ -847,6 +854,13 @@ def report_checkpoint(name, **extra):
     payload = {"name": name}
     payload.update(extra)
     orchestrator_request("POST", "/checkpoint", payload)
+    deadline = time.time() + 240
+    while time.time() < deadline:
+        status = orchestrator_request("POST", "/release-status", {"name": name})
+        if status["released"] is True:
+            return
+        time.sleep(0.2)
+    raise RuntimeError(f"timed out waiting for orchestrator release {name}")
 
 
 def report_failure(error):
