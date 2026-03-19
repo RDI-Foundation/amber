@@ -488,3 +488,5 @@ jobs:
           cargo test -p amber-compiler --all-features docker_smoke_external_slot_routes_to_outside_service -- --ignored --test-threads=1
       - name: Run helper docker smoke test
         run: cargo test -p amber-helper --all-features helper_image_executes_run_plan_in_scratch -- --ignored --test-threads=1
+      - name: Run manager docker smoke test
+        run: AMBER_TEST_USE_PREBUILT_IMAGES=1 cargo test -p amber-manager --test amber_scenario_manager_live -- --ignored --nocapture

@@ -34,6 +34,7 @@ COPY compiler/Cargo.toml compiler/
 COPY runtime/docker-gateway/Cargo.toml runtime/docker-gateway/
 COPY runtime/helper/Cargo.toml runtime/helper/
 COPY images/Cargo.toml images/
+COPY manager/Cargo.toml manager/
 COPY compiler/json5/Cargo.toml compiler/json5/
 COPY compiler/manifest/Cargo.toml compiler/manifest/
 COPY runtime/mesh/Cargo.toml runtime/mesh/
@@ -47,8 +48,8 @@ COPY runtime/provisioner/Cargo.toml runtime/provisioner/
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    mkdir -p cli/src compiler/config/src compiler/src runtime/docker-gateway/src runtime/helper/src images/src compiler/json5/src compiler/manifest/src runtime/mesh/src runtime/proxy/src runtime/router/src compiler/resolver/src compiler/scenario/src compiler/template/src node/src runtime/provisioner/src && \
-    touch cli/src/main.rs compiler/config/src/lib.rs compiler/src/lib.rs runtime/docker-gateway/src/main.rs runtime/helper/src/main.rs images/src/lib.rs compiler/json5/src/lib.rs compiler/manifest/src/lib.rs runtime/mesh/src/lib.rs runtime/proxy/src/lib.rs runtime/router/src/main.rs compiler/resolver/src/lib.rs compiler/scenario/src/lib.rs compiler/template/src/lib.rs node/src/main.rs runtime/provisioner/src/main.rs && \
+    mkdir -p cli/src compiler/config/src compiler/src runtime/docker-gateway/src runtime/helper/src images/src manager/src compiler/json5/src compiler/manifest/src runtime/mesh/src runtime/proxy/src runtime/router/src compiler/resolver/src compiler/scenario/src compiler/template/src node/src runtime/provisioner/src && \
+    touch cli/src/main.rs compiler/config/src/lib.rs compiler/src/lib.rs runtime/docker-gateway/src/main.rs runtime/helper/src/main.rs images/src/lib.rs manager/src/lib.rs manager/src/main.rs compiler/json5/src/lib.rs compiler/manifest/src/lib.rs runtime/mesh/src/lib.rs runtime/proxy/src/lib.rs runtime/router/src/main.rs compiler/resolver/src/lib.rs compiler/scenario/src/lib.rs compiler/template/src/lib.rs node/src/main.rs runtime/provisioner/src/main.rs && \
     cargo fetch --locked
 
 COPY compiler/config ./compiler/config

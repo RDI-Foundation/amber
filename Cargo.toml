@@ -9,6 +9,7 @@ members = [
   "compiler/scenario",
   "compiler/template",
   "images",
+  "manager",
   "node",
   "runtime/docker-gateway",
   "runtime/helper",
