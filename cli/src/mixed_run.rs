@@ -1059,6 +1059,15 @@ fn external_slot_env_for_site(
     Ok(env)
 }
 
+fn external_slot_name_from_env_var(env_var: &str) -> String {
+    let slot = env_var
+        .strip_prefix("AMBER_EXTERNAL_SLOT_")
+        .unwrap_or(env_var);
+    slot.strip_suffix("_URL")
+        .unwrap_or(slot)
+        .to_ascii_lowercase()
+}
+
 fn launch_env(
     run_id: &str,
     mesh_scope: &str,
@@ -1681,12 +1690,7 @@ async fn apply_desired_links(plan: &SiteSupervisorPlan, endpoint: &ControlEndpoi
         "desired links",
     )?;
     for (env_var, url) in &desired.external_slots {
-        let slot = env_var
-            .strip_prefix("AMBER_EXTERNAL_SLOT_")
-            .unwrap_or(env_var.as_str())
-            .strip_suffix("_URL")
-            .unwrap_or(env_var.as_str())
-            .to_ascii_lowercase();
+        let slot = external_slot_name_from_env_var(env_var);
         register_external_slot_with_retry(endpoint, &slot, url, Duration::from_secs(2)).await?;
     }
     for peer in &desired.export_peers {
@@ -2761,6 +2765,8 @@ fn send_manager_observability(endpoint: &str, path: &str, body: &[u8]) -> Result
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     #[test]
@@ -2813,5 +2819,36 @@ mod tests {
             container_host_from_resolved_ip(SiteKind::Kubernetes, None),
             CONTAINER_HOST_ALIAS
         );
+    }
+
+    #[test]
+    fn external_slot_name_from_env_var_restores_slot_name() {
+        assert_eq!(
+            external_slot_name_from_env_var("AMBER_EXTERNAL_SLOT_API_URL"),
+            "api"
+        );
+    }
+
+    #[test]
+    fn external_slot_env_for_site_skips_missing_weak_provider() {
+        let env = external_slot_env_for_site(
+            "consumer_site",
+            SiteKind::Direct,
+            &[RunLink {
+                provider_site: "provider_site".to_string(),
+                consumer_site: "consumer_site".to_string(),
+                provider_component: "/provider".to_string(),
+                provide: "api".to_string(),
+                consumer_component: "/consumer".to_string(),
+                slot: "upstream".to_string(),
+                weak: true,
+                protocol: NetworkProtocol::Http,
+                export_name: "amber_export_provider_api_http".to_string(),
+                external_slot_name: "amber_link_consumer_provider_api_http".to_string(),
+            }],
+            &BTreeMap::new(),
+        )
+        .expect("weak links should not require a launched provider");
+        assert!(env.is_empty());
     }
 }

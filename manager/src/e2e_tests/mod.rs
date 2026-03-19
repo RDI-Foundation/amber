@@ -699,6 +699,19 @@ async fn health_monitor_restarts_unhealthy_provider_without_rewiring_consumer() 
         })
         .await;
 
+    harness
+        .wait_until(
+            "provider and consumer return to running after restart",
+            Duration::from_secs(10),
+            || async {
+                let provider_detail = harness.scenario_detail(&provider.scenario_id).await;
+                let consumer_detail = harness.scenario_detail(&consumer.scenario_id).await;
+                provider_detail.observed_state == ObservedState::Running
+                    && consumer_detail.observed_state == ObservedState::Running
+            },
+        )
+        .await;
+
     let consumer_spec = harness
         .runtime
         .last_spec(&consumer.scenario_id)

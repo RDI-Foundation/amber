@@ -951,7 +951,11 @@ fn rewrite_mesh_scope(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs, path::Path};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs,
+        path::Path,
+    };
 
     use amber_manifest::ManifestRef;
     use amber_resolver::Resolver;
@@ -1369,6 +1373,110 @@ mod tests {
             ]
         );
         assert_eq!(plan.links.len(), 6);
+    }
+
+    #[test]
+    fn startup_waves_reject_cyclic_cross_site_dependencies() {
+        let err = topo_waves(&BTreeMap::from([
+            (
+                "compose_b".to_string(),
+                BTreeSet::from(["direct_a".to_string()]),
+            ),
+            (
+                "direct_a".to_string(),
+                BTreeSet::from(["compose_b".to_string()]),
+            ),
+        ]))
+        .expect_err("cyclic site dependencies should fail planning");
+        assert!(matches!(
+            err,
+            RunPlanError::CyclicSiteDependencies { ref sites }
+                if sites == &vec!["compose_b".to_string(), "direct_a".to_string()]
+        ));
+    }
+
+    #[tokio::test]
+    async fn build_run_plan_preserves_repeated_cross_site_consumers() {
+        let dir = tmp_dir("run-plan-repeated-cross-site-consumers-");
+        let provider = dir.path().join("provider.json5");
+        let a = dir.path().join("a.json5");
+        let b = dir.path().join("b.json5");
+        let root = dir.path().join("root.json5");
+
+        write(&provider, image_server_manifest());
+        for consumer in [&a, &b] {
+            write(
+                consumer,
+                r#"{
+  manifest_version: "0.3.0",
+  slots: { upstream: { kind: "http" } },
+  program: {
+    path: "/usr/bin/env",
+    args: ["sh", "-c", "sleep 30"],
+    env: { UPSTREAM_URL: "${slots.upstream.url}" },
+    network: { endpoints: [{ name: "http", port: 8080, protocol: "http" }] }
+  },
+  provides: { api: { kind: "http", endpoint: "http" } },
+  exports: { api: "api" }
+}"#,
+            );
+        }
+        write(
+            &root,
+            r##"{
+  manifest_version: "0.3.0",
+  components: {
+    provider: "./provider.json5",
+    a: "./a.json5",
+    b: "./b.json5"
+  },
+  bindings: [
+    { from: "#provider.api", to: "#a.upstream" },
+    { from: "#provider.api", to: "#b.upstream" }
+  ],
+  exports: {
+    provider_api: "#provider.api",
+    a_api: "#a.api",
+    b_api: "#b.api"
+  }
+}"##,
+        );
+
+        let compiled = compile(&root).await;
+        let scenario = compiled.scenario();
+        let endpoint_plan = build_endpoint_plan(scenario).expect("endpoint plan should build");
+        let mesh_plan = build_mesh_plan(
+            scenario,
+            &endpoint_plan,
+            MeshOptions {
+                backend_label: "test",
+            },
+        )
+        .expect("mesh plan should build");
+        let assignments = scenario
+            .components_iter()
+            .filter_map(
+                |(component_id, component)| match component.moniker.as_str() {
+                    "/provider" => Some((component_id, "compose_provider".to_string())),
+                    "/a" | "/b" => Some((component_id, "direct_consumers".to_string())),
+                    _ => None,
+                },
+            )
+            .collect::<BTreeMap<_, _>>();
+
+        let links = build_cross_site_links(scenario, &mesh_plan, &assignments);
+        let consumer_links = links
+            .iter()
+            .filter(|link| link.consumer_site == "direct_consumers")
+            .collect::<Vec<_>>();
+        assert_eq!(consumer_links.len(), 2);
+        assert_eq!(
+            consumer_links
+                .iter()
+                .map(|link| link.consumer_component.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/a", "/b"]
+        );
     }
 
     #[tokio::test]
