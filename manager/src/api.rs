@@ -307,7 +307,7 @@ async fn pause_scenario(
     Path(scenario_id): Path<String>,
 ) -> Result<Json<EnqueueOperationResponse>, ApiError> {
     ensure_scenario_exists(&state, &scenario_id).await?;
-    ensure_scenario_has_no_running_dependents(&state, &scenario_id).await?;
+    ensure_scenario_has_no_active_dependents(&state, &scenario_id).await?;
     enqueue_scenario_operation(
         &state,
         &scenario_id,
@@ -379,7 +379,7 @@ async fn delete_scenario(
     Query(query): Query<DeleteScenarioQuery>,
 ) -> Result<Json<EnqueueOperationResponse>, ApiError> {
     ensure_scenario_exists(&state, &scenario_id).await?;
-    ensure_scenario_has_no_running_dependents(&state, &scenario_id).await?;
+    ensure_scenario_has_no_active_dependents(&state, &scenario_id).await?;
     let operation_id = ids::new_operation_id();
     let staged = state
         .store()
@@ -480,20 +480,20 @@ async fn load_scenario(
     )))
 }
 
-async fn ensure_scenario_has_no_running_dependents(
+async fn ensure_scenario_has_no_active_dependents(
     state: &Arc<AppState>,
     scenario_id: &str,
 ) -> Result<(), ApiError> {
     let blockers = state
         .store()
-        .list_running_dependency_blockers(scenario_id)
+        .list_dependency_blockers(scenario_id)
         .await
         .map_err(ApiError::internal)?;
     if blockers.is_empty() {
         return Ok(());
     }
     Err(ApiError::conflict(format!(
-        "scenario {} cannot be modified because running scenarios depend on its exports: {}",
+        "scenario {} cannot be modified because active scenarios depend on its exports: {}",
         scenario_id,
         blockers.join(", ")
     )))

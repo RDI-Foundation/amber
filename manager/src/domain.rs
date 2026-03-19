@@ -32,6 +32,8 @@ pub enum ObservedState {
 }
 
 impl ObservedState {
+    pub const DEPENDENCY_BLOCKING_STATES: [&'static str; 3] = ["starting", "running", "degraded"];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Starting => "starting",
@@ -40,6 +42,10 @@ impl ObservedState {
             Self::Paused => "paused",
             Self::Failed => "failed",
         }
+    }
+
+    pub fn blocks_dependency_changes(self) -> bool {
+        matches!(self, Self::Starting | Self::Running | Self::Degraded)
     }
 }
 

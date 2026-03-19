@@ -25,6 +25,7 @@ use crate::{
         OperationKind, OperationPayload, OperationStatus, ScenarioTelemetryRequest,
         ServiceProtocol, UpgradeScenarioRequest,
     },
+    ids,
     runtime::RuntimeSupervisor,
     store::{NewPendingScenario, ScenarioStateUpdate, Store, StoredDependency, StoredScenario},
 };
@@ -379,6 +380,131 @@ async fn startup_recovery_does_not_replay_interrupted_upgrade() {
     assert_eq!(revisions.len(), 1);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_upgrade_with_stable_export_topology_does_not_enqueue_consumer_reconcile() {
+    let (tempdir, state, worker) = setup_worker_test_context().await;
+
+    let provider_manifest_url = write_manifest(
+        tempdir.path(),
+        "provider.json5",
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "provider",
+            entrypoint: ["provider"],
+            network: { endpoints: [{ name: "api", port: 80 }] },
+          },
+          provides: { api: { kind: "http", endpoint: "api" } },
+          exports: { api: "api" },
+        }
+        "#,
+    );
+    let consumer_manifest_url = write_manifest(
+        tempdir.path(),
+        "consumer.json5",
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "consumer",
+            entrypoint: ["consumer"],
+            network: { endpoints: [{ name: "api", port: 80 }] },
+          },
+          slots: { upstream: { kind: "http" } },
+          provides: { api: { kind: "http", endpoint: "api" } },
+          exports: { api: "api" },
+        }
+        "#,
+    );
+
+    create_running_scenario(
+        state.store(),
+        &worker,
+        "scn_provider",
+        "op_create_provider",
+        "amber_scn_provider",
+        CreateScenarioRequest {
+            source_url: provider_manifest_url.clone(),
+            root_config: json!({ "value": "v1" }),
+            external_slots: BTreeMap::new(),
+            exports: BTreeMap::new(),
+            metadata: json!({}),
+            telemetry: ScenarioTelemetryRequest::default(),
+            store_bundle: false,
+            start: true,
+        },
+        1,
+    )
+    .await;
+    create_running_scenario(
+        state.store(),
+        &worker,
+        "scn_consumer",
+        "op_create_consumer",
+        "amber_scn_consumer",
+        CreateScenarioRequest {
+            source_url: consumer_manifest_url,
+            root_config: json!({}),
+            external_slots: BTreeMap::from([(
+                "upstream".to_string(),
+                crate::domain::ExternalSlotBindingRequest {
+                    bindable_service_id: ids::export_service_id("scn_provider", "api"),
+                },
+            )]),
+            exports: BTreeMap::new(),
+            metadata: json!({}),
+            telemetry: ScenarioTelemetryRequest::default(),
+            store_bundle: false,
+            start: true,
+        },
+        2,
+    )
+    .await;
+
+    let staged = state
+        .store()
+        .stage_scenario_operation(
+            "scn_provider",
+            "op_upgrade_provider",
+            OperationKind::Upgrade,
+            &OperationPayload::Upgrade {
+                request: UpgradeScenarioRequest {
+                    source_url: None,
+                    root_config: Some(json!({ "value": "v2" })),
+                    external_slots: Some(BTreeMap::new()),
+                    exports: Some(BTreeMap::new()),
+                    metadata: Some(json!({ "generation": 2 })),
+                    telemetry: Some(ScenarioTelemetryRequest::default()),
+                    store_bundle: false,
+                },
+            },
+            ScenarioStateUpdate::default(),
+            3,
+        )
+        .await
+        .expect("stage provider upgrade");
+    assert!(staged);
+
+    let upgrade_operation = state
+        .store()
+        .claim_next_scenario_work(3)
+        .await
+        .expect("claim upgrade work")
+        .expect("provider upgrade work");
+    worker.process_claimed_work(upgrade_operation).await;
+
+    let pending = state
+        .store()
+        .claim_next_scenario_work(4)
+        .await
+        .expect("claim follow-up work");
+    assert!(
+        pending.is_none(),
+        "provider upgrade with unchanged export topology should not schedule consumer reconcile"
+    );
+}
+
 fn write_manifest(root: &Path, name: &str, contents: &str) -> String {
     let path = root.join("manifests").join(name);
     if let Some(parent) = path.parent() {
@@ -422,4 +548,46 @@ async fn setup_worker_test_context() -> (TempDir, Arc<AppState>, OperationWorker
     );
     let worker = OperationWorker::new(state.clone());
     (tempdir, state, worker)
+}
+
+async fn create_running_scenario(
+    store: &Store,
+    worker: &OperationWorker,
+    scenario_id: &str,
+    operation_id: &str,
+    compose_project: &str,
+    request: CreateScenarioRequest,
+    now_ms: i64,
+) {
+    let payload = OperationPayload::Create {
+        request: request.clone(),
+    };
+    let external_slots =
+        serde_json::to_value(&request.external_slots).expect("serialize external slots");
+    let exports = serde_json::to_value(&request.exports).expect("serialize exports");
+    store
+        .create_pending_scenario_with_operation(NewPendingScenario {
+            scenario_id,
+            source_url: &request.source_url,
+            root_config: &request.root_config,
+            metadata: &request.metadata,
+            external_slots: &external_slots,
+            exports: &exports,
+            telemetry: &request.telemetry,
+            desired_state: DesiredState::Running,
+            observed_state: ObservedState::Starting,
+            compose_project,
+            operation_id,
+            payload: &payload,
+            now_ms,
+        })
+        .await
+        .expect("seed pending scenario");
+
+    let work = store
+        .claim_next_scenario_work(now_ms)
+        .await
+        .expect("claim create work")
+        .expect("queued create work");
+    worker.process_claimed_work(work).await;
 }

@@ -20,10 +20,10 @@ use crate::{
     config::{ConfigError, ManagerFileConfig, OperatorServiceProvider},
     domain::{
         BindableServiceProviderKind, BindableServiceResponse, BindableServiceSourceKind,
-        DesiredState, ExportRequest, ServiceProtocol,
+        ExportRequest, ServiceProtocol,
     },
     ids,
-    store::{NewDependency, NewExportService},
+    store::{NewDependency, NewExportService, StoredExportService},
 };
 
 impl OperationWorker {
@@ -37,6 +37,7 @@ impl OperationWorker {
         validate_cycles: bool,
     ) -> Result<PreparedBindings, OperationError> {
         let catalog = self.load_bindable_service_catalog().await?;
+        let existing_export_listeners = self.existing_export_listeners(scenario_id).await?;
         let mut bindings = PreparedBindings::default();
 
         for (slot_name, binding) in external_slots {
@@ -122,8 +123,13 @@ impl OperationWorker {
 
         for (export_name, export_meta) in &compiled.proxy_metadata.exports {
             let protocol = parse_protocol(&export_meta.protocol)?;
-            let internal_listen =
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), pick_export_port()?);
+            let internal_listen = existing_export_listeners
+                .get(export_name)
+                .copied()
+                .unwrap_or(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    pick_export_port()?,
+                ));
             let published_listen = requested_exports
                 .get(export_name)
                 .and_then(|request| request.publish.as_ref())
@@ -151,19 +157,51 @@ impl OperationWorker {
         Ok(bindings)
     }
 
+    pub(super) async fn current_export_services(
+        &self,
+        scenario_id: &str,
+    ) -> Result<Vec<StoredExportService>, OperationError> {
+        Ok(self
+            .state
+            .store
+            .list_export_services()
+            .await
+            .map_err(retryable_error)?
+            .into_iter()
+            .filter(|service| service.scenario_id == scenario_id)
+            .collect())
+    }
+
+    async fn existing_export_listeners(
+        &self,
+        scenario_id: &str,
+    ) -> Result<BTreeMap<String, SocketAddr>, OperationError> {
+        let mut listeners = BTreeMap::new();
+        for service in self.current_export_services(scenario_id).await? {
+            let Ok(ip) = service.listen_addr.parse() else {
+                continue;
+            };
+            listeners.insert(
+                service.export_name,
+                SocketAddr::new(ip, service.listen_port),
+            );
+        }
+        Ok(listeners)
+    }
+
     pub(super) async fn ensure_export_change_is_safe(
         &self,
         provider_scenario_id: &str,
         compiled: &CompiledMaterialization,
     ) -> Result<(), OperationError> {
-        let running_consumers = self
+        let active_consumers = self
             .state
             .store
             .list_scenarios()
             .await
             .map_err(retryable_error)?
             .into_iter()
-            .filter(|scenario| scenario.desired_state == DesiredState::Running)
+            .filter(|scenario| scenario.observed_state.blocks_dependency_changes())
             .map(|scenario| scenario.id)
             .collect::<BTreeSet<_>>();
         let current_exports = self
@@ -188,7 +226,7 @@ impl OperationWorker {
                 dependency.provider_scenario_id.as_deref() == Some(provider_scenario_id)
             })
         {
-            if !running_consumers.contains(&dependency.consumer_scenario_id) {
+            if !active_consumers.contains(&dependency.consumer_scenario_id) {
                 continue;
             }
             let Some(current_export) = current_exports.get(&dependency.bindable_service_id) else {
@@ -200,14 +238,14 @@ impl OperationWorker {
                 .get(&current_export.export_name)
             else {
                 return Err(invalid_error(format!(
-                    "upgrade would remove export {} that running scenario {} depends on",
+                    "upgrade would remove export {} that active scenario {} depends on",
                     current_export.export_name, dependency.consumer_scenario_id
                 )));
             };
             let new_protocol = parse_protocol(&new_export.protocol)?;
             if new_protocol.as_str() != current_export.protocol {
                 return Err(invalid_error(format!(
-                    "upgrade would change export {} from {} to {} while running scenario {} \
+                    "upgrade would change export {} from {} to {} while active scenario {} \
                      depends on it",
                     current_export.export_name,
                     current_export.protocol,
@@ -306,14 +344,14 @@ impl OperationWorker {
         let blockers = self
             .state
             .store
-            .list_running_dependency_blockers(provider_scenario_id)
+            .list_dependency_blockers(provider_scenario_id)
             .await
             .map_err(retryable_error)?;
         if blockers.is_empty() {
             return Ok(());
         }
         Err(invalid_error(format!(
-            "scenario {} cannot be modified because running scenarios depend on its exports: {}",
+            "scenario {} cannot be modified because active scenarios depend on its exports: {}",
             provider_scenario_id,
             blockers.join(", ")
         )))
@@ -396,6 +434,45 @@ impl OperationWorker {
             }
         }
     }
+}
+
+pub(super) fn export_topology_changed(
+    current: &[StoredExportService],
+    next: &[NewExportService],
+) -> bool {
+    fn current_topology(services: &[StoredExportService]) -> BTreeMap<&str, (&str, &str, u16)> {
+        services
+            .iter()
+            .map(|service| {
+                (
+                    service.export_name.as_str(),
+                    (
+                        service.service_id.as_str(),
+                        service.protocol.as_str(),
+                        service.listen_port,
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn next_topology(services: &[NewExportService]) -> BTreeMap<&str, (&str, &str, u16)> {
+        services
+            .iter()
+            .map(|service| {
+                (
+                    service.export_name.as_str(),
+                    (
+                        service.service_id.as_str(),
+                        service.protocol.as_str(),
+                        service.listen_port,
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    current_topology(current) != next_topology(next)
 }
 
 pub(super) fn build_operator_services(

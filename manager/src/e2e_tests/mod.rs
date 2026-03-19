@@ -12,12 +12,39 @@ use self::harness::{
 use crate::{
     config::ManagerFileConfig,
     domain::{
-        BindableServiceResponse, CreateScenarioRequest, EnqueueOperationResponse,
+        BindableServiceResponse, CreateScenarioRequest, DesiredState, EnqueueOperationResponse,
         ExportPublishRequest, ExportRequest, ObservedState, OperationStatus,
         ScenarioRevisionSummaryResponse, ScenarioSummaryResponse, ScenarioTelemetryRequest,
         UpgradeScenarioRequest,
     },
 };
+
+async fn create_bound_provider_and_consumer(
+    harness: &TestHarness,
+) -> (EnqueueOperationResponse, EnqueueOperationResponse) {
+    let provider_url = harness.write_provider_manifest("provider.json5");
+    let consumer_url = harness.write_consumer_manifest("consumer.json5");
+
+    let provider = harness.create_scenario(&create_request(provider_url)).await;
+    let provider_op = harness.wait_for_operation(&provider.operation_id).await;
+    assert_eq!(provider_op.status, OperationStatus::Succeeded);
+
+    let provider_service = harness
+        .find_export_service(&provider.scenario_id, "api")
+        .await
+        .expect("provider export service");
+    let consumer = harness
+        .create_scenario(&create_request_with_slot(
+            consumer_url,
+            "api",
+            provider_service.bindable_service_id,
+        ))
+        .await;
+    let consumer_op = harness.wait_for_operation(&consumer.operation_id).await;
+    assert_eq!(consumer_op.status, OperationStatus::Succeeded);
+
+    (provider, consumer)
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scenario_lifecycle_over_live_http_api() {
@@ -344,26 +371,7 @@ async fn paused_resume_and_reconcile_keep_persisted_runtime_config() {
 #[tokio::test(flavor = "multi_thread")]
 async fn consumer_binds_to_provider_export_and_blocks_provider_delete() {
     let harness = TestHarness::new(ManagerFileConfig::default()).await;
-    let provider_url = harness.write_provider_manifest("provider.json5");
-    let consumer_url = harness.write_consumer_manifest("consumer.json5");
-
-    let provider = harness.create_scenario(&create_request(provider_url)).await;
-    let provider_op = harness.wait_for_operation(&provider.operation_id).await;
-    assert_eq!(provider_op.status, OperationStatus::Succeeded);
-
-    let provider_service = harness
-        .find_export_service(&provider.scenario_id, "api")
-        .await
-        .expect("provider export service");
-    let consumer = harness
-        .create_scenario(&create_request_with_slot(
-            consumer_url,
-            "api",
-            provider_service.bindable_service_id.clone(),
-        ))
-        .await;
-    let consumer_op = harness.wait_for_operation(&consumer.operation_id).await;
-    assert_eq!(consumer_op.status, OperationStatus::Succeeded);
+    let (provider, consumer) = create_bound_provider_and_consumer(&harness).await;
 
     let consumer_detail = harness.scenario_detail(&consumer.scenario_id).await;
     assert_eq!(
@@ -386,6 +394,82 @@ async fn consumer_binds_to_provider_export_and_blocks_provider_delete() {
     let consumer_detail = harness.scenario_detail(&consumer.scenario_id).await;
     assert_eq!(provider_detail.observed_state, ObservedState::Running);
     assert_eq!(consumer_detail.observed_state, ObservedState::Running);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_delete_stays_blocked_while_consumer_is_observed_running() {
+    let harness = TestHarness::new(ManagerFileConfig::default()).await;
+    let (provider, consumer) = create_bound_provider_and_consumer(&harness).await;
+
+    harness
+        .set_scenario_states_for_test(
+            &consumer.scenario_id,
+            DesiredState::Paused,
+            ObservedState::Running,
+        )
+        .await;
+
+    let (status, body) = harness
+        .delete_raw(&format!("/v1/scenarios/{}", provider.scenario_id))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "unexpected body: {body}");
+    assert!(
+        body.contains("depend on its exports"),
+        "unexpected body: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_upgrade_stays_blocked_while_consumer_is_observed_running() {
+    let harness = TestHarness::new(ManagerFileConfig::default()).await;
+    let (provider, consumer) = create_bound_provider_and_consumer(&harness).await;
+
+    harness
+        .set_scenario_states_for_test(
+            &consumer.scenario_id,
+            DesiredState::Paused,
+            ObservedState::Running,
+        )
+        .await;
+
+    let provider_with_renamed_export = harness.write_manifest(
+        "provider-renamed-export.json5",
+        r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "provider",
+            entrypoint: ["provider"],
+            network: { endpoints: [{ name: "api", port: 80 }] },
+          },
+          provides: { api: { kind: "http", endpoint: "api" } },
+          exports: { api2: "api" },
+        }
+        "#,
+    );
+    let upgrade: EnqueueOperationResponse = harness
+        .post_json(
+            &format!("/v1/scenarios/{}/upgrade", provider.scenario_id),
+            &UpgradeScenarioRequest {
+                source_url: Some(provider_with_renamed_export),
+                root_config: Some(json!({})),
+                external_slots: Some(BTreeMap::new()),
+                exports: Some(BTreeMap::new()),
+                metadata: Some(json!({})),
+                telemetry: Some(ScenarioTelemetryRequest::default()),
+                store_bundle: false,
+            },
+        )
+        .await;
+    let upgrade = harness.wait_for_operation(&upgrade.operation_id).await;
+    assert_eq!(upgrade.status, OperationStatus::Failed);
+    assert!(
+        upgrade
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("active scenario")),
+        "unexpected operation detail: {upgrade:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -591,28 +675,9 @@ async fn create_stops_retrying_after_backoff_budget_is_exhausted() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn health_monitor_restarts_unhealthy_provider_and_rewires_consumer() {
+async fn health_monitor_restarts_unhealthy_provider_without_rewiring_consumer() {
     let harness = TestHarness::new(ManagerFileConfig::default()).await;
-    let provider_url = harness.write_provider_manifest("provider.json5");
-    let consumer_url = harness.write_consumer_manifest("consumer.json5");
-
-    let provider = harness.create_scenario(&create_request(provider_url)).await;
-    let provider_op = harness.wait_for_operation(&provider.operation_id).await;
-    assert_eq!(provider_op.status, OperationStatus::Succeeded);
-    let provider_service = harness
-        .find_export_service(&provider.scenario_id, "api")
-        .await
-        .expect("provider export service");
-
-    let consumer = harness
-        .create_scenario(&create_request_with_slot(
-            consumer_url,
-            "api",
-            provider_service.bindable_service_id,
-        ))
-        .await;
-    let consumer_op = harness.wait_for_operation(&consumer.operation_id).await;
-    assert_eq!(consumer_op.status, OperationStatus::Succeeded);
+    let (provider, consumer) = create_bound_provider_and_consumer(&harness).await;
 
     let initial_consumer_spec = harness
         .runtime
@@ -633,19 +698,18 @@ async fn health_monitor_restarts_unhealthy_provider_and_rewires_consumer() {
             harness.runtime.apply_count(&provider.scenario_id).await > initial_provider_apply_count
         })
         .await;
-    harness
-        .wait_until("consumer reconcile", Duration::from_secs(10), || async {
-            harness.runtime.apply_count(&consumer.scenario_id).await > initial_consumer_apply_count
-        })
-        .await;
 
-    let rewired_spec = harness
+    let consumer_spec = harness
         .runtime
         .last_spec(&consumer.scenario_id)
         .await
-        .expect("rewired consumer runtime spec");
-    let rewired_upstream = rewired_spec.proxy_plan.slot_bindings[0].upstream;
-    assert_ne!(rewired_upstream, initial_upstream);
+        .expect("consumer runtime spec");
+    let consumer_upstream = consumer_spec.proxy_plan.slot_bindings[0].upstream;
+    assert_eq!(consumer_upstream, initial_upstream);
+    assert_eq!(
+        harness.runtime.apply_count(&consumer.scenario_id).await,
+        initial_consumer_apply_count
+    );
 
     let provider_detail = harness.scenario_detail(&provider.scenario_id).await;
     let consumer_detail = harness.scenario_detail(&consumer.scenario_id).await;

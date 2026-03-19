@@ -9,6 +9,7 @@ use super::{
         StoredRevisionSummary, StoredScenario, decode_json_with_context, encode_json,
     },
 };
+use crate::domain::ObservedState;
 
 impl Store {
     pub async fn list_scenarios(&self) -> Result<Vec<StoredScenario>, StoreError> {
@@ -689,21 +690,24 @@ impl Store {
         .map_err(StoreError::Database)
     }
 
-    pub async fn list_running_dependency_blockers(
+    pub async fn list_dependency_blockers(
         &self,
         provider_scenario_id: &str,
     ) -> Result<Vec<String>, StoreError> {
         sqlx::query_scalar::<_, String>(
             r#"
-            SELECT d.consumer_scenario_id
+            SELECT DISTINCT d.consumer_scenario_id
             FROM scenario_dependencies d
             JOIN scenarios s ON s.id = d.consumer_scenario_id
             WHERE d.provider_scenario_id = ?
-              AND s.desired_state = 'running'
+              AND s.observed_state IN (?, ?, ?)
             ORDER BY d.consumer_scenario_id
             "#,
         )
         .bind(provider_scenario_id)
+        .bind(ObservedState::DEPENDENCY_BLOCKING_STATES[0])
+        .bind(ObservedState::DEPENDENCY_BLOCKING_STATES[1])
+        .bind(ObservedState::DEPENDENCY_BLOCKING_STATES[2])
         .fetch_all(&self.pool)
         .await
         .map_err(StoreError::Database)

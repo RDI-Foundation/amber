@@ -21,8 +21,8 @@ use crate::{
     api::router,
     config::{ManagerFileConfig, OperatorBindableServiceConfig, OperatorServiceProvider},
     domain::{
-        BindableServiceResponse, CreateScenarioRequest, EnqueueOperationResponse,
-        ExternalSlotBindingRequest, OperationStatus, OperationStatusResponse,
+        BindableServiceResponse, CreateScenarioRequest, DesiredState, EnqueueOperationResponse,
+        ExternalSlotBindingRequest, ObservedState, OperationStatus, OperationStatusResponse,
         ScenarioDetailResponse, ScenarioTelemetryRequest, ServiceProtocol,
     },
     runtime::{FakeRuntimeController, RuntimeSupervisor},
@@ -368,6 +368,19 @@ impl TestHarness {
     pub(super) fn read_runtime_env(&self, scenario_id: &str, revision: i64) -> String {
         std::fs::read_to_string(self.runtime_dir(scenario_id, revision).join(".env"))
             .expect("read runtime env")
+    }
+
+    pub(super) async fn set_scenario_states_for_test(
+        &self,
+        scenario_id: &str,
+        desired_state: DesiredState,
+        observed_state: ObservedState,
+    ) {
+        self._state
+            .store()
+            .set_scenario_states(scenario_id, desired_state, observed_state, None, 1_000)
+            .await
+            .expect("set scenario states for test");
     }
 
     async fn decode_success<T: DeserializeOwned>(response: reqwest::Response) -> T {

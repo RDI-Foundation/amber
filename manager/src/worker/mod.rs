@@ -340,30 +340,7 @@ impl OperationWorker {
     }
 
     async fn process_claimed_work(&self, work: ClaimedScenarioWork) {
-        let operation = match work.operation_id.as_deref() {
-            Some(operation_id) => {
-                if let Err(err) = self
-                    .state
-                    .store
-                    .mark_operation_running(operation_id, now_ms())
-                    .await
-                {
-                    error!("failed to mark operation {} running: {err}", operation_id);
-                }
-                match self.state.store.get_operation(operation_id).await {
-                    Ok(Some(operation)) => Some(operation),
-                    Ok(None) => None,
-                    Err(err) => {
-                        error!(
-                            "failed to load claimed operation {} for {}: {}",
-                            operation_id, work.scenario_id, err
-                        );
-                        None
-                    }
-                }
-            }
-            None => None,
-        };
+        let operation = self.load_claimed_operation(&work).await;
 
         let cleanup_runtime = work.cleanup_runtime
             || operation.as_ref().is_some_and(|operation| {
@@ -454,6 +431,54 @@ impl OperationWorker {
                 }
             }
         }
+    }
+
+    async fn retry_store_until_value<F, Fut, T>(&self, mut op: F, description: &str) -> T
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, StoreError>>,
+    {
+        loop {
+            match op().await {
+                Ok(value) => return value,
+                Err(err) => {
+                    error!("failed to {}: {}", description, err);
+                    tokio::time::sleep(IDLE_WAIT).await;
+                }
+            }
+        }
+    }
+
+    async fn load_claimed_operation(&self, work: &ClaimedScenarioWork) -> Option<StoredOperation> {
+        let operation_id = work.operation_id.as_deref()?;
+
+        self.retry_store_until_ok(
+            || async {
+                self.state
+                    .store
+                    .mark_operation_running(operation_id, now_ms())
+                    .await
+            },
+            &format!("mark operation {} running", operation_id),
+        )
+        .await;
+
+        let operation = self
+            .retry_store_until_value(
+                || async { self.state.store.get_operation(operation_id).await },
+                &format!(
+                    "load claimed operation {} for {}",
+                    operation_id, work.scenario_id
+                ),
+            )
+            .await;
+        if operation.is_none() {
+            error!(
+                "claimed scenario work for {} referenced missing operation {}",
+                work.scenario_id, operation_id
+            );
+        }
+        operation
     }
 }
 

@@ -5,6 +5,7 @@ use tracing::{error, warn};
 
 use super::{
     OperationWorker,
+    bindings::export_topology_changed,
     errors::{
         OperationError, backoff_ms, classify_create_compile_error,
         classify_reconcile_compile_error, classify_upgrade_compile_error, invalid_error,
@@ -411,6 +412,10 @@ impl OperationWorker {
                 false,
             )
             .await?;
+        let export_topology_changed = export_topology_changed(
+            &self.current_export_services(&scenario.id).await?,
+            &bindings.export_services,
+        );
 
         let telemetry = scenario.telemetry.clone();
         let runtime_input = compiler::build_runtime_input(
@@ -456,7 +461,9 @@ impl OperationWorker {
             )
             .await
             .map_err(retryable_error)?;
-        self.enqueue_dependent_reconciles(&scenario.id).await;
+        if export_topology_changed {
+            self.enqueue_dependent_reconciles(&scenario.id).await;
+        }
 
         Ok(Some(json!({
             "scenario_id": scenario.id,
