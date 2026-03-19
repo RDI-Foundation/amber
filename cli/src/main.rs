@@ -1,5 +1,6 @@
 mod docs;
 mod mixed_run;
+mod tcp_readiness;
 mod vm_runtime;
 
 #[cfg(target_os = "linux")]
@@ -54,10 +55,11 @@ use amber_mesh::{MeshProtocol, OutboundRoute, TransportConfig};
 use amber_proxy::ProxyCommand;
 use amber_resolver::Resolver;
 use amber_scenario::{SCENARIO_IR_SCHEMA, ScenarioIr};
-use amber_template::{
-    ConfigTemplatePayload, MountSpec, ProgramArgTemplate, RuntimeSlotObject,
-    RuntimeTemplateContext, TemplatePart, TemplateSpec,
-};
+#[cfg(any(target_os = "linux", test))]
+use amber_template::TemplatePart;
+use amber_template::{ConfigTemplatePayload, MountSpec, RuntimeSlotObject, RuntimeTemplateContext};
+#[cfg(target_os = "linux")]
+use amber_template::{ProgramArgTemplate, TemplateSpec};
 use base64::Engine as _;
 use clap::{ArgAction, Args, Parser, Subcommand};
 use miette::{
@@ -71,6 +73,8 @@ use tokio::{
 };
 use tracing_subscriber::EnvFilter;
 use url::Url;
+
+use crate::tcp_readiness::wait_for_stable_endpoint;
 
 const CLI_LONG_ABOUT: &str = "\
 Compile, inspect, and run Amber scenarios.
@@ -343,6 +347,8 @@ enum Command {
     RunObservabilitySink(RunObservabilitySinkArgs),
     #[command(hide = true, name = "run-vm-guestfwd-bridge")]
     RunVmGuestfwdBridge(RunVmGuestfwdBridgeArgs),
+    #[command(hide = true, name = "run-direct-local-probe")]
+    RunDirectLocalProbe(RunDirectLocalProbeArgs),
 }
 
 #[derive(Args)]
@@ -515,6 +521,17 @@ struct RunVmInitArgs {
 }
 
 #[derive(Args)]
+struct RunDirectLocalProbeArgs {
+    /// Loopback endpoint inside a direct component namespace.
+    #[arg(value_name = "ADDR:PORT")]
+    addr: SocketAddr,
+
+    /// Maximum time to wait for the endpoint to accept stable connections.
+    #[arg(long = "timeout-ms", value_name = "MILLIS")]
+    timeout_ms: u64,
+}
+
+#[derive(Args)]
 struct RunSiteSupervisorArgs {
     /// Path to a mixed-site supervisor plan JSON file.
     #[arg(long = "plan", value_name = "FILE")]
@@ -661,6 +678,7 @@ async fn main() -> Result<()> {
     let result = match cli.command {
         Command::Proxy(args) => proxy(args, verbose).await,
         Command::RunVmGuestfwdBridge(args) => run_vm_guestfwd_bridge(args).await,
+        Command::RunDirectLocalProbe(args) => run_direct_local_probe(args).await,
         command => {
             init_tracing(verbose)?;
             match command {
@@ -686,6 +704,7 @@ async fn main() -> Result<()> {
                     mixed_run::run_observability_sink(args.plan).await
                 }
                 Command::RunVmGuestfwdBridge(_) => unreachable!("handled above"),
+                Command::RunDirectLocalProbe(_) => unreachable!("handled above"),
                 Command::Proxy(_) => unreachable!("handled above"),
             }
         }
@@ -780,6 +799,11 @@ async fn run_vm_guestfwd_bridge(args: RunVmGuestfwdBridgeArgs) -> Result<()> {
         .join()
         .map_err(|_| miette::miette!("vm slot bridge writer thread panicked"))??;
     Ok(())
+}
+
+async fn run_direct_local_probe(args: RunDirectLocalProbeArgs) -> Result<()> {
+    wait_for_stable_endpoint(args.addr, Duration::from_millis(args.timeout_ms))
+        .wrap_err_with(|| format!("direct local endpoint {} did not become ready", args.addr))
 }
 
 fn verbosity_level(verbose: u8) -> &'static str {
@@ -1249,7 +1273,11 @@ async fn compile_for_run(input: &str) -> Result<CompiledScenario> {
 #[derive(Debug)]
 struct ManagedChild {
     name: String,
-    child: tokio::process::Child,
+    wrapper: Option<tokio::process::Child>,
+    #[cfg(target_os = "linux")]
+    wrapper_pid: u32,
+    #[cfg(target_os = "linux")]
+    managed_pid: u32,
 }
 
 #[derive(Debug)]
@@ -1259,17 +1287,17 @@ struct ProcessSpec {
     args: Vec<String>,
     env: BTreeMap<String, String>,
     work_dir: PathBuf,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    sandbox: ProcessSandbox,
+    #[cfg(target_os = "linux")]
     read_only_mounts: Vec<ReadOnlyMount>,
     writable_dirs: Vec<PathBuf>,
     bind_dirs: Vec<PathBuf>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     bind_mounts: Vec<BindMount>,
     hidden_paths: Vec<PathBuf>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     network: ProcessNetwork,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReadOnlyMount {
     source: PathBuf,
@@ -1283,11 +1311,18 @@ struct BindMount {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 enum ProcessNetwork {
     Host,
+    #[cfg(target_os = "linux")]
     Isolated,
+    #[cfg(target_os = "linux")]
     Join(u32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessSandbox {
+    Sandboxed,
+    Unsandboxed,
 }
 
 #[derive(Debug)]
@@ -1301,6 +1336,8 @@ enum RuntimeExitReason {
 
 const DIRECT_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const DIRECT_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(150);
+const DIRECT_LOCAL_TARGET_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const DIRECT_MESH_ENDPOINT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DirectControlSocketPaths {
@@ -1392,10 +1429,11 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
         })?;
         let runtime_state =
             assign_direct_runtime_ports(&runtime_root, &direct_plan, args.router_mesh_port)?;
-        write_direct_runtime_state(&plan_root, &runtime_state)?;
-        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+        #[cfg(target_os = "linux")]
         let mesh_network =
             configure_direct_mesh_network(&runtime_root, &runtime_state, &direct_plan)?;
+        #[cfg(not(target_os = "linux"))]
+        configure_direct_mesh_network(&runtime_root, &runtime_state, &direct_plan)?;
 
         let router_binary = resolve_runtime_binary("amber-router")?;
         if let Some(router) = direct_plan.router.as_ref() {
@@ -1505,6 +1543,8 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                 args: Vec::new(),
                 env,
                 work_dir,
+                sandbox: ProcessSandbox::Unsandboxed,
+                #[cfg(target_os = "linux")]
                 read_only_mounts: vec![ReadOnlyMount {
                     source: runtime_root.join("mesh"),
                     dest: runtime_root.join("mesh"),
@@ -1556,6 +1596,8 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                 args: Vec::new(),
                 env,
                 work_dir,
+                sandbox: ProcessSandbox::Sandboxed,
+                #[cfg(target_os = "linux")]
                 read_only_mounts: vec![ReadOnlyMount {
                     source: runtime_root.join("mesh"),
                     dest: runtime_root.join("mesh"),
@@ -1630,8 +1672,26 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
             }
             let _ =
                 spawn_managed_process(spec, &mut sandbox, &mut children, &mut log_tasks).await?;
+            #[cfg(target_os = "linux")]
+            wait_for_component_local_targets(
+                component,
+                &runtime_root,
+                component_sidecar_pid_by_id.get(component_id).copied(),
+                DIRECT_LOCAL_TARGET_READY_TIMEOUT,
+            )
+            .await?;
+            #[cfg(not(target_os = "linux"))]
+            wait_for_component_local_targets(
+                component,
+                &runtime_root,
+                None,
+                DIRECT_LOCAL_TARGET_READY_TIMEOUT,
+            )
+            .await?;
         }
 
+        wait_for_direct_mesh_endpoints(&runtime_state, DIRECT_MESH_ENDPOINT_READY_TIMEOUT).await?;
+        write_direct_runtime_state(&plan_root, &runtime_state)?;
         supervise_children(&mut children).await
     }
     .await;
@@ -1794,7 +1854,7 @@ struct DirectRuntimeState {
 
 #[derive(Debug, Default)]
 struct DirectMeshNetworkPlan {
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(target_os = "linux")]
     component_mesh_port_by_id: HashMap<usize, u16>,
 }
 
@@ -2093,9 +2153,11 @@ fn component_program_spec(
     runtime_addresses: &DirectRuntimeAddressPlan,
     runtime_state: &DirectRuntimeState,
 ) -> Result<ProcessSpec> {
+    #[cfg(target_os = "linux")]
     let source_dir = component_source_dir(component)?;
     let work_dir = runtime_root.join(&component.program.work_dir);
     let mut writable_dirs = vec![work_dir.clone()];
+    #[cfg(target_os = "linux")]
     let read_only_mounts = component_program_read_only_mounts(component, source_dir.as_deref())?;
     let bind_mounts = direct_storage_bind_mounts(storage_root, component)?;
     match &component.program.execution {
@@ -2109,6 +2171,8 @@ fn component_program_spec(
                 args,
                 env: env.clone(),
                 work_dir,
+                sandbox: ProcessSandbox::Sandboxed,
+                #[cfg(target_os = "linux")]
                 read_only_mounts,
                 writable_dirs,
                 bind_dirs: Vec::new(),
@@ -2158,6 +2222,8 @@ fn component_program_spec(
                 args: vec!["run".to_string()],
                 env,
                 work_dir,
+                sandbox: ProcessSandbox::Sandboxed,
+                #[cfg(target_os = "linux")]
                 read_only_mounts,
                 writable_dirs,
                 bind_dirs: Vec::new(),
@@ -2191,6 +2257,123 @@ fn direct_storage_bind_mounts(
         });
     }
     Ok(mounts)
+}
+
+fn component_local_target_ports(
+    component: &DirectComponentPlan,
+    runtime_root: &Path,
+) -> Result<BTreeSet<u16>> {
+    let config = read_mesh_config_public(&runtime_root.join(&component.sidecar.mesh_config_path))?;
+    Ok(config
+        .inbound
+        .into_iter()
+        .filter_map(|route| match route.target {
+            InboundTarget::Local { port } => Some(port),
+            _ => None,
+        })
+        .collect())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn wait_for_component_local_targets(
+    component: &DirectComponentPlan,
+    runtime_root: &Path,
+    _sidecar_pid: Option<u32>,
+    timeout: Duration,
+) -> Result<()> {
+    for port in component_local_target_ports(component, runtime_root)? {
+        wait_for_stable_endpoint(SocketAddr::from(([127, 0, 0, 1], port)), timeout).map_err(
+            |err| {
+                miette::miette!(
+                    "local target 127.0.0.1:{} for component {} did not become ready: {err}",
+                    port,
+                    component.moniker
+                )
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_component_local_targets(
+    component: &DirectComponentPlan,
+    runtime_root: &Path,
+    sidecar_pid: Option<u32>,
+    timeout: Duration,
+) -> Result<()> {
+    let ports = component_local_target_ports(component, runtime_root)?;
+    if ports.is_empty() {
+        return Ok(());
+    }
+    let sidecar_pid = sidecar_pid.ok_or_else(|| {
+        miette::miette!(
+            "missing sidecar pid while waiting for component {} local targets",
+            component.moniker
+        )
+    })?;
+    let namespace_join = prepare_linux_namespace_join(sidecar_pid)?;
+    let amber_cli = env::current_exe()
+        .into_diagnostic()
+        .wrap_err("failed to locate current amber binary for direct local probe")?;
+    let deadline = Instant::now() + timeout;
+    for port in ports {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(miette::miette!(
+                "local target 127.0.0.1:{port} for component {} did not become ready within {:?}",
+                component.moniker,
+                timeout
+            ));
+        }
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let mut command = TokioCommand::new(&amber_cli);
+        command
+            .arg("run-direct-local-probe")
+            .arg(addr.to_string())
+            .arg("--timeout-ms")
+            .arg(remaining.as_millis().to_string());
+        if let Some(namespace_join) = namespace_join.clone() {
+            unsafe {
+                command.pre_exec(move || enter_linux_namespaces(&namespace_join));
+            }
+        }
+        let status = command.status().await.into_diagnostic().wrap_err_with(|| {
+            format!(
+                "failed to start direct local readiness probe for component {}",
+                component.moniker
+            )
+        })?;
+        if !status.success() {
+            return Err(miette::miette!(
+                "local target {} for component {} did not become ready (status: {})",
+                addr,
+                component.moniker,
+                status
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn wait_for_direct_mesh_endpoints(
+    runtime_state: &DirectRuntimeState,
+    timeout: Duration,
+) -> Result<()> {
+    let mut ports = BTreeSet::new();
+    if let Some(port) = runtime_state.router_mesh_port {
+        ports.insert(port);
+    }
+    ports.extend(runtime_state.component_mesh_port_by_id.values().copied());
+
+    for port in ports {
+        wait_for_stable_endpoint(SocketAddr::from(([127, 0, 0, 1], port)), timeout).map_err(
+            |err| {
+                miette::miette!("direct mesh endpoint 127.0.0.1:{port} did not become ready: {err}")
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn append_runtime_template_context_env(
@@ -2338,6 +2521,7 @@ fn split_entrypoint(entrypoint: &[String]) -> Result<(String, Vec<String>)> {
     Ok((program.clone(), entrypoint[1..].to_vec()))
 }
 
+#[cfg(target_os = "linux")]
 fn component_source_dir(component: &DirectComponentPlan) -> Result<Option<PathBuf>> {
     let Some(raw) = component.source_dir.as_deref() else {
         return Ok(None);
@@ -2353,6 +2537,7 @@ fn component_source_dir(component: &DirectComponentPlan) -> Result<Option<PathBu
     Ok(Some(path))
 }
 
+#[cfg(target_os = "linux")]
 fn component_program_read_only_mounts(
     component: &DirectComponentPlan,
     source_dir: Option<&Path>,
@@ -2386,6 +2571,7 @@ fn component_program_read_only_mounts(
     Ok(mounts.into_values().collect())
 }
 
+#[cfg(target_os = "linux")]
 fn component_execution_program_path(component: &DirectComponentPlan) -> Result<Option<String>> {
     match &component.program.execution {
         DirectProgramExecutionPlan::Direct { entrypoint, .. } => Ok(entrypoint.first().cloned()),
@@ -2405,6 +2591,7 @@ fn component_execution_program_path(component: &DirectComponentPlan) -> Result<O
     }
 }
 
+#[cfg(target_os = "linux")]
 fn decode_entrypoint_payload_program(raw_b64: &str) -> Result<String> {
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(raw_b64.as_bytes())
@@ -2417,6 +2604,7 @@ fn decode_entrypoint_payload_program(raw_b64: &str) -> Result<String> {
         .ok_or_else(|| miette::miette!("entrypoint payload is empty"))
 }
 
+#[cfg(target_os = "linux")]
 fn decode_template_spec_program(raw_b64: &str) -> Result<String> {
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(raw_b64.as_bytes())
@@ -2431,6 +2619,7 @@ fn decode_template_spec_program(raw_b64: &str) -> Result<String> {
     render_program_arg_template_literal(path_template)
 }
 
+#[cfg(target_os = "linux")]
 fn render_program_arg_template_literal(arg: &ProgramArgTemplate) -> Result<String> {
     let ProgramArgTemplate::Arg(parts) = arg else {
         return Err(miette::miette!(
@@ -2440,6 +2629,7 @@ fn render_program_arg_template_literal(arg: &ProgramArgTemplate) -> Result<Strin
     render_template_string_literal(parts)
 }
 
+#[cfg(target_os = "linux")]
 fn render_template_string_literal(parts: &[TemplatePart]) -> Result<String> {
     let mut out = String::new();
     for part in parts {
@@ -2622,11 +2812,24 @@ async fn spawn_managed_process(
     children: &mut Vec<ManagedChild>,
     log_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> Result<u32> {
-    let (program, args) = sandbox.wrap_command(&spec)?;
+    let (program, args) = match spec.sandbox {
+        ProcessSandbox::Sandboxed => sandbox.wrap_command(&spec)?,
+        ProcessSandbox::Unsandboxed => {
+            #[cfg(target_os = "linux")]
+            if !matches!(spec.network, ProcessNetwork::Host) {
+                return Err(miette::miette!(
+                    "unsandboxed direct processes must use host networking"
+                ));
+            }
+            (spec.program.clone(), spec.args.clone())
+        }
+    };
     #[cfg(target_os = "linux")]
     let mut args = args;
     #[cfg(target_os = "linux")]
-    let namespace_join = if matches!(sandbox, DirectSandbox::Bubblewrap { .. }) {
+    let namespace_join = if matches!(spec.sandbox, ProcessSandbox::Sandboxed)
+        && matches!(sandbox, DirectSandbox::Bubblewrap { .. })
+    {
         match spec.network {
             ProcessNetwork::Join(pid) => prepare_linux_namespace_join(pid)?,
             _ => None,
@@ -2635,8 +2838,8 @@ async fn spawn_managed_process(
         None
     };
     #[cfg(target_os = "linux")]
-    let pid_capture = if matches!(sandbox, DirectSandbox::Bubblewrap { .. })
-        && matches!(spec.network, ProcessNetwork::Isolated)
+    let pid_capture = if matches!(spec.sandbox, ProcessSandbox::Sandboxed)
+        && matches!(sandbox, DirectSandbox::Bubblewrap { .. })
     {
         insert_bubblewrap_info_fd(&mut args, 3)?;
         SpawnPidCapture::BubblewrapChild
@@ -2668,6 +2871,7 @@ enum SpawnPidCapture {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone)]
 struct LinuxNamespaceJoin {
     user: Option<CString>,
     net: Option<CString>,
@@ -2755,49 +2959,61 @@ async fn spawn_managed_command(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
-    let mut child = command
+    let mut wrapper = command
         .spawn()
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to spawn process {name}"))?;
 
     #[cfg(target_os = "linux")]
-    let pid = if let Some(pipe) = bubblewrap_info_pipe {
+    let managed_pid = if let Some(pipe) = bubblewrap_info_pipe {
         match read_bubblewrap_child_pid(pipe).await {
             Ok(pid) => pid,
             Err(err) => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                let _ = wrapper.start_kill();
+                let _ = wrapper.wait().await;
                 return Err(err).wrap_err_with(|| {
                     format!("failed to capture bubblewrap child pid for {name}")
                 });
             }
         }
     } else {
-        child
+        wrapper
             .id()
             .ok_or_else(|| miette::miette!("failed to capture process id for {name}"))?
     };
 
     #[cfg(not(target_os = "linux"))]
-    let pid = child
+    let managed_pid = wrapper
         .id()
         .ok_or_else(|| miette::miette!("failed to capture process id for {name}"))?;
 
-    if let Some(stdout) = child.stdout.take() {
+    #[cfg(target_os = "linux")]
+    let wrapper_pid = wrapper
+        .id()
+        .ok_or_else(|| miette::miette!("failed to capture process id for {name}"))?;
+
+    if let Some(stdout) = wrapper.stdout.take() {
         let name = name.clone();
         log_tasks.push(tokio::spawn(async move {
             stream_logs(stdout, name, false).await;
         }));
     }
-    if let Some(stderr) = child.stderr.take() {
+    if let Some(stderr) = wrapper.stderr.take() {
         let name = name.clone();
         log_tasks.push(tokio::spawn(async move {
             stream_logs(stderr, name, true).await;
         }));
     }
 
-    children.push(ManagedChild { name, child });
-    Ok(pid)
+    children.push(ManagedChild {
+        name,
+        wrapper: Some(wrapper),
+        #[cfg(target_os = "linux")]
+        wrapper_pid,
+        #[cfg(target_os = "linux")]
+        managed_pid,
+    });
+    Ok(managed_pid)
 }
 
 #[cfg(target_os = "linux")]
@@ -2919,24 +3135,63 @@ fn enter_linux_namespace(
 #[cfg(target_os = "linux")]
 async fn read_bubblewrap_child_pid(pipe: BubblewrapInfoPipe) -> Result<u32> {
     drop(pipe.write);
+    set_fd_nonblocking(pipe.read.as_raw_fd())?;
     let read = pipe.read;
-    let raw = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::task::spawn_blocking(move || -> Result<String> {
-            let mut file: fs::File = read.into();
-            let mut raw = String::new();
-            file.read_to_string(&mut raw)
-                .into_diagnostic()
-                .wrap_err("failed to read bubblewrap info payload")?;
-            Ok(raw)
-        }),
-    )
+    tokio::task::spawn_blocking(move || -> Result<u32> {
+        let mut file: fs::File = read.into();
+        let mut raw = String::new();
+        let mut buffer = [0_u8; 512];
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) => {
+                    return parse_bubblewrap_child_pid(raw.as_str()).wrap_err(
+                        "bubblewrap info payload ended before a child pid was available",
+                    );
+                }
+                Ok(read) => {
+                    raw.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                    if let Ok(pid) = parse_bubblewrap_child_pid(raw.as_str()) {
+                        return Ok(pid);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(miette::miette!(
+                            "timed out waiting for bubblewrap info payload"
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(err) => {
+                    return Err(err)
+                        .into_diagnostic()
+                        .wrap_err("failed to read bubblewrap info payload");
+                }
+            }
+        }
+    })
     .await
     .into_diagnostic()
-    .wrap_err("timed out waiting for bubblewrap info payload")?
-    .into_diagnostic()
-    .wrap_err("bubblewrap info reader task failed")??;
-    parse_bubblewrap_child_pid(raw.as_str())
+    .wrap_err("bubblewrap info reader task failed")?
+}
+
+#[cfg(target_os = "linux")]
+fn set_fd_nonblocking(fd: RawFd) -> Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(miette::miette!(
+            "failed to read descriptor flags: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(miette::miette!(
+            "failed to make descriptor nonblocking: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -2962,7 +3217,7 @@ async fn spawn_component_slirp4netns(
     children: &mut Vec<ManagedChild>,
     log_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> Result<()> {
-    let slirp_root = runtime_root.join("network/slirp4netns");
+    let slirp_root = direct_slirp4netns_root();
     fs::create_dir_all(&slirp_root)
         .into_diagnostic()
         .wrap_err_with(|| {
@@ -2971,7 +3226,7 @@ async fn spawn_component_slirp4netns(
                 slirp_root.display()
             )
         })?;
-    let api_socket_path = slirp_root.join(format!("c{}.sock", component.id));
+    let api_socket_path = direct_slirp4netns_api_socket_path(runtime_root, component.id);
     if api_socket_path.exists() {
         fs::remove_file(&api_socket_path)
             .into_diagnostic()
@@ -3015,6 +3270,20 @@ async fn spawn_component_slirp4netns(
                 log_name
             )
         })
+}
+
+#[cfg(target_os = "linux")]
+fn direct_slirp4netns_root() -> PathBuf {
+    env::temp_dir().join("amber-direct-slirp4netns")
+}
+
+#[cfg(target_os = "linux")]
+fn direct_slirp4netns_api_socket_path(runtime_root: &Path, component_id: usize) -> PathBuf {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    runtime_root.hash(&mut hasher);
+    component_id.hash(&mut hasher);
+    let suffix = hasher.finish();
+    direct_slirp4netns_root().join(format!("c{component_id}-{suffix:016x}.sock"))
 }
 
 #[cfg(target_os = "linux")]
@@ -3164,7 +3433,43 @@ async fn supervise_children(children: &mut [ManagedChild]) -> Result<(RuntimeExi
             }
             _ = sleep(DIRECT_CHILD_POLL_INTERVAL) => {
                 for child in children.iter_mut() {
-                    if let Some(status) = child.child.try_wait().into_diagnostic()? {
+                    #[cfg(target_os = "linux")]
+                    if let Some(wrapper) = child.wrapper.as_mut() {
+                        if let Some(status) = wrapper.try_wait().into_diagnostic()? {
+                            child.wrapper = None;
+                            if child.wrapper_pid == child.managed_pid
+                                || !linux_pid_is_alive(child.managed_pid)
+                            {
+                                let exit_code = if status.success() {
+                                    0
+                                } else {
+                                    status.code().unwrap_or(1).max(1)
+                                };
+                                return Ok((
+                                    RuntimeExitReason::ChildExited {
+                                        name: child.name.clone(),
+                                        status,
+                                    },
+                                    exit_code,
+                                ));
+                            }
+                        }
+                    }
+                    #[cfg(target_os = "linux")]
+                    if child.wrapper.is_none() && !linux_pid_is_alive(child.managed_pid) {
+                        let status = synthetic_failure_exit_status();
+                        return Ok((
+                            RuntimeExitReason::ChildExited {
+                                name: child.name.clone(),
+                                status,
+                            },
+                            1,
+                        ));
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    if let Some(wrapper) = child.wrapper.as_mut()
+                        && let Some(status) = wrapper.try_wait().into_diagnostic()?
+                    {
                         let exit_code = if status.success() {
                             0
                         } else {
@@ -3186,18 +3491,21 @@ async fn supervise_children(children: &mut [ManagedChild]) -> Result<(RuntimeExi
 
 async fn terminate_children(children: &mut [ManagedChild]) {
     for child in children.iter_mut() {
-        if child.child.try_wait().ok().flatten().is_some() {
-            continue;
+        #[cfg(target_os = "linux")]
+        {
+            if linux_pid_is_alive(child.managed_pid) {
+                let _ = send_sigterm(child.managed_pid);
+            }
+            if child.wrapper_pid != child.managed_pid {
+                let _ = send_sigterm(child.wrapper_pid);
+            }
         }
-        if let Some(pid) = child.child.id() {
-            #[cfg(unix)]
-            {
-                let _ = send_sigterm(pid);
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = child.child.start_kill();
-            }
+        #[cfg(not(target_os = "linux"))]
+        if let Some(wrapper) = child.wrapper.as_mut()
+            && wrapper.try_wait().ok().flatten().is_none()
+            && let Some(pid) = wrapper.id()
+        {
+            let _ = send_sigterm(pid);
         }
     }
 
@@ -3205,7 +3513,26 @@ async fn terminate_children(children: &mut [ManagedChild]) {
     loop {
         let mut all_exited = true;
         for child in children.iter_mut() {
-            if child.child.try_wait().ok().flatten().is_none() {
+            #[cfg(target_os = "linux")]
+            if let Some(wrapper) = child.wrapper.as_mut()
+                && wrapper.try_wait().ok().flatten().is_some()
+            {
+                child.wrapper = None;
+            }
+            #[cfg(target_os = "linux")]
+            if linux_pid_is_alive(child.managed_pid) {
+                all_exited = false;
+            }
+            #[cfg(target_os = "linux")]
+            if child.wrapper.is_some() {
+                all_exited = false;
+            }
+            #[cfg(not(target_os = "linux"))]
+            if child
+                .wrapper
+                .as_mut()
+                .is_some_and(|wrapper| wrapper.try_wait().ok().flatten().is_none())
+            {
                 all_exited = false;
             }
         }
@@ -3216,12 +3543,26 @@ async fn terminate_children(children: &mut [ManagedChild]) {
     }
 
     for child in children.iter_mut() {
-        if child.child.try_wait().ok().flatten().is_none() {
-            let _ = child.child.start_kill();
+        #[cfg(target_os = "linux")]
+        {
+            if linux_pid_is_alive(child.managed_pid) {
+                let _ = kill_pid_force(child.managed_pid);
+            }
+            if child.wrapper_pid != child.managed_pid {
+                let _ = kill_pid_force(child.wrapper_pid);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        if let Some(wrapper) = child.wrapper.as_mut()
+            && wrapper.try_wait().ok().flatten().is_none()
+        {
+            let _ = wrapper.start_kill();
         }
     }
     for child in children.iter_mut() {
-        let _ = child.child.wait().await;
+        if let Some(mut wrapper) = child.wrapper.take() {
+            let _ = wrapper.wait().await;
+        }
     }
 }
 
@@ -3230,6 +3571,32 @@ fn send_sigterm(pid: u32) -> std::result::Result<(), ()> {
     let pid = i32::try_from(pid).map_err(|_| ())?;
     let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
     if rc == 0 { Ok(()) } else { Err(()) }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pid_is_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(target_os = "linux")]
+fn kill_pid_force(pid: u32) -> std::result::Result<(), ()> {
+    let pid = i32::try_from(pid).map_err(|_| ())?;
+    let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
+    if rc == 0 { Ok(()) } else { Err(()) }
+}
+
+#[cfg(all(target_os = "linux", unix))]
+fn synthetic_failure_exit_status() -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    std::process::ExitStatus::from_raw(1 << 8)
 }
 
 #[derive(Debug)]
@@ -3464,6 +3831,11 @@ impl DirectSandbox {
                 profiles_dir,
                 next_profile_id,
             } => {
+                if !matches!(spec.network, ProcessNetwork::Host) {
+                    return Err(miette::miette!(
+                        "macOS direct runtime does not support non-host process networking"
+                    ));
+                }
                 if spec
                     .bind_mounts
                     .iter()
@@ -4661,6 +5033,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn component_program_read_only_mounts_resolve_parent_escape_paths() {
         let component = DirectComponentPlan {
@@ -5106,8 +5479,22 @@ mod tests {
             .expect("child should spawn");
         let mut children = vec![ManagedChild {
             name: "partial-startup-child".to_string(),
-            child,
+            wrapper: Some(child),
+            #[cfg(target_os = "linux")]
+            wrapper_pid: 0,
+            #[cfg(target_os = "linux")]
+            managed_pid: 0,
         }];
+        #[cfg(target_os = "linux")]
+        {
+            let pid = children[0]
+                .wrapper
+                .as_ref()
+                .and_then(tokio::process::Child::id)
+                .expect("child pid should be available");
+            children[0].wrapper_pid = pid;
+            children[0].managed_pid = pid;
+        }
 
         cleanup_direct_runtime(
             &mut children,
@@ -5144,14 +5531,9 @@ mod tests {
             "runtime workspace should be removed"
         );
 
-        let status = children[0]
-            .child
-            .wait()
-            .await
-            .expect("child should be reaped after cleanup");
         assert!(
-            !status.success(),
-            "cleanup should terminate partial-startup child"
+            children[0].wrapper.is_none(),
+            "cleanup should reap partial-startup child"
         );
     }
 
@@ -5165,8 +5547,22 @@ mod tests {
             .expect("child should spawn");
         let mut children = vec![ManagedChild {
             name: "ok-child".to_string(),
-            child,
+            wrapper: Some(child),
+            #[cfg(target_os = "linux")]
+            wrapper_pid: 0,
+            #[cfg(target_os = "linux")]
+            managed_pid: 0,
         }];
+        #[cfg(target_os = "linux")]
+        {
+            let pid = children[0]
+                .wrapper
+                .as_ref()
+                .and_then(tokio::process::Child::id)
+                .expect("child pid should be available");
+            children[0].wrapper_pid = pid;
+            children[0].managed_pid = pid;
+        }
 
         let (reason, exit_code) = supervise_children(&mut children)
             .await
@@ -5191,8 +5587,22 @@ mod tests {
             .expect("child should spawn");
         let mut children = vec![ManagedChild {
             name: "fail-child".to_string(),
-            child,
+            wrapper: Some(child),
+            #[cfg(target_os = "linux")]
+            wrapper_pid: 0,
+            #[cfg(target_os = "linux")]
+            managed_pid: 0,
         }];
+        #[cfg(target_os = "linux")]
+        {
+            let pid = children[0]
+                .wrapper
+                .as_ref()
+                .and_then(tokio::process::Child::id)
+                .expect("child pid should be available");
+            children[0].wrapper_pid = pid;
+            children[0].managed_pid = pid;
+        }
 
         let (reason, exit_code) = supervise_children(&mut children)
             .await
@@ -5230,6 +5640,8 @@ mod tests {
             args: vec!["ok".to_string()],
             env: BTreeMap::new(),
             work_dir: PathBuf::from("/tmp/amber-work"),
+            sandbox: ProcessSandbox::Sandboxed,
+            #[cfg(target_os = "linux")]
             read_only_mounts: Vec::new(),
             writable_dirs: Vec::new(),
             bind_dirs: Vec::new(),

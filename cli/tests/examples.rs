@@ -10,7 +10,47 @@ mod example_catalog;
 #[test]
 fn examples_check_deny_warnings() {
     let examples_dir = examples_dir();
-    let mut manifests: Vec<PathBuf> = collect_examples()
+    let examples = collect_examples();
+    for example in &examples {
+        assert!(
+            !example.summary.trim().is_empty(),
+            "example {} should have a non-empty summary",
+            example.name
+        );
+        assert!(
+            example.dir.starts_with(&examples_dir),
+            "example {} dir {} should live under {}",
+            example.name,
+            example.dir.display(),
+            examples_dir.display()
+        );
+        assert!(
+            example.dir.is_dir(),
+            "example {} dir {} should exist",
+            example.name,
+            example.dir.display()
+        );
+        assert!(
+            !example.files.is_empty(),
+            "example {} should contain at least one non-README file",
+            example.name
+        );
+        for file in &example.files {
+            assert!(
+                file.starts_with(&example.dir),
+                "example file {} should live under {}",
+                file.display(),
+                example.dir.display()
+            );
+            assert!(
+                file.is_file(),
+                "example file {} should exist",
+                file.display()
+            );
+        }
+    }
+
+    let mut manifests: Vec<PathBuf> = examples
         .into_iter()
         .map(|example| example.root_manifest)
         .collect();

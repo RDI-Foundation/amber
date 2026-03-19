@@ -5,7 +5,7 @@ use std::{
     fs::{self, File},
     hash::{Hash as _, Hasher as _},
     io::{Seek as _, SeekFrom, Write as _},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitStatus, Stdio},
 };
@@ -23,7 +23,7 @@ use amber_config::{
 };
 use amber_mesh::{
     InboundTarget, MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MESH_PROVISION_PLAN_VERSION,
-    MeshConfigPublic, MeshIdentity, MeshIdentityPublic, MeshIdentitySecret, MeshPeer,
+    MeshConfigPublic, MeshIdentity, MeshIdentityPublic, MeshIdentitySecret, MeshPeer, MeshProtocol,
     MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTarget,
 };
 use amber_template::{
@@ -41,14 +41,18 @@ use tokio::{
     time::{Duration, Instant, sleep, timeout},
 };
 
+use crate::tcp_readiness::{wait_for_http_response, wait_for_stable_endpoint};
+
 const VM_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const VM_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(15);
 const VM_GUESTFWD_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const VM_QMP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const TCG_VM_STARTUP_TIMEOUT: Duration = Duration::from_secs(720);
 
 const VM_RUNTIME_DISK_LABEL: [u8; 11] = *b"AMBERRUN   ";
 const VM_RUNTIME_DISK_SIZE: u64 = 64 * 1024 * 1024;
-const VM_HOST_GUESTFWD_IP: &str = "10.0.2.100";
+pub(crate) const VM_HOST_GUESTFWD_IP: &str = "10.0.2.100";
+const QEMU_VIRTIO_NET_DEVICE: &str = "virtio-net-pci,netdev=net0,rombar=0";
 
 const MANAGED_PROCESS_PATH: &str = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/\
                                     local/sbin:/usr/bin:/bin:/usr/sbin:/sbin";
@@ -135,10 +139,11 @@ enum VmArch {
     X86_64,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QemuAccel {
+    #[cfg(target_os = "macos")]
     Hvf,
+    #[cfg(target_os = "linux")]
     Kvm,
     Tcg,
 }
@@ -220,7 +225,6 @@ pub(crate) async fn run_vm_init(
         }
 
         let port_assignments = assign_vm_runtime_ports(&runtime_root, &vm_plan, router_mesh_port)?;
-        write_vm_runtime_state(&plan_root, &port_assignments.state)?;
 
         let router_binary = resolve_host_binary("amber-router")?;
         if let Some(router) = vm_plan.router.as_ref() {
@@ -309,8 +313,14 @@ pub(crate) async fn run_vm_init(
                 &mut log_tasks,
             )
             .await?;
+            wait_for_endpoint_forwards(
+                component,
+                &runtime_root,
+                vm_endpoint_forward_ready_timeout(),
+            )?;
         }
 
+        write_vm_runtime_state(&plan_root, &port_assignments.state)?;
         supervise_children(&mut children).await
     }
     .await;
@@ -1155,28 +1165,59 @@ fn wait_for_guestfwd_targets(
     };
     for ports in slot_ports.values() {
         for port in ports {
-            wait_for_local_listener(*port, timeout).map_err(|err| {
-                miette::miette!(
-                    "guestfwd target 127.0.0.1:{} for component {} did not become ready: {err}",
-                    port,
-                    component.moniker
-                )
-            })?;
+            wait_for_stable_endpoint(SocketAddr::from(([127, 0, 0, 1], *port)), timeout).map_err(
+                |err| {
+                    miette::miette!(
+                        "guestfwd target 127.0.0.1:{} for component {} did not become ready: {err}",
+                        port,
+                        component.moniker
+                    )
+                },
+            )?;
         }
     }
     Ok(())
 }
 
-fn wait_for_local_listener(port: u16, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    while Instant::now() < deadline {
-        if TcpStream::connect(addr).is_ok() {
-            return Ok(());
+fn wait_for_endpoint_forwards(
+    component: &VmComponentPlan,
+    runtime_root: &Path,
+    timeout: Duration,
+) -> Result<()> {
+    let config = read_mesh_config_public(&runtime_root.join(&component.mesh_config_path))?;
+    for route in config.inbound {
+        let InboundTarget::Local { port: host_port } = route.target else {
+            continue;
+        };
+        let addr = SocketAddr::from(([127, 0, 0, 1], host_port));
+        match route.protocol {
+            MeshProtocol::Http => wait_for_http_response(addr, timeout).map_err(|err| {
+                miette::miette!(
+                    "forwarded HTTP endpoint 127.0.0.1:{} for component {} did not become ready: \
+                     {err}",
+                    host_port,
+                    component.moniker
+                )
+            })?,
+            MeshProtocol::Tcp => wait_for_stable_endpoint(addr, timeout).map_err(|err| {
+                miette::miette!(
+                    "forwarded TCP endpoint 127.0.0.1:{} for component {} did not become ready: \
+                     {err}",
+                    host_port,
+                    component.moniker
+                )
+            })?,
         }
-        std::thread::sleep(Duration::from_millis(50));
     }
-    Err(miette::miette!("timeout after {:?}", timeout))
+    Ok(())
+}
+
+fn vm_endpoint_forward_ready_timeout() -> Duration {
+    if vm_uses_tcg_accel() {
+        TCG_VM_STARTUP_TIMEOUT
+    } else {
+        Duration::from_secs(30)
+    }
 }
 
 fn build_vm_launch_plan(
@@ -1300,11 +1341,11 @@ fn build_vm_launch_plan(
     command.extend(qemu_machine_args(host.arch, host.accel)?);
     command.extend([
         "-device".to_string(),
-        "virtio-rng-pci".to_string(),
+        "virtio-rng-pci,rombar=0".to_string(),
         "-netdev".to_string(),
         netdev_arg,
         "-device".to_string(),
-        "virtio-net-pci,netdev=net0".to_string(),
+        QEMU_VIRTIO_NET_DEVICE.to_string(),
     ]);
     push_qemu_block_device(
         &mut command,
@@ -1370,7 +1411,7 @@ fn push_qemu_block_device(
         path.display()
     ));
     command.push("-device".to_string());
-    let mut device = format!("virtio-blk-pci,drive={id}");
+    let mut device = format!("virtio-blk-pci,drive={id},rombar=0");
     if let Some(serial) = serial {
         device.push_str(",serial=");
         device.push_str(serial);
@@ -2175,7 +2216,10 @@ fn qemu_machine_args(arch: VmArch, accel: QemuAccel) -> Result<Vec<String>> {
             "virt,highmem=off".to_string(),
             "-cpu".to_string(),
             match accel {
-                QemuAccel::Hvf | QemuAccel::Kvm => "host".to_string(),
+                #[cfg(target_os = "macos")]
+                QemuAccel::Hvf => "host".to_string(),
+                #[cfg(target_os = "linux")]
+                QemuAccel::Kvm => "host".to_string(),
                 QemuAccel::Tcg => "max".to_string(),
             },
         ],
@@ -2184,13 +2228,18 @@ fn qemu_machine_args(arch: VmArch, accel: QemuAccel) -> Result<Vec<String>> {
             "q35".to_string(),
             "-cpu".to_string(),
             match accel {
-                QemuAccel::Hvf | QemuAccel::Kvm => "host".to_string(),
+                #[cfg(target_os = "macos")]
+                QemuAccel::Hvf => "host".to_string(),
+                #[cfg(target_os = "linux")]
+                QemuAccel::Kvm => "host".to_string(),
                 QemuAccel::Tcg => "max".to_string(),
             },
         ],
     };
     args.extend(match accel {
+        #[cfg(target_os = "macos")]
         QemuAccel::Hvf => vec!["-accel".to_string(), "hvf".to_string()],
+        #[cfg(target_os = "linux")]
         QemuAccel::Kvm => vec!["-accel".to_string(), "kvm".to_string()],
         QemuAccel::Tcg => vec!["-accel".to_string(), "tcg".to_string()],
     });
@@ -2313,6 +2362,10 @@ fn host_arch() -> Result<VmArch> {
             other
         )),
     }
+}
+
+pub(crate) fn vm_uses_tcg_accel() -> bool {
+    matches!(detect_qemu_accel(), QemuAccel::Tcg)
 }
 
 fn detect_qemu_accel() -> QemuAccel {

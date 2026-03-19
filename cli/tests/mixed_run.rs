@@ -1,5 +1,14 @@
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
+#[path = "test_support/cloud_image.rs"]
+mod cloud_image_support;
+#[path = "test_support/outputs_root.rs"]
+mod outputs_root_support;
+#[path = "test_support/target_dir.rs"]
+mod target_dir_support;
+#[path = "test_support/workspace_root.rs"]
+mod workspace_root_support;
+
 use std::{
     collections::BTreeSet,
     env, fs,
@@ -12,7 +21,11 @@ use std::{
 };
 
 use amber_images::{AMBER_HELPER, AMBER_PROVISIONER, AMBER_ROUTER};
+use cloud_image_support::default_host_arch_cloud_image_filename;
+use outputs_root_support::cli_test_outputs_root;
 use serde_json::{Value, json};
+use target_dir_support::cargo_target_dir;
+use workspace_root_support::workspace_root;
 
 const COMMON_HTTP_APP: &str = r#"import json
 import os
@@ -110,15 +123,8 @@ class Handler(BaseHTTPRequestHandler):
 ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 "#;
 
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("cli crate should live under the workspace root")
-        .to_path_buf()
-}
-
 fn outputs_root() -> PathBuf {
-    workspace_root().join("target").join("cli-test-outputs")
+    cli_test_outputs_root(&workspace_root())
 }
 
 struct TestTempDir {
@@ -138,20 +144,6 @@ impl TestTempDir {
     }
 }
 
-fn cargo_target_dir() -> PathBuf {
-    match env::var_os("CARGO_TARGET_DIR") {
-        Some(dir) => {
-            let dir = PathBuf::from(dir);
-            if dir.is_absolute() {
-                dir
-            } else {
-                workspace_root().join(dir)
-            }
-        }
-        None => workspace_root().join("target"),
-    }
-}
-
 fn runtime_bin_dir() -> &'static PathBuf {
     static BIN_DIR: OnceLock<PathBuf> = OnceLock::new();
     BIN_DIR.get_or_init(|| {
@@ -163,6 +155,8 @@ fn runtime_bin_dir() -> &'static PathBuf {
             .arg("amber-cli")
             .arg("-p")
             .arg("amber-router")
+            .arg("-p")
+            .arg("amber-helper")
             .output()
             .expect("failed to build amber runtime binaries");
         assert!(
@@ -171,22 +165,14 @@ fn runtime_bin_dir() -> &'static PathBuf {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        cargo_target_dir().join("debug")
+        cargo_target_dir(&workspace_root()).join("debug")
     })
 }
 
 fn mixed_run_base_image() -> PathBuf {
     env::var_os("AMBER_MIXED_RUN_BASE_IMAGE")
         .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_root().join(default_mixed_run_base_image_filename()))
-}
-
-fn default_mixed_run_base_image_filename() -> &'static str {
-    match env::consts::ARCH {
-        "aarch64" => "ubuntu-24.04-minimal-cloudimg-arm64.img",
-        "x86_64" => "ubuntu-24.04-minimal-cloudimg-amd64.img",
-        other => panic!("mixed-run VM tests support only aarch64 and x86_64 hosts, found {other}"),
-    }
+        .unwrap_or_else(|| workspace_root().join(default_host_arch_cloud_image_filename()))
 }
 
 fn temp_output_dir(prefix: &str) -> TestTempDir {
@@ -499,10 +485,14 @@ fn ensure_docker_image(tag: &str, dockerfile: &Path) {
         return;
     }
 
-    let status = Command::new("docker")
-        .arg("buildx")
-        .arg("build")
-        .arg("--load")
+    let mut command = Command::new("docker");
+    if docker_supports_buildx() {
+        command.arg("buildx").arg("build").arg("--load");
+    } else {
+        command.env("DOCKER_BUILDKIT", "1");
+        command.arg("build");
+    }
+    let status = command
         .arg("-t")
         .arg(tag)
         .arg("-f")
@@ -511,6 +501,17 @@ fn ensure_docker_image(tag: &str, dockerfile: &Path) {
         .status()
         .unwrap_or_else(|err| panic!("failed to build {tag}: {err}"));
     assert!(status.success(), "docker build failed for {tag}");
+}
+
+fn docker_supports_buildx() -> bool {
+    static READY: OnceLock<bool> = OnceLock::new();
+    *READY.get_or_init(|| {
+        Command::new("docker")
+            .arg("buildx")
+            .arg("version")
+            .status()
+            .is_ok_and(|status| status.success())
+    })
 }
 
 fn ensure_internal_images() {
@@ -596,6 +597,7 @@ struct RunHandle {
     run_root: PathBuf,
     receipt: Value,
     storage_root: PathBuf,
+    command_env: Vec<(String, String)>,
     stopped: bool,
 }
 
@@ -622,6 +624,7 @@ impl RunHandle {
             .arg(&self.run_id)
             .arg("--storage-root")
             .arg(&self.storage_root)
+            .envs(self.command_env.iter().map(|(key, value)| (key, value)))
             .output()
             .expect("failed to run amber stop");
         assert!(
@@ -644,6 +647,7 @@ impl Drop for RunHandle {
             .arg(&self.run_id)
             .arg("--storage-root")
             .arg(&self.storage_root)
+            .envs(self.command_env.iter().map(|(key, value)| (key, value)))
             .output();
         self.stopped = true;
     }
@@ -669,6 +673,16 @@ fn run_manifest_with_args(
     storage_root: &Path,
     extra_args: &[&str],
 ) -> RunHandle {
+    run_manifest_with_args_and_env(manifest, placement, storage_root, extra_args, &[])
+}
+
+fn run_manifest_with_args_and_env(
+    manifest: &Path,
+    placement: &Path,
+    storage_root: &Path,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> RunHandle {
     let output = amber_command()
         .arg("run")
         .arg(manifest)
@@ -677,6 +691,7 @@ fn run_manifest_with_args(
         .arg("--storage-root")
         .arg(storage_root)
         .args(extra_args)
+        .envs(extra_env.iter().copied())
         .output()
         .expect("failed to run amber run");
     assert!(
@@ -693,12 +708,25 @@ fn run_manifest_with_args(
         run_root,
         receipt,
         storage_root: storage_root.to_path_buf(),
+        command_env: extra_env
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect(),
         stopped: false,
     }
 }
 
 fn run_manifest(manifest: &Path, placement: &Path, storage_root: &Path) -> RunHandle {
     run_manifest_with_args(manifest, placement, storage_root, &[])
+}
+
+fn run_manifest_with_env(
+    manifest: &Path,
+    placement: &Path,
+    storage_root: &Path,
+    extra_env: &[(&str, &str)],
+) -> RunHandle {
+    run_manifest_with_args_and_env(manifest, placement, storage_root, &[], extra_env)
 }
 
 fn run_manifest_detached(manifest: &Path, placement: &Path, storage_root: &Path) -> RunHandle {
@@ -1695,11 +1723,17 @@ fn mixed_run_five_site_startup_state_and_teardown() {
     let kubeconfig = temp.path().join("kubeconfig");
     let kind_cluster = KindCluster::from_env_or_create(&kubeconfig);
     ensure_kind_internal_images(&kind_cluster);
+    let kubeconfig_env = kind_cluster.kubeconfig.display().to_string();
     let adversarial_port = pick_free_port();
     let _host_server = HostHttpServer::start(adversarial_port);
     let fixture = write_five_site_fixture(temp.path(), &kind_cluster, adversarial_port);
     let storage_root = temp.path().join("state");
-    let mut run = run_manifest(&fixture.manifest, &fixture.placement, &storage_root);
+    let mut run = run_manifest_with_env(
+        &fixture.manifest,
+        &fixture.placement,
+        &storage_root,
+        &[("KUBECONFIG", &kubeconfig_env)],
+    );
 
     let run_plan = read_json(&run.run_root.join("run-plan.json"));
     assert_eq!(
@@ -2232,9 +2266,15 @@ fn mixed_run_recovers_when_kubernetes_site_is_temporarily_unreachable() {
     let kubeconfig = temp.path().join("kubeconfig");
     let kind_cluster = KindCluster::from_env_or_create(&kubeconfig);
     ensure_kind_internal_images(&kind_cluster);
+    let kubeconfig_env = kind_cluster.kubeconfig.display().to_string();
     let fixture = write_single_site_kind_fixture(temp.path(), &kind_cluster);
     let storage_root = temp.path().join("state");
-    let mut run = run_manifest(&fixture.manifest, &fixture.placement, &storage_root);
+    let mut run = run_manifest_with_env(
+        &fixture.manifest,
+        &fixture.placement,
+        &storage_root,
+        &[("KUBECONFIG", &kubeconfig_env)],
+    );
 
     let kind_state = wait_for_state_status(
         &run.run_root,

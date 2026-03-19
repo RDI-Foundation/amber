@@ -5,7 +5,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct Example {
     pub(crate) name: String,

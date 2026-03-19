@@ -30,7 +30,10 @@ use url::Url;
 
 use crate::{
     direct_current_control_socket_path, direct_runtime_state_path,
-    vm_runtime::{VmRuntimeState, vm_current_control_socket_path},
+    tcp_readiness::endpoint_accepts_stable_connection,
+    vm_runtime::{
+        TCG_VM_STARTUP_TIMEOUT, VmRuntimeState, vm_current_control_socket_path, vm_uses_tcg_accel,
+    },
 };
 
 const RECEIPT_SCHEMA: &str = "amber.run.receipt";
@@ -46,7 +49,6 @@ const OTLP_SINK_PLAN_VERSION: u32 = 1;
 const OTELCOL_UPSTREAM_ENV: &str = "AMBER_OTEL_UPSTREAM_OTLP_HTTP_ENDPOINT";
 const TEST_WAVE_DELAY_ENV: &str = "AMBER_TEST_MIXED_RUN_AFTER_WAVE_DELAY_MS";
 
-const SITE_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const ROUTER_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const RESTART_BACKOFF: Duration = Duration::from_secs(1);
@@ -318,7 +320,7 @@ pub(crate) async fn run_run_plan_with_id(
     let test_wave_delay = test_wave_delay()?;
 
     let result = async {
-        for (wave_idx, wave) in run_plan.startup_waves.iter().enumerate() {
+        for wave in &run_plan.startup_waves {
             for site_id in wave {
                 let site_plan = run_plan
                     .sites
@@ -418,9 +420,7 @@ pub(crate) async fn run_run_plan_with_id(
                 started_site_receipts.insert(site_id.clone(), launched.receipt.clone());
                 launched_by_site.insert(site_id.clone(), launched);
             }
-            if wave_idx + 1 < run_plan.startup_waves.len()
-                && let Some(delay) = test_wave_delay
-            {
+            if let Some(delay) = test_wave_delay {
                 sleep(delay).await;
             }
         }
@@ -1158,7 +1158,7 @@ async fn wait_for_site_ready(
     supervisor: &mut SupervisorChild,
     mesh_scope: &str,
 ) -> Result<LaunchedSite> {
-    let deadline = Instant::now() + SITE_READY_TIMEOUT;
+    let deadline = Instant::now() + site_ready_timeout(site_plan);
     let state_path = site_state_path(site_state_root.parent().unwrap_or(site_state_root), site_id);
     loop {
         if state_path.is_file() {
@@ -1216,6 +1216,14 @@ async fn wait_for_site_ready(
             ));
         }
         sleep(Duration::from_millis(200)).await;
+    }
+}
+
+fn site_ready_timeout(site_plan: &RunSitePlan) -> Duration {
+    if matches!(site_plan.site.kind, SiteKind::Vm) && vm_uses_tcg_accel() {
+        TCG_VM_STARTUP_TIMEOUT
+    } else {
+        Duration::from_secs(120)
     }
 }
 
@@ -1560,6 +1568,9 @@ async fn try_discover_vm_site(
         if !router_mesh_listener_ready(router_addr).await {
             return Ok(None);
         }
+        if !vm_endpoint_forwards_ready(&state) {
+            return Ok(None);
+        }
         return Ok(Some(RouterDiscovery {
             control_endpoint,
             router_identity,
@@ -1567,6 +1578,18 @@ async fn try_discover_vm_site(
         }));
     }
     Ok(None)
+}
+
+fn vm_endpoint_forwards_ready(state: &VmRuntimeState) -> bool {
+    state
+        .endpoint_forwards_by_component
+        .values()
+        .flat_map(|ports| ports.values().copied())
+        .all(|port| forwarded_endpoint_ready(SocketAddr::from(([127, 0, 0, 1], port))))
+}
+
+fn forwarded_endpoint_ready(addr: SocketAddr) -> bool {
+    endpoint_accepts_stable_connection(addr, Duration::from_millis(250), Duration::from_millis(250))
 }
 
 async fn try_discover_compose_site(plan: &SiteSupervisorPlan) -> Result<Option<RouterDiscovery>> {
@@ -1803,8 +1826,10 @@ fn kubectl_command(context: Option<&str>) -> Command {
 fn ensure_kubernetes_namespace(plan: &SiteSupervisorPlan) -> Result<()> {
     let namespace = required_str(plan.kubernetes_namespace.as_deref(), "kubernetes namespace")?;
     let deadline = Instant::now() + KUBERNETES_NAMESPACE_READY_TIMEOUT;
+    let context = plan.context.as_deref();
+    let mut last_error = None::<String>;
     loop {
-        let output = kubectl_command(plan.context.as_deref())
+        let output = kubectl_command(context)
             .arg("get")
             .arg("namespace")
             .arg(namespace)
@@ -1823,29 +1848,49 @@ fn ensure_kubernetes_namespace(plan: &SiteSupervisorPlan) -> Result<()> {
             if !is_terminating {
                 return Ok(());
             }
-        } else if Instant::now() >= deadline {
-            break;
         } else {
-            let status = kubectl_command(plan.context.as_deref())
-                .arg("create")
-                .arg("namespace")
-                .arg(namespace)
-                .status()
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to create kubernetes namespace `{namespace}`"))?;
-            if status.success() {
-                return Ok(());
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.contains("context") && stderr.contains("does not exist") {
+                let context = context.unwrap_or("<current>");
+                return Err(miette::miette!(
+                    "kubernetes context `{context}` is not available: {stderr}"
+                ));
+            }
+            if stderr.contains("(NotFound)") || stderr.contains("not found") {
+                let create_output = kubectl_command(context)
+                    .arg("create")
+                    .arg("namespace")
+                    .arg(namespace)
+                    .output()
+                    .into_diagnostic()
+                    .wrap_err_with(|| {
+                        format!("failed to create kubernetes namespace `{namespace}`")
+                    })?;
+                if create_output.status.success() {
+                    return Ok(());
+                }
+                last_error = Some(
+                    String::from_utf8_lossy(&create_output.stderr)
+                        .trim()
+                        .to_string(),
+                );
+            } else if !stderr.is_empty() {
+                last_error = Some(stderr);
             }
         }
         if Instant::now() >= deadline {
+            let detail = last_error
+                .as_deref()
+                .filter(|detail| !detail.is_empty())
+                .map(|detail| format!(": {detail}"))
+                .unwrap_or_default();
             return Err(miette::miette!(
-                "kubernetes namespace `{namespace}` is still terminating after {}s",
+                "failed to prepare kubernetes namespace `{namespace}` within {}s{detail}",
                 KUBERNETES_NAMESPACE_READY_TIMEOUT.as_secs()
             ));
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    unreachable!("deadline check should have returned")
 }
 
 fn compose_project_name(run_id: &str, site_id: &str) -> String {
@@ -2618,4 +2663,37 @@ fn send_manager_observability(endpoint: &str, path: &str, body: &[u8]) -> Result
         .into_diagnostic()
         .wrap_err("failed to write manager observability request body")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forwarded_endpoint_ready_accepts_open_connection() {
+        let listener =
+            TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let handle = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("listener should accept");
+            std::thread::sleep(Duration::from_millis(500));
+        });
+
+        assert!(forwarded_endpoint_ready(addr));
+        handle.join().expect("listener thread should finish");
+    }
+
+    #[test]
+    fn forwarded_endpoint_ready_rejects_reset_connection() {
+        let listener =
+            TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("listener should accept");
+            drop(stream);
+        });
+
+        assert!(!forwarded_endpoint_ready(addr));
+        handle.join().expect("listener thread should finish");
+    }
 }

@@ -35,6 +35,7 @@ const VM_RUNTIME_STATE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DIRECT_RUNTIME_STATE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const EXPORT_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(30);
 const ROUTER_IDENTITY_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+const CONTROL_CONTAINER_REQUEST_TIMEOUT_SECS: u64 = 2;
 const CONTROL_CURL_IMAGE: &str = "curlimages/curl:8.12.1";
 const CONTROL_SOCKET_MOUNT_DIR: &str = "/amber/control";
 const COMPOSE_PROJECT_NAME_ENV: &str = "COMPOSE_PROJECT_NAME";
@@ -1540,6 +1541,10 @@ async fn send_control_request_via_mount(
             .arg(CONTROL_CURL_IMAGE)
             .arg("--unix-socket")
             .arg(socket_path)
+            .arg("--connect-timeout")
+            .arg(CONTROL_CONTAINER_REQUEST_TIMEOUT_SECS.to_string())
+            .arg("--max-time")
+            .arg(CONTROL_CONTAINER_REQUEST_TIMEOUT_SECS.to_string())
             .arg("-sS")
             .arg("-i")
             .arg("-X")
@@ -1594,6 +1599,8 @@ fn is_retryable_container_connect_error(stderr: &str) -> bool {
     lower.contains("could not connect to server")
         || lower.contains("failed to connect")
         || lower.contains("connection refused")
+        || lower.contains("timed out")
+        || lower.contains("operation timed out")
 }
 
 fn parse_control_request(

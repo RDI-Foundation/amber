@@ -1,5 +1,12 @@
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
+#[path = "test_support/cloud_image.rs"]
+mod cloud_image_support;
+#[path = "test_support/target_dir.rs"]
+mod target_dir_support;
+#[path = "test_support/workspace_root.rs"]
+mod workspace_root_support;
+
 use std::{
     env, fs,
     io::{Read, Write},
@@ -10,6 +17,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use cloud_image_support::default_host_arch_cloud_image_filename;
+use target_dir_support::cargo_target_dir;
+use workspace_root_support::workspace_root;
+
 struct SpawnedChild {
     child: std::process::Child,
     log_path: PathBuf,
@@ -18,27 +29,6 @@ struct SpawnedChild {
 fn pick_free_port() -> u16 {
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
     listener.local_addr().unwrap().port()
-}
-
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("cli crate should live under the workspace root")
-        .to_path_buf()
-}
-
-fn cargo_target_dir(workspace_root: &Path) -> PathBuf {
-    match env::var_os("CARGO_TARGET_DIR") {
-        Some(dir) => {
-            let dir = PathBuf::from(dir);
-            if dir.is_absolute() {
-                dir
-            } else {
-                workspace_root.join(dir)
-            }
-        }
-        None => workspace_root.join("target"),
-    }
 }
 
 fn ensure_runtime_binaries_built(workspace_root: &Path) -> PathBuf {
@@ -66,15 +56,7 @@ fn ensure_runtime_binaries_built(workspace_root: &Path) -> PathBuf {
 fn vm_base_image(workspace_root: &Path) -> PathBuf {
     env::var_os("AMBER_VM_SMOKE_BASE_IMAGE")
         .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_root.join(default_vm_smoke_base_image_filename()))
-}
-
-fn default_vm_smoke_base_image_filename() -> &'static str {
-    match env::consts::ARCH {
-        "aarch64" => "ubuntu-24.04-minimal-cloudimg-arm64.img",
-        "x86_64" => "ubuntu-24.04-minimal-cloudimg-amd64.img",
-        other => panic!("vm smoke test supports only aarch64 and x86_64 hosts, found {other}"),
-    }
+        .unwrap_or_else(|| workspace_root.join(default_host_arch_cloud_image_filename()))
 }
 
 fn smoke_timeout() -> Duration {
@@ -468,7 +450,7 @@ fn assert_vm_run(
 fn vm_smoke_network_storage_and_migration_example() {
     let workspace_root = workspace_root();
     let base_image = vm_base_image(&workspace_root);
-    let default_image = default_vm_smoke_base_image_filename();
+    let default_image = default_host_arch_cloud_image_filename();
     assert!(
         base_image.is_file(),
         "missing VM smoke base image {}; set AMBER_VM_SMOKE_BASE_IMAGE or place {} at the \
