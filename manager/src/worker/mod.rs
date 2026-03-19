@@ -384,14 +384,17 @@ impl OperationWorker {
                 )
                 .await;
 
-                if let Some(operation) = operation.as_ref()
-                    && let Err(err) = self
-                        .state
-                        .store
-                        .mark_operation_succeeded(&operation.id, result.as_ref(), now_ms())
-                        .await
-                {
-                    error!("failed to mark operation {} succeeded: {err}", operation.id);
+                if let Some(operation) = operation.as_ref() {
+                    self.retry_store_until_ok(
+                        || async {
+                            self.state
+                                .store
+                                .mark_operation_succeeded(&operation.id, result.as_ref(), now_ms())
+                                .await
+                        },
+                        &format!("mark operation {} succeeded", operation.id),
+                    )
+                    .await;
                 }
             }
             Err(err) => self.handle_work_error(&work, operation.as_ref(), err).await,

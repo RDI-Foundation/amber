@@ -175,6 +175,15 @@ impl RuntimeSupervisor {
             #[cfg(test)]
             RuntimeBackend::Fake { state } => {
                 let mut state = state.lock().await;
+                if let Some(remaining) = state.fail_next_stop.get_mut(scenario_id)
+                    && *remaining > 0
+                {
+                    *remaining -= 1;
+                    return Err(RuntimeError::Compose(format!(
+                        "fake runtime stop failure for {}",
+                        scenario_id
+                    )));
+                }
                 state.running_specs.remove(scenario_id);
                 state.health_failures.remove(scenario_id);
                 Ok(())
@@ -619,6 +628,7 @@ struct FakeRuntimeState {
     running_specs: HashMap<String, RunningScenarioSpec>,
     health_failures: HashMap<String, String>,
     fail_next_apply: HashMap<String, u32>,
+    fail_next_stop: HashMap<String, u32>,
     fail_any_apply_remaining: u32,
     apply_attempt_counts: HashMap<String, u32>,
     apply_counts: HashMap<String, u32>,
@@ -634,6 +644,14 @@ pub(crate) struct FakeRuntimeController {
 impl FakeRuntimeController {
     pub(crate) async fn fail_next_apply_any(&self, count: u32) {
         self.state.lock().await.fail_any_apply_remaining = count;
+    }
+
+    pub(crate) async fn fail_next_stop(&self, scenario_id: &str, count: u32) {
+        self.state
+            .lock()
+            .await
+            .fail_next_stop
+            .insert(scenario_id.to_string(), count);
     }
 
     pub(crate) async fn mark_unhealthy(&self, scenario_id: &str, message: impl Into<String>) {

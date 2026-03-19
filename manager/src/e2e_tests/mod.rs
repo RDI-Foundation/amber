@@ -718,6 +718,38 @@ async fn health_monitor_restarts_unhealthy_provider_without_rewiring_consumer() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn failed_pause_keeps_consumer_blocking_provider_delete() {
+    let harness = TestHarness::new(ManagerFileConfig::default()).await;
+    let (provider, consumer) = create_bound_provider_and_consumer(&harness).await;
+
+    harness
+        .runtime
+        .fail_next_stop(&consumer.scenario_id, 1)
+        .await;
+
+    let paused: EnqueueOperationResponse = harness
+        .post_empty(&format!("/v1/scenarios/{}/pause", consumer.scenario_id))
+        .await;
+    harness
+        .wait_until("pause entered backoff", Duration::from_secs(10), || async {
+            let operation: crate::domain::OperationStatusResponse = harness
+                .get_json(&format!("/v1/operations/{}", paused.operation_id))
+                .await;
+            operation.status == OperationStatus::Queued && operation.phase == "backing_off"
+        })
+        .await;
+
+    let consumer_detail = harness.scenario_detail(&consumer.scenario_id).await;
+    assert_eq!(consumer_detail.desired_state, DesiredState::Paused);
+    assert_eq!(consumer_detail.observed_state, ObservedState::Degraded);
+
+    let (status, body) = harness
+        .delete_raw(&format!("/v1/scenarios/{}", provider.scenario_id))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "unexpected body: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn failed_runtime_cleanup_marks_exports_unavailable() {
     let harness = TestHarness::new(ManagerFileConfig::default()).await;
     let provider_url = harness.write_provider_manifest("provider.json5");

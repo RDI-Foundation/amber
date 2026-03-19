@@ -8,8 +8,8 @@ use super::{
     bindings::export_topology_changed,
     errors::{
         OperationError, backoff_ms, classify_create_compile_error,
-        classify_reconcile_compile_error, classify_upgrade_compile_error, invalid_error,
-        invalid_scenario_error, now_ms, retryable_error,
+        classify_reconcile_compile_error, classify_upgrade_compile_error, degraded_error,
+        invalid_error, invalid_scenario_error, now_ms, retryable_error,
     },
 };
 use crate::{
@@ -93,17 +93,6 @@ impl OperationWorker {
     ) -> Result<Option<Value>, OperationError> {
         let scenario = self.load_scenario(scenario_id).await?;
         self.ensure_provider_not_required(&scenario.id).await?;
-        self.state
-            .store
-            .set_scenario_states(
-                &scenario.id,
-                DesiredState::Paused,
-                ObservedState::Paused,
-                None,
-                now_ms(),
-            )
-            .await
-            .map_err(retryable_error)?;
         self.apply_paused_state(&scenario.id).await?;
         Ok(Some(json!({
             "scenario_id": scenario.id,
@@ -481,26 +470,31 @@ impl OperationWorker {
                 .runtime
                 .stop_scenario(&scenario.id, &compose_dir, &scenario.compose_project, false)
                 .await
-                .map_err(retryable_error)?;
+                .map_err(|err| degraded_error(err.to_string()))?;
         } else {
             self.state.runtime.stop_proxy(&scenario.id).await;
         }
-        self.state
-            .store
-            .clear_export_services(&scenario.id)
-            .await
-            .map_err(retryable_error)?;
-        self.state
-            .store
-            .set_scenario_states(
-                &scenario.id,
-                DesiredState::Paused,
-                ObservedState::Paused,
-                None,
-                now_ms(),
-            )
-            .await
-            .map_err(retryable_error)?;
+        self.retry_store_until_ok(
+            || async { self.state.store.clear_export_services(&scenario.id).await },
+            &format!("clear export services for paused scenario {}", scenario.id),
+        )
+        .await;
+        self.retry_store_until_ok(
+            || async {
+                self.state
+                    .store
+                    .set_scenario_states(
+                        &scenario.id,
+                        DesiredState::Paused,
+                        ObservedState::Paused,
+                        None,
+                        now_ms(),
+                    )
+                    .await
+            },
+            &format!("set paused scenario state for {}", scenario.id),
+        )
+        .await;
         Ok(())
     }
 
@@ -690,17 +684,17 @@ impl OperationWorker {
         )
         .await;
 
-        if let Some(operation) = operation
-            && let Err(store_err) = self
-                .state
-                .store
-                .mark_operation_failed(&operation.id, &err.message, now)
-                .await
-        {
-            error!(
-                "failed to mark operation {} failed: {}",
-                operation.id, store_err
-            );
+        if let Some(operation) = operation {
+            self.retry_store_until_ok(
+                || async {
+                    self.state
+                        .store
+                        .mark_operation_failed(&operation.id, &err.message, now)
+                        .await
+                },
+                &format!("mark operation {} failed", operation.id),
+            )
+            .await;
         }
     }
 
