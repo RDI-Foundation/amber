@@ -11,15 +11,26 @@ fn main() {
     let workspace_root = manifest_dir
         .parent()
         .expect("cli crate should live under the workspace root");
+    let cli_version = env::var("AMBER_BUILD_VERSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| amber_images::AMBER_CLI.tag.to_string());
     let examples_dir = workspace_root.join("examples");
     let examples = example_catalog::collect_examples(&examples_dir)
         .expect("failed to collect embedded example documentation");
 
+    println!("cargo:rerun-if-env-changed=AMBER_BUILD_VERSION");
     println!(
         "cargo:rerun-if-changed={}",
         workspace_root.join("README.md").display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        workspace_root.join("docker/images.json").display()
+    );
     println!("cargo:rerun-if-changed={}", examples_dir.display());
+    println!("cargo:rustc-env=AMBER_CLI_VERSION={cli_version}");
     for example in &examples {
         println!("cargo:rerun-if-changed={}", example.dir.display());
         println!("cargo:rerun-if-changed={}", example.root_manifest.display());

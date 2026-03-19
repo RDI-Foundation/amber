@@ -63,15 +63,16 @@ COPY runtime/router ./runtime/router
 COPY docker/images.json docker/images.json
 
 ARG BUILD_MODE=release
+ARG AMBER_BUILD_VERSION
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
     target=$(cat /tmp/rust-target) && \
     if [ "$BUILD_MODE" = "release" ]; then \
-      cargo build --locked --release -p amber-cli --target "${target}"; \
+      AMBER_BUILD_VERSION="${AMBER_BUILD_VERSION}" cargo build --locked --release -p amber-cli --target "${target}"; \
       build_dir=release; \
     else \
-      cargo build --locked -p amber-cli --target "${target}"; \
+      AMBER_BUILD_VERSION="${AMBER_BUILD_VERSION}" cargo build --locked -p amber-cli --target "${target}"; \
       build_dir=debug; \
     fi && \
     install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber /out/amber && \

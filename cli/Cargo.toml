@@ -1,6 +1,5 @@
 [package]
 name = "amber-cli"
-version = "0.1.0"
 edition = "2024"
 
 [[bin]]
@@ -33,6 +32,7 @@ tracing-subscriber = { workspace = true }
 url = { workspace = true }
 
 [build-dependencies]
+amber-images = { workspace = true }
 amber-manifest = { workspace = true }
 
 [dev-dependencies]

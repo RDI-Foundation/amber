@@ -98,7 +98,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "amber-cli"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "amber-compiler",
  "amber-config",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "amber-compiler"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "amber-config",
  "amber-images",
@@ -159,7 +159,7 @@ dependencies = [
 
 [[package]]
 name = "amber-config"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "amber-template",
  "jsonptr",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "amber-docker-gateway"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "base64",
  "bytes",
@@ -194,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "amber-helper"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "amber-config",
  "amber-mesh",
@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "amber-images"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "semver",
  "serde",
@@ -224,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "amber-json5"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "json5",
  "jsonptr",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "amber-manager"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "amber-compiler",
  "amber-config",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "amber-manifest"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "amber-config",
  "amber-json5",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "amber-mesh"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -310,11 +310,11 @@ dependencies = [
 
 [[package]]
 name = "amber-node"
-version = "0.1.0"
+version = "0.0.0"
 
 [[package]]
 name = "amber-provisioner"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "amber-mesh",
  "base64",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "amber-proxy"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "amber-compiler",
  "amber-manifest",
@@ -349,7 +349,7 @@ dependencies = [
 
 [[package]]
 name = "amber-resolver"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "amber-manifest",
  "futures",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "amber-router"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "aho-corasick",
  "amber-mesh",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "amber-scenario"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "amber-manifest",
  "amber-template",
@@ -406,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "amber-template"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "serde",
  "serde_json",

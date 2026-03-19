@@ -62,6 +62,7 @@ jobs:
           image_registry="${image_registry%/}"
           echo "image_registry=${image_registry}" >> "$GITHUB_OUTPUT"
           echo "IMAGE_REGISTRY=${image_registry}" >> "$GITHUB_ENV"
+      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -117,6 +118,7 @@ jobs:
             echo "$images"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -150,6 +152,26 @@ jobs:
             echo "$json"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
+      - name: Read amber-cli release version
+        id: cli_version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(jq -re '.images[] | select(.name == "amber-cli") | .version' <<< '${{ steps.version_tags.outputs.json }}')"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+      - name: Rebuild amber-cli with resolved version metadata
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/amber-cli/Dockerfile
+          build-args: |
+            BUILD_MODE=release
+            AMBER_BUILD_VERSION=${{ steps.cli_version.outputs.version }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.registry.outputs.image_registry }}/amber-cli:main
+            ${{ steps.registry.outputs.image_registry }}/amber-cli:${{ github.sha }}
       - name: Publish release versions and semver channels
         shell: bash
         run: |
@@ -346,6 +368,7 @@ jobs:
   cli-artifacts:
     name: Build amber-cli artifacts (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
+    needs: merge-manifests
     permissions:
       contents: read
     env:
@@ -372,6 +395,26 @@ jobs:
         with:
           toolchain: nightly-2025-10-30
       - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Read image registry
+        id: registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_registry="$(jq -r '.registry' docker/images.json)"
+          if [ -z "$image_registry" ] || [ "$image_registry" = "null" ]; then
+            echo "docker/images.json registry is missing" >&2
+            exit 1
+          fi
+          image_registry="${image_registry%/}"
+          echo "IMAGE_REGISTRY=${image_registry}" >> "$GITHUB_ENV"
+      - name: Resolve amber-cli release version
+        id: cli_version
+        shell: bash
+        run: |
+          set -euo pipefail
+          json="$(cargo run -q -p amber-images --bin version_tags -- --resolve --registry "$IMAGE_REGISTRY" --sha "$GITHUB_SHA" docker/images.json)"
+          version="$(jq -re '.images[] | select(.name == "amber-cli") | .version' <<< "$json")"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
       - name: Install musl toolchain
         if: contains(matrix.target, 'linux-musl')
         run: |
@@ -380,6 +423,8 @@ jobs:
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}
       - name: Build amber-cli
+        env:
+          AMBER_BUILD_VERSION: ${{ steps.cli_version.outputs.version }}
         run: cargo build -p amber-cli --release --target ${{ matrix.target }}
       - name: Package artifact
         run: |
