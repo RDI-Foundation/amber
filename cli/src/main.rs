@@ -260,9 +260,11 @@ const DASHBOARD_AFTER_HELP: &str = concat!(
     "Default UI address: http://127.0.0.1:18888"
 );
 
+const CLI_VERSION: &str = env!("AMBER_CLI_VERSION");
+
 #[derive(Parser)]
 #[command(name = "amber")]
-#[command(version)]
+#[command(version = CLI_VERSION)]
 #[command(about = "Compile, inspect, and run Amber scenarios")]
 #[command(long_about = CLI_LONG_ABOUT)]
 #[command(after_help = CLI_AFTER_HELP)]
@@ -4211,6 +4213,8 @@ fn write_directory_output(
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory as _;
+
     use super::*;
 
     fn encode_json_b64(value: &serde_json::Value) -> String {
@@ -4240,6 +4244,12 @@ mod tests {
         assert_eq!(verbosity_level(3), "debug");
         assert_eq!(verbosity_level(4), "trace");
         assert_eq!(verbosity_level(9), "trace");
+    }
+
+    #[test]
+    fn cli_version_comes_from_build_metadata() {
+        let cli = Cli::command();
+        assert_eq!(cli.get_version(), Some(CLI_VERSION));
     }
 
     #[test]

@@ -13,6 +13,8 @@ use tracing_subscriber::EnvFilter;
 #[path = "../versioning.rs"]
 mod versioning;
 
+const OCI_REVISION_ANNOTATION: &str = "org.opencontainers.image.revision";
+
 #[derive(Debug, PartialEq, Eq)]
 struct CliArgs {
     manifest_path: PathBuf,
@@ -242,6 +244,12 @@ struct ResolvedVersion {
     parsed: Version,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ManifestMetadata {
+    signature: String,
+    revision: Option<String>,
+}
+
 fn resolve_version(
     image_name: &str,
     raw_version: &str,
@@ -286,15 +294,19 @@ fn resolve_wildcard_version(
         .strip_suffix('x')
         .ok_or_else(|| format!("wildcard version for {image_name} does not end with x"))?;
     let sha_ref = image_ref(&resolver.registry, image_name, &resolver.sha);
-    let sha_signature = manifest_signature(&sha_ref)?
-        .ok_or_else(|| format!("sha tag does not exist for {image_name}: {sha_ref}"))?;
+    let sha_signature = manifest_metadata(&sha_ref)?
+        .ok_or_else(|| format!("sha tag does not exist for {image_name}: {sha_ref}"))?
+        .signature;
 
     let mut sequence = 0_u64;
     loop {
         let candidate = format!("{wildcard_prefix}{sequence}");
         let candidate_ref = image_ref(&resolver.registry, image_name, &candidate);
-        match manifest_signature(&candidate_ref)? {
-            Some(existing_signature) if existing_signature == sha_signature => {
+        match manifest_metadata(&candidate_ref)? {
+            Some(existing) if existing.revision.as_deref() == Some(resolver.sha.as_str()) => {
+                return Ok(candidate);
+            }
+            Some(existing) if existing.signature == sha_signature => {
                 return Ok(candidate);
             }
             Some(_) => {}
@@ -311,18 +323,25 @@ fn image_ref(registry: &str, image: &str, tag: &str) -> String {
     format!("{registry}/{image}:{tag}")
 }
 
-fn manifest_signature(reference: &str) -> Result<Option<String>, String> {
+fn manifest_metadata(reference: &str) -> Result<Option<ManifestMetadata>, String> {
     let raw = match inspect_raw_manifest(reference)? {
         Some(raw) => raw,
         None => return Ok(None),
     };
+    manifest_metadata_from_raw(reference, &raw).map(Some)
+}
 
-    let mut manifest: Value = serde_json::from_str(&raw)
+fn manifest_metadata_from_raw(reference: &str, raw: &str) -> Result<ManifestMetadata, String> {
+    let mut manifest: Value = serde_json::from_str(raw)
         .map_err(|err| format!("failed to parse manifest for {reference}: {err}"))?;
+    let revision = manifest_revision(&manifest).map(ToOwned::to_owned);
     normalize_manifest(&mut manifest);
-    serde_json::to_string(&manifest)
-        .map(Some)
-        .map_err(|err| format!("failed to serialize normalized manifest for {reference}: {err}"))
+    let signature = serde_json::to_string(&manifest)
+        .map_err(|err| format!("failed to serialize normalized manifest for {reference}: {err}"))?;
+    Ok(ManifestMetadata {
+        signature,
+        revision,
+    })
 }
 
 fn inspect_raw_manifest(reference: &str) -> Result<Option<String>, String> {
@@ -360,6 +379,16 @@ fn looks_like_missing_manifest(detail: &str) -> bool {
     lower.contains("no such manifest")
         || lower.contains("manifest unknown")
         || lower.contains("not found")
+}
+
+fn manifest_revision(manifest: &Value) -> Option<&str> {
+    manifest
+        .get("annotations")
+        .and_then(Value::as_object)
+        .and_then(|annotations| annotations.get(OCI_REVISION_ANNOTATION))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn normalize_manifest(manifest: &mut Value) {
@@ -403,7 +432,11 @@ fn manifest_sort_key(manifest: &Value) -> (String, String, String, String) {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{CliArgs, ResolverConfig, parse_args_from};
+    use serde_json::json;
+
+    use super::{
+        CliArgs, ResolverConfig, manifest_metadata_from_raw, manifest_revision, parse_args_from,
+    };
 
     #[test]
     fn parse_args_without_resolver() {
@@ -446,5 +479,73 @@ mod tests {
         let err = parse_args_from(["--registry=ghcr.io/rdi-foundation".to_string()])
             .expect_err("registry without resolve should fail");
         assert_eq!(err, "--registry/--sha require --resolve");
+    }
+
+    #[test]
+    fn manifest_revision_reads_oci_revision_annotation() {
+        let manifest = json!({
+            "annotations": {
+                "org.opencontainers.image.revision": "abc123"
+            }
+        });
+        assert_eq!(manifest_revision(&manifest), Some("abc123"));
+    }
+
+    #[test]
+    fn manifest_metadata_preserves_revision_when_normalizing_signature() {
+        let raw = json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "annotations": {
+                "org.opencontainers.image.revision": "abc123"
+            },
+            "manifests": [
+                {
+                    "digest": "sha256:b",
+                    "platform": {
+                        "architecture": "arm64",
+                        "os": "linux"
+                    }
+                },
+                {
+                    "digest": "sha256:a",
+                    "platform": {
+                        "architecture": "amd64",
+                        "os": "linux"
+                    }
+                }
+            ]
+        });
+
+        let metadata = manifest_metadata_from_raw("test-ref", &raw.to_string())
+            .expect("manifest metadata should parse");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&metadata.signature)
+                .expect("normalized signature should be valid json"),
+            json!({
+                "annotations": {
+                    "org.opencontainers.image.revision": "abc123"
+                },
+                "manifests": [
+                    {
+                        "digest": "sha256:a",
+                        "platform": {
+                            "architecture": "amd64",
+                            "os": "linux"
+                        }
+                    },
+                    {
+                        "digest": "sha256:b",
+                        "platform": {
+                            "architecture": "arm64",
+                            "os": "linux"
+                        }
+                    }
+                ],
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "schemaVersion": 2
+            })
+        );
+        assert_eq!(metadata.revision, Some("abc123".to_string()));
     }
 }
