@@ -228,6 +228,7 @@ pub(crate) async fn run_vm_init(
         }
 
         let port_assignments = assign_vm_runtime_ports(&runtime_root, &vm_plan, router_mesh_port)?;
+        write_vm_runtime_state(&plan_root, &port_assignments.state)?;
 
         let router_binary = resolve_host_binary("amber-router")?;
         if let Some(router) = vm_plan.router.as_ref() {
@@ -322,8 +323,6 @@ pub(crate) async fn run_vm_init(
                 vm_endpoint_forward_ready_timeout(),
             )?;
         }
-
-        write_vm_runtime_state(&plan_root, &port_assignments.state)?;
         supervise_children(&mut children).await
     }
     .await;

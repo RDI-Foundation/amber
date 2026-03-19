@@ -33,6 +33,7 @@ const CONTROL_UPDATE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const DIRECT_RUNTIME_STATE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const VM_RUNTIME_STATE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DIRECT_RUNTIME_STATE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const TCG_VM_RUNTIME_STATE_WAIT_TIMEOUT: Duration = Duration::from_secs(720);
 const EXPORT_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(30);
 const ROUTER_IDENTITY_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_CONTAINER_REQUEST_TIMEOUT_SECS: u64 = 2;
@@ -850,7 +851,7 @@ async fn resolve_router_mesh_addr_required(
         )),
         ProxyTargetKind::Vm if router.mesh_port == 0 => SocketAddr::from((
             [127, 0, 0, 1],
-            wait_for_vm_runtime_router_port(&target.source, DIRECT_RUNTIME_STATE_WAIT_TIMEOUT)
+            wait_for_vm_runtime_router_port(&target.source, vm_runtime_state_wait_timeout())
                 .await?,
         )),
         _ => {
@@ -1711,6 +1712,14 @@ async fn wait_for_direct_runtime_router_port(plan_root: &Path, timeout: Duration
          --router-addr",
     )
     .await
+}
+
+fn vm_runtime_state_wait_timeout() -> Duration {
+    if env::var_os("AMBER_VM_FORCE_TCG").is_some() {
+        TCG_VM_RUNTIME_STATE_WAIT_TIMEOUT
+    } else {
+        DIRECT_RUNTIME_STATE_WAIT_TIMEOUT
+    }
 }
 
 async fn wait_for_vm_runtime_router_port(plan_root: &Path, timeout: Duration) -> Result<u16> {

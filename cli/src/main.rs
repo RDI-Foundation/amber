@@ -3450,25 +3450,25 @@ async fn supervise_children(children: &mut [ManagedChild]) -> Result<(RuntimeExi
             _ = sleep(DIRECT_CHILD_POLL_INTERVAL) => {
                 for child in children.iter_mut() {
                     #[cfg(target_os = "linux")]
-                    if let Some(wrapper) = child.wrapper.as_mut() {
-                        if let Some(status) = wrapper.try_wait().into_diagnostic()? {
-                            child.wrapper = None;
-                            if child.wrapper_pid == child.managed_pid
-                                || !linux_pid_is_alive(child.managed_pid)
-                            {
-                                let exit_code = if status.success() {
-                                    0
-                                } else {
-                                    status.code().unwrap_or(1).max(1)
-                                };
-                                return Ok((
-                                    RuntimeExitReason::ChildExited {
-                                        name: child.name.clone(),
-                                        status,
-                                    },
-                                    exit_code,
-                                ));
-                            }
+                    if let Some(wrapper) = child.wrapper.as_mut()
+                        && let Some(status) = wrapper.try_wait().into_diagnostic()?
+                    {
+                        child.wrapper = None;
+                        if child.wrapper_pid == child.managed_pid
+                            || !linux_pid_is_alive(child.managed_pid)
+                        {
+                            let exit_code = if status.success() {
+                                0
+                            } else {
+                                status.code().unwrap_or(1).max(1)
+                            };
+                            return Ok((
+                                RuntimeExitReason::ChildExited {
+                                    name: child.name.clone(),
+                                    status,
+                                },
+                                exit_code,
+                            ));
                         }
                     }
                     #[cfg(target_os = "linux")]
