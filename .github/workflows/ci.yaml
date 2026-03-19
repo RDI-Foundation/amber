@@ -486,36 +486,12 @@ jobs:
           AMBER_TEST_USE_PREBUILT_IMAGES: "1"
         run: |
           set -euo pipefail
-          run_test() {
-            cargo test -p amber-cli --test mixed_run "$1" -- --ignored --nocapture --test-threads=1
-          }
-          run_test mixed_run_cleanup_after_coordinator_dies_during_setup
-          run_test mixed_run_detached_stop_smoke
-          run_test mixed_run_direct_compose_proxy_smoke
-          run_test mixed_run_five_site_startup_state_and_teardown
-          run_test mixed_run_local_observability_manager_smoke
-          run_test mixed_run_local_observability_scenario_smoke
-          run_test mixed_run_partial_site_failure_during_launch_cleans_up
-          run_test mixed_run_recovers_direct_component_failure_after_setup
-          run_test mixed_run_recovers_vm_site_failure_after_setup
-          run_test mixed_run_recovers_when_kubernetes_site_is_temporarily_unreachable
+          cargo test -p amber-cli --test mixed_run mixed_run_ -- --ignored --nocapture --test-threads=1
       - name: Run mixed-site e2e tests
         if: github.event_name != 'pull_request'
         run: |
           set -euo pipefail
-          run_test() {
-            cargo test -p amber-cli --test mixed_run "$1" -- --ignored --nocapture --test-threads=1
-          }
-          run_test mixed_run_cleanup_after_coordinator_dies_during_setup
-          run_test mixed_run_detached_stop_smoke
-          run_test mixed_run_direct_compose_proxy_smoke
-          run_test mixed_run_five_site_startup_state_and_teardown
-          run_test mixed_run_local_observability_manager_smoke
-          run_test mixed_run_local_observability_scenario_smoke
-          run_test mixed_run_partial_site_failure_during_launch_cleans_up
-          run_test mixed_run_recovers_direct_component_failure_after_setup
-          run_test mixed_run_recovers_vm_site_failure_after_setup
-          run_test mixed_run_recovers_when_kubernetes_site_is_temporarily_unreachable
+          cargo test -p amber-cli --test mixed_run mixed_run_ -- --ignored --nocapture --test-threads=1
       - name: Delete shared KinD cluster
         if: always()
         shell: bash
