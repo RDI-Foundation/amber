@@ -172,7 +172,15 @@ fn runtime_bin_dir() -> &'static PathBuf {
 fn mixed_run_base_image() -> PathBuf {
     env::var_os("AMBER_MIXED_RUN_BASE_IMAGE")
         .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_root().join("ubuntu-24.04-minimal-cloudimg-arm64.img"))
+        .unwrap_or_else(|| workspace_root().join(default_mixed_run_base_image_filename()))
+}
+
+fn default_mixed_run_base_image_filename() -> &'static str {
+    match env::consts::ARCH {
+        "aarch64" => "ubuntu-24.04-minimal-cloudimg-arm64.img",
+        "x86_64" => "ubuntu-24.04-minimal-cloudimg-amd64.img",
+        other => panic!("mixed-run VM tests support only aarch64 and x86_64 hosts, found {other}"),
+    }
 }
 
 fn temp_output_dir(prefix: &str) -> TestTempDir {
@@ -1624,8 +1632,8 @@ fn namespace_exists(namespace: &str, kubeconfig: &Path, context: &str) -> bool {
 }
 
 #[test]
-#[ignore = "requires docker + kind + kubectl + qemu + ubuntu-24.04-minimal-cloudimg-arm64.img; run \
-            manually or in CI"]
+#[ignore = "requires docker + kind + kubectl + qemu + an Ubuntu 24.04 cloud image matching the \
+            host architecture; run manually or in CI"]
 fn mixed_run_five_site_startup_state_and_teardown() {
     let temp = temp_output_dir("mixed-run-five-site-");
     let kubeconfig = temp.path().join("kubeconfig");
@@ -1962,7 +1970,8 @@ fn mixed_run_partial_site_failure_during_launch_cleans_up() {
 }
 
 #[test]
-#[ignore = "requires docker + qemu + ubuntu-24.04-minimal-cloudimg-arm64.img; run manually or in CI"]
+#[ignore = "requires docker + qemu + an Ubuntu 24.04 cloud image matching the host architecture; \
+            run manually or in CI"]
 fn mixed_run_cleanup_after_coordinator_dies_during_setup() {
     ensure_internal_images();
     let temp = temp_output_dir("mixed-run-precommit-kill-");
@@ -2086,7 +2095,8 @@ fn mixed_run_recovers_direct_component_failure_after_setup() {
 }
 
 #[test]
-#[ignore = "requires qemu + ubuntu-24.04-minimal-cloudimg-arm64.img; run manually or in CI"]
+#[ignore = "requires qemu + an Ubuntu 24.04 cloud image matching the host architecture; run \
+            manually or in CI"]
 fn mixed_run_recovers_vm_site_failure_after_setup() {
     let temp = temp_output_dir("mixed-run-vm-restart-");
     let fixture = write_single_site_vm_fixture(temp.path());

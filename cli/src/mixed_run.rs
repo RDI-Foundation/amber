@@ -2218,6 +2218,7 @@ fn hold_coordinator_lock(run_root: &Path) -> Result<fs::File> {
         .open(&path)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to open coordinator lock {}", path.display()))?;
+    set_close_on_exec(&file)?;
 
     #[cfg(unix)]
     {
@@ -2234,6 +2235,35 @@ fn hold_coordinator_lock(run_root: &Path) -> Result<fs::File> {
     }
 
     Ok(file)
+}
+
+fn set_close_on_exec(file: &fs::File) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+
+        let fd = file.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags == -1 {
+            return Err(miette::miette!(
+                "failed to read coordinator lock flags: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+            return Err(miette::miette!(
+                "failed to set coordinator lock close-on-exec: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+    }
+
+    Ok(())
 }
 
 fn coordinator_has_exited(run_root: &Path, coordinator_pid: u32) -> Result<bool> {
@@ -2273,9 +2303,52 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     }
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|err| miette::miette!("failed to serialize {}: {err}", path.display()))?;
-    fs::write(path, bytes)
+    write_bytes_atomic(path, &bytes)
+}
+
+fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("tmp");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_path = path.with_file_name(format!(".{file_name}.tmp-{}-{nonce}", std::process::id()));
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
         .into_diagnostic()
-        .wrap_err_with(|| format!("failed to write {}", path.display()))
+        .wrap_err_with(|| format!("failed to create {}", tmp_path.display()))?;
+    if let Err(err) = file.write_all(bytes) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(miette::miette!(
+            "failed to write {}: {err}",
+            tmp_path.display()
+        ));
+    }
+    if let Err(err) = file.sync_all() {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(miette::miette!(
+            "failed to sync {}: {err}",
+            tmp_path.display()
+        ));
+    }
+    drop(file);
+
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(miette::miette!(
+            "failed to replace {} with {}: {err}",
+            path.display(),
+            tmp_path.display()
+        ));
+    }
+
+    Ok(())
 }
 
 fn canonicalize_existing_path(path: &Path, description: &str) -> Result<PathBuf> {

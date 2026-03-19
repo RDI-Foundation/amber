@@ -316,7 +316,22 @@ jobs:
       - name: Configure mixed-site VM image path
         run: |
           set -euo pipefail
-          echo "AMBER_MIXED_RUN_BASE_IMAGE=${RUNNER_TEMP}/ubuntu-24.04-minimal-cloudimg-arm64.img" >> "$GITHUB_ENV"
+          case "$(uname -m)" in
+            x86_64)
+              echo "AMBER_MIXED_RUN_BASE_IMAGE=${RUNNER_TEMP}/ubuntu-24.04-minimal-cloudimg-amd64.img" >> "$GITHUB_ENV"
+              echo "AMBER_MIXED_RUN_QEMU_PACKAGES=qemu-system-x86 qemu-utils xorriso" >> "$GITHUB_ENV"
+              echo "AMBER_MIXED_RUN_IMAGE_URL=https://cloud-images.ubuntu.com/minimal/releases/noble/release-20240709/ubuntu-24.04-minimal-cloudimg-amd64.img" >> "$GITHUB_ENV"
+              ;;
+            aarch64|arm64)
+              echo "AMBER_MIXED_RUN_BASE_IMAGE=${RUNNER_TEMP}/ubuntu-24.04-minimal-cloudimg-arm64.img" >> "$GITHUB_ENV"
+              echo "AMBER_MIXED_RUN_QEMU_PACKAGES=qemu-system-arm qemu-utils qemu-efi-aarch64 xorriso" >> "$GITHUB_ENV"
+              echo "AMBER_MIXED_RUN_IMAGE_URL=https://cloud-images.ubuntu.com/minimal/releases/noble/release-20240709/ubuntu-24.04-minimal-cloudimg-arm64.img" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "unsupported mixed-site runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
       - name: Relax AppArmor user namespace restrictions when present
         run: |
           set -euo pipefail
@@ -389,17 +404,16 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y qemu-system-arm qemu-utils qemu-efi-aarch64 xorriso
-      - name: Fetch Ubuntu minimal ARM64 cloud image
+          sudo apt-get install -y ${AMBER_MIXED_RUN_QEMU_PACKAGES}
+      - name: Fetch Ubuntu minimal cloud image
         run: |
           set -euo pipefail
-          image_url="https://cloud-images.ubuntu.com/minimal/releases/noble/release-20240709/ubuntu-24.04-minimal-cloudimg-arm64.img"
           if [ ! -f "$AMBER_MIXED_RUN_BASE_IMAGE" ]; then
             curl --fail --show-error --silent --location \
               --retry 5 \
               --retry-all-errors \
               --output "$AMBER_MIXED_RUN_BASE_IMAGE" \
-              "$image_url"
+              "$AMBER_MIXED_RUN_IMAGE_URL"
           fi
           qemu-img info "$AMBER_MIXED_RUN_BASE_IMAGE"
       - name: Ensure KinD is available
