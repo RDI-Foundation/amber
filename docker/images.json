@@ -30,6 +30,12 @@
       "context": ".",
       "dockerfile": "docker/amber-provisioner/Dockerfile",
       "version": "v0.1.x"
+    },
+    {
+      "name": "amber-manager",
+      "context": ".",
+      "dockerfile": "docker/amber-manager/Dockerfile",
+      "version": "v0.1.x"
     }
   ]
 }

@@ -157,7 +157,11 @@ images:
 Amber writes those references only when needed. Docker Compose and Kubernetes will pull them
 automatically; if you're in a restricted environment, pre-pull them ahead of time.
 
-If you're working in this repo, the internal image list and tags live in
+Amber also publishes `ghcr.io/rdi-foundation/amber-manager:v0.1` for running the scenario
+manager daemon in a container. Unlike the runtime images above, Amber does not inject that image
+into generated outputs; you run it explicitly when you want the manager service.
+
+If you're working in this repo, the published image list and tags live in
 `docker/images.json`; CI publishes and verifies those tags on `main`.
 Image publishing is fully manifest-driven. Git tags are not used to publish images.
 
