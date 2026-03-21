@@ -623,6 +623,28 @@ async fn handle(mut req: Request<ProxyBody>, conn: Arc<ConnState>) -> Response<P
         return forward(req, conn.state.clone()).await;
     }
 
+    // Allow image pull (POST /images/create?fromImage=...) but block image import (fromSrc)
+    // and bare requests with no query parameters.
+    if req.method() == Method::POST && is_create_endpoint(&segs, "images") {
+        let is_pull = req
+            .uri()
+            .query()
+            .and_then(|q| serde_urlencoded::from_str::<Vec<(String, String)>>(q).ok())
+            .map(|params| {
+                params.iter().any(|(k, _)| k == "fromImage")
+                    && !params.iter().any(|(k, _)| k == "fromSrc")
+            })
+            .unwrap_or(false);
+
+        if is_pull {
+            return forward(req, conn.state.clone()).await;
+        }
+        return docker_error(
+            StatusCode::FORBIDDEN,
+            "only image pull (fromImage) is allowed; build/import is blocked",
+        );
+    }
+
     if requires_owner_label_filters(req.method(), &segs) {
         if let Err(resp) = apply_required_label_filters(&mut req, &conn.state, &id) {
             return *resp;
@@ -2949,6 +2971,162 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn allows_image_pull_with_from_image() {
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+        gateway.enqueue_json(
+            Method::POST,
+            "/images/create",
+            StatusCode::OK,
+            serde_json::json!({"status":"Pulling from library/nginx"}),
+        );
+
+        let response = send_gateway_request(
+            gateway.addr,
+            Method::POST,
+            "/images/create?fromImage=nginx&tag=latest",
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+
+        let requests = gateway.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, Method::POST);
+        assert_eq!(requests[0].path, "/images/create");
+        assert_eq!(
+            requests[0].path_and_query,
+            "/images/create?fromImage=nginx&tag=latest"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn allows_image_pull_without_explicit_tag() {
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+        gateway.enqueue_json(
+            Method::POST,
+            "/images/create",
+            StatusCode::OK,
+            serde_json::json!({"status":"Pulling from library/alpine"}),
+        );
+
+        let response = send_gateway_request(
+            gateway.addr,
+            Method::POST,
+            "/images/create?fromImage=alpine",
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+
+        let requests = gateway.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, Method::POST);
+        assert_eq!(
+            requests[0].path_and_query,
+            "/images/create?fromImage=alpine"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn allows_image_pull_with_registry_qualified_name() {
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+        gateway.enqueue_json(
+            Method::POST,
+            "/images/create",
+            StatusCode::OK,
+            serde_json::json!({"status":"Pulling from ghcr.io/org/app"}),
+        );
+
+        let response = send_gateway_request(
+            gateway.addr,
+            Method::POST,
+            "/images/create?fromImage=ghcr.io/org/app&tag=v1.2",
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+
+        let requests = gateway.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].path_and_query,
+            "/images/create?fromImage=ghcr.io/org/app&tag=v1.2"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocks_image_import_with_from_src() {
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+
+        let response = send_gateway_request(
+            gateway.addr,
+            Method::POST,
+            "/images/create?fromSrc=-",
+            &[("content-type", "application/x-tar")],
+            &[],
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert!(response_message(&response.body).contains("only image pull"));
+        assert!(gateway.requests().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocks_image_create_with_no_query_params() {
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+
+        let response =
+            send_gateway_request(gateway.addr, Method::POST, "/images/create", &[], &[]).await;
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert!(response_message(&response.body).contains("only image pull"));
+        assert!(gateway.requests().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocks_image_create_with_both_from_image_and_from_src() {
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+
+        let response = send_gateway_request(
+            gateway.addr,
+            Method::POST,
+            "/images/create?fromImage=nginx&fromSrc=-",
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert!(gateway.requests().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn allows_image_pull_with_version_prefix() {
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+        gateway.enqueue_json(
+            Method::POST,
+            "/v1.45/images/create",
+            StatusCode::OK,
+            serde_json::json!({"status":"Pulling from library/nginx"}),
+        );
+
+        let response = send_gateway_request(
+            gateway.addr,
+            Method::POST,
+            "/v1.45/images/create?fromImage=nginx&tag=latest",
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+
+        let requests = gateway.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, Method::POST);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn allows_info_endpoint() {
         let gateway = GatewayHarness::start(vec![default_caller()]).await;
         gateway.enqueue_json(
@@ -4185,6 +4363,58 @@ mod tests {
         )
         .await;
         assert_eq!(blocked_connect.status, StatusCode::FORBIDDEN);
+
+        // Image pull: resolve a known image, then pull it through the gateway.
+        if let Some(image) = docker_image_for_ignored_e2e(&docker_sock).await {
+            let (from_image, tag) = image.rsplit_once(':').unwrap_or((image.as_str(), "latest"));
+
+            let pull_result = send_gateway_request(
+                listen,
+                Method::POST,
+                &format!("/images/create?fromImage={from_image}&tag={tag}"),
+                &[],
+                &[],
+            )
+            .await;
+            assert!(
+                pull_result.status.is_success(),
+                "image pull via gateway failed: {} {}",
+                pull_result.status,
+                String::from_utf8_lossy(&pull_result.body)
+            );
+
+            // Verify the pulled image is inspectable through the gateway.
+            let inspect = send_gateway_request(
+                listen,
+                Method::GET,
+                &format!("/images/{image}/json"),
+                &[],
+                &[],
+            )
+            .await;
+            assert_eq!(
+                inspect.status,
+                StatusCode::OK,
+                "image inspect after pull failed: {}",
+                String::from_utf8_lossy(&inspect.body)
+            );
+        }
+
+        // Image import should still be blocked.
+        let blocked_import = send_gateway_request(
+            listen,
+            Method::POST,
+            "/images/create?fromSrc=-",
+            &[("content-type", "application/x-tar")],
+            &[],
+        )
+        .await;
+        assert_eq!(blocked_import.status, StatusCode::FORBIDDEN);
+
+        // Bare image create (no query params) should be blocked.
+        let blocked_bare =
+            send_gateway_request(listen, Method::POST, "/images/create", &[], &[]).await;
+        assert_eq!(blocked_bare.status, StatusCode::FORBIDDEN);
 
         gateway_task.abort();
         docker_delete_network_best_effort(&docker_sock, &owned_network).await;
