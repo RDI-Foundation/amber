@@ -145,9 +145,25 @@ impl OrchestratorServer {
             )
             .await;
             if controller_detail["observed_state"].as_str() == Some("failed") {
+                let controller_failure = tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if let Some(failure) = self.state.failure().await {
+                            break Some(failure);
+                        }
+                        self.state.failure_notify.notified().await;
+                    }
+                })
+                .await
+                .ok()
+                .flatten();
+                let compose_logs = controller_detail["compose_project"]
+                    .as_str()
+                    .map(compose_project_logs)
+                    .unwrap_or_else(|| "controller compose logs unavailable".to_string());
                 panic!(
                     "controller scenario failed while waiting for checkpoint {name}: \
-                     {controller_detail:#?}"
+                     {controller_detail:#?}\nreported failure:\n{controller_failure:#?}\ncompose \
+                     logs:\n{compose_logs}"
                 );
             }
 
@@ -205,6 +221,16 @@ async fn orchestrator_failure(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires docker + docker compose; run manually"]
 async fn controller_scenario_manages_provider_consumer_lifecycle_over_manager_slot() {
+    run_controller_scenario_manages_provider_consumer_lifecycle("rest").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires docker + docker compose; run manually"]
+async fn controller_scenario_manages_provider_consumer_lifecycle_over_manager_slot_mcp() {
+    run_controller_scenario_manages_provider_consumer_lifecycle("mcp").await;
+}
+
+async fn run_controller_scenario_manages_provider_consumer_lifecycle(manager_transport: &str) {
     build_required_internal_images();
 
     let tempdir = tempfile::Builder::new()
@@ -256,6 +282,7 @@ async fn controller_scenario_manages_provider_consumer_lifecycle_over_manager_sl
                 "provider_url": manifests.provider_manifest_url,
                 "consumer_url": manifests.consumer_manifest_url,
                 "consumer_publish_port": consumer_port,
+                "manager_transport": manager_transport,
             },
             "external_slots": {
                 "manager": {
@@ -738,8 +765,9 @@ fn controller_manifest_contents() -> &'static str {
       provider_url: { type: "string" },
       consumer_url: { type: "string" },
       consumer_publish_port: { type: "integer" },
+      manager_transport: { type: "string", enum: ["rest", "mcp"] },
     },
-    required: ["provider_url", "consumer_url", "consumer_publish_port"],
+    required: ["provider_url", "consumer_url", "consumer_publish_port", "manager_transport"],
     additionalProperties: false,
   },
   program: {
@@ -756,6 +784,7 @@ fn controller_manifest_contents() -> &'static str {
       PROVIDER_URL: "${config.provider_url}",
       CONSUMER_URL: "${config.consumer_url}",
       CONSUMER_PUBLISH_PORT: "${config.consumer_publish_port}",
+      MANAGER_TRANSPORT: "${config.manager_transport}",
     },
   },
   slots: {
@@ -780,6 +809,7 @@ ORCHESTRATOR_URL = os.environ["ORCHESTRATOR_URL"].rstrip("/")
 PROVIDER_URL = os.environ["PROVIDER_URL"]
 CONSUMER_URL = os.environ["CONSUMER_URL"]
 CONSUMER_PUBLISH_PORT = int(os.environ["CONSUMER_PUBLISH_PORT"])
+MANAGER_TRANSPORT = os.environ["MANAGER_TRANSPORT"]
 PROVIDER_V1 = "provider-v1"
 PROVIDER_V2 = "provider-v2"
 
@@ -811,6 +841,128 @@ def manager_request(method, path, body=None):
     return json_request(MANAGER_URL, method, path, body)
 
 
+def sse_json_rpc_message(raw):
+    body = raw.decode("utf-8").replace("\r\n", "\n")
+    payloads = []
+    for event in body.split("\n\n"):
+        data_lines = []
+        for line in event.splitlines():
+            if line.startswith("data:"):
+                data_lines.append(line[5:].lstrip())
+        payload = "\n".join(data_lines)
+        if payload:
+            payloads.append(payload)
+    if not payloads:
+        raise RuntimeError(f"SSE response did not contain JSON-RPC data: {body}")
+    return json.loads(payloads[-1])
+
+
+class McpManagerClient:
+    def __init__(self, base_url):
+        self.endpoint = base_url + "/mcp"
+        self.session_id = None
+        self.request_id = 1
+        self.initialize()
+
+    def _post(self, payload, *, include_session, timeout=30):
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if include_session:
+            headers["mcp-session-id"] = self.session_id
+        request = urllib.request.Request(
+            self.endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.status, response.headers, response.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"MCP POST {payload.get('method')} failed with {exc.code}: {detail}"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(f"MCP POST {payload.get('method')} failed: {exc}") from exc
+
+    def initialize(self):
+        status, headers, raw = self._post(
+            {
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "amber-controller-live-test",
+                        "version": "0.0.0",
+                    },
+                },
+            },
+            include_session=False,
+        )
+        if status != 200:
+            raise RuntimeError(f"MCP initialize returned unexpected status {status}")
+        self.session_id = headers.get("mcp-session-id")
+        if not self.session_id:
+            raise RuntimeError("MCP initialize response did not include mcp-session-id")
+        message = sse_json_rpc_message(raw)
+        if message.get("error") is not None:
+            raise RuntimeError(f"MCP initialize returned error: {message}")
+        status, _, _ = self._post(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+            },
+            include_session=True,
+        )
+        if status != 202:
+            raise RuntimeError(
+                f"notifications/initialized returned unexpected status {status}"
+            )
+
+    def request(self, method, params=None, timeout=30):
+        request_id = self.request_id
+        self.request_id += 1
+        payload = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": {} if params is None else params,
+        }
+        status, _, raw = self._post(payload, include_session=True, timeout=timeout)
+        if status != 200:
+            raise RuntimeError(f"MCP request {method} returned unexpected status {status}")
+        message = sse_json_rpc_message(raw)
+        if message.get("id") != request_id:
+            raise RuntimeError(
+                f"MCP request {method} returned unexpected id {message.get('id')}"
+            )
+        if message.get("error") is not None:
+            raise RuntimeError(f"MCP request {method} failed: {message['error']}")
+        return message["result"]
+
+    def call_tool(self, name, arguments=None, timeout=30):
+        result = self.request(
+            "tools/call",
+            {
+                "name": name,
+                "arguments": {} if arguments is None else arguments,
+            },
+            timeout=timeout,
+        )
+        if result.get("isError") is True:
+            raise RuntimeError(f"MCP tool {name} returned isError: {result}")
+        return result["structuredContent"]
+
+
+MCP_MANAGER = None
+
+
 def orchestrator_request(method, path, body=None, timeout=240):
     return json_request(ORCHESTRATOR_URL, method, path, body, timeout=timeout)
 
@@ -829,7 +981,40 @@ def wait_for_json_ready(name, request_fn, path, field):
     raise RuntimeError(f"timed out waiting for {name} readiness")
 
 
+def wait_for_mcp_manager_ready():
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        try:
+            response = MCP_MANAGER.call_tool("amber.v1.manager.ready.get", {})
+        except Exception:
+            time.sleep(0.2)
+            continue
+        if response.get("ready") is True:
+            return
+        time.sleep(0.2)
+    raise RuntimeError("timed out waiting for manager MCP readiness")
+
+
 def wait_for_operation(operation_id):
+    if MANAGER_TRANSPORT == "mcp":
+        result = MCP_MANAGER.call_tool(
+            "amber.v1.operations.wait",
+            {
+                "operation_id": operation_id,
+                "timeout_ms": 120000,
+                "poll_interval_ms": 200,
+            },
+            timeout=150,
+        )
+        if result.get("timed_out") is True:
+            raise RuntimeError(f"timed out waiting for operation {operation_id}")
+        operation = result["operation"]
+        if operation["status"] == "failed":
+            raise RuntimeError(
+                f"operation {operation_id} failed: {operation.get('last_error') or operation}"
+            )
+        return operation
+
     deadline = time.time() + 120
     while time.time() < deadline:
         operation = manager_request("GET", f"/v1/operations/{operation_id}")
@@ -844,10 +1029,62 @@ def wait_for_operation(operation_id):
     raise RuntimeError(f"timed out waiting for operation {operation_id}")
 
 
-def enqueue(method, path, body=None):
-    response = manager_request(method, path, body)
-    operation_id = response["operation_id"]
-    return wait_for_operation(operation_id)
+def manager_create_scenario(payload):
+    if MANAGER_TRANSPORT == "rest":
+        return manager_request("POST", "/v1/scenarios", payload)
+    return MCP_MANAGER.call_tool("amber.v1.scenarios.create", payload)
+
+
+def manager_get_scenario(scenario_id):
+    if MANAGER_TRANSPORT == "rest":
+        return manager_request("GET", f"/v1/scenarios/{scenario_id}")
+    return MCP_MANAGER.call_tool(
+        "amber.v1.scenarios.get",
+        {"scenario_id": scenario_id},
+    )
+
+
+def manager_pause_scenario(scenario_id):
+    if MANAGER_TRANSPORT == "rest":
+        response = manager_request("POST", f"/v1/scenarios/{scenario_id}/pause")
+    else:
+        response = MCP_MANAGER.call_tool(
+            "amber.v1.scenarios.pause",
+            {"scenario_id": scenario_id},
+        )
+    return wait_for_operation(response["operation_id"])
+
+
+def manager_resume_scenario(scenario_id):
+    if MANAGER_TRANSPORT == "rest":
+        response = manager_request("POST", f"/v1/scenarios/{scenario_id}/resume")
+    else:
+        response = MCP_MANAGER.call_tool(
+            "amber.v1.scenarios.resume",
+            {"scenario_id": scenario_id},
+        )
+    return wait_for_operation(response["operation_id"])
+
+
+def manager_upgrade_scenario(scenario_id, payload):
+    if MANAGER_TRANSPORT == "rest":
+        response = manager_request("POST", f"/v1/scenarios/{scenario_id}/upgrade", payload)
+    else:
+        request = dict(payload)
+        request["scenario_id"] = scenario_id
+        response = MCP_MANAGER.call_tool("amber.v1.scenarios.upgrade", request)
+    return wait_for_operation(response["operation_id"])
+
+
+def manager_delete_scenario(scenario_id):
+    if MANAGER_TRANSPORT == "rest":
+        response = manager_request("DELETE", f"/v1/scenarios/{scenario_id}")
+    else:
+        response = MCP_MANAGER.call_tool(
+            "amber.v1.scenarios.delete",
+            {"scenario_id": scenario_id},
+        )
+    return wait_for_operation(response["operation_id"])
 
 
 def report_checkpoint(name, **extra):
@@ -871,12 +1108,19 @@ def report_failure(error):
 
 
 def run_controller():
+    global MCP_MANAGER
+
+    if MANAGER_TRANSPORT not in ("rest", "mcp"):
+        raise RuntimeError(f"unsupported manager transport: {MANAGER_TRANSPORT}")
+
     wait_for_json_ready("manager slot", manager_request, "/readyz", "ready")
     wait_for_json_ready("orchestrator slot", orchestrator_request, "/healthz", "ok")
 
-    provider = manager_request(
-        "POST",
-        "/v1/scenarios",
+    if MANAGER_TRANSPORT == "mcp":
+        MCP_MANAGER = McpManagerClient(MANAGER_URL)
+        wait_for_mcp_manager_ready()
+
+    provider = manager_create_scenario(
         {
             "source_url": PROVIDER_URL,
             "root_config": {"value": PROVIDER_V1},
@@ -891,12 +1135,10 @@ def run_controller():
     wait_for_operation(provider["operation_id"])
     provider_id = provider["scenario_id"]
 
-    provider_detail = manager_request("GET", f"/v1/scenarios/{provider_id}")
+    provider_detail = manager_get_scenario(provider_id)
     provider_service = provider_detail["exports"]["api"]["bindable_service_id"]
 
-    consumer = manager_request(
-        "POST",
-        "/v1/scenarios",
+    consumer = manager_create_scenario(
         {
             "source_url": CONSUMER_URL,
             "root_config": {},
@@ -924,21 +1166,20 @@ def run_controller():
         "children_created", provider_id=provider_id, consumer_id=consumer_id
     )
 
-    enqueue("POST", f"/v1/scenarios/{consumer_id}/pause")
+    manager_pause_scenario(consumer_id)
     report_checkpoint("consumer_paused", provider_id=provider_id, consumer_id=consumer_id)
 
-    enqueue("POST", f"/v1/scenarios/{provider_id}/pause")
+    manager_pause_scenario(provider_id)
     report_checkpoint("provider_paused", provider_id=provider_id, consumer_id=consumer_id)
 
-    enqueue("POST", f"/v1/scenarios/{provider_id}/resume")
-    enqueue("POST", f"/v1/scenarios/{consumer_id}/resume")
+    manager_resume_scenario(provider_id)
+    manager_resume_scenario(consumer_id)
     report_checkpoint(
         "provider_stack_resumed", provider_id=provider_id, consumer_id=consumer_id
     )
 
-    enqueue(
-        "POST",
-        f"/v1/scenarios/{provider_id}/upgrade",
+    manager_upgrade_scenario(
+        provider_id,
         {
             "root_config": {"value": PROVIDER_V2},
             "store_bundle": False,
@@ -946,8 +1187,8 @@ def run_controller():
     )
     report_checkpoint("provider_upgraded", provider_id=provider_id, consumer_id=consumer_id)
 
-    enqueue("DELETE", f"/v1/scenarios/{consumer_id}")
-    enqueue("DELETE", f"/v1/scenarios/{provider_id}")
+    manager_delete_scenario(consumer_id)
+    manager_delete_scenario(provider_id)
     report_checkpoint(
         "children_cleaned_up", provider_id=provider_id, consumer_id=consumer_id
     )
@@ -1047,6 +1288,32 @@ fn drain_pipes(child: &mut Child) -> (String, String) {
         let _ = pipe.read_to_string(&mut stderr);
     }
     (stdout, stderr)
+}
+
+fn compose_project_logs(project: &str) -> String {
+    let output = Command::new("docker")
+        .arg("compose")
+        .arg("-p")
+        .arg(project)
+        .arg("logs")
+        .arg("--no-color")
+        .output();
+    match output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if output.status.success() {
+                stdout.into_owned()
+            } else {
+                format!(
+                    "docker compose logs failed with \
+                     {status}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                    status = output.status
+                )
+            }
+        }
+        Err(err) => format!("failed to run docker compose logs: {err}"),
+    }
 }
 
 async fn wait_for_manager_ready(client: &Client, manager: &mut ManagerProcess, base_url: &str) {

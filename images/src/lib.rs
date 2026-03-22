@@ -1,3 +1,5 @@
+pub mod versioning;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct ImageRef {
     pub name: &'static str,

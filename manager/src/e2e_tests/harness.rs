@@ -25,7 +25,9 @@ use crate::{
         ExternalSlotBindingRequest, ObservedState, OperationStatus, OperationStatusResponse,
         ScenarioDetailResponse, ScenarioTelemetryRequest, ServiceProtocol,
     },
+    mcp,
     runtime::{FakeRuntimeController, RuntimeSupervisor},
+    service::ManagerService,
     store::Store,
     worker::{AppState, HealthMonitor, OperationWorker},
 };
@@ -36,19 +38,38 @@ pub(super) struct TestHarness {
     client: Client,
     pub(super) runtime: FakeRuntimeController,
     data_dir: PathBuf,
-    base_url: String,
+    pub(super) base_url: String,
     task_handles: Vec<JoinHandle<()>>,
 }
 
 impl TestHarness {
     pub(super) async fn new(file_config: ManagerFileConfig) -> Self {
+        Self::new_inner(file_config, true, 10).await
+    }
+
+    pub(super) async fn new_without_worker(file_config: ManagerFileConfig) -> Self {
+        Self::new_inner(file_config, false, 10).await
+    }
+
+    pub(super) async fn new_with_base_backoff(
+        file_config: ManagerFileConfig,
+        base_backoff_ms: u64,
+    ) -> Self {
+        Self::new_inner(file_config, true, base_backoff_ms).await
+    }
+
+    async fn new_inner(
+        file_config: ManagerFileConfig,
+        run_worker: bool,
+        base_backoff_ms: u64,
+    ) -> Self {
         let tempdir = TempDir::new().expect("tempdir");
         let data_dir = tempdir.path().join("manager-data");
         tokio::fs::create_dir_all(&data_dir)
             .await
             .expect("create manager data dir");
 
-        let config = manager_config(&data_dir);
+        let config = manager_config(&data_dir, base_backoff_ms);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(config.database_connect_options())
@@ -63,12 +84,6 @@ impl TestHarness {
             AppState::new(config, file_config, store, runtime, notify).expect("create app state"),
         );
 
-        let worker = OperationWorker::new(state.clone());
-        worker.enqueue_startup_reconciles().await;
-        let worker_handle = tokio::spawn(async move {
-            worker.run().await;
-        });
-
         let health_monitor = HealthMonitor::new(state.clone());
         let health_handle = tokio::spawn(async move {
             health_monitor.run().await;
@@ -78,12 +93,22 @@ impl TestHarness {
             .await
             .expect("bind test listener");
         let addr = listener.local_addr().expect("listener addr");
-        let app = router(state.clone());
+        let manager = Arc::new(ManagerService::new(state.clone()));
+        let app = router(manager.clone()).nest_service("/mcp", mcp::service(manager));
         let server_handle = tokio::spawn(async move {
             serve(listener, app.into_make_service())
                 .await
                 .expect("serve test app");
         });
+
+        let mut task_handles = vec![health_handle, server_handle];
+        if run_worker {
+            let worker = OperationWorker::new(state.clone());
+            worker.enqueue_startup_reconciles().await;
+            task_handles.push(tokio::spawn(async move {
+                worker.run().await;
+            }));
+        }
 
         Self {
             _tempdir: tempdir,
@@ -92,7 +117,7 @@ impl TestHarness {
             runtime: runtime_controller,
             data_dir,
             base_url: format!("http://{addr}"),
-            task_handles: vec![worker_handle, health_handle, server_handle],
+            task_handles,
         }
     }
 
@@ -455,19 +480,20 @@ pub(super) fn slot_bindings(
     )])
 }
 
-fn manager_config(data_dir: &Path) -> ManagerConfig {
+fn manager_config(data_dir: &Path, base_backoff_ms: u64) -> ManagerConfig {
     ManagerConfig::parse_from([
-        "amber-manager",
-        "--listen",
-        "127.0.0.1:0",
-        "--data-dir",
+        "amber-manager".to_string(),
+        "--listen".to_string(),
+        "127.0.0.1:0".to_string(),
+        "--data-dir".to_string(),
         data_dir
             .to_str()
-            .expect("manager data dir should be valid UTF-8"),
-        "--max-restart-attempts",
-        "3",
-        "--base-backoff-ms",
-        "10",
+            .expect("manager data dir should be valid UTF-8")
+            .to_string(),
+        "--max-restart-attempts".to_string(),
+        "3".to_string(),
+        "--base-backoff-ms".to_string(),
+        base_backoff_ms.to_string(),
     ])
 }
 

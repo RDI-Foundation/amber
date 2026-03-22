@@ -78,7 +78,7 @@ pub fn runtime_tag(version: &Version) -> String {
     }
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // Dead when used as a mod from images/build.rs
 pub fn floating_tags(version: &Version) -> Vec<String> {
     let mut tags = if version.pre.is_empty() {
         vec![

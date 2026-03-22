@@ -5,7 +5,9 @@ mod domain;
 mod ids;
 mod instance_lock;
 mod json;
+mod mcp;
 mod runtime;
+mod service;
 mod store;
 mod worker;
 
@@ -14,11 +16,9 @@ mod e2e_tests;
 
 use std::sync::Arc;
 
-use api::router;
-use axum::serve;
+use axum::Router;
 pub use config::ManagerConfig;
 use sqlx::sqlite::SqlitePoolOptions;
-use store::Store;
 use tokio::{net::TcpListener, sync::Notify};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
@@ -36,7 +36,7 @@ pub async fn run(config: ManagerConfig) -> Result<(), config::ConfigError> {
         .connect_with(config.database_connect_options())
         .await
         .map_err(config::ConfigError::Database)?;
-    let store = Store::new(pool);
+    let store = store::Store::new(pool);
     store
         .migrate()
         .await
@@ -51,6 +51,7 @@ pub async fn run(config: ManagerConfig) -> Result<(), config::ConfigError> {
         runtime,
         notify.clone(),
     )?);
+    let manager = Arc::new(service::ManagerService::new(state.clone()));
 
     let worker = OperationWorker::new(state.clone());
     worker.enqueue_startup_reconciles().await;
@@ -58,7 +59,7 @@ pub async fn run(config: ManagerConfig) -> Result<(), config::ConfigError> {
         worker.run().await;
     });
 
-    let health_monitor = HealthMonitor::new(state.clone());
+    let health_monitor = HealthMonitor::new(state);
     tokio::spawn(async move {
         health_monitor.run().await;
     });
@@ -67,18 +68,18 @@ pub async fn run(config: ManagerConfig) -> Result<(), config::ConfigError> {
         .await
         .map_err(config::ConfigError::Io)?;
     info!("amber-manager listening on {}", config.listen_addr());
-    serve(
-        listener,
-        router(state)
-            .layer(TraceLayer::new_for_http())
-            .into_make_service(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .map_err(|err| {
-        warn!("server failed: {err}");
-        config::ConfigError::Io(std::io::Error::other(err))
-    })
+
+    let app = api::router(manager.clone())
+        .nest_service("/mcp", mcp::service(manager))
+        .layer(TraceLayer::new_for_http());
+
+    axum::serve(listener, Router::new().merge(app).into_make_service())
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .map_err(|err| {
+            warn!("server failed: {err}");
+            config::ConfigError::Io(std::io::Error::other(err))
+        })
 }
 
 async fn shutdown_signal() {

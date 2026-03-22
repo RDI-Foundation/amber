@@ -291,10 +291,13 @@ enum BodyMode {
     Collect,
 }
 
-#[allow(dead_code)]
 enum FilterDecision {
     Continue,
-    Reject { status: StatusCode, message: String },
+    #[allow(dead_code)]
+    Reject {
+        status: StatusCode,
+        message: String,
+    },
 }
 
 struct RewriteContext {

@@ -129,6 +129,10 @@ pub async fn compile_upgrade(
     .await
 }
 
+pub async fn inspect_source(source_url: &str) -> Result<CompiledMaterialization, CompileError> {
+    compile_source_materialization(source_url, false, None).await
+}
+
 pub fn inspect_stored_ir(scenario_ir_json: &str) -> Result<CompiledMaterialization, CompileError> {
     compiled_materialization_from_stored_ir(
         scenario_ir_json,
@@ -271,6 +275,22 @@ async fn compile_and_materialize(
     store_bundle: bool,
     bundle_dir: Option<&Path>,
 ) -> Result<CompiledMaterialization, CompileError> {
+    let mut materialization =
+        compile_source_materialization(source_url, store_bundle, bundle_dir).await?;
+    validate_slot_request(&materialization.proxy_metadata, external_slots)?;
+    validate_export_request(&materialization.proxy_metadata, exports)?;
+    let (non_secret_root_config, secret_root_config) =
+        validate_and_split_root_config(materialization.root_schema.as_ref(), root_config)?;
+    materialization.non_secret_root_config = non_secret_root_config;
+    materialization.secret_root_config = secret_root_config;
+    Ok(materialization)
+}
+
+async fn compile_source_materialization(
+    source_url: &str,
+    store_bundle: bool,
+    bundle_dir: Option<&Path>,
+) -> Result<CompiledMaterialization, CompileError> {
     let url = Url::parse(source_url)
         .map_err(|_| CompileError::InvalidSourceUrl(source_url.to_string()))?;
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
@@ -305,18 +325,14 @@ async fn compile_and_materialize(
         .emit(&compiled)
         .map_err(|err| CompileError::Compile(err.to_string()))?;
     let proxy_metadata = extract_proxy_metadata(&compose.files)?;
-    validate_slot_request(&proxy_metadata, external_slots)?;
-    validate_export_request(&proxy_metadata, exports)?;
     let root_schema = root_schema_from_ir(&scenario_ir);
-    let (non_secret_root_config, secret_root_config) =
-        validate_and_split_root_config(root_schema.as_ref(), root_config)?;
 
     Ok(CompiledMaterialization {
         scenario_ir,
         scenario_ir_json,
         root_schema,
-        non_secret_root_config,
-        secret_root_config,
+        non_secret_root_config: json!({}),
+        secret_root_config: json!({}),
         compose_files: compose.files,
         proxy_metadata,
         bundle_root: bundle_dir.map(Path::to_path_buf).filter(|_| store_bundle),
