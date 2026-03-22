@@ -44,21 +44,32 @@ pub(super) struct TestHarness {
 
 impl TestHarness {
     pub(super) async fn new(file_config: ManagerFileConfig) -> Self {
-        Self::new_inner(file_config, true).await
+        Self::new_inner(file_config, true, 10).await
     }
 
     pub(super) async fn new_without_worker(file_config: ManagerFileConfig) -> Self {
-        Self::new_inner(file_config, false).await
+        Self::new_inner(file_config, false, 10).await
     }
 
-    async fn new_inner(file_config: ManagerFileConfig, run_worker: bool) -> Self {
+    pub(super) async fn new_with_base_backoff(
+        file_config: ManagerFileConfig,
+        base_backoff_ms: u64,
+    ) -> Self {
+        Self::new_inner(file_config, true, base_backoff_ms).await
+    }
+
+    async fn new_inner(
+        file_config: ManagerFileConfig,
+        run_worker: bool,
+        base_backoff_ms: u64,
+    ) -> Self {
         let tempdir = TempDir::new().expect("tempdir");
         let data_dir = tempdir.path().join("manager-data");
         tokio::fs::create_dir_all(&data_dir)
             .await
             .expect("create manager data dir");
 
-        let config = manager_config(&data_dir);
+        let config = manager_config(&data_dir, base_backoff_ms);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(config.database_connect_options())
@@ -469,19 +480,20 @@ pub(super) fn slot_bindings(
     )])
 }
 
-fn manager_config(data_dir: &Path) -> ManagerConfig {
+fn manager_config(data_dir: &Path, base_backoff_ms: u64) -> ManagerConfig {
     ManagerConfig::parse_from([
-        "amber-manager",
-        "--listen",
-        "127.0.0.1:0",
-        "--data-dir",
+        "amber-manager".to_string(),
+        "--listen".to_string(),
+        "127.0.0.1:0".to_string(),
+        "--data-dir".to_string(),
         data_dir
             .to_str()
-            .expect("manager data dir should be valid UTF-8"),
-        "--max-restart-attempts",
-        "3",
-        "--base-backoff-ms",
-        "10",
+            .expect("manager data dir should be valid UTF-8")
+            .to_string(),
+        "--max-restart-attempts".to_string(),
+        "3".to_string(),
+        "--base-backoff-ms".to_string(),
+        base_backoff_ms.to_string(),
     ])
 }
 
