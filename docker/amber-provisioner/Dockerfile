@@ -52,15 +52,14 @@ COPY runtime/provisioner ./runtime/provisioner
 
 RUN target=$(cat /tmp/rust-target) && \
     cargo build -p amber-provisioner --release --locked --target "${target}" && \
-    install -D -m 0755 /app/target/"${target}"/release/amber-provisioner /out/amber-provisioner
+    install -D -m 0755 /app/target/"${target}"/release/amber-provisioner /out/amber-provisioner && \
+    mkdir -p /out/amber/plan /out/amber/provision && \
+    touch /out/amber/plan/mesh-provision-plan.json
 
 FROM gcr.io/distroless/static-debian13 AS runtime
 
-# Docker config mounts require the target directory to exist.
-WORKDIR /amber/plan
-WORKDIR /
-
 COPY --from=builder /out/amber-provisioner /amber-provisioner
+COPY --from=builder /out/amber /amber
 
 USER 65532:65532
 ENTRYPOINT ["/amber-provisioner"]

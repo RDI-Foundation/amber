@@ -69,10 +69,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
       cargo build --locked -p amber-helper --target "${target}"; \
       build_dir=debug; \
     fi && \
-    install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber-helper /out/amber-helper
+    install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber-helper /out/amber-helper && \
+    mkdir -p /out/amber/bin
 
 FROM scratch
 
 COPY --from=builder /out/amber-helper /amber-helper
+COPY --from=builder /out/amber /amber
 
 ENTRYPOINT ["/amber-helper"]

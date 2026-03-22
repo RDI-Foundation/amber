@@ -429,7 +429,7 @@ fn assert_depends_on(service: &super::Service, name: &str, condition: &str) {
 }
 
 fn storage_scenario(version: &str, initial_state: &str) -> Scenario {
-    let provide_http =
+    let provide_http: ProvideDecl =
         serde_json::from_value(json!({ "kind": "http", "endpoint": "http" })).unwrap();
 
     let root = Component {
@@ -462,7 +462,7 @@ fn storage_scenario(version: &str, initial_state: &str) -> Scenario {
             }),
         )),
         slots: BTreeMap::new(),
-        provides: BTreeMap::from([("http".to_string(), provide_http)]),
+        provides: BTreeMap::from([("http".to_string(), provide_http.clone())]),
         resources: BTreeMap::from([("state".to_string(), storage_resource_decl(None))]),
         metadata: None,
         children: Vec::new(),
@@ -472,7 +472,14 @@ fn storage_scenario(version: &str, initial_state: &str) -> Scenario {
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: Vec::new(),
-        exports: Vec::new(),
+        exports: vec![ScenarioExport {
+            name: "http".to_string(),
+            capability: provide_http.decl.clone(),
+            from: ProvideRef {
+                component: ComponentId(0),
+                name: "http".to_string(),
+            },
+        }],
     }
 }
 
@@ -1139,7 +1146,7 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
     ] {
         assert_service_hardened(service(&compose, name), yaml.as_ref());
     }
-    for name in ["amber-provisioner", "c1-server-net", "c2-client-net"] {
+    for name in ["c1-server-net", "c2-client-net"] {
         assert_internal_service_rootfs_hardened(service(&compose, name), yaml.as_ref());
     }
 

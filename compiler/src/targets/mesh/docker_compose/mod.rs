@@ -521,7 +521,6 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
         let mut provisioner_service = Service::new(images.provisioner.clone());
         provisioner_service.user = Some("0:0".to_string());
         apply_default_service_hardening(&mut provisioner_service);
-        apply_internal_service_rootfs_hardening(&mut provisioner_service);
         provisioner_service.environment = Some(Environment::List(vec![format!(
             "AMBER_MESH_PROVISION_PLAN_PATH={PROVISIONER_PLAN_PATH}"
         )]));

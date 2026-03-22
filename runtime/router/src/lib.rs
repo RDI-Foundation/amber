@@ -5271,15 +5271,15 @@ async fn validate_external_host(host: &str, port: u16) -> Result<(), String> {
 
 fn is_disallowed_external_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local(),
         IpAddr::V6(v6) => {
             if v6.is_loopback() || v6.is_unicast_link_local() {
                 return true;
             }
             if let Some(v4) = v6.to_ipv4_mapped() {
-                return v4.is_loopback() || v4.is_private() || v4.is_link_local();
+                return v4.is_loopback() || v4.is_link_local();
             }
-            (v6.segments()[0] & 0xfe00) == 0xfc00
+            false
         }
     }
 }
@@ -6418,6 +6418,31 @@ mod tests {
     }
 
     #[test]
+    fn resolve_http_external_target_with_override_accepts_private_ip_literals() {
+        let target = ExternalTarget {
+            name: "matrix".to_string(),
+            url_env: "MATRIX_URL".to_string(),
+            optional: false,
+            url_override: None,
+        };
+
+        let resolved = resolve_http_external_target_with_override(
+            &target,
+            Some("http://10.0.0.8:6167/base"),
+            &Uri::from_static("/_matrix/client/v3/sync"),
+        )
+        .expect("private target should resolve");
+
+        let ResolvedHttpExternalTarget::Http(url) = resolved else {
+            panic!("expected direct http target");
+        };
+        assert_eq!(
+            url.as_str(),
+            "http://10.0.0.8:6167/base/_matrix/client/v3/sync"
+        );
+    }
+
+    #[test]
     fn resolve_http_external_target_with_override_preserves_mesh_targets() {
         let peer_key = base64::engine::general_purpose::STANDARD.encode([251u8; 32]);
         assert!(
@@ -6534,6 +6559,19 @@ mod tests {
             err.to_string().contains("disallowed address"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_tcp_target_accepts_private_ip_literals() {
+        let target = ExternalTarget {
+            name: "matrix".to_string(),
+            url_env: "MATRIX_URL".to_string(),
+            optional: false,
+            url_override: Some("tcp://10.0.0.8:6167".to_string()),
+        };
+
+        let resolved = resolve_tcp_target(&target).expect("private target should resolve");
+        assert_eq!(resolved, ("10.0.0.8".to_string(), 6167));
     }
 
     #[tokio::test]

@@ -67,11 +67,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
       cargo build --locked -p amber-router --target "${target}"; \
       build_dir=debug; \
     fi && \
-    install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber-router /out/amber-router
+    install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber-router /out/amber-router && \
+    mkdir -p /out/amber/mesh /out/amber/control
 
 FROM gcr.io/distroless/static-debian13 AS runtime
 
 COPY --from=builder /out/amber-router /amber-router
+COPY --from=builder /out/amber /amber
 
 USER 65532:65532
 ENTRYPOINT ["/amber-router"]
