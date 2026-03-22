@@ -14,7 +14,7 @@ use tokio::{sync::Notify, time::timeout};
 use tracing::{error, info};
 
 use self::{
-    bindings::{build_operator_services, parse_protocol},
+    bindings::{build_operator_configs, build_operator_services, parse_protocol},
     errors::{OperationError, now_ms},
     graph::topological_order,
 };
@@ -23,8 +23,8 @@ use crate::{
     compiler::{ExportRuntimeBinding, ScenarioSourceAccess, SlotRuntimeBinding},
     config::{ConfigError, ManagerFileConfig, OperatorServiceProvider},
     domain::{
-        BindableServiceProviderKind, BindableServiceResponse, BindableServiceSourceKind,
-        OperationKind, OperationPayload, ServiceProtocol,
+        BindableConfigResponse, BindableServiceProviderKind, BindableServiceResponse,
+        BindableServiceSourceKind, OperationKind, OperationPayload, ServiceProtocol,
     },
     runtime::RuntimeSupervisor,
     store::{
@@ -44,6 +44,7 @@ pub struct AppState {
     runtime: RuntimeSupervisor,
     notify: Arc<Notify>,
     operator_services: BTreeMap<String, OperatorBindableService>,
+    operator_configs: BTreeMap<String, OperatorBindableConfig>,
     scenario_sources: ScenarioSourceAccess,
 }
 
@@ -57,9 +58,11 @@ impl AppState {
     ) -> Result<Self, ConfigError> {
         let ManagerFileConfig {
             bindable_services,
+            bindable_configs,
             scenario_source_allowlist,
         } = file_config;
         let operator_services = build_operator_services(bindable_services)?;
+        let operator_configs = build_operator_configs(bindable_configs)?;
         let scenario_sources = ScenarioSourceAccess::from_config(scenario_source_allowlist)?;
         Ok(Self {
             config,
@@ -67,6 +70,7 @@ impl AppState {
             runtime,
             notify,
             operator_services,
+            operator_configs,
             scenario_sources,
         })
     }
@@ -108,6 +112,22 @@ impl AppState {
         }
         services.sort_by(|left, right| left.bindable_service_id.cmp(&right.bindable_service_id));
         Ok(services)
+    }
+
+    pub fn bindable_configs(&self) -> Vec<BindableConfigResponse> {
+        let mut configs = self
+            .operator_configs
+            .values()
+            .map(OperatorBindableConfig::response)
+            .collect::<Vec<_>>();
+        configs.sort_by(|left, right| left.bindable_config_id.cmp(&right.bindable_config_id));
+        configs
+    }
+
+    pub fn bindable_config_value(&self, bindable_config_id: &str) -> Option<&Value> {
+        self.operator_configs
+            .get(bindable_config_id)
+            .map(|config| &config.value)
     }
 
     pub fn scenario_sources(&self) -> &ScenarioSourceAccess {
@@ -571,6 +591,23 @@ impl OperatorBindableService {
 }
 
 #[derive(Clone, Debug)]
+pub(super) struct OperatorBindableConfig {
+    pub(super) bindable_config_id: String,
+    pub(super) display_name: String,
+    pub(super) value: Value,
+}
+
+impl OperatorBindableConfig {
+    fn response(&self) -> BindableConfigResponse {
+        BindableConfigResponse {
+            bindable_config_id: self.bindable_config_id.clone(),
+            display_name: Some(self.display_name.clone()),
+            json_type: json_type_name(&self.value).to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 struct ResolvedBindableService {
     response: BindableServiceResponse,
     protocol: ServiceProtocol,
@@ -616,5 +653,16 @@ fn restart_interrupted_operation_message(kind: OperationKind) -> &'static str {
         OperationKind::Reconcile => {
             "manager restarted while reconcile was in progress; the operation was requeued"
         }
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }

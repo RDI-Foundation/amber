@@ -162,8 +162,8 @@ manager daemon in a container. Unlike the runtime images above, Amber does not i
 into generated outputs; you run it explicitly when you want the manager service.
 
 `amber-manager` reads operator policy from the JSON file passed via `--config`. For example,
-operators can register static bindable services and restrict scenario create/upgrade requests to an
-explicit `scenario_source_allowlist`:
+operators can register static bindable services, operator-provided bindable root-config values,
+and restrict scenario create/upgrade requests to an explicit `scenario_source_allowlist`:
 
 ```json
 {
@@ -176,6 +176,10 @@ explicit `scenario_source_allowlist`:
       }
     }
   },
+  "bindable_configs": {
+    "openai_prod_api_key": "sk-live-xxxxx",
+    "shared_otel_endpoint": "http://otel.internal:4318/v1/traces"
+  },
   "scenario_source_allowlist": [
     "file:///opt/amber/scenarios/controller.json5",
     "https://artifacts.example.com/amber/provider.json5"
@@ -187,6 +191,24 @@ If `scenario_source_allowlist` is omitted, the manager accepts any scenario sour
 present, any manager request that fetches a scenario from a `source_url` must use one of the
 listed URLs. Today that includes create requests, upgrades, and `source_url`-based config schema
 lookups. An empty allowlist rejects all such requests.
+
+Bindable configs are enumerated through the manager API as opaque ids such as
+`cfg_openai_prod_api_key`; the raw values are not returned by the API. Create and upgrade
+requests can then map root-config paths to those ids with `external_root_config`, for example:
+
+```json
+{
+  "source_url": "https://artifacts.example.com/amber/provider.json5",
+  "root_config": {},
+  "external_root_config": {
+    "api_key": "cfg_openai_prod_api_key",
+    "telemetry.endpoint": "cfg_shared_otel_endpoint"
+  }
+}
+```
+
+The manager resolves `external_root_config` into the effective root config before compilation, so
+the caller never needs the underlying secret value.
 
 If you're working in this repo, the published image list and tags live in
 `docker/images.json`; CI publishes and verifies those tags on `main`.

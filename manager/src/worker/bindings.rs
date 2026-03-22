@@ -7,8 +7,8 @@ use amber_manifest::CapabilityTransport;
 use tracing::warn;
 
 use super::{
-    OperationWorker, OperatorBindableService, PreparedBindings, ResolvedBindableProvider,
-    ResolvedBindableService,
+    OperationWorker, OperatorBindableConfig, OperatorBindableService, PreparedBindings,
+    ResolvedBindableProvider, ResolvedBindableService,
     errors::{
         OperationError, degraded_error, invalid_error, invalid_scenario_error, retryable_error,
     },
@@ -464,6 +464,30 @@ pub(super) fn build_operator_services(
         );
     }
     Ok(services)
+}
+
+pub(super) fn build_operator_configs(
+    bindable_configs: BTreeMap<String, serde_json::Value>,
+) -> Result<BTreeMap<String, OperatorBindableConfig>, ConfigError> {
+    let mut configs = BTreeMap::new();
+    for (name, value) in bindable_configs {
+        let bindable_config_id = ids::operator_config_id(&name);
+        if configs.contains_key(&bindable_config_id) {
+            return Err(ConfigError::InvalidConfig(format!(
+                "bindable config names collide after normalization: {}",
+                name
+            )));
+        }
+        configs.insert(
+            bindable_config_id.clone(),
+            OperatorBindableConfig {
+                bindable_config_id,
+                display_name: name,
+                value,
+            },
+        );
+    }
+    Ok(configs)
 }
 
 pub(super) fn parse_protocol(raw: &str) -> Result<ServiceProtocol, OperationError> {

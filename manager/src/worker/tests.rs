@@ -216,6 +216,7 @@ async fn prepare_bindings_does_not_probe_published_listener_early() {
             &CreateScenarioRequest {
                 source_url: manifest_url,
                 root_config: json!({}),
+                external_root_config: BTreeMap::new(),
                 external_slots: BTreeMap::new(),
                 exports: BTreeMap::new(),
                 metadata: json!({}),
@@ -285,6 +286,7 @@ async fn startup_recovery_does_not_replay_interrupted_upgrade() {
     let create_request = CreateScenarioRequest {
         source_url: manifest_url.clone(),
         root_config: json!({}),
+        external_root_config: BTreeMap::new(),
         external_slots: BTreeMap::new(),
         exports: BTreeMap::new(),
         metadata: json!({}),
@@ -335,6 +337,7 @@ async fn startup_recovery_does_not_replay_interrupted_upgrade() {
         request: UpgradeScenarioRequest {
             source_url: None,
             root_config: Some(json!({})),
+            external_root_config: None,
             external_slots: Some(BTreeMap::new()),
             exports: Some(BTreeMap::new()),
             metadata: Some(json!({ "generation": 2 })),
@@ -451,6 +454,7 @@ async fn provider_upgrade_with_stable_export_topology_does_not_enqueue_consumer_
         CreateScenarioRequest {
             source_url: provider_manifest_url.clone(),
             root_config: json!({ "value": "v1" }),
+            external_root_config: BTreeMap::new(),
             external_slots: BTreeMap::new(),
             exports: BTreeMap::new(),
             metadata: json!({}),
@@ -470,6 +474,7 @@ async fn provider_upgrade_with_stable_export_topology_does_not_enqueue_consumer_
         CreateScenarioRequest {
             source_url: consumer_manifest_url,
             root_config: json!({}),
+            external_root_config: BTreeMap::new(),
             external_slots: BTreeMap::from([(
                 "upstream".to_string(),
                 crate::domain::ExternalSlotBindingRequest {
@@ -496,6 +501,7 @@ async fn provider_upgrade_with_stable_export_topology_does_not_enqueue_consumer_
                 request: UpgradeScenarioRequest {
                     source_url: None,
                     root_config: Some(json!({ "value": "v2" })),
+                    external_root_config: None,
                     external_slots: Some(BTreeMap::new()),
                     exports: Some(BTreeMap::new()),
                     metadata: Some(json!({ "generation": 2 })),

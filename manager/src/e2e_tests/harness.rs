@@ -459,6 +459,7 @@ pub(super) fn create_request(source_url: String) -> CreateScenarioRequest {
     CreateScenarioRequest {
         source_url,
         root_config: json!({}),
+        external_root_config: BTreeMap::new(),
         external_slots: BTreeMap::new(),
         exports: BTreeMap::new(),
         metadata: json!({}),
@@ -476,6 +477,7 @@ pub(super) fn create_request_with_slot(
     CreateScenarioRequest {
         source_url,
         root_config: json!({}),
+        external_root_config: BTreeMap::new(),
         external_slots: slot_bindings(slot_name, &bindable_service_id),
         exports: BTreeMap::new(),
         metadata: json!({}),

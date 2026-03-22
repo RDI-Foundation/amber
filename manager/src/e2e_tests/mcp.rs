@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, net::TcpListener, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::TcpListener,
+    time::Duration,
+};
 
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
@@ -11,13 +15,14 @@ use super::harness::{
 use crate::{
     config::ManagerFileConfig,
     domain::{
-        BindableServiceResponse, CreateScenarioRequest, EnqueueOperationResponse,
-        ExportPublishRequest, ExportRequest, ObservedState, OperationStatus,
-        OperationStatusResponse, ScenarioDetailResponse, ServiceProtocol,
+        BindableConfigResponse, BindableServiceResponse, CreateScenarioRequest,
+        EnqueueOperationResponse, ExportPublishRequest, ExportRequest, ObservedState,
+        OperationStatus, OperationStatusResponse, ScenarioDetailResponse, ServiceProtocol,
     },
+    ids,
     mcp::{
-        BindableServicesListResponse, ExportsListResponse, ScenarioRevisionsListResponse,
-        ScenariosListResponse,
+        BindableConfigsListResponse, BindableServicesListResponse, ExportsListResponse,
+        ScenarioRevisionsListResponse, ScenariosListResponse,
     },
     service::{
         ExportDetailResponse, ExportWaitResult, ManagerHealthResponse, ManagerReadyResponse,
@@ -318,6 +323,8 @@ async fn mcp_streamable_http_discovers_and_covers_all_tools() {
         "amber.v1.manager.ready.get",
         "amber.v1.bindable_services.list",
         "amber.v1.bindable_services.get",
+        "amber.v1.bindable_configs.list",
+        "amber.v1.bindable_configs.get",
         "amber.v1.scenarios.list",
         "amber.v1.scenarios.get",
         "amber.v1.scenarios.create",
@@ -724,6 +731,40 @@ async fn mcp_streamable_http_discovers_and_covers_all_tools() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn mcp_bindable_configs_list_and_get() {
+    let config_name = "shared_secret";
+    let harness = TestHarness::new(ManagerFileConfig {
+        bindable_services: Default::default(),
+        bindable_configs: BTreeMap::from([(config_name.to_string(), json!("bravo"))]),
+        scenario_source_allowlist: None,
+    })
+    .await;
+    let mut mcp = McpClient::connect(&harness.base_url).await;
+
+    let listed: BindableConfigsListResponse = mcp
+        .call_tool("amber.v1.bindable_configs.list", json!({}))
+        .await;
+    assert_eq!(listed.bindable_configs.len(), 1);
+    assert_eq!(
+        listed.bindable_configs[0].bindable_config_id,
+        ids::operator_config_id(config_name)
+    );
+    assert_eq!(listed.bindable_configs[0].json_type, "string");
+
+    let fetched: BindableConfigResponse = mcp
+        .call_tool(
+            "amber.v1.bindable_configs.get",
+            json!({ "bindable_config_id": ids::operator_config_id(config_name) }),
+        )
+        .await;
+    assert_eq!(
+        fetched.bindable_config_id,
+        ids::operator_config_id(config_name)
+    );
+    assert_eq!(fetched.json_type, "string");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn mcp_exports_wait_reports_timeout_for_paused_scenario() {
     let harness = TestHarness::new(operator_service_config()).await;
     let mut mcp = McpClient::connect(&harness.base_url).await;
@@ -957,6 +998,7 @@ async fn mcp_create_rejects_source_url_outside_operator_allowlist() {
 
     let harness = TestHarness::new(ManagerFileConfig {
         bindable_services: Default::default(),
+        bindable_configs: Default::default(),
         scenario_source_allowlist: Some(BTreeSet::from([allowed_url])),
     })
     .await;
@@ -989,6 +1031,7 @@ async fn mcp_config_schema_rejects_source_url_outside_operator_allowlist() {
 
     let harness = TestHarness::new(ManagerFileConfig {
         bindable_services: Default::default(),
+        bindable_configs: Default::default(),
         scenario_source_allowlist: Some(BTreeSet::from([allowed_url])),
     })
     .await;
