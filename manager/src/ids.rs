@@ -20,6 +20,10 @@ pub fn operator_service_id(name: &str) -> String {
     format!("svc_{}", sanitize_component(name))
 }
 
+pub fn operator_config_id(name: &str) -> String {
+    format!("cfg_{}", sanitize_component(name))
+}
+
 fn sanitize_component(value: &str) -> String {
     value
         .chars()

@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, net::TcpListener, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::TcpListener,
+    time::{Duration, Instant},
+};
 
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
@@ -9,14 +13,16 @@ use super::harness::{
     TestHarness, create_request, create_request_with_slot, operator_service_config,
 };
 use crate::{
+    config::ManagerFileConfig,
     domain::{
-        BindableServiceResponse, CreateScenarioRequest, EnqueueOperationResponse,
-        ExportPublishRequest, ExportRequest, ObservedState, OperationStatus,
-        OperationStatusResponse, ScenarioDetailResponse, ServiceProtocol,
+        BindableConfigResponse, BindableServiceResponse, CreateScenarioRequest,
+        EnqueueOperationResponse, ExportPublishRequest, ExportRequest, ObservedState,
+        OperationStatus, OperationStatusResponse, ScenarioDetailResponse, ServiceProtocol,
     },
+    ids,
     mcp::{
-        BindableServicesListResponse, ExportsListResponse, ScenarioRevisionsListResponse,
-        ScenariosListResponse,
+        BindableConfigsListResponse, BindableServicesListResponse, ExportsListResponse,
+        ScenarioRevisionsListResponse, ScenariosListResponse,
     },
     service::{
         ExportDetailResponse, ExportWaitResult, ManagerHealthResponse, ManagerReadyResponse,
@@ -119,16 +125,20 @@ impl McpClient {
     }
 
     async fn wait_until_ready(&mut self) {
-        for _ in 0..50 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
             let ready: ManagerReadyResponse = self
                 .call_tool("amber.v1.manager.ready.get", json!({}))
                 .await;
             if ready.ready {
                 return;
             }
-            sleep(Duration::from_millis(20)).await;
+            assert!(
+                Instant::now() < deadline,
+                "manager never reported ready over MCP"
+            );
+            sleep(Duration::from_millis(50)).await;
         }
-        panic!("manager never reported ready over MCP");
     }
 
     async fn tools_list(&mut self) -> Vec<Value> {
@@ -317,6 +327,8 @@ async fn mcp_streamable_http_discovers_and_covers_all_tools() {
         "amber.v1.manager.ready.get",
         "amber.v1.bindable_services.list",
         "amber.v1.bindable_services.get",
+        "amber.v1.bindable_configs.list",
+        "amber.v1.bindable_configs.get",
         "amber.v1.scenarios.list",
         "amber.v1.scenarios.get",
         "amber.v1.scenarios.create",
@@ -723,6 +735,40 @@ async fn mcp_streamable_http_discovers_and_covers_all_tools() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn mcp_bindable_configs_list_and_get() {
+    let config_name = "shared_secret";
+    let harness = TestHarness::new(ManagerFileConfig {
+        bindable_services: Default::default(),
+        bindable_configs: BTreeMap::from([(config_name.to_string(), json!("bravo"))]),
+        scenario_source_allowlist: None,
+    })
+    .await;
+    let mut mcp = McpClient::connect(&harness.base_url).await;
+
+    let listed: BindableConfigsListResponse = mcp
+        .call_tool("amber.v1.bindable_configs.list", json!({}))
+        .await;
+    assert_eq!(listed.bindable_configs.len(), 1);
+    assert_eq!(
+        listed.bindable_configs[0].bindable_config_id,
+        ids::operator_config_id(config_name)
+    );
+    assert_eq!(listed.bindable_configs[0].json_type, "string");
+
+    let fetched: BindableConfigResponse = mcp
+        .call_tool(
+            "amber.v1.bindable_configs.get",
+            json!({ "bindable_config_id": ids::operator_config_id(config_name) }),
+        )
+        .await;
+    assert_eq!(
+        fetched.bindable_config_id,
+        ids::operator_config_id(config_name)
+    );
+    assert_eq!(fetched.json_type, "string");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn mcp_exports_wait_reports_timeout_for_paused_scenario() {
     let harness = TestHarness::new(operator_service_config()).await;
     let mut mcp = McpClient::connect(&harness.base_url).await;
@@ -946,4 +992,61 @@ async fn mcp_wait_tools_reject_oversized_timeouts() {
         )
         .await;
     assert!(export_error.contains("timeout_ms"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_create_rejects_source_url_outside_operator_allowlist() {
+    let manifest_harness = TestHarness::new(ManagerFileConfig::default()).await;
+    let allowed_url = manifest_harness.write_provider_manifest("mcp-allowlisted-provider.json5");
+    let denied_url = manifest_harness.write_provider_manifest("mcp-blocked-provider.json5");
+
+    let harness = TestHarness::new(ManagerFileConfig {
+        bindable_services: Default::default(),
+        bindable_configs: Default::default(),
+        scenario_source_allowlist: Some(BTreeSet::from([allowed_url])),
+    })
+    .await;
+    let mut mcp = McpClient::connect(&harness.base_url).await;
+
+    let error = mcp
+        .call_tool_error(
+            "amber.v1.scenarios.create",
+            serde_json::to_value(create_request(denied_url.clone()))
+                .expect("serialize allowlist-blocked create request"),
+        )
+        .await;
+    assert!(error.contains("scenario_source_allowlist"));
+    assert!(error.contains(&denied_url));
+
+    let scenarios: ScenariosListResponse =
+        mcp.call_tool("amber.v1.scenarios.list", json!({})).await;
+    assert!(
+        scenarios.scenarios.is_empty(),
+        "unexpected scenarios: {scenarios:#?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_config_schema_rejects_source_url_outside_operator_allowlist() {
+    let manifest_harness = TestHarness::new(ManagerFileConfig::default()).await;
+    let allowed_url =
+        manifest_harness.write_provider_manifest("mcp-schema-allowlisted-provider.json5");
+    let denied_url = manifest_harness.write_provider_manifest("mcp-schema-blocked-provider.json5");
+
+    let harness = TestHarness::new(ManagerFileConfig {
+        bindable_services: Default::default(),
+        bindable_configs: Default::default(),
+        scenario_source_allowlist: Some(BTreeSet::from([allowed_url])),
+    })
+    .await;
+    let mut mcp = McpClient::connect(&harness.base_url).await;
+
+    let error = mcp
+        .call_tool_error(
+            "amber.v1.scenarios.config_schema.get",
+            json!({ "source_url": denied_url.clone() }),
+        )
+        .await;
+    assert!(error.contains("scenario_source_allowlist"));
+    assert!(error.contains(&denied_url));
 }

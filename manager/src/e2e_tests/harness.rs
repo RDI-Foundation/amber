@@ -222,6 +222,30 @@ impl TestHarness {
         self.get_json(&format!("/v1/scenarios/{scenario_id}")).await
     }
 
+    pub(super) async fn wait_for_scenario_detail<F>(
+        &self,
+        description: &str,
+        scenario_id: &str,
+        timeout: Duration,
+        mut check: F,
+    ) -> ScenarioDetailResponse
+    where
+        F: FnMut(&ScenarioDetailResponse) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let detail = self.scenario_detail(scenario_id).await;
+            if check(&detail) {
+                return detail;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {description}"
+            );
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     pub(super) async fn find_export_service(
         &self,
         scenario_id: &str,
@@ -326,6 +350,23 @@ impl TestHarness {
             .await
             .expect("send POST");
         Self::decode_success(response).await
+    }
+
+    pub(super) async fn post_json_raw<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> (StatusCode, String) {
+        let response = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .json(body)
+            .send()
+            .await
+            .expect("send raw POST");
+        let status = response.status();
+        let body = response.text().await.expect("read raw POST body");
+        (status, body)
     }
 
     pub(super) async fn post_empty<T: DeserializeOwned>(&self, path: &str) -> T {
@@ -442,6 +483,7 @@ pub(super) fn create_request(source_url: String) -> CreateScenarioRequest {
     CreateScenarioRequest {
         source_url,
         root_config: json!({}),
+        external_root_config: BTreeMap::new(),
         external_slots: BTreeMap::new(),
         exports: BTreeMap::new(),
         metadata: json!({}),
@@ -459,6 +501,7 @@ pub(super) fn create_request_with_slot(
     CreateScenarioRequest {
         source_url,
         root_config: json!({}),
+        external_root_config: BTreeMap::new(),
         external_slots: slot_bindings(slot_name, &bindable_service_id),
         exports: BTreeMap::new(),
         metadata: json!({}),

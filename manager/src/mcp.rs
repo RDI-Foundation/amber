@@ -82,9 +82,19 @@ pub(crate) struct BindableServicesListResponse {
     pub bindable_services: Vec<crate::domain::BindableServiceResponse>,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, JsonSchema)]
+pub(crate) struct BindableConfigsListResponse {
+    pub bindable_configs: Vec<crate::domain::BindableConfigResponse>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 struct BindableServicesGetArgs {
     bindable_service_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct BindableConfigsGetArgs {
+    bindable_config_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema, Default)]
@@ -249,6 +259,30 @@ impl AmberManagerMcp {
         self.core
             .get_bindable_service(&args.bindable_service_id)
             .await
+            .map(Json)
+            .map_err(map_manager_error)
+    }
+
+    #[tool(
+        name = "amber.v1.bindable_configs.list",
+        description = "List bindable configs."
+    )]
+    async fn bindable_configs_list(&self) -> Result<Json<BindableConfigsListResponse>, McpError> {
+        Ok(Json(BindableConfigsListResponse {
+            bindable_configs: self.core.list_bindable_configs(),
+        }))
+    }
+
+    #[tool(
+        name = "amber.v1.bindable_configs.get",
+        description = "Read one bindable config."
+    )]
+    async fn bindable_configs_get(
+        &self,
+        Parameters(args): Parameters<BindableConfigsGetArgs>,
+    ) -> Result<Json<crate::domain::BindableConfigResponse>, McpError> {
+        self.core
+            .get_bindable_config(&args.bindable_config_id)
             .map(Json)
             .map_err(map_manager_error)
     }
@@ -676,6 +710,12 @@ fn module_docs() -> &'static [ModuleDoc] {
             when_to_use: "Use this when you need bindable service identity or availability.",
         },
         ModuleDoc {
+            name: "bindable_configs",
+            description: "Bindable-config discovery for operator-provided root config values.",
+            when_to_use: "Use this when you need bindable config identity before create or \
+                          upgrade.",
+        },
+        ModuleDoc {
             name: "scenarios",
             description: "Scenario inspection, lifecycle, revision history, and config schema \
                           discovery.",
@@ -729,6 +769,17 @@ fn tool_doc_extra(name: &str) -> ToolDocExtra {
             examples: &["Use the bindable_service_id from exports.get or bindable_services.list."],
             failure_cases: &["Unknown bindable service IDs are tool-call failures."],
         },
+        "amber.v1.bindable_configs.list" => ToolDocExtra {
+            examples: &[
+                "List all bindable configs before constructing external_root_config.",
+                "Use this with scenarios.config_schema.get when brokering root config choices.",
+            ],
+            failure_cases: &["This should only fail on transport or server failure."],
+        },
+        "amber.v1.bindable_configs.get" => ToolDocExtra {
+            examples: &["Use the bindable_config_id from bindable_configs.list."],
+            failure_cases: &["Unknown bindable config IDs are tool-call failures."],
+        },
         "amber.v1.scenarios.list" => ToolDocExtra {
             examples: &[
                 "Filter by metadata_exact to find policy-tagged scenarios.",
@@ -750,6 +801,7 @@ fn tool_doc_extra(name: &str) -> ToolDocExtra {
             failure_cases: &[
                 "Invalid source_url, invalid slots, or invalid exports surface as tool-call \
                  failures.",
+                "scenario_source_allowlist rejections surface as tool-call failures.",
             ],
         },
         "amber.v1.scenarios.upgrade" => ToolDocExtra {
@@ -758,7 +810,8 @@ fn tool_doc_extra(name: &str) -> ToolDocExtra {
                  settings.",
             ],
             failure_cases: &[
-                "Unknown scenario IDs and conflicting in-flight operations are tool-call failures.",
+                "Unknown scenario IDs, conflicting in-flight operations, and \
+                 scenario_source_allowlist rejections are tool-call failures.",
             ],
         },
         "amber.v1.scenarios.pause" => ToolDocExtra {
@@ -784,7 +837,10 @@ fn tool_doc_extra(name: &str) -> ToolDocExtra {
                 "Call with source_url before create when root_config shape is unknown.",
                 "Call with scenario_id to inspect an existing scenario’s active config schema.",
             ],
-            failure_cases: &["Exactly one of source_url or scenario_id must be supplied."],
+            failure_cases: &[
+                "Exactly one of source_url or scenario_id must be supplied.",
+                "Disallowed or invalid source_url values are tool-call failures.",
+            ],
         },
         "amber.v1.operations.get" => ToolDocExtra {
             examples: &["Read raw operation state when you need phase or retry-count details."],

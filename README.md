@@ -161,6 +161,55 @@ Amber also publishes `ghcr.io/rdi-foundation/amber-manager:v0.1` for running the
 manager daemon in a container. Unlike the runtime images above, Amber does not inject that image
 into generated outputs; you run it explicitly when you want the manager service.
 
+`amber-manager` reads operator policy from the JSON file passed via `--config`. For example,
+operators can register static bindable services, operator-provided bindable root-config values,
+and restrict scenario create/upgrade requests to an explicit `scenario_source_allowlist`:
+
+```json
+{
+  "bindable_services": {
+    "manager": {
+      "protocol": "http",
+      "provider": {
+        "kind": "loopback_upstream",
+        "upstream": "127.0.0.1:4100"
+      }
+    }
+  },
+  "bindable_configs": {
+    "openai_prod_api_key": "sk-live-xxxxx",
+    "shared_otel_endpoint": "http://otel.internal:4318/v1/traces"
+  },
+  "scenario_source_allowlist": [
+    "file:///opt/amber/scenarios/controller.json5",
+    "https://artifacts.example.com/amber/provider.json5"
+  ]
+}
+```
+
+If `scenario_source_allowlist` is omitted, the manager accepts any scenario source URL. If it is
+present, any manager request that fetches a scenario from a `source_url` must use one of the
+listed URLs. Today that includes create requests, upgrades, and `source_url`-based config schema
+lookups. An empty allowlist rejects all such requests.
+
+Bindable configs are enumerated through the manager API as opaque ids such as
+`cfg_openai_prod_api_key`; the raw values are not returned by the API. Create and upgrade
+requests can then map root-config paths to those ids with `external_root_config`, for example:
+
+```json
+{
+  "source_url": "https://artifacts.example.com/amber/provider.json5",
+  "root_config": {},
+  "external_root_config": {
+    "api_key": "cfg_openai_prod_api_key",
+    "telemetry.endpoint": "cfg_shared_otel_endpoint"
+  }
+}
+```
+
+The manager resolves `external_root_config` into the effective root config before compilation, so
+the caller never needs the underlying secret value.
+
 If you're working in this repo, the published image list and tags live in
 `docker/images.json`; CI publishes and verifies those tags on `main`.
 Image publishing is fully manifest-driven. Git tags are not used to publish images.

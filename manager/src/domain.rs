@@ -155,6 +155,8 @@ pub struct CreateScenarioRequest {
     #[serde(default)]
     pub root_config: Value,
     #[serde(default)]
+    pub external_root_config: BTreeMap<String, String>,
+    #[serde(default)]
     pub external_slots: BTreeMap<String, ExternalSlotBindingRequest>,
     #[serde(default)]
     pub exports: BTreeMap<String, ExportRequest>,
@@ -175,6 +177,8 @@ pub struct UpgradeScenarioRequest {
     pub source_url: Option<String>,
     #[serde(default)]
     pub root_config: Option<Value>,
+    #[serde(default)]
+    pub external_root_config: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub external_slots: Option<BTreeMap<String, ExternalSlotBindingRequest>>,
     #[serde(default)]
@@ -254,6 +258,15 @@ pub struct BindableServiceResponse {
     pub scenario_id: Option<String>,
     #[serde(default)]
     pub export: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BindableConfigResponse {
+    pub bindable_config_id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    pub json_type: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]

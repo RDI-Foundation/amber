@@ -41,7 +41,10 @@ impl OperationWorker {
             .map_err(retryable_error)?;
         let revision_dir = self.state.runtime.revision_dir(scenario_id, revision);
         let bundle_dir = request.store_bundle.then(|| revision_dir.join("bundle"));
-        let compiled = compiler::compile_create(request, bundle_dir.as_deref())
+        let compiled = self
+            .state
+            .scenario_sources()
+            .compile_create(request, bundle_dir.as_deref())
             .await
             .map_err(classify_create_compile_error)?;
         let bindings = self
@@ -145,16 +148,19 @@ impl OperationWorker {
             .map_err(retryable_error)?;
         let revision_dir = self.state.runtime.revision_dir(&scenario.id, revision);
         let bundle_dir = request.store_bundle.then(|| revision_dir.join("bundle"));
-        let compiled = compiler::compile_upgrade(
-            &resolved.source_url,
-            &resolved.root_config,
-            &resolved.external_slots,
-            &resolved.exports,
-            request.store_bundle,
-            bundle_dir.as_deref(),
-        )
-        .await
-        .map_err(classify_upgrade_compile_error)?;
+        let compiled = self
+            .state
+            .scenario_sources()
+            .compile_upgrade(
+                &resolved.source_url,
+                &resolved.root_config,
+                &resolved.external_slots,
+                &resolved.exports,
+                request.store_bundle,
+                bundle_dir.as_deref(),
+            )
+            .await
+            .map_err(classify_upgrade_compile_error)?;
 
         self.ensure_export_change_is_safe(&scenario.id, &compiled)
             .await?;

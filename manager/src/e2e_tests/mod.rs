@@ -1,7 +1,11 @@
 mod harness;
 mod mcp;
 
-use std::{collections::BTreeMap, net::TcpListener, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::TcpListener,
+    time::Duration,
+};
 
 use amber_config::{encode_env_value, env_var_for_path};
 use reqwest::StatusCode;
@@ -13,11 +17,12 @@ use self::harness::{
 use crate::{
     config::ManagerFileConfig,
     domain::{
-        BindableServiceResponse, CreateScenarioRequest, DesiredState, EnqueueOperationResponse,
-        ExportPublishRequest, ExportRequest, ObservedState, OperationStatus,
-        ScenarioRevisionSummaryResponse, ScenarioSummaryResponse, ScenarioTelemetryRequest,
-        UpgradeScenarioRequest,
+        BindableConfigResponse, BindableServiceResponse, CreateScenarioRequest, DesiredState,
+        EnqueueOperationResponse, ExportPublishRequest, ExportRequest, ObservedState,
+        OperationStatus, ScenarioRevisionSummaryResponse, ScenarioSummaryResponse,
+        ScenarioTelemetryRequest, UpgradeScenarioRequest,
     },
+    ids,
 };
 
 async fn create_bound_provider_and_consumer(
@@ -109,6 +114,7 @@ async fn scenario_lifecycle_over_live_http_api() {
             &UpgradeScenarioRequest {
                 source_url: None,
                 root_config: Some(json!({})),
+                external_root_config: None,
                 external_slots: Some(BTreeMap::new()),
                 exports: Some(BTreeMap::new()),
                 metadata: Some(json!({ "generation": 2 })),
@@ -143,6 +149,331 @@ async fn scenario_lifecycle_over_live_http_api() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn create_rejects_source_url_outside_operator_allowlist() {
+    let manifest_harness = TestHarness::new(ManagerFileConfig::default()).await;
+    let allowed_url = manifest_harness.write_provider_manifest("allowlisted-provider.json5");
+    let denied_url = manifest_harness.write_provider_manifest("blocked-provider.json5");
+
+    let restricted_harness = TestHarness::new(ManagerFileConfig {
+        bindable_services: BTreeMap::new(),
+        bindable_configs: BTreeMap::new(),
+        scenario_source_allowlist: Some(BTreeSet::from([allowed_url])),
+    })
+    .await;
+
+    let (status, body) = restricted_harness
+        .post_json_raw("/v1/scenarios", &create_request(denied_url.clone()))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+    assert!(
+        body.contains("scenario_source_allowlist"),
+        "unexpected body: {body}"
+    );
+    assert!(body.contains(&denied_url), "unexpected body: {body}");
+
+    let scenarios: Vec<ScenarioSummaryResponse> =
+        restricted_harness.get_json("/v1/scenarios").await;
+    assert!(scenarios.is_empty(), "unexpected scenarios: {scenarios:#?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_rejects_invalid_source_url_before_enqueue() {
+    let harness = TestHarness::new(ManagerFileConfig::default()).await;
+
+    let (status, body) = harness
+        .post_json_raw(
+            "/v1/scenarios",
+            &create_request("not a valid url".to_string()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+    assert!(
+        body.contains("invalid source URL"),
+        "unexpected body: {body}"
+    );
+    assert!(body.contains("not a valid url"), "unexpected body: {body}");
+
+    let scenarios: Vec<ScenarioSummaryResponse> = harness.get_json("/v1/scenarios").await;
+    assert!(scenarios.is_empty(), "unexpected scenarios: {scenarios:#?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bindable_configs_enumerate_and_resolve_into_root_config() {
+    let public_name = "public_alpha";
+    let secret_name = "secret_bravo";
+    let harness = TestHarness::new(ManagerFileConfig {
+        bindable_services: BTreeMap::new(),
+        bindable_configs: BTreeMap::from([
+            (public_name.to_string(), json!("alpha")),
+            (secret_name.to_string(), json!("bravo")),
+        ]),
+        scenario_source_allowlist: None,
+    })
+    .await;
+    let configured_url = harness.write_configured_manifest("configured-bindable.json5");
+
+    let configs: Vec<BindableConfigResponse> = harness.get_json("/v1/bindable-configs").await;
+    assert_eq!(configs.len(), 2);
+    assert_eq!(
+        configs
+            .iter()
+            .map(|config| config.bindable_config_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            ids::operator_config_id(public_name),
+            ids::operator_config_id(secret_name),
+        ]
+    );
+    assert_eq!(configs[0].json_type, "string");
+    assert_eq!(configs[1].json_type, "string");
+
+    let created = harness
+        .create_scenario(&CreateScenarioRequest {
+            source_url: configured_url,
+            root_config: json!({}),
+            external_root_config: BTreeMap::from([
+                (
+                    "public_value".to_string(),
+                    ids::operator_config_id(public_name),
+                ),
+                (
+                    "secret_value".to_string(),
+                    ids::operator_config_id(secret_name),
+                ),
+            ]),
+            external_slots: BTreeMap::new(),
+            exports: BTreeMap::new(),
+            metadata: json!({}),
+            telemetry: ScenarioTelemetryRequest::default(),
+            store_bundle: false,
+            start: true,
+        })
+        .await;
+    let create_op = harness.wait_for_operation(&created.operation_id).await;
+    assert_eq!(create_op.status, OperationStatus::Succeeded);
+
+    let detail = harness.scenario_detail(&created.scenario_id).await;
+    assert_eq!(detail.root_config, json!({ "public_value": "alpha" }));
+    assert_eq!(
+        detail.secret_root_config_paths,
+        vec!["secret_value".to_string()]
+    );
+
+    let runtime_env = harness.read_runtime_env(&created.scenario_id, 1);
+    assert_env_contains_root_config(&runtime_env, "public_value", "alpha");
+    assert_env_contains_root_config(&runtime_env, "secret_value", "bravo");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrade_rebinds_existing_external_root_config_without_resending_root_config() {
+    let first_public_name = "public_alpha";
+    let second_public_name = "public_charlie";
+    let first_secret_name = "secret_bravo";
+    let second_secret_name = "secret_delta";
+    let harness = TestHarness::new(ManagerFileConfig {
+        bindable_services: BTreeMap::new(),
+        bindable_configs: BTreeMap::from([
+            (first_public_name.to_string(), json!("alpha")),
+            (second_public_name.to_string(), json!("charlie")),
+            (first_secret_name.to_string(), json!("bravo")),
+            (second_secret_name.to_string(), json!("delta")),
+        ]),
+        scenario_source_allowlist: None,
+    })
+    .await;
+    let configured_url = harness.write_configured_manifest("configured-bindable.json5");
+
+    let created = harness
+        .create_scenario(&CreateScenarioRequest {
+            source_url: configured_url,
+            root_config: json!({}),
+            external_root_config: BTreeMap::from([
+                (
+                    "public_value".to_string(),
+                    ids::operator_config_id(first_public_name),
+                ),
+                (
+                    "secret_value".to_string(),
+                    ids::operator_config_id(first_secret_name),
+                ),
+            ]),
+            external_slots: BTreeMap::new(),
+            exports: BTreeMap::new(),
+            metadata: json!({}),
+            telemetry: ScenarioTelemetryRequest::default(),
+            store_bundle: false,
+            start: true,
+        })
+        .await;
+    let create_op = harness.wait_for_operation(&created.operation_id).await;
+    assert_eq!(create_op.status, OperationStatus::Succeeded);
+
+    let upgraded: EnqueueOperationResponse = harness
+        .post_json(
+            &format!("/v1/scenarios/{}/upgrade", created.scenario_id),
+            &UpgradeScenarioRequest {
+                source_url: None,
+                root_config: None,
+                external_root_config: Some(BTreeMap::from([
+                    (
+                        "public_value".to_string(),
+                        ids::operator_config_id(second_public_name),
+                    ),
+                    (
+                        "secret_value".to_string(),
+                        ids::operator_config_id(second_secret_name),
+                    ),
+                ])),
+                external_slots: None,
+                exports: None,
+                metadata: None,
+                telemetry: None,
+                store_bundle: false,
+            },
+        )
+        .await;
+    let upgraded_op = harness.wait_for_operation(&upgraded.operation_id).await;
+    assert_eq!(upgraded_op.status, OperationStatus::Succeeded);
+
+    let detail = harness.scenario_detail(&created.scenario_id).await;
+    assert_eq!(detail.active_revision, Some(2));
+    assert_eq!(detail.root_config, json!({ "public_value": "charlie" }));
+    assert_eq!(
+        detail.secret_root_config_paths,
+        vec!["secret_value".to_string()]
+    );
+
+    let upgraded_env = harness.read_runtime_env(&created.scenario_id, 2);
+    assert_env_contains_root_config(&upgraded_env, "public_value", "charlie");
+    assert_env_contains_root_config(&upgraded_env, "secret_value", "delta");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_rejects_unknown_bindable_config_before_enqueue() {
+    let harness = TestHarness::new(ManagerFileConfig::default()).await;
+    let configured_url = harness.write_configured_manifest("configured-missing-bindable.json5");
+
+    let (status, body) = harness
+        .post_json_raw(
+            "/v1/scenarios",
+            &CreateScenarioRequest {
+                source_url: configured_url,
+                root_config: json!({}),
+                external_root_config: BTreeMap::from([(
+                    "secret_value".to_string(),
+                    "cfg_missing".to_string(),
+                )]),
+                external_slots: BTreeMap::new(),
+                exports: BTreeMap::new(),
+                metadata: json!({}),
+                telemetry: ScenarioTelemetryRequest::default(),
+                store_bundle: false,
+                start: true,
+            },
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+    assert!(body.contains("cfg_missing"), "unexpected body: {body}");
+
+    let scenarios: Vec<ScenarioSummaryResponse> = harness.get_json("/v1/scenarios").await;
+    assert!(scenarios.is_empty(), "unexpected scenarios: {scenarios:#?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_rejects_external_root_config_path_with_empty_segment_before_enqueue() {
+    let bindable_name = "secret_bravo";
+    let harness = TestHarness::new(ManagerFileConfig {
+        bindable_services: BTreeMap::new(),
+        bindable_configs: BTreeMap::from([(bindable_name.to_string(), json!("bravo"))]),
+        scenario_source_allowlist: None,
+    })
+    .await;
+    let configured_url = harness.write_configured_manifest("configured-missing-bindable.json5");
+
+    let invalid_path = "secret..value";
+    let (status, body) = harness
+        .post_json_raw(
+            "/v1/scenarios",
+            &CreateScenarioRequest {
+                source_url: configured_url,
+                root_config: json!({}),
+                external_root_config: BTreeMap::from([(
+                    invalid_path.to_string(),
+                    ids::operator_config_id(bindable_name),
+                )]),
+                external_slots: BTreeMap::new(),
+                exports: BTreeMap::new(),
+                metadata: json!({}),
+                telemetry: ScenarioTelemetryRequest::default(),
+                store_bundle: false,
+                start: true,
+            },
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+    assert!(body.contains(invalid_path), "unexpected body: {body}");
+    assert!(body.contains("empty segments"), "unexpected body: {body}");
+
+    let scenarios: Vec<ScenarioSummaryResponse> = harness.get_json("/v1/scenarios").await;
+    assert!(scenarios.is_empty(), "unexpected scenarios: {scenarios:#?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrade_rejects_source_url_outside_operator_allowlist() {
+    let manifest_harness = TestHarness::new(ManagerFileConfig::default()).await;
+    let allowed_url =
+        manifest_harness.write_provider_manifest("upgrade-allowlisted-provider.json5");
+    let denied_url = manifest_harness.write_provider_manifest("upgrade-blocked-provider.json5");
+
+    let restricted_harness = TestHarness::new(ManagerFileConfig {
+        bindable_services: BTreeMap::new(),
+        bindable_configs: BTreeMap::new(),
+        scenario_source_allowlist: Some(BTreeSet::from([allowed_url.clone()])),
+    })
+    .await;
+
+    let created = restricted_harness
+        .create_scenario(&create_request(allowed_url))
+        .await;
+    let create_op = restricted_harness
+        .wait_for_operation(&created.operation_id)
+        .await;
+    assert_eq!(create_op.status, OperationStatus::Succeeded);
+
+    let (status, body) = restricted_harness
+        .post_json_raw(
+            &format!("/v1/scenarios/{}/upgrade", created.scenario_id),
+            &UpgradeScenarioRequest {
+                source_url: Some(denied_url.clone()),
+                root_config: None,
+                external_root_config: None,
+                external_slots: None,
+                exports: None,
+                metadata: None,
+                telemetry: None,
+                store_bundle: false,
+            },
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+    assert!(
+        body.contains("scenario_source_allowlist"),
+        "unexpected body: {body}"
+    );
+    assert!(body.contains(&denied_url), "unexpected body: {body}");
+
+    let detail = restricted_harness
+        .scenario_detail(&created.scenario_id)
+        .await;
+    assert_eq!(detail.active_revision, Some(1));
+
+    let revisions: Vec<ScenarioRevisionSummaryResponse> = restricted_harness
+        .get_json(&format!("/v1/scenarios/{}/revisions", created.scenario_id))
+        .await;
+    assert_eq!(revisions.len(), 1, "unexpected revisions: {revisions:#?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn upgrade_preserves_omitted_configuration_fields() {
     let harness = TestHarness::new(ManagerFileConfig::default()).await;
     let configured_url = harness.write_configured_manifest("configured-upgrade.json5");
@@ -158,6 +489,7 @@ async fn upgrade_preserves_omitted_configuration_fields() {
                 "public_value": "alpha",
                 "secret_value": "bravo",
             }),
+            external_root_config: BTreeMap::new(),
             external_slots: BTreeMap::new(),
             exports: BTreeMap::from([(
                 "api".to_string(),
@@ -184,6 +516,7 @@ async fn upgrade_preserves_omitted_configuration_fields() {
             &UpgradeScenarioRequest {
                 source_url: None,
                 root_config: None,
+                external_root_config: None,
                 external_slots: None,
                 exports: None,
                 metadata: Some(json!({ "generation": 2 })),
@@ -231,24 +564,20 @@ async fn upgrade_recovers_root_config_after_failed_initial_create() {
     let harness = TestHarness::new(ManagerFileConfig::default()).await;
     let configured_url = harness.write_configured_manifest("configured-after-failed-create.json5");
     let telemetry_endpoint = "http://127.0.0.1:4318/v1/traces";
+    let mut failed_create_request = create_request(configured_url.clone());
+    failed_create_request.root_config = json!({
+        "public_value": "alpha",
+        "secret_value": "bravo",
+    });
+    failed_create_request
+        .exports
+        .insert("bogus".to_string(), ExportRequest { publish: None });
+    failed_create_request.metadata = json!({ "generation": 1 });
+    failed_create_request.telemetry = ScenarioTelemetryRequest {
+        upstream_otlp_http_endpoint: Some(telemetry_endpoint.to_string()),
+    };
 
-    let created = harness
-        .create_scenario(&CreateScenarioRequest {
-            source_url: "not a valid url".to_string(),
-            root_config: json!({
-                "public_value": "alpha",
-                "secret_value": "bravo",
-            }),
-            external_slots: BTreeMap::new(),
-            exports: BTreeMap::new(),
-            metadata: json!({ "generation": 1 }),
-            telemetry: ScenarioTelemetryRequest {
-                upstream_otlp_http_endpoint: Some(telemetry_endpoint.to_string()),
-            },
-            store_bundle: false,
-            start: true,
-        })
-        .await;
+    let created = harness.create_scenario(&failed_create_request).await;
     let create_op = harness.wait_for_operation(&created.operation_id).await;
     assert_eq!(create_op.status, OperationStatus::Failed);
 
@@ -262,10 +591,11 @@ async fn upgrade_recovers_root_config_after_failed_initial_create() {
         .post_json(
             &format!("/v1/scenarios/{}/upgrade", created.scenario_id),
             &UpgradeScenarioRequest {
-                source_url: Some(configured_url),
+                source_url: None,
                 root_config: None,
+                external_root_config: None,
                 external_slots: None,
-                exports: None,
+                exports: Some(BTreeMap::new()),
                 metadata: None,
                 telemetry: None,
                 store_bundle: false,
@@ -299,6 +629,70 @@ async fn upgrade_recovers_root_config_after_failed_initial_create() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn upgrade_recovers_bindable_root_config_after_failed_initial_create() {
+    let public_name = "public_alpha";
+    let secret_name = "secret_bravo";
+    let harness = TestHarness::new(ManagerFileConfig {
+        bindable_services: BTreeMap::new(),
+        bindable_configs: BTreeMap::from([
+            (public_name.to_string(), json!("alpha")),
+            (secret_name.to_string(), json!("bravo")),
+        ]),
+        scenario_source_allowlist: None,
+    })
+    .await;
+    let configured_url = harness.write_configured_manifest("configured-bindable-recovery.json5");
+
+    let mut failed_create_request = create_request(configured_url);
+    failed_create_request.external_root_config = BTreeMap::from([
+        (
+            "public_value".to_string(),
+            ids::operator_config_id(public_name),
+        ),
+        (
+            "secret_value".to_string(),
+            ids::operator_config_id(secret_name),
+        ),
+    ]);
+    failed_create_request
+        .exports
+        .insert("bogus".to_string(), ExportRequest { publish: None });
+
+    let created = harness.create_scenario(&failed_create_request).await;
+    let create_op = harness.wait_for_operation(&created.operation_id).await;
+    assert_eq!(create_op.status, OperationStatus::Failed);
+
+    let upgraded: EnqueueOperationResponse = harness
+        .post_json(
+            &format!("/v1/scenarios/{}/upgrade", created.scenario_id),
+            &UpgradeScenarioRequest {
+                source_url: None,
+                root_config: None,
+                external_root_config: None,
+                external_slots: None,
+                exports: Some(BTreeMap::new()),
+                metadata: None,
+                telemetry: None,
+                store_bundle: false,
+            },
+        )
+        .await;
+    let upgraded_op = harness.wait_for_operation(&upgraded.operation_id).await;
+    assert_eq!(upgraded_op.status, OperationStatus::Succeeded);
+
+    let detail = harness.scenario_detail(&created.scenario_id).await;
+    assert_eq!(detail.root_config, json!({ "public_value": "alpha" }));
+    assert_eq!(
+        detail.secret_root_config_paths,
+        vec!["secret_value".to_string()]
+    );
+
+    let runtime_env = harness.read_runtime_env(&created.scenario_id, 1);
+    assert_env_contains_root_config(&runtime_env, "public_value", "alpha");
+    assert_env_contains_root_config(&runtime_env, "secret_value", "bravo");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn paused_resume_and_reconcile_keep_persisted_runtime_config() {
     let harness = TestHarness::new(ManagerFileConfig::default()).await;
     let configured_url = harness.write_configured_manifest("configured.json5");
@@ -311,6 +705,7 @@ async fn paused_resume_and_reconcile_keep_persisted_runtime_config() {
                 "public_value": "alpha",
                 "secret_value": "bravo",
             }),
+            external_root_config: BTreeMap::new(),
             external_slots: BTreeMap::new(),
             exports: BTreeMap::new(),
             metadata: json!({}),
@@ -454,6 +849,7 @@ async fn provider_upgrade_stays_blocked_while_consumer_is_observed_running() {
             &UpgradeScenarioRequest {
                 source_url: Some(provider_with_renamed_export),
                 root_config: Some(json!({})),
+                external_root_config: None,
                 external_slots: Some(BTreeMap::new()),
                 exports: Some(BTreeMap::new()),
                 metadata: Some(json!({})),
@@ -503,6 +899,7 @@ async fn upgrade_applies_new_telemetry_immediately() {
             &UpgradeScenarioRequest {
                 source_url: None,
                 root_config: Some(json!({})),
+                external_root_config: None,
                 external_slots: Some(BTreeMap::new()),
                 exports: Some(BTreeMap::new()),
                 metadata: Some(json!({})),
@@ -571,6 +968,7 @@ async fn upgrade_rejects_dependency_cycle() {
             &UpgradeScenarioRequest {
                 source_url: None,
                 root_config: Some(json!({})),
+                external_root_config: None,
                 external_slots: Some(slot_bindings("dep", &second_export.bindable_service_id)),
                 exports: Some(BTreeMap::new()),
                 metadata: Some(json!({})),
@@ -700,6 +1098,23 @@ async fn health_monitor_restarts_unhealthy_provider_without_rewiring_consumer() 
         })
         .await;
 
+    let provider_detail = harness
+        .wait_for_scenario_detail(
+            "provider observed running after restart",
+            &provider.scenario_id,
+            Duration::from_secs(10),
+            |detail| detail.observed_state == ObservedState::Running,
+        )
+        .await;
+    let consumer_detail = harness
+        .wait_for_scenario_detail(
+            "consumer remained running during provider restart",
+            &consumer.scenario_id,
+            Duration::from_secs(10),
+            |detail| detail.observed_state == ObservedState::Running,
+        )
+        .await;
+
     let consumer_spec = harness
         .runtime
         .last_spec(&consumer.scenario_id)
@@ -711,9 +1126,6 @@ async fn health_monitor_restarts_unhealthy_provider_without_rewiring_consumer() 
         harness.runtime.apply_count(&consumer.scenario_id).await,
         initial_consumer_apply_count
     );
-
-    let provider_detail = harness.scenario_detail(&provider.scenario_id).await;
-    let consumer_detail = harness.scenario_detail(&consumer.scenario_id).await;
     assert_eq!(provider_detail.observed_state, ObservedState::Running);
     assert_eq!(consumer_detail.observed_state, ObservedState::Running);
 }

@@ -19,6 +19,8 @@ pub fn router(service: Arc<ManagerService>) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/v1/bindable-services", get(list_bindable_services))
+        .route("/v1/bindable-configs", get(list_bindable_configs))
+        .route("/v1/bindable-configs/{id}", get(get_bindable_config))
         .route("/v1/scenarios", get(list_scenarios).post(create_scenario))
         .route(
             "/v1/scenarios/{id}",
@@ -55,6 +57,19 @@ async fn list_bindable_services(
             .list_bindable_services(BindableServiceFilter::default())
             .await?,
     ))
+}
+
+async fn list_bindable_configs(
+    State(service): State<Arc<ManagerService>>,
+) -> Result<Json<Vec<crate::domain::BindableConfigResponse>>, ApiError> {
+    Ok(Json(service.list_bindable_configs()))
+}
+
+async fn get_bindable_config(
+    State(service): State<Arc<ManagerService>>,
+    Path(bindable_config_id): Path<String>,
+) -> Result<Json<crate::domain::BindableConfigResponse>, ApiError> {
+    Ok(Json(service.get_bindable_config(&bindable_config_id)?))
 }
 
 async fn list_scenarios(

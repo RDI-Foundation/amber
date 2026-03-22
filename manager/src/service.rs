@@ -12,16 +12,18 @@ use serde_json::{Map, Value, json};
 use tokio::time::{Instant, sleep};
 
 use crate::{
-    compiler::{inspect_source, inspect_stored_ir, root_schema_from_ir},
+    compiler::{inspect_stored_ir, root_schema_from_ir},
     domain::{
-        BindableServiceProviderKind, BindableServiceResponse, BindableServiceSourceKind,
-        CreateScenarioRequest, DesiredState, EnqueueOperationResponse, ExportPublishRequest,
-        ExportRequest, ExportResponse, ExternalSlotBindingRequest, ExternalSlotBindingResponse,
-        ObservedState, OperationKind, OperationPayload, OperationStatus, OperationStatusResponse,
-        ScenarioDetailResponse, ScenarioRevisionSummaryResponse, ScenarioSummaryResponse,
-        ServiceProtocol, UpgradeScenarioRequest,
+        BindableConfigResponse, BindableServiceProviderKind, BindableServiceResponse,
+        BindableServiceSourceKind, CreateScenarioRequest, DesiredState, EnqueueOperationResponse,
+        ExportPublishRequest, ExportRequest, ExportResponse, ExternalSlotBindingRequest,
+        ExternalSlotBindingResponse, ObservedState, OperationKind, OperationPayload,
+        OperationStatus, OperationStatusResponse, ScenarioDetailResponse,
+        ScenarioRevisionSummaryResponse, ScenarioSummaryResponse, ServiceProtocol,
+        UpgradeScenarioRequest,
     },
     ids,
+    json::merge_json,
     store::{NewPendingScenario, ScenarioStateUpdate, StoredOperation, StoredScenario},
     worker::AppState,
 };
@@ -174,6 +176,25 @@ impl ManagerService {
             })
     }
 
+    pub fn list_bindable_configs(&self) -> Vec<BindableConfigResponse> {
+        self.state.bindable_configs()
+    }
+
+    pub fn get_bindable_config(
+        &self,
+        bindable_config_id: &str,
+    ) -> Result<BindableConfigResponse, ManagerError> {
+        self.list_bindable_configs()
+            .into_iter()
+            .find(|config| config.bindable_config_id == bindable_config_id)
+            .ok_or_else(|| {
+                ManagerError::not_found(format!(
+                    "bindable config {} does not exist",
+                    bindable_config_id
+                ))
+            })
+    }
+
     pub async fn list_scenarios(
         &self,
         filter: ScenarioFilter,
@@ -203,6 +224,8 @@ impl ManagerService {
         &self,
         request: CreateScenarioRequest,
     ) -> Result<EnqueueOperationResponse, ManagerError> {
+        self.ensure_scenario_source_allowed(&request.source_url)?;
+        let request = self.resolve_bindable_create_request(request)?;
         let scenario_id = ids::new_scenario_id();
         let operation_id = ids::new_operation_id();
         let desired_state = if request.start {
@@ -325,7 +348,16 @@ impl ManagerService {
         scenario_id: &str,
         request: UpgradeScenarioRequest,
     ) -> Result<EnqueueOperationResponse, ManagerError> {
-        self.ensure_scenario_exists(scenario_id).await?;
+        let scenario = self.load_scenario_row(scenario_id).await?;
+        self.ensure_scenario_source_allowed(
+            request
+                .source_url
+                .as_deref()
+                .unwrap_or(&scenario.source_url),
+        )?;
+        let request = self
+            .resolve_bindable_upgrade_request(&scenario, request)
+            .await?;
         let operation_id = ids::new_operation_id();
         let staged = self
             .state
@@ -557,7 +589,10 @@ impl ManagerService {
     ) -> Result<ScenarioConfigSchemaResponse, ManagerError> {
         match lookup {
             ScenarioConfigSchemaLookup::SourceUrl(source_url) => {
-                let compiled = inspect_source(&source_url)
+                let compiled = self
+                    .state
+                    .scenario_sources()
+                    .inspect(&source_url)
                     .await
                     .map_err(ManagerError::bad_request)?;
                 build_config_schema_response(source_url, &compiled)
@@ -580,7 +615,9 @@ impl ManagerService {
                         })?;
                     inspect_stored_ir(&revision.scenario_ir_json).map_err(ManagerError::internal)?
                 } else {
-                    inspect_source(&source_url)
+                    self.state
+                        .scenario_sources()
+                        .inspect(&source_url)
                         .await
                         .map_err(ManagerError::bad_request)?
                 };
@@ -625,6 +662,13 @@ impl ManagerService {
             scenario_id: scenario_id.to_string(),
             operation_id,
         })
+    }
+
+    fn ensure_scenario_source_allowed(&self, source_url: &str) -> Result<(), ManagerError> {
+        self.state
+            .scenario_sources()
+            .preflight(source_url)
+            .map_err(ManagerError::bad_request)
     }
 
     async fn get_scenario_export(
@@ -697,6 +741,93 @@ impl ManagerService {
         )))
     }
 
+    fn resolve_bindable_create_request(
+        &self,
+        mut request: CreateScenarioRequest,
+    ) -> Result<CreateScenarioRequest, ManagerError> {
+        request.root_config = self.resolve_external_root_config(
+            request.root_config,
+            &request.external_root_config,
+            JsonPathWriteMode::InsertOnly,
+        )?;
+        request.external_root_config.clear();
+        Ok(request)
+    }
+
+    async fn resolve_bindable_upgrade_request(
+        &self,
+        scenario: &StoredScenario,
+        mut request: UpgradeScenarioRequest,
+    ) -> Result<UpgradeScenarioRequest, ManagerError> {
+        let Some(external_root_config) = request.external_root_config.as_ref() else {
+            return Ok(request);
+        };
+        let (base_root_config, write_mode) = match request.root_config.take() {
+            Some(root_config) => (root_config, JsonPathWriteMode::InsertOnly),
+            None => {
+                let secret_root_config = self
+                    .state
+                    .store()
+                    .load_secret_config(&scenario.id)
+                    .await
+                    .map_err(ManagerError::internal)?;
+                (
+                    merge_json(
+                        scenario.root_config.clone().unwrap_or_else(|| json!({})),
+                        secret_root_config,
+                    ),
+                    JsonPathWriteMode::OverwriteExisting,
+                )
+            }
+        };
+        request.root_config = Some(self.resolve_external_root_config(
+            base_root_config,
+            external_root_config,
+            write_mode,
+        )?);
+        request.external_root_config = None;
+        Ok(request)
+    }
+
+    fn resolve_external_root_config(
+        &self,
+        root_config: Value,
+        external_root_config: &BTreeMap<String, String>,
+        write_mode: JsonPathWriteMode,
+    ) -> Result<Value, ManagerError> {
+        if external_root_config.is_empty() {
+            return Ok(root_config);
+        }
+
+        let mut resolved = if root_config.is_null() {
+            json!({})
+        } else {
+            root_config
+        };
+        if !resolved.is_object() {
+            return Err(ManagerError::bad_request(
+                "root_config must be an object when external_root_config is provided",
+            ));
+        }
+
+        for (path, bindable_config_id) in external_root_config {
+            let value = self
+                .state
+                .bindable_config_value(bindable_config_id)
+                .cloned()
+                .ok_or_else(|| {
+                    ManagerError::bad_request(format!(
+                        "bindable config {} does not exist",
+                        bindable_config_id
+                    ))
+                })?;
+            write_json_path(&mut resolved, path, value, write_mode)
+                .map_err(ManagerError::bad_request)?;
+        }
+
+        Ok(resolved)
+    }
+
     async fn project_scenario(
         &self,
         scenario: StoredScenario,
@@ -754,9 +885,13 @@ impl ManagerService {
 
         let exports: BTreeMap<String, ExportRequest> =
             serde_json::from_value(scenario.exports.clone()).map_err(ManagerError::internal)?;
-        let pending_export_protocols =
-            discover_pending_export_protocols(&scenario.source_url, compiled.is_none(), &exports)
-                .await;
+        let pending_export_protocols = discover_pending_export_protocols(
+            self.state.as_ref(),
+            &scenario.source_url,
+            compiled.is_none(),
+            &exports,
+        )
+        .await;
         let export_names = compiled
             .as_ref()
             .map(|compiled| {
@@ -909,6 +1044,61 @@ fn bindable_service_matches(
             .is_none_or(|available| service.available == available)
 }
 
+#[derive(Clone, Copy)]
+enum JsonPathWriteMode {
+    InsertOnly,
+    OverwriteExisting,
+}
+
+fn write_json_path(
+    root: &mut Value,
+    path: &str,
+    value: Value,
+    mode: JsonPathWriteMode,
+) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("external_root_config path must not be empty".to_string());
+    }
+    let mut current = root;
+    let mut parts = path.split('.').peekable();
+    while let Some(part) = parts.next() {
+        if part.is_empty() {
+            return Err(format!(
+                "external_root_config path {path} must not contain empty segments"
+            ));
+        }
+        let is_last = parts.peek().is_none();
+        if is_last {
+            let map = current.as_object_mut().ok_or_else(|| {
+                format!(
+                    "external_root_config path {path} conflicts with a non-object root_config \
+                     value"
+                )
+            })?;
+            if matches!(mode, JsonPathWriteMode::InsertOnly) && map.contains_key(part) {
+                return Err(format!(
+                    "root_config path {path} was provided more than once"
+                ));
+            }
+            map.insert(part.to_string(), value);
+            return Ok(());
+        }
+
+        if current.is_null() {
+            *current = Value::Object(Map::new());
+        }
+        let map = current.as_object_mut().ok_or_else(|| {
+            format!(
+                "external_root_config path {path} conflicts with a non-object root_config value"
+            )
+        })?;
+        current = map
+            .entry(part.to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+    }
+    Ok(())
+}
+
 fn scenario_matches_filter(scenario: &ScenarioSummaryResponse, filter: &ScenarioFilter) -> bool {
     filter
         .scenario_id
@@ -1053,6 +1243,7 @@ fn export_detail_from_projection(
 }
 
 async fn discover_pending_export_protocols(
+    state: &AppState,
     source_url: &str,
     needs_discovery: bool,
     requested_exports: &BTreeMap<String, ExportRequest>,
@@ -1061,7 +1252,7 @@ async fn discover_pending_export_protocols(
         return BTreeMap::new();
     }
 
-    let Ok(compiled) = inspect_source(source_url).await else {
+    let Ok(compiled) = state.scenario_sources().inspect(source_url).await else {
         return BTreeMap::new();
     };
     compiled
