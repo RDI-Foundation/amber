@@ -44,6 +44,14 @@ pub(super) struct TestHarness {
 
 impl TestHarness {
     pub(super) async fn new(file_config: ManagerFileConfig) -> Self {
+        Self::new_inner(file_config, true).await
+    }
+
+    pub(super) async fn new_without_worker(file_config: ManagerFileConfig) -> Self {
+        Self::new_inner(file_config, false).await
+    }
+
+    async fn new_inner(file_config: ManagerFileConfig, run_worker: bool) -> Self {
         let tempdir = TempDir::new().expect("tempdir");
         let data_dir = tempdir.path().join("manager-data");
         tokio::fs::create_dir_all(&data_dir)
@@ -65,12 +73,6 @@ impl TestHarness {
             AppState::new(config, file_config, store, runtime, notify).expect("create app state"),
         );
 
-        let worker = OperationWorker::new(state.clone());
-        worker.enqueue_startup_reconciles().await;
-        let worker_handle = tokio::spawn(async move {
-            worker.run().await;
-        });
-
         let health_monitor = HealthMonitor::new(state.clone());
         let health_handle = tokio::spawn(async move {
             health_monitor.run().await;
@@ -88,6 +90,15 @@ impl TestHarness {
                 .expect("serve test app");
         });
 
+        let mut task_handles = vec![health_handle, server_handle];
+        if run_worker {
+            let worker = OperationWorker::new(state.clone());
+            worker.enqueue_startup_reconciles().await;
+            task_handles.push(tokio::spawn(async move {
+                worker.run().await;
+            }));
+        }
+
         Self {
             _tempdir: tempdir,
             _state: state,
@@ -95,7 +106,7 @@ impl TestHarness {
             runtime: runtime_controller,
             data_dir,
             base_url: format!("http://{addr}"),
-            task_handles: vec![worker_handle, health_handle, server_handle],
+            task_handles,
         }
     }
 

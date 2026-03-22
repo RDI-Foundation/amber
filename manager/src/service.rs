@@ -462,6 +462,7 @@ impl ManagerService {
         let mut exports = Vec::new();
         for scenario in scenarios {
             let projection = self.project_scenario(scenario).await?;
+            let source_protocols = source_export_protocols(&projection).await?;
             for export_name in projection.detail.exports.keys() {
                 let fallback_protocol = projection
                     .detail
@@ -470,7 +471,8 @@ impl ManagerService {
                     .and_then(|export| export.bindable_service_id.as_ref())
                     .and_then(|bindable_service_id| {
                         protocols_by_service_id.get(bindable_service_id).cloned()
-                    });
+                    })
+                    .or_else(|| source_protocols.get(export_name).cloned());
                 let export =
                     export_detail_from_projection(&projection, export_name, fallback_protocol)?;
                 if export_matches_filter(&export, &filter) {
@@ -637,27 +639,23 @@ impl ManagerService {
         let projection = self
             .project_scenario(self.load_scenario_row(scenario_id).await?)
             .await?;
-        let fallback_protocol = if compiled_export_protocol(&projection, export_name).is_some() {
-            None
-        } else {
-            let bindable_service_id = projection
-                .detail
-                .exports
-                .get(export_name)
-                .and_then(|export| export.bindable_service_id.as_ref())
-                .ok_or_else(|| {
-                    ManagerError::not_found(format!(
-                        "export {} does not exist for scenario {}",
-                        export_name, scenario_id
-                    ))
-                })?;
-            self.state
+        let source_protocols = source_export_protocols(&projection).await?;
+        let bindable_service_id = projection
+            .detail
+            .exports
+            .get(export_name)
+            .and_then(|export| export.bindable_service_id.as_ref());
+        let fallback_protocol = match bindable_service_id {
+            Some(bindable_service_id) => self
+                .state
                 .bindable_services()
                 .await
                 .map_err(ManagerError::internal)?
                 .into_iter()
                 .find(|service| service.bindable_service_id == bindable_service_id.as_str())
                 .map(|service| service.protocol)
+                .or_else(|| source_protocols.get(export_name).cloned()),
+            None => source_protocols.get(export_name).cloned(),
         };
         export_detail_from_projection(&projection, export_name, fallback_protocol).map_err(
             |error| match error.kind {
@@ -1035,6 +1033,39 @@ fn export_detail_from_projection(
         protocol,
         publish: export.publish.clone(),
     })
+}
+
+async fn source_export_protocols(
+    projection: &ScenarioProjection,
+) -> Result<BTreeMap<String, ServiceProtocol>, ManagerError> {
+    if projection.compiled.is_some() || projection.detail.exports.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let compiled = inspect_source(&projection.detail.source_url)
+        .await
+        .map_err(|err| {
+            ManagerError::internal(format!(
+                "failed to inspect source {} while discovering pending export metadata for \
+                 scenario {}: {err}",
+                projection.detail.source_url, projection.detail.scenario_id
+            ))
+        })?;
+    compiled
+        .proxy_metadata
+        .exports
+        .into_iter()
+        .map(|(export_name, export)| {
+            parse_service_protocol(&export.protocol)
+                .ok_or_else(|| {
+                    ManagerError::internal(format!(
+                        "export {} for scenario {} uses unsupported protocol {}",
+                        export_name, projection.detail.scenario_id, export.protocol
+                    ))
+                })
+                .map(|protocol| (export_name, protocol))
+        })
+        .collect()
 }
 
 fn build_config_schema_response(

@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, time::Duration};
+use std::{collections::BTreeSet, net::TcpListener, time::Duration};
 
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
@@ -10,8 +10,9 @@ use super::harness::{
 };
 use crate::{
     domain::{
-        BindableServiceResponse, CreateScenarioRequest, EnqueueOperationResponse, ObservedState,
-        OperationStatus, OperationStatusResponse, ScenarioDetailResponse, ServiceProtocol,
+        BindableServiceResponse, CreateScenarioRequest, EnqueueOperationResponse,
+        ExportPublishRequest, ExportRequest, ObservedState, OperationStatus,
+        OperationStatusResponse, ScenarioDetailResponse, ServiceProtocol,
     },
     mcp::{
         BindableServicesListResponse, ExportsListResponse, ScenarioRevisionsListResponse,
@@ -711,4 +712,81 @@ async fn mcp_exports_wait_reports_timeout_for_paused_scenario() {
             .expect("export detail should be present")
             .available
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_exports_tools_handle_pending_exports_without_active_revision() {
+    let harness = TestHarness::new_without_worker(operator_service_config()).await;
+    let mut mcp = McpClient::connect(&harness.base_url).await;
+
+    let provider_url = harness.write_provider_manifest("mcp-pending-provider.json5");
+    let publish_listener = TcpListener::bind("127.0.0.1:0").expect("bind publish listener");
+    let publish_addr = publish_listener.local_addr().expect("publish addr");
+    drop(publish_listener);
+    let mut request: CreateScenarioRequest = create_request(provider_url);
+    request.exports.insert(
+        "api".to_string(),
+        ExportRequest {
+            publish: Some(ExportPublishRequest {
+                listen: publish_addr,
+            }),
+        },
+    );
+    let created: EnqueueOperationResponse = mcp
+        .call_tool(
+            "amber.v1.scenarios.create",
+            serde_json::to_value(&request).expect("serialize pending provider request"),
+        )
+        .await;
+
+    let operation: OperationStatusResponse = mcp
+        .call_tool(
+            "amber.v1.operations.get",
+            json!({ "operation_id": created.operation_id }),
+        )
+        .await;
+    assert_eq!(operation.status, OperationStatus::Queued);
+
+    let exports: ExportsListResponse = mcp
+        .call_tool(
+            "amber.v1.exports.list",
+            json!({ "scenario_id": created.scenario_id }),
+        )
+        .await;
+    assert_eq!(exports.exports.len(), 1);
+    assert_eq!(exports.exports[0].export, "api");
+    assert_eq!(exports.exports[0].protocol, ServiceProtocol::Http);
+    assert!(!exports.exports[0].available);
+
+    let export: ExportDetailResponse = mcp
+        .call_tool(
+            "amber.v1.exports.get",
+            json!({
+                "scenario_id": created.scenario_id,
+                "export": "api",
+            }),
+        )
+        .await;
+    assert_eq!(export.export, "api");
+    assert_eq!(export.protocol, ServiceProtocol::Http);
+    assert!(!export.available);
+
+    let export_wait: ExportWaitResult = mcp
+        .call_tool(
+            "amber.v1.exports.wait",
+            json!({
+                "scenario_id": created.scenario_id,
+                "export": "api",
+                "timeout_ms": 50,
+                "poll_interval_ms": 10,
+            }),
+        )
+        .await;
+    assert!(export_wait.timed_out);
+    let pending_export = export_wait
+        .export_detail
+        .expect("pending export detail should be present");
+    assert_eq!(pending_export.export, "api");
+    assert_eq!(pending_export.protocol, ServiceProtocol::Http);
+    assert!(!pending_export.available);
 }
