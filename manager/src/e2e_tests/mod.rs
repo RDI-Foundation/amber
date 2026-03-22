@@ -380,6 +380,45 @@ async fn create_rejects_unknown_bindable_config_before_enqueue() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn create_rejects_external_root_config_path_with_empty_segment_before_enqueue() {
+    let bindable_name = "secret_bravo";
+    let harness = TestHarness::new(ManagerFileConfig {
+        bindable_services: BTreeMap::new(),
+        bindable_configs: BTreeMap::from([(bindable_name.to_string(), json!("bravo"))]),
+        scenario_source_allowlist: None,
+    })
+    .await;
+    let configured_url = harness.write_configured_manifest("configured-missing-bindable.json5");
+
+    let invalid_path = "secret..value";
+    let (status, body) = harness
+        .post_json_raw(
+            "/v1/scenarios",
+            &CreateScenarioRequest {
+                source_url: configured_url,
+                root_config: json!({}),
+                external_root_config: BTreeMap::from([(
+                    invalid_path.to_string(),
+                    ids::operator_config_id(bindable_name),
+                )]),
+                external_slots: BTreeMap::new(),
+                exports: BTreeMap::new(),
+                metadata: json!({}),
+                telemetry: ScenarioTelemetryRequest::default(),
+                store_bundle: false,
+                start: true,
+            },
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+    assert!(body.contains(invalid_path), "unexpected body: {body}");
+    assert!(body.contains("empty segments"), "unexpected body: {body}");
+
+    let scenarios: Vec<ScenarioSummaryResponse> = harness.get_json("/v1/scenarios").await;
+    assert!(scenarios.is_empty(), "unexpected scenarios: {scenarios:#?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn upgrade_rejects_source_url_outside_operator_allowlist() {
     let manifest_harness = TestHarness::new(ManagerFileConfig::default()).await;
     let allowed_url =

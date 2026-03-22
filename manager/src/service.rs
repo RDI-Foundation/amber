@@ -1062,6 +1062,11 @@ fn write_json_path(
     let mut current = root;
     let mut parts = path.split('.').peekable();
     while let Some(part) = parts.next() {
+        if part.is_empty() {
+            return Err(format!(
+                "external_root_config path {path} must not contain empty segments"
+            ));
+        }
         let is_last = parts.peek().is_none();
         if is_last {
             let map = current.as_object_mut().ok_or_else(|| {
