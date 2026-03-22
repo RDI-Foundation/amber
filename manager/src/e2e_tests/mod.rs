@@ -1,4 +1,5 @@
 mod harness;
+mod mcp;
 
 use std::{collections::BTreeMap, net::TcpListener, time::Duration};
 

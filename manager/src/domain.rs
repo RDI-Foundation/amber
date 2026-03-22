@@ -1,11 +1,12 @@
 use std::{collections::BTreeMap, net::SocketAddr};
 
+use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const IMPLICIT_OWNER_ID: &str = "default";
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DesiredState {
     Running,
@@ -21,7 +22,7 @@ impl DesiredState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservedState {
     Starting,
@@ -45,7 +46,7 @@ impl ObservedState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationKind {
     Create,
@@ -69,7 +70,7 @@ impl OperationKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationStatus {
     Queued,
@@ -89,7 +90,7 @@ impl OperationStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceProtocol {
     Http,
@@ -105,14 +106,14 @@ impl ServiceProtocol {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BindableServiceSourceKind {
     OperatorService,
     ScenarioExport,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BindableServiceProviderKind {
     DirectUrl,
@@ -120,33 +121,34 @@ pub enum BindableServiceProviderKind {
     ScenarioExport,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExternalSlotBindingRequest {
     pub bindable_service_id: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExportPublishRequest {
+    #[schemars(with = "String")]
     pub listen: SocketAddr,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+#[derive(Clone, Debug, Deserialize, Serialize, Default, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExportRequest {
     #[serde(default)]
     pub publish: Option<ExportPublishRequest>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScenarioTelemetryRequest {
     #[serde(default)]
     pub upstream_otlp_http_endpoint: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateScenarioRequest {
     pub source_url: String,
@@ -166,7 +168,7 @@ pub struct CreateScenarioRequest {
     pub start: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpgradeScenarioRequest {
     #[serde(default)]
@@ -185,14 +187,14 @@ pub struct UpgradeScenarioRequest {
     pub store_bundle: bool,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DeleteScenarioQuery {
     #[serde(default)]
     pub destroy_storage: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OperationPayload {
     Create {
@@ -212,14 +214,14 @@ pub enum OperationPayload {
     },
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EnqueueOperationResponse {
     pub scenario_id: String,
     pub operation_id: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OperationStatusResponse {
     pub operation_id: String,
@@ -238,7 +240,7 @@ pub struct OperationStatusResponse {
     pub result: Option<Value>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BindableServiceResponse {
     pub bindable_service_id: String,
@@ -254,7 +256,7 @@ pub struct BindableServiceResponse {
     pub export: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScenarioSummaryResponse {
     pub scenario_id: String,
@@ -267,7 +269,7 @@ pub struct ScenarioSummaryResponse {
     pub last_error: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScenarioDetailResponse {
     pub scenario_id: String,
@@ -287,7 +289,7 @@ pub struct ScenarioDetailResponse {
     pub last_error: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExternalSlotBindingResponse {
     pub bindable_service_id: String,
@@ -295,7 +297,7 @@ pub struct ExternalSlotBindingResponse {
     pub provider_scenario_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExportResponse {
     #[serde(default)]
@@ -306,7 +308,7 @@ pub struct ExportResponse {
     pub available: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScenarioRevisionSummaryResponse {
     pub revision: i64,
@@ -315,7 +317,7 @@ pub struct ScenarioRevisionSummaryResponse {
     pub created_at_ms: i64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorResponse {
     pub error: String,

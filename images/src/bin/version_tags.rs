@@ -5,13 +5,11 @@ use std::{
     process::Command,
 };
 
+use amber_images::versioning;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing_subscriber::EnvFilter;
-
-#[path = "../versioning.rs"]
-mod versioning;
 
 const OCI_REVISION_ANNOTATION: &str = "org.opencontainers.image.revision";
 

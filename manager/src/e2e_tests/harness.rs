@@ -25,7 +25,9 @@ use crate::{
         ExternalSlotBindingRequest, ObservedState, OperationStatus, OperationStatusResponse,
         ScenarioDetailResponse, ScenarioTelemetryRequest, ServiceProtocol,
     },
+    mcp,
     runtime::{FakeRuntimeController, RuntimeSupervisor},
+    service::ManagerService,
     store::Store,
     worker::{AppState, HealthMonitor, OperationWorker},
 };
@@ -36,7 +38,7 @@ pub(super) struct TestHarness {
     client: Client,
     pub(super) runtime: FakeRuntimeController,
     data_dir: PathBuf,
-    base_url: String,
+    pub(super) base_url: String,
     task_handles: Vec<JoinHandle<()>>,
 }
 
@@ -78,7 +80,8 @@ impl TestHarness {
             .await
             .expect("bind test listener");
         let addr = listener.local_addr().expect("listener addr");
-        let app = router(state.clone());
+        let manager = Arc::new(ManagerService::new(state.clone()));
+        let app = router(manager.clone()).nest_service("/mcp", mcp::service(manager));
         let server_handle = tokio::spawn(async move {
             serve(listener, app.into_make_service())
                 .await
