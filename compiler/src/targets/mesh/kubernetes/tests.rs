@@ -76,6 +76,21 @@ fn parse_rendered_env(content: &str) -> std::collections::BTreeMap<String, Strin
         .collect()
 }
 
+fn assert_default_container_security_context(doc: &str) {
+    assert!(doc.contains("securityContext:"), "{doc}");
+    assert!(doc.contains("allowPrivilegeEscalation: false"), "{doc}");
+    assert!(doc.contains("drop:"), "{doc}");
+    assert!(doc.contains("- ALL"), "{doc}");
+    assert!(doc.contains("seccompProfile:"), "{doc}");
+    assert!(doc.contains("type: RuntimeDefault"), "{doc}");
+}
+
+fn assert_internal_container_runtime_hardening(doc: &str) {
+    assert!(doc.contains("readOnlyRootFilesystem: true"), "{doc}");
+    assert!(doc.contains("runAsNonRoot: true"), "{doc}");
+    assert!(doc.contains("runAsUser: 65532"), "{doc}");
+}
+
 #[test]
 fn render_root_config_env_content_materializes_defaults() {
     let leaves = [
@@ -1394,6 +1409,7 @@ fn kubernetes_mesh_workloads_wait_for_fresh_mesh_config() {
         component_deployment.contains("/amber/mesh/mesh-config.json"),
         "{component_deployment}"
     );
+    assert_internal_container_runtime_hardening(component_deployment);
 
     let router_deployment = artifact
         .files
@@ -1407,6 +1423,48 @@ fn kubernetes_mesh_workloads_wait_for_fresh_mesh_config() {
         router_deployment.contains("/amber/mesh/mesh-config.json"),
         "{router_deployment}"
     );
+    assert_internal_container_runtime_hardening(router_deployment);
+}
+
+#[test]
+fn kubernetes_emits_default_container_security_contexts() {
+    let fixture_dir = tempdir().expect("fixture dir");
+    let scenario_path = write_kubernetes_smoke_fixture(fixture_dir.path());
+    let artifact = compile_fixture(&scenario_path);
+
+    let component_deployment = artifact
+        .files
+        .iter()
+        .find_map(|(path, content)| {
+            let path = path.to_str()?;
+            (path.starts_with("03-deployments/")
+                && path.ends_with(".yaml")
+                && !path.ends_with("amber-router.yaml"))
+            .then_some(content)
+        })
+        .expect("component deployment yaml");
+    assert_default_container_security_context(component_deployment);
+    assert_internal_container_runtime_hardening(component_deployment);
+
+    let router_deployment = artifact
+        .files
+        .get(&PathBuf::from("03-deployments/amber-router.yaml"))
+        .expect("router deployment yaml");
+    assert_default_container_security_context(router_deployment);
+    assert_internal_container_runtime_hardening(router_deployment);
+
+    let provisioner_job = artifact
+        .files
+        .get(&PathBuf::from("02-rbac/amber-provisioner-job.yaml"))
+        .expect("provisioner job yaml");
+    assert_default_container_security_context(provisioner_job);
+    assert_internal_container_runtime_hardening(provisioner_job);
+
+    let otelcol_daemonset = artifact
+        .files
+        .get(&PathBuf::from("03-daemonsets/amber-otelcol.yaml"))
+        .expect("otelcol daemonset yaml");
+    assert_default_container_security_context(otelcol_daemonset);
 }
 
 #[test]

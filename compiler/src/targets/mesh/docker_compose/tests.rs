@@ -376,6 +376,21 @@ fn env_value(service: &super::Service, key: &str) -> Option<String> {
     }
 }
 
+fn assert_service_hardened(service: &super::Service, yaml: &str) {
+    assert!(service.cap_drop.iter().any(|cap| cap == "ALL"), "{yaml}");
+    assert!(
+        service
+            .security_opt
+            .iter()
+            .any(|opt| opt == "no-new-privileges:true"),
+        "{yaml}"
+    );
+}
+
+fn assert_internal_service_rootfs_hardened(service: &super::Service, yaml: &str) {
+    assert_eq!(service.read_only, Some(true), "{yaml}");
+}
+
 fn injected_docker_gateway_service(compose: &super::DockerComposeFile) -> (&str, &super::Service) {
     compose
         .services
@@ -864,6 +879,7 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
         gateway.network_mode.as_deref(),
         Some(expected_network_mode.as_str()),
     );
+    assert_internal_service_rootfs_hardened(gateway, yaml.as_ref());
 
     let gateway_config = env_value(gateway, super::DOCKER_GATEWAY_CONFIG_ENV)
         .expect("gateway config env should be present");
@@ -961,6 +977,10 @@ fn docker_compose_emits_framework_docker_mount_proxy_wiring() {
         program_service,
         super::HELPER_INIT_SERVICE,
         "service_completed_successfully",
+    );
+    assert_internal_service_rootfs_hardened(
+        service(&compose, super::HELPER_INIT_SERVICE),
+        yaml.as_ref(),
     );
     assert_depends_on(program_service, gateway_name, "service_started");
 
@@ -1108,6 +1128,20 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
     assert!(compose.services.contains_key("c1-server"), "{yaml}");
     assert!(compose.services.contains_key("c2-client-net"), "{yaml}");
     assert!(compose.services.contains_key("c2-client"), "{yaml}");
+
+    for name in [
+        "amber-provisioner",
+        "amber-otelcol",
+        "c1-server-net",
+        "c1-server",
+        "c2-client-net",
+        "c2-client",
+    ] {
+        assert_service_hardened(service(&compose, name), yaml.as_ref());
+    }
+    for name in ["amber-provisioner", "c1-server-net", "c2-client-net"] {
+        assert_internal_service_rootfs_hardened(service(&compose, name), yaml.as_ref());
+    }
 
     // Program uses sidecar netns.
     assert_eq!(
@@ -1626,6 +1660,12 @@ fn compose_routes_external_slots_through_router() {
     assert!(compose.services.contains_key("amber-router"));
     let router_service = service(&compose, "amber-router");
     assert!(env_value(router_service, "AMBER_EXTERNAL_SLOT_API_URL").is_some());
+    assert_eq!(
+        router_service.user.as_deref(),
+        Some("65532:65532"),
+        "{yaml}"
+    );
+    assert_internal_service_rootfs_hardened(router_service, yaml.as_ref());
     assert!(
         router_service.ports.is_empty(),
         "slot-only scenarios should not publish the router mesh port on the host"

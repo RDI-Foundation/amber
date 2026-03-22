@@ -2119,6 +2119,9 @@ async fn proxy_noise_to_external_tcp(
     target: ExternalTarget,
 ) -> Result<(), RouterError> {
     let (host, port) = resolve_tcp_target(&target)?;
+    validate_external_host(host.as_str(), port)
+        .await
+        .map_err(RouterError::InvalidConfig)?;
     let upstream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
     proxy_noise_to_plain(session, upstream).await
 }
@@ -5132,7 +5135,26 @@ async fn resolve_http_external_target(
         let overrides = state.external_overrides.read().await;
         overrides.get(&state.target.name).cloned()
     };
-    resolve_http_external_target_with_override(&state.target, override_url.as_deref(), uri)
+    let resolved =
+        resolve_http_external_target_with_override(&state.target, override_url.as_deref(), uri)?;
+    if let ResolvedHttpExternalTarget::Http(url) = &resolved {
+        let Some(host) = url.host_str() else {
+            return Err(error_response(
+                StatusCode::BAD_GATEWAY,
+                "external slot url missing host",
+            ));
+        };
+        let Some(port) = url.port_or_known_default() else {
+            return Err(error_response(
+                StatusCode::BAD_GATEWAY,
+                "external slot url missing port",
+            ));
+        };
+        validate_external_host(host, port)
+            .await
+            .map_err(|err| error_response(StatusCode::BAD_GATEWAY, &err))?;
+    }
+    Ok(resolved)
 }
 
 #[allow(clippy::result_large_err)]
@@ -5173,6 +5195,14 @@ fn resolve_http_external_target_with_override(
             "external slot url must be http/https",
         ));
     }
+    let Some(host) = base.host_str() else {
+        return Err(error_response(
+            StatusCode::BAD_GATEWAY,
+            "external slot url missing host",
+        ));
+    };
+    validate_external_ip_literal(host)
+        .map_err(|err| error_response(StatusCode::BAD_GATEWAY, &err))?;
 
     Ok(ResolvedHttpExternalTarget::Http(join_url(&base, uri)))
 }
@@ -5195,8 +5225,63 @@ fn resolve_tcp_target(target: &ExternalTarget) -> Result<(String, u16), RouterEr
     let port = parsed.port().ok_or_else(|| {
         RouterError::InvalidConfig("external tcp target url missing port".to_string())
     })?;
+    validate_external_ip_literal(host).map_err(RouterError::InvalidConfig)?;
 
     Ok((host.to_string(), port))
+}
+
+fn validate_external_ip_literal(host: &str) -> Result<(), String> {
+    let Ok(ip) = host.parse::<IpAddr>() else {
+        return Ok(());
+    };
+    if is_disallowed_external_ip(ip) {
+        return Err(format!(
+            "external target {host} resolves to a disallowed address: {ip}"
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_external_host(host: &str, port: u16) -> Result<(), String> {
+    validate_external_ip_literal(host)?;
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+
+    let mut saw_addr = false;
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|err| format!("failed to resolve external target {host}:{port}: {err}"))?;
+    for addr in addrs {
+        saw_addr = true;
+        let ip = addr.ip();
+        if is_disallowed_external_ip(ip) {
+            return Err(format!(
+                "external target {host}:{port} resolves to a disallowed address: {ip}"
+            ));
+        }
+    }
+    if !saw_addr {
+        return Err(format!(
+            "external target {host}:{port} did not resolve to an address"
+        ));
+    }
+    Ok(())
+}
+
+fn is_disallowed_external_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unicast_link_local() {
+                return true;
+            }
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.is_loopback() || v4.is_private() || v4.is_link_local();
+            }
+            (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
 }
 
 fn join_url(base: &Url, uri: &Uri) -> Url {
@@ -6299,7 +6384,7 @@ mod tests {
 
         let resolved = resolve_http_external_target_with_override(
             &target,
-            Some("http://127.0.0.1:6167/base"),
+            Some("http://8.8.8.8:6167/base"),
             &Uri::from_static("/_matrix/client/v3/sync?timeout=30000"),
         )
         .expect("http target should resolve");
@@ -6309,8 +6394,27 @@ mod tests {
         };
         assert_eq!(
             url.as_str(),
-            "http://127.0.0.1:6167/base/_matrix/client/v3/sync?timeout=30000"
+            "http://8.8.8.8:6167/base/_matrix/client/v3/sync?timeout=30000"
         );
+    }
+
+    #[test]
+    fn resolve_http_external_target_with_override_rejects_loopback_ip_literals() {
+        let target = ExternalTarget {
+            name: "matrix".to_string(),
+            url_env: "MATRIX_URL".to_string(),
+            optional: false,
+            url_override: None,
+        };
+
+        let response = resolve_http_external_target_with_override(
+            &target,
+            Some("http://127.0.0.1:6167/base"),
+            &Uri::from_static("/_matrix/client/v3/sync"),
+        )
+        .expect_err("loopback target should be rejected");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[test]
@@ -6375,7 +6479,7 @@ mod tests {
         external_overrides
             .write()
             .await
-            .insert("matrix".to_string(), "http://127.0.0.1:6167".to_string());
+            .insert("matrix".to_string(), "http://8.8.8.8:6167".to_string());
 
         let second = resolve_http_external_target(&state, &uri)
             .await
@@ -6383,7 +6487,53 @@ mod tests {
         let ResolvedHttpExternalTarget::Http(url) = second else {
             panic!("expected direct http target after override registration");
         };
-        assert_eq!(url.as_str(), "http://127.0.0.1:6167/_matrix/client/v3/sync");
+        assert_eq!(url.as_str(), "http://8.8.8.8:6167/_matrix/client/v3/sync");
+    }
+
+    #[tokio::test]
+    async fn resolve_http_external_target_rejects_localhost_overrides() {
+        let external_overrides: ExternalOverrides = Arc::new(RwLock::new(HashMap::new()));
+        let state = HttpProxyState {
+            client: build_client(),
+            target: ExternalTarget {
+                name: "matrix".to_string(),
+                url_env: "MATRIX_URL".to_string(),
+                optional: false,
+                url_override: None,
+            },
+            labels: test_http_exchange_labels(),
+            config: Arc::new(test_mesh_config()),
+            external_overrides: external_overrides.clone(),
+            mesh_upstream: Arc::new(Mutex::new(None)),
+        };
+        let uri = Uri::from_static("/_matrix/client/v3/sync");
+
+        external_overrides
+            .write()
+            .await
+            .insert("matrix".to_string(), "http://localhost:6167".to_string());
+
+        let response = resolve_http_external_target(&state, &uri)
+            .await
+            .expect_err("localhost override should be rejected");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn resolve_tcp_target_rejects_loopback_ip_literals() {
+        let target = ExternalTarget {
+            name: "matrix".to_string(),
+            url_env: "MATRIX_URL".to_string(),
+            optional: false,
+            url_override: Some("tcp://127.0.0.1:6167".to_string()),
+        };
+
+        let err = resolve_tcp_target(&target).expect_err("loopback target should be rejected");
+        assert!(
+            err.to_string().contains("disallowed address"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

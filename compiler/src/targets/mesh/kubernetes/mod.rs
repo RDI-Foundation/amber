@@ -87,6 +87,7 @@ const OTELCOL_SERVICE_ACCOUNT: &str = "amber-otelcol";
 const OTELCOL_ROLE_NAME: &str = "amber-otelcol";
 const OTELCOL_ROLE_BINDING_NAME: &str = "amber-otelcol";
 const MESH_CONFIG_WAIT_TIMEOUT_SECS: u64 = 180;
+const INTERNAL_RUNTIME_UID: u32 = 65532;
 
 const ROOT_CONFIG_SECRET_NAME: &str = "amber-root-config-secret";
 const ROOT_CONFIG_CONFIGMAP_NAME: &str = "amber-root-config";
@@ -399,7 +400,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
         to_yaml(&otelcol_role_binding)?,
     );
 
-    let otelcol_container = Container {
+    let otelcol_container = harden_container(Container {
         name: "otelcol".to_string(),
         image: DEFAULT_OTELCOL_IMAGE.to_string(),
         command: Vec::new(),
@@ -422,6 +423,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
             },
         ],
         readiness_probe: None,
+        security_context: None,
         volume_mounts: vec![
             VolumeMount {
                 name: "otelcol-config".to_string(),
@@ -439,7 +441,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
                 read_only: Some(true),
             },
         ],
-    };
+    });
 
     let otelcol_daemonset = DaemonSet {
         api_version: "apps/v1",
@@ -706,7 +708,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
             });
         }
 
-        let (mut container, mut volumes) = match runtime_plan.execution {
+        let (container, mut volumes) = match runtime_plan.execution {
             ComponentExecutionPlan::Resolved { entrypoint, env } => {
                 // Helper-free execution: entrypoint and env are already fully resolved,
                 // so we don't need AMBER_CONFIG_* env vars here.
@@ -728,6 +730,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
                     env_from: Vec::new(),
                     ports,
                     readiness_probe: None,
+                    security_context: None,
                     volume_mounts: Vec::new(),
                 };
 
@@ -786,6 +789,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
                 build_helper_runner_container(program_image.clone(), ports, container_env)
             }
         };
+        let mut container = harden_container(container);
         let mut storage_volume_names = BTreeSet::new();
         for storage_mount in storage_mounts {
             let claim_name = storage_claim_name(&storage_mount.identity);
@@ -829,7 +833,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
             sidecar_env.push(EnvVar::literal("AMBER_SCENARIO_SCOPE", scope));
         }
 
-        let sidecar = Container {
+        let sidecar = harden_non_root_internal_container(Container {
             name: "sidecar".to_string(),
             image: images.router.clone(),
             command: Vec::new(),
@@ -842,12 +846,13 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
                 protocol: "TCP",
             }],
             readiness_probe: None,
+            security_context: None,
             volume_mounts: vec![VolumeMount {
                 name: MESH_SECRET_VOLUME_NAME.to_string(),
                 mount_path: MESH_CONFIG_DIR.to_string(),
                 read_only: Some(true),
             }],
-        };
+        });
 
         if let Some(env_var) = image_source_env_var {
             kustomization.replacements.push(Replacement {
@@ -879,7 +884,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
         }
 
         if needs_helper_for_component {
-            init_containers.push(Container {
+            init_containers.push(harden_read_only_container(Container {
                 name: "install-helper".to_string(),
                 image: images.helper.clone(),
                 command: vec![
@@ -892,12 +897,13 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
                 env_from: Vec::new(),
                 ports: Vec::new(),
                 readiness_probe: None,
+                security_context: None,
                 volume_mounts: vec![VolumeMount {
                     name: HELPER_VOLUME_NAME.to_string(),
                     mount_path: HELPER_BIN_DIR.to_string(),
                     read_only: None,
                 }],
-            });
+            }));
         }
 
         let pod_spec = PodSpec {
@@ -990,7 +996,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
             });
         }
 
-        let container = Container {
+        let container = harden_non_root_internal_container(Container {
             name: "router".to_string(),
             image: images.router.clone(),
             command: Vec::new(),
@@ -999,12 +1005,13 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
             env_from,
             ports: router_container_ports.clone(),
             readiness_probe: None,
+            security_context: None,
             volume_mounts: vec![VolumeMount {
                 name: MESH_SECRET_VOLUME_NAME.to_string(),
                 mount_path: MESH_CONFIG_DIR.to_string(),
                 read_only: Some(true),
             }],
-        };
+        });
         let router_secret = mesh_secret_name(ROUTER_NAME);
 
         let init_containers = mesh_config_plan
@@ -1456,7 +1463,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
 
         let plan_mount_name = "mesh-plan";
         let plan_mount_dir = "/etc/amber";
-        let container = Container {
+        let container = harden_non_root_internal_container(Container {
             name: PROVISIONER_NAME.to_string(),
             image: images.provisioner.clone(),
             command: Vec::new(),
@@ -1468,12 +1475,13 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
             env_from: Vec::new(),
             ports: Vec::new(),
             readiness_probe: None,
+            security_context: None,
             volume_mounts: vec![VolumeMount {
                 name: plan_mount_name.to_string(),
                 mount_path: plan_mount_dir.to_string(),
                 read_only: Some(true),
             }],
-        };
+        });
 
         let job = Job::new_with_backoff_limit(
             &provisioner_job_name,
@@ -1885,8 +1893,45 @@ fn mesh_secret_name(service: &str) -> String {
     format!("{service}-mesh")
 }
 
+fn default_container_security_context() -> SecurityContext {
+    SecurityContext {
+        allow_privilege_escalation: Some(false),
+        capabilities: Some(Capabilities {
+            drop: vec!["ALL".to_string()],
+        }),
+        read_only_root_filesystem: None,
+        run_as_non_root: None,
+        run_as_user: None,
+        seccomp_profile: Some(SeccompProfile {
+            profile_type: "RuntimeDefault".to_string(),
+        }),
+    }
+}
+
+fn harden_container(mut container: Container) -> Container {
+    container.security_context = Some(default_container_security_context());
+    container
+}
+
+fn harden_read_only_container(mut container: Container) -> Container {
+    container = harden_container(container);
+    if let Some(security_context) = &mut container.security_context {
+        security_context.read_only_root_filesystem = Some(true);
+    }
+    container
+}
+
+fn harden_non_root_internal_container(mut container: Container) -> Container {
+    container = harden_read_only_container(container);
+    if let Some(security_context) = &mut container.security_context {
+        security_context.run_as_non_root = Some(true);
+        security_context.run_as_user = Some(INTERNAL_RUNTIME_UID);
+    }
+    container
+}
+
 fn build_mesh_config_wait_init_container(helper_image: &str, expected_scope: &str) -> Container {
-    Container {
+    harden_non_root_internal_container(Container {
         name: "wait-mesh-config".to_string(),
         image: helper_image.to_string(),
         command: vec![
@@ -1901,12 +1946,13 @@ fn build_mesh_config_wait_init_container(helper_image: &str, expected_scope: &st
         env_from: Vec::new(),
         ports: Vec::new(),
         readiness_probe: None,
+        security_context: None,
         volume_mounts: vec![VolumeMount {
             name: MESH_SECRET_VOLUME_NAME.to_string(),
             mount_path: MESH_CONFIG_DIR.to_string(),
             read_only: Some(true),
         }],
-    }
+    })
 }
 
 fn encode_scenario_digest(digest: &[u8; 32]) -> String {
@@ -2061,7 +2107,7 @@ fn build_helper_runner_container(
     ports: Vec<ContainerPort>,
     env: Vec<EnvVar>,
 ) -> (Container, Vec<Volume>) {
-    let container = Container {
+    let container = harden_container(Container {
         name: "main".to_string(),
         image: program_image,
         command: vec![HELPER_BIN_PATH.to_string(), "run".to_string()],
@@ -2070,12 +2116,13 @@ fn build_helper_runner_container(
         env_from: Vec::new(),
         ports,
         readiness_probe: None,
+        security_context: None,
         volume_mounts: vec![VolumeMount {
             name: HELPER_VOLUME_NAME.to_string(),
             mount_path: HELPER_BIN_DIR.to_string(),
             read_only: Some(true),
         }],
-    };
+    });
     let volumes = vec![Volume::empty_dir(HELPER_VOLUME_NAME)];
     (container, volumes)
 }

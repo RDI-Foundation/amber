@@ -954,6 +954,8 @@ struct ProcessSpec {
     env: BTreeMap<String, String>,
     work_dir: PathBuf,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    drop_all_caps: bool,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     read_only_mounts: Vec<ReadOnlyMount>,
     writable_dirs: Vec<PathBuf>,
     bind_dirs: Vec<PathBuf>,
@@ -1180,6 +1182,7 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                 args: Vec::new(),
                 env,
                 work_dir,
+                drop_all_caps: true,
                 read_only_mounts: vec![ReadOnlyMount {
                     source: runtime_root.join("mesh"),
                     dest: runtime_root.join("mesh"),
@@ -1231,6 +1234,7 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                 args: Vec::new(),
                 env,
                 work_dir,
+                drop_all_caps: true,
                 read_only_mounts: vec![ReadOnlyMount {
                     source: runtime_root.join("mesh"),
                     dest: runtime_root.join("mesh"),
@@ -1771,6 +1775,7 @@ fn component_program_spec(
                 args,
                 env: env.clone(),
                 work_dir,
+                drop_all_caps: false,
                 read_only_mounts,
                 writable_dirs,
                 bind_dirs: Vec::new(),
@@ -1820,6 +1825,7 @@ fn component_program_spec(
                 args: vec!["run".to_string()],
                 env,
                 work_dir,
+                drop_all_caps: false,
                 read_only_mounts,
                 writable_dirs,
                 bind_dirs: Vec::new(),
@@ -2981,6 +2987,10 @@ impl DirectSandbox {
                     "--chdir".to_string(),
                     spec.work_dir.display().to_string(),
                 ];
+                if spec.drop_all_caps {
+                    args.push("--cap-drop".to_string());
+                    args.push("ALL".to_string());
+                }
                 if matches!(spec.network, ProcessNetwork::Isolated) {
                     args.push("--unshare-net".to_string());
                 }
@@ -4847,6 +4857,7 @@ mod tests {
             args: vec!["ok".to_string()],
             env: BTreeMap::new(),
             work_dir: PathBuf::from("/tmp/amber-work"),
+            drop_all_caps: false,
             read_only_mounts: Vec::new(),
             writable_dirs: Vec::new(),
             bind_dirs: Vec::new(),
@@ -4982,6 +4993,27 @@ mod tests {
         assert!(
             args.contains(&"--unshare-net".to_string()),
             "bubblewrap args missing --unshare-net: {args:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bubblewrap_can_drop_all_caps_for_internal_processes() {
+        let mut sandbox = DirectSandbox::Bubblewrap {
+            binary: PathBuf::from("/usr/bin/bwrap"),
+        };
+        let spec = ProcessSpec {
+            drop_all_caps: true,
+            ..linux_test_process_spec()
+        };
+
+        let (_, args) = sandbox
+            .wrap_command(&spec)
+            .expect("command should be wrapped");
+        assert!(
+            args.windows(2)
+                .any(|window| window[0] == "--cap-drop" && window[1] == "ALL"),
+            "bubblewrap args should drop all caps when requested: {args:?}"
         );
     }
 
