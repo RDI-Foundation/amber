@@ -410,9 +410,8 @@ impl ManagerService {
         timeout_ms: Option<u64>,
         poll_interval_ms: Option<u64>,
     ) -> Result<OperationWaitResult, ManagerError> {
-        let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
         let poll_interval = Duration::from_millis(poll_interval_ms.unwrap_or(200).max(1));
-        let deadline = Instant::now() + timeout;
+        let deadline = wait_deadline(timeout_ms)?;
 
         loop {
             let operation = self.get_operation(operation_id).await?;
@@ -462,7 +461,6 @@ impl ManagerService {
         let mut exports = Vec::new();
         for scenario in scenarios {
             let projection = self.project_scenario(scenario).await?;
-            let source_protocols = source_export_protocols(&projection).await?;
             for export_name in projection.detail.exports.keys() {
                 let fallback_protocol = projection
                     .detail
@@ -471,8 +469,7 @@ impl ManagerService {
                     .and_then(|export| export.bindable_service_id.as_ref())
                     .and_then(|bindable_service_id| {
                         protocols_by_service_id.get(bindable_service_id).cloned()
-                    })
-                    .or_else(|| source_protocols.get(export_name).cloned());
+                    });
                 let export =
                     export_detail_from_projection(&projection, export_name, fallback_protocol)?;
                 if export_matches_filter(&export, &filter) {
@@ -528,9 +525,8 @@ impl ManagerService {
         timeout_ms: Option<u64>,
         poll_interval_ms: Option<u64>,
     ) -> Result<ExportWaitResult, ManagerError> {
-        let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
         let poll_interval = Duration::from_millis(poll_interval_ms.unwrap_or(200).max(1));
-        let deadline = Instant::now() + timeout;
+        let deadline = wait_deadline(timeout_ms)?;
 
         loop {
             let detail = self
@@ -639,7 +635,6 @@ impl ManagerService {
         let projection = self
             .project_scenario(self.load_scenario_row(scenario_id).await?)
             .await?;
-        let source_protocols = source_export_protocols(&projection).await?;
         let bindable_service_id = projection
             .detail
             .exports
@@ -653,9 +648,8 @@ impl ManagerService {
                 .map_err(ManagerError::internal)?
                 .into_iter()
                 .find(|service| service.bindable_service_id == bindable_service_id.as_str())
-                .map(|service| service.protocol)
-                .or_else(|| source_protocols.get(export_name).cloned()),
-            None => source_protocols.get(export_name).cloned(),
+                .map(|service| service.protocol),
+            None => None,
         };
         export_detail_from_projection(&projection, export_name, fallback_protocol).map_err(
             |error| match error.kind {
@@ -760,6 +754,9 @@ impl ManagerService {
 
         let exports: BTreeMap<String, ExportRequest> =
             serde_json::from_value(scenario.exports.clone()).map_err(ManagerError::internal)?;
+        let pending_export_protocols =
+            discover_pending_export_protocols(&scenario.source_url, compiled.is_none(), &exports)
+                .await;
         let export_names = compiled
             .as_ref()
             .map(|compiled| {
@@ -770,10 +767,7 @@ impl ManagerService {
                     .cloned()
                     .collect::<BTreeSet<_>>()
             })
-            .unwrap_or_default()
-            .into_iter()
-            .chain(exports.keys().cloned())
-            .collect::<BTreeSet<_>>();
+            .unwrap_or_else(|| pending_export_protocols.keys().cloned().collect());
         let exports = export_names
             .into_iter()
             .map(|export_name| {
@@ -801,6 +795,7 @@ impl ManagerService {
 
         Ok(ScenarioProjection {
             compiled,
+            pending_export_protocols,
             detail: ScenarioDetailResponse {
                 scenario_id: scenario.id,
                 source_url: scenario.source_url,
@@ -830,6 +825,7 @@ impl ManagerService {
 
 struct ScenarioProjection {
     compiled: Option<crate::compiler::CompiledMaterialization>,
+    pending_export_protocols: BTreeMap<String, ServiceProtocol>,
     detail: ScenarioDetailResponse,
 }
 
@@ -989,6 +985,21 @@ fn parse_service_protocol(protocol: &str) -> Option<ServiceProtocol> {
     }
 }
 
+const MAX_WAIT_TIMEOUT_MS: u64 = u32::MAX as u64;
+
+fn wait_deadline(timeout_ms: Option<u64>) -> Result<Instant, ManagerError> {
+    let timeout_ms = timeout_ms.unwrap_or(30_000);
+    if timeout_ms > MAX_WAIT_TIMEOUT_MS {
+        return Err(ManagerError::bad_request(format!(
+            "timeout_ms {timeout_ms} exceeds the maximum supported timeout of \
+             {MAX_WAIT_TIMEOUT_MS}ms"
+        )));
+    }
+    Instant::now()
+        .checked_add(Duration::from_millis(timeout_ms))
+        .ok_or_else(|| ManagerError::bad_request(format!("timeout_ms {timeout_ms} is too large")))
+}
+
 fn compiled_export_protocol(
     projection: &ScenarioProjection,
     export_name: &str,
@@ -1018,6 +1029,12 @@ fn export_detail_from_projection(
         ))
     })?;
     let protocol = compiled_export_protocol(projection, export_name)
+        .or_else(|| {
+            projection
+                .pending_export_protocols
+                .get(export_name)
+                .cloned()
+        })
         .or(fallback_protocol)
         .ok_or_else(|| {
             ManagerError::internal(format!(
@@ -1035,35 +1052,24 @@ fn export_detail_from_projection(
     })
 }
 
-async fn source_export_protocols(
-    projection: &ScenarioProjection,
-) -> Result<BTreeMap<String, ServiceProtocol>, ManagerError> {
-    if projection.compiled.is_some() || projection.detail.exports.is_empty() {
-        return Ok(BTreeMap::new());
+async fn discover_pending_export_protocols(
+    source_url: &str,
+    needs_discovery: bool,
+    requested_exports: &BTreeMap<String, ExportRequest>,
+) -> BTreeMap<String, ServiceProtocol> {
+    if !needs_discovery || requested_exports.is_empty() {
+        return BTreeMap::new();
     }
 
-    let compiled = inspect_source(&projection.detail.source_url)
-        .await
-        .map_err(|err| {
-            ManagerError::internal(format!(
-                "failed to inspect source {} while discovering pending export metadata for \
-                 scenario {}: {err}",
-                projection.detail.source_url, projection.detail.scenario_id
-            ))
-        })?;
+    let Ok(compiled) = inspect_source(source_url).await else {
+        return BTreeMap::new();
+    };
     compiled
         .proxy_metadata
         .exports
         .into_iter()
-        .map(|(export_name, export)| {
-            parse_service_protocol(&export.protocol)
-                .ok_or_else(|| {
-                    ManagerError::internal(format!(
-                        "export {} for scenario {} uses unsupported protocol {}",
-                        export_name, projection.detail.scenario_id, export.protocol
-                    ))
-                })
-                .map(|protocol| (export_name, protocol))
+        .filter_map(|(export_name, export)| {
+            parse_service_protocol(&export.protocol).map(|protocol| (export_name, protocol))
         })
         .collect()
 }

@@ -194,6 +194,67 @@ impl McpClient {
         .unwrap_or_else(|err| panic!("deserialize tool result for {name}: {err}; {result:#?}"))
     }
 
+    async fn call_tool_error(&mut self, name: &str, arguments: Value) -> String {
+        let id = self.next_id;
+        self.next_id += 1;
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", &self.session_id)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": arguments,
+                },
+            }))
+            .send()
+            .await
+            .unwrap_or_else(|err| panic!("send MCP tool error request {name}: {err}"));
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|err| panic!("read MCP tool error response for {name}: {err}"));
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "MCP tool error request {name} failed with status {status}: {body}"
+        );
+        let payload = sse_json_rpc_message(&body);
+        assert_eq!(payload["id"].as_u64(), Some(id));
+        if let Some(error) = payload.get("error") {
+            return error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("MCP tool error response for {name} missing message: {payload:#?}")
+                })
+                .to_string();
+        }
+
+        let result = payload.get("result").unwrap_or_else(|| {
+            panic!("MCP tool error response for {name} missing result: {payload:#?}")
+        });
+        assert_eq!(
+            result.get("isError").and_then(Value::as_bool),
+            Some(true),
+            "tool {name} unexpectedly succeeded: {payload:#?}"
+        );
+        result
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|content| content.first())
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("tool {name} error did not include text: {payload:#?}"))
+            .to_string()
+    }
+
     async fn request(&mut self, method: &str, params: Value) -> Value {
         let id = self.next_id;
         self.next_id += 1;
@@ -789,4 +850,100 @@ async fn mcp_exports_tools_handle_pending_exports_without_active_revision() {
     assert_eq!(pending_export.export, "api");
     assert_eq!(pending_export.protocol, ServiceProtocol::Http);
     assert!(!pending_export.available);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_exports_list_ignores_undeclared_pending_exports() {
+    let harness = TestHarness::new_without_worker(operator_service_config()).await;
+    let mut mcp = McpClient::connect(&harness.base_url).await;
+
+    let provider_url = harness.write_provider_manifest("mcp-undeclared-export-provider.json5");
+
+    let mut valid_request = create_request(provider_url.clone());
+    valid_request
+        .exports
+        .insert("api".to_string(), ExportRequest { publish: None });
+    let valid: EnqueueOperationResponse = mcp
+        .call_tool(
+            "amber.v1.scenarios.create",
+            serde_json::to_value(&valid_request).expect("serialize valid export request"),
+        )
+        .await;
+
+    let mut invalid_request = create_request(provider_url);
+    invalid_request
+        .exports
+        .insert("bogus".to_string(), ExportRequest { publish: None });
+    let invalid: EnqueueOperationResponse = mcp
+        .call_tool(
+            "amber.v1.scenarios.create",
+            serde_json::to_value(&invalid_request).expect("serialize invalid export request"),
+        )
+        .await;
+
+    let exports: ExportsListResponse = mcp.call_tool("amber.v1.exports.list", json!({})).await;
+    assert!(
+        exports
+            .exports
+            .iter()
+            .any(|export| { export.scenario_id == valid.scenario_id && export.export == "api" })
+    );
+    assert!(
+        !exports
+            .exports
+            .iter()
+            .any(|export| export.export == "bogus")
+    );
+
+    let error = mcp
+        .call_tool_error(
+            "amber.v1.exports.get",
+            json!({
+                "scenario_id": invalid.scenario_id,
+                "export": "bogus",
+            }),
+        )
+        .await;
+    assert!(error.contains("does not exist"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_wait_tools_reject_oversized_timeouts() {
+    let harness = TestHarness::new_without_worker(operator_service_config()).await;
+    let mut mcp = McpClient::connect(&harness.base_url).await;
+
+    let provider_url = harness.write_provider_manifest("mcp-oversized-timeout-provider.json5");
+    let mut request = create_request(provider_url);
+    request
+        .exports
+        .insert("api".to_string(), ExportRequest { publish: None });
+    let created: EnqueueOperationResponse = mcp
+        .call_tool(
+            "amber.v1.scenarios.create",
+            serde_json::to_value(&request).expect("serialize oversized-timeout request"),
+        )
+        .await;
+
+    let operation_error = mcp
+        .call_tool_error(
+            "amber.v1.operations.wait",
+            json!({
+                "operation_id": created.operation_id,
+                "timeout_ms": u64::MAX,
+            }),
+        )
+        .await;
+    assert!(operation_error.contains("timeout_ms"));
+
+    let export_error = mcp
+        .call_tool_error(
+            "amber.v1.exports.wait",
+            json!({
+                "scenario_id": created.scenario_id,
+                "export": "api",
+                "timeout_ms": u64::MAX,
+            }),
+        )
+        .await;
+    assert!(export_error.contains("timeout_ms"));
 }
