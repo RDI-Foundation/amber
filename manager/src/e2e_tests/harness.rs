@@ -222,6 +222,30 @@ impl TestHarness {
         self.get_json(&format!("/v1/scenarios/{scenario_id}")).await
     }
 
+    pub(super) async fn wait_for_scenario_detail<F>(
+        &self,
+        description: &str,
+        scenario_id: &str,
+        timeout: Duration,
+        mut check: F,
+    ) -> ScenarioDetailResponse
+    where
+        F: FnMut(&ScenarioDetailResponse) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let detail = self.scenario_detail(scenario_id).await;
+            if check(&detail) {
+                return detail;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {description}"
+            );
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     pub(super) async fn find_export_service(
         &self,
         scenario_id: &str,

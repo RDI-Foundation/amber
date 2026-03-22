@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::TcpListener,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use reqwest::{Client, StatusCode};
@@ -125,16 +125,20 @@ impl McpClient {
     }
 
     async fn wait_until_ready(&mut self) {
-        for _ in 0..50 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
             let ready: ManagerReadyResponse = self
                 .call_tool("amber.v1.manager.ready.get", json!({}))
                 .await;
             if ready.ready {
                 return;
             }
-            sleep(Duration::from_millis(20)).await;
+            assert!(
+                Instant::now() < deadline,
+                "manager never reported ready over MCP"
+            );
+            sleep(Duration::from_millis(50)).await;
         }
-        panic!("manager never reported ready over MCP");
     }
 
     async fn tools_list(&mut self) -> Vec<Value> {

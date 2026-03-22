@@ -265,6 +265,90 @@ async fn bindable_configs_enumerate_and_resolve_into_root_config() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn upgrade_rebinds_existing_external_root_config_without_resending_root_config() {
+    let first_public_name = "public_alpha";
+    let second_public_name = "public_charlie";
+    let first_secret_name = "secret_bravo";
+    let second_secret_name = "secret_delta";
+    let harness = TestHarness::new(ManagerFileConfig {
+        bindable_services: BTreeMap::new(),
+        bindable_configs: BTreeMap::from([
+            (first_public_name.to_string(), json!("alpha")),
+            (second_public_name.to_string(), json!("charlie")),
+            (first_secret_name.to_string(), json!("bravo")),
+            (second_secret_name.to_string(), json!("delta")),
+        ]),
+        scenario_source_allowlist: None,
+    })
+    .await;
+    let configured_url = harness.write_configured_manifest("configured-bindable.json5");
+
+    let created = harness
+        .create_scenario(&CreateScenarioRequest {
+            source_url: configured_url,
+            root_config: json!({}),
+            external_root_config: BTreeMap::from([
+                (
+                    "public_value".to_string(),
+                    ids::operator_config_id(first_public_name),
+                ),
+                (
+                    "secret_value".to_string(),
+                    ids::operator_config_id(first_secret_name),
+                ),
+            ]),
+            external_slots: BTreeMap::new(),
+            exports: BTreeMap::new(),
+            metadata: json!({}),
+            telemetry: ScenarioTelemetryRequest::default(),
+            store_bundle: false,
+            start: true,
+        })
+        .await;
+    let create_op = harness.wait_for_operation(&created.operation_id).await;
+    assert_eq!(create_op.status, OperationStatus::Succeeded);
+
+    let upgraded: EnqueueOperationResponse = harness
+        .post_json(
+            &format!("/v1/scenarios/{}/upgrade", created.scenario_id),
+            &UpgradeScenarioRequest {
+                source_url: None,
+                root_config: None,
+                external_root_config: Some(BTreeMap::from([
+                    (
+                        "public_value".to_string(),
+                        ids::operator_config_id(second_public_name),
+                    ),
+                    (
+                        "secret_value".to_string(),
+                        ids::operator_config_id(second_secret_name),
+                    ),
+                ])),
+                external_slots: None,
+                exports: None,
+                metadata: None,
+                telemetry: None,
+                store_bundle: false,
+            },
+        )
+        .await;
+    let upgraded_op = harness.wait_for_operation(&upgraded.operation_id).await;
+    assert_eq!(upgraded_op.status, OperationStatus::Succeeded);
+
+    let detail = harness.scenario_detail(&created.scenario_id).await;
+    assert_eq!(detail.active_revision, Some(2));
+    assert_eq!(detail.root_config, json!({ "public_value": "charlie" }));
+    assert_eq!(
+        detail.secret_root_config_paths,
+        vec!["secret_value".to_string()]
+    );
+
+    let upgraded_env = harness.read_runtime_env(&created.scenario_id, 2);
+    assert_env_contains_root_config(&upgraded_env, "public_value", "charlie");
+    assert_env_contains_root_config(&upgraded_env, "secret_value", "delta");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn create_rejects_unknown_bindable_config_before_enqueue() {
     let harness = TestHarness::new(ManagerFileConfig::default()).await;
     let configured_url = harness.write_configured_manifest("configured-missing-bindable.json5");
@@ -975,6 +1059,23 @@ async fn health_monitor_restarts_unhealthy_provider_without_rewiring_consumer() 
         })
         .await;
 
+    let provider_detail = harness
+        .wait_for_scenario_detail(
+            "provider observed running after restart",
+            &provider.scenario_id,
+            Duration::from_secs(10),
+            |detail| detail.observed_state == ObservedState::Running,
+        )
+        .await;
+    let consumer_detail = harness
+        .wait_for_scenario_detail(
+            "consumer remained running during provider restart",
+            &consumer.scenario_id,
+            Duration::from_secs(10),
+            |detail| detail.observed_state == ObservedState::Running,
+        )
+        .await;
+
     let consumer_spec = harness
         .runtime
         .last_spec(&consumer.scenario_id)
@@ -986,9 +1087,6 @@ async fn health_monitor_restarts_unhealthy_provider_without_rewiring_consumer() 
         harness.runtime.apply_count(&consumer.scenario_id).await,
         initial_consumer_apply_count
     );
-
-    let provider_detail = harness.scenario_detail(&provider.scenario_id).await;
-    let consumer_detail = harness.scenario_detail(&consumer.scenario_id).await;
     assert_eq!(provider_detail.observed_state, ObservedState::Running);
     assert_eq!(consumer_detail.observed_state, ObservedState::Running);
 }

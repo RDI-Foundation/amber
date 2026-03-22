@@ -745,8 +745,11 @@ impl ManagerService {
         &self,
         mut request: CreateScenarioRequest,
     ) -> Result<CreateScenarioRequest, ManagerError> {
-        request.root_config =
-            self.resolve_external_root_config(request.root_config, &request.external_root_config)?;
+        request.root_config = self.resolve_external_root_config(
+            request.root_config,
+            &request.external_root_config,
+            JsonPathWriteMode::InsertOnly,
+        )?;
         request.external_root_config.clear();
         Ok(request)
     }
@@ -759,8 +762,8 @@ impl ManagerService {
         let Some(external_root_config) = request.external_root_config.as_ref() else {
             return Ok(request);
         };
-        let base_root_config = match request.root_config.take() {
-            Some(root_config) => root_config,
+        let (base_root_config, write_mode) = match request.root_config.take() {
+            Some(root_config) => (root_config, JsonPathWriteMode::InsertOnly),
             None => {
                 let secret_root_config = self
                     .state
@@ -768,14 +771,20 @@ impl ManagerService {
                     .load_secret_config(&scenario.id)
                     .await
                     .map_err(ManagerError::internal)?;
-                merge_json(
-                    scenario.root_config.clone().unwrap_or_else(|| json!({})),
-                    secret_root_config,
+                (
+                    merge_json(
+                        scenario.root_config.clone().unwrap_or_else(|| json!({})),
+                        secret_root_config,
+                    ),
+                    JsonPathWriteMode::OverwriteExisting,
                 )
             }
         };
-        request.root_config =
-            Some(self.resolve_external_root_config(base_root_config, external_root_config)?);
+        request.root_config = Some(self.resolve_external_root_config(
+            base_root_config,
+            external_root_config,
+            write_mode,
+        )?);
         request.external_root_config = None;
         Ok(request)
     }
@@ -784,6 +793,7 @@ impl ManagerService {
         &self,
         root_config: Value,
         external_root_config: &BTreeMap<String, String>,
+        write_mode: JsonPathWriteMode,
     ) -> Result<Value, ManagerError> {
         if external_root_config.is_empty() {
             return Ok(root_config);
@@ -811,7 +821,7 @@ impl ManagerService {
                         bindable_config_id
                     ))
                 })?;
-            insert_json_path_no_overwrite(&mut resolved, path, value)
+            write_json_path(&mut resolved, path, value, write_mode)
                 .map_err(ManagerError::bad_request)?;
         }
 
@@ -1034,7 +1044,18 @@ fn bindable_service_matches(
             .is_none_or(|available| service.available == available)
 }
 
-fn insert_json_path_no_overwrite(root: &mut Value, path: &str, value: Value) -> Result<(), String> {
+#[derive(Clone, Copy)]
+enum JsonPathWriteMode {
+    InsertOnly,
+    OverwriteExisting,
+}
+
+fn write_json_path(
+    root: &mut Value,
+    path: &str,
+    value: Value,
+    mode: JsonPathWriteMode,
+) -> Result<(), String> {
     if path.trim().is_empty() {
         return Err("external_root_config path must not be empty".to_string());
     }
@@ -1049,7 +1070,7 @@ fn insert_json_path_no_overwrite(root: &mut Value, path: &str, value: Value) -> 
                      value"
                 )
             })?;
-            if map.contains_key(part) {
+            if matches!(mode, JsonPathWriteMode::InsertOnly) && map.contains_key(part) {
                 return Err(format!(
                     "root_config path {path} was provided more than once"
                 ));
