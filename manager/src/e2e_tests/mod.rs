@@ -1,7 +1,11 @@
 mod harness;
 mod mcp;
 
-use std::{collections::BTreeMap, net::TcpListener, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::TcpListener,
+    time::Duration,
+};
 
 use amber_config::{encode_env_value, env_var_for_path};
 use reqwest::StatusCode;
@@ -143,6 +147,107 @@ async fn scenario_lifecycle_over_live_http_api() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn create_rejects_source_url_outside_operator_allowlist() {
+    let manifest_harness = TestHarness::new(ManagerFileConfig::default()).await;
+    let allowed_url = manifest_harness.write_provider_manifest("allowlisted-provider.json5");
+    let denied_url = manifest_harness.write_provider_manifest("blocked-provider.json5");
+
+    let restricted_harness = TestHarness::new(ManagerFileConfig {
+        bindable_services: BTreeMap::new(),
+        scenario_source_allowlist: Some(BTreeSet::from([allowed_url])),
+    })
+    .await;
+
+    let (status, body) = restricted_harness
+        .post_json_raw("/v1/scenarios", &create_request(denied_url.clone()))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+    assert!(
+        body.contains("scenario_source_allowlist"),
+        "unexpected body: {body}"
+    );
+    assert!(body.contains(&denied_url), "unexpected body: {body}");
+
+    let scenarios: Vec<ScenarioSummaryResponse> =
+        restricted_harness.get_json("/v1/scenarios").await;
+    assert!(scenarios.is_empty(), "unexpected scenarios: {scenarios:#?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_rejects_invalid_source_url_before_enqueue() {
+    let harness = TestHarness::new(ManagerFileConfig::default()).await;
+
+    let (status, body) = harness
+        .post_json_raw(
+            "/v1/scenarios",
+            &create_request("not a valid url".to_string()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+    assert!(
+        body.contains("invalid source URL"),
+        "unexpected body: {body}"
+    );
+    assert!(body.contains("not a valid url"), "unexpected body: {body}");
+
+    let scenarios: Vec<ScenarioSummaryResponse> = harness.get_json("/v1/scenarios").await;
+    assert!(scenarios.is_empty(), "unexpected scenarios: {scenarios:#?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrade_rejects_source_url_outside_operator_allowlist() {
+    let manifest_harness = TestHarness::new(ManagerFileConfig::default()).await;
+    let allowed_url =
+        manifest_harness.write_provider_manifest("upgrade-allowlisted-provider.json5");
+    let denied_url = manifest_harness.write_provider_manifest("upgrade-blocked-provider.json5");
+
+    let restricted_harness = TestHarness::new(ManagerFileConfig {
+        bindable_services: BTreeMap::new(),
+        scenario_source_allowlist: Some(BTreeSet::from([allowed_url.clone()])),
+    })
+    .await;
+
+    let created = restricted_harness
+        .create_scenario(&create_request(allowed_url))
+        .await;
+    let create_op = restricted_harness
+        .wait_for_operation(&created.operation_id)
+        .await;
+    assert_eq!(create_op.status, OperationStatus::Succeeded);
+
+    let (status, body) = restricted_harness
+        .post_json_raw(
+            &format!("/v1/scenarios/{}/upgrade", created.scenario_id),
+            &UpgradeScenarioRequest {
+                source_url: Some(denied_url.clone()),
+                root_config: None,
+                external_slots: None,
+                exports: None,
+                metadata: None,
+                telemetry: None,
+                store_bundle: false,
+            },
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+    assert!(
+        body.contains("scenario_source_allowlist"),
+        "unexpected body: {body}"
+    );
+    assert!(body.contains(&denied_url), "unexpected body: {body}");
+
+    let detail = restricted_harness
+        .scenario_detail(&created.scenario_id)
+        .await;
+    assert_eq!(detail.active_revision, Some(1));
+
+    let revisions: Vec<ScenarioRevisionSummaryResponse> = restricted_harness
+        .get_json(&format!("/v1/scenarios/{}/revisions", created.scenario_id))
+        .await;
+    assert_eq!(revisions.len(), 1, "unexpected revisions: {revisions:#?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn upgrade_preserves_omitted_configuration_fields() {
     let harness = TestHarness::new(ManagerFileConfig::default()).await;
     let configured_url = harness.write_configured_manifest("configured-upgrade.json5");
@@ -231,24 +336,20 @@ async fn upgrade_recovers_root_config_after_failed_initial_create() {
     let harness = TestHarness::new(ManagerFileConfig::default()).await;
     let configured_url = harness.write_configured_manifest("configured-after-failed-create.json5");
     let telemetry_endpoint = "http://127.0.0.1:4318/v1/traces";
+    let mut failed_create_request = create_request(configured_url.clone());
+    failed_create_request.root_config = json!({
+        "public_value": "alpha",
+        "secret_value": "bravo",
+    });
+    failed_create_request
+        .exports
+        .insert("bogus".to_string(), ExportRequest { publish: None });
+    failed_create_request.metadata = json!({ "generation": 1 });
+    failed_create_request.telemetry = ScenarioTelemetryRequest {
+        upstream_otlp_http_endpoint: Some(telemetry_endpoint.to_string()),
+    };
 
-    let created = harness
-        .create_scenario(&CreateScenarioRequest {
-            source_url: "not a valid url".to_string(),
-            root_config: json!({
-                "public_value": "alpha",
-                "secret_value": "bravo",
-            }),
-            external_slots: BTreeMap::new(),
-            exports: BTreeMap::new(),
-            metadata: json!({ "generation": 1 }),
-            telemetry: ScenarioTelemetryRequest {
-                upstream_otlp_http_endpoint: Some(telemetry_endpoint.to_string()),
-            },
-            store_bundle: false,
-            start: true,
-        })
-        .await;
+    let created = harness.create_scenario(&failed_create_request).await;
     let create_op = harness.wait_for_operation(&created.operation_id).await;
     assert_eq!(create_op.status, OperationStatus::Failed);
 
@@ -262,10 +363,10 @@ async fn upgrade_recovers_root_config_after_failed_initial_create() {
         .post_json(
             &format!("/v1/scenarios/{}/upgrade", created.scenario_id),
             &UpgradeScenarioRequest {
-                source_url: Some(configured_url),
+                source_url: None,
                 root_config: None,
                 external_slots: None,
-                exports: None,
+                exports: Some(BTreeMap::new()),
                 metadata: None,
                 telemetry: None,
                 store_bundle: false,

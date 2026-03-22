@@ -20,7 +20,7 @@ use self::{
 };
 use crate::{
     ManagerConfig,
-    compiler::{ExportRuntimeBinding, SlotRuntimeBinding},
+    compiler::{ExportRuntimeBinding, ScenarioSourceAccess, SlotRuntimeBinding},
     config::{ConfigError, ManagerFileConfig, OperatorServiceProvider},
     domain::{
         BindableServiceProviderKind, BindableServiceResponse, BindableServiceSourceKind,
@@ -44,6 +44,7 @@ pub struct AppState {
     runtime: RuntimeSupervisor,
     notify: Arc<Notify>,
     operator_services: BTreeMap<String, OperatorBindableService>,
+    scenario_sources: ScenarioSourceAccess,
 }
 
 impl AppState {
@@ -54,13 +55,19 @@ impl AppState {
         runtime: RuntimeSupervisor,
         notify: Arc<Notify>,
     ) -> Result<Self, ConfigError> {
-        let operator_services = build_operator_services(file_config)?;
+        let ManagerFileConfig {
+            bindable_services,
+            scenario_source_allowlist,
+        } = file_config;
+        let operator_services = build_operator_services(bindable_services)?;
+        let scenario_sources = ScenarioSourceAccess::from_config(scenario_source_allowlist)?;
         Ok(Self {
             config,
             store,
             runtime,
             notify,
             operator_services,
+            scenario_sources,
         })
     }
 
@@ -101,6 +108,10 @@ impl AppState {
         }
         services.sort_by(|left, right| left.bindable_service_id.cmp(&right.bindable_service_id));
         Ok(services)
+    }
+
+    pub fn scenario_sources(&self) -> &ScenarioSourceAccess {
+        &self.scenario_sources
     }
 }
 

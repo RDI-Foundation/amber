@@ -328,6 +328,23 @@ impl TestHarness {
         Self::decode_success(response).await
     }
 
+    pub(super) async fn post_json_raw<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> (StatusCode, String) {
+        let response = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .json(body)
+            .send()
+            .await
+            .expect("send raw POST");
+        let status = response.status();
+        let body = response.text().await.expect("read raw POST body");
+        (status, body)
+    }
+
     pub(super) async fn post_empty<T: DeserializeOwned>(&self, path: &str) -> T {
         let response = self
             .client

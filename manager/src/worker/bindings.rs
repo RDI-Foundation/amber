@@ -17,7 +17,7 @@ use super::{
 };
 use crate::{
     compiler::{CompiledMaterialization, ExportRuntimeBinding, SlotRuntimeBinding},
-    config::{ConfigError, ManagerFileConfig, OperatorServiceProvider},
+    config::{ConfigError, OperatorBindableServiceConfig, OperatorServiceProvider},
     domain::{
         BindableServiceProviderKind, BindableServiceResponse, BindableServiceSourceKind,
         ExportRequest, ServiceProtocol,
@@ -434,10 +434,10 @@ pub(super) fn export_topology_changed(
 }
 
 pub(super) fn build_operator_services(
-    file_config: ManagerFileConfig,
+    bindable_services: BTreeMap<String, OperatorBindableServiceConfig>,
 ) -> Result<BTreeMap<String, OperatorBindableService>, ConfigError> {
     let mut services = BTreeMap::new();
-    for (name, config) in file_config.bindable_services {
+    for (name, config) in bindable_services {
         let service_id = ids::operator_service_id(&name);
         if services.contains_key(&service_id) {
             return Err(ConfigError::InvalidConfig(format!(

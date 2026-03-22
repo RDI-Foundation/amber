@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 use tokio::time::{Instant, sleep};
 
 use crate::{
-    compiler::{inspect_source, inspect_stored_ir, root_schema_from_ir},
+    compiler::{inspect_stored_ir, root_schema_from_ir},
     domain::{
         BindableServiceProviderKind, BindableServiceResponse, BindableServiceSourceKind,
         CreateScenarioRequest, DesiredState, EnqueueOperationResponse, ExportPublishRequest,
@@ -203,6 +203,7 @@ impl ManagerService {
         &self,
         request: CreateScenarioRequest,
     ) -> Result<EnqueueOperationResponse, ManagerError> {
+        self.ensure_scenario_source_allowed(&request.source_url)?;
         let scenario_id = ids::new_scenario_id();
         let operation_id = ids::new_operation_id();
         let desired_state = if request.start {
@@ -325,7 +326,13 @@ impl ManagerService {
         scenario_id: &str,
         request: UpgradeScenarioRequest,
     ) -> Result<EnqueueOperationResponse, ManagerError> {
-        self.ensure_scenario_exists(scenario_id).await?;
+        let scenario = self.load_scenario_row(scenario_id).await?;
+        self.ensure_scenario_source_allowed(
+            request
+                .source_url
+                .as_deref()
+                .unwrap_or(&scenario.source_url),
+        )?;
         let operation_id = ids::new_operation_id();
         let staged = self
             .state
@@ -557,7 +564,10 @@ impl ManagerService {
     ) -> Result<ScenarioConfigSchemaResponse, ManagerError> {
         match lookup {
             ScenarioConfigSchemaLookup::SourceUrl(source_url) => {
-                let compiled = inspect_source(&source_url)
+                let compiled = self
+                    .state
+                    .scenario_sources()
+                    .inspect(&source_url)
                     .await
                     .map_err(ManagerError::bad_request)?;
                 build_config_schema_response(source_url, &compiled)
@@ -580,7 +590,9 @@ impl ManagerService {
                         })?;
                     inspect_stored_ir(&revision.scenario_ir_json).map_err(ManagerError::internal)?
                 } else {
-                    inspect_source(&source_url)
+                    self.state
+                        .scenario_sources()
+                        .inspect(&source_url)
                         .await
                         .map_err(ManagerError::bad_request)?
                 };
@@ -625,6 +637,13 @@ impl ManagerService {
             scenario_id: scenario_id.to_string(),
             operation_id,
         })
+    }
+
+    fn ensure_scenario_source_allowed(&self, source_url: &str) -> Result<(), ManagerError> {
+        self.state
+            .scenario_sources()
+            .preflight(source_url)
+            .map_err(ManagerError::bad_request)
     }
 
     async fn get_scenario_export(
@@ -754,9 +773,13 @@ impl ManagerService {
 
         let exports: BTreeMap<String, ExportRequest> =
             serde_json::from_value(scenario.exports.clone()).map_err(ManagerError::internal)?;
-        let pending_export_protocols =
-            discover_pending_export_protocols(&scenario.source_url, compiled.is_none(), &exports)
-                .await;
+        let pending_export_protocols = discover_pending_export_protocols(
+            self.state.as_ref(),
+            &scenario.source_url,
+            compiled.is_none(),
+            &exports,
+        )
+        .await;
         let export_names = compiled
             .as_ref()
             .map(|compiled| {
@@ -1053,6 +1076,7 @@ fn export_detail_from_projection(
 }
 
 async fn discover_pending_export_protocols(
+    state: &AppState,
     source_url: &str,
     needs_discovery: bool,
     requested_exports: &BTreeMap<String, ExportRequest>,
@@ -1061,7 +1085,7 @@ async fn discover_pending_export_protocols(
         return BTreeMap::new();
     }
 
-    let Ok(compiled) = inspect_source(source_url).await else {
+    let Ok(compiled) = state.scenario_sources().inspect(source_url).await else {
         return BTreeMap::new();
     };
     compiled

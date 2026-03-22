@@ -18,7 +18,7 @@ use super::{
 };
 use crate::{
     ManagerConfig,
-    compiler::{self, CompileError},
+    compiler::CompileError,
     config::{ManagerFileConfig, OperatorBindableServiceConfig},
     domain::{
         CreateScenarioRequest, DesiredState, ExportPublishRequest, ExportRequest, ObservedState,
@@ -94,7 +94,8 @@ fn build_operator_services_rejects_non_loopback_upstream() {
         },
     );
 
-    let err = build_operator_services(config).expect_err("should reject non-loopback upstream");
+    let err = build_operator_services(config.bindable_services)
+        .expect_err("should reject non-loopback upstream");
     assert!(
         err.to_string().contains("loopback upstream"),
         "unexpected error: {err}"
@@ -118,9 +119,30 @@ fn create_compile_write_failures_retry_as_scenario_errors() {
 }
 
 #[test]
+fn create_compile_allowlist_failures_are_invalid_scenario_errors() {
+    let err =
+        classify_create_compile_error(CompileError::SourceNotAllowed("https://example.com".into()));
+    assert!(!err.retryable);
+    assert!(err.affects_scenario);
+    assert_eq!(err.observed_state, Some(ObservedState::Failed));
+    assert!(!err.cleanup_runtime);
+}
+
+#[test]
 fn upgrade_compile_write_failures_retry_without_touching_scenario_state() {
     let err = classify_upgrade_compile_error(CompileError::WriteOutput("disk full".to_string()));
     assert!(err.retryable);
+    assert!(!err.affects_scenario);
+    assert_eq!(err.observed_state, None);
+    assert!(!err.cleanup_runtime);
+}
+
+#[test]
+fn upgrade_compile_allowlist_failures_are_invalid_operation_errors() {
+    let err = classify_upgrade_compile_error(CompileError::SourceNotAllowed(
+        "https://example.com".into(),
+    ));
+    assert!(!err.retryable);
     assert!(!err.affects_scenario);
     assert_eq!(err.observed_state, None);
     assert!(!err.cleanup_runtime);
@@ -170,7 +192,7 @@ async fn prepare_bindings_does_not_probe_published_listener_early() {
         AppState::new(config, ManagerFileConfig::default(), store, runtime, notify)
             .expect("create app state"),
     );
-    let worker = OperationWorker::new(state);
+    let worker = OperationWorker::new(state.clone());
 
     let manifest_url = write_manifest(
         tempdir.path(),
@@ -188,21 +210,23 @@ async fn prepare_bindings_does_not_probe_published_listener_early() {
         }
         "#,
     );
-    let compiled = compiler::compile_create(
-        &CreateScenarioRequest {
-            source_url: manifest_url,
-            root_config: json!({}),
-            external_slots: BTreeMap::new(),
-            exports: BTreeMap::new(),
-            metadata: json!({}),
-            telemetry: ScenarioTelemetryRequest::default(),
-            store_bundle: false,
-            start: true,
-        },
-        None,
-    )
-    .await
-    .expect("compile provider manifest");
+    let compiled = state
+        .scenario_sources()
+        .compile_create(
+            &CreateScenarioRequest {
+                source_url: manifest_url,
+                root_config: json!({}),
+                external_slots: BTreeMap::new(),
+                exports: BTreeMap::new(),
+                metadata: json!({}),
+                telemetry: ScenarioTelemetryRequest::default(),
+                store_bundle: false,
+                start: true,
+            },
+            None,
+        )
+        .await
+        .expect("compile provider manifest");
 
     let occupied_listener = TcpListener::bind("127.0.0.1:0").expect("bind occupied listener");
     let publish_addr = occupied_listener

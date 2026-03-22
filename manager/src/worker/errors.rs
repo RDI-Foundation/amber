@@ -72,7 +72,8 @@ pub(super) fn retryable_operation_error(message: impl Into<String>) -> Operation
 
 pub(super) fn classify_create_compile_error(err: compiler::CompileError) -> OperationError {
     match err {
-        compiler::CompileError::InvalidSourceUrl(_)
+        compiler::CompileError::InvalidSourceUrl { .. }
+        | compiler::CompileError::SourceNotAllowed(_)
         | compiler::CompileError::InvalidRootConfig(_)
         | compiler::CompileError::UnknownExternalSlot(_)
         | compiler::CompileError::MissingRequiredExternalSlot(_)
@@ -87,7 +88,8 @@ pub(super) fn classify_create_compile_error(err: compiler::CompileError) -> Oper
 
 pub(super) fn classify_upgrade_compile_error(err: compiler::CompileError) -> OperationError {
     match err {
-        compiler::CompileError::InvalidSourceUrl(_)
+        compiler::CompileError::InvalidSourceUrl { .. }
+        | compiler::CompileError::SourceNotAllowed(_)
         | compiler::CompileError::InvalidRootConfig(_)
         | compiler::CompileError::UnknownExternalSlot(_)
         | compiler::CompileError::MissingRequiredExternalSlot(_)
@@ -102,7 +104,8 @@ pub(super) fn classify_upgrade_compile_error(err: compiler::CompileError) -> Ope
 
 pub(super) fn classify_reconcile_compile_error(err: compiler::CompileError) -> OperationError {
     match err {
-        compiler::CompileError::InvalidSourceUrl(_)
+        compiler::CompileError::InvalidSourceUrl { .. }
+        | compiler::CompileError::SourceNotAllowed(_)
         | compiler::CompileError::InvalidRootConfig(_)
         | compiler::CompileError::UnknownExternalSlot(_)
         | compiler::CompileError::MissingRequiredExternalSlot(_)

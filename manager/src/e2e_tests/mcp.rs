@@ -9,6 +9,7 @@ use super::harness::{
     TestHarness, create_request, create_request_with_slot, operator_service_config,
 };
 use crate::{
+    config::ManagerFileConfig,
     domain::{
         BindableServiceResponse, CreateScenarioRequest, EnqueueOperationResponse,
         ExportPublishRequest, ExportRequest, ObservedState, OperationStatus,
@@ -946,4 +947,59 @@ async fn mcp_wait_tools_reject_oversized_timeouts() {
         )
         .await;
     assert!(export_error.contains("timeout_ms"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_create_rejects_source_url_outside_operator_allowlist() {
+    let manifest_harness = TestHarness::new(ManagerFileConfig::default()).await;
+    let allowed_url = manifest_harness.write_provider_manifest("mcp-allowlisted-provider.json5");
+    let denied_url = manifest_harness.write_provider_manifest("mcp-blocked-provider.json5");
+
+    let harness = TestHarness::new(ManagerFileConfig {
+        bindable_services: Default::default(),
+        scenario_source_allowlist: Some(BTreeSet::from([allowed_url])),
+    })
+    .await;
+    let mut mcp = McpClient::connect(&harness.base_url).await;
+
+    let error = mcp
+        .call_tool_error(
+            "amber.v1.scenarios.create",
+            serde_json::to_value(create_request(denied_url.clone()))
+                .expect("serialize allowlist-blocked create request"),
+        )
+        .await;
+    assert!(error.contains("scenario_source_allowlist"));
+    assert!(error.contains(&denied_url));
+
+    let scenarios: ScenariosListResponse =
+        mcp.call_tool("amber.v1.scenarios.list", json!({})).await;
+    assert!(
+        scenarios.scenarios.is_empty(),
+        "unexpected scenarios: {scenarios:#?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_config_schema_rejects_source_url_outside_operator_allowlist() {
+    let manifest_harness = TestHarness::new(ManagerFileConfig::default()).await;
+    let allowed_url =
+        manifest_harness.write_provider_manifest("mcp-schema-allowlisted-provider.json5");
+    let denied_url = manifest_harness.write_provider_manifest("mcp-schema-blocked-provider.json5");
+
+    let harness = TestHarness::new(ManagerFileConfig {
+        bindable_services: Default::default(),
+        scenario_source_allowlist: Some(BTreeSet::from([allowed_url])),
+    })
+    .await;
+    let mut mcp = McpClient::connect(&harness.base_url).await;
+
+    let error = mcp
+        .call_tool_error(
+            "amber.v1.scenarios.config_schema.get",
+            json!({ "source_url": denied_url.clone() }),
+        )
+        .await;
+    assert!(error.contains("scenario_source_allowlist"));
+    assert!(error.contains(&denied_url));
 }

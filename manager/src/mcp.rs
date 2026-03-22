@@ -750,6 +750,7 @@ fn tool_doc_extra(name: &str) -> ToolDocExtra {
             failure_cases: &[
                 "Invalid source_url, invalid slots, or invalid exports surface as tool-call \
                  failures.",
+                "scenario_source_allowlist rejections surface as tool-call failures.",
             ],
         },
         "amber.v1.scenarios.upgrade" => ToolDocExtra {
@@ -758,7 +759,8 @@ fn tool_doc_extra(name: &str) -> ToolDocExtra {
                  settings.",
             ],
             failure_cases: &[
-                "Unknown scenario IDs and conflicting in-flight operations are tool-call failures.",
+                "Unknown scenario IDs, conflicting in-flight operations, and \
+                 scenario_source_allowlist rejections are tool-call failures.",
             ],
         },
         "amber.v1.scenarios.pause" => ToolDocExtra {
@@ -784,7 +786,10 @@ fn tool_doc_extra(name: &str) -> ToolDocExtra {
                 "Call with source_url before create when root_config shape is unknown.",
                 "Call with scenario_id to inspect an existing scenario’s active config schema.",
             ],
-            failure_cases: &["Exactly one of source_url or scenario_id must be supplied."],
+            failure_cases: &[
+                "Exactly one of source_url or scenario_id must be supplied.",
+                "Disallowed or invalid source_url values are tool-call failures.",
+            ],
         },
         "amber.v1.operations.get" => ToolDocExtra {
             examples: &["Read raw operation state when you need phase or retry-count details."],

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
@@ -81,6 +81,9 @@ impl ManagerConfig {
 pub struct ManagerFileConfig {
     #[serde(default)]
     pub bindable_services: BTreeMap<String, OperatorBindableServiceConfig>,
+
+    #[serde(default)]
+    pub scenario_source_allowlist: Option<BTreeSet<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
