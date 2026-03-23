@@ -71,6 +71,9 @@ fn profile_meta_schema() -> Value {
                     "$dynamicRef": false,
                     "$recursiveRef": false,
                 },
+                "patternProperties": {
+                    "^x-": true,
+                },
                 "allOf": [
                     {
                         "if": { "required": ["properties"] },
@@ -193,6 +196,37 @@ mod tests {
         let _ = input
             .parse::<Manifest>()
             .expect("schema with secret annotations should parse");
+    }
+
+    #[test]
+    fn config_schema_profile_accepts_x_annotations() {
+        let input = r#"
+        {
+          manifest_version: "0.1.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              my_config: {
+                type: "string",
+                "x-example-hide": true,
+              },
+              nested: {
+                type: "object",
+                "x-example-section": "advanced",
+                properties: {
+                  enabled: {
+                    type: "boolean",
+                    "x-example-label": "Enable advanced mode",
+                  },
+                },
+              },
+            },
+          },
+        }
+        "#;
+        let _ = input
+            .parse::<Manifest>()
+            .expect("schema with x-* annotations should parse");
     }
 
     #[test]
