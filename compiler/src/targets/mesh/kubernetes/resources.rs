@@ -423,8 +423,41 @@ pub struct Container {
     pub ports: Vec<ContainerPort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub readiness_probe: Option<Probe>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_context: Option<SecurityContext>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub volume_mounts: Vec<VolumeMount>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecurityContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_privilege_escalation: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Capabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_only_root_filesystem: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_as_non_root: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_as_user: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seccomp_profile: Option<SeccompProfile>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Capabilities {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub drop: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeccompProfile {
+    #[serde(rename = "type")]
+    pub profile_type: String,
 }
 
 #[derive(Clone, Debug, Serialize)]

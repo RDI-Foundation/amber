@@ -139,6 +139,11 @@ Direct output only supports components that use `program.path`.
 - Linux: `bwrap` and `slirp4netns`
 - macOS: `/usr/bin/sandbox-exec`
 
+Current enforcement notes:
+- Direct/native on Linux has the strongest capability mediation today: Amber runs each component behind a sidecar/router, isolates sidecar networking, joins the component into that namespace, shapes the filesystem with curated read-only mounts plus explicit writable storage, and drops all Linux capabilities for Amber-owned sidecars.
+- Docker Compose and Kubernetes now default generated containers to non-escalating privilege settings, run Amber-owned internal routers/provisioners non-root where their images already guarantee it, make those internal root filesystems read-only where possible, and reject external slot targets that resolve to loopback or link-local IPs.
+- Docker Compose and Kubernetes do not yet transparently redirect all arbitrary container egress through the router. Amber strongly mediates declared capability paths, but shared pod/service networking still means generic outbound traffic is not yet fully non-bypassable on those backends.
+
 ### 3c) Generate VM output and run
 
 ```sh
