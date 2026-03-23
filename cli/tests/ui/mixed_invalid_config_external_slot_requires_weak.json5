@@ -1,0 +1,18 @@
+{
+  manifest_version: "0.3.0",
+  slots: {
+    api: { kind: "http" },
+  },
+  components: {
+    sink: "./mixed_invalid_config_external_slot_requires_weak_sink.json5",
+    cfg: {
+      manifest: "./mixed_invalid_config_external_slot_requires_weak_cfg.json5",
+      config: {
+        url: "${slots.api.url}",
+      },
+    },
+  },
+  bindings: [
+    { to: "#sink.api", from: "slots.api" },
+  ],
+}

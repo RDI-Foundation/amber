@@ -1,0 +1,29 @@
+{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      url: { type: "string" },
+    },
+    additionalProperties: false,
+  },
+  program: {
+    image: "cfg",
+    entrypoint: ["cfg"],
+    network: {
+      endpoints: [{ name: "out", port: 8081 }],
+    },
+    env: {
+      URL: {
+        when: "config.url",
+        value: "${config.url}",
+      },
+    },
+  },
+  provides: {
+    out: { kind: "http", endpoint: "out" },
+  },
+  exports: {
+    out: "provides.out",
+  },
+}

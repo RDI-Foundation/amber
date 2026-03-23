@@ -3400,6 +3400,204 @@ async fn check_keeps_unused_program_for_external_binding_to_unused_slot() {
 }
 
 #[tokio::test]
+async fn check_reports_external_slot_requires_weak_even_with_unrelated_invalid_config() {
+    let dir = tmp_dir("mixed-invalid-config-external-weak");
+    let root_path = dir.path().join("root.json5");
+    let sink_path = dir.path().join("sink.json5");
+    let cfg_path = dir.path().join("config-child.json5");
+
+    write_file(
+        &sink_path,
+        r#"
+        {
+          manifest_version: "0.3.0",
+          program: {
+            image: "sink",
+            entrypoint: ["sink"],
+            env: { API_URL: "${slots.api.url}" }
+          },
+          slots: { api: { kind: "http" } }
+        }
+        "#,
+    );
+    write_file(
+        &cfg_path,
+        r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              url: { type: "string" }
+            },
+            required: ["url"],
+            additionalProperties: false
+          },
+          program: {
+            image: "cfg",
+            entrypoint: ["cfg"],
+            env: { URL: "${config.url}" }
+          }
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.3.0",
+              slots: {{ api: {{ kind: "http" }} }},
+              components: {{
+                sink: "{sink}",
+                cfg: {{
+                  manifest: "{cfg}",
+                  config: {{ url: "${{slots.api.url}}" }}
+                }}
+              }},
+              bindings: [
+                {{ to: "#sink.api", from: "slots.api" }}
+              ]
+            }}
+            "##,
+            sink = file_url(&sink_path),
+            cfg = file_url(&cfg_path),
+        ),
+    );
+
+    let compiler = default_compiler();
+    let output = compiler
+        .check(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .unwrap();
+
+    assert!(output.has_errors);
+    assert!(
+        has_diagnostic_code(&output.diagnostics, "linker::invalid_config"),
+        "expected invalid_config diagnostics, got {:?}",
+        output
+            .diagnostics
+            .iter()
+            .map(|diag| diag.to_string())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        has_diagnostic_code(&output.diagnostics, "linker::external_slot_requires_weak"),
+        "expected external_slot_requires_weak diagnostics, got {:?}",
+        output
+            .diagnostics
+            .iter()
+            .map(|diag| diag.to_string())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        has_diagnostic_code(&output.diagnostics, "linker::unbound_slot"),
+        "expected unbound_slot diagnostics, got {:?}",
+        output
+            .diagnostics
+            .iter()
+            .map(|diag| diag.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn check_reports_invalid_export_even_with_unrelated_invalid_config() {
+    let dir = tmp_dir("mixed-invalid-config-export-resolution");
+    let root_path = dir.path().join("root.json5");
+    let sink_path = dir.path().join("sink.json5");
+    let cfg_path = dir.path().join("config-child.json5");
+
+    write_file(
+        &sink_path,
+        r#"
+        {
+          manifest_version: "0.3.0",
+          slots: { api: { kind: "http" } },
+          exports: { api: "self.api" }
+        }
+        "#,
+    );
+    write_file(
+        &cfg_path,
+        r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              url: { type: "string" }
+            },
+            required: ["url"],
+            additionalProperties: false
+          },
+          program: {
+            image: "cfg",
+            entrypoint: ["cfg"],
+            env: { URL: "${config.url}" }
+          }
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.3.0",
+              slots: {{ api: {{ kind: "http" }} }},
+              components: {{
+                sink: "{sink}",
+                cfg: {{
+                  manifest: "{cfg}",
+                  config: {{ url: "${{slots.api.url}}" }}
+                }}
+              }},
+              bindings: [
+                {{ to: "#sink.api", from: "slots.api", weak: true }}
+              ],
+              exports: {{ api: "#sink.api" }}
+            }}
+            "##,
+            sink = file_url(&sink_path),
+            cfg = file_url(&cfg_path),
+        ),
+    );
+
+    let compiler = default_compiler();
+    let output = compiler
+        .check(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .unwrap();
+
+    assert!(output.has_errors);
+    assert!(
+        has_diagnostic_code(&output.diagnostics, "linker::invalid_config"),
+        "expected invalid_config diagnostics, got {:?}",
+        output
+            .diagnostics
+            .iter()
+            .map(|diag| diag.to_string())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        has_diagnostic_code(&output.diagnostics, "linker::invalid_export"),
+        "expected invalid_export diagnostics, got {:?}",
+        output
+            .diagnostics
+            .iter()
+            .map(|diag| diag.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn check_suppresses_unused_program_but_not_unused_provide_for_externally_rooted_child() {
     let dir = tmp_dir("external-rooted-narrow-lint");
     let root_path = dir.path().join("root.json5");
