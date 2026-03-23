@@ -17,7 +17,8 @@ use crate::{
     domain::{
         BindableConfigResponse, BindableServiceResponse, CreateScenarioRequest,
         EnqueueOperationResponse, ExportPublishRequest, ExportRequest, ObservedState,
-        OperationStatus, OperationStatusResponse, ScenarioDetailResponse, ServiceProtocol,
+        OperationStatus, OperationStatusResponse, ScenarioDetailResponse,
+        ScenarioSourceAllowlistEntryResponse, ServiceProtocol,
     },
     ids,
     mcp::{
@@ -325,6 +326,7 @@ async fn mcp_streamable_http_discovers_and_covers_all_tools() {
     let expected_tool_names = [
         "amber.v1.manager.health.get",
         "amber.v1.manager.ready.get",
+        "amber.v1.manager.scenario_source_allowlist.remove",
         "amber.v1.bindable_services.list",
         "amber.v1.bindable_services.get",
         "amber.v1.bindable_configs.list",
@@ -1024,6 +1026,39 @@ async fn mcp_create_rejects_source_url_outside_operator_allowlist() {
         scenarios.scenarios.is_empty(),
         "unexpected scenarios: {scenarios:#?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_remove_allowlist_entry_blocks_future_creates() {
+    let manifest_harness = TestHarness::new(ManagerFileConfig::default()).await;
+    let allowed_url =
+        manifest_harness.write_provider_manifest("mcp-remove-allowlisted-provider.json5");
+
+    let harness = TestHarness::new(ManagerFileConfig {
+        bindable_services: Default::default(),
+        bindable_configs: Default::default(),
+        scenario_source_allowlist: Some(BTreeSet::from([allowed_url.clone()])),
+    })
+    .await;
+    let mut mcp = McpClient::connect(&harness.base_url).await;
+
+    let removed: ScenarioSourceAllowlistEntryResponse = mcp
+        .call_tool(
+            "amber.v1.manager.scenario_source_allowlist.remove",
+            json!({ "source_url": allowed_url.clone() }),
+        )
+        .await;
+    assert_eq!(removed.source_url, allowed_url);
+
+    let error = mcp
+        .call_tool_error(
+            "amber.v1.scenarios.create",
+            serde_json::to_value(create_request(removed.source_url.clone()))
+                .expect("serialize removed-allowlist create request"),
+        )
+        .await;
+    assert!(error.contains("scenario_source_allowlist"));
+    assert!(error.contains(&removed.source_url));
 }
 
 #[tokio::test(flavor = "multi_thread")]

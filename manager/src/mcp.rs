@@ -22,7 +22,8 @@ use serde_json::{Map, Value};
 use crate::{
     domain::{
         BindableServiceProviderKind, BindableServiceSourceKind, CreateScenarioRequest,
-        DesiredState, ObservedState, ServiceProtocol, UpgradeScenarioRequest,
+        DesiredState, ObservedState, ScenarioSourceAllowlistEntryRequest, ServiceProtocol,
+        UpgradeScenarioRequest,
     },
     service::{
         BindableServiceFilter, ExportFilter, ExportLookup, ManagerError, ManagerService,
@@ -225,6 +226,20 @@ impl AmberManagerMcp {
         Ok(Json(crate::service::ManagerReadyResponse {
             ready: self.core.ready().await,
         }))
+    }
+
+    #[tool(
+        name = "amber.v1.manager.scenario_source_allowlist.remove",
+        description = "Remove one scenario source URL from the operator-managed allowlist."
+    )]
+    async fn manager_scenario_source_allowlist_remove(
+        &self,
+        Parameters(request): Parameters<ScenarioSourceAllowlistEntryRequest>,
+    ) -> Result<Json<crate::domain::ScenarioSourceAllowlistEntryResponse>, McpError> {
+        self.core
+            .remove_scenario_source_allowlist_entry(request)
+            .map(Json)
+            .map_err(map_manager_error)
     }
 
     #[tool(
@@ -701,8 +716,9 @@ fn module_docs() -> &'static [ModuleDoc] {
     &[
         ModuleDoc {
             name: "manager",
-            description: "Manager liveness and readiness checks.",
-            when_to_use: "Use this before assuming the manager can accept lifecycle operations.",
+            description: "Manager liveness, readiness, and operator policy controls.",
+            when_to_use: "Use this before assuming the manager can accept lifecycle operations or \
+                          when changing runtime manager policy.",
         },
         ModuleDoc {
             name: "bindable_services",
@@ -757,6 +773,18 @@ fn tool_doc_extra(name: &str) -> ToolDocExtra {
         "amber.v1.manager.ready.get" => ToolDocExtra {
             examples: &["Call this before create or lifecycle operations."],
             failure_cases: &["A false readiness result is normal and not a tool-call error."],
+        },
+        "amber.v1.manager.scenario_source_allowlist.remove" => ToolDocExtra {
+            examples: &[
+                "Remove a bootstrap-only manifest URL after the required scenarios have already \
+                 been created.",
+                "Use the same source_url string you allowed initially; equivalent URLs are \
+                 normalized before removal.",
+            ],
+            failure_cases: &[
+                "Removing from a manager with no scenario_source_allowlist is a tool-call failure.",
+                "Unknown or invalid source_url values are tool-call failures.",
+            ],
         },
         "amber.v1.bindable_services.list" => ToolDocExtra {
             examples: &[
