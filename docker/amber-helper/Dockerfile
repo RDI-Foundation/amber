@@ -70,7 +70,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
       build_dir=debug; \
     fi && \
     install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber-helper /out/amber-helper && \
-    mkdir -p /out/amber/bin
+    mkdir -p /out/amber/bin /out/amber/mesh
 
 FROM scratch
 

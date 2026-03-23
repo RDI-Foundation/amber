@@ -1427,6 +1427,17 @@ fn kubernetes_mesh_workloads_wait_for_fresh_mesh_config() {
 }
 
 #[test]
+fn helper_image_precreates_mesh_mount_dir_for_read_only_init_container() {
+    let dockerfile = fs::read_to_string(workspace_root().join("docker/amber-helper/Dockerfile"))
+        .expect("read helper Dockerfile");
+    assert!(
+        dockerfile.contains("/out/amber/mesh"),
+        "helper image must create /amber/mesh for the read-only wait-mesh-config init \
+         container\n{dockerfile}"
+    );
+}
+
+#[test]
 fn kubernetes_emits_default_container_security_contexts() {
     let fixture_dir = tempdir().expect("fixture dir");
     let scenario_path = write_kubernetes_smoke_fixture(fixture_dir.path());
