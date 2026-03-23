@@ -520,6 +520,44 @@ async fn relative_manifest_refs_require_file_base() {
 }
 
 #[tokio::test]
+async fn missing_child_manifest_error_points_to_component_manifest_ref() {
+    let dir = tmp_dir("missing-child-manifest");
+    let root_path = dir.path().join("root.json5");
+
+    write_file(
+        &root_path,
+        r#"
+        {
+          manifest_version: "0.2.0",
+          components: {
+            foo: "./does-not-exist.json",
+          },
+        }
+        "#,
+    );
+
+    let compiler = default_compiler();
+    let err = compiler
+        .check(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .unwrap_err();
+
+    let crate::Error::Frontend(crate::frontend::Error::ManifestRefResolution {
+        child,
+        reference,
+        ..
+    }) = err
+    else {
+        panic!("expected contextual child manifest resolution error");
+    };
+    assert_eq!(child.as_ref(), "foo");
+    assert_eq!(reference.as_ref(), "./does-not-exist.json");
+}
+
+#[tokio::test]
 async fn cycle_is_detected_across_url_aliases_with_same_digest() {
     let (url, server) = spawn_alias_cycle_manifest_server();
 
