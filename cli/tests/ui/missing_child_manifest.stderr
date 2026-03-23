@@ -1,0 +1,13 @@
+Error: compiler::manifest_ref_resolution
+
+  × check failed
+  ╰─▶ failed to resolve manifest reference `./does-not-exist.json` for
+      component `#foo` in <CARGO_MANIFEST_DIR>/tests/ui/
+      missing_child_manifest.json5: No such file or directory (os error 2)
+   ╭─[<CARGO_MANIFEST_DIR>/tests/ui/missing_child_manifest.json5:4:10]
+ 3 │   components: {
+ 4 │     foo: "./does-not-exist.json",
+   ·          ───────────┬───────────
+   ·                     ╰── manifest reference declared here
+ 5 │   },
+   ╰────

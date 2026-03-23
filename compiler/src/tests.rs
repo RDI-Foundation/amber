@@ -520,6 +520,44 @@ async fn relative_manifest_refs_require_file_base() {
 }
 
 #[tokio::test]
+async fn missing_child_manifest_error_points_to_component_manifest_ref() {
+    let dir = tmp_dir("missing-child-manifest");
+    let root_path = dir.path().join("root.json5");
+
+    write_file(
+        &root_path,
+        r#"
+        {
+          manifest_version: "0.2.0",
+          components: {
+            foo: "./does-not-exist.json",
+          },
+        }
+        "#,
+    );
+
+    let compiler = default_compiler();
+    let err = compiler
+        .check(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .unwrap_err();
+
+    let crate::Error::Frontend(crate::frontend::Error::ManifestRefResolution {
+        child,
+        reference,
+        ..
+    }) = err
+    else {
+        panic!("expected contextual child manifest resolution error");
+    };
+    assert_eq!(child.as_ref(), "foo");
+    assert_eq!(reference.as_ref(), "./does-not-exist.json");
+}
+
+#[tokio::test]
 async fn cycle_is_detected_across_url_aliases_with_same_digest() {
     let (url, server) = spawn_alias_cycle_manifest_server();
 
@@ -3391,6 +3429,204 @@ async fn check_keeps_unused_program_for_external_binding_to_unused_slot() {
     assert!(
         has_diagnostic_code(&output.diagnostics, "manifest::unused_program"),
         "expected manifest::unused_program diagnostics, got {:?}",
+        output
+            .diagnostics
+            .iter()
+            .map(|diag| diag.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn check_reports_external_slot_requires_weak_even_with_unrelated_invalid_config() {
+    let dir = tmp_dir("mixed-invalid-config-external-weak");
+    let root_path = dir.path().join("root.json5");
+    let sink_path = dir.path().join("sink.json5");
+    let cfg_path = dir.path().join("config-child.json5");
+
+    write_file(
+        &sink_path,
+        r#"
+        {
+          manifest_version: "0.3.0",
+          program: {
+            image: "sink",
+            entrypoint: ["sink"],
+            env: { API_URL: "${slots.api.url}" }
+          },
+          slots: { api: { kind: "http" } }
+        }
+        "#,
+    );
+    write_file(
+        &cfg_path,
+        r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              url: { type: "string" }
+            },
+            required: ["url"],
+            additionalProperties: false
+          },
+          program: {
+            image: "cfg",
+            entrypoint: ["cfg"],
+            env: { URL: "${config.url}" }
+          }
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.3.0",
+              slots: {{ api: {{ kind: "http" }} }},
+              components: {{
+                sink: "{sink}",
+                cfg: {{
+                  manifest: "{cfg}",
+                  config: {{ url: "${{slots.api.url}}" }}
+                }}
+              }},
+              bindings: [
+                {{ to: "#sink.api", from: "slots.api" }}
+              ]
+            }}
+            "##,
+            sink = file_url(&sink_path),
+            cfg = file_url(&cfg_path),
+        ),
+    );
+
+    let compiler = default_compiler();
+    let output = compiler
+        .check(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .unwrap();
+
+    assert!(output.has_errors);
+    assert!(
+        has_diagnostic_code(&output.diagnostics, "linker::invalid_config"),
+        "expected invalid_config diagnostics, got {:?}",
+        output
+            .diagnostics
+            .iter()
+            .map(|diag| diag.to_string())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        has_diagnostic_code(&output.diagnostics, "linker::external_slot_requires_weak"),
+        "expected external_slot_requires_weak diagnostics, got {:?}",
+        output
+            .diagnostics
+            .iter()
+            .map(|diag| diag.to_string())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        has_diagnostic_code(&output.diagnostics, "linker::unbound_slot"),
+        "expected unbound_slot diagnostics, got {:?}",
+        output
+            .diagnostics
+            .iter()
+            .map(|diag| diag.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn check_reports_invalid_export_even_with_unrelated_invalid_config() {
+    let dir = tmp_dir("mixed-invalid-config-export-resolution");
+    let root_path = dir.path().join("root.json5");
+    let sink_path = dir.path().join("sink.json5");
+    let cfg_path = dir.path().join("config-child.json5");
+
+    write_file(
+        &sink_path,
+        r#"
+        {
+          manifest_version: "0.3.0",
+          slots: { api: { kind: "http" } },
+          exports: { api: "self.api" }
+        }
+        "#,
+    );
+    write_file(
+        &cfg_path,
+        r#"
+        {
+          manifest_version: "0.3.0",
+          config_schema: {
+            type: "object",
+            properties: {
+              url: { type: "string" }
+            },
+            required: ["url"],
+            additionalProperties: false
+          },
+          program: {
+            image: "cfg",
+            entrypoint: ["cfg"],
+            env: { URL: "${config.url}" }
+          }
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.3.0",
+              slots: {{ api: {{ kind: "http" }} }},
+              components: {{
+                sink: "{sink}",
+                cfg: {{
+                  manifest: "{cfg}",
+                  config: {{ url: "${{slots.api.url}}" }}
+                }}
+              }},
+              bindings: [
+                {{ to: "#sink.api", from: "slots.api", weak: true }}
+              ],
+              exports: {{ api: "#sink.api" }}
+            }}
+            "##,
+            sink = file_url(&sink_path),
+            cfg = file_url(&cfg_path),
+        ),
+    );
+
+    let compiler = default_compiler();
+    let output = compiler
+        .check(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .unwrap();
+
+    assert!(output.has_errors);
+    assert!(
+        has_diagnostic_code(&output.diagnostics, "linker::invalid_config"),
+        "expected invalid_config diagnostics, got {:?}",
+        output
+            .diagnostics
+            .iter()
+            .map(|diag| diag.to_string())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        has_diagnostic_code(&output.diagnostics, "linker::invalid_export"),
+        "expected invalid_export diagnostics, got {:?}",
         output
             .diagnostics
             .iter()

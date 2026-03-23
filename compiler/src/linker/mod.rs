@@ -1010,13 +1010,8 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         }
     }
 
-    if !errors.is_empty() {
-        return Err(Error::Multiple {
-            count: errors.len(),
-            errors,
-        });
-    }
-
+    // Keep going after local manifest/config/program validation errors so `check` can still
+    // surface independent global diagnostics such as binding-shape and export resolution issues.
     let bindings = collect_bindings(
         &components,
         &manifests,
@@ -1066,18 +1061,15 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         &mut errors,
     );
 
-    if !errors.is_empty() {
-        return Err(Error::Multiple {
-            count: errors.len(),
-            errors,
-        });
-    }
-
     let mut exports = Vec::new();
     for export_name in root_manifest.exports().keys() {
-        let resolved_export =
+        // Earlier validation already emitted a diagnostic for invalid child-export chains.
+        // Skip them here so unrelated earlier errors do not turn `check` into a panic.
+        let Ok(resolved_export) =
             resolve_export(&components, &manifests, &link_index, root, export_name)
-                .expect("export was validated during linking");
+        else {
+            continue;
+        };
         let export_decl = resolved_export.decl.clone();
         let from = match resolved_export.source {
             ResolvedExportSource::Provide(provide) => Some(provide),
