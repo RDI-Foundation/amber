@@ -19,8 +19,9 @@ use crate::{
     domain::{
         BindableConfigResponse, BindableServiceResponse, CreateScenarioRequest, DesiredState,
         EnqueueOperationResponse, ExportPublishRequest, ExportRequest, ObservedState,
-        OperationStatus, ScenarioRevisionSummaryResponse, ScenarioSummaryResponse,
-        ScenarioTelemetryRequest, UpgradeScenarioRequest,
+        OperationStatus, ScenarioRevisionSummaryResponse, ScenarioSourceAllowlistEntryRequest,
+        ScenarioSourceAllowlistEntryResponse, ScenarioSummaryResponse, ScenarioTelemetryRequest,
+        UpgradeScenarioRequest,
     },
     ids,
 };
@@ -174,6 +175,60 @@ async fn create_rejects_source_url_outside_operator_allowlist() {
     let scenarios: Vec<ScenarioSummaryResponse> =
         restricted_harness.get_json("/v1/scenarios").await;
     assert!(scenarios.is_empty(), "unexpected scenarios: {scenarios:#?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remove_allowlist_entry_blocks_future_creates_but_not_existing_lifecycle_operations() {
+    let manifest_harness = TestHarness::new(ManagerFileConfig::default()).await;
+    let allowed_url = manifest_harness.write_provider_manifest("remove-allowlisted-provider.json5");
+
+    let harness = TestHarness::new(ManagerFileConfig {
+        bindable_services: BTreeMap::new(),
+        bindable_configs: BTreeMap::new(),
+        scenario_source_allowlist: Some(BTreeSet::from([allowed_url.clone()])),
+    })
+    .await;
+
+    let created = harness
+        .create_scenario(&create_request(allowed_url.clone()))
+        .await;
+    let create_op = harness.wait_for_operation(&created.operation_id).await;
+    assert_eq!(create_op.status, OperationStatus::Succeeded);
+
+    let removed: ScenarioSourceAllowlistEntryResponse = harness
+        .post_json(
+            "/v1/manager/scenario-source-allowlist/remove",
+            &ScenarioSourceAllowlistEntryRequest {
+                source_url: allowed_url.clone(),
+            },
+        )
+        .await;
+    assert_eq!(removed.source_url, allowed_url);
+
+    let paused: EnqueueOperationResponse = harness
+        .post_empty(&format!("/v1/scenarios/{}/pause", created.scenario_id))
+        .await;
+    let paused_op = harness.wait_for_operation(&paused.operation_id).await;
+    assert_eq!(paused_op.status, OperationStatus::Succeeded);
+
+    let resumed: EnqueueOperationResponse = harness
+        .post_empty(&format!("/v1/scenarios/{}/resume", created.scenario_id))
+        .await;
+    let resumed_op = harness.wait_for_operation(&resumed.operation_id).await;
+    assert_eq!(resumed_op.status, OperationStatus::Succeeded);
+
+    let (status, body) = harness
+        .post_json_raw("/v1/scenarios", &create_request(removed.source_url.clone()))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unexpected body: {body}");
+    assert!(
+        body.contains("scenario_source_allowlist"),
+        "unexpected body: {body}"
+    );
+    assert!(
+        body.contains(&removed.source_url),
+        "unexpected body: {body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

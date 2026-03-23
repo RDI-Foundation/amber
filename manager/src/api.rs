@@ -10,7 +10,10 @@ use axum::{
 use serde_json::{Value, json};
 
 use crate::{
-    domain::{CreateScenarioRequest, DeleteScenarioQuery, ErrorResponse, UpgradeScenarioRequest},
+    domain::{
+        CreateScenarioRequest, DeleteScenarioQuery, ErrorResponse,
+        ScenarioSourceAllowlistEntryRequest, UpgradeScenarioRequest,
+    },
     service::{BindableServiceFilter, ManagerError, ManagerService, ScenarioFilter},
 };
 
@@ -18,6 +21,10 @@ pub fn router(service: Arc<ManagerService>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route(
+            "/v1/manager/scenario-source-allowlist/remove",
+            post(remove_scenario_source_allowlist_entry),
+        )
         .route("/v1/bindable-services", get(list_bindable_services))
         .route("/v1/bindable-configs", get(list_bindable_configs))
         .route("/v1/bindable-configs/{id}", get(get_bindable_config))
@@ -56,6 +63,15 @@ async fn list_bindable_services(
         service
             .list_bindable_services(BindableServiceFilter::default())
             .await?,
+    ))
+}
+
+async fn remove_scenario_source_allowlist_entry(
+    State(service): State<Arc<ManagerService>>,
+    Json(request): Json<ScenarioSourceAllowlistEntryRequest>,
+) -> Result<Json<crate::domain::ScenarioSourceAllowlistEntryResponse>, ApiError> {
+    Ok(Json(
+        service.remove_scenario_source_allowlist_entry(request)?,
     ))
 }
 

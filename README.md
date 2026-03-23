@@ -197,6 +197,11 @@ present, any manager request that fetches a scenario from a `source_url` must us
 listed URLs. Today that includes create requests, upgrades, and `source_url`-based config schema
 lookups. An empty allowlist rejects all such requests.
 
+At runtime, the manager API can remove individual entries from `scenario_source_allowlist` after
+bootstrap. That update is in-memory only: it affects subsequent create, upgrade, and
+`source_url`-based schema lookups immediately, but it does not rewrite the manager config file, so
+the original configured allowlist is restored on manager restart unless you also update `--config`.
+
 Bindable configs are enumerated through the manager API as opaque ids such as
 `cfg_openai_prod_api_key`; the raw values are not returned by the API. Create and upgrade
 requests can then map root-config paths to those ids with `external_root_config`, for example:

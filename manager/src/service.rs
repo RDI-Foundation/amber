@@ -19,7 +19,8 @@ use crate::{
         ExportPublishRequest, ExportRequest, ExportResponse, ExternalSlotBindingRequest,
         ExternalSlotBindingResponse, ObservedState, OperationKind, OperationPayload,
         OperationStatus, OperationStatusResponse, ScenarioDetailResponse,
-        ScenarioRevisionSummaryResponse, ScenarioSummaryResponse, ServiceProtocol,
+        ScenarioRevisionSummaryResponse, ScenarioSourceAllowlistEntryRequest,
+        ScenarioSourceAllowlistEntryResponse, ScenarioSummaryResponse, ServiceProtocol,
         UpgradeScenarioRequest,
     },
     ids,
@@ -139,6 +140,27 @@ impl ManagerService {
 
     pub fn health(&self) -> bool {
         true
+    }
+
+    pub fn remove_scenario_source_allowlist_entry(
+        &self,
+        request: ScenarioSourceAllowlistEntryRequest,
+    ) -> Result<ScenarioSourceAllowlistEntryResponse, ManagerError> {
+        self.state
+            .scenario_sources()
+            .remove(&request.source_url)
+            .map(|source_url| ScenarioSourceAllowlistEntryResponse { source_url })
+            .map_err(|err| match err {
+                crate::compiler::ScenarioSourceAllowlistUpdateError::InvalidSourceUrl(err) => {
+                    ManagerError::bad_request(err)
+                }
+                crate::compiler::ScenarioSourceAllowlistUpdateError::AllowlistDisabled => {
+                    ManagerError::bad_request(err)
+                }
+                crate::compiler::ScenarioSourceAllowlistUpdateError::SourceNotPresent(_) => {
+                    ManagerError::not_found(err.to_string())
+                }
+            })
     }
 
     pub async fn ready(&self) -> bool {
