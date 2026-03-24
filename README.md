@@ -34,7 +34,7 @@ binary, run `amber docs readme`. To list embedded examples or dump one example's
 
 ## Getting started
 
-Amber is distributed as a prebuilt CLI binary or as a Docker image.
+Amber is distributed as a prebuilt CLI binary, as an npm package, or as a Docker image.
 
 ### Option A: Download the prebuilt CLI
 
@@ -53,7 +53,20 @@ tar -xzf amber-cli-linux-amd64.tar.gz
 
 If you want `amber` on your PATH, move it into a directory that’s already on PATH.
 
-### Option B: Use the Dockerized CLI
+### Option B: Install from npm
+
+```sh
+npm install -g @rdif/amber@^0.3
+amber --help
+```
+
+The npm package installs the `amber` CLI plus the local runtime binaries that `amber run`
+needs for direct/native and VM execution. Host-side requirements are unchanged:
+
+- Linux still requires `bwrap` and `slirp4netns`
+- macOS still requires `/usr/bin/sandbox-exec`
+
+### Option C: Use the Dockerized CLI
 
 ```sh
 docker run --rm -v "$PWD":/work -w /work ghcr.io/rdi-foundation/amber-cli:v0.3 --help
@@ -220,9 +233,13 @@ requests can then map root-config paths to those ids with `external_root_config`
 The manager resolves `external_root_config` into the effective root config before compilation, so
 the caller never needs the underlying secret value.
 
-If you're working in this repo, the published image list and tags live in
-`docker/images.json`; CI publishes and verifies those tags on `main`.
-Image publishing is fully manifest-driven. Git tags are not used to publish images.
+If you're working in this repo, Docker publishing is driven by `docker/images.json`.
+npm publishing is configured in `npm/config.mjs`, and `node npm/release.mjs spec`
+emits the expanded spec that CI consumes.
+
+Binary npm packages inherit the resolved version of their corresponding Docker image.
+Bundle npm packages keep their own wildcard series and only advance when the packed npm
+contents change. Git tags are not used to publish either Docker images or npm packages.
 
 Tag behavior is defined per image in `docker/images.json`:
 

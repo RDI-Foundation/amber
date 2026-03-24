@@ -380,6 +380,139 @@ jobs:
       - name: Run helper docker smoke test
         run: cargo test -p amber-helper --all-features helper_image_executes_run_plan_in_scratch -- --ignored --test-threads=1
 
+  npm-binary-matrix:
+    name: npm Binary Matrix
+    runs-on: ubuntu-latest
+    if: ${{ secrets.NPM_TOKEN != '' }}
+    outputs:
+      build_matrix: ${{ steps.matrix.outputs.build_matrix }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: npm/package-lock.json
+      - name: Install npm release tooling
+        working-directory: npm
+        run: npm ci
+      - name: Build npm binary matrix
+        id: matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp
+          node npm/release.mjs spec > .tmp/npm-release-spec.json
+          matrix="$(node npm/release.mjs matrix --spec .tmp/npm-release-spec.json)"
+          echo "build_matrix=${matrix}" >> "$GITHUB_OUTPUT"
+
+  npm-binary-artifacts:
+    name: Build npm binary artifacts (${{ matrix.package_dir }} ${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    if: ${{ secrets.NPM_TOKEN != '' }}
+    needs: [merge-manifests, npm-binary-matrix]
+    permissions:
+      contents: read
+      packages: read
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.npm-binary-matrix.outputs.build_matrix) }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: npm/package-lock.json
+      - name: Install npm release tooling
+        working-directory: npm
+        run: npm ci
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.source == 'cargo'
+        with:
+          toolchain: nightly-2025-10-30
+      - uses: mozilla-actions/sccache-action@v0.0.9
+        if: matrix.source == 'cargo'
+      - name: Add Rust target
+        if: matrix.source == 'cargo'
+        run: rustup target add ${{ matrix.target }}
+      - uses: docker/login-action@v3
+        if: matrix.source == 'docker'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build npm binary artifact
+        env:
+          AMBER_BUILD_VERSION: ${{ needs.merge-manifests.outputs.amber_cli_version }}
+        run: |
+          node npm/release.mjs artifact \
+            --package-dir "${{ matrix.package_dir }}" \
+            --platform "${{ matrix.platform }}" \
+            --source "${{ matrix.source }}" \
+            --binary-name "${{ matrix.binary_name }}" \
+            --docker-image "${{ matrix.docker_image }}" \
+            --binary-path "${{ matrix.binary_path }}" \
+            --cargo-package "${{ matrix.cargo_package }}" \
+            --target "${{ matrix.target }}" \
+            --sha "${{ github.sha }}" \
+            --out-dir npm-binaries
+      - name: Upload npm binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-binary-${{ matrix.package_dir }}-${{ matrix.platform }}
+          path: npm-binaries
+          if-no-files-found: error
+
+  npm-packages:
+    name: Publish npm packages
+    runs-on: ubuntu-latest
+    if: ${{ secrets.NPM_TOKEN != '' }}
+    needs: [merge-manifests, npm-binary-artifacts]
+    permissions:
+      contents: read
+      packages: read
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: npm/package-lock.json
+      - name: Install npm release tooling
+        working-directory: npm
+        run: npm ci
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly-2025-10-30
+      - name: Download npm binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: npm-binary-*
+          path: .tmp/npm-binary-artifacts
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish npm release
+        run: |
+          mkdir -p .tmp
+          node npm/release.mjs spec > .tmp/npm-release-spec.json
+          node npm/release.mjs publish-release \
+            --spec .tmp/npm-release-spec.json \
+            --artifact-root .tmp/npm-binary-artifacts/npm-binaries \
+            --out-dir .tmp/npm-packages \
+            --sha "${{ github.sha }}"
+
   cli-artifacts:
     name: Build amber-cli artifacts (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
