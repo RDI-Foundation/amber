@@ -373,6 +373,23 @@ mod linux_direct_smoke {
             .expect("failed to start amber proxy")
     }
 
+    fn run_amber_to_completion(
+        direct_out: &Path,
+        runtime_bin_dir: &Path,
+        extra_env: &[(&str, &str)],
+    ) -> std::process::Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_amber"));
+        cmd.arg("run")
+            .arg(direct_out)
+            .env("AMBER_RUNTIME_BIN_DIR", runtime_bin_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+        cmd.output().expect("failed to run amber run")
+    }
+
     fn drain_pipes(child: &mut std::process::Child) -> (String, String) {
         let mut stdout = String::new();
         if let Some(mut pipe) = child.stdout.take() {
@@ -985,5 +1002,224 @@ exec python3 -m http.server 8080 --bind 127.0.0.1 -d /tmp/www
         assert_http_reachable_or_dump(&mut child, &mut proxy, export_port, "host-fs direct server");
 
         shutdown_direct_runtime(&mut child, &mut proxy);
+    }
+
+    #[test]
+    #[ignore = "requires local runtime binaries and spawns direct processes"]
+    fn direct_smoke_preserves_legacy_source_tree_reads_when_reads_is_omitted() {
+        let workspace_root = workspace_root();
+
+        let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+        fs::create_dir_all(&outputs_root).expect("failed to create outputs root");
+        let temp = tempfile::Builder::new()
+            .prefix("direct-source-tree-fs-smoke-")
+            .tempdir_in(&outputs_root)
+            .expect("failed to create temp test dir");
+        let sibling_secret = temp.path().join("secret.txt");
+        fs::write(&sibling_secret, "top-secret").expect("failed to write sibling secret");
+
+        let port = pick_free_port();
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("failed to create bin directory");
+        let script = bin_dir.join("serve-source-tree.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nset -eu\ncat '{}' >/dev/null\nexec python3 -m http.server {port} \
+                 --bind 127.0.0.1\n",
+                sibling_secret.display()
+            ),
+        )
+        .expect("failed to write script");
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).expect("chmod script");
+
+        let manifest_path = temp.path().join("scenario.json5");
+        fs::write(
+            &manifest_path,
+            format!(
+                r#"{{
+  manifest_version: "0.1.0",
+  program: {{
+    path: "./bin/serve-source-tree.sh",
+    network: {{
+      endpoints: [
+        {{ name: "http", port: {port}, protocol: "http" }},
+      ],
+    }},
+  }},
+  provides: {{
+    http: {{ kind: "http", endpoint: "http" }},
+  }},
+  exports: {{
+    http: "http",
+  }},
+}}
+"#
+            ),
+        )
+        .expect("failed to write manifest");
+
+        let direct_out = temp.path().join("out");
+        compile_direct_or_panic(&direct_out, &manifest_path);
+
+        let runtime_bin_dir = ensure_runtime_binaries_built(&workspace_root);
+        let mut child = spawn_amber_run(&direct_out, runtime_bin_dir.as_path(), &[]);
+        let export_port = pick_free_port();
+        let mut proxy = spawn_amber_proxy(&direct_out, "http", export_port);
+        assert_http_reachable_or_dump(
+            &mut child,
+            &mut proxy,
+            export_port,
+            "legacy source-tree direct server",
+        );
+
+        shutdown_direct_runtime(&mut child, &mut proxy);
+    }
+
+    #[test]
+    #[ignore = "requires local runtime binaries and spawns direct processes"]
+    fn direct_smoke_reads_empty_blocks_ambient_source_tree_reads() {
+        let workspace_root = workspace_root();
+
+        let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+        fs::create_dir_all(&outputs_root).expect("failed to create outputs root");
+        let temp = tempfile::Builder::new()
+            .prefix("direct-source-tree-reads-empty-smoke-")
+            .tempdir_in(&outputs_root)
+            .expect("failed to create temp test dir");
+        let sibling_secret = temp.path().join("secret.txt");
+        fs::write(&sibling_secret, "top-secret").expect("failed to write sibling secret");
+
+        let port = pick_free_port();
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("failed to create bin directory");
+        let script = bin_dir.join("check-source-tree.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nset -eu\nif cat '{}' >/dev/null 2>&1; then\n  echo \"ambient \
+                 source-tree file was readable inside sandbox\" >&2\n  exit 42\nfi\nexec python3 \
+                 -m http.server {port} --bind 127.0.0.1\n",
+                sibling_secret.display()
+            ),
+        )
+        .expect("failed to write script");
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).expect("chmod script");
+
+        let manifest_path = temp.path().join("scenario.json5");
+        fs::write(
+            &manifest_path,
+            format!(
+                r#"{{
+  manifest_version: "0.1.0",
+  program: {{
+    path: "./bin/check-source-tree.sh",
+    reads: [],
+    network: {{
+      endpoints: [
+        {{ name: "http", port: {port}, protocol: "http" }},
+      ],
+    }},
+  }},
+  provides: {{
+    http: {{ kind: "http", endpoint: "http" }},
+  }},
+  exports: {{
+    http: "http",
+  }},
+}}
+"#
+            ),
+        )
+        .expect("failed to write manifest");
+
+        let direct_out = temp.path().join("out");
+        compile_direct_or_panic(&direct_out, &manifest_path);
+
+        let runtime_bin_dir = ensure_runtime_binaries_built(&workspace_root);
+        let mut child = spawn_amber_run(&direct_out, runtime_bin_dir.as_path(), &[]);
+        let export_port = pick_free_port();
+        let mut proxy = spawn_amber_proxy(&direct_out, "http", export_port);
+        assert_http_reachable_or_dump(
+            &mut child,
+            &mut proxy,
+            export_port,
+            "reads-empty direct server",
+        );
+
+        shutdown_direct_runtime(&mut child, &mut proxy);
+    }
+
+    #[test]
+    #[ignore = "requires local runtime binaries and spawns direct processes"]
+    fn direct_smoke_seccomp_blocks_ptrace() {
+        let workspace_root = workspace_root();
+
+        let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+        fs::create_dir_all(&outputs_root).expect("failed to create outputs root");
+        let temp = tempfile::Builder::new()
+            .prefix("direct-seccomp-smoke-")
+            .tempdir_in(&outputs_root)
+            .expect("failed to create temp test dir");
+        let python = serde_json::to_string(
+            r#"import ctypes, errno, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+PTRACE_TRACEME = 0
+rc = libc.ptrace(PTRACE_TRACEME, 0, 0, 0)
+if rc == -1:
+    err = ctypes.get_errno()
+    if err == errno.EPERM:
+        print("ptrace blocked")
+        sys.exit(0)
+    raise OSError(err, os.strerror(err))
+print("ptrace unexpectedly succeeded")
+sys.exit(1)
+"#,
+        )
+        .expect("python should encode");
+        let manifest_path = temp.path().join("scenario.json5");
+        fs::write(
+            &manifest_path,
+            format!(
+                r#"{{
+  manifest_version: "0.1.0",
+  program: {{
+    path: "/usr/bin/env",
+    args: ["python3", "-c", {python}],
+  }},
+}}
+"#
+            ),
+        )
+        .expect("failed to write manifest");
+
+        let direct_out = temp.path().join("out");
+        compile_direct_or_panic(&direct_out, &manifest_path);
+
+        let runtime_bin_dir = ensure_runtime_binaries_built(&workspace_root);
+        let run = run_amber_to_completion(&direct_out, runtime_bin_dir.as_path(), &[]);
+        assert!(
+            run.status.success(),
+            "amber run failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            run.status,
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            stdout.contains("ptrace blocked"),
+            "expected seccomp denial marker in stdout, got:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
     }
 }

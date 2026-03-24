@@ -9,6 +9,7 @@ base64 = { workspace = true }
 jsonschema = { workspace = true }
 amber-template = { workspace = true }
 libc = "0.2.177"
+linux-raw-sys = { version = "0.12.1", features = ["landlock", "ptrace"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 signal-hook = "0.3.18"

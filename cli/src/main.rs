@@ -36,6 +36,8 @@ use amber_compiler::{
     },
 };
 use amber_config::{self as config, CONFIG_ENV_PREFIX};
+#[cfg(target_os = "linux")]
+use amber_helper::{DIRECT_HARDENING_ENV, DirectHardeningPlan};
 use amber_manifest::ManifestRef;
 use amber_mesh::{
     InboundTarget, MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MESH_PROVISION_PLAN_VERSION,
@@ -207,7 +209,7 @@ Examples:
   amber run /tmp/amber-direct --storage-root /srv/amber-state
 
 Runtime requirements:
-  Linux: `bwrap` and `slirp4netns`
+  Linux: `bwrap`, `slirp4netns`, and a Landlock-enabled kernel
   macOS: `/usr/bin/sandbox-exec` or QEMU/HVF";
 
 const PROXY_LONG_ABOUT: &str = "\
@@ -1759,16 +1761,53 @@ fn component_program_spec(
     runtime_addresses: &DirectRuntimeAddressPlan,
     runtime_state: &DirectRuntimeState,
 ) -> Result<ProcessSpec> {
-    let source_dir = component_source_dir(component)?;
     let work_dir = runtime_root.join(&component.program.work_dir);
     let mut writable_dirs = vec![work_dir.clone()];
-    let read_only_mounts = component_program_read_only_mounts(component, source_dir.as_deref())?;
+    let read_only_mounts = component_program_read_only_mounts(component)?;
     let bind_mounts = direct_storage_bind_mounts(storage_root, component)?;
     match &component.program.execution {
         DirectProgramExecutionPlan::Direct { entrypoint, env } => {
             let (program, args) = split_entrypoint(entrypoint)?;
             let program =
                 ensure_absolute_direct_program_path(&program, component.moniker.as_str())?;
+            #[cfg(target_os = "linux")]
+            {
+                let helper_binary = resolve_runtime_binary("amber-helper")?;
+                let mut helper_env = BTreeMap::new();
+                insert_helper_payload(
+                    &mut helper_env,
+                    "AMBER_RESOLVED_ENTRYPOINT_B64",
+                    entrypoint,
+                    "direct program entrypoint",
+                )?;
+                insert_helper_payload(
+                    &mut helper_env,
+                    "AMBER_RESOLVED_ENV_B64",
+                    env,
+                    "direct program environment",
+                )?;
+                append_linux_direct_hardening_env(
+                    &mut helper_env,
+                    &read_only_mounts,
+                    &writable_dirs,
+                    &[],
+                    &bind_mounts,
+                )?;
+                return Ok(ProcessSpec {
+                    name: component.program.log_name.clone(),
+                    program: helper_binary.to_string(),
+                    args: vec!["run".to_string()],
+                    env: helper_env,
+                    work_dir,
+                    drop_all_caps: false,
+                    read_only_mounts,
+                    writable_dirs,
+                    bind_dirs: Vec::new(),
+                    bind_mounts,
+                    hidden_paths: Vec::new(),
+                    network: ProcessNetwork::Host,
+                });
+            }
             Ok(ProcessSpec {
                 name: component.program.log_name.clone(),
                 program,
@@ -1819,6 +1858,14 @@ fn component_program_spec(
                     &env,
                 )?);
             }
+            #[cfg(target_os = "linux")]
+            append_linux_direct_hardening_env(
+                &mut env,
+                &read_only_mounts,
+                &writable_dirs,
+                &[],
+                &bind_mounts,
+            )?;
             Ok(ProcessSpec {
                 name: component.program.log_name.clone(),
                 program: helper_binary.to_string(),
@@ -1835,6 +1882,24 @@ fn component_program_spec(
             })
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn insert_helper_payload<T: Serialize>(
+    env_map: &mut BTreeMap<String, String>,
+    key: &str,
+    value: &T,
+    description: &str,
+) -> Result<()> {
+    env_map.insert(key.to_string(), encode_helper_payload(value, description)?);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn encode_helper_payload<T: Serialize>(value: &T, description: &str) -> Result<String> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|err| miette::miette!("failed to serialize {description}: {err}"))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 fn direct_storage_bind_mounts(
@@ -2006,52 +2071,33 @@ fn split_entrypoint(entrypoint: &[String]) -> Result<(String, Vec<String>)> {
     Ok((program.clone(), entrypoint[1..].to_vec()))
 }
 
-fn component_source_dir(component: &DirectComponentPlan) -> Result<Option<PathBuf>> {
-    let Some(raw) = component.source_dir.as_deref() else {
-        return Ok(None);
-    };
-    let path = PathBuf::from(raw);
-    if !path.is_absolute() {
-        return Err(miette::miette!(
-            "direct plan has non-absolute source directory {} for component {}",
-            path.display(),
-            component.moniker
-        ));
-    }
-    Ok(Some(path))
-}
-
 fn component_program_read_only_mounts(
     component: &DirectComponentPlan,
-    source_dir: Option<&Path>,
 ) -> Result<Vec<ReadOnlyMount>> {
     let mut mounts = BTreeMap::<PathBuf, ReadOnlyMount>::new();
-    if let Some(source_dir) = source_dir
-        && source_dir.is_absolute()
-    {
-        mounts.insert(
-            source_dir.to_path_buf(),
-            ReadOnlyMount {
-                source: source_dir.to_path_buf(),
-                dest: source_dir.to_path_buf(),
-            },
-        );
+    for path in &component.program.read_only_paths {
+        insert_same_path_read_only_mount(&mut mounts, PathBuf::from(path));
     }
 
-    let Some(program_path) = component_execution_program_path(component)? else {
-        return Ok(mounts.into_values().collect());
-    };
-    let program_path =
-        ensure_absolute_direct_program_path(&program_path, component.moniker.as_str())?;
-    let program_path = Path::new(&program_path);
-    if let Some(parent) = program_path.parent() {
-        mounts.entry(parent.to_path_buf()).or_insert(ReadOnlyMount {
-            source: parent.to_path_buf(),
-            dest: parent.to_path_buf(),
-        });
+    if let Some(program_path) = component_execution_program_path(component)? {
+        let program =
+            ensure_absolute_direct_program_path(&program_path, component.moniker.as_str())?;
+        if let Some(path) = program_support_path(program.as_str()) {
+            insert_same_path_read_only_mount(&mut mounts, path);
+        }
     }
 
     Ok(mounts.into_values().collect())
+}
+
+fn insert_same_path_read_only_mount(mounts: &mut BTreeMap<PathBuf, ReadOnlyMount>, path: PathBuf) {
+    if !path.is_absolute() {
+        return;
+    }
+    mounts.entry(path.clone()).or_insert(ReadOnlyMount {
+        source: path.clone(),
+        dest: path,
+    });
 }
 
 fn component_execution_program_path(component: &DirectComponentPlan) -> Result<Option<String>> {
@@ -2144,6 +2190,22 @@ fn render_template_string_literal(parts: &[TemplatePart]) -> Result<String> {
         ));
     }
     Ok(out)
+}
+
+#[cfg(target_os = "linux")]
+fn append_linux_direct_hardening_env(
+    env_map: &mut BTreeMap<String, String>,
+    read_only_mounts: &[ReadOnlyMount],
+    writable_dirs: &[PathBuf],
+    bind_dirs: &[PathBuf],
+    bind_mounts: &[BindMount],
+) -> Result<()> {
+    let plan = linux_direct_hardening_plan(read_only_mounts, writable_dirs, bind_dirs, bind_mounts);
+    env_map.insert(
+        DIRECT_HARDENING_ENV.to_string(),
+        encode_helper_payload(&plan, "direct hardening plan")?,
+    );
+    Ok(())
 }
 
 fn ensure_absolute_direct_program_path(program: &str, component_moniker: &str) -> Result<String> {
@@ -3233,6 +3295,21 @@ const LINUX_DEFAULT_READ_ONLY_PATHS: &[&str] = &[
 const LINUX_DEFAULT_DEVICE_PATHS: &[&str] =
     &["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"];
 
+#[cfg(target_os = "macos")]
+const MACOS_DEFAULT_READ_ONLY_PATHS: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/System",
+    "/Library",
+    "/opt",
+    "/nix/store",
+    "/etc",
+    "/private/etc",
+    "/var/db/timezone",
+    "/dev",
+];
+
 fn configure_managed_command_env(
     command: &mut TokioCommand,
     work_dir: &Path,
@@ -3272,11 +3349,18 @@ fn linux_default_read_only_mounts() -> Vec<ReadOnlyMount> {
 
 #[cfg(target_os = "linux")]
 fn linux_program_support_mount(program: &str) -> Option<ReadOnlyMount> {
+    linux_same_path_read_only_mount(program_support_path(program)?.as_path())
+}
+
+fn program_support_path(program: &str) -> Option<PathBuf> {
     let program = Path::new(program);
     if !program.is_absolute() {
         return None;
     }
-    linux_same_path_read_only_mount(program.parent()?)
+    Some(match program.parent() {
+        Some(parent) if parent != Path::new("/") => parent.to_path_buf(),
+        _ => program.to_path_buf(),
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -3303,6 +3387,58 @@ fn linux_normalize_read_only_mount(mount: &ReadOnlyMount) -> Option<ReadOnlyMoun
             .unwrap_or_else(|| mount.source.clone()),
         dest: mount.dest.clone(),
     })
+}
+
+#[cfg(target_os = "linux")]
+fn linux_direct_hardening_plan(
+    read_only_mounts: &[ReadOnlyMount],
+    writable_dirs: &[PathBuf],
+    bind_dirs: &[PathBuf],
+    bind_mounts: &[BindMount],
+) -> DirectHardeningPlan {
+    let mut read_only_paths = BTreeSet::new();
+    for mount in linux_default_read_only_mounts() {
+        read_only_paths.insert(mount.dest);
+    }
+    read_only_paths.insert(PathBuf::from("/proc"));
+    read_only_paths.insert(PathBuf::from("/dev"));
+    for mount in read_only_mounts {
+        if let Some(mount) = linux_normalize_read_only_mount(mount) {
+            read_only_paths.insert(mount.dest);
+        }
+    }
+
+    let mut writable_paths = BTreeSet::from([
+        PathBuf::from("/tmp"),
+        PathBuf::from("/run"),
+        PathBuf::from("/dev/shm"),
+    ]);
+    for path in LINUX_DEFAULT_DEVICE_PATHS {
+        writable_paths.insert(PathBuf::from(path));
+    }
+    for dir in writable_dirs {
+        if dir.is_absolute() {
+            writable_paths.insert(normalize_linux_writable_dir(dir));
+        }
+    }
+    for dir in bind_dirs {
+        if dir.is_absolute() {
+            writable_paths.insert(normalize_linux_writable_dir(dir));
+        }
+    }
+    for mount in bind_mounts {
+        if mount.dest.is_absolute() {
+            writable_paths.insert(mount.dest.clone());
+        }
+    }
+
+    DirectHardeningPlan {
+        read_only_paths: read_only_paths
+            .into_iter()
+            .filter(|path| !writable_paths.contains(path))
+            .collect(),
+        writable_paths: writable_paths.into_iter().collect(),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -3381,16 +3517,8 @@ fn linux_mount_dest_dirs(path: &Path, include_self: bool) -> Vec<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn render_seatbelt_profile(spec: &ProcessSpec) -> String {
-    let mut allowed = BTreeSet::new();
-    insert_seatbelt_path_variants(&mut allowed, &spec.work_dir);
-    allowed.insert("/tmp".to_string());
-    allowed.insert("/private/tmp".to_string());
-    for dir in &spec.writable_dirs {
-        insert_seatbelt_path_variants(&mut allowed, dir);
-    }
-    for dir in &spec.bind_dirs {
-        insert_seatbelt_path_variants(&mut allowed, dir);
-    }
+    let readable = seatbelt_readable_paths(spec);
+    let writable = seatbelt_writable_paths(spec);
 
     let mut profile = String::new();
     profile.push_str("(version 1)\n");
@@ -3402,23 +3530,88 @@ fn render_seatbelt_profile(spec: &ProcessSpec) -> String {
         let mut variants = BTreeSet::new();
         insert_seatbelt_path_variants(&mut variants, path);
         for rendered in variants {
-            profile.push_str("(deny file-read* (subpath \"");
-            profile.push_str(&rendered.replace('\\', "\\\\").replace('\"', "\\\""));
-            profile.push_str("\"))\n");
-            profile.push_str("(deny file-write* (subpath \"");
-            profile.push_str(&rendered.replace('\\', "\\\\").replace('\"', "\\\""));
-            profile.push_str("\"))\n");
+            push_seatbelt_path_rule(&mut profile, "deny file-read*", rendered.as_str());
+            push_seatbelt_path_rule(&mut profile, "deny file-write*", rendered.as_str());
         }
     }
-    profile.push_str("(allow file-read*)\n");
-    profile.push_str("(allow file-write*");
-    for path in allowed {
-        profile.push_str(" (subpath \"");
-        profile.push_str(&path.replace('\\', "\\\\").replace('\"', "\\\""));
-        profile.push_str("\")");
+    push_seatbelt_allow_rule(&mut profile, "file-read*", &readable);
+    push_seatbelt_allow_rule(&mut profile, "file-write*", &writable);
+    profile
+}
+
+#[cfg(target_os = "macos")]
+fn seatbelt_readable_paths(spec: &ProcessSpec) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for path in MACOS_DEFAULT_READ_ONLY_PATHS {
+        insert_seatbelt_path_variants(&mut out, Path::new(path));
+    }
+    if let Some(path) = program_support_path(spec.program.as_str()) {
+        insert_seatbelt_path_variants(&mut out, &path);
+    }
+    for path in seatbelt_writable_pathbufs(spec) {
+        insert_seatbelt_path_variants(&mut out, &path);
+    }
+    for mount in &spec.read_only_mounts {
+        insert_seatbelt_path_variants(&mut out, &mount.dest);
+    }
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn seatbelt_writable_paths(spec: &ProcessSpec) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for path in seatbelt_writable_pathbufs(spec) {
+        insert_seatbelt_path_variants(&mut out, &path);
+    }
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn seatbelt_writable_pathbufs(spec: &ProcessSpec) -> BTreeSet<PathBuf> {
+    let mut out = BTreeSet::from([
+        spec.work_dir.clone(),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/private/tmp"),
+    ]);
+    for dir in &spec.writable_dirs {
+        out.insert(dir.clone());
+    }
+    for dir in &spec.bind_dirs {
+        out.insert(dir.clone());
+    }
+    for mount in &spec.bind_mounts {
+        out.insert(mount.dest.clone());
+    }
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn push_seatbelt_allow_rule(profile: &mut String, operation: &str, paths: &BTreeSet<String>) {
+    profile.push_str("(allow ");
+    profile.push_str(operation);
+    for path in paths {
+        push_seatbelt_path_filters(profile, path.as_str());
     }
     profile.push_str(")\n");
-    profile
+}
+
+#[cfg(target_os = "macos")]
+fn push_seatbelt_path_rule(profile: &mut String, operation: &str, path: &str) {
+    profile.push('(');
+    profile.push_str(operation);
+    push_seatbelt_path_filters(profile, path);
+    profile.push_str(")\n");
+}
+
+#[cfg(target_os = "macos")]
+fn push_seatbelt_path_filters(profile: &mut String, path: &str) {
+    let escaped = path.replace('\\', "\\\\").replace('\"', "\\\"");
+    profile.push_str(" (literal \"");
+    profile.push_str(&escaped);
+    profile.push_str("\")");
+    profile.push_str(" (subpath \"");
+    profile.push_str(&escaped);
+    profile.push_str("\")");
 }
 
 #[cfg(target_os = "macos")]
@@ -3455,8 +3648,8 @@ fn seatbelt_private_alias(path: &str) -> Option<String> {
 fn missing_direct_sandbox_help() -> &'static str {
     #[cfg(target_os = "linux")]
     {
-        "install bubblewrap (`bwrap`) and ensure it is available in PATH (direct mode also uses \
-         `slirp4netns`)"
+        "install bubblewrap (`bwrap`) and `slirp4netns`, ensure both are available in PATH, and \
+         run on a Landlock-enabled Linux kernel"
     }
     #[cfg(target_os = "macos")]
     {
@@ -4289,7 +4482,7 @@ mod tests {
     }
 
     #[test]
-    fn component_program_read_only_mounts_resolve_parent_escape_paths() {
+    fn component_program_read_only_mounts_include_explicit_paths_and_program_support() {
         let component = DirectComponentPlan {
             id: 3,
             moniker: "app".to_string(),
@@ -4305,6 +4498,10 @@ mod tests {
             program: amber_compiler::reporter::direct::DirectProgramPlan {
                 log_name: "app-program".to_string(),
                 work_dir: "work/components/app".to_string(),
+                read_only_paths: vec![
+                    "/workspace/scenarios/app".to_string(),
+                    "/workspace/shared-config".to_string(),
+                ],
                 storage_mounts: Vec::new(),
                 execution: DirectProgramExecutionPlan::Direct {
                     entrypoint: vec!["/workspace/scenarios/app/../bin/tool".to_string()],
@@ -4313,11 +4510,7 @@ mod tests {
             },
         };
 
-        let mounts = component_program_read_only_mounts(
-            &component,
-            Some(Path::new("/workspace/scenarios/app")),
-        )
-        .expect("mounts should resolve");
+        let mounts = component_program_read_only_mounts(&component).expect("mounts should resolve");
 
         assert!(
             mounts
@@ -4327,7 +4520,58 @@ mod tests {
         assert!(
             mounts
                 .iter()
+                .any(|mount| mount.source == Path::new("/workspace/shared-config"))
+        );
+        assert!(
+            mounts
+                .iter()
                 .any(|mount| mount.source == Path::new("/workspace/scenarios/app/../bin"))
+        );
+    }
+
+    #[test]
+    fn component_program_read_only_mounts_keep_helper_runner_entrypoint_support_path() {
+        let component = DirectComponentPlan {
+            id: 3,
+            moniker: "app".to_string(),
+            log_name: "app".to_string(),
+            source_dir: Some("/workspace/scenarios/app".to_string()),
+            depends_on: Vec::new(),
+            sidecar: amber_compiler::reporter::direct::DirectSidecarPlan {
+                log_name: "app-sidecar".to_string(),
+                mesh_port: 0,
+                mesh_config_path: "mesh/components/app/mesh-config.json".to_string(),
+                mesh_identity_path: "mesh/components/app/mesh-identity.json".to_string(),
+            },
+            program: amber_compiler::reporter::direct::DirectProgramPlan {
+                log_name: "app-program".to_string(),
+                work_dir: "work/components/app".to_string(),
+                read_only_paths: vec!["/workspace/shared-config".to_string()],
+                storage_mounts: Vec::new(),
+                execution: DirectProgramExecutionPlan::HelperRunner {
+                    entrypoint_b64: Some(encode_json_b64(&serde_json::json!([
+                        "/workspace/tools/app-runner",
+                        "--serve"
+                    ]))),
+                    env_b64: None,
+                    template_spec_b64: None,
+                    runtime_config: None,
+                    mount_spec_b64: None,
+                },
+            },
+        };
+
+        let mounts = component_program_read_only_mounts(&component).expect("mounts should resolve");
+
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount.source == Path::new("/workspace/shared-config"))
+        );
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount.source == Path::new("/workspace/tools"))
         );
     }
 
@@ -4546,6 +4790,7 @@ mod tests {
                 program: amber_compiler::reporter::direct::DirectProgramPlan {
                     log_name: "app-program".to_string(),
                     work_dir: "work/components/app".to_string(),
+                    read_only_paths: Vec::new(),
                     storage_mounts: Vec::new(),
                     execution: DirectProgramExecutionPlan::Direct {
                         entrypoint: vec!["/bin/echo".to_string()],
@@ -4865,6 +5110,56 @@ mod tests {
             hidden_paths: Vec::new(),
             network: ProcessNetwork::Host,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_test_process_spec() -> ProcessSpec {
+        ProcessSpec {
+            name: "component".to_string(),
+            program: "/tmp/amber/bin/server".to_string(),
+            args: vec!["ok".to_string()],
+            env: BTreeMap::new(),
+            work_dir: PathBuf::from("/tmp/amber/work"),
+            drop_all_caps: false,
+            read_only_mounts: vec![ReadOnlyMount {
+                source: PathBuf::from("/tmp/amber/shared"),
+                dest: PathBuf::from("/tmp/amber/shared"),
+            }],
+            writable_dirs: vec![PathBuf::from("/tmp/amber/work")],
+            bind_dirs: Vec::new(),
+            bind_mounts: Vec::new(),
+            hidden_paths: vec![PathBuf::from("/tmp/amber/mesh")],
+            network: ProcessNetwork::Host,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_profile_limits_reads_to_runtime_defaults_and_allowed_paths() {
+        let profile = render_seatbelt_profile(&macos_test_process_spec());
+
+        assert!(
+            !profile.contains("(allow file-read*)\n"),
+            "seatbelt profile should not allow global reads: {profile}"
+        );
+        assert!(
+            profile.contains("(subpath \"/tmp/amber/bin\")"),
+            "seatbelt profile should allow the program support path: {profile}"
+        );
+        assert!(
+            profile.contains("(subpath \"/tmp/amber/shared\")"),
+            "seatbelt profile should allow declared read-only paths: {profile}"
+        );
+        assert!(
+            profile.contains("(subpath \"/tmp/amber/work\")"),
+            "seatbelt profile should allow writable paths for reads and writes: {profile}"
+        );
+        assert!(
+            profile.contains(
+                "(deny file-read* (literal \"/tmp/amber/mesh\") (subpath \"/tmp/amber/mesh\"))"
+            ),
+            "seatbelt profile should deny hidden paths explicitly: {profile}"
+        );
     }
 
     #[cfg(target_os = "linux")]

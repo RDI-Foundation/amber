@@ -154,6 +154,8 @@ impl Serialize for Program {
             entrypoint: Option<&'a ProgramEntrypoint>,
             #[serde(skip_serializing_if = "Option::is_none")]
             args: Option<&'a ProgramEntrypoint>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            reads: Option<&'a Vec<String>>,
             #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
             env: &'a BTreeMap<String, ProgramEnvValue>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -169,6 +171,7 @@ impl Serialize for Program {
                 vm: None,
                 entrypoint: Some(&program.entrypoint),
                 args: None,
+                reads: None,
                 env: &program.common.env,
                 network: program.common.network.as_ref(),
                 mounts: &program.common.mounts,
@@ -179,6 +182,7 @@ impl Serialize for Program {
                 vm: None,
                 entrypoint: None,
                 args: Some(&program.args),
+                reads: program.reads.as_ref(),
                 env: &program.common.env,
                 network: program.common.network.as_ref(),
                 mounts: &program.common.mounts,
@@ -189,6 +193,7 @@ impl Serialize for Program {
                 vm: Some(program),
                 entrypoint: None,
                 args: None,
+                reads: None,
                 env: &EMPTY_PROGRAM_ENV,
                 network: None,
                 mounts: &[],
@@ -218,6 +223,8 @@ impl<'de> Deserialize<'de> for Program {
             #[serde(default)]
             args: Option<ProgramEntrypoint>,
             #[serde(default)]
+            reads: Option<Vec<String>>,
+            #[serde(default)]
             env: BTreeMap<String, ProgramEnvValue>,
             #[serde(default)]
             network: Option<ProgramNetwork>,
@@ -231,6 +238,11 @@ impl<'de> Deserialize<'de> for Program {
                 if fields.args.is_some() {
                     return Err(serde::de::Error::custom(
                         "program.args is only supported with program.path",
+                    ));
+                }
+                if fields.reads.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "program.reads is only supported with program.path",
                     ));
                 }
                 Ok(Self::Image(ProgramImage {
@@ -252,6 +264,7 @@ impl<'de> Deserialize<'de> for Program {
                 Ok(Self::Path(ProgramPath {
                     path: path.0,
                     args: fields.args.unwrap_or_default(),
+                    reads: fields.reads,
                     common: ProgramCommon {
                         env: fields.env,
                         network: fields.network,
@@ -268,6 +281,11 @@ impl<'de> Deserialize<'de> for Program {
                 if fields.args.is_some() {
                     return Err(serde::de::Error::custom(
                         "program.args is only supported with program.path",
+                    ));
+                }
+                if fields.reads.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "program.reads is only supported with program.path",
                     ));
                 }
                 if !fields.env.is_empty() {
@@ -328,6 +346,8 @@ pub struct ProgramPath {
     pub path: String,
     #[serde(default)]
     pub args: ProgramEntrypoint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reads: Option<Vec<String>>,
     #[serde(flatten)]
     pub common: ProgramCommon,
 }

@@ -136,11 +136,11 @@ amber run /tmp/amber-direct
 Direct output only supports components that use `program.path`.
 
 `amber run` for direct output requires a local sandbox backend:
-- Linux: `bwrap` and `slirp4netns`
+- Linux: `bwrap`, `slirp4netns`, and a Landlock-enabled kernel
 - macOS: `/usr/bin/sandbox-exec`
 
 Current enforcement notes:
-- Direct/native on Linux has the strongest capability mediation today: Amber runs each component behind a sidecar/router, isolates sidecar networking, joins the component into that namespace, shapes the filesystem with curated read-only mounts plus explicit writable storage, and drops all Linux capabilities for Amber-owned sidecars.
+- Direct/native on Linux has the strongest capability mediation today: Amber runs each component behind a sidecar/router, isolates sidecar networking, joins the component into that namespace, shapes the filesystem with curated read-only mounts plus explicit writable storage, launches component programs through `amber-helper`, applies fixed seccomp and Landlock hardening inside that shaped view, and drops all Linux capabilities for Amber-owned sidecars.
 - Docker Compose and Kubernetes now default generated containers to non-escalating privilege settings, run Amber-owned internal routers/provisioners non-root where their images already guarantee it, make those internal root filesystems read-only where possible, and reject external slot targets that resolve to loopback or link-local IPs.
 - Docker Compose and Kubernetes do not yet transparently redirect all arbitrary container egress through the router. Amber strongly mediates declared capability paths, but shared pod/service networking still means generic outbound traffic is not yet fully non-bypassable on those backends.
 
@@ -266,7 +266,11 @@ amber run /tmp/direct-out
 ```
 
 Direct output requires `program.path` with an explicit absolute path or a manifest-relative path
-like `./bin/server`; it does not search `PATH`.
+like `./bin/server`; it does not search `PATH`. By default, direct mode preserves the same ambient
+read-only access to the component's local source tree that it historically exposed. Add
+`program.reads` to replace that legacy source-tree read access with explicit manifest-relative or
+absolute read-only paths instead. Amber still keeps the executable support path and platform
+runtime defaults readable so the process can start.
 
 ### Compile + run VM
 

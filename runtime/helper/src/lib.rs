@@ -3,7 +3,7 @@ use std::{
     ffi::OsString,
     fs,
     io::ErrorKind,
-    path::Path,
+    path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
@@ -28,6 +28,7 @@ const RESOLVED_ENV_ENV: &str = "AMBER_RESOLVED_ENV_B64";
 const MOUNT_SPEC_ENV: &str = "AMBER_MOUNT_SPEC_B64";
 const DOCKER_MOUNT_PROXY_SPEC_ENV: &str = "AMBER_DOCKER_MOUNT_PROXY_SPEC_B64";
 const RUNTIME_TEMPLATE_CONTEXT_ENV: &str = "AMBER_RUNTIME_TEMPLATE_CONTEXT_B64";
+pub const DIRECT_HARDENING_ENV: &str = "AMBER_DIRECT_HARDENING_B64";
 
 #[derive(Debug, Deserialize, Serialize)]
 struct DockerMountProxySpec {
@@ -66,6 +67,12 @@ pub enum HelperError {
 }
 
 pub type Result<T> = std::result::Result<T, HelperError>;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DirectHardeningPlan {
+    pub read_only_paths: Vec<PathBuf>,
+    pub writable_paths: Vec<PathBuf>,
+}
 
 pub fn wait_for_mesh_config_scope(
     config_path: &Path,
@@ -139,6 +146,7 @@ pub struct RunPlan {
     pub entrypoint: Vec<String>,
     pub env: BTreeMap<OsString, OsString>,
     pub docker_mount_proxies: Vec<(String, String, u16)>,
+    pub direct_hardening: Option<DirectHardeningPlan>,
 }
 
 pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Result<RunPlan> {
@@ -153,6 +161,7 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
     let mut mount_spec_b64 = None;
     let mut docker_mount_proxy_spec_b64 = None;
     let mut runtime_template_context_b64 = None;
+    let mut direct_hardening_b64 = None;
 
     for (key, value) in env {
         let Some(key_str) = key.to_str() else {
@@ -214,6 +223,12 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
                 })?;
                 runtime_template_context_b64 = Some(value);
             }
+            DIRECT_HARDENING_ENV => {
+                let value = value.into_string().map_err(|_| {
+                    HelperError::Msg(format!("{DIRECT_HARDENING_ENV} must be valid UTF-8"))
+                })?;
+                direct_hardening_b64 = Some(value);
+            }
             _ if key_str.starts_with(CONFIG_ENV_PREFIX) => {
                 let value = value
                     .into_string()
@@ -241,6 +256,14 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
         decode_b64_json_t::<RuntimeTemplateContext>(RUNTIME_TEMPLATE_CONTEXT_ENV, raw)?
     } else {
         RuntimeTemplateContext::default()
+    };
+    let direct_hardening = if let Some(raw) = direct_hardening_b64.as_deref() {
+        Some(decode_b64_json_t::<DirectHardeningPlan>(
+            DIRECT_HARDENING_ENV,
+            raw,
+        )?)
+    } else {
+        None
     };
 
     let config_payload_present = root_schema_b64.is_some()
@@ -411,6 +434,7 @@ pub fn build_run_plan(env: impl IntoIterator<Item = (OsString, OsString)>) -> Re
             .into_iter()
             .map(|spec| (spec.path, spec.tcp_host, spec.tcp_port))
             .collect(),
+        direct_hardening,
     })
 }
 
@@ -1678,6 +1702,40 @@ mod tests {
                 23000
             )]
         );
+    }
+
+    #[test]
+    fn helper_decodes_direct_hardening_plan() {
+        use base64::engine::general_purpose::STANDARD;
+
+        let entrypoint = vec!["/bin/echo".to_string(), "ok".to_string()];
+        let env = BTreeMap::<String, String>::new();
+        let hardening = DirectHardeningPlan {
+            read_only_paths: vec![PathBuf::from("/usr"), PathBuf::from("/app/bin")],
+            writable_paths: vec![PathBuf::from("/tmp"), PathBuf::from("/app/state")],
+        };
+
+        let envs = BTreeMap::from([
+            (
+                RESOLVED_ENTRYPOINT_ENV.to_string(),
+                STANDARD.encode(serde_json::to_vec(&entrypoint).unwrap()),
+            ),
+            (
+                RESOLVED_ENV_ENV.to_string(),
+                STANDARD.encode(serde_json::to_vec(&env).unwrap()),
+            ),
+            (
+                DIRECT_HARDENING_ENV.to_string(),
+                STANDARD.encode(serde_json::to_vec(&hardening).unwrap()),
+            ),
+        ]);
+
+        let os_env = envs
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let plan = build_run_plan(os_env).expect("build run plan");
+
+        assert_eq!(plan.direct_hardening, Some(hardening));
     }
 
     #[cfg(unix)]
