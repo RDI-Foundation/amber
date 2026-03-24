@@ -1767,9 +1767,6 @@ fn component_program_spec(
     let bind_mounts = direct_storage_bind_mounts(storage_root, component)?;
     match &component.program.execution {
         DirectProgramExecutionPlan::Direct { entrypoint, env } => {
-            let (program, args) = split_entrypoint(entrypoint)?;
-            let program =
-                ensure_absolute_direct_program_path(&program, component.moniker.as_str())?;
             #[cfg(target_os = "linux")]
             {
                 let helper_binary = resolve_runtime_binary("amber-helper")?;
@@ -1808,20 +1805,26 @@ fn component_program_spec(
                     network: ProcessNetwork::Host,
                 });
             }
-            Ok(ProcessSpec {
-                name: component.program.log_name.clone(),
-                program,
-                args,
-                env: env.clone(),
-                work_dir,
-                drop_all_caps: false,
-                read_only_mounts,
-                writable_dirs,
-                bind_dirs: Vec::new(),
-                bind_mounts,
-                hidden_paths: Vec::new(),
-                network: ProcessNetwork::Host,
-            })
+            #[cfg(not(target_os = "linux"))]
+            {
+                let (program, args) = split_entrypoint(entrypoint)?;
+                let program =
+                    ensure_absolute_direct_program_path(&program, component.moniker.as_str())?;
+                Ok(ProcessSpec {
+                    name: component.program.log_name.clone(),
+                    program,
+                    args,
+                    env: env.clone(),
+                    work_dir,
+                    drop_all_caps: false,
+                    read_only_mounts,
+                    writable_dirs,
+                    bind_dirs: Vec::new(),
+                    bind_mounts,
+                    hidden_paths: Vec::new(),
+                    network: ProcessNetwork::Host,
+                })
+            }
         }
         DirectProgramExecutionPlan::HelperRunner {
             entrypoint_b64,
@@ -2064,6 +2067,7 @@ fn append_runtime_config_env(
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn split_entrypoint(entrypoint: &[String]) -> Result<(String, Vec<String>)> {
     let Some(program) = entrypoint.first() else {
         return Err(miette::miette!("program entrypoint must not be empty"));
