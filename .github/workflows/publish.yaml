@@ -509,7 +509,7 @@ jobs:
           node npm/release.mjs spec > .tmp/npm-release-spec.json
           node npm/release.mjs publish-release \
             --spec .tmp/npm-release-spec.json \
-            --artifact-root .tmp/npm-binary-artifacts/npm-binaries \
+            --artifact-root .tmp/npm-binary-artifacts \
             --out-dir .tmp/npm-packages \
             --sha "${{ github.sha }}"
 
