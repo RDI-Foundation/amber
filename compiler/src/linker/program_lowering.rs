@@ -139,6 +139,7 @@ pub(crate) fn lower_program_with_config_analysis(
                 program: Program::Path(ProgramPath {
                     path: program.path.clone(),
                     args: program.args.clone(),
+                    reads: program.reads.clone(),
                     common: common.common,
                 }),
                 mount_source_indices: common.mount_source_indices,

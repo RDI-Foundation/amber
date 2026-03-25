@@ -4879,6 +4879,163 @@ fn compile_direct_resolves_relative_program_path_into_direct_plan() {
             .and_then(Value::as_str),
         Some(expected_program_path.as_str())
     );
+    assert_eq!(
+        component
+            .get("program")
+            .and_then(|program| program.get("read_only_paths"))
+            .and_then(Value::as_array),
+        Some(&vec![Value::String(expected_source_dir)])
+    );
+}
+
+#[test]
+fn compile_direct_program_reads_overrides_legacy_source_tree_mounts() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("direct-program-reads-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let manifest = outputs_dir.path().join("scenario.json5");
+    fs::write(
+        &manifest,
+        r#"{
+  manifest_version: "0.1.0",
+  program: {
+    path: "./bin/server",
+    reads: ["./templates", "/srv/shared", "./templates"],
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"#,
+    )
+    .expect("failed to write manifest");
+
+    let artifact_dir = outputs_dir.path().join("direct");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&artifact_dir)
+        .arg(&manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    assert!(
+        output.status.success(),
+        "amber compile --direct failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let direct_plan = fs::read_to_string(artifact_dir.join("direct-plan.json"))
+        .expect("failed to read direct plan");
+    let direct_json: Value =
+        serde_json::from_str(&direct_plan).expect("direct plan should be valid JSON");
+    let component = direct_json["components"][0]
+        .as_object()
+        .expect("component should exist");
+    let expected_templates = manifest
+        .parent()
+        .expect("manifest should have a parent")
+        .join("./templates")
+        .display()
+        .to_string();
+
+    let expected_read_only_paths = vec![
+        Value::String(expected_templates),
+        Value::String("/srv/shared".to_string()),
+    ];
+    assert_eq!(
+        component
+            .get("program")
+            .and_then(|program| program.get("read_only_paths"))
+            .and_then(Value::as_array),
+        Some(&expected_read_only_paths)
+    );
+}
+
+#[test]
+fn compile_direct_program_reads_empty_disables_legacy_source_tree_mounts() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli crate should live under the workspace root");
+
+    let outputs_root = workspace_root.join("target").join("cli-test-outputs");
+    fs::create_dir_all(&outputs_root).expect("failed to create outputs directory");
+    let outputs_dir = tempfile::Builder::new()
+        .prefix("direct-program-reads-empty-")
+        .tempdir_in(&outputs_root)
+        .expect("failed to create outputs directory");
+
+    let manifest = outputs_dir.path().join("scenario.json5");
+    fs::write(
+        &manifest,
+        r#"{
+  manifest_version: "0.1.0",
+  program: {
+    path: "./bin/server",
+    reads: [],
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" }
+      ]
+    }
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" }
+  },
+  exports: {
+    http: "http"
+  }
+}
+"#,
+    )
+    .expect("failed to write manifest");
+
+    let artifact_dir = outputs_dir.path().join("direct");
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--direct")
+        .arg(&artifact_dir)
+        .arg(&manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --direct: {err}"));
+
+    assert!(
+        output.status.success(),
+        "amber compile --direct failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let direct_plan = fs::read_to_string(artifact_dir.join("direct-plan.json"))
+        .expect("failed to read direct plan");
+    let direct_json: Value =
+        serde_json::from_str(&direct_plan).expect("direct plan should be valid JSON");
+
+    assert_eq!(
+        direct_json["components"][0]["program"]["read_only_paths"]
+            .as_array()
+            .expect("read_only_paths should exist"),
+        &Vec::<Value>::new()
+    );
 }
 
 #[test]

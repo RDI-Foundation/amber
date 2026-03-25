@@ -295,6 +295,8 @@ impl<'de> Deserialize<'de> for Program {
             #[serde(default)]
             #[serde(deserialize_with = "double_option::deserialize")]
             args: Option<Option<ProgramEntrypoint>>,
+            #[serde(default)]
+            reads: Option<Vec<String>>,
             #[serde_as(as = "MapPreventDuplicates<_, _>")]
             #[serde(default)]
             env: BTreeMap<String, ProgramEnvValue>,
@@ -310,6 +312,11 @@ impl<'de> Deserialize<'de> for Program {
                 if fields.args.is_some() {
                     return Err(serde::de::Error::custom(
                         "program.args is only supported with program.path",
+                    ));
+                }
+                if fields.reads.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "program.reads is only supported with program.path",
                     ));
                 }
                 Ok(Self::Image(ProgramImage {
@@ -331,6 +338,7 @@ impl<'de> Deserialize<'de> for Program {
                 Ok(Self::Path(ProgramPath {
                     path: path.0,
                     args: fields.args.flatten().unwrap_or_default(),
+                    reads: fields.reads,
                     common: ProgramCommon {
                         env: fields.env,
                         network: fields.network,
@@ -347,6 +355,11 @@ impl<'de> Deserialize<'de> for Program {
                 if fields.args.is_some() {
                     return Err(serde::de::Error::custom(
                         "program.args is only supported with program.path",
+                    ));
+                }
+                if fields.reads.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "program.reads is only supported with program.path",
                     ));
                 }
                 if !fields.env.is_empty() {
@@ -895,6 +908,8 @@ impl<'de> Deserialize<'de> for RawProgram {
             #[serde(default)]
             #[serde(deserialize_with = "double_option::deserialize")]
             args: Option<Option<RawProgramEntrypoint>>,
+            #[serde(default)]
+            reads: Option<Vec<String>>,
             #[serde_as(as = "MapPreventDuplicates<_, _>")]
             #[serde(default)]
             env: BTreeMap<String, RawProgramEnvValue>,
@@ -910,6 +925,11 @@ impl<'de> Deserialize<'de> for RawProgram {
                 if fields.args.is_some() {
                     return Err(serde::de::Error::custom(
                         "program.args is only supported with program.path",
+                    ));
+                }
+                if fields.reads.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "program.reads is only supported with program.path",
                     ));
                 }
                 Ok(Self::Image(RawProgramImage {
@@ -931,6 +951,7 @@ impl<'de> Deserialize<'de> for RawProgram {
                 Ok(Self::Path(RawProgramPath {
                     path,
                     args: fields.args.flatten().unwrap_or_default(),
+                    reads: fields.reads,
                     common: RawProgramCommon {
                         env: fields.env,
                         network: fields.network,
@@ -947,6 +968,11 @@ impl<'de> Deserialize<'de> for RawProgram {
                 if fields.args.is_some() {
                     return Err(serde::de::Error::custom(
                         "program.args is only supported with program.path",
+                    ));
+                }
+                if fields.reads.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "program.reads is only supported with program.path",
                     ));
                 }
                 if !fields.env.is_empty() {
@@ -1058,6 +1084,8 @@ pub struct RawProgramPath {
     #[serde(default)]
     #[builder(default)]
     pub args: RawProgramEntrypoint,
+    #[serde(default)]
+    pub reads: Option<Vec<String>>,
     #[serde(flatten)]
     pub common: RawProgramCommon,
 }
@@ -1073,6 +1101,7 @@ impl RawProgramPath {
             args: self.args.resolve("/program/args", &mut |value, pointer| {
                 resolver.resolve_inline_string(value, pointer)
             })?,
+            reads: self.reads,
             common: self.common.resolve("/program", resolver)?,
         })
     }
@@ -1244,6 +1273,7 @@ impl From<ProgramPath> for RawProgramPath {
         Self {
             path: value.path.into(),
             args: value.args.into(),
+            reads: value.reads,
             common: value.common.into(),
         }
     }
@@ -1336,6 +1366,8 @@ pub struct ProgramPath {
     #[serde(default)]
     #[builder(default)]
     pub args: ProgramEntrypoint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reads: Option<Vec<String>>,
     #[serde(flatten)]
     pub common: ProgramCommon,
 }

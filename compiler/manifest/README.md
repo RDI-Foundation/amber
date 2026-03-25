@@ -262,6 +262,15 @@ program: {
     // },
     LOG_LEVEL: "debug",
   },
+
+  // reads: optional.
+  // Direct mode infers the same local source-tree reads it supported before when this field is
+  // omitted. If it is present, Amber replaces that legacy source-tree read access with these
+  // manifest-relative or absolute read-only paths instead. Amber still keeps the executable
+  // support path and platform runtime defaults readable so the process can start.
+  //
+  // reads: [".", "../shared-config"],
+
   network: {
     endpoints: [
       { name: "http", port: 8080, protocol: "http" },
@@ -322,6 +331,7 @@ Rules:
 * `program` must declare exactly one of `image`, `path`, or `vm`.
 * `program.entrypoint` is only valid with `program.image`.
 * `program.args` is only valid with `program.path`.
+* `program.reads` is only valid with `program.path`.
 * `program.env` is only valid with `program.image` or `program.path`. VM guest startup should be configured through `program.vm.cloud_init`.
 * `program.network` and `program.mounts` are only valid with `program.image` or `program.path`. VM programs use `program.vm.network` and `program.vm.mounts`.
 * `program.path` must be an explicit absolute path or a relative path containing a separator

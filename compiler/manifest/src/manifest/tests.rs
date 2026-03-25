@@ -453,6 +453,29 @@ fn program_path_args_string_sugar_splits() {
 }
 
 #[test]
+fn program_path_accepts_reads() {
+    let manifest: Manifest = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            path: "./bin/server",
+            reads: [".", "../shared-config"],
+          }
+        }
+        "#
+    .parse()
+    .unwrap();
+
+    let Program::Path(program) = manifest.program.as_ref().expect("program should exist") else {
+        panic!("expected native path program");
+    };
+    assert_eq!(
+        program.reads,
+        Some(vec![".".to_string(), "../shared-config".to_string()])
+    );
+}
+
+#[test]
 fn program_requires_exactly_one_source_field() {
     let both = r#"
         {
@@ -542,6 +565,49 @@ fn program_path_rejects_null_entrypoint_field() {
     assert!(
         err.to_string()
             .contains("program.entrypoint is only supported with program.image")
+    );
+}
+
+#[test]
+fn program_image_rejects_reads_field() {
+    let err = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "example:latest",
+            entrypoint: ["/bin/true"],
+            reads: ["."],
+          }
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("program.reads is only supported with program.path")
+    );
+}
+
+#[test]
+fn program_vm_rejects_reads_field() {
+    let err = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            vm: {
+              image: "ghcr.io/acme/base:latest",
+              cpus: 1,
+              memory_mib: 512,
+            },
+            reads: ["."],
+          }
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("program.reads is only supported with program.path")
     );
 }
 

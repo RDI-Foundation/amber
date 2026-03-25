@@ -9,6 +9,7 @@ path = "src/main.rs"
 [dependencies]
 amber-compiler = { workspace = true }
 amber-config = { workspace = true }
+amber-helper = { path = "../runtime/helper" }
 amber-manifest = { workspace = true }
 amber-mesh = { workspace = true }
 amber-proxy = { workspace = true }

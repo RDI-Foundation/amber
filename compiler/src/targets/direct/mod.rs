@@ -44,7 +44,7 @@ use crate::{
     },
 };
 
-pub const DIRECT_PLAN_VERSION: &str = "3";
+pub const DIRECT_PLAN_VERSION: &str = "4";
 pub const DIRECT_PLAN_FILENAME: &str = "direct-plan.json";
 pub const RUN_SCRIPT_FILENAME: &str = "run.sh";
 pub const MESH_PROVISION_PLAN_FILENAME: &str = "mesh-provision-plan.json";
@@ -128,6 +128,8 @@ pub struct DirectSidecarPlan {
 pub struct DirectProgramPlan {
     pub log_name: String,
     pub work_dir: String,
+    #[serde(default)]
+    pub read_only_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub storage_mounts: Vec<DirectStorageMount>,
     pub execution: DirectProgramExecutionPlan,
@@ -445,6 +447,8 @@ fn build_component_plans(
             source_dir.as_deref(),
             component.moniker.as_str(),
         )?;
+        let read_only_paths =
+            direct_program_read_only_paths(component.program.as_ref(), source_dir.as_deref())?;
 
         out.push(DirectComponentPlan {
             id: id.0,
@@ -463,6 +467,7 @@ fn build_component_plans(
             program: DirectProgramPlan {
                 log_name: format!("{}-program", names.base),
                 work_dir: names.work_dir.clone(),
+                read_only_paths,
                 storage_mounts: direct_storage_mounts(
                     storage_plan.mounts_by_component.get(id).map(Vec::as_slice),
                 ),
@@ -484,6 +489,51 @@ fn direct_storage_mounts(
         });
     }
     out
+}
+
+fn direct_program_read_only_paths(
+    program: Option<&amber_scenario::Program>,
+    source_dir: Option<&Path>,
+) -> Result<Vec<String>, MeshError> {
+    let Some(amber_scenario::Program::Path(program)) = program else {
+        return Ok(Vec::new());
+    };
+
+    let Some(reads) = program.reads.as_ref() else {
+        return Ok(source_dir
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect());
+    };
+
+    let mut paths = BTreeSet::new();
+    for read in reads {
+        paths.insert(resolve_direct_read_path(read, source_dir)?);
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn resolve_direct_read_path(path: &str, source_dir: Option<&Path>) -> Result<String, MeshError> {
+    let read_path = Path::new(path);
+    if read_path.is_absolute() {
+        return Ok(path.to_string());
+    }
+
+    let source_dir = source_dir.ok_or_else(|| {
+        MeshError::new(format!(
+            "direct program read path `{path}` is relative, but Amber can only resolve relative \
+             reads for components compiled from local file manifests"
+        ))
+    })?;
+    if !source_dir.is_absolute() {
+        return Err(MeshError::new(format!(
+            "component source directory {} is not absolute; cannot resolve direct read path \
+             `{path}`",
+            source_dir.display()
+        )));
+    }
+
+    Ok(source_dir.join(read_path).display().to_string())
 }
 
 fn direct_storage_state_subdir(identity: &StorageIdentity) -> String {
@@ -1026,8 +1076,10 @@ mod tests {
         sync::Arc,
     };
 
-    use amber_manifest::Manifest;
-    use amber_scenario::{BindingEdge, Component, Moniker, Scenario};
+    use amber_manifest::{Manifest, ProgramEntrypoint};
+    use amber_scenario::{
+        BindingEdge, Component, Moniker, Program, ProgramCommon, ProgramPath, Scenario,
+    };
 
     use super::*;
     use crate::{
@@ -1123,6 +1175,44 @@ mod tests {
         assert_eq!(
             spec.program.entrypoint[0],
             ProgramArgTemplate::Arg(vec![TemplatePart::lit("/workspace/app/./bin/server")])
+        );
+    }
+
+    #[test]
+    fn direct_program_read_only_paths_preserve_legacy_source_dir_when_reads_are_omitted() {
+        let paths = direct_program_read_only_paths(
+            Some(&Program::Path(ProgramPath {
+                path: "./bin/server".to_string(),
+                args: ProgramEntrypoint::default(),
+                reads: None,
+                common: ProgramCommon::default(),
+            })),
+            Some(Path::new("/workspace/app")),
+        )
+        .expect("legacy read-only paths should resolve");
+
+        assert_eq!(paths, vec!["/workspace/app".to_string()]);
+    }
+
+    #[test]
+    fn direct_program_read_only_paths_use_explicit_reads_exactly() {
+        let paths = direct_program_read_only_paths(
+            Some(&Program::Path(ProgramPath {
+                path: "./bin/server".to_string(),
+                args: ProgramEntrypoint::default(),
+                reads: Some(vec!["./templates".to_string(), "/srv/shared".to_string()]),
+                common: ProgramCommon::default(),
+            })),
+            Some(Path::new("/workspace/app")),
+        )
+        .expect("explicit read-only paths should resolve");
+
+        assert_eq!(
+            paths,
+            vec![
+                "/srv/shared".to_string(),
+                "/workspace/app/./templates".to_string(),
+            ]
         );
     }
 

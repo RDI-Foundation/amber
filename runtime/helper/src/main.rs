@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use std::mem::offset_of;
 use std::{
     env, fs,
     io::{BufRead as _, BufReader, Read},
@@ -13,13 +15,36 @@ use std::{
     os::unix::net::{UnixListener, UnixStream},
     os::unix::process::{CommandExt, ExitStatusExt},
 };
+#[cfg(target_os = "linux")]
+use std::{
+    os::fd::{AsRawFd as _, FromRawFd as _},
+    os::unix::fs::OpenOptionsExt as _,
+};
 
-use amber_helper::{HelperError, RunPlan, build_run_plan, wait_for_mesh_config_scope};
+use amber_helper::{
+    DirectHardeningPlan, HelperError, RunPlan, build_run_plan, wait_for_mesh_config_scope,
+};
 use amber_mesh::telemetry::{
     COMPONENT_MONIKER_ENV, OtlpIdentity, OtlpInstallMode, SCENARIO_SCOPE_ENV, SubscriberFormat,
     SubscriberOptions, init_otel_tracer, init_subscriber, observability_log_scope_name,
     shutdown_tracer_provider, structured_logs_enabled,
 };
+#[cfg(target_os = "linux")]
+use linux_raw_sys::landlock::{
+    LANDLOCK_ACCESS_FS_EXECUTE, LANDLOCK_ACCESS_FS_IOCTL_DEV, LANDLOCK_ACCESS_FS_MAKE_BLOCK,
+    LANDLOCK_ACCESS_FS_MAKE_CHAR, LANDLOCK_ACCESS_FS_MAKE_DIR, LANDLOCK_ACCESS_FS_MAKE_FIFO,
+    LANDLOCK_ACCESS_FS_MAKE_REG, LANDLOCK_ACCESS_FS_MAKE_SOCK, LANDLOCK_ACCESS_FS_MAKE_SYM,
+    LANDLOCK_ACCESS_FS_READ_DIR, LANDLOCK_ACCESS_FS_READ_FILE, LANDLOCK_ACCESS_FS_REFER,
+    LANDLOCK_ACCESS_FS_REMOVE_DIR, LANDLOCK_ACCESS_FS_REMOVE_FILE, LANDLOCK_ACCESS_FS_TRUNCATE,
+    LANDLOCK_ACCESS_FS_WRITE_FILE, LANDLOCK_CREATE_RULESET_VERSION, landlock_path_beneath_attr,
+    landlock_rule_type, landlock_ruleset_attr,
+};
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+use linux_raw_sys::ptrace::AUDIT_ARCH_AARCH64;
+#[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+use linux_raw_sys::ptrace::AUDIT_ARCH_RISCV64;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use linux_raw_sys::ptrace::AUDIT_ARCH_X86_64;
 #[cfg(unix)]
 use signal_hook::{consts::signal, iterator::Signals};
 use tracing_subscriber::EnvFilter;
@@ -182,6 +207,7 @@ fn exec_plan(plan: RunPlan) -> Result<ExitCode, HelperError> {
         entrypoint,
         env,
         docker_mount_proxies,
+        direct_hardening,
     } = plan;
 
     if !docker_mount_proxies.is_empty() {
@@ -206,7 +232,11 @@ fn exec_plan(plan: RunPlan) -> Result<ExitCode, HelperError> {
 
     #[cfg(unix)]
     {
-        let status = run_child_with_signal_forwarding(&mut cmd, component_moniker.as_str())?;
+        let status = run_child_with_signal_forwarding(
+            &mut cmd,
+            component_moniker.as_str(),
+            direct_hardening.as_ref(),
+        )?;
         Ok(exit_code_from_status(status))
     }
 
@@ -215,6 +245,11 @@ fn exec_plan(plan: RunPlan) -> Result<ExitCode, HelperError> {
         if !docker_mount_proxies.is_empty() {
             return Err(HelperError::Msg(
                 "docker mount proxy injection is only supported on unix targets".to_string(),
+            ));
+        }
+        if direct_hardening.is_some() {
+            return Err(HelperError::Msg(
+                "direct hardening payloads are only supported on unix targets".to_string(),
             ));
         }
 
@@ -227,12 +262,20 @@ fn exec_plan(plan: RunPlan) -> Result<ExitCode, HelperError> {
 fn run_child_with_signal_forwarding(
     cmd: &mut Command,
     component_moniker: &str,
+    direct_hardening: Option<&DirectHardeningPlan>,
 ) -> Result<ExitStatus, HelperError> {
+    let direct_hardening = direct_hardening.cloned();
+    #[cfg(not(target_os = "linux"))]
+    let _ = &direct_hardening;
     // Isolate the workload in its own process group so we can relay stop signals to
     // the full workload tree without signaling amber-helper itself.
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             if libc::setpgid(0, 0) == 0 {
+                #[cfg(target_os = "linux")]
+                if let Some(plan) = direct_hardening.as_ref() {
+                    apply_linux_direct_hardening(plan)?;
+                }
                 Ok(())
             } else {
                 Err(io::Error::last_os_error())
@@ -373,6 +416,354 @@ fn exit_code_from_status(status: ExitStatus) -> ExitCode {
     }
 
     ExitCode::from(1)
+}
+
+#[cfg(target_os = "linux")]
+fn apply_linux_direct_hardening(plan: &DirectHardeningPlan) -> io::Result<()> {
+    enable_no_new_privs()?;
+    apply_landlock(plan)
+        .map_err(|err| io::Error::other(format!("failed to apply Landlock ruleset: {err}")))?;
+    apply_seccomp()
+        .map_err(|err| io::Error::other(format!("failed to install seccomp filter: {err}")))
+}
+
+#[cfg(target_os = "linux")]
+fn enable_no_new_privs() -> io::Result<()> {
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn apply_landlock(plan: &DirectHardeningPlan) -> io::Result<()> {
+    let abi_version = landlock_abi_version()?;
+    let handled_access_fs = landlock_handled_access_fs(abi_version);
+    let ruleset_attr = landlock_ruleset_attr {
+        handled_access_fs,
+        handled_access_net: 0,
+        scoped: 0,
+    };
+    let ruleset_fd = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            &ruleset_attr as *const landlock_ruleset_attr,
+            std::mem::size_of::<landlock_ruleset_attr>(),
+            0usize,
+        )
+    };
+    if ruleset_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let ruleset_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(ruleset_fd as i32) };
+
+    let read_only_access = u64::from(
+        LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR,
+    );
+    let writable_access = landlock_handled_access_fs(abi_version);
+
+    for path in &plan.read_only_paths {
+        add_landlock_rule(ruleset_fd.as_raw_fd(), path, read_only_access)?;
+    }
+    for path in &plan.writable_paths {
+        add_landlock_rule(ruleset_fd.as_raw_fd(), path, writable_access)?;
+    }
+
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_restrict_self,
+            ruleset_fd.as_raw_fd(),
+            0u32,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn landlock_abi_version() -> io::Result<u32> {
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<landlock_ruleset_attr>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    if rc >= 0 {
+        u32::try_from(rc).map_err(|_| io::Error::other("landlock ABI version is out of range"))
+    } else {
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP) | Some(libc::EINVAL) => {
+                Err(io::Error::other(
+                    "linux direct mode requires a Landlock-enabled kernel; the current kernel \
+                     does not support Amber's Landlock rulesets",
+                ))
+            }
+            _ => Err(err),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn landlock_handled_access_fs(abi_version: u32) -> u64 {
+    let mut access = u64::from(
+        LANDLOCK_ACCESS_FS_EXECUTE
+            | LANDLOCK_ACCESS_FS_WRITE_FILE
+            | LANDLOCK_ACCESS_FS_READ_FILE
+            | LANDLOCK_ACCESS_FS_READ_DIR
+            | LANDLOCK_ACCESS_FS_REMOVE_DIR
+            | LANDLOCK_ACCESS_FS_REMOVE_FILE
+            | LANDLOCK_ACCESS_FS_MAKE_CHAR
+            | LANDLOCK_ACCESS_FS_MAKE_DIR
+            | LANDLOCK_ACCESS_FS_MAKE_REG
+            | LANDLOCK_ACCESS_FS_MAKE_SOCK
+            | LANDLOCK_ACCESS_FS_MAKE_FIFO
+            | LANDLOCK_ACCESS_FS_MAKE_BLOCK
+            | LANDLOCK_ACCESS_FS_MAKE_SYM,
+    );
+    if abi_version >= 2 {
+        access |= u64::from(LANDLOCK_ACCESS_FS_REFER);
+    }
+    if abi_version >= 3 {
+        access |= u64::from(LANDLOCK_ACCESS_FS_TRUNCATE);
+    }
+    if abi_version >= 5 {
+        access |= u64::from(LANDLOCK_ACCESS_FS_IOCTL_DEV);
+    }
+    access
+}
+
+#[cfg(target_os = "linux")]
+fn add_landlock_rule(ruleset_fd: i32, path: &Path, allowed_access: u64) -> io::Result<()> {
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let rule = landlock_path_beneath_attr {
+        allowed_access,
+        parent_fd: file.as_raw_fd(),
+    };
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_add_rule,
+            ruleset_fd,
+            landlock_rule_type::LANDLOCK_RULE_PATH_BENEATH as u32,
+            &rule as *const landlock_path_beneath_attr,
+            0u32,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "x86_64"
+    )
+))]
+fn apply_seccomp() -> io::Result<()> {
+    let mut filter = seccomp_filter_program();
+    let mut program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_mut_ptr(),
+    };
+    let rc = unsafe {
+        libc::prctl(
+            libc::PR_SET_SECCOMP,
+            libc::SECCOMP_MODE_FILTER,
+            &mut program as *mut libc::sock_fprog,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    not(any(
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "x86_64"
+    ))
+))]
+fn apply_seccomp() -> io::Result<()> {
+    Err(io::Error::other(format!(
+        "linux direct mode seccomp hardening is not implemented for architecture {}",
+        std::env::consts::ARCH
+    )))
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "x86_64"
+    )
+))]
+fn seccomp_filter_program() -> Vec<libc::sock_filter> {
+    let deny = seccomp_errno(libc::EPERM as u16);
+    unsafe {
+        let mut filter = vec![
+            libc::BPF_STMT(
+                (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+                offset_of!(libc::seccomp_data, arch) as u32,
+            ),
+            libc::BPF_JUMP(
+                (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                native_audit_arch(),
+                1,
+                0,
+            ),
+            libc::BPF_STMT(
+                (libc::BPF_RET | libc::BPF_K) as u16,
+                libc::SECCOMP_RET_KILL_PROCESS,
+            ),
+            libc::BPF_STMT(
+                (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+                offset_of!(libc::seccomp_data, nr) as u32,
+            ),
+        ];
+
+        for syscall in denied_syscalls() {
+            filter.push(libc::BPF_JUMP(
+                (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                *syscall as u32,
+                0,
+                1,
+            ));
+            filter.push(libc::BPF_STMT((libc::BPF_RET | libc::BPF_K) as u16, deny));
+        }
+
+        // Amber components only communicate over Unix sockets, declared TCP/HTTP capability
+        // paths, and optional public-network egress over IP sockets. Other socket families are
+        // outside Amber's transport model and are denied in direct mode.
+        filter.extend_from_slice(&[
+            libc::BPF_JUMP(
+                (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                libc::SYS_socket as u32,
+                0,
+                5,
+            ),
+            libc::BPF_STMT(
+                (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+                offset_of!(libc::seccomp_data, args) as u32,
+            ),
+            libc::BPF_JUMP(
+                (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                libc::AF_UNIX as u32,
+                3,
+                0,
+            ),
+            libc::BPF_JUMP(
+                (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                libc::AF_INET as u32,
+                2,
+                0,
+            ),
+            libc::BPF_JUMP(
+                (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                libc::AF_INET6 as u32,
+                1,
+                0,
+            ),
+            libc::BPF_STMT((libc::BPF_RET | libc::BPF_K) as u16, deny),
+            libc::BPF_STMT(
+                (libc::BPF_RET | libc::BPF_K) as u16,
+                libc::SECCOMP_RET_ALLOW,
+            ),
+        ]);
+
+        filter
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "x86_64"
+    )
+))]
+fn seccomp_errno(errno: u16) -> u32 {
+    libc::SECCOMP_RET_ERRNO | u32::from(errno)
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "x86_64"
+    )
+))]
+fn denied_syscalls() -> &'static [libc::c_long] {
+    &[
+        libc::SYS_ptrace,
+        libc::SYS_process_vm_readv,
+        libc::SYS_process_vm_writev,
+        libc::SYS_kcmp,
+        libc::SYS_unshare,
+        libc::SYS_setns,
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_pivot_root,
+        libc::SYS_open_by_handle_at,
+        libc::SYS_bpf,
+        libc::SYS_perf_event_open,
+        libc::SYS_fanotify_init,
+        libc::SYS_open_tree,
+        libc::SYS_move_mount,
+        libc::SYS_fsopen,
+        libc::SYS_fsconfig,
+        libc::SYS_fsmount,
+        libc::SYS_fspick,
+        libc::SYS_mount_setattr,
+    ]
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "x86_64"
+    )
+))]
+fn native_audit_arch() -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        AUDIT_ARCH_AARCH64
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        AUDIT_ARCH_RISCV64
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        AUDIT_ARCH_X86_64
+    }
 }
 
 #[cfg(unix)]
