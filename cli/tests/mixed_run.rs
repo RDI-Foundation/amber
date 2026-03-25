@@ -396,8 +396,26 @@ fn spawn_proxy(
     spawn_proxy_with_exports(output_dir, &[(export, local_port)], extra_args)
 }
 
+fn spawn_proxy_target(
+    target: &str,
+    export: &str,
+    local_port: u16,
+    extra_args: &[String],
+) -> SpawnedProxy {
+    spawn_proxy_target_with_exports(target, &[(export, local_port)], extra_args)
+}
+
 fn spawn_proxy_with_exports(
     output_dir: &Path,
+    exports: &[(&str, u16)],
+    extra_args: &[String],
+) -> SpawnedProxy {
+    let target = output_dir.display().to_string();
+    spawn_proxy_target_with_exports(&target, exports, extra_args)
+}
+
+fn spawn_proxy_target_with_exports(
+    target: &str,
     exports: &[(&str, u16)],
     extra_args: &[String],
 ) -> SpawnedProxy {
@@ -415,7 +433,7 @@ fn spawn_proxy_with_exports(
         .try_clone()
         .expect("failed to clone amber proxy log handle");
     let mut cmd = amber_command();
-    cmd.arg("proxy").arg(output_dir);
+    cmd.arg("proxy").arg(target);
     for (export, local_port) in exports {
         cmd.arg("--export")
             .arg(format!("{export}=127.0.0.1:{local_port}"));
@@ -429,7 +447,7 @@ fn spawn_proxy_with_exports(
     SpawnedProxy {
         child,
         log_path,
-        output_dir: output_dir.to_path_buf(),
+        output_dir: PathBuf::from(target),
     }
 }
 
@@ -769,6 +787,30 @@ fn run_manifest_expect_failure_with_env(
         run_root: wait_for_single_run_root(storage_root, Duration::from_secs(60)),
         output,
     }
+}
+
+fn dry_run_manifest(
+    manifest: &Path,
+    placement: &Path,
+    storage_root: &Path,
+    bundle_root: &Path,
+    extra_args: &[&str],
+) -> std::process::Output {
+    amber_command()
+        .arg("run")
+        .arg("-Z")
+        .arg("unstable-options")
+        .arg(manifest)
+        .arg("--placement")
+        .arg(placement)
+        .arg("--storage-root")
+        .arg(storage_root)
+        .args(extra_args)
+        .arg("--dry-run")
+        .arg("--emit-launch-bundle")
+        .arg(bundle_root)
+        .output()
+        .expect("failed to run amber run --dry-run")
 }
 
 fn spawn_run_manifest_with_env(
@@ -2343,6 +2385,317 @@ fn mixed_run_recovers_when_kubernetes_site_is_temporarily_unreachable() {
     );
     stop_proxy(&mut proxy);
     run.stop();
+}
+
+#[test]
+fn mixed_run_dry_run_requires_unstable_options() {
+    let temp = temp_output_dir("mixed-run-dry-run-gate-");
+    let fixture = write_two_site_fixture(temp.path());
+    let storage_root = temp.path().join("state");
+    let bundle_root = temp.path().join("launch-bundle");
+
+    let output = amber_command()
+        .arg("run")
+        .arg(&fixture.manifest)
+        .arg("--placement")
+        .arg(&fixture.placement)
+        .arg("--storage-root")
+        .arg(&storage_root)
+        .arg("--dry-run")
+        .arg("--emit-launch-bundle")
+        .arg(&bundle_root)
+        .output()
+        .expect("failed to run amber run --dry-run");
+    assert!(
+        !output.status.success(),
+        "amber run --dry-run unexpectedly succeeded without -Z \
+         unstable-options\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unstable-options"),
+        "dry-run failure should explain the unstable gate\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn mixed_run_dry_run_emits_launch_bundle_without_starting_sites() {
+    let temp = temp_output_dir("mixed-run-dry-run-");
+    let fixture = write_two_site_fixture(temp.path());
+    let storage_root = temp.path().join("state");
+    let bundle_root = temp.path().join("launch-bundle");
+
+    let output = dry_run_manifest(
+        &fixture.manifest,
+        &fixture.placement,
+        &storage_root,
+        &bundle_root,
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "amber run --dry-run failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+        "amber run --dry-run should stay silent on stdout, got:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let launch_bundle = read_json(&bundle_root.join("launch-bundle.json"));
+    let run_plan = read_json(&bundle_root.join("run-plan.json"));
+    assert_eq!(
+        launch_bundle["bundle_root"].as_str(),
+        Some(bundle_root.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        launch_bundle["plan_path"].as_str(),
+        Some(bundle_root.join("run-plan.json").to_string_lossy().as_ref())
+    );
+    assert_eq!(launch_bundle["mesh_scope"], run_plan["mesh_scope"]);
+    assert_eq!(launch_bundle["assignments"], run_plan["assignments"]);
+    assert_eq!(launch_bundle["startup_waves"], run_plan["startup_waves"]);
+    assert!(
+        launch_bundle["run_id"]
+            .as_str()
+            .is_some_and(|run_id| !run_id.is_empty()),
+        "launch bundle should include a run id"
+    );
+
+    let direct_site = &launch_bundle["sites"]["direct_local"];
+    assert_eq!(direct_site["kind"], json!("direct"));
+    assert!(
+        Path::new(
+            direct_site["artifact_dir"]
+                .as_str()
+                .expect("launch bundle should record direct artifact dir")
+        )
+        .join("direct-plan.json")
+        .is_file(),
+        "dry-run should materialize direct artifacts"
+    );
+    assert!(
+        Path::new(
+            direct_site["supervisor_plan_path"]
+                .as_str()
+                .expect("launch bundle should record direct supervisor plan path")
+        )
+        .is_file(),
+        "dry-run should materialize direct supervisor plan"
+    );
+    assert!(
+        Path::new(
+            direct_site["desired_links_path"]
+                .as_str()
+                .expect("launch bundle should record direct desired-links path")
+        )
+        .is_file(),
+        "dry-run should materialize direct desired-links file"
+    );
+    assert!(
+        !direct_site["launch_commands"]
+            .as_array()
+            .expect("direct launch commands should serialize as an array")
+            .is_empty(),
+        "dry-run should record direct launch commands"
+    );
+    assert!(
+        !direct_site["processes"]
+            .as_array()
+            .expect("direct process previews should serialize as an array")
+            .is_empty(),
+        "dry-run should record direct process previews"
+    );
+    assert!(
+        Path::new(
+            direct_site["artifact_dir"]
+                .as_str()
+                .expect("launch bundle should record direct artifact dir")
+        )
+        .join(".amber")
+        .join("direct-runtime.json")
+        .is_file(),
+        "dry-run should materialize reusable direct runtime state"
+    );
+
+    let compose_site = &launch_bundle["sites"]["compose_local"];
+    assert_eq!(compose_site["kind"], json!("compose"));
+    assert!(
+        Path::new(
+            compose_site["artifact_dir"]
+                .as_str()
+                .expect("launch bundle should record compose artifact dir")
+        )
+        .join("compose.yaml")
+        .is_file(),
+        "dry-run should materialize compose artifacts"
+    );
+    assert!(
+        Path::new(
+            compose_site["supervisor_plan_path"]
+                .as_str()
+                .expect("launch bundle should record compose supervisor plan path")
+        )
+        .is_file(),
+        "dry-run should materialize compose supervisor plan"
+    );
+    assert!(
+        Path::new(
+            compose_site["desired_links_path"]
+                .as_str()
+                .expect("launch bundle should record compose desired-links path")
+        )
+        .is_file(),
+        "dry-run should materialize compose desired-links file"
+    );
+    assert!(
+        !compose_site["launch_commands"]
+            .as_array()
+            .expect("compose launch commands should serialize as an array")
+            .is_empty(),
+        "dry-run should record compose launch commands"
+    );
+    let stitching = launch_bundle["stitching"]
+        .as_array()
+        .expect("launch bundle stitching should serialize as an array");
+    assert_eq!(stitching.len(), 1);
+    assert_eq!(stitching[0]["provider_site"], json!("compose_local"));
+    assert_eq!(stitching[0]["consumer_site"], json!("direct_local"));
+    assert_eq!(
+        stitching[0]["resolution"],
+        json!("requires_runtime_discovery")
+    );
+    assert!(
+        stitching[0]["unresolved_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("Docker")),
+        "compose-backed stitching should explain why the exact external URL is not known"
+    );
+
+    let direct_desired_links = read_json(
+        &bundle_root
+            .join("state")
+            .join("direct_local")
+            .join("desired-links.json"),
+    );
+    let direct_desired_links = direct_desired_links
+        .as_object()
+        .expect("desired-links.json should contain an object");
+    assert!(
+        !direct_desired_links.contains_key("external_slots"),
+        "dry-run should not pre-register external slot URLs"
+    );
+    assert!(
+        !direct_desired_links.contains_key("export_peers"),
+        "dry-run should not pre-register export peers"
+    );
+
+    assert!(
+        !bundle_root.join("receipt.json").exists(),
+        "dry-run should not write a run receipt"
+    );
+    assert!(
+        !storage_root.join("runs").exists(),
+        "dry-run should not allocate a live run under the storage root"
+    );
+}
+
+#[test]
+fn mixed_run_dry_run_tolerates_unresolved_vm_preview_config() {
+    let temp = temp_output_dir("mixed-run-dry-run-vm-preview-");
+    let bundle_root = temp.path().join("launch-bundle");
+    let manifest = workspace_root().join("examples/mixed-site/scenario.json5");
+
+    let output = amber_command()
+        .arg("run")
+        .arg("-Z")
+        .arg("unstable-options")
+        .arg(&manifest)
+        .arg("--dry-run")
+        .arg("--emit-launch-bundle")
+        .arg(&bundle_root)
+        .output()
+        .expect("failed to run amber run --dry-run for mixed-site example");
+    assert!(
+        output.status.success(),
+        "amber run --dry-run should tolerate unresolved VM preview \
+         config\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let launch_bundle = read_json(&bundle_root.join("launch-bundle.json"));
+    let vm_site = launch_bundle["sites"]
+        .as_object()
+        .and_then(|sites| sites.values().find(|site| site["kind"] == json!("vm")))
+        .expect("launch bundle should contain a vm site");
+    assert!(
+        vm_site["virtual_machines"]
+            .as_array()
+            .is_some_and(|machines| !machines.is_empty()),
+        "vm site should still emit VM launch previews"
+    );
+    let first_vm = &vm_site["virtual_machines"][0];
+    assert!(
+        first_vm["command"]
+            .as_array()
+            .is_some_and(|command| !command.is_empty()),
+        "vm preview should keep the exact QEMU command when only the base image is unresolved"
+    );
+    assert!(
+        first_vm.get("base_image").is_none(),
+        "vm preview should omit unresolved base_image paths instead of inventing one"
+    );
+    assert!(
+        first_vm["unresolved_fields"]
+            .as_array()
+            .is_some_and(|issues| {
+                issues.iter().any(|issue| {
+                    issue["field"] == json!("base_image")
+                        && issue["detail"]
+                            .as_str()
+                            .is_some_and(|detail| detail.contains("base_image"))
+                })
+            }),
+        "vm preview should explain which launch field remains unresolved"
+    );
+}
+
+#[test]
+#[ignore = "requires docker; run manually or in CI"]
+fn mixed_run_proxy_attaches_by_run_id_smoke() {
+    ensure_internal_images();
+    let temp = temp_output_dir("mixed-run-proxy-run-id-");
+    let fixture = write_two_site_fixture(temp.path());
+
+    let storage_root = temp.path().join("state");
+    let mut run = run_manifest(&fixture.manifest, &fixture.placement, &storage_root);
+
+    let proxy_port = pick_free_port();
+    let proxy_args = vec![
+        "--storage-root".to_string(),
+        storage_root.display().to_string(),
+        "--site".to_string(),
+        "direct_local".to_string(),
+    ];
+    let mut proxy = spawn_proxy_target(&run.run_id, "a_http", proxy_port, &proxy_args);
+    wait_for_path(&mut proxy, proxy_port, "/id", Duration::from_secs(60));
+    assert_eq!(
+        wait_for_body(&mut proxy, proxy_port, "/call/b", Duration::from_secs(60)),
+        "B"
+    );
+    stop_proxy(&mut proxy);
+
+    run.stop();
+    assert!(
+        !run.run_root.join("receipt.json").exists(),
+        "receipt should be removed after amber stop"
+    );
 }
 
 #[test]

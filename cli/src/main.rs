@@ -25,18 +25,19 @@ use amber_compiler::{
     reporter::{
         CompiledScenario, Reporter as _,
         direct::{
-            DIRECT_PLAN_FILENAME, DIRECT_PLAN_VERSION, DirectArtifact, DirectComponentPlan,
-            DirectPlan, DirectProgramExecutionPlan, DirectReporter, DirectRuntimeAddressPlan,
-            DirectRuntimeConfigPayload, DirectRuntimeUrlSource, RUN_SCRIPT_FILENAME,
+            DIRECT_PLAN_FILENAME, DIRECT_PLAN_VERSION, DirectComponentPlan, DirectPlan,
+            DirectProgramExecutionPlan, DirectRuntimeAddressPlan, DirectRuntimeConfigPayload,
+            DirectRuntimeUrlSource, RUN_SCRIPT_FILENAME,
         },
-        docker_compose::DockerComposeReporter,
         dot::DotReporter,
-        kubernetes::KubernetesReporter,
         metadata::MetadataReporter,
         scenario_ir::ScenarioIrReporter,
-        vm::{VM_PLAN_FILENAME, VmArtifact, VmReporter},
+        vm::VM_PLAN_FILENAME,
     },
-    run_plan::{PlacementFile, RUN_PLAN_SCHEMA, RunPlan, build_run_plan, parse_placement_file},
+    run_plan::{
+        PlacementFile, RUN_PLAN_SCHEMA, RunPlan, SiteKind, build_homogeneous_export_run_plan,
+        build_run_plan, build_unmanaged_export, parse_placement_file,
+    },
 };
 use amber_config::{self as config, CONFIG_ENV_PREFIX};
 use amber_manifest::ManifestRef;
@@ -218,6 +219,7 @@ const RUN_AFTER_HELP: &str = "\
 Examples:
   amber run path/to/root.json5
   amber run path/to/root.json5 --placement local-sites.json
+  amber run -Z unstable-options path/to/root.json5 --dry-run --emit-launch-bundle /tmp/amber-launch
   amber run /tmp/amber-run-plan.json
   amber run /tmp/amber-direct
   amber run /tmp/amber-direct/direct-plan.json
@@ -242,6 +244,8 @@ The output can be a Docker Compose output directory, a Kubernetes output directo
 const PROXY_AFTER_HELP: &str = "\
 Examples:
   amber proxy /tmp/amber-compose --export public=127.0.0.1:18080
+
+  amber proxy <run-id> --site direct_local --export public=127.0.0.1:18080
 
   amber proxy /tmp/amber-compose \\
     --slot ext_api=127.0.0.1:38081 \\
@@ -454,8 +458,12 @@ struct DocsExamplesArgs {
 
 #[derive(Args)]
 struct RunArgs {
+    /// Enable unstable CLI options.
+    #[arg(short = 'Z', value_name = "FLAG")]
+    unstable: Vec<String>,
+
     /// Manifest, bundle, mixed-site run plan, or direct/vm runnable output from `amber compile`.
-    #[arg(value_name = "OUTPUT")]
+    #[arg(value_name = "TARGET")]
     output: String,
 
     /// Override where Amber stores persistent runtime state.
@@ -473,6 +481,14 @@ struct RunArgs {
     /// Managed observability mode for mixed-site runs (`local` or an OTLP/HTTP endpoint URL).
     #[arg(long = "observability", value_name = "local|URL")]
     observability: Option<String>,
+
+    /// Materialize the mixed-site launch bundle without starting workloads.
+    #[arg(long = "dry-run")]
+    dry_run: bool,
+
+    /// Write the materialized mixed-site launch bundle to this directory.
+    #[arg(long = "emit-launch-bundle", value_name = "DIR")]
+    emit_launch_bundle: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -581,9 +597,17 @@ struct StopArgs {
 
 #[derive(Args)]
 struct ProxyArgs {
-    /// Docker Compose output directory, direct output directory, VM output directory, or Kubernetes output directory from `amber compile`.
+    /// Docker Compose output directory, direct output directory, VM output directory, Kubernetes output directory, run root, or mixed-site run id.
     #[arg(value_name = "OUTPUT")]
     output: String,
+
+    /// Site id to attach when proxying against a mixed-site run.
+    #[arg(long = "site", value_name = "SITE_ID")]
+    site: Option<String>,
+
+    /// Override where Amber stores persistent mixed-run state when `OUTPUT` is a run id.
+    #[arg(long = "storage-root", value_name = "DIR")]
+    storage_root: Option<PathBuf>,
 
     /// Compose project name override for Docker Compose outputs.
     #[arg(long = "project-name", value_name = "NAME")]
@@ -960,11 +984,33 @@ async fn compile(args: CompileArgs) -> Result<()> {
         write_primary_output(primary, &compiled)?;
     }
 
+    if placement.is_some()
+        && (outputs.docker_compose.is_some()
+            || outputs.kubernetes.is_some()
+            || outputs.direct.is_some()
+            || outputs.vm.is_some())
+    {
+        return Err(miette::miette!(
+            "`amber compile --docker-compose`, `--kubernetes`, `--direct`, and `--vm` do not \
+             accept `--placement`; use `--run-plan` for placed mixed-site planning"
+        ));
+    }
+
+    let run_plan = if outputs.run_plan.is_some() {
+        Some(
+            build_run_plan(&compiled, placement.as_ref())
+                .into_diagnostic()
+                .wrap_err("failed to build mixed-site run plan")?,
+        )
+    } else {
+        None
+    };
+
     if let Some(run_plan_path) = outputs.run_plan.as_ref() {
-        let run_plan = build_run_plan(&compiled, placement.as_ref())
-            .into_diagnostic()
-            .wrap_err("failed to build mixed-site run plan")?;
-        write_run_plan_output(run_plan_path, &run_plan)?;
+        write_run_plan_output(
+            run_plan_path,
+            run_plan.as_ref().expect("run plan should be built"),
+        )?;
     }
 
     if let Some(dot_dest) = outputs.dot {
@@ -976,29 +1022,31 @@ async fn compile(args: CompileArgs) -> Result<()> {
     }
 
     if let Some(compose_root) = outputs.docker_compose.as_ref() {
-        let compose = DockerComposeReporter
-            .emit(&compiled)
-            .map_err(miette::Report::new)?;
-        write_docker_compose_output(compose_root, &compose)?;
+        let run_plan = build_homogeneous_export_run_plan(&compiled, SiteKind::Compose)
+            .into_diagnostic()
+            .wrap_err("failed to build homogeneous compose export plan")?;
+        write_unmanaged_export_output(compose_root, &run_plan, SiteKind::Compose)?;
     }
 
     if let Some(kubernetes_dest) = outputs.kubernetes {
-        let artifact = KubernetesReporter
-            .emit(&compiled)
-            .map_err(miette::Report::new)?;
-        write_kubernetes_output(&kubernetes_dest, &artifact)?;
+        let run_plan = build_homogeneous_export_run_plan(&compiled, SiteKind::Kubernetes)
+            .into_diagnostic()
+            .wrap_err("failed to build homogeneous kubernetes export plan")?;
+        write_unmanaged_export_output(&kubernetes_dest, &run_plan, SiteKind::Kubernetes)?;
     }
 
     if let Some(direct_dest) = outputs.direct {
-        let artifact = DirectReporter
-            .emit(&compiled)
-            .map_err(miette::Report::new)?;
-        write_direct_output(&direct_dest, &artifact)?;
+        let run_plan = build_homogeneous_export_run_plan(&compiled, SiteKind::Direct)
+            .into_diagnostic()
+            .wrap_err("failed to build homogeneous direct export plan")?;
+        write_unmanaged_export_output(&direct_dest, &run_plan, SiteKind::Direct)?;
     }
 
     if let Some(vm_dest) = outputs.vm {
-        let artifact = VmReporter.emit(&compiled).map_err(miette::Report::new)?;
-        write_vm_output(&vm_dest, &artifact)?;
+        let run_plan = build_homogeneous_export_run_plan(&compiled, SiteKind::Vm)
+            .into_diagnostic()
+            .wrap_err("failed to build homogeneous vm export plan")?;
+        write_unmanaged_export_output(&vm_dest, &run_plan, SiteKind::Vm)?;
     }
 
     if let Some(metadata_dest) = outputs.metadata {
@@ -1045,13 +1093,37 @@ fn docs(args: DocsArgs) -> Result<()> {
 }
 
 async fn run(args: RunArgs) -> Result<()> {
+    let unstable_options = args.unstable.iter().any(|flag| flag == "unstable-options");
+    if (args.dry_run || args.emit_launch_bundle.is_some()) && !unstable_options {
+        return Err(miette::miette!(
+            "`amber run --dry-run` and `--emit-launch-bundle` are unstable; pass `-Z \
+             unstable-options`"
+        ));
+    }
+    if args.detach && (args.dry_run || args.emit_launch_bundle.is_some()) {
+        return Err(miette::miette!(
+            "`amber run --detach` does not support `--dry-run` or `--emit-launch-bundle`"
+        ));
+    }
+    if args.dry_run && args.emit_launch_bundle.is_none() {
+        return Err(miette::miette!(
+            "`amber run --dry-run` requires `--emit-launch-bundle <dir>`"
+        ));
+    }
+    if args.emit_launch_bundle.is_some() && !args.dry_run {
+        return Err(miette::miette!(
+            "`--emit-launch-bundle` currently requires `--dry-run`"
+        ));
+    }
+
     let placement = load_placement_file(args.placement.as_deref())?;
     if let Some(target) = try_load_run_target(&args.output)? {
         return match target.kind {
             RunTargetKind::Direct => {
-                if args.detach {
+                if args.detach || args.dry_run {
                     return Err(miette::miette!(
-                        "`amber run --detach` only supports mixed-site manifests and run plans"
+                        "`amber run --detach` and `amber run --dry-run` only support mixed-site \
+                         manifests and run plans"
                     ));
                 }
                 run_direct_init(RunDirectInitArgs {
@@ -1063,9 +1135,10 @@ async fn run(args: RunArgs) -> Result<()> {
                 .await
             }
             RunTargetKind::Vm => {
-                if args.detach {
+                if args.detach || args.dry_run {
                     return Err(miette::miette!(
-                        "`amber run --detach` only supports mixed-site manifests and run plans"
+                        "`amber run --detach` and `amber run --dry-run` only support mixed-site \
+                         manifests and run plans"
                     ));
                 }
                 vm_runtime::run_vm_init(target.plan, args.storage_root, None, None).await
@@ -1087,6 +1160,19 @@ async fn run(args: RunArgs) -> Result<()> {
                         args.observability.as_deref(),
                     )
                     .await;
+                }
+                if args.dry_run {
+                    let bundle_root = args
+                        .emit_launch_bundle
+                        .as_deref()
+                        .expect("dry-run bundle path should be validated");
+                    return mixed_run::dry_run_run_plan(
+                        Some(&target.plan),
+                        &run_plan,
+                        bundle_root,
+                        args.observability.as_deref(),
+                    )
+                    .map(|_| ());
                 }
                 mixed_run::run_run_plan(
                     Some(&target.plan),
@@ -1115,6 +1201,19 @@ async fn run(args: RunArgs) -> Result<()> {
             args.observability.as_deref(),
         )
         .await;
+    }
+    if args.dry_run {
+        let bundle_root = args
+            .emit_launch_bundle
+            .as_deref()
+            .expect("dry-run bundle path should be validated");
+        return mixed_run::dry_run_run_plan(
+            None,
+            &run_plan,
+            bundle_root,
+            args.observability.as_deref(),
+        )
+        .map(|_| ());
     }
     mixed_run::run_run_plan(
         None,
@@ -1325,6 +1424,63 @@ enum ProcessSandbox {
     Unsandboxed,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct DirectMountPreview {
+    pub(crate) source: String,
+    pub(crate) dest: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct DirectDockerMountProxyPreview {
+    pub(crate) path: String,
+    pub(crate) tcp_host: String,
+    pub(crate) tcp_port: u16,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct DirectResolvedProcessPreview {
+    pub(crate) argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) docker_mount_proxies: Vec<DirectDockerMountProxyPreview>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct DirectLaunchProcessPreview {
+    pub(crate) role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) component: Option<String>,
+    pub(crate) name: String,
+    pub(crate) argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) env: BTreeMap<String, String>,
+    pub(crate) current_dir: String,
+    pub(crate) sandbox: String,
+    pub(crate) network: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) writable_dirs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) bind_dirs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) bind_mounts: Vec<DirectMountPreview>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) hidden_paths: Vec<String>,
+    #[cfg(target_os = "linux")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) read_only_mounts: Vec<DirectMountPreview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resolved_process: Option<DirectResolvedProcessPreview>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct DirectSiteLaunchPreview {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) router_public_key_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) processes: Vec<DirectLaunchProcessPreview>,
+}
+
 #[derive(Debug)]
 enum RuntimeExitReason {
     CtrlC,
@@ -1346,37 +1502,22 @@ struct DirectControlSocketPaths {
     runtime: PathBuf,
 }
 
+struct DirectRuntimeInputs {
+    plan_root: PathBuf,
+    direct_plan: DirectPlan,
+    mesh_plan: MeshProvisionPlan,
+}
+
 async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
     let plan_path = canonicalize_user_path(&args.plan, "direct plan")?;
-    let plan_root = plan_path
-        .parent()
-        .ok_or_else(|| miette::miette!("invalid direct plan path {}", plan_path.display()))?
-        .to_path_buf();
+    let DirectRuntimeInputs {
+        plan_root,
+        direct_plan,
+        mesh_plan,
+    } = load_direct_runtime_inputs(&plan_path)?;
     let storage_root = direct_storage_root(&plan_root, args.storage_root.as_deref())
         .into_diagnostic()
         .wrap_err("failed to resolve direct storage root")?;
-    let plan_raw = fs::read_to_string(&plan_path)
-        .map_err(|err| miette::miette!("failed to read {}: {err}", plan_path.display()))?;
-    let direct_plan: DirectPlan = serde_json::from_str(&plan_raw)
-        .map_err(|err| miette::miette!("invalid direct plan {}: {err}", plan_path.display()))?;
-    if direct_plan.version != DIRECT_PLAN_VERSION {
-        return Err(miette::miette!(
-            "unsupported direct plan version {} in {}; expected {}",
-            direct_plan.version,
-            plan_path.display(),
-            DIRECT_PLAN_VERSION
-        ));
-    }
-
-    let mesh_plan_path = plan_root.join(&direct_plan.mesh_provision_plan);
-    let mesh_raw = fs::read_to_string(&mesh_plan_path)
-        .map_err(|err| miette::miette!("failed to read {}: {err}", mesh_plan_path.display()))?;
-    let mesh_plan: MeshProvisionPlan = serde_json::from_str(&mesh_raw).map_err(|err| {
-        miette::miette!(
-            "invalid mesh provision plan {}: {err}",
-            mesh_plan_path.display()
-        )
-    })?;
 
     let runtime_dir = if let Some(runtime_root) = args.runtime_root.as_ref() {
         fs::create_dir_all(runtime_root)
@@ -1409,11 +1550,6 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
     let mut control_socket_paths = None;
 
     let supervision = async {
-        provision_mesh_filesystem(&mesh_plan, &runtime_root)?;
-        if runtime_state_path.exists() {
-            let _ = fs::remove_file(&runtime_state_path);
-        }
-
         let mut sandbox = DirectSandbox::detect(&runtime_root);
         if !sandbox.is_available() {
             return Err(miette::miette!(
@@ -1427,8 +1563,14 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                 "direct runtime requires `slirp4netns` on Linux for isolated component networking"
             )
         })?;
-        let runtime_state =
-            assign_direct_runtime_ports(&runtime_root, &direct_plan, args.router_mesh_port)?;
+        let runtime_state = materialize_direct_runtime(
+            &plan_root,
+            &runtime_root,
+            &direct_plan,
+            &mesh_plan,
+            args.router_mesh_port,
+            args.runtime_root.is_some() && runtime_state_path.is_file(),
+        )?;
         #[cfg(target_os = "linux")]
         let mesh_network =
             configure_direct_mesh_network(&runtime_root, &runtime_state, &direct_plan)?;
@@ -2077,6 +2219,39 @@ fn write_direct_runtime_state(plan_root: &Path, state: &DirectRuntimeState) -> R
     Ok(())
 }
 
+fn read_direct_runtime_state(path: &Path) -> Result<DirectRuntimeState> {
+    let raw = fs::read_to_string(path).map_err(|err| {
+        miette::miette!(
+            "failed to read direct runtime state {}: {err}",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&raw)
+        .map_err(|err| miette::miette!("invalid direct runtime state {}: {err}", path.display()))
+}
+
+fn materialize_direct_runtime(
+    plan_root: &Path,
+    runtime_root: &Path,
+    direct_plan: &DirectPlan,
+    mesh_plan: &MeshProvisionPlan,
+    fixed_router_mesh_port: Option<u16>,
+    reuse_existing: bool,
+) -> Result<DirectRuntimeState> {
+    let runtime_state_path = direct_runtime_state_path(plan_root);
+    if reuse_existing && runtime_state_path.is_file() {
+        return read_direct_runtime_state(&runtime_state_path);
+    }
+    if runtime_state_path.exists() {
+        let _ = fs::remove_file(&runtime_state_path);
+    }
+    provision_mesh_filesystem(mesh_plan, runtime_root)?;
+    let runtime_state =
+        assign_direct_runtime_ports(runtime_root, direct_plan, fixed_router_mesh_port)?;
+    write_direct_runtime_state(plan_root, &runtime_state)?;
+    Ok(runtime_state)
+}
+
 fn configure_direct_mesh_network(
     runtime_root: &Path,
     runtime_state: &DirectRuntimeState,
@@ -2249,6 +2424,342 @@ fn component_program_spec(
             })
         }
     }
+}
+
+pub(crate) fn build_direct_site_launch_preview(
+    plan_path: &Path,
+    storage_root: &Path,
+    runtime_root: &Path,
+    router_mesh_port: Option<u16>,
+) -> Result<DirectSiteLaunchPreview> {
+    let plan_path = canonicalize_user_path(plan_path, "direct plan")?;
+    let DirectRuntimeInputs {
+        plan_root,
+        direct_plan,
+        mesh_plan,
+    } = load_direct_runtime_inputs(&plan_path)?;
+    let runtime_state = materialize_direct_runtime(
+        &plan_root,
+        runtime_root,
+        &direct_plan,
+        &mesh_plan,
+        router_mesh_port,
+        true,
+    )?;
+    #[cfg(target_os = "linux")]
+    configure_direct_mesh_network(runtime_root, &runtime_state, &direct_plan)?;
+    #[cfg(not(target_os = "linux"))]
+    configure_direct_mesh_network(runtime_root, &runtime_state, &direct_plan)?;
+
+    let router_binary = resolve_runtime_binary("amber-router")?;
+    let mut processes = Vec::new();
+    let mut router_public_key_b64 = None;
+    if let Some(router) = direct_plan.router.as_ref() {
+        let router_config = read_mesh_config_public(&runtime_root.join(&router.mesh_config_path))?;
+        router_public_key_b64 = Some(
+            base64::engine::general_purpose::STANDARD.encode(router_config.identity.public_key),
+        );
+        let paths = DirectControlSocketPaths {
+            artifact_link: resolve_direct_artifact_path(&plan_root, &router.control_socket_path),
+            current_link: direct_current_control_socket_path(&plan_root),
+            runtime: direct_runtime_control_socket_path(runtime_root),
+        };
+        let mut env = BTreeMap::new();
+        env.insert(
+            "AMBER_ROUTER_CONFIG_PATH".to_string(),
+            runtime_root
+                .join(&router.mesh_config_path)
+                .display()
+                .to_string(),
+        );
+        env.insert(
+            "AMBER_ROUTER_IDENTITY_PATH".to_string(),
+            runtime_root
+                .join(&router.mesh_identity_path)
+                .display()
+                .to_string(),
+        );
+        env.insert(
+            "AMBER_ROUTER_CONTROL_SOCKET_PATH".to_string(),
+            paths.runtime.display().to_string(),
+        );
+        for passthrough in &router.env_passthrough {
+            if let Ok(value) = env::var(passthrough) {
+                env.insert(passthrough.clone(), value);
+            }
+        }
+        let work_dir = runtime_root.join("work/router");
+        processes.push(direct_process_preview(
+            ProcessSpec {
+                name: "router".to_string(),
+                program: router_binary.clone(),
+                args: Vec::new(),
+                env,
+                work_dir,
+                sandbox: ProcessSandbox::Unsandboxed,
+                #[cfg(target_os = "linux")]
+                read_only_mounts: vec![ReadOnlyMount {
+                    source: runtime_root.join("mesh"),
+                    dest: runtime_root.join("mesh"),
+                }],
+                writable_dirs: Vec::new(),
+                bind_dirs: vec![
+                    direct_runtime_control_socket_path(runtime_root)
+                        .parent()
+                        .ok_or_else(|| {
+                            miette::miette!("invalid direct runtime control socket path")
+                        })?
+                        .to_path_buf(),
+                ],
+                bind_mounts: Vec::new(),
+                hidden_paths: Vec::new(),
+                network: ProcessNetwork::Host,
+            },
+            "router",
+            None,
+            None,
+            None,
+        ));
+    }
+
+    let components_by_id = direct_plan
+        .components
+        .iter()
+        .map(|component| (component.id, component))
+        .collect::<HashMap<_, _>>();
+    for component in &direct_plan.components {
+        let mut env = BTreeMap::new();
+        env.insert(
+            "AMBER_ROUTER_CONFIG_PATH".to_string(),
+            runtime_root
+                .join(&component.sidecar.mesh_config_path)
+                .display()
+                .to_string(),
+        );
+        env.insert(
+            "AMBER_ROUTER_IDENTITY_PATH".to_string(),
+            runtime_root
+                .join(&component.sidecar.mesh_identity_path)
+                .display()
+                .to_string(),
+        );
+        processes.push(direct_process_preview(
+            ProcessSpec {
+                name: component.sidecar.log_name.clone(),
+                program: router_binary.clone(),
+                args: Vec::new(),
+                env,
+                work_dir: runtime_root.join(&component.program.work_dir),
+                sandbox: ProcessSandbox::Sandboxed,
+                #[cfg(target_os = "linux")]
+                read_only_mounts: vec![ReadOnlyMount {
+                    source: runtime_root.join("mesh"),
+                    dest: runtime_root.join("mesh"),
+                }],
+                writable_dirs: Vec::new(),
+                bind_dirs: Vec::new(),
+                bind_mounts: Vec::new(),
+                hidden_paths: Vec::new(),
+                network: {
+                    #[cfg(target_os = "linux")]
+                    {
+                        ProcessNetwork::Isolated
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        ProcessNetwork::Host
+                    }
+                },
+            },
+            "sidecar",
+            Some(component.moniker.as_str()),
+            None,
+            None,
+        ));
+    }
+    for component_id in &direct_plan.startup_order {
+        let component = components_by_id.get(component_id).copied().ok_or_else(|| {
+            miette::miette!(
+                "direct plan startup order references unknown component id {}",
+                component_id
+            )
+        })?;
+        let mut spec = component_program_spec(
+            runtime_root,
+            storage_root,
+            component,
+            &direct_plan.runtime_addresses,
+            &runtime_state,
+        )?;
+        spec.hidden_paths.push(runtime_root.join("mesh"));
+        let resolved_process = match &component.program.execution {
+            DirectProgramExecutionPlan::Direct { .. } => None,
+            DirectProgramExecutionPlan::HelperRunner { .. } => {
+                Some(direct_resolved_process_preview(&spec.env)?)
+            }
+        };
+        processes.push(direct_process_preview(
+            spec,
+            "program",
+            Some(component.moniker.as_str()),
+            Some(direct_program_network_override()),
+            resolved_process,
+        ));
+    }
+
+    Ok(DirectSiteLaunchPreview {
+        router_public_key_b64,
+        processes,
+    })
+}
+
+fn load_direct_runtime_inputs(plan_path: &Path) -> Result<DirectRuntimeInputs> {
+    let plan_root = plan_path
+        .parent()
+        .ok_or_else(|| miette::miette!("invalid direct plan path {}", plan_path.display()))?
+        .to_path_buf();
+    let plan_raw = fs::read_to_string(plan_path)
+        .map_err(|err| miette::miette!("failed to read {}: {err}", plan_path.display()))?;
+    let direct_plan: DirectPlan = serde_json::from_str(&plan_raw)
+        .map_err(|err| miette::miette!("invalid direct plan {}: {err}", plan_path.display()))?;
+    if direct_plan.version != DIRECT_PLAN_VERSION {
+        return Err(miette::miette!(
+            "unsupported direct plan version {} in {}; expected {}",
+            direct_plan.version,
+            plan_path.display(),
+            DIRECT_PLAN_VERSION
+        ));
+    }
+    let mesh_plan_path = plan_root.join(&direct_plan.mesh_provision_plan);
+    let mesh_raw = fs::read_to_string(&mesh_plan_path)
+        .map_err(|err| miette::miette!("failed to read {}: {err}", mesh_plan_path.display()))?;
+    let mesh_plan: MeshProvisionPlan = serde_json::from_str(&mesh_raw).map_err(|err| {
+        miette::miette!(
+            "invalid mesh provision plan {}: {err}",
+            mesh_plan_path.display()
+        )
+    })?;
+    Ok(DirectRuntimeInputs {
+        plan_root,
+        direct_plan,
+        mesh_plan,
+    })
+}
+
+fn direct_process_preview(
+    spec: ProcessSpec,
+    role: &str,
+    component: Option<&str>,
+    network_override: Option<&str>,
+    resolved_process: Option<DirectResolvedProcessPreview>,
+) -> DirectLaunchProcessPreview {
+    let mut argv = Vec::with_capacity(1 + spec.args.len());
+    argv.push(spec.program.clone());
+    argv.extend(spec.args.clone());
+    DirectLaunchProcessPreview {
+        role: role.to_string(),
+        component: component.map(ToOwned::to_owned),
+        name: spec.name,
+        argv,
+        env: spec.env,
+        current_dir: spec.work_dir.display().to_string(),
+        sandbox: match spec.sandbox {
+            ProcessSandbox::Sandboxed => "sandboxed",
+            ProcessSandbox::Unsandboxed => "unsandboxed",
+        }
+        .to_string(),
+        network: network_override
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| direct_process_network_label(spec.network)),
+        writable_dirs: spec
+            .writable_dirs
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        bind_dirs: spec
+            .bind_dirs
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        bind_mounts: spec
+            .bind_mounts
+            .into_iter()
+            .map(|mount| DirectMountPreview {
+                source: mount.source.display().to_string(),
+                dest: mount.dest.display().to_string(),
+            })
+            .collect(),
+        hidden_paths: spec
+            .hidden_paths
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        #[cfg(target_os = "linux")]
+        read_only_mounts: spec
+            .read_only_mounts
+            .into_iter()
+            .map(|mount| DirectMountPreview {
+                source: mount.source.display().to_string(),
+                dest: mount.dest.display().to_string(),
+            })
+            .collect(),
+        resolved_process,
+    }
+}
+
+fn direct_process_network_label(network: ProcessNetwork) -> String {
+    match network {
+        ProcessNetwork::Host => "host".to_string(),
+        #[cfg(target_os = "linux")]
+        ProcessNetwork::Isolated => "isolated".to_string(),
+        #[cfg(target_os = "linux")]
+        ProcessNetwork::Join(_) => "join_component_sidecar".to_string(),
+    }
+}
+
+fn direct_program_network_override() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        "join_component_sidecar"
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "host"
+    }
+}
+
+fn direct_resolved_process_preview(
+    env_map: &BTreeMap<String, String>,
+) -> Result<DirectResolvedProcessPreview> {
+    let plan = amber_helper::build_run_plan(env_map.iter().map(|(key, value)| {
+        (
+            std::ffi::OsString::from(key),
+            std::ffi::OsString::from(value),
+        )
+    }))
+    .map_err(|err| miette::miette!("failed to build helper-runner preview: {err}"))?;
+    Ok(DirectResolvedProcessPreview {
+        argv: plan.entrypoint,
+        env: plan
+            .env
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect(),
+        docker_mount_proxies: plan
+            .docker_mount_proxies
+            .into_iter()
+            .map(|(path, tcp_host, tcp_port)| DirectDockerMountProxyPreview {
+                path,
+                tcp_host,
+                tcp_port,
+            })
+            .collect(),
+    })
 }
 
 fn direct_storage_bind_mounts(
@@ -4314,7 +4825,17 @@ fn output_dir_for_target(root: &Path, target: &MeshProvisionTarget) -> Result<Pa
 }
 
 async fn proxy(args: ProxyArgs, verbose: u8) -> Result<()> {
-    let mut proxy = ProxyCommand::new(&args.output);
+    let run_proxy_target = mixed_run::maybe_resolve_proxy_run_target(
+        &args.output,
+        args.site.as_deref(),
+        args.storage_root.as_deref(),
+    )?;
+    let mut proxy = ProxyCommand::new(
+        run_proxy_target
+            .as_ref()
+            .map(|target| target.artifact_dir.as_path())
+            .unwrap_or_else(|| Path::new(&args.output)),
+    );
     if let Some(project_name) = args.project_name.as_deref() {
         proxy.set_project_name(project_name)?;
     }
@@ -4331,8 +4852,16 @@ async fn proxy(args: ProxyArgs, verbose: u8) -> Result<()> {
     }
     if let Some(router_addr) = args.router_addr {
         proxy.set_router_addr(router_addr);
+    } else if let Some(run_proxy_target) = run_proxy_target.as_ref()
+        && let Some(router_addr) = run_proxy_target.router_addr
+    {
+        proxy.set_router_addr(router_addr);
     }
     if let Some(router_control_addr) = args.router_control_addr.as_deref() {
+        apply_router_control_override(&mut proxy, router_control_addr)?;
+    } else if let Some(run_proxy_target) = run_proxy_target.as_ref()
+        && let Some(router_control_addr) = run_proxy_target.router_control_addr.as_deref()
+    {
         apply_router_control_override(&mut proxy, router_control_addr)?;
     }
     if let Some(config) = load_router_config_optional(&args)? {
@@ -4894,40 +5423,20 @@ fn write_artifact(path: &Path, contents: &[u8]) -> Result<()> {
         .wrap_err_with(|| format!("failed to write `{}`", path.display()))
 }
 
-fn write_docker_compose_output(
-    root: &Path,
-    artifact: &amber_compiler::reporter::docker_compose::DockerComposeArtifact,
-) -> Result<()> {
+fn write_unmanaged_export_output(root: &Path, run_plan: &RunPlan, kind: SiteKind) -> Result<()> {
+    let export = build_unmanaged_export(run_plan, kind)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to derive unmanaged {} export from the resolved run plan",
+                unmanaged_export_label(kind)
+            )
+        })?;
     write_directory_output(
         root,
-        "docker compose output directory",
-        &artifact.files,
-        None,
-    )
-}
-
-fn write_kubernetes_output(
-    root: &Path,
-    artifact: &amber_compiler::reporter::kubernetes::KubernetesArtifact,
-) -> Result<()> {
-    write_directory_output(root, "kubernetes output directory", &artifact.files, None)
-}
-
-fn write_direct_output(root: &Path, artifact: &DirectArtifact) -> Result<()> {
-    write_directory_output(
-        root,
-        "direct output directory",
-        &artifact.files,
-        Some(Path::new(RUN_SCRIPT_FILENAME)),
-    )
-}
-
-fn write_vm_output(root: &Path, artifact: &VmArtifact) -> Result<()> {
-    write_directory_output(
-        root,
-        "vm output directory",
-        &artifact.files,
-        Some(Path::new(RUN_SCRIPT_FILENAME)),
+        unmanaged_export_output_dir_label(kind),
+        &export.files,
+        unmanaged_export_executable_rel_path(kind),
     )
 }
 
@@ -4980,6 +5489,31 @@ fn write_directory_output(
     }
 
     Ok(())
+}
+
+fn unmanaged_export_label(kind: SiteKind) -> &'static str {
+    match kind {
+        SiteKind::Compose => "docker-compose",
+        SiteKind::Kubernetes => "kubernetes",
+        SiteKind::Direct => "direct",
+        SiteKind::Vm => "vm",
+    }
+}
+
+fn unmanaged_export_output_dir_label(kind: SiteKind) -> &'static str {
+    match kind {
+        SiteKind::Compose => "docker compose output directory",
+        SiteKind::Kubernetes => "kubernetes output directory",
+        SiteKind::Direct => "direct output directory",
+        SiteKind::Vm => "vm output directory",
+    }
+}
+
+fn unmanaged_export_executable_rel_path(kind: SiteKind) -> Option<&'static Path> {
+    match kind {
+        SiteKind::Direct | SiteKind::Vm => Some(Path::new(RUN_SCRIPT_FILENAME)),
+        SiteKind::Compose | SiteKind::Kubernetes => None,
+    }
 }
 
 #[cfg(test)]

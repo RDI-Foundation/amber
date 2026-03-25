@@ -1,10 +1,5 @@
-Error:   × program.image in /child resolves to a mixed runtime image template, but
-  │ kubernetes output only supports runtime images that resolve to exactly one
-  │ concrete config value (for example `${config.image}`).
-    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/k8s_program_image_runtime_template_unsupported_program_image_child.json5:10:12]
-  9 │   program: {
- 10 │     image: "busybox:${config.tag}",
-    ·            ───────────┬───────────
-    ·                       ╰── program.image interpolation here
- 11 │     entrypoint: ["child"],
-    ╰────
+Error:   × failed to build homogeneous kubernetes export plan
+  ╰─▶ run planning failed: failed to render kubernetes site: program.image
+      in /child resolves to a mixed runtime image template, but kubernetes
+      output only supports runtime images that resolve to exactly one concrete
+      config value (for example `${config.image}`).

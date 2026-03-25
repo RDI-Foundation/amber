@@ -29,15 +29,19 @@ use tokio::time::{Instant, sleep};
 use url::Url;
 
 use crate::{
+    DirectLaunchProcessPreview, DirectSiteLaunchPreview, build_direct_site_launch_preview,
     direct_current_control_socket_path, direct_runtime_state_path,
     tcp_readiness::endpoint_accepts_stable_connection,
     vm_runtime::{
-        TCG_VM_STARTUP_TIMEOUT, VmRuntimeState, vm_current_control_socket_path, vm_uses_tcg_accel,
+        TCG_VM_STARTUP_TIMEOUT, VmLaunchPreview, VmRuntimeState, VmSiteLaunchPreview,
+        build_vm_site_launch_preview, vm_current_control_socket_path, vm_uses_tcg_accel,
     },
 };
 
 const RECEIPT_SCHEMA: &str = "amber.run.receipt";
 const RECEIPT_VERSION: u32 = 2;
+const LAUNCH_BUNDLE_SCHEMA: &str = "amber.run.launch_bundle";
+const LAUNCH_BUNDLE_VERSION: u32 = 1;
 const SITE_STATE_SCHEMA: &str = "amber.run.site_state";
 const SITE_STATE_VERSION: u32 = 2;
 const SITE_PLAN_SCHEMA: &str = "amber.run.site_supervisor_plan";
@@ -76,6 +80,102 @@ pub(crate) struct RunReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) observability: Option<ObservabilityReceipt>,
     pub(crate) sites: BTreeMap<String, SiteReceipt>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LaunchBundleManifest {
+    schema: String,
+    version: u32,
+    run_id: String,
+    mesh_scope: String,
+    plan_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_plan_path: Option<String>,
+    bundle_root: String,
+    assignments: BTreeMap<String, String>,
+    startup_waves: Vec<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    stitching: Vec<LaunchBundleLinkPreview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observability: Option<LaunchBundleObservability>,
+    sites: BTreeMap<String, LaunchBundleSite>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LaunchBundleObservability {
+    endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requests_log: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    launch_commands: Vec<LaunchCommandPreview>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LaunchBundleSite {
+    kind: SiteKind,
+    router_identity_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    router_public_key_b64: Option<String>,
+    assigned_components: Vec<String>,
+    artifact_dir: String,
+    site_state_root: String,
+    supervisor_plan_path: String,
+    desired_links_path: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    dynamic_external_slots: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    launch_commands: Vec<LaunchCommandPreview>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    processes: Vec<DirectLaunchProcessPreview>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    virtual_machines: Vec<VmLaunchPreview>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    inspectability_warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LaunchCommandPreview {
+    argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    current_dir: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LaunchBundleLinkPreview {
+    provider_site: String,
+    provider_kind: SiteKind,
+    provider_component: String,
+    provide: String,
+    provider_router_identity_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_router_mesh_port: Option<u16>,
+    consumer_site: String,
+    consumer_kind: SiteKind,
+    consumer_component: String,
+    slot: String,
+    protocol: NetworkProtocol,
+    export_name: String,
+    external_slot_name: String,
+    external_slot_env: String,
+    consumer_mesh_host: String,
+    resolution: LaunchBundleLinkResolution,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preview_external_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unresolved_reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LaunchBundleLinkResolution {
+    Exact,
+    RequiresRuntimeDiscovery,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -199,6 +299,43 @@ struct SupervisorPlanInput<'a> {
     observability_endpoint: Option<&'a str>,
 }
 
+#[derive(Clone, Debug)]
+struct MaterializedObservability {
+    receipt: ObservabilityReceipt,
+    plan_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct MaterializedSite {
+    site_plan: RunSitePlan,
+    artifact_dir: PathBuf,
+    site_state_root: PathBuf,
+    base_supervisor_plan: SiteSupervisorPlan,
+}
+
+#[derive(Clone, Debug)]
+struct MaterializedLaunchBundle {
+    run_plan_path: PathBuf,
+    observability: Option<MaterializedObservability>,
+    sites: BTreeMap<String, MaterializedSite>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SiteLaunchPreviewBundle {
+    router_public_key_b64: Option<String>,
+    processes: Vec<DirectLaunchProcessPreview>,
+    virtual_machines: Vec<VmLaunchPreview>,
+    inspectability_warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct SiteStitchContext {
+    kind: SiteKind,
+    router_identity_id: String,
+    router_public_key_b64: Option<String>,
+    router_mesh_port: Option<u16>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct DesiredLinkState {
     schema: String,
@@ -237,6 +374,13 @@ struct LaunchedSite {
     router_addr: SocketAddr,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedRunProxyTarget {
+    pub(crate) artifact_dir: PathBuf,
+    pub(crate) router_control_addr: Option<String>,
+    pub(crate) router_addr: Option<SocketAddr>,
+}
+
 #[derive(Debug, Deserialize)]
 struct DirectRuntimeStateView {
     #[serde(default)]
@@ -255,6 +399,684 @@ struct SupervisorRuntime {
     port_forward: Option<Child>,
     last_start_attempt: Option<Instant>,
     last_stitch_refresh: Option<Instant>,
+}
+
+pub(crate) fn dry_run_run_plan(
+    source_plan_path: Option<&Path>,
+    run_plan: &RunPlan,
+    bundle_root: &Path,
+    observability: Option<&str>,
+) -> Result<PathBuf> {
+    if bundle_root.exists() {
+        return Err(miette::miette!(
+            "launch bundle output directory `{}` already exists",
+            bundle_root.display()
+        ));
+    }
+    fs::create_dir_all(bundle_root)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to create launch bundle output directory {}",
+                bundle_root.display()
+            )
+        })?;
+    let run_id = new_run_id();
+    materialize_launch_bundle(
+        source_plan_path,
+        run_plan,
+        bundle_root,
+        &run_id,
+        observability,
+    )?;
+    Ok(bundle_root.to_path_buf())
+}
+
+fn materialize_launch_bundle(
+    source_plan_path: Option<&Path>,
+    run_plan: &RunPlan,
+    bundle_root: &Path,
+    run_id: &str,
+    observability: Option<&str>,
+) -> Result<MaterializedLaunchBundle> {
+    let sites_root = bundle_root.join("sites");
+    let state_root = bundle_root.join("state");
+    fs::create_dir_all(&sites_root)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create run directory {}", sites_root.display()))?;
+    fs::create_dir_all(&state_root)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create state directory {}", state_root.display()))?;
+
+    let run_plan_path = run_plan_path(bundle_root);
+    write_json(&run_plan_path, run_plan)?;
+
+    let observability =
+        materialize_observability(bundle_root, run_id, &run_plan.mesh_scope, observability)?;
+    let observability_endpoint = observability
+        .as_ref()
+        .map(|materialized| materialized.receipt.endpoint.as_str());
+
+    let mut sites = BTreeMap::new();
+    for (site_id, site_plan) in &run_plan.sites {
+        let artifact_dir = materialize_site_artifacts(&sites_root, site_id, site_plan)?;
+        patch_site_artifacts(
+            &artifact_dir,
+            site_plan.site.kind,
+            &BTreeMap::new(),
+            observability_endpoint,
+        )?;
+        let site_state_root = state_root.join(site_id);
+        let base_supervisor_plan = build_supervisor_plan(
+            SupervisorPlanInput {
+                run_root: bundle_root,
+                run_id,
+                mesh_scope: &run_plan.mesh_scope,
+                site_id,
+                site_plan,
+                artifact_dir: &artifact_dir,
+                site_state_root: &site_state_root,
+                observability_endpoint,
+            },
+            launch_env(
+                run_id,
+                &run_plan.mesh_scope,
+                site_plan.site.kind,
+                &BTreeMap::new(),
+                observability_endpoint,
+            )?,
+        )?;
+        write_json(
+            &site_supervisor_plan_path(&site_state_root),
+            &base_supervisor_plan,
+        )?;
+        write_json(
+            &desired_links_path(&site_state_root),
+            &DesiredLinkState {
+                schema: DESIRED_LINKS_SCHEMA.to_string(),
+                version: DESIRED_LINKS_VERSION,
+                external_slots: BTreeMap::new(),
+                export_peers: Vec::new(),
+            },
+        )?;
+        sites.insert(
+            site_id.clone(),
+            MaterializedSite {
+                site_plan: site_plan.clone(),
+                artifact_dir,
+                site_state_root,
+                base_supervisor_plan,
+            },
+        );
+    }
+
+    let manifest = build_launch_bundle_manifest(
+        run_id,
+        source_plan_path,
+        run_plan,
+        bundle_root,
+        &run_plan_path,
+        observability.as_ref(),
+        &sites,
+    )?;
+    write_json(&launch_bundle_manifest_path(bundle_root), &manifest)?;
+
+    Ok(MaterializedLaunchBundle {
+        run_plan_path,
+        observability,
+        sites,
+    })
+}
+
+fn build_launch_bundle_manifest(
+    run_id: &str,
+    source_plan_path: Option<&Path>,
+    run_plan: &RunPlan,
+    bundle_root: &Path,
+    run_plan_path: &Path,
+    observability: Option<&MaterializedObservability>,
+    sites: &BTreeMap<String, MaterializedSite>,
+) -> Result<LaunchBundleManifest> {
+    let mut site_entries = BTreeMap::new();
+    let mut site_contexts = BTreeMap::new();
+    for (site_id, site) in sites {
+        let mut dynamic_external_slots = run_plan
+            .links
+            .iter()
+            .filter(|link| link.consumer_site == *site_id)
+            .map(|link| link.external_slot_name.clone())
+            .collect::<Vec<_>>();
+        dynamic_external_slots.sort();
+        dynamic_external_slots.dedup();
+        let preview = match site_launch_preview(&site.base_supervisor_plan) {
+            Ok(preview) => preview,
+            Err(err) => SiteLaunchPreviewBundle {
+                inspectability_warnings: vec![format!(
+                    "failed to inspect site launch details: {err}"
+                )],
+                ..Default::default()
+            },
+        };
+        site_contexts.insert(
+            site_id.clone(),
+            SiteStitchContext {
+                kind: site.site_plan.site.kind,
+                router_identity_id: site.site_plan.router_identity_id.clone(),
+                router_public_key_b64: preview.router_public_key_b64.clone(),
+                router_mesh_port: site.base_supervisor_plan.router_mesh_port,
+            },
+        );
+        site_entries.insert(
+            site_id.clone(),
+            LaunchBundleSite {
+                kind: site.site_plan.site.kind,
+                router_identity_id: site.site_plan.router_identity_id.clone(),
+                router_public_key_b64: preview.router_public_key_b64,
+                assigned_components: site.site_plan.assigned_components.clone(),
+                artifact_dir: site.artifact_dir.display().to_string(),
+                site_state_root: site.site_state_root.display().to_string(),
+                supervisor_plan_path: site_supervisor_plan_path(&site.site_state_root)
+                    .display()
+                    .to_string(),
+                desired_links_path: desired_links_path(&site.site_state_root)
+                    .display()
+                    .to_string(),
+                dynamic_external_slots,
+                launch_commands: site_launch_commands(&site.base_supervisor_plan)?,
+                processes: preview.processes,
+                virtual_machines: preview.virtual_machines,
+                inspectability_warnings: preview.inspectability_warnings,
+            },
+        );
+    }
+
+    let observability = observability
+        .map(|observability| -> Result<LaunchBundleObservability> {
+            Ok(LaunchBundleObservability {
+                endpoint: observability.receipt.endpoint.clone(),
+                plan_path: observability
+                    .plan_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                state_path: observability
+                    .plan_path
+                    .as_ref()
+                    .map(|_| observability_state_path(bundle_root).display().to_string()),
+                requests_log: observability.receipt.requests_log.clone(),
+                launch_commands: observability_launch_commands(observability)?,
+            })
+        })
+        .transpose()?;
+
+    Ok(LaunchBundleManifest {
+        schema: LAUNCH_BUNDLE_SCHEMA.to_string(),
+        version: LAUNCH_BUNDLE_VERSION,
+        run_id: run_id.to_string(),
+        mesh_scope: run_plan.mesh_scope.clone(),
+        plan_path: run_plan_path.display().to_string(),
+        source_plan_path: source_plan_path.map(|path| path.display().to_string()),
+        bundle_root: bundle_root.display().to_string(),
+        assignments: run_plan.assignments.clone(),
+        startup_waves: run_plan.startup_waves.clone(),
+        stitching: build_launch_bundle_stitching_preview(run_plan, &site_contexts)?,
+        observability,
+        sites: site_entries,
+    })
+}
+
+fn site_launch_preview(plan: &SiteSupervisorPlan) -> Result<SiteLaunchPreviewBundle> {
+    Ok(match plan.kind {
+        SiteKind::Direct => {
+            let preview: DirectSiteLaunchPreview = build_direct_site_launch_preview(
+                &PathBuf::from(&plan.artifact_dir).join("direct-plan.json"),
+                Path::new(required_path(
+                    plan.storage_root.as_deref(),
+                    "direct storage root",
+                )),
+                Path::new(required_path(
+                    plan.runtime_root.as_deref(),
+                    "direct runtime root",
+                )),
+                plan.router_mesh_port,
+            )?;
+            SiteLaunchPreviewBundle {
+                router_public_key_b64: preview.router_public_key_b64,
+                processes: preview.processes,
+                virtual_machines: Vec::new(),
+                inspectability_warnings: Vec::new(),
+            }
+        }
+        SiteKind::Vm => {
+            let preview: VmSiteLaunchPreview = build_vm_site_launch_preview(
+                &PathBuf::from(&plan.artifact_dir).join("vm-plan.json"),
+                Path::new(required_path(
+                    plan.storage_root.as_deref(),
+                    "vm storage root",
+                )),
+                Path::new(required_path(
+                    plan.runtime_root.as_deref(),
+                    "vm runtime root",
+                )),
+                plan.router_mesh_port,
+            )?;
+            SiteLaunchPreviewBundle {
+                router_public_key_b64: preview.router_public_key_b64,
+                processes: Vec::new(),
+                virtual_machines: preview.virtual_machines,
+                inspectability_warnings: preview.inspectability_warnings,
+            }
+        }
+        SiteKind::Compose | SiteKind::Kubernetes => SiteLaunchPreviewBundle::default(),
+    })
+}
+
+fn build_launch_bundle_stitching_preview(
+    run_plan: &RunPlan,
+    site_contexts: &BTreeMap<String, SiteStitchContext>,
+) -> Result<Vec<LaunchBundleLinkPreview>> {
+    run_plan
+        .links
+        .iter()
+        .map(|link| {
+            let provider = site_contexts.get(&link.provider_site).ok_or_else(|| {
+                miette::miette!(
+                    "launch bundle is missing provider site `{}`",
+                    link.provider_site
+                )
+            })?;
+            let consumer = site_contexts.get(&link.consumer_site).ok_or_else(|| {
+                miette::miette!(
+                    "launch bundle is missing consumer site `{}`",
+                    link.consumer_site
+                )
+            })?;
+            let preview_external_url = match (
+                provider.router_mesh_port,
+                provider.router_public_key_b64.as_deref(),
+            ) {
+                (Some(port), Some(peer_key_b64)) => Some(preview_external_slot_url(
+                    port,
+                    peer_key_b64,
+                    &provider.router_identity_id,
+                    link,
+                    consumer.kind,
+                )?),
+                _ => None,
+            };
+            let (resolution, unresolved_reason) = if preview_external_url.is_some() {
+                (LaunchBundleLinkResolution::Exact, None)
+            } else {
+                let reason = match provider.kind {
+                    SiteKind::Compose => {
+                        "compose router host ports are assigned when Docker starts the site"
+                    }
+                    SiteKind::Kubernetes => {
+                        "kubernetes router addresses are discovered after the port-forward sidecar \
+                         starts"
+                    }
+                    SiteKind::Direct | SiteKind::Vm => {
+                        "provider runtime identity and mesh address are materialized during launch"
+                    }
+                };
+                (
+                    LaunchBundleLinkResolution::RequiresRuntimeDiscovery,
+                    Some(reason.to_string()),
+                )
+            };
+            Ok(LaunchBundleLinkPreview {
+                provider_site: link.provider_site.clone(),
+                provider_kind: provider.kind,
+                provider_component: link.provider_component.clone(),
+                provide: link.provide.clone(),
+                provider_router_identity_id: provider.router_identity_id.clone(),
+                provider_router_mesh_port: provider.router_mesh_port,
+                consumer_site: link.consumer_site.clone(),
+                consumer_kind: consumer.kind,
+                consumer_component: link.consumer_component.clone(),
+                slot: link.slot.clone(),
+                protocol: link.protocol,
+                export_name: link.export_name.clone(),
+                external_slot_name: link.external_slot_name.clone(),
+                external_slot_env: amber_compiler::mesh::external_slot_env_var(
+                    &link.external_slot_name,
+                ),
+                consumer_mesh_host: container_host_for_consumer(consumer.kind),
+                resolution,
+                preview_external_url,
+                unresolved_reason,
+            })
+        })
+        .collect()
+}
+
+fn preview_external_slot_url(
+    port: u16,
+    peer_key_b64: &str,
+    peer_id: &str,
+    link: &RunLink,
+    consumer_kind: SiteKind,
+) -> Result<String> {
+    let host = container_host_for_consumer(consumer_kind);
+    let mut mesh_url = Url::parse(&format!("mesh://{}:{port}", host))
+        .into_diagnostic()
+        .wrap_err("failed to build preview mesh link url")?;
+    mesh_url
+        .query_pairs_mut()
+        .append_pair("peer_id", peer_id)
+        .append_pair("peer_key", peer_key_b64)
+        .append_pair(
+            "route_id",
+            &router_export_route_id(&link.export_name, mesh_protocol(link.protocol)?),
+        )
+        .append_pair("capability", &link.export_name);
+    Ok(mesh_url.to_string())
+}
+
+fn site_launch_commands(plan: &SiteSupervisorPlan) -> Result<Vec<LaunchCommandPreview>> {
+    let exe = env::current_exe()
+        .into_diagnostic()
+        .wrap_err("failed to resolve amber executable path")?;
+    Ok(match plan.kind {
+        SiteKind::Direct => {
+            let mut argv = vec![
+                exe.display().to_string(),
+                "run-direct-init".to_string(),
+                "--plan".to_string(),
+                PathBuf::from(&plan.artifact_dir)
+                    .join("direct-plan.json")
+                    .display()
+                    .to_string(),
+                "--storage-root".to_string(),
+                required_path(plan.storage_root.as_deref(), "direct storage root").to_string(),
+            ];
+            if let Some(runtime_root) = plan.runtime_root.as_deref() {
+                argv.push("--runtime-root".to_string());
+                argv.push(runtime_root.to_string());
+            }
+            if let Some(port) = plan.router_mesh_port {
+                argv.push("--router-mesh-port".to_string());
+                argv.push(port.to_string());
+            }
+            vec![LaunchCommandPreview {
+                argv,
+                env: plan.launch_env.clone(),
+                current_dir: Some(plan.site_state_root.clone()),
+            }]
+        }
+        SiteKind::Vm => {
+            let mut argv = vec![
+                exe.display().to_string(),
+                "run-vm-init".to_string(),
+                "--plan".to_string(),
+                PathBuf::from(&plan.artifact_dir)
+                    .join("vm-plan.json")
+                    .display()
+                    .to_string(),
+                "--storage-root".to_string(),
+                required_path(plan.storage_root.as_deref(), "vm storage root").to_string(),
+            ];
+            if let Some(runtime_root) = plan.runtime_root.as_deref() {
+                argv.push("--runtime-root".to_string());
+                argv.push(runtime_root.to_string());
+            }
+            if let Some(port) = plan.router_mesh_port {
+                argv.push("--router-mesh-port".to_string());
+                argv.push(port.to_string());
+            }
+            vec![LaunchCommandPreview {
+                argv,
+                env: plan.launch_env.clone(),
+                current_dir: Some(plan.site_state_root.clone()),
+            }]
+        }
+        SiteKind::Compose => {
+            let mut argv = vec![
+                "docker".to_string(),
+                "compose".to_string(),
+                "-f".to_string(),
+                PathBuf::from(&plan.artifact_dir)
+                    .join("compose.yaml")
+                    .display()
+                    .to_string(),
+            ];
+            if let Some(project_name) = plan.compose_project.as_deref() {
+                argv.push("-p".to_string());
+                argv.push(project_name.to_string());
+            }
+            argv.push("up".to_string());
+            argv.push("-d".to_string());
+            vec![LaunchCommandPreview {
+                argv,
+                env: plan.launch_env.clone(),
+                current_dir: Some(plan.artifact_dir.clone()),
+            }]
+        }
+        SiteKind::Kubernetes => {
+            let mut commands = Vec::new();
+            if let Some(namespace) = plan.kubernetes_namespace.as_deref() {
+                let mut get_ns = kubectl_preview(plan.context.as_deref());
+                get_ns.extend([
+                    "get".to_string(),
+                    "namespace".to_string(),
+                    namespace.to_string(),
+                    "-o".to_string(),
+                    "json".to_string(),
+                ]);
+                commands.push(LaunchCommandPreview {
+                    argv: get_ns,
+                    env: BTreeMap::new(),
+                    current_dir: None,
+                });
+
+                let mut create_ns = kubectl_preview(plan.context.as_deref());
+                create_ns.extend([
+                    "create".to_string(),
+                    "namespace".to_string(),
+                    namespace.to_string(),
+                ]);
+                commands.push(LaunchCommandPreview {
+                    argv: create_ns,
+                    env: BTreeMap::new(),
+                    current_dir: None,
+                });
+            }
+
+            let mut apply = kubectl_preview(plan.context.as_deref());
+            apply.extend(["apply".to_string(), "-k".to_string(), ".".to_string()]);
+            commands.push(LaunchCommandPreview {
+                argv: apply,
+                env: BTreeMap::new(),
+                current_dir: Some(plan.artifact_dir.clone()),
+            });
+
+            if let (Some(namespace), Some(mesh_port), Some(control_port)) = (
+                plan.kubernetes_namespace.as_deref(),
+                plan.port_forward_mesh_port,
+                plan.port_forward_control_port,
+            ) {
+                let mut port_forward = kubectl_preview(plan.context.as_deref());
+                port_forward.extend([
+                    "-n".to_string(),
+                    namespace.to_string(),
+                    "port-forward".to_string(),
+                    "--address".to_string(),
+                    "0.0.0.0".to_string(),
+                    "deploy/amber-router".to_string(),
+                    format!("{mesh_port}:24000"),
+                    format!("{control_port}:24100"),
+                ]);
+                commands.push(LaunchCommandPreview {
+                    argv: port_forward,
+                    env: BTreeMap::new(),
+                    current_dir: None,
+                });
+            }
+
+            commands
+        }
+    })
+}
+
+fn observability_launch_commands(
+    observability: &MaterializedObservability,
+) -> Result<Vec<LaunchCommandPreview>> {
+    let Some(plan_path) = observability.plan_path.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let exe = env::current_exe()
+        .into_diagnostic()
+        .wrap_err("failed to resolve amber executable path")?;
+    Ok(vec![LaunchCommandPreview {
+        argv: vec![
+            exe.display().to_string(),
+            "run-observability-sink".to_string(),
+            "--plan".to_string(),
+            plan_path.display().to_string(),
+        ],
+        env: BTreeMap::new(),
+        current_dir: Some(
+            plan_path
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or_else(|| Path::new("."))
+                .display()
+                .to_string(),
+        ),
+    }])
+}
+
+fn kubectl_preview(context: Option<&str>) -> Vec<String> {
+    let mut argv = vec!["kubectl".to_string()];
+    if let Some(context) = context {
+        argv.push("--context".to_string());
+        argv.push(context.to_string());
+    }
+    argv
+}
+
+fn materialize_observability(
+    run_root: &Path,
+    run_id: &str,
+    mesh_scope: &str,
+    observability: Option<&str>,
+) -> Result<Option<MaterializedObservability>> {
+    let Some(observability) = observability
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    if observability == "local" {
+        let listen_port = reserve_loopback_port()?;
+        let listen_addr = SocketAddr::from(([0, 0, 0, 0], listen_port));
+        let advertise_endpoint = format!("http://127.0.0.1:{listen_port}");
+        let requests_log = run_root.join("observability").join("requests.log");
+        let plan = ObservabilitySinkPlan {
+            schema: OTLP_SINK_PLAN_SCHEMA.to_string(),
+            version: OTLP_SINK_PLAN_VERSION,
+            run_id: run_id.to_string(),
+            mesh_scope: mesh_scope.to_string(),
+            run_root: run_root.display().to_string(),
+            listen_addr: listen_addr.to_string(),
+            advertise_endpoint: advertise_endpoint.clone(),
+            requests_log: requests_log.display().to_string(),
+        };
+        let plan_path = observability_plan_path(run_root);
+        write_json(&plan_path, &plan)?;
+        return Ok(Some(MaterializedObservability {
+            receipt: ObservabilityReceipt {
+                endpoint: advertise_endpoint,
+                sink_pid: None,
+                requests_log: Some(requests_log.display().to_string()),
+            },
+            plan_path: Some(plan_path),
+        }));
+    }
+
+    Ok(Some(MaterializedObservability {
+        receipt: ObservabilityReceipt {
+            endpoint: observability.to_string(),
+            sink_pid: None,
+            requests_log: None,
+        },
+        plan_path: None,
+    }))
+}
+
+async fn start_materialized_observability(
+    run_root: &Path,
+    observability: Option<&MaterializedObservability>,
+) -> Result<Option<ObservabilityReceipt>> {
+    let Some(observability) = observability else {
+        return Ok(None);
+    };
+    let Some(plan_path) = observability.plan_path.as_ref() else {
+        return Ok(Some(observability.receipt.clone()));
+    };
+
+    let mut child = spawn_detached_child(
+        run_root,
+        &run_root.join("observability").join("sink.log"),
+        |cmd| {
+            cmd.arg("run-observability-sink")
+                .arg("--plan")
+                .arg(plan_path);
+        },
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().into_diagnostic()? {
+            return Err(miette::miette!(
+                "observability sink exited before becoming ready with status {status}"
+            ));
+        }
+        if observability_state_path(run_root).is_file() {
+            let mut receipt = observability.receipt.clone();
+            receipt.sink_pid = Some(child.id());
+            return Ok(Some(receipt));
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    Err(miette::miette!("timed out waiting for observability sink"))
+}
+
+fn prepare_site_launch(
+    site: &MaterializedSite,
+    external_env: &BTreeMap<String, String>,
+) -> Result<()> {
+    patch_site_artifacts(
+        &site.artifact_dir,
+        site.site_plan.site.kind,
+        external_env,
+        site.base_supervisor_plan.observability_endpoint.as_deref(),
+    )?;
+    let mut supervisor_plan = site.base_supervisor_plan.clone();
+    supervisor_plan.launch_env.extend(
+        external_env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    write_json(
+        &site_supervisor_plan_path(&site.site_state_root),
+        &supervisor_plan,
+    )?;
+    write_json(
+        &desired_links_path(&site.site_state_root),
+        &DesiredLinkState {
+            schema: DESIRED_LINKS_SCHEMA.to_string(),
+            version: DESIRED_LINKS_VERSION,
+            external_slots: external_env
+                .iter()
+                .filter_map(|(env_var, url)| {
+                    env_var
+                        .strip_prefix("AMBER_EXTERNAL_SLOT_")
+                        .map(|_| (env_var.clone(), url.clone()))
+                })
+                .collect(),
+            export_peers: Vec::new(),
+        },
+    )
 }
 
 pub(crate) async fn run_run_plan(
@@ -293,12 +1115,10 @@ pub(crate) async fn run_run_plan_with_id(
         .wrap_err_with(|| format!("failed to create state directory {}", state_root.display()))?;
     let _coordinator_lock = hold_coordinator_lock(&run_root)?;
 
-    let run_plan_path = run_plan_path(&run_root);
-    write_json(&run_plan_path, run_plan)?;
-
+    let launch_bundle =
+        materialize_launch_bundle(source_plan_path, run_plan, &run_root, run_id, observability)?;
     let observability_receipt =
-        start_observability_if_needed(&run_root, run_id, &run_plan.mesh_scope, observability)
-            .await?;
+        start_materialized_observability(&run_root, launch_bundle.observability.as_ref()).await?;
     init_manager_telemetry(
         &format!("/run/{run_id}/coordinator"),
         &run_plan.mesh_scope,
@@ -323,76 +1143,23 @@ pub(crate) async fn run_run_plan_with_id(
     let result = async {
         for wave in &run_plan.startup_waves {
             for site_id in wave {
-                let site_plan = run_plan
+                let site = launch_bundle
                     .sites
                     .get(site_id)
-                    .ok_or_else(|| miette::miette!("run plan is missing site `{site_id}`"))?;
-                let artifact_dir = materialize_site_artifacts(&sites_root, site_id, site_plan)?;
+                    .ok_or_else(|| miette::miette!("launch bundle is missing site `{site_id}`"))?;
                 let external_env = external_slot_env_for_site(
                     site_id,
-                    site_plan.site.kind,
+                    site.site_plan.site.kind,
                     &run_plan.links,
                     &launched_by_site,
                 )?;
-                patch_site_artifacts(
-                    &artifact_dir,
-                    site_plan.site.kind,
-                    &external_env,
-                    observability_receipt
-                        .as_ref()
-                        .map(|value| value.endpoint.as_str()),
-                )?;
-                let site_state_root = state_root.join(site_id);
-                let launch_env = launch_env(
-                    run_id,
-                    &run_plan.mesh_scope,
-                    site_plan.site.kind,
-                    &external_env,
-                    observability_receipt
-                        .as_ref()
-                        .map(|value| value.endpoint.as_str()),
-                )?;
-                let supervisor_plan = build_supervisor_plan(
-                    SupervisorPlanInput {
-                        run_root: &run_root,
-                        run_id,
-                        mesh_scope: &run_plan.mesh_scope,
-                        site_id,
-                        site_plan,
-                        artifact_dir: &artifact_dir,
-                        site_state_root: &site_state_root,
-                        observability_endpoint: observability_receipt
-                            .as_ref()
-                            .map(|value| value.endpoint.as_str()),
-                    },
-                    launch_env,
-                )?;
-                write_json(
-                    &site_supervisor_plan_path(&site_state_root),
-                    &supervisor_plan,
-                )?;
-                write_json(
-                    &desired_links_path(&site_state_root),
-                    &DesiredLinkState {
-                        schema: DESIRED_LINKS_SCHEMA.to_string(),
-                        version: DESIRED_LINKS_VERSION,
-                        external_slots: external_env
-                            .iter()
-                            .filter_map(|(env_var, url)| {
-                                env_var
-                                    .strip_prefix("AMBER_EXTERNAL_SLOT_")
-                                    .map(|_| (env_var.clone(), url.clone()))
-                            })
-                            .collect(),
-                        export_peers: Vec::new(),
-                    },
-                )?;
+                prepare_site_launch(site, &external_env)?;
 
-                let mut supervisor = spawn_site_supervisor(&site_state_root)?;
+                let mut supervisor = spawn_site_supervisor(&site.site_state_root)?;
                 let launched = wait_for_site_ready(
                     site_id,
-                    site_plan,
-                    &site_state_root,
+                    &site.site_plan,
+                    &site.site_state_root,
                     &mut supervisor,
                     &run_plan.mesh_scope,
                 )
@@ -438,7 +1205,7 @@ pub(crate) async fn run_run_plan_with_id(
             version: RECEIPT_VERSION,
             run_id: run_id.to_string(),
             mesh_scope: run_plan.mesh_scope.clone(),
-            plan_path: run_plan_path.display().to_string(),
+            plan_path: launch_bundle.run_plan_path.display().to_string(),
             source_plan_path: source_plan_path.map(|path| path.display().to_string()),
             run_root: run_root.display().to_string(),
             observability: observability_receipt.clone(),
@@ -568,6 +1335,39 @@ pub(crate) async fn stop_run(run_id: &str, storage_root_override: Option<&Path>)
     Ok(())
 }
 
+pub(crate) fn maybe_resolve_proxy_run_target(
+    target: &str,
+    site_id: Option<&str>,
+    storage_root_override: Option<&Path>,
+) -> Result<Option<ResolvedRunProxyTarget>> {
+    let target_path = Path::new(target);
+    if target_path.exists() {
+        let run_root = canonicalize_existing_path(target_path, "proxy target")?;
+        if run_root.is_file()
+            && run_root.file_name().and_then(|name| name.to_str()) == Some("receipt.json")
+        {
+            return resolve_proxy_run_root(
+                run_root
+                    .parent()
+                    .ok_or_else(|| miette::miette!("receipt path is missing a parent run root"))?,
+                site_id,
+            )
+            .map(Some);
+        }
+        if run_root.is_dir() && receipt_path(&run_root).is_file() {
+            return resolve_proxy_run_root(&run_root, site_id).map(Some);
+        }
+        return Ok(None);
+    }
+
+    let storage_root = mixed_run_storage_root(storage_root_override)?;
+    let run_root = storage_root.join("runs").join(target);
+    if !receipt_path(&run_root).is_file() {
+        return Ok(None);
+    }
+    resolve_proxy_run_root(&run_root, site_id).map(Some)
+}
+
 fn stop_site_from_receipt(site: &SiteReceipt) -> Result<()> {
     match site.kind {
         SiteKind::Direct | SiteKind::Vm => {
@@ -621,6 +1421,77 @@ fn stop_site_from_receipt(site: &SiteReceipt) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn resolve_proxy_run_root(
+    run_root: &Path,
+    site_id: Option<&str>,
+) -> Result<ResolvedRunProxyTarget> {
+    let receipt: RunReceipt = read_json(&receipt_path(run_root), "run receipt")?;
+    let (site_id, site_receipt) = select_proxy_site(&receipt, site_id)?;
+    let artifact_dir = canonicalize_existing_path(
+        Path::new(&site_receipt.artifact_dir),
+        "site artifact directory",
+    )?;
+    let state_path = site_state_path(&run_root.join("state"), site_id);
+    let live_state = if state_path.is_file() {
+        Some(read_json::<SiteManagerState>(
+            &state_path,
+            "site manager state",
+        )?)
+    } else {
+        None
+    };
+    let router_control_addr = live_state
+        .as_ref()
+        .and_then(|state| state.router_control.clone())
+        .or_else(|| site_receipt.router_control.clone());
+    let router_addr = live_state
+        .as_ref()
+        .and_then(|state| state.router_mesh_addr.as_deref().map(str::to_string))
+        .or_else(|| site_receipt.router_mesh_addr.clone())
+        .map(|addr| {
+            addr.parse::<SocketAddr>()
+                .into_diagnostic()
+                .wrap_err_with(|| format!("invalid router mesh addr `{addr}` in run metadata"))
+        })
+        .transpose()?;
+    Ok(ResolvedRunProxyTarget {
+        artifact_dir,
+        router_control_addr,
+        router_addr,
+    })
+}
+
+fn select_proxy_site<'a>(
+    receipt: &'a RunReceipt,
+    site_id: Option<&str>,
+) -> Result<(&'a str, &'a SiteReceipt)> {
+    if let Some(site_id) = site_id {
+        let (site_key, site) = receipt.sites.get_key_value(site_id).ok_or_else(|| {
+            miette::miette!(
+                "run `{}` does not contain site `{site_id}`; available sites: {}",
+                receipt.run_id,
+                receipt.sites.keys().cloned().collect::<Vec<_>>().join(", ")
+            )
+        })?;
+        return Ok((site_key.as_str(), site));
+    }
+
+    let mut sites = receipt.sites.iter();
+    let Some((only_site_id, only_site)) = sites.next() else {
+        return Err(miette::miette!(
+            "run `{}` has no sites recorded in its receipt",
+            receipt.run_id
+        ));
+    };
+    if sites.next().is_some() {
+        return Err(miette::miette!(
+            "run `{}` contains multiple sites; pass `--site <site-id>` to `amber proxy`",
+            receipt.run_id
+        ));
+    }
+    Ok((only_site_id.as_str(), only_site))
 }
 
 pub(crate) async fn run_site_supervisor(plan_path: PathBuf) -> Result<()> {
@@ -887,71 +1758,6 @@ pub(crate) fn mixed_run_storage_root(override_root: Option<&Path>) -> Result<Pat
         env::current_dir().into_diagnostic()?.join(".amber-runs")
     };
     Ok(path)
-}
-
-async fn start_observability_if_needed(
-    run_root: &Path,
-    run_id: &str,
-    mesh_scope: &str,
-    observability: Option<&str>,
-) -> Result<Option<ObservabilityReceipt>> {
-    let Some(observability) = observability
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(None);
-    };
-
-    if observability == "local" {
-        let listen_port = reserve_loopback_port()?;
-        let listen_addr = SocketAddr::from(([0, 0, 0, 0], listen_port));
-        let advertise_endpoint = format!("http://127.0.0.1:{listen_port}");
-        let requests_log = run_root.join("observability").join("requests.log");
-        let plan = ObservabilitySinkPlan {
-            schema: OTLP_SINK_PLAN_SCHEMA.to_string(),
-            version: OTLP_SINK_PLAN_VERSION,
-            run_id: run_id.to_string(),
-            mesh_scope: mesh_scope.to_string(),
-            run_root: run_root.display().to_string(),
-            listen_addr: listen_addr.to_string(),
-            advertise_endpoint: advertise_endpoint.clone(),
-            requests_log: requests_log.display().to_string(),
-        };
-        let plan_path = observability_plan_path(run_root);
-        write_json(&plan_path, &plan)?;
-        let mut child = spawn_detached_child(
-            &PathBuf::from(&plan.run_root),
-            &run_root.join("observability").join("sink.log"),
-            |cmd| {
-                cmd.arg("run-observability-sink")
-                    .arg("--plan")
-                    .arg(&plan_path);
-            },
-        )?;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if let Some(status) = child.try_wait().into_diagnostic()? {
-                return Err(miette::miette!(
-                    "observability sink exited before becoming ready with status {status}"
-                ));
-            }
-            if observability_state_path(run_root).is_file() {
-                return Ok(Some(ObservabilityReceipt {
-                    endpoint: advertise_endpoint,
-                    sink_pid: Some(child.id()),
-                    requests_log: Some(requests_log.display().to_string()),
-                }));
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-        return Err(miette::miette!("timed out waiting for observability sink"));
-    }
-
-    Ok(Some(ObservabilityReceipt {
-        endpoint: observability.to_string(),
-        sink_pid: None,
-        requests_log: None,
-    }))
 }
 
 fn materialize_site_artifacts(
@@ -2300,6 +3106,10 @@ fn run_plan_path(run_root: &Path) -> PathBuf {
     run_root.join("run-plan.json")
 }
 
+fn launch_bundle_manifest_path(run_root: &Path) -> PathBuf {
+    run_root.join("launch-bundle.json")
+}
+
 fn site_state_path(state_root: &Path, site_id: &str) -> PathBuf {
     state_root.join(site_id).join("manager-state.json")
 }
@@ -2767,7 +3577,61 @@ fn send_manager_observability(endpoint: &str, path: &str, body: &[u8]) -> Result
 mod tests {
     use std::collections::BTreeMap;
 
+    use tempfile::tempdir;
+
     use super::*;
+
+    fn test_site_receipt(
+        kind: SiteKind,
+        artifact_dir: &Path,
+        router_control: Option<&str>,
+        router_mesh_addr: Option<&str>,
+    ) -> SiteReceipt {
+        SiteReceipt {
+            kind,
+            artifact_dir: artifact_dir.display().to_string(),
+            supervisor_pid: 100,
+            process_pid: None,
+            compose_project: None,
+            kubernetes_namespace: None,
+            port_forward_pid: None,
+            context: None,
+            router_control: router_control.map(str::to_string),
+            router_mesh_addr: router_mesh_addr.map(str::to_string),
+            router_identity_id: None,
+            router_public_key_b64: None,
+        }
+    }
+
+    fn test_site_state(
+        run_id: &str,
+        site_id: &str,
+        kind: SiteKind,
+        artifact_dir: &Path,
+        router_control: Option<&str>,
+        router_mesh_addr: Option<&str>,
+    ) -> SiteManagerState {
+        SiteManagerState {
+            schema: "amber.run.site-state".to_string(),
+            version: 1,
+            run_id: run_id.to_string(),
+            site_id: site_id.to_string(),
+            kind,
+            status: SiteLifecycleStatus::Running,
+            artifact_dir: artifact_dir.display().to_string(),
+            supervisor_pid: 101,
+            process_pid: None,
+            compose_project: None,
+            kubernetes_namespace: None,
+            port_forward_pid: None,
+            context: None,
+            router_control: router_control.map(str::to_string),
+            router_mesh_addr: router_mesh_addr.map(str::to_string),
+            router_identity_id: None,
+            router_public_key_b64: None,
+            last_error: None,
+        }
+    }
 
     #[test]
     fn forwarded_endpoint_ready_accepts_open_connection() {
@@ -2850,5 +3714,133 @@ mod tests {
         )
         .expect("weak links should not require a launched provider");
         assert!(env.is_empty());
+    }
+
+    #[test]
+    fn maybe_resolve_proxy_run_target_resolves_run_id_and_prefers_live_state() {
+        let temp = tempdir().expect("tempdir should exist");
+        let storage_root = temp.path();
+        let run_id = "run-123";
+        let run_root = storage_root.join("runs").join(run_id);
+        let artifact_dir = run_root.join("sites").join("direct_local").join("artifact");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir should exist");
+        let state_root = run_root.join("state");
+        fs::create_dir_all(state_root.join("direct_local")).expect("state dir should exist");
+
+        let receipt = RunReceipt {
+            schema: RECEIPT_SCHEMA.to_string(),
+            version: RECEIPT_VERSION,
+            run_id: run_id.to_string(),
+            mesh_scope: "mesh.scope.test".to_string(),
+            plan_path: run_plan_path(&run_root).display().to_string(),
+            source_plan_path: None,
+            run_root: run_root.display().to_string(),
+            observability: None,
+            sites: BTreeMap::from([(
+                "direct_local".to_string(),
+                test_site_receipt(
+                    SiteKind::Direct,
+                    &artifact_dir,
+                    Some("unix:///receipt.sock"),
+                    Some("127.0.0.1:18080"),
+                ),
+            )]),
+        };
+        write_json(&receipt_path(&run_root), &receipt).expect("receipt should serialize");
+        write_json(
+            &site_state_path(&state_root, "direct_local"),
+            &test_site_state(
+                run_id,
+                "direct_local",
+                SiteKind::Direct,
+                &artifact_dir,
+                Some("unix:///live.sock"),
+                Some("127.0.0.1:18081"),
+            ),
+        )
+        .expect("state should serialize");
+
+        let resolved =
+            maybe_resolve_proxy_run_target(run_id, Some("direct_local"), Some(storage_root))
+                .expect("run target resolution should succeed")
+                .expect("run target should resolve");
+
+        assert_eq!(
+            resolved.artifact_dir,
+            artifact_dir
+                .canonicalize()
+                .expect("artifact dir should canonicalize")
+        );
+        assert_eq!(
+            resolved.router_control_addr.as_deref(),
+            Some("unix:///live.sock")
+        );
+        assert_eq!(
+            resolved.router_addr,
+            Some(
+                "127.0.0.1:18081"
+                    .parse::<SocketAddr>()
+                    .expect("socket addr should parse")
+            )
+        );
+    }
+
+    #[test]
+    fn maybe_resolve_proxy_run_target_requires_site_for_multi_site_run() {
+        let temp = tempdir().expect("tempdir should exist");
+        let storage_root = temp.path();
+        let run_id = "run-456";
+        let run_root = storage_root.join("runs").join(run_id);
+        let direct_artifact = run_root.join("sites").join("direct_local").join("artifact");
+        let compose_artifact = run_root
+            .join("sites")
+            .join("compose_local")
+            .join("artifact");
+        fs::create_dir_all(&direct_artifact).expect("direct artifact dir should exist");
+        fs::create_dir_all(&compose_artifact).expect("compose artifact dir should exist");
+
+        let receipt = RunReceipt {
+            schema: RECEIPT_SCHEMA.to_string(),
+            version: RECEIPT_VERSION,
+            run_id: run_id.to_string(),
+            mesh_scope: "mesh.scope.test".to_string(),
+            plan_path: run_plan_path(&run_root).display().to_string(),
+            source_plan_path: None,
+            run_root: run_root.display().to_string(),
+            observability: None,
+            sites: BTreeMap::from([
+                (
+                    "compose_local".to_string(),
+                    test_site_receipt(
+                        SiteKind::Compose,
+                        &compose_artifact,
+                        Some("unix:///compose.sock"),
+                        Some("127.0.0.1:19090"),
+                    ),
+                ),
+                (
+                    "direct_local".to_string(),
+                    test_site_receipt(
+                        SiteKind::Direct,
+                        &direct_artifact,
+                        Some("unix:///direct.sock"),
+                        Some("127.0.0.1:19091"),
+                    ),
+                ),
+            ]),
+        };
+        write_json(&receipt_path(&run_root), &receipt).expect("receipt should serialize");
+
+        let err = maybe_resolve_proxy_run_target(run_id, None, Some(storage_root))
+            .expect_err("multi-site run ids should require --site");
+        let message = err.to_string();
+        assert!(
+            message.contains("contains multiple sites"),
+            "expected multi-site guidance, got: {message}"
+        );
+        assert!(
+            message.contains("--site <site-id>"),
+            "expected --site guidance, got: {message}"
+        );
     }
 }

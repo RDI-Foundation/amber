@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    path::PathBuf,
+};
 
 use amber_json5 as json5;
 use amber_manifest::{CapabilityKind, NetworkProtocol, SlotDecl};
@@ -46,6 +49,13 @@ pub struct RunSitePlan {
     pub assigned_components: Vec<String>,
     pub scenario_ir: ScenarioIr,
     pub artifact_files: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnmanagedExport {
+    pub site_id: String,
+    pub kind: SiteKind,
+    pub files: BTreeMap<PathBuf, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +156,16 @@ pub enum RunPlanError {
 
     #[error("cyclic strong cross-site dependencies prevent startup ordering for sites {sites:?}")]
     CyclicSiteDependencies { sites: Vec<String> },
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error(
+    "unmanaged {requested} export currently requires a single {requested} site, but the resolved \
+     run plan contains {sites}"
+)]
+pub struct UnmanagedExportError {
+    requested: &'static str,
+    sites: String,
 }
 
 pub fn parse_placement_file(contents: &str) -> Result<PlacementFile, PlacementParseError> {
@@ -287,6 +307,76 @@ pub fn build_run_plan(
     })
 }
 
+pub fn build_homogeneous_export_run_plan(
+    compiled: &CompiledScenario,
+    requested_kind: SiteKind,
+) -> Result<RunPlan, RunPlanError> {
+    let site_id = homogeneous_export_site_id(requested_kind).to_string();
+    let placement = PlacementFile {
+        schema: PLACEMENT_SCHEMA.to_string(),
+        version: PLACEMENT_VERSION,
+        sites: BTreeMap::from([(
+            site_id.clone(),
+            SiteDefinition {
+                kind: requested_kind,
+                context: None,
+            },
+        )]),
+        defaults: PlacementDefaults {
+            path: Some(site_id.clone()),
+            vm: Some(site_id.clone()),
+            image: Some(site_id),
+        },
+        components: BTreeMap::new(),
+    };
+    build_run_plan(compiled, Some(&placement))
+}
+
+pub fn build_unmanaged_export(
+    run_plan: &RunPlan,
+    requested_kind: SiteKind,
+) -> Result<UnmanagedExport, UnmanagedExportError> {
+    let requested = site_kind_name(requested_kind);
+    let resolved_sites = run_plan
+        .sites
+        .iter()
+        .map(|(site_id, site_plan)| {
+            format!("`{site_id}` ({})", site_kind_name(site_plan.site.kind))
+        })
+        .collect::<Vec<_>>();
+    if run_plan.sites.len() != 1
+        || run_plan
+            .sites
+            .values()
+            .next()
+            .is_none_or(|site_plan| site_plan.site.kind != requested_kind)
+    {
+        return Err(UnmanagedExportError {
+            requested,
+            sites: if resolved_sites.is_empty() {
+                "<no sites>".to_string()
+            } else {
+                resolved_sites.join(", ")
+            },
+        });
+    }
+
+    let (site_id, site_plan) = run_plan
+        .sites
+        .iter()
+        .next()
+        .expect("site count should be one after validation");
+    Ok(UnmanagedExport {
+        site_id: site_id.clone(),
+        kind: site_plan.site.kind,
+        files: site_plan
+            .artifact_files
+            .iter()
+            .map(|(path, contents)| (PathBuf::from(path), contents.clone()))
+            .collect(),
+    })
+}
+
 fn resolve_assignments(
     scenario: &Scenario,
     placement: Option<&PlacementFile>,
@@ -337,6 +427,24 @@ fn resolve_assignments(
         assignments.insert(component_id, site_id);
     }
     Ok(assignments)
+}
+
+fn site_kind_name(kind: SiteKind) -> &'static str {
+    match kind {
+        SiteKind::Direct => "direct",
+        SiteKind::Vm => "vm",
+        SiteKind::Compose => "compose",
+        SiteKind::Kubernetes => "kubernetes",
+    }
+}
+
+fn homogeneous_export_site_id(kind: SiteKind) -> &'static str {
+    match kind {
+        SiteKind::Direct => "direct_local",
+        SiteKind::Vm => "vm_local",
+        SiteKind::Compose => "compose_local",
+        SiteKind::Kubernetes => "kubernetes_local",
+    }
 }
 
 fn validate_program_support(
@@ -1527,5 +1635,105 @@ mod tests {
                 "site artifact for {site_id} should not retain its site-local mesh scope"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn build_unmanaged_export_uses_single_matching_site() {
+        let dir = tmp_dir("run-plan-unmanaged-export-single-");
+        let image_child = dir.path().join("image.json5");
+        let root = dir.path().join("root.json5");
+
+        write(&image_child, image_server_manifest());
+        write(
+            &root,
+            r##"{
+  manifest_version: "0.3.0",
+  components: {
+    image: "./image.json5"
+  },
+  exports: {
+    image_api: "#image.api"
+  }
+}"##,
+        );
+
+        let compiled = compile(&root).await;
+        let plan = build_run_plan(&compiled, None).expect("run plan should build");
+        let export = build_unmanaged_export(&plan, SiteKind::Compose).expect("export should build");
+        assert_eq!(export.site_id, "compose_local");
+        assert!(export.files.contains_key(&PathBuf::from("compose.yaml")));
+    }
+
+    #[tokio::test]
+    async fn build_unmanaged_export_rejects_mixed_site_plans() {
+        let dir = tmp_dir("run-plan-unmanaged-export-mixed-");
+        let path_child = dir.path().join("tool.json5");
+        let image_child = dir.path().join("image.json5");
+        let root = dir.path().join("root.json5");
+
+        write(&path_child, path_server_manifest());
+        write(&image_child, image_server_manifest());
+        write(
+            &root,
+            r##"{
+  manifest_version: "0.3.0",
+  components: {
+    tool: "./tool.json5",
+    image: "./image.json5"
+  },
+  exports: {
+    tool_api: "#tool.api",
+    image_api: "#image.api"
+  }
+}"##,
+        );
+
+        let compiled = compile(&root).await;
+        let plan = build_run_plan(&compiled, None).expect("run plan should build");
+        let err = build_unmanaged_export(&plan, SiteKind::Compose)
+            .expect_err("mixed-site export should fail");
+        let rendered = err.to_string();
+        assert!(rendered.contains("single compose site"), "{rendered}");
+        assert!(rendered.contains("`direct_local` (direct)"), "{rendered}");
+        assert!(rendered.contains("`compose_local` (compose)"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn build_homogeneous_export_run_plan_targets_requested_kind_without_placement() {
+        let dir = tmp_dir("run-plan-homogeneous-export-");
+        let image_child = dir.path().join("image.json5");
+        let root = dir.path().join("root.json5");
+
+        write(&image_child, image_server_manifest());
+        write(
+            &root,
+            r##"{
+  manifest_version: "0.3.0",
+  components: {
+    image: "./image.json5"
+  },
+  exports: {
+    image_api: "#image.api"
+  }
+}"##,
+        );
+
+        let compiled = compile(&root).await;
+        let plan = build_homogeneous_export_run_plan(&compiled, SiteKind::Kubernetes)
+            .expect("homogeneous export plan should build");
+        let site = plan
+            .sites
+            .get("kubernetes_local")
+            .expect("kubernetes export site should exist");
+        assert_eq!(site.site.kind, SiteKind::Kubernetes);
+
+        let export =
+            build_unmanaged_export(&plan, SiteKind::Kubernetes).expect("export should build");
+        assert_eq!(export.site_id, "kubernetes_local");
+        assert!(
+            export
+                .files
+                .contains_key(&PathBuf::from("kustomization.yaml"))
+        );
     }
 }

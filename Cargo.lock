@@ -102,6 +102,7 @@ version = "0.0.0"
 dependencies = [
  "amber-compiler",
  "amber-config",
+ "amber-helper",
  "amber-images",
  "amber-manifest",
  "amber-mesh",
