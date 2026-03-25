@@ -243,8 +243,7 @@ struct ResolvedVersion {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct ManifestMetadata {
-    signature: String,
+struct PublishedTag {
     revision: Option<String>,
 }
 
@@ -291,20 +290,29 @@ fn resolve_wildcard_version(
     let wildcard_prefix = raw_version
         .strip_suffix('x')
         .ok_or_else(|| format!("wildcard version for {image_name} does not end with x"))?;
-    let sha_ref = image_ref(&resolver.registry, image_name, &resolver.sha);
-    let sha_signature = manifest_metadata(&sha_ref)?
-        .ok_or_else(|| format!("sha tag does not exist for {image_name}: {sha_ref}"))?
-        .signature;
 
+    resolve_wildcard_version_from_lookup(
+        image_name,
+        wildcard_prefix,
+        resolver.sha.as_str(),
+        |candidate| {
+            let candidate_ref = image_ref(&resolver.registry, image_name, candidate);
+            published_tag(&candidate_ref)
+        },
+    )
+}
+
+fn resolve_wildcard_version_from_lookup(
+    image_name: &str,
+    wildcard_prefix: &str,
+    sha: &str,
+    mut lookup: impl FnMut(&str) -> Result<Option<PublishedTag>, String>,
+) -> Result<String, String> {
     let mut sequence = 0_u64;
     loop {
         let candidate = format!("{wildcard_prefix}{sequence}");
-        let candidate_ref = image_ref(&resolver.registry, image_name, &candidate);
-        match manifest_metadata(&candidate_ref)? {
-            Some(existing) if existing.revision.as_deref() == Some(resolver.sha.as_str()) => {
-                return Ok(candidate);
-            }
-            Some(existing) if existing.signature == sha_signature => {
+        match lookup(&candidate)? {
+            Some(existing) if existing.revision.as_deref() == Some(sha) => {
                 return Ok(candidate);
             }
             Some(_) => {}
@@ -321,25 +329,19 @@ fn image_ref(registry: &str, image: &str, tag: &str) -> String {
     format!("{registry}/{image}:{tag}")
 }
 
-fn manifest_metadata(reference: &str) -> Result<Option<ManifestMetadata>, String> {
+fn published_tag(reference: &str) -> Result<Option<PublishedTag>, String> {
     let raw = match inspect_raw_manifest(reference)? {
         Some(raw) => raw,
         None => return Ok(None),
     };
-    manifest_metadata_from_raw(reference, &raw).map(Some)
+    published_tag_from_raw(reference, &raw).map(Some)
 }
 
-fn manifest_metadata_from_raw(reference: &str, raw: &str) -> Result<ManifestMetadata, String> {
-    let mut manifest: Value = serde_json::from_str(raw)
+fn published_tag_from_raw(reference: &str, raw: &str) -> Result<PublishedTag, String> {
+    let manifest: Value = serde_json::from_str(raw)
         .map_err(|err| format!("failed to parse manifest for {reference}: {err}"))?;
     let revision = manifest_revision(&manifest).map(ToOwned::to_owned);
-    normalize_manifest(&mut manifest);
-    let signature = serde_json::to_string(&manifest)
-        .map_err(|err| format!("failed to serialize normalized manifest for {reference}: {err}"))?;
-    Ok(ManifestMetadata {
-        signature,
-        revision,
-    })
+    Ok(PublishedTag { revision })
 }
 
 fn inspect_raw_manifest(reference: &str) -> Result<Option<String>, String> {
@@ -389,43 +391,6 @@ fn manifest_revision(manifest: &Value) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-fn normalize_manifest(manifest: &mut Value) {
-    let Some(entries) = manifest.get_mut("manifests").and_then(Value::as_array_mut) else {
-        return;
-    };
-
-    entries.sort_by_key(manifest_sort_key);
-}
-
-fn manifest_sort_key(manifest: &Value) -> (String, String, String, String) {
-    let platform = manifest
-        .get("platform")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let os = platform
-        .get("os")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let arch = platform
-        .get("architecture")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let variant = platform
-        .get("variant")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let digest = manifest
-        .get("digest")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    (os, arch, variant, digest)
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -433,7 +398,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CliArgs, ResolverConfig, manifest_metadata_from_raw, manifest_revision, parse_args_from,
+        CliArgs, PublishedTag, ResolverConfig, manifest_revision, parse_args_from,
+        published_tag_from_raw, resolve_wildcard_version_from_lookup,
     };
 
     #[test]
@@ -490,60 +456,56 @@ mod tests {
     }
 
     #[test]
-    fn manifest_metadata_preserves_revision_when_normalizing_signature() {
+    fn published_tag_reads_revision_from_raw_manifest() {
         let raw = json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.index.v1+json",
             "annotations": {
                 "org.opencontainers.image.revision": "abc123"
-            },
-            "manifests": [
-                {
-                    "digest": "sha256:b",
-                    "platform": {
-                        "architecture": "arm64",
-                        "os": "linux"
-                    }
-                },
-                {
-                    "digest": "sha256:a",
-                    "platform": {
-                        "architecture": "amd64",
-                        "os": "linux"
-                    }
-                }
-            ]
+            }
         });
 
-        let metadata = manifest_metadata_from_raw("test-ref", &raw.to_string())
-            .expect("manifest metadata should parse");
+        let tag = published_tag_from_raw("test-ref", &raw.to_string())
+            .expect("published tag should parse");
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&metadata.signature)
-                .expect("normalized signature should be valid json"),
-            json!({
-                "annotations": {
-                    "org.opencontainers.image.revision": "abc123"
-                },
-                "manifests": [
-                    {
-                        "digest": "sha256:a",
-                        "platform": {
-                            "architecture": "amd64",
-                            "os": "linux"
-                        }
-                    },
-                    {
-                        "digest": "sha256:b",
-                        "platform": {
-                            "architecture": "arm64",
-                            "os": "linux"
-                        }
-                    }
-                ],
-                "mediaType": "application/vnd.oci.image.index.v1+json",
-                "schemaVersion": 2
-            })
+            tag,
+            PublishedTag {
+                revision: Some("abc123".to_string())
+            }
         );
-        assert_eq!(metadata.revision, Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn wildcard_resolution_reuses_existing_version_for_same_revision() {
+        let resolved =
+            resolve_wildcard_version_from_lookup("amber-cli", "v0.3.", "abc123", |tag| {
+                Ok(match tag {
+                    "v0.3.0" => Some(PublishedTag {
+                        revision: Some("old-sha".to_string()),
+                    }),
+                    "v0.3.1" => Some(PublishedTag {
+                        revision: Some("abc123".to_string()),
+                    }),
+                    _ => None,
+                })
+            })
+            .expect("wildcard version should resolve");
+        assert_eq!(resolved, "v0.3.1");
+    }
+
+    #[test]
+    fn wildcard_resolution_uses_first_missing_version_before_build_exists() {
+        let resolved =
+            resolve_wildcard_version_from_lookup("amber-cli", "v0.3.", "abc123", |tag| {
+                Ok(match tag {
+                    "v0.3.0" => Some(PublishedTag {
+                        revision: Some("old-sha".to_string()),
+                    }),
+                    "v0.3.1" => Some(PublishedTag { revision: None }),
+                    _ => None,
+                })
+            })
+            .expect("wildcard version should resolve");
+        assert_eq!(resolved, "v0.3.2");
     }
 }
