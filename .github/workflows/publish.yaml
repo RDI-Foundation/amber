@@ -330,6 +330,85 @@ jobs:
           rm -f "$expected_file"
           exit "$missing"
 
+  kubernetes-tests:
+    name: Kubernetes Reporter Tests (prebuilt images)
+    runs-on: ubuntu-latest
+    needs: [merge-manifests, resolved-version-tags]
+    permissions:
+      contents: read
+      packages: read
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Ensure KinD is available
+        run: |
+          if ! command -v kind >/dev/null 2>&1; then
+            curl -fsSL -o /tmp/kind https://kind.sigs.k8s.io/dl/v0.22.0/kind-linux-amd64
+            chmod +x /tmp/kind
+            sudo mv /tmp/kind /usr/local/bin/kind
+          fi
+      - name: Ensure kubectl is available
+        run: |
+          if ! command -v kubectl >/dev/null 2>&1; then
+            curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            chmod +x /tmp/kubectl
+            sudo mv /tmp/kubectl /usr/local/bin/kubectl
+          fi
+      - name: Create shared KinD cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+          cluster_name="amber-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          kubeconfig="${RUNNER_TEMP}/amber-kind-kubeconfig"
+          kind create cluster --name "$cluster_name" --kubeconfig "$kubeconfig" --wait 120s
+          echo "AMBER_TEST_KIND_CLUSTER_NAME=${cluster_name}" >> "$GITHUB_ENV"
+          echo "AMBER_TEST_KIND_KUBECONFIG=${kubeconfig}" >> "$GITHUB_ENV"
+      - name: Read image registry
+        id: registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_registry="$(jq -r '.registry' docker/images.json)"
+          if [ -z "$image_registry" ] || [ "$image_registry" = "null" ]; then
+            echo "docker/images.json registry is missing" >&2
+            exit 1
+          fi
+          image_registry="${image_registry%/}"
+          echo "IMAGE_REGISTRY=${image_registry}" >> "$GITHUB_ENV"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull and retag images for tests
+        shell: bash
+        env:
+          VERSION_TAGS_JSON: ${{ needs.resolved-version-tags.outputs.json }}
+        run: |
+          SOURCE_IMAGE_REGISTRY="$IMAGE_REGISTRY" \
+          TARGET_IMAGE_REGISTRY="$IMAGE_REGISTRY" \
+          SOURCE_IMAGE_TAG="$GITHUB_SHA" \
+          ./.github/scripts/prepare_prebuilt_images.sh
+      - name: Run Kubernetes smoke tests (prebuilt images)
+        env:
+          AMBER_TEST_USE_PREBUILT_IMAGES: "1"
+        run: |
+          cargo test -p amber-compiler --all-features kubernetes_smoke_config_roundtrip -- --ignored --test-threads=1
+          cargo test -p amber-compiler --all-features kubernetes_smoke_external_slot_routes_to_outside_service -- --ignored --test-threads=1
+          cargo test -p amber-compiler --all-features kubernetes_smoke_export_routes_to_host -- --ignored --test-threads=1
+      - name: Delete shared KinD cluster
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${AMBER_TEST_KIND_CLUSTER_NAME:-}" ]; then
+            kind delete cluster --name "${AMBER_TEST_KIND_CLUSTER_NAME}" --kubeconfig "${AMBER_TEST_KIND_KUBECONFIG}"
+          fi
+
   docker-tests:
     name: Docker Smoke Tests (prebuilt images)
     runs-on: ubuntu-latest
@@ -364,24 +443,13 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Pull and retag images for tests
         shell: bash
+        env:
+          VERSION_TAGS_JSON: ${{ needs.resolved-version-tags.outputs.json }}
         run: |
-          set -euo pipefail
-          version_tags_json='${{ needs.resolved-version-tags.outputs.json }}'
-          while IFS= read -r spec; do
-            [ -z "$spec" ] && continue
-            name="$(jq -r '.name' <<< "$spec")"
-            version="$(jq -r '.version' <<< "$spec")"
-            runtime_tag="$(jq -r '.runtime_tag' <<< "$spec")"
-            src="${IMAGE_REGISTRY}/${name}:${GITHUB_SHA}"
-            docker pull "$src"
-            docker tag "$src" "${IMAGE_REGISTRY}/${name}:${version}"
-            if [ "$runtime_tag" != "$version" ]; then
-              docker tag "$src" "${IMAGE_REGISTRY}/${name}:${runtime_tag}"
-            fi
-            if [ "$name" = "amber-helper" ]; then
-              docker tag "$src" "amber-helper:e2e"
-            fi
-          done < <(jq -c '.images[]' <<< "$version_tags_json")
+          SOURCE_IMAGE_REGISTRY="$IMAGE_REGISTRY" \
+          TARGET_IMAGE_REGISTRY="$IMAGE_REGISTRY" \
+          SOURCE_IMAGE_TAG="$GITHUB_SHA" \
+          ./.github/scripts/prepare_prebuilt_images.sh
       - name: Run docker compose smoke tests
         run: |
           cargo test -p amber-compiler --all-features docker_smoke_ocap_blocks_unbound_callers -- --ignored --test-threads=1
@@ -507,7 +575,7 @@ jobs:
     name: Publish npm packages
     runs-on: ubuntu-latest
     if: ${{ needs.npm-publish-config.outputs.enabled == 'true' }}
-    needs: [npm-publish-config, npm-binary-artifacts, verify-image-tags, docker-tests]
+    needs: [npm-publish-config, npm-binary-artifacts, verify-image-tags, kubernetes-tests, docker-tests]
     permissions:
       contents: read
       packages: read
