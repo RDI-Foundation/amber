@@ -658,6 +658,7 @@ async fn handle(mut req: Request<ProxyBody>, conn: Arc<ConnState>) -> Response<P
             conn.state.clone(),
             &id,
             Some(&version_prefix),
+            true,
         )
         .await
         {
@@ -668,18 +669,20 @@ async fn handle(mut req: Request<ProxyBody>, conn: Arc<ConnState>) -> Response<P
     }
 
     if req.method() == Method::POST && is_create_endpoint(&segs, "networks") {
-        let req = match prepare_labeled_create_request(req, conn.state.clone(), &id, None).await {
-            Ok(value) => value,
-            Err(resp) => return resp,
-        };
+        let req =
+            match prepare_labeled_create_request(req, conn.state.clone(), &id, None, false).await {
+                Ok(value) => value,
+                Err(resp) => return resp,
+            };
         return forward(req, conn.state.clone()).await;
     }
 
     if req.method() == Method::POST && is_create_endpoint(&segs, "volumes") {
-        let req = match prepare_labeled_create_request(req, conn.state.clone(), &id, None).await {
-            Ok(value) => value,
-            Err(resp) => return resp,
-        };
+        let req =
+            match prepare_labeled_create_request(req, conn.state.clone(), &id, None, false).await {
+                Ok(value) => value,
+                Err(resp) => return resp,
+            };
         return forward(req, conn.state.clone()).await;
     }
 
@@ -859,6 +862,7 @@ async fn prepare_labeled_create_request(
     state: Arc<State>,
     id: &CallerIdentity,
     authorize_container_refs_version_prefix: Option<&str>,
+    normalize_container_default_network: bool,
 ) -> Result<Request<ProxyBody>, Response<ProxyBody>> {
     let (parts, body) = req.into_parts();
     let collected = body
@@ -875,7 +879,8 @@ async fn prepare_labeled_create_request(
     }
 
     let to_set = owner_label_pairs(&state, id);
-    let new_body = inject_labels_into_create_body(raw, &to_set).map_err(|resp| *resp)?;
+    let new_body = rewrite_create_body(raw, &to_set, normalize_container_default_network)
+        .map_err(|resp| *resp)?;
 
     let mut req = Request::from_parts(parts, box_body_from_bytes(new_body.clone()));
     set_content_length(&mut req, new_body.len());
@@ -1642,9 +1647,10 @@ fn merge_required_labels(
     Ok(())
 }
 
-fn inject_labels_into_create_body(
+fn rewrite_create_body(
     body: Bytes,
     to_set: &[(String, String)],
+    normalize_container_default_network: bool,
 ) -> GatewayResult<Bytes> {
     let mut value: serde_json::Value = serde_json::from_slice(&body).map_err(|err| {
         boxed_response(docker_error(
@@ -1662,6 +1668,10 @@ fn inject_labels_into_create_body(
             "expected JSON object body",
         ))
     })?;
+
+    if normalize_container_default_network {
+        normalize_container_default_network_mode(obj)?;
+    }
 
     let labels_val = obj
         .entry("Labels")
@@ -1685,6 +1695,48 @@ fn inject_labels_into_create_body(
         ))
     })?;
     Ok(Bytes::from(out))
+}
+
+fn normalize_container_default_network_mode(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+) -> GatewayResult<()> {
+    let uses_implicit_default_network = obj
+        .get("HostConfig")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|host_config| host_config.get("NetworkMode"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .is_none_or(|mode| mode.is_empty() || mode.eq_ignore_ascii_case("default"));
+
+    let has_explicit_endpoints = obj
+        .get("NetworkingConfig")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|networking_config| networking_config.get("EndpointsConfig"))
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|endpoints| !endpoints.is_empty());
+
+    if !uses_implicit_default_network || has_explicit_endpoints {
+        return Ok(());
+    }
+
+    // Plain `docker create` uses the daemon's builtin default network. Once we add a Compose
+    // project label, Docker resolves `default` as `<project>_default` unless we make the builtin
+    // bridge selection explicit.
+    let host_config = obj
+        .entry("HostConfig")
+        .or_insert_with(|| serde_json::Value::Object(Default::default()))
+        .as_object_mut()
+        .ok_or_else(|| {
+            boxed_response(docker_error(
+                StatusCode::BAD_REQUEST,
+                "HostConfig must be a JSON object",
+            ))
+        })?;
+    host_config.insert(
+        "NetworkMode".to_string(),
+        serde_json::Value::String("bridge".to_string()),
+    );
+    Ok(())
 }
 
 fn wants_upgrade(req: &Request<ProxyBody>) -> bool {
@@ -2342,6 +2394,33 @@ mod tests {
         }
     }
 
+    async fn reachable_docker_socket_for_ignored_e2e() -> Option<PathBuf> {
+        let Some(docker_sock) = docker_socket_for_ignored_e2e() else {
+            eprintln!("skipping docker daemon e2e: no docker unix socket found");
+            return None;
+        };
+
+        if UnixStream::connect(&docker_sock).await.is_err() {
+            eprintln!(
+                "skipping docker daemon e2e: docker socket exists but is not reachable at {}",
+                docker_sock.display()
+            );
+            return None;
+        }
+
+        let ping = send_docker_request(&docker_sock, Method::GET, "/_ping", None).await;
+        if ping.status != StatusCode::OK {
+            eprintln!(
+                "skipping docker daemon e2e: /_ping returned {} with body {}",
+                ping.status,
+                String::from_utf8_lossy(&ping.body)
+            );
+            return None;
+        }
+
+        Some(docker_sock)
+    }
+
     async fn docker_image_for_ignored_e2e(docker_sock: &PathBuf) -> Option<String> {
         let busybox_tag = "busybox:latest";
         let busybox_inspect = send_docker_request(
@@ -2549,7 +2628,7 @@ mod tests {
     fn inject_labels_adds_missing_labels() {
         let body = Bytes::from(r#"{"Image":"busybox"}"#);
         let labels = vec![("com.example.owner".to_string(), "alice".to_string())];
-        let out = inject_labels_into_create_body(body, &labels).expect("inject labels");
+        let out = rewrite_create_body(body, &labels, false).expect("inject labels");
         let parsed: serde_json::Value = serde_json::from_slice(&out).expect("valid json");
         let labels = parsed
             .get("Labels")
@@ -2558,6 +2637,55 @@ mod tests {
         assert_eq!(
             labels.get("com.example.owner").and_then(|v| v.as_str()),
             Some("alice")
+        );
+    }
+
+    #[test]
+    fn rewrite_create_body_normalizes_implicit_default_network_to_bridge() {
+        let body = Bytes::from(
+            r#"{
+                "Image":"busybox",
+                "HostConfig":{"NetworkMode":"default"},
+                "NetworkingConfig":{"EndpointsConfig":{}}
+            }"#,
+        );
+        let out = rewrite_create_body(body, &[], true).expect("rewrite create body");
+        let parsed: serde_json::Value = serde_json::from_slice(&out).expect("valid json");
+
+        assert_eq!(
+            parsed
+                .get("HostConfig")
+                .and_then(|value| value.get("NetworkMode"))
+                .and_then(|value| value.as_str()),
+            Some("bridge")
+        );
+    }
+
+    #[test]
+    fn rewrite_create_body_preserves_explicit_network_targets() {
+        let body = Bytes::from(
+            r#"{
+                "Image":"busybox",
+                "HostConfig":{"NetworkMode":"app-net"},
+                "NetworkingConfig":{"EndpointsConfig":{"side-net":{}}}
+            }"#,
+        );
+        let out = rewrite_create_body(body, &[], true).expect("rewrite create body");
+        let parsed: serde_json::Value = serde_json::from_slice(&out).expect("valid json");
+
+        assert_eq!(
+            parsed
+                .get("HostConfig")
+                .and_then(|value| value.get("NetworkMode"))
+                .and_then(|value| value.as_str()),
+            Some("app-net")
+        );
+        assert!(
+            parsed
+                .get("NetworkingConfig")
+                .and_then(|value| value.get("EndpointsConfig"))
+                .and_then(|value| value.get("side-net"))
+                .is_some()
         );
     }
 
@@ -3379,6 +3507,27 @@ mod tests {
         assert!(paths.contains("/networks/side-net"));
         assert!(paths.contains("/volumes/shared-vol"));
         assert!(paths.contains("/containers/create"));
+
+        let create_req = requests
+            .iter()
+            .find(|req| req.method == Method::POST && req.path == "/containers/create")
+            .expect("create should be forwarded");
+        let forwarded: serde_json::Value =
+            serde_json::from_slice(&create_req.body).expect("forwarded body json");
+        assert_eq!(
+            forwarded
+                .get("HostConfig")
+                .and_then(|value| value.get("NetworkMode"))
+                .and_then(|value| value.as_str()),
+            Some("app-net")
+        );
+        assert!(
+            forwarded
+                .get("NetworkingConfig")
+                .and_then(|value| value.get("EndpointsConfig"))
+                .and_then(|value| value.get("side-net"))
+                .is_some()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4106,29 +4255,116 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires a reachable Docker daemon via DOCKER_HOST, ~/.docker/run/docker.sock, or \
                 /var/run/docker.sock"]
-    async fn docker_daemon_e2e_enforces_scoping_and_policy() {
-        let Some(docker_sock) = docker_socket_for_ignored_e2e() else {
-            eprintln!("skipping docker daemon e2e: no docker unix socket found");
+    async fn docker_daemon_e2e_issue_84_default_network_container_create_succeeds() {
+        let Some(docker_sock) = reachable_docker_socket_for_ignored_e2e().await else {
             return;
         };
 
-        if UnixStream::connect(&docker_sock).await.is_err() {
-            eprintln!(
-                "skipping docker daemon e2e: docker socket exists but is not reachable at {}",
-                docker_sock.display()
-            );
+        let Some(image) = docker_image_for_ignored_e2e(&docker_sock).await else {
             return;
-        }
+        };
 
-        let ping = send_docker_request(&docker_sock, Method::GET, "/_ping", None).await;
-        if ping.status != StatusCode::OK {
-            eprintln!(
-                "skipping docker daemon e2e: /_ping returned {} with body {}",
-                ping.status,
-                String::from_utf8_lossy(&ping.body)
-            );
+        let suffix = unique_test_suffix();
+        let compose_project = format!("amber-gw-e2e-project-{suffix}");
+        let component = format!("amber-gw-e2e-component-{suffix}");
+        let container_name = format!("amber-gw-default-net-{suffix}");
+
+        let listen = reserve_loopback_socket_addr();
+        let config = DockerGatewayConfig {
+            listen,
+            docker_sock: docker_sock.clone(),
+            compose_project: compose_project.clone(),
+            callers: vec![CallerConfig {
+                host: "127.0.0.1".to_string(),
+                port: None,
+                component: component.clone(),
+                compose_service: component,
+            }],
+        };
+
+        let gateway_task = tokio::spawn(async move {
+            if let Err(err) = run(config).await {
+                panic!("gateway run failed in issue #84 e2e test: {err}");
+            }
+        });
+        wait_until_gateway_listens(listen, &gateway_task).await;
+
+        // This matches the default-network semantics `docker create` sends to the Engine API.
+        let create_body = serde_json::json!({
+            "Image": image,
+            "Cmd": ["true"],
+            "Labels": {},
+            "HostConfig": {
+                "NetworkMode": "default"
+            },
+            "NetworkingConfig": {
+                "EndpointsConfig": {}
+            }
+        })
+        .to_string();
+
+        let create = send_gateway_request(
+            listen,
+            Method::POST,
+            &format!("/containers/create?name={container_name}"),
+            &[("content-type", "application/json")],
+            create_body.as_bytes(),
+        )
+        .await;
+
+        assert!(
+            create.status.is_success(),
+            "issue #84 create failed via gateway: {} body={}",
+            create.status,
+            String::from_utf8_lossy(&create.body)
+        );
+
+        let inspect = send_docker_request(
+            &docker_sock,
+            Method::GET,
+            &format!("/containers/{container_name}/json"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            inspect.status,
+            StatusCode::OK,
+            "issue #84 inspect after create failed: {} body={}",
+            inspect.status,
+            String::from_utf8_lossy(&inspect.body)
+        );
+        let inspect_value: serde_json::Value =
+            serde_json::from_slice(&inspect.body).expect("container inspect json");
+        assert_eq!(
+            inspect_value
+                .get("HostConfig")
+                .and_then(|value| value.get("NetworkMode"))
+                .and_then(|value| value.as_str()),
+            Some("bridge")
+        );
+        let labels = inspect_value
+            .get("Config")
+            .and_then(|value| value.get("Labels"))
+            .and_then(|value| value.as_object())
+            .expect("container labels");
+        assert_eq!(
+            labels
+                .get(COMPOSE_PROJECT_LABEL)
+                .and_then(|value| value.as_str()),
+            Some(compose_project.as_str())
+        );
+
+        gateway_task.abort();
+        docker_delete_container_best_effort(&docker_sock, &container_name).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a reachable Docker daemon via DOCKER_HOST, ~/.docker/run/docker.sock, or \
+                /var/run/docker.sock"]
+    async fn docker_daemon_e2e_enforces_scoping_and_policy() {
+        let Some(docker_sock) = reachable_docker_socket_for_ignored_e2e().await else {
             return;
-        }
+        };
 
         let suffix = unique_test_suffix();
         let compose_project = format!("amber-gw-e2e-project-{suffix}");
@@ -4427,28 +4663,9 @@ mod tests {
     #[ignore = "requires a reachable Docker daemon via DOCKER_HOST, ~/.docker/run/docker.sock, or \
                 /var/run/docker.sock"]
     async fn docker_daemon_e2e_enforces_multicaller_container_exec_and_upgrade() {
-        let Some(docker_sock) = docker_socket_for_ignored_e2e() else {
-            eprintln!("skipping docker daemon e2e: no docker unix socket found");
+        let Some(docker_sock) = reachable_docker_socket_for_ignored_e2e().await else {
             return;
         };
-
-        if UnixStream::connect(&docker_sock).await.is_err() {
-            eprintln!(
-                "skipping docker daemon e2e: docker socket exists but is not reachable at {}",
-                docker_sock.display()
-            );
-            return;
-        }
-
-        let ping = send_docker_request(&docker_sock, Method::GET, "/_ping", None).await;
-        if ping.status != StatusCode::OK {
-            eprintln!(
-                "skipping docker daemon e2e: /_ping returned {} with body {}",
-                ping.status,
-                String::from_utf8_lossy(&ping.body)
-            );
-            return;
-        }
 
         let Some(image) = docker_image_for_ignored_e2e(&docker_sock).await else {
             return;
