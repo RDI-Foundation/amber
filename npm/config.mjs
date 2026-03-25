@@ -6,9 +6,11 @@
 // - Docker image defaults to `name`
 // - Cargo package defaults to the Docker image name
 // - binary name defaults to `name`
-// - Linux x64 and arm64 packages are produced from the published Docker images
+// - Linux x64 and arm64 artifacts are produced from the published Docker images
 // - Docker-side binary path defaults to `/${binary_name}`
-// - macOS arm64 packages are only produced when `publish_macos: true`
+// - macOS arm64 artifacts are only produced when `publish_macos: true`
+// - runtime packages publish one top-level npm package plus one platform package per
+//   supported OS/arch combination
 
 export default {
   scope: "@rdif",
@@ -19,7 +21,6 @@ export default {
       description: "Amber CLI compiler binary",
       binary_name: "amber",
       docker_image: "amber-cli",
-      publish: false,
       publish_macos: true,
     },
     {
@@ -34,32 +35,15 @@ export default {
       docker_image: "amber-router",
       publish_macos: true,
     },
-    {
-      name: "amber-provisioner",
-      description: "Amber provisioner runtime binary",
-      docker_image: "amber-provisioner",
-    },
-    {
-      name: "amber-docker-gateway",
-      description: "Amber Docker gateway runtime binary",
-      docker_image: "amber-docker-gateway",
-    },
-    {
-      name: "amber-manager",
-      description: "Amber scenario manager binary",
-      docker_image: "amber-manager",
-      docker_binary_path: "/usr/local/bin/amber-manager",
-    },
   ],
 
-  bundles: [
+  runtime_packages: [
     {
       name: "amber",
       description: "Amber CLI plus the local runtime binaries required by amber run",
       version: "v0.3.x",
-      binary_name: "amber",
-      entry_package: "amber-cli",
-      dependencies: ["amber-router", "amber-helper"],
+      entry_binary_package: "amber-cli",
+      runtime_binaries: ["amber-cli", "amber-router", "amber-helper"],
     },
   ],
 };

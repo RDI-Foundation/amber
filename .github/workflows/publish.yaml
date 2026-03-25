@@ -458,53 +458,24 @@ jobs:
       - name: Run helper docker smoke test
         run: cargo test -p amber-helper --all-features helper_image_executes_run_plan_in_scratch -- --ignored --test-threads=1
 
-  npm-publish-config:
-    name: Resolve npm publish config
-    runs-on: ubuntu-latest
-    outputs:
-      enabled: ${{ steps.check.outputs.enabled }}
-    steps:
-      - name: Check whether npm publishing is configured
-        id: check
-        shell: bash
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -n "${NPM_TOKEN:-}" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-          fi
-
   npm-binary-matrix:
     name: npm Binary Matrix
     runs-on: ubuntu-latest
-    needs: npm-publish-config
     outputs:
       build_matrix: ${{ steps.matrix.outputs.build_matrix }}
     steps:
       - uses: actions/checkout@v5
-        if: needs.npm-publish-config.outputs.enabled == 'true'
       - uses: actions/setup-node@v4
-        if: needs.npm-publish-config.outputs.enabled == 'true'
         with:
-          node-version: 22
+          node-version: 22.14.0
           cache: npm
           cache-dependency-path: npm/package-lock.json
       - name: Install npm release tooling
-        if: needs.npm-publish-config.outputs.enabled == 'true'
         working-directory: npm
         run: npm ci
       - name: Build npm binary matrix
         id: matrix
-        shell: bash
         run: |
-          set -euo pipefail
-          if [ "${{ needs.npm-publish-config.outputs.enabled }}" != "true" ]; then
-            echo 'build_matrix={"include":[]}' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           mkdir -p .tmp
           node npm/release.mjs spec > .tmp/npm-release-spec.json
           matrix="$(node npm/release.mjs matrix --spec .tmp/npm-release-spec.json)"
@@ -513,8 +484,7 @@ jobs:
   npm-binary-artifacts:
     name: Build npm binary artifacts (${{ matrix.package_dir }} ${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
-    if: ${{ needs.npm-publish-config.outputs.enabled == 'true' }}
-    needs: [npm-publish-config, merge-manifests, npm-binary-matrix]
+    needs: [merge-manifests, npm-binary-matrix]
     permissions:
       contents: read
       packages: read
@@ -528,7 +498,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 22.14.0
           cache: npm
           cache-dependency-path: npm/package-lock.json
       - name: Install npm release tooling
@@ -574,39 +544,30 @@ jobs:
   npm-packages:
     name: Publish npm packages
     runs-on: ubuntu-latest
-    if: ${{ needs.npm-publish-config.outputs.enabled == 'true' }}
-    needs: [npm-publish-config, npm-binary-artifacts, verify-image-tags, kubernetes-tests, docker-tests]
+    needs: [resolved-version-tags, npm-binary-artifacts, verify-image-tags, kubernetes-tests, docker-tests]
     permissions:
       contents: read
+      id-token: write
       packages: read
-    env:
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 22.14.0
           registry-url: https://registry.npmjs.org
           cache: npm
           cache-dependency-path: npm/package-lock.json
+      - name: Install npm CLI for trusted publishing
+        run: npm install -g npm@^11.5.1
       - name: Install npm release tooling
         working-directory: npm
         run: npm ci
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: nightly-2025-10-30
       - name: Download npm binary artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: npm-binary-*
           path: .tmp/npm-binary-artifacts
           merge-multiple: true
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Publish npm release
         run: |
           mkdir -p .tmp
@@ -615,7 +576,7 @@ jobs:
             --spec .tmp/npm-release-spec.json \
             --artifact-root .tmp/npm-binary-artifacts \
             --out-dir .tmp/npm-packages \
-            --sha "${{ github.sha }}"
+            --version-floor "${{ needs.resolved-version-tags.outputs.amber_cli_version }}"
 
   cli-artifacts:
     name: Build amber-cli artifacts (${{ matrix.platform }})

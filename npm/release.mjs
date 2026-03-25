@@ -4,7 +4,6 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pack from "libnpmpack";
-import libnpmpublish from "libnpmpublish";
 import npmFetch from "npm-registry-fetch";
 
 import config from "./config.mjs";
@@ -13,13 +12,16 @@ const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const WORKSPACE_ROOT = path.resolve(SCRIPT_DIR, "..");
 const PACKAGE_FILES_DIR = path.join(SCRIPT_DIR, "package-files");
 const NPM_REGISTRY = "https://registry.npmjs.org/";
-const { publish: publishPackage } = libnpmpublish;
 
 function fail(message) {
   throw new Error(message);
 }
 
 function parseFlagArgs(argv) {
+  if (argv.length % 2 !== 0) {
+    fail(`expected flag/value pairs, got: ${argv.join(" ")}`);
+  }
+
   const args = new Map();
 
   for (let index = 0; index < argv.length; index += 2) {
@@ -87,7 +89,7 @@ function stripLeadingV(version) {
   return version.startsWith("v") ? version.slice(1) : version;
 }
 
-function npmVersionFromDockerVersion(version) {
+function npmVersionFromTag(version) {
   const npmVersion = stripLeadingV(version.trim());
   if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(npmVersion)) {
     fail(`invalid npm version derived from ${version}`);
@@ -96,11 +98,31 @@ function npmVersionFromDockerVersion(version) {
 }
 
 function wildcardCandidate(versionSpec, sequence) {
-  return npmVersionFromDockerVersion(`${versionSpec.slice(0, -1)}${sequence}`);
+  return npmVersionFromTag(`${versionSpec.slice(0, -1)}${sequence}`);
 }
 
 function wildcardSeed(versionSpec) {
   return wildcardCandidate(versionSpec, 0);
+}
+
+function wildcardPrefix(versionSpec) {
+  return stripLeadingV(versionSpec.trim()).slice(0, -1);
+}
+
+function wildcardSequence(versionSpec, version) {
+  const normalizedVersion = npmVersionFromTag(version);
+  const prefix = wildcardPrefix(versionSpec);
+
+  if (!normalizedVersion.startsWith(prefix)) {
+    fail(`version ${version} does not match wildcard series ${versionSpec}`);
+  }
+
+  const sequence = normalizedVersion.slice(prefix.length);
+  if (!/^\d+$/.test(sequence)) {
+    fail(`version ${version} does not end with a numeric wildcard sequence for ${versionSpec}`);
+  }
+
+  return Number(sequence);
 }
 
 function scopedPackageName(name) {
@@ -109,6 +131,14 @@ function scopedPackageName(name) {
 
 function packageDir(root, name) {
   return path.join(root, name);
+}
+
+function runtimePlatformDirName(runtimePackage, platform) {
+  return `${runtimePackage.name}-${platform.name}`;
+}
+
+function runtimePlatformPackageName(runtimePackage, platform) {
+  return scopedPackageName(runtimePlatformDirName(runtimePackage, platform));
 }
 
 function expandBinaryPackage(entry) {
@@ -122,12 +152,16 @@ function expandBinaryPackage(entry) {
       runner: "ubuntu-latest",
       source: "docker",
       binary_path: dockerBinaryPath,
+      os: "linux",
+      cpu: "x64",
     },
     {
       name: "linux-arm64",
       runner: "ubuntu-24.04-arm",
       source: "docker",
       binary_path: dockerBinaryPath,
+      os: "linux",
+      cpu: "arm64",
     },
   ];
 
@@ -138,65 +172,121 @@ function expandBinaryPackage(entry) {
       source: "cargo",
       cargo_package: cargoPackage,
       target: "aarch64-apple-darwin",
+      os: "darwin",
+      cpu: "arm64",
     });
   }
 
   return {
     name: entry.name,
-    package_name: scopedPackageName(entry.name),
     description: entry.description ?? `Amber ${binaryName} binary`,
     docker_image: dockerImage,
     cargo_package: cargoPackage,
     binary_name: binaryName,
-    publish: entry.publish ?? true,
     platforms,
   };
 }
 
-function expandBundlePackage(entry, binariesByName) {
-  const entryPackageName = entry.entry_package ?? entry.binary_name ?? entry.name;
-  const entryPackage = binariesByName.get(entryPackageName);
-  if (!entryPackage) {
-    fail(`unknown bundle entry package ${entryPackageName}`);
+function ensureUnique(entries, kind) {
+  const seen = new Set();
+
+  for (const entry of entries) {
+    if (seen.has(entry.name)) {
+      fail(`duplicate ${kind} ${entry.name}`);
+    }
+    seen.add(entry.name);
+  }
+}
+
+function sharedPlatforms(binaryPackages) {
+  if (binaryPackages.length === 0) {
+    fail("runtime package must include at least one binary");
   }
 
-  const dependencies = entry.dependencies.map((name) => {
-    const binaryPackage = binariesByName.get(name);
-    if (!binaryPackage) {
-      fail(`unknown bundle dependency ${name}`);
-    }
+  const firstPlatforms = new Map(
+    binaryPackages[0].platforms.map((platform) => [
+      platform.name,
+      {
+        name: platform.name,
+        os: platform.os,
+        cpu: platform.cpu,
+      },
+    ]),
+  );
 
-    return {
-      name: binaryPackage.name,
-      package_name: binaryPackage.package_name,
-      binary_name: binaryPackage.binary_name,
-    };
+  for (const binaryPackage of binaryPackages.slice(1)) {
+    const platformsByName = new Map(binaryPackage.platforms.map((platform) => [platform.name, platform]));
+
+    for (const [platformName, sharedPlatform] of Array.from(firstPlatforms.entries())) {
+      const platform = platformsByName.get(platformName);
+      if (!platform) {
+        firstPlatforms.delete(platformName);
+        continue;
+      }
+      if (platform.os !== sharedPlatform.os || platform.cpu !== sharedPlatform.cpu) {
+        fail(
+          `binary ${binaryPackage.name} disagrees on ${platformName} metadata for runtime package`,
+        );
+      }
+    }
+  }
+
+  return Array.from(firstPlatforms.values());
+}
+
+function expandRuntimePackage(entry, binaryPackagesByName) {
+  const runtimeBinaries = entry.runtime_binaries.map((binaryName) => {
+    const binaryPackage = binaryPackagesByName.get(binaryName);
+    if (!binaryPackage) {
+      fail(`unknown runtime binary ${binaryName}`);
+    }
+    return binaryPackage;
   });
+
+  const entryBinaryPackage = binaryPackagesByName.get(entry.entry_binary_package);
+  if (!entryBinaryPackage) {
+    fail(`unknown entry binary package ${entry.entry_binary_package}`);
+  }
+  if (!runtimeBinaries.some((binaryPackage) => binaryPackage.name === entry.entry_binary_package)) {
+    fail(
+      `runtime package ${entry.name} entry binary package ${entry.entry_binary_package} must also be listed in runtime_binaries`,
+    );
+  }
+
+  const platforms = sharedPlatforms(runtimeBinaries);
+  if (platforms.length === 0) {
+    fail(`runtime package ${entry.name} has no shared supported platforms`);
+  }
 
   return {
     name: entry.name,
     package_name: scopedPackageName(entry.name),
-    description: entry.description ?? `Amber ${entry.name} bundle`,
+    description: entry.description ?? `Amber ${entry.name} runtime`,
     version_spec: entry.version,
-    entry_binary: entry.binary_name ?? entry.name,
-    entry_package: {
-      name: entryPackage.name,
-      binary_name: entryPackage.binary_name,
-      platforms: entryPackage.platforms,
-    },
-    dependencies,
+    entry_binary: entryBinaryPackage.binary_name,
+    entry_binary_package: entry.entry_binary_package,
+    runtime_binaries: runtimeBinaries.map((binaryPackage) => ({
+      name: binaryPackage.name,
+      binary_name: binaryPackage.binary_name,
+    })),
+    platforms,
   };
 }
 
 function expandedSpec() {
   const binaryPackages = config.binaries.map(expandBinaryPackage);
-  const binariesByName = new Map(binaryPackages.map((entry) => [entry.name, entry]));
-  const bundlePackages = config.bundles.map((entry) => expandBundlePackage(entry, binariesByName));
+  ensureUnique(binaryPackages, "binary package");
+
+  const binaryPackagesByName = new Map(binaryPackages.map((entry) => [entry.name, entry]));
+  const runtimePackages = config.runtime_packages.map((entry) =>
+    expandRuntimePackage(entry, binaryPackagesByName),
+  );
+  ensureUnique(runtimePackages, "runtime package");
 
   return {
     scope: config.scope,
     binary_packages: binaryPackages,
-    bundle_packages: bundlePackages,
+    runtime_packages: runtimePackages,
   };
 }
 
@@ -205,9 +295,26 @@ function readSpec(args) {
   return specPath ? readJson(specPath) : expandedSpec();
 }
 
+function requiredBinaryPackageNames(spec) {
+  const required = new Set();
+
+  for (const runtimePackage of spec.runtime_packages) {
+    for (const runtimeBinary of runtimePackage.runtime_binaries) {
+      required.add(runtimeBinary.name);
+    }
+  }
+
+  return required;
+}
+
+function requiredBinaryPackages(spec) {
+  const required = requiredBinaryPackageNames(spec);
+  return spec.binary_packages.filter((entry) => required.has(entry.name));
+}
+
 function matrixFromSpec(spec) {
   return {
-    include: spec.binary_packages.flatMap((binaryPackage) =>
+    include: requiredBinaryPackages(spec).flatMap((binaryPackage) =>
       binaryPackage.platforms.map((platform) => ({
         package_dir: binaryPackage.name,
         docker_image: binaryPackage.docker_image,
@@ -243,122 +350,114 @@ function commonPackageJson({ fullName, version, description }) {
   };
 }
 
-function stageBinaryPackage({ artifactRoot, outDir, binaryPackage, version }) {
-  const targetDir = packageDir(outDir, binaryPackage.name);
-  const artifacts = {};
+function runtimePlatformMap(runtimePackage) {
+  return Object.fromEntries(
+    runtimePackage.platforms.map((platform) => [platform.name, runtimePlatformPackageName(runtimePackage, platform)]),
+  );
+}
 
-  for (const platform of binaryPackage.platforms) {
+function stageRuntimePlatformPackage({
+  artifactRoot,
+  outDir,
+  runtimePackage,
+  binaryPackagesByName,
+  platform,
+  version,
+}) {
+  const targetDir = packageDir(outDir, runtimePlatformDirName(runtimePackage, platform));
+
+  for (const runtimeBinary of runtimePackage.runtime_binaries) {
+    const binaryPackage = binaryPackagesByName.get(runtimeBinary.name);
+    if (!binaryPackage) {
+      fail(`missing binary package ${runtimeBinary.name}`);
+    }
+
     const source = path.join(
       artifactRoot,
       binaryPackage.name,
       platform.name,
       binaryPackage.binary_name,
     );
-    const relativeTarget = path.join("artifacts", platform.name, binaryPackage.binary_name);
-    copyExecutable(source, path.join(targetDir, relativeTarget));
-    artifacts[platform.name] = relativeTarget;
+
+    if (binaryPackage.name === runtimePackage.entry_binary_package) {
+      copyExecutable(source, path.join(targetDir, "bin", runtimePackage.entry_binary));
+      continue;
+    }
+
+    copyExecutable(source, path.join(targetDir, "runtime-bin", binaryPackage.binary_name));
   }
 
   writeJson(path.join(targetDir, "package.json"), {
     ...commonPackageJson({
-      fullName: binaryPackage.package_name,
+      fullName: runtimePlatformPackageName(runtimePackage, platform),
       version,
-      description: binaryPackage.description,
+      description: `${runtimePackage.description} (${platform.name})`,
     }),
+    os: [platform.os],
+    cpu: [platform.cpu],
     bin: {
-      [binaryPackage.binary_name]: "./bin/run.cjs",
+      [runtimePackage.entry_binary]: `./bin/${runtimePackage.entry_binary}`,
     },
-    files: ["LICENSE", "artifacts", "bin", "lib"],
+    files: ["LICENSE", "bin", "runtime-bin"],
     amber: {
-      artifacts,
+      runtime_bin_dir: "runtime-bin",
     },
   });
   fs.copyFileSync(path.join(WORKSPACE_ROOT, "LICENSE"), path.join(targetDir, "LICENSE"));
-  copyPackageFile("platform.cjs", targetDir, "lib/platform.cjs");
-  copyPackageFile("binary-run.cjs", targetDir, "bin/run.cjs", 0o755);
 }
 
-function stageBundlePackage({ artifactRoot, outDir, bundlePackage, binaryPackageVersions }) {
-  const targetDir = packageDir(outDir, bundlePackage.name);
-  const runtimeDependencies = bundlePackage.dependencies.map((dependency) => ({
-    ...dependency,
-    version: binaryPackageVersions.get(dependency.name),
-  }));
-  const artifacts = {};
-
-  for (const platform of bundlePackage.entry_package.platforms) {
-    const source = path.join(
-      artifactRoot,
-      bundlePackage.entry_package.name,
-      platform.name,
-      bundlePackage.entry_package.binary_name,
-    );
-    const relativeTarget = path.join("artifacts", platform.name, bundlePackage.entry_binary);
-    copyExecutable(source, path.join(targetDir, relativeTarget));
-    artifacts[platform.name] = relativeTarget;
-  }
+function stageRuntimeWrapperPackage({ outDir, runtimePackage, version }) {
+  const targetDir = packageDir(outDir, runtimePackage.name);
+  const platformPackages = runtimePlatformMap(runtimePackage);
 
   writeJson(path.join(targetDir, "package.json"), {
     ...commonPackageJson({
-      fullName: bundlePackage.package_name,
-      version: wildcardSeed(bundlePackage.version_spec),
-      description: bundlePackage.description,
+      fullName: runtimePackage.package_name,
+      version,
+      description: runtimePackage.description,
     }),
     bin: {
-      [bundlePackage.entry_binary]: "./bin/run.cjs",
+      [runtimePackage.entry_binary]: "./bin/run.cjs",
     },
-    files: ["LICENSE", "artifacts", "bin", "lib"],
-    scripts: {
-      postinstall: "node ./lib/install-runtime.cjs",
-    },
-    dependencies: Object.fromEntries(
-      runtimeDependencies.map((dependency) => [dependency.package_name, dependency.version]),
+    files: ["LICENSE", "bin", "lib"],
+    optionalDependencies: Object.fromEntries(
+      Object.values(platformPackages).map((packageName) => [packageName, version]),
     ),
     amber: {
-      artifacts,
-      entry_binary: bundlePackage.entry_binary,
-      runtime_dependencies: runtimeDependencies.map((dependency) => ({
-        package_name: dependency.package_name,
-        binary_name: dependency.binary_name,
-      })),
+      entry_binary: runtimePackage.entry_binary,
+      platform_packages: platformPackages,
     },
   });
   fs.copyFileSync(path.join(WORKSPACE_ROOT, "LICENSE"), path.join(targetDir, "LICENSE"));
   copyPackageFile("platform.cjs", targetDir, "lib/platform.cjs");
-  copyPackageFile("bundle-install-runtime.cjs", targetDir, "lib/install-runtime.cjs", 0o755);
-  copyPackageFile("bundle-run.cjs", targetDir, "bin/run.cjs", 0o755);
+  copyPackageFile("installed-binary.cjs", targetDir, "lib/installed-binary.cjs");
+  copyPackageFile("runtime-run.cjs", targetDir, "bin/run.cjs", 0o755);
 }
 
-function stagePackages({ spec, dockerVersionTags, artifactRoot, outDir }) {
-  const dockerVersionsByImage = new Map(
-    dockerVersionTags.images.map((entry) => [entry.name, npmVersionFromDockerVersion(entry.version)]),
-  );
-  const binaryPackageVersions = new Map();
+function stagePackages({ spec, artifactRoot, outDir }) {
+  const binaryPackagesByName = new Map(spec.binary_packages.map((entry) => [entry.name, entry]));
 
   fs.rmSync(outDir, { recursive: true, force: true });
   fs.mkdirSync(outDir, { recursive: true });
 
-  for (const binaryPackage of spec.binary_packages) {
-    const version = dockerVersionsByImage.get(binaryPackage.docker_image);
-    if (!version) {
-      fail(`missing resolved docker version for ${binaryPackage.docker_image}`);
+  for (const runtimePackage of spec.runtime_packages) {
+    const version = wildcardSeed(runtimePackage.version_spec);
+
+    for (const platform of runtimePackage.platforms) {
+      stageRuntimePlatformPackage({
+        artifactRoot,
+        outDir,
+        runtimePackage,
+        binaryPackagesByName,
+        platform,
+        version,
+      });
     }
 
-    stageBinaryPackage({
-      artifactRoot,
+    stageRuntimeWrapperPackage({
       outDir,
-      binaryPackage,
+      runtimePackage,
       version,
-    });
-    binaryPackageVersions.set(binaryPackage.name, version);
-  }
-
-  for (const bundlePackage of spec.bundle_packages) {
-    stageBundlePackage({
-      artifactRoot,
-      outDir,
-      bundlePackage,
-      binaryPackageVersions,
     });
   }
 }
@@ -371,19 +470,7 @@ function writePackageJson(dir, packageJson) {
   writeJson(path.join(dir, "package.json"), packageJson);
 }
 
-function npmAuthToken() {
-  return process.env.NODE_AUTH_TOKEN || process.env.NPM_TOKEN || null;
-}
-
 function npmRegistryOptions() {
-  const token = npmAuthToken();
-  if (token) {
-    return {
-      registry: NPM_REGISTRY,
-      token,
-    };
-  }
-
   return {
     registry: NPM_REGISTRY,
   };
@@ -398,7 +485,10 @@ async function npmPack(dir) {
 
 async function npmViewIntegrity(packageName, version) {
   try {
-    const packument = await npmFetch.json(encodeURIComponent(packageName), npmRegistryOptions());
+    const packument = await npmFetch.json(encodeURIComponent(packageName), {
+      ...npmRegistryOptions(),
+      query: { write: true },
+    });
     return packument.versions?.[version]?.dist?.integrity ?? null;
   } catch (error) {
     if (error.code === "E404") {
@@ -408,51 +498,96 @@ async function npmViewIntegrity(packageName, version) {
   }
 }
 
-async function resolveBundleVersions({ spec, packageRoot }) {
-  for (const bundlePackage of spec.bundle_packages) {
-    const dir = packageDir(packageRoot, bundlePackage.name);
-    const original = readPackageJson(dir);
+function runtimePackageVersionFloors({ spec, versionFloor }) {
+  if (spec.runtime_packages.length !== 1) {
+    fail("publish-release requires explicit per-runtime version floor handling for multiple runtime packages");
+  }
+
+  const [runtimePackage] = spec.runtime_packages;
+  return new Map([
+    [runtimePackage.name, wildcardSequence(runtimePackage.version_spec, versionFloor)],
+  ]);
+}
+
+function setRuntimePackageVersion({ runtimePackage, packageRoot, version }) {
+  const wrapperDir = packageDir(packageRoot, runtimePackage.name);
+  const wrapperPackageJson = readPackageJson(wrapperDir);
+
+  writePackageJson(wrapperDir, {
+    ...wrapperPackageJson,
+    version,
+    optionalDependencies: Object.fromEntries(
+      Object.keys(wrapperPackageJson.optionalDependencies).map((packageName) => [packageName, version]),
+    ),
+  });
+
+  for (const platform of runtimePackage.platforms) {
+    const platformDir = packageDir(packageRoot, runtimePlatformDirName(runtimePackage, platform));
+    const platformPackageJson = readPackageJson(platformDir);
+    writePackageJson(platformDir, {
+      ...platformPackageJson,
+      version,
+    });
+  }
+}
+
+function runtimePackagePublishDirs(runtimePackage, packageRoot) {
+  return [
+    ...runtimePackage.platforms.map((platform) =>
+      packageDir(packageRoot, runtimePlatformDirName(runtimePackage, platform)),
+    ),
+    packageDir(packageRoot, runtimePackage.name),
+  ];
+}
+
+async function resolveRuntimePackageVersions({ spec, packageRoot, versionFloors }) {
+  for (const runtimePackage of spec.runtime_packages) {
     let resolved = false;
+    const startingSequence = versionFloors.get(runtimePackage.name) ?? 0;
 
-    for (let sequence = 0; sequence < 10_000; sequence += 1) {
-      const version = wildcardCandidate(bundlePackage.version_spec, sequence);
-      writePackageJson(dir, { ...original, version });
+    for (let sequence = startingSequence; sequence < 10_000; sequence += 1) {
+      const version = wildcardCandidate(runtimePackage.version_spec, sequence);
+      setRuntimePackageVersion({
+        runtimePackage,
+        packageRoot,
+        version,
+      });
 
-      const tarball = await npmPack(dir);
-      const publishedIntegrity = await npmViewIntegrity(bundlePackage.package_name, version);
+      let conflicts = false;
+      for (const dir of runtimePackagePublishDirs(runtimePackage, packageRoot)) {
+        const packageJson = readPackageJson(dir);
+        const tarball = await npmPack(dir);
+        const publishedIntegrity = await npmViewIntegrity(packageJson.name, packageJson.version);
 
-      if (publishedIntegrity === null || publishedIntegrity === tarball.integrity) {
+        if (publishedIntegrity !== null && publishedIntegrity !== tarball.integrity) {
+          conflicts = true;
+          break;
+        }
+      }
+
+      if (!conflicts) {
         resolved = true;
         break;
       }
     }
 
     if (!resolved) {
-      fail(`ran out of bundle versions for ${bundlePackage.package_name}`);
+      fail(`ran out of bundle versions for ${runtimePackage.package_name}`);
     }
   }
 }
 
-async function npmPublish(packageJson, tarball) {
-  const token = npmAuthToken();
-  if (!token) {
-    fail("NODE_AUTH_TOKEN or NPM_TOKEN is required to publish npm packages");
-  }
-
-  await publishPackage(packageJson, tarball, {
-    ...npmRegistryOptions(),
-    access: "public",
-    npmVersion: "amber-npm-tools",
+function npmPublish(dir) {
+  runCommand("npm", ["publish", "--access", "public", "--registry", NPM_REGISTRY], {
+    cwd: dir,
+    env: process.env,
   });
 }
 
 async function publishPackages({ spec, packageRoot }) {
-  const packageDirs = [
-    ...spec.binary_packages
-      .filter((entry) => entry.publish)
-      .map((entry) => packageDir(packageRoot, entry.name)),
-    ...spec.bundle_packages.map((entry) => packageDir(packageRoot, entry.name)),
-  ];
+  const packageDirs = spec.runtime_packages.flatMap((runtimePackage) =>
+    runtimePackagePublishDirs(runtimePackage, packageRoot),
+  );
 
   for (const dir of packageDirs) {
     const packageJson = readPackageJson(dir);
@@ -468,7 +603,7 @@ async function publishPackages({ spec, packageRoot }) {
       fail(`${packageJson.name}@${packageJson.version} already exists with different contents`);
     }
 
-    await npmPublish(packageJson, tarball);
+    npmPublish(dir);
   }
 }
 
@@ -521,38 +656,9 @@ function buildArtifact(args) {
   fail(`unsupported artifact source ${source}`);
 }
 
-function resolvedDockerVersionTags(sha) {
-  return JSON.parse(
-    runCommand(
-      "cargo",
-      [
-        "run",
-        "-q",
-        "-p",
-        "amber-images",
-        "--bin",
-        "version_tags",
-        "--",
-        "--resolve",
-        "--registry",
-        dockerRegistry(),
-        "--sha",
-        sha,
-        "docker/images.json",
-      ],
-      {
-        cwd: WORKSPACE_ROOT,
-        env: process.env,
-        captureOutput: true,
-      },
-    ),
-  );
-}
-
 function stageCommand(args) {
   stagePackages({
     spec: readSpec(args),
-    dockerVersionTags: readJson(requireFlag(args, "--docker-version-tags")),
     artifactRoot: requireFlag(args, "--artifact-root"),
     outDir: requireFlag(args, "--out-dir"),
   });
@@ -561,16 +667,20 @@ function stageCommand(args) {
 async function publishRelease(args) {
   const spec = readSpec(args);
   const outDir = requireFlag(args, "--out-dir");
+  const versionFloor = requireFlag(args, "--version-floor");
 
   stagePackages({
     spec,
-    dockerVersionTags: resolvedDockerVersionTags(requireFlag(args, "--sha")),
     artifactRoot: requireFlag(args, "--artifact-root"),
     outDir,
   });
-  await resolveBundleVersions({
+  await resolveRuntimePackageVersions({
     spec,
     packageRoot: outDir,
+    versionFloors: runtimePackageVersionFloors({
+      spec,
+      versionFloor,
+    }),
   });
   await publishPackages({
     spec,

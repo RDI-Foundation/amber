@@ -60,8 +60,10 @@ npm install -g @rdif/amber@^0.3
 amber --help
 ```
 
-The npm package installs the `amber` CLI plus the local runtime binaries that `amber run`
-needs for direct/native and VM execution. Host-side requirements are unchanged:
+The npm package is a thin wrapper over a platform-specific runtime package, so npm only
+downloads the matching Amber bundle that `amber run` needs for direct/native and VM execution.
+The published platform packages currently cover Linux x64, Linux arm64, and macOS arm64.
+Host-side requirements are unchanged:
 
 - Linux still requires `bwrap` and `slirp4netns`
 - macOS still requires `/usr/bin/sandbox-exec`
@@ -235,10 +237,14 @@ the caller never needs the underlying secret value.
 
 If you're working in this repo, Docker publishing is driven by `docker/images.json`.
 npm publishing is configured in `npm/config.mjs`, and `node npm/release.mjs spec`
-emits the expanded spec that CI consumes.
+emits the expanded spec that CI consumes. GitHub Actions publishes to npm with
+trusted publishing, so the release path shells out to `npm publish` instead of
+using a long-lived registry token. The npm release tooling publishes `@rdif/amber` plus one
+platform-specific runtime package per supported OS/arch, so npm only downloads the matching
+platform bundle instead of every Amber binary for every platform.
 
-Binary npm packages inherit the resolved version of their corresponding Docker image.
-Bundle npm packages keep their own wildcard series and only advance when the packed npm
+The npm packages keep their own wildcard version series, start from the current `amber-cli`
+image version when a new runtime family is introduced, and only advance when the packed npm
 contents change. Git tags are not used to publish either Docker images or npm packages.
 
 Tag behavior is defined per image in `docker/images.json`:
