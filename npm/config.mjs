@@ -19,6 +19,7 @@ export default {
       description: "Amber CLI compiler binary",
       binary_name: "amber",
       docker_image: "amber-cli",
+      publish: false,
       publish_macos: true,
     },
     {
@@ -57,7 +58,8 @@ export default {
       description: "Amber CLI plus the local runtime binaries required by amber run",
       version: "v0.3.x",
       binary_name: "amber",
-      dependencies: ["amber-cli", "amber-router", "amber-helper"],
+      entry_package: "amber-cli",
+      dependencies: ["amber-router", "amber-helper"],
     },
   ],
 };

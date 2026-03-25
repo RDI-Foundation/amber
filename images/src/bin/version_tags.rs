@@ -379,6 +379,9 @@ fn looks_like_missing_manifest(detail: &str) -> bool {
     lower.contains("no such manifest")
         || lower.contains("manifest unknown")
         || lower.contains("not found")
+        || lower.contains("name unknown")
+        || lower.contains("name not known")
+        || lower.contains("repository does not exist")
 }
 
 fn manifest_revision(manifest: &Value) -> Option<&str> {
@@ -507,5 +510,15 @@ mod tests {
             })
             .expect("wildcard version should resolve");
         assert_eq!(resolved, "v0.3.2");
+    }
+
+    #[test]
+    fn missing_manifest_detection_accepts_missing_repository_responses() {
+        assert!(super::looks_like_missing_manifest(
+            "pull access denied, repository does not exist or may require authorization"
+        ));
+        assert!(super::looks_like_missing_manifest(
+            "NAME_UNKNOWN: repository name not known to registry"
+        ));
     }
 }

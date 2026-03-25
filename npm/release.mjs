@@ -148,11 +148,18 @@ function expandBinaryPackage(entry) {
     docker_image: dockerImage,
     cargo_package: cargoPackage,
     binary_name: binaryName,
+    publish: entry.publish ?? true,
     platforms,
   };
 }
 
 function expandBundlePackage(entry, binariesByName) {
+  const entryPackageName = entry.entry_package ?? entry.binary_name ?? entry.name;
+  const entryPackage = binariesByName.get(entryPackageName);
+  if (!entryPackage) {
+    fail(`unknown bundle entry package ${entryPackageName}`);
+  }
+
   const dependencies = entry.dependencies.map((name) => {
     const binaryPackage = binariesByName.get(name);
     if (!binaryPackage) {
@@ -172,6 +179,11 @@ function expandBundlePackage(entry, binariesByName) {
     description: entry.description ?? `Amber ${entry.name} bundle`,
     version_spec: entry.version,
     entry_binary: entry.binary_name ?? entry.name,
+    entry_package: {
+      name: entryPackage.name,
+      binary_name: entryPackage.binary_name,
+      platforms: entryPackage.platforms,
+    },
     dependencies,
   };
 }
@@ -266,12 +278,25 @@ function stageBinaryPackage({ artifactRoot, outDir, binaryPackage, version }) {
   copyPackageFile("binary-run.cjs", targetDir, "bin/run.cjs", 0o755);
 }
 
-function stageBundlePackage({ outDir, bundlePackage, binaryPackageVersions }) {
+function stageBundlePackage({ artifactRoot, outDir, bundlePackage, binaryPackageVersions }) {
   const targetDir = packageDir(outDir, bundlePackage.name);
   const runtimeDependencies = bundlePackage.dependencies.map((dependency) => ({
     ...dependency,
     version: binaryPackageVersions.get(dependency.name),
   }));
+  const artifacts = {};
+
+  for (const platform of bundlePackage.entry_package.platforms) {
+    const source = path.join(
+      artifactRoot,
+      bundlePackage.entry_package.name,
+      platform.name,
+      bundlePackage.entry_package.binary_name,
+    );
+    const relativeTarget = path.join("artifacts", platform.name, bundlePackage.entry_binary);
+    copyExecutable(source, path.join(targetDir, relativeTarget));
+    artifacts[platform.name] = relativeTarget;
+  }
 
   writeJson(path.join(targetDir, "package.json"), {
     ...commonPackageJson({
@@ -282,7 +307,7 @@ function stageBundlePackage({ outDir, bundlePackage, binaryPackageVersions }) {
     bin: {
       [bundlePackage.entry_binary]: "./bin/run.cjs",
     },
-    files: ["LICENSE", "bin", "lib"],
+    files: ["LICENSE", "artifacts", "bin", "lib"],
     scripts: {
       postinstall: "node ./lib/install-runtime.cjs",
     },
@@ -290,6 +315,7 @@ function stageBundlePackage({ outDir, bundlePackage, binaryPackageVersions }) {
       runtimeDependencies.map((dependency) => [dependency.package_name, dependency.version]),
     ),
     amber: {
+      artifacts,
       entry_binary: bundlePackage.entry_binary,
       runtime_dependencies: runtimeDependencies.map((dependency) => ({
         package_name: dependency.package_name,
@@ -329,6 +355,7 @@ function stagePackages({ spec, dockerVersionTags, artifactRoot, outDir }) {
 
   for (const bundlePackage of spec.bundle_packages) {
     stageBundlePackage({
+      artifactRoot,
       outDir,
       bundlePackage,
       binaryPackageVersions,
@@ -421,7 +448,9 @@ async function npmPublish(packageJson, tarball) {
 
 async function publishPackages({ spec, packageRoot }) {
   const packageDirs = [
-    ...spec.binary_packages.map((entry) => packageDir(packageRoot, entry.name)),
+    ...spec.binary_packages
+      .filter((entry) => entry.publish)
+      .map((entry) => packageDir(packageRoot, entry.name)),
     ...spec.bundle_packages.map((entry) => packageDir(packageRoot, entry.name)),
   ];
 
