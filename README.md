@@ -65,10 +65,35 @@ This is most convenient for `amber check`, `amber compile`, and `amber docs`. Th
 runtime commands below (`amber proxy`, `amber run`, and `amber dashboard`) are simplest with the
 native CLI.
 
-## Tutorial
+## Fastest first run
 
-Amber compiles manifests. The fastest way to learn is to compile a tiny manifest pair and
-inspect the outputs.
+If you want the shortest path to a real mixed-site run, use the example in this repo.
+
+In one terminal:
+
+```sh
+cd examples/mixed-site
+python3 mock-catalog.py
+```
+
+In another terminal:
+
+```sh
+cd examples/mixed-site
+amber run .
+```
+
+Amber will compile the manifest in memory, prompt for any missing root config and outside-service
+values, start the direct and Compose sites, auto-start the outside-world proxy, print localhost
+URLs for the exported entrypoints, and stay attached. Call the printed app URL with `curl`, then
+press Ctrl-C in the `amber run` terminal to tear the whole scenario down.
+
+The detailed walkthrough for that flow lives in `examples/mixed-site/README.md`.
+
+## Compiler walkthrough
+
+Amber is still a compiler. When you want inspectable outputs, generated artifacts, or explicit
+control over placement, start with a tiny manifest pair and compile it.
 
 ### 1) Create a minimal two-file manifest
 
@@ -151,15 +176,21 @@ amber run /tmp/amber-vm
 ### 3d) Run a mixed-site manifest directly
 
 ```sh
-amber run examples/mixed-site/scenario.json5 \
-  --placement examples/mixed-site/local-placement.json5 \
-  --observability local \
-  --detach
+cd examples/mixed-site
+python3 mock-catalog.py
 ```
 
-This starts one scenario across a direct/native site, a Docker Compose site, and a VM site.
-Use `amber compile --run-plan` first when you want to inspect the exact site assignment and
-startup waves before launch.
+In another terminal:
+
+```sh
+cd examples/mixed-site
+amber run .
+```
+
+This is the friendly mixed-site local-dev path: Amber compiles the manifest, prompts for missing
+config, auto-starts the outside-world proxy, publishes exports on localhost, and stays attached.
+The `examples/mixed-site/README.md` walkthrough shows the full direct + Compose flow and the
+explicit control path if you want to inspect or override placement.
 
 Depending on the scenario and backend, generated runtime outputs may reference Amber's internal
 images:
@@ -220,8 +251,9 @@ amber run path/to/root.json5
 amber run path/to/root.json5 --placement path/to/sites.json5 --detach
 ```
 
-This is the default mixed-site workflow. Amber compiles the manifest, builds the run plan,
-materializes site artifacts, and coordinates the site managers for you.
+This is the default mixed-site workflow. In an interactive terminal, `amber run` can prompt for
+missing config, auto-start the outside-world proxy, print localhost export URLs, and stay
+attached as the foreground session owner. Use `--detach` when you want a background run instead.
 
 ### Run a compiled mixed-site plan
 
@@ -284,8 +316,8 @@ Top-level command guide:
 
 - `amber check <manifest-or-bundle>`: resolve manifests, run validation and linting, and print diagnostics without writing any artifacts.
 - `amber compile <input> [output flags]`: compile a manifest, bundle, or Scenario IR and emit one or more outputs such as Scenario IR, mixed-site run plans, Graphviz DOT, Docker Compose runtime directories, Kubernetes manifests, direct/native artifacts, VM artifacts, metadata, or an offline bundle.
-- `amber run <input>`: start a manifest, bundle, mixed-site run plan, direct/native artifact, or VM artifact. Use `--placement` when you want an explicit site layout and `--observability` when you want Amber-managed OTLP export for a mixed-site run.
-- `amber proxy <output> --export name=127.0.0.1:PORT`: expose a scenario export on localhost. Add `--slot name=127.0.0.1:PORT` to connect a scenario slot to a local upstream at the same time.
+- `amber run <input>`: start a manifest, bundle, mixed-site run plan, direct/native artifact, or VM artifact. Use `--placement` when you want an explicit site layout, `--env-file` when you want an explicit config source, and `--observability` when you want Amber-managed OTLP export for a mixed-site run.
+- `amber proxy <output> --export name=127.0.0.1:PORT`: expose a scenario export on localhost. Add `--slot name=127.0.0.1:PORT` to connect a scenario slot to a local upstream at the same time. When the target is a mixed-site run id, Amber can proxy the whole running scenario without making you discover internal artifact paths.
 - `amber dashboard [--detach]`: start the local Aspire dashboard that Amber examples use for observability and tracing workflows.
 
 Output-specific pointers:

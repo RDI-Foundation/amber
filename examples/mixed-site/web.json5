@@ -1,14 +1,23 @@
 {
   manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      tenant: { type: "string" },
+    },
+    required: ["tenant"],
+    additionalProperties: false,
+  },
   slots: {
-    queue: { kind: "http" },
+    api: { kind: "http" },
   },
   program: {
     path: "/usr/bin/env",
-    args: ["python3", "-u", { file: "./console.py" }],
+    args: ["python3", "-u", "-c", { file: "./web.py" }],
     env: {
       PORT: "8080",
-      QUEUE_URL: "${slots.queue.url}",
+      TENANT: "${config.tenant}",
+      API_URL: "${slots.api.url}",
     },
     network: {
       endpoints: [

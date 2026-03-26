@@ -1,5 +1,8 @@
 mod docs;
 mod mixed_run;
+mod run_inputs;
+mod run_logs;
+mod site_proxy_metadata;
 mod tcp_readiness;
 mod vm_runtime;
 
@@ -75,7 +78,17 @@ use tokio::{
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
-use crate::tcp_readiness::wait_for_stable_endpoint;
+use crate::{
+    run_inputs::{
+        RunInterface, ambient_run_env, collect_run_interface, load_run_env,
+        missing_required_external_slots, missing_required_root_inputs, project_env_path,
+        prompt_for_missing_inputs, render_resolved_input_lines, render_root_reuse_env,
+        resolve_manifest_entry_path, run_interactive, select_external_slot_env, select_root_env,
+        slot_url_from_socket,
+    },
+    run_logs::{RunLogOptions, print_run_logs, print_run_ps, stream_run_logs_until},
+    tcp_readiness::wait_for_stable_endpoint,
+};
 
 const CLI_LONG_ABOUT: &str = "\
 Compile, inspect, and run Amber scenarios.
@@ -217,8 +230,10 @@ This command understands direct/native artifacts from `amber compile --direct`, 
 
 const RUN_AFTER_HELP: &str = "\
 Examples:
+  amber run .
   amber run path/to/root.json5
   amber run path/to/root.json5 --placement local-sites.json
+  amber run path/to/root.json5 --env-file dev.env
   amber run -Z unstable-options path/to/root.json5 --dry-run --emit-launch-bundle /tmp/amber-launch
   amber run /tmp/amber-run-plan.json
   amber run /tmp/amber-direct
@@ -245,6 +260,8 @@ const PROXY_AFTER_HELP: &str = "\
 Examples:
   amber proxy /tmp/amber-compose --export public=127.0.0.1:18080
 
+  amber proxy <run-id> --export public=127.0.0.1:18080
+
   amber proxy <run-id> --site direct_local --export public=127.0.0.1:18080
 
   amber proxy /tmp/amber-compose \\
@@ -259,6 +276,8 @@ Examples:
 
 Notes:
   At least one `--slot NAME=ADDR:PORT` or `--export NAME=ADDR:PORT` is required.
+  Mixed-site run ids expose the whole running scenario by default; add `--site` only when you need \
+                                a specific internal site surface.
   Docker Compose outputs auto-detect router control and, for exports, the published router mesh \
                                 port.
   Direct and VM outputs usually infer local router metadata automatically.
@@ -327,6 +346,10 @@ enum Command {
     Run(RunArgs),
     #[command(about = "Stop a mixed-site run by run id")]
     Stop(StopArgs),
+    #[command(about = "List active mixed-site runs")]
+    Ps(PsArgs),
+    #[command(about = "Print persisted logs for a mixed-site run")]
+    Logs(LogsArgs),
     #[command(
         about = "Bridge scenario exports and external slots to the host",
         long_about = PROXY_LONG_ABOUT,
@@ -349,6 +372,8 @@ enum Command {
     RunDetachedCoordinator(RunDetachedCoordinatorArgs),
     #[command(hide = true, name = "run-observability-sink")]
     RunObservabilitySink(RunObservabilitySinkArgs),
+    #[command(hide = true, name = "run-outside-proxy")]
+    RunOutsideProxy(RunOutsideProxyArgs),
     #[command(hide = true, name = "run-vm-guestfwd-bridge")]
     RunVmGuestfwdBridge(RunVmGuestfwdBridgeArgs),
     #[command(hide = true, name = "run-direct-local-probe")]
@@ -474,6 +499,10 @@ struct RunArgs {
     #[arg(long = "placement", value_name = "FILE")]
     placement: Option<PathBuf>,
 
+    /// Load runtime inputs from an env file. Repeat to merge multiple files.
+    #[arg(long = "env-file", value_name = "FILE")]
+    env_file: Vec<PathBuf>,
+
     /// Start a mixed-site run in detached mode.
     #[arg(long = "detach")]
     detach: bool,
@@ -548,6 +577,13 @@ struct RunDirectLocalProbeArgs {
 }
 
 #[derive(Args)]
+struct RunOutsideProxyArgs {
+    /// Path to a run outside proxy plan JSON file.
+    #[arg(long = "plan", value_name = "FILE")]
+    plan: PathBuf,
+}
+
+#[derive(Args)]
 struct RunSiteSupervisorArgs {
     /// Path to a mixed-site supervisor plan JSON file.
     #[arg(long = "plan", value_name = "FILE")]
@@ -575,6 +611,28 @@ struct RunDetachedCoordinatorArgs {
     /// Managed observability mode for mixed-site runs (`local` or an OTLP/HTTP endpoint URL).
     #[arg(long = "observability", value_name = "local|URL")]
     observability: Option<String>,
+}
+
+#[derive(Args)]
+struct PsArgs {
+    /// Override where Amber stores persistent mixed-run state.
+    #[arg(long = "storage-root", value_name = "DIR")]
+    storage_root: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct LogsArgs {
+    /// Mixed-site run id.
+    #[arg(value_name = "RUN_ID")]
+    run_id: String,
+
+    /// Override where Amber stores persistent mixed-run state.
+    #[arg(long = "storage-root", value_name = "DIR")]
+    storage_root: Option<PathBuf>,
+
+    /// Keep streaming new log output.
+    #[arg(short = 'f', long = "follow")]
+    follow: bool,
 }
 
 #[derive(Args)]
@@ -693,6 +751,13 @@ struct RunTarget {
     plan: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+struct PreparedMixedRunInputs {
+    interface: RunInterface,
+    root_env: BTreeMap<String, String>,
+    external_slot_env: BTreeMap<String, String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     miette::set_panic_hook();
@@ -711,6 +776,8 @@ async fn main() -> Result<()> {
                 Command::Docs(args) => docs(args),
                 Command::Run(args) => run(args).await,
                 Command::Stop(args) => stop(args).await,
+                Command::Ps(args) => ps(args),
+                Command::Logs(args) => logs(args).await,
                 Command::Dashboard(args) => dashboard(args).await,
                 Command::RunDirectInit(args) => run_direct_init(args).await,
                 Command::RunVmInit(args) => {
@@ -727,6 +794,7 @@ async fn main() -> Result<()> {
                 Command::RunObservabilitySink(args) => {
                     mixed_run::run_observability_sink(args.plan).await
                 }
+                Command::RunOutsideProxy(args) => mixed_run::run_outside_proxy(args.plan).await,
                 Command::RunVmGuestfwdBridge(_) => unreachable!("handled above"),
                 Command::RunDirectLocalProbe(_) => unreachable!("handled above"),
                 Command::Proxy(_) => unreachable!("handled above"),
@@ -1094,6 +1162,7 @@ fn docs(args: DocsArgs) -> Result<()> {
 
 async fn run(args: RunArgs) -> Result<()> {
     let unstable_options = args.unstable.iter().any(|flag| flag == "unstable-options");
+    let interactive = run_interactive();
     if (args.dry_run || args.emit_launch_bundle.is_some()) && !unstable_options {
         return Err(miette::miette!(
             "`amber run --dry-run` and `--emit-launch-bundle` are unstable; pass `-Z \
@@ -1117,6 +1186,7 @@ async fn run(args: RunArgs) -> Result<()> {
     }
 
     let placement = load_placement_file(args.placement.as_deref())?;
+    let explicit_env = load_run_env(None, &args.env_file)?;
     if let Some(target) = try_load_run_target(&args.output)? {
         return match target.kind {
             RunTargetKind::Direct => {
@@ -1126,11 +1196,14 @@ async fn run(args: RunArgs) -> Result<()> {
                          manifests and run plans"
                     ));
                 }
-                run_direct_init(RunDirectInitArgs {
-                    plan: target.plan,
-                    storage_root: args.storage_root,
-                    runtime_root: None,
-                    router_mesh_port: None,
+                with_scoped_run_env(&explicit_env, || async {
+                    run_direct_init(RunDirectInitArgs {
+                        plan: target.plan,
+                        storage_root: args.storage_root,
+                        runtime_root: None,
+                        router_mesh_port: None,
+                    })
+                    .await
                 })
                 .await
             }
@@ -1141,7 +1214,10 @@ async fn run(args: RunArgs) -> Result<()> {
                          manifests and run plans"
                     ));
                 }
-                vm_runtime::run_vm_init(target.plan, args.storage_root, None, None).await
+                with_scoped_run_env(&explicit_env, || async {
+                    vm_runtime::run_vm_init(target.plan, args.storage_root, None, None).await
+                })
+                .await
             }
             RunTargetKind::MixedRunPlan => {
                 let run_plan_raw = fs::read_to_string(&target.plan)
@@ -1152,15 +1228,13 @@ async fn run(args: RunArgs) -> Result<()> {
                 let run_plan: RunPlan = serde_json::from_str(&run_plan_raw).map_err(|err| {
                     miette::miette!("invalid run plan {}: {err}", target.plan.display())
                 })?;
-                if args.detach {
-                    return run_detached(
-                        &run_plan,
-                        args.storage_root.as_deref(),
-                        Some(&target.plan),
-                        args.observability.as_deref(),
-                    )
-                    .await;
-                }
+                let prepared = prepare_mixed_run_inputs(
+                    &run_plan,
+                    None,
+                    &args.env_file,
+                    interactive,
+                    !args.dry_run,
+                )?;
                 if args.dry_run {
                     let bundle_root = args
                         .emit_launch_bundle
@@ -1171,14 +1245,37 @@ async fn run(args: RunArgs) -> Result<()> {
                         &run_plan,
                         bundle_root,
                         args.observability.as_deref(),
+                        &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
                     )
                     .map(|_| ());
+                }
+                if args.detach {
+                    return run_detached(
+                        &run_plan,
+                        args.storage_root.as_deref(),
+                        Some(&target.plan),
+                        args.observability.as_deref(),
+                        &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
+                    )
+                    .await;
+                }
+                if interactive {
+                    return run_attached_mixed_run(
+                        &args.output,
+                        Some(&target.plan),
+                        &run_plan,
+                        args.storage_root.as_deref(),
+                        args.observability.as_deref(),
+                        prepared,
+                    )
+                    .await;
                 }
                 mixed_run::run_run_plan(
                     Some(&target.plan),
                     &run_plan,
                     args.storage_root.as_deref(),
                     args.observability.as_deref(),
+                    &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
                 )
                 .await
                 .map(|receipt| {
@@ -1193,12 +1290,21 @@ async fn run(args: RunArgs) -> Result<()> {
     let run_plan = build_run_plan(&compiled, placement.as_ref())
         .into_diagnostic()
         .wrap_err("failed to build mixed-site run plan")?;
+    let project_env_root = project_env_root_for_run_input(&args.output)?;
+    let prepared = prepare_mixed_run_inputs(
+        &run_plan,
+        project_env_root.as_deref(),
+        &args.env_file,
+        interactive,
+        !args.dry_run,
+    )?;
     if args.detach {
         return run_detached(
             &run_plan,
             args.storage_root.as_deref(),
             None,
             args.observability.as_deref(),
+            &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
         )
         .await;
     }
@@ -1212,14 +1318,27 @@ async fn run(args: RunArgs) -> Result<()> {
             &run_plan,
             bundle_root,
             args.observability.as_deref(),
+            &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
         )
         .map(|_| ());
+    }
+    if interactive {
+        return run_attached_mixed_run(
+            &args.output,
+            None,
+            &run_plan,
+            args.storage_root.as_deref(),
+            args.observability.as_deref(),
+            prepared,
+        )
+        .await;
     }
     mixed_run::run_run_plan(
         None,
         &run_plan,
         args.storage_root.as_deref(),
         args.observability.as_deref(),
+        &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
     )
     .await
     .map(|receipt| {
@@ -1233,6 +1352,7 @@ async fn run_detached(
     storage_root_override: Option<&Path>,
     source_plan_path: Option<&Path>,
     observability: Option<&str>,
+    site_launch_env: &BTreeMap<String, String>,
 ) -> Result<()> {
     let storage_root = mixed_run::mixed_run_storage_root(storage_root_override)?;
     let run_id = mixed_run::new_run_id();
@@ -1253,7 +1373,8 @@ async fn run_detached(
             .arg("--run-id")
             .arg(&run_id)
             .arg("--storage-root")
-            .arg(&storage_root);
+            .arg(&storage_root)
+            .envs(site_launch_env);
         if let Some(source_plan) = source_plan.as_ref() {
             cmd.arg("--source-plan").arg(source_plan);
         }
@@ -1280,9 +1401,264 @@ async fn run_detached_coordinator(args: RunDetachedCoordinatorArgs) -> Result<()
         args.storage_root.as_deref(),
         args.observability.as_deref(),
         &args.run_id,
+        &ambient_run_env(),
     )
     .await
     .map(|_| ())
+}
+
+fn project_env_root_for_run_input(input: &str) -> Result<Option<PathBuf>> {
+    let Some(path) = local_input_path(input)? else {
+        return Ok(None);
+    };
+    if BundleLoader::from_path(&path)?.is_some() {
+        return Ok(None);
+    }
+    let manifest_path = resolve_manifest_entry_path(&path)?;
+    Ok(manifest_path.parent().map(Path::to_path_buf))
+}
+
+fn prepare_mixed_run_inputs(
+    run_plan: &RunPlan,
+    project_env_root: Option<&Path>,
+    env_files: &[PathBuf],
+    interactive: bool,
+    require_complete_inputs: bool,
+) -> Result<PreparedMixedRunInputs> {
+    let interface = collect_run_interface(run_plan)?;
+    let mut env = load_run_env(project_env_root, env_files)?;
+    if interactive {
+        prompt_for_missing_inputs(&mut env, &interface)?;
+    }
+
+    let missing_root = missing_required_root_inputs(&env, &interface);
+    let missing_slots = missing_required_external_slots(&env, &interface);
+    if require_complete_inputs && (!missing_root.is_empty() || !missing_slots.is_empty()) {
+        let mut message = String::from("missing required runtime inputs:");
+        for input in missing_root {
+            message.push_str(&format!(
+                "\n  - {} for config.{}",
+                input.env_var, input.path
+            ));
+        }
+        for slot in missing_slots {
+            message.push_str(&format!("\n  - {} for slot.{}", slot.env_var, slot.name));
+        }
+        if let Some(project_env_root) = project_env_root {
+            message.push_str(&format!(
+                "\n\nProvide them via ambient environment, `--env-file`, or {}",
+                project_env_path(project_env_root).display()
+            ));
+        } else {
+            message.push_str("\n\nProvide them via ambient environment or `--env-file`.");
+        }
+        return Err(miette::miette!(message));
+    }
+
+    Ok(PreparedMixedRunInputs {
+        root_env: select_root_env(&env, &interface),
+        external_slot_env: select_external_slot_env(&env, &interface),
+        interface,
+    })
+}
+
+fn merged_env_maps(
+    left: &BTreeMap<String, String>,
+    right: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut merged = left.clone();
+    merged.extend(right.clone());
+    merged
+}
+
+fn export_listener_url(protocol: &str, addr: SocketAddr) -> String {
+    match protocol {
+        "tcp" => format!("tcp://{addr}"),
+        _ => format!("http://{addr}"),
+    }
+}
+
+async fn with_scoped_run_env<F, Fut, T>(vars: &BTreeMap<String, String>, run: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let _guard = ScopedRunEnv::apply(vars);
+    run().await
+}
+
+async fn run_attached_mixed_run(
+    target: &str,
+    source_plan_path: Option<&Path>,
+    run_plan: &RunPlan,
+    storage_root_override: Option<&Path>,
+    observability: Option<&str>,
+    prepared: PreparedMixedRunInputs,
+) -> Result<()> {
+    let receipt = mixed_run::run_run_plan(
+        source_plan_path,
+        run_plan,
+        storage_root_override,
+        observability,
+        &prepared.root_env,
+    )
+    .await?;
+    let run_root = PathBuf::from(&receipt.run_root);
+
+    let export_bindings = prepared
+        .interface
+        .exports
+        .iter()
+        .map(|export| {
+            Ok((
+                export.name.clone(),
+                SocketAddr::from(([127, 0, 0, 1], mixed_run::reserve_loopback_port()?)),
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let slot_bindings = prepared
+        .interface
+        .external_slots
+        .iter()
+        .filter_map(|slot| {
+            prepared
+                .external_slot_env
+                .get(&slot.env_var)
+                .map(|value| (slot.name.clone(), value.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut proxy_child = if slot_bindings.is_empty() && export_bindings.is_empty() {
+        None
+    } else {
+        Some(mixed_run::spawn_run_outside_proxy(
+            &run_root,
+            &slot_bindings,
+            &export_bindings,
+        )?)
+    };
+    if proxy_child.is_some()
+        && let Err(err) = mixed_run::wait_for_run_outside_proxy_ready(&run_root).await
+    {
+        if let Some(proxy_child) = proxy_child.as_mut() {
+            let _ = proxy_child.kill();
+            let _ = proxy_child.wait();
+        }
+        let _ = mixed_run::stop_run(&receipt.run_id, storage_root_override).await;
+        return Err(err);
+    }
+
+    let reuse_path = if prepared.interface.root_inputs.is_empty() {
+        None
+    } else {
+        let path = run_root.join("root-config.env");
+        fs::write(
+            &path,
+            render_root_reuse_env(&prepared.root_env, &prepared.interface),
+        )
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write {}", path.display()))?;
+        Some(path)
+    };
+
+    for line in render_resolved_input_lines(
+        &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
+        &prepared.interface,
+    ) {
+        println!("{line}");
+    }
+    if !prepared.interface.root_inputs.is_empty() || !prepared.interface.external_slots.is_empty() {
+        println!();
+    }
+    println!("Ready.");
+    for (name, addr) in &export_bindings {
+        let protocol = prepared
+            .interface
+            .exports
+            .iter()
+            .find(|export| export.name == *name)
+            .map(|export| export.protocol.as_str())
+            .unwrap_or("http");
+        println!("  {name}  {}", export_listener_url(protocol, *addr));
+    }
+    if let Some(path) = reuse_path.as_ref() {
+        println!();
+        println!("Reuse:");
+        println!("  amber run {target} --env-file {}", path.display());
+    }
+
+    let result = stream_run_logs_until(
+        &run_root,
+        RunLogOptions {
+            follow: true,
+            print_existing: false,
+        },
+    )
+    .await;
+    let stop_result = mixed_run::stop_run(&receipt.run_id, storage_root_override).await;
+    if let Some(proxy_child) = proxy_child.as_mut() {
+        let _ = proxy_child.kill();
+        let _ = proxy_child.wait();
+    }
+    result?;
+    stop_result
+}
+
+fn ps(args: PsArgs) -> Result<()> {
+    let storage_root = mixed_run::mixed_run_storage_root(args.storage_root.as_deref())?;
+    print_run_ps(&storage_root)
+}
+
+async fn logs(args: LogsArgs) -> Result<()> {
+    let storage_root = mixed_run::mixed_run_storage_root(args.storage_root.as_deref())?;
+    let run_root = storage_root.join("runs").join(&args.run_id);
+    if args.follow {
+        stream_run_logs_until(
+            &run_root,
+            RunLogOptions {
+                follow: true,
+                print_existing: true,
+            },
+        )
+        .await
+    } else {
+        print_run_logs(&run_root)
+    }
+}
+
+struct ScopedRunEnv {
+    saved: Vec<(String, Option<String>)>,
+}
+
+impl ScopedRunEnv {
+    fn apply(vars: &BTreeMap<String, String>) -> Self {
+        let saved = vars
+            .keys()
+            .map(|key| (key.clone(), env::var(key).ok()))
+            .collect::<Vec<_>>();
+        for (key, value) in vars {
+            // These vars are only scoped to the current amber process and any children it spawns.
+            unsafe {
+                env::set_var(key, value);
+            }
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for ScopedRunEnv {
+    fn drop(&mut self) {
+        for (key, value) in self.saved.drain(..) {
+            if let Some(value) = value {
+                unsafe {
+                    env::set_var(key, value);
+                }
+            } else {
+                unsafe {
+                    env::remove_var(key);
+                }
+            }
+        }
+    }
 }
 
 fn try_load_run_target(output: &str) -> Result<Option<RunTarget>> {
@@ -4825,6 +5201,58 @@ fn output_dir_for_target(root: &Path, target: &MeshProvisionTarget) -> Result<Pa
 }
 
 async fn proxy(args: ProxyArgs, verbose: u8) -> Result<()> {
+    if args.site.is_none()
+        && let Some(run_root) =
+            mixed_run::maybe_resolve_run_root(&args.output, args.storage_root.as_deref())?
+    {
+        if args.project_name.is_some()
+            || args.mesh_addr.is_some()
+            || args.router_addr.is_some()
+            || args.router_control_addr.is_some()
+            || args.router_config_b64.is_some()
+            || args.router_config.is_some()
+        {
+            return Err(miette::miette!(
+                "run-scoped `amber proxy <run-id>` does not support site-scoped router overrides; \
+                 pass `--site` to target one internal site explicitly"
+            ));
+        }
+
+        let run_plan: RunPlan = mixed_run::read_json(&run_root.join("run-plan.json"), "run plan")?;
+        let interface = collect_run_interface(&run_plan)?;
+        let mut slot_bindings = BTreeMap::new();
+        for raw in &args.slot {
+            let (slot_name, upstream) = parse_named_socket_addr(raw, "--slot")?;
+            let slot = interface
+                .external_slots
+                .iter()
+                .find(|slot| slot.name == slot_name)
+                .ok_or_else(|| {
+                    miette::miette!(
+                        "run does not declare external slot `{slot_name}`; available external \
+                         slots: {}",
+                        interface
+                            .external_slots
+                            .iter()
+                            .map(|slot| slot.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?;
+            slot_bindings.insert(slot_name, slot_url_from_socket(slot, upstream)?);
+        }
+        let mut export_bindings = BTreeMap::new();
+        for raw in &args.export {
+            let (export_name, listen) = parse_named_socket_addr(raw, "--export")?;
+            export_bindings.insert(export_name, listen);
+        }
+
+        let plan_path =
+            mixed_run::write_run_outside_proxy_plan(&run_root, &slot_bindings, &export_bindings)?;
+        let _ = verbose;
+        return mixed_run::run_outside_proxy(plan_path).await;
+    }
+
     let run_proxy_target = mixed_run::maybe_resolve_proxy_run_target(
         &args.output,
         args.site.as_deref(),
@@ -5092,6 +5520,7 @@ fn parse_manifest_ref(input: &str) -> Result<ManifestRef> {
     }
 
     let abs = canonicalize_user_path(Path::new(input), "manifest path")?;
+    let abs = resolve_manifest_entry_path(&abs)?;
     let url = url::Url::from_file_path(&abs)
         .map_err(|_| miette::miette!("could not convert `{}` into a file URL", abs.display()))?;
 

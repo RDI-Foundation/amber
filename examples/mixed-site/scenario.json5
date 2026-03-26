@@ -1,34 +1,43 @@
 {
   manifest_version: "0.3.0",
+
   config_schema: {
     type: "object",
     properties: {
-      base_image: { type: "string" },
+      tenant: { type: "string" },
+      catalog_token: { type: "string", secret: true },
     },
-    required: ["base_image"],
+    required: ["tenant", "catalog_token"],
     additionalProperties: false,
   },
+
+  slots: {
+    catalog_api: { kind: "http" },
+  },
+
   components: {
-    console: {
-      manifest: "./console.json5",
-    },
-    queue: {
-      manifest: "./queue.json5",
-    },
-    vault: {
-      manifest: "./vault.json5",
+    web: {
+      manifest: "./web.json5",
       config: {
-        base_image: "${config.base_image}",
+        tenant: "${config.tenant}",
+      },
+    },
+    api: {
+      manifest: "./api.json5",
+      config: {
+        tenant: "${config.tenant}",
+        catalog_token: "${config.catalog_token}",
       },
     },
   },
+
   bindings: [
-    { to: "#console.queue", from: "#queue.http" },
-    { to: "#queue.vault", from: "#vault.http" },
+    { to: "#web.api", from: "#api.http" },
+    { to: "#api.catalog_api", from: "slots.catalog_api", weak: true },
   ],
+
   exports: {
-    console_http: "#console.http",
-    queue_http: "#queue.http",
-    vault_http: "#vault.http",
+    app: "#web.http",
+    api: "#api.http",
   },
 }

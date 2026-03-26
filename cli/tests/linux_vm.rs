@@ -28,6 +28,10 @@ use workspace_root_support::workspace_root;
 const GUEST_USER: &str = "amber";
 const DEFAULT_ROOT_OVERLAY_SIZE: &str = "40G";
 const QEMU_VIRTIO_NET_DEVICE: &str = "virtio-net-pci,netdev=net0,rombar=0";
+const LINUX_VM_KIND_VERSION: &str = "v0.26.0";
+const LINUX_VM_KIND_NODE_IMAGE: &str =
+    "kindest/node:v1.32.0@sha256:c48c62eac5da28cdadcf560d1d8616cfa6783b58f0d94cf63ad1bf49600cb027";
+const LINUX_VM_KIND_PULL_TIMEOUT: &str = "180s";
 
 struct GuestArch {
     cloud_image_filename: &'static str,
@@ -38,6 +42,12 @@ struct GuestArch {
     qemu_system: &'static str,
 }
 
+struct ProvisioningSpec {
+    guest_packages: &'static str,
+    profile_setup: String,
+    profile_checks: String,
+}
+
 #[derive(Clone, Copy)]
 enum ProvisionProfile {
     VmSmoke,
@@ -45,11 +55,75 @@ enum ProvisionProfile {
 }
 
 impl ProvisionProfile {
-    fn cache_key(self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
             Self::VmSmoke => "vm-smoke",
             Self::MixedRun => "mixed-run",
         }
+    }
+
+    fn provisioning_spec(self, arch: &GuestArch) -> ProvisioningSpec {
+        match self {
+            Self::VmSmoke => ProvisioningSpec {
+                guest_packages: "build-essential ca-certificates curl git jq pkg-config libssl-dev",
+                profile_setup: String::new(),
+                profile_checks: String::new(),
+            },
+            Self::MixedRun => ProvisioningSpec {
+                guest_packages: "build-essential ca-certificates curl git jq pkg-config libssl-dev bubblewrap \
+                                 slirp4netns docker.io",
+                profile_setup: format!(
+                    "if ! docker compose version >/dev/null 2>&1; then\n\
+                       sudo apt-get install -y --no-install-recommends docker-compose-v2 || sudo apt-get install -y --no-install-recommends docker-compose-plugin\n\
+                     fi\n\
+                     if ! docker buildx version >/dev/null 2>&1; then\n\
+                       sudo apt-get install -y --no-install-recommends docker-buildx-plugin || \\\n\
+                       sudo apt-get install -y --no-install-recommends docker-buildx || \\\n\
+                       sudo apt-get install -y --no-install-recommends moby-buildx\n\
+                     fi\n\
+                     if sysctl kernel.apparmor_restrict_unprivileged_unconfined >/dev/null 2>&1; then\n\
+                       sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0\n\
+                     fi\n\
+                     if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then\n\
+                       sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0\n\
+                     fi\n\
+                     sudo systemctl enable --now docker\n\
+                     sudo usermod -aG docker {user}\n\
+                     if ! command -v kind >/dev/null 2>&1 || ! kind --version | grep -q '{kind_version}'; then\n\
+                       curl -fsSL -o /tmp/kind https://kind.sigs.k8s.io/dl/{kind_version}/kind-linux-{kind_arch}\n\
+                       chmod +x /tmp/kind\n\
+                       sudo mv /tmp/kind /usr/local/bin/kind\n\
+                     fi\n\
+                     if ! sudo docker image inspect '{kind_node_image}' >/dev/null 2>&1; then\n\
+                       timeout {kind_pull_timeout} sudo docker pull '{kind_node_image}'\n\
+                     fi\n\
+                     if ! command -v kubectl >/dev/null 2>&1; then\n\
+                       stable=\"$(curl -fsSL https://dl.k8s.io/release/stable.txt)\"\n\
+                       curl -fsSL -o /tmp/kubectl \"https://dl.k8s.io/release/${{stable}}/bin/linux/{kubectl_arch}/kubectl\"\n\
+                       chmod +x /tmp/kubectl\n\
+                       sudo mv /tmp/kubectl /usr/local/bin/kubectl\n\
+                     fi\n",
+                    user = GUEST_USER,
+                    kind_arch = arch.kind_arch,
+                    kind_version = LINUX_VM_KIND_VERSION,
+                    kind_node_image = LINUX_VM_KIND_NODE_IMAGE,
+                    kind_pull_timeout = LINUX_VM_KIND_PULL_TIMEOUT,
+                    kubectl_arch = arch.kubectl_arch,
+                ),
+                profile_checks: "docker compose version\ndocker buildx version\nkind \
+                                 --version\nkubectl version --client=true\n"
+                    .to_string(),
+            },
+        }
+    }
+
+    fn cache_key(self) -> String {
+        let spec = self.provisioning_spec(&guest_arch());
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        spec.guest_packages.hash(&mut hasher);
+        spec.profile_setup.hash(&mut hasher);
+        spec.profile_checks.hash(&mut hasher);
+        format!("{}-{:016x}", self.name(), hasher.finish())
     }
 }
 
@@ -638,56 +712,7 @@ impl LinuxVmHarness {
 
     fn provision_guest(&self, profile: ProvisionProfile) -> Result<(), String> {
         let arch = guest_arch();
-        let guest_packages = match profile {
-            ProvisionProfile::VmSmoke => {
-                "build-essential ca-certificates curl git jq pkg-config libssl-dev"
-            }
-            ProvisionProfile::MixedRun => {
-                "build-essential ca-certificates curl git jq pkg-config libssl-dev bubblewrap \
-                 slirp4netns docker.io"
-            }
-        };
-        let profile_setup = match profile {
-            ProvisionProfile::VmSmoke => String::new(),
-            ProvisionProfile::MixedRun => format!(
-                "if ! docker compose version >/dev/null 2>&1; then\n\
-                   sudo apt-get install -y --no-install-recommends docker-compose-v2 || sudo apt-get install -y --no-install-recommends docker-compose-plugin\n\
-                 fi\n\
-                 if ! docker buildx version >/dev/null 2>&1; then\n\
-                   sudo apt-get install -y --no-install-recommends docker-buildx-plugin || \\\n\
-                   sudo apt-get install -y --no-install-recommends docker-buildx || \\\n\
-                   sudo apt-get install -y --no-install-recommends moby-buildx\n\
-                 fi\n\
-                 if sysctl kernel.apparmor_restrict_unprivileged_unconfined >/dev/null 2>&1; then\n\
-                   sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0\n\
-                 fi\n\
-                 if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then\n\
-                   sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0\n\
-                 fi\n\
-                 sudo systemctl enable --now docker\n\
-                 sudo usermod -aG docker {user}\n\
-                 if ! command -v kind >/dev/null 2>&1; then\n\
-                   curl -fsSL -o /tmp/kind https://kind.sigs.k8s.io/dl/v0.22.0/kind-linux-{kind_arch}\n\
-                   chmod +x /tmp/kind\n\
-                   sudo mv /tmp/kind /usr/local/bin/kind\n\
-                 fi\n\
-                 if ! command -v kubectl >/dev/null 2>&1; then\n\
-                   stable=\"$(curl -fsSL https://dl.k8s.io/release/stable.txt)\"\n\
-                   curl -fsSL -o /tmp/kubectl \"https://dl.k8s.io/release/${{stable}}/bin/linux/{kubectl_arch}/kubectl\"\n\
-                   chmod +x /tmp/kubectl\n\
-                   sudo mv /tmp/kubectl /usr/local/bin/kubectl\n\
-                 fi\n",
-                user = GUEST_USER,
-                kind_arch = arch.kind_arch,
-                kubectl_arch = arch.kubectl_arch,
-            ),
-        };
-        let profile_checks = match profile {
-            ProvisionProfile::VmSmoke => String::new(),
-            ProvisionProfile::MixedRun => "docker compose version\ndocker buildx version\nkind \
-                                           --version\nkubectl version --client=true\n"
-                .to_string(),
-        };
+        let spec = profile.provisioning_spec(&arch);
         self.run_guest_checked(
             "provision linux guest",
             &format!(
@@ -708,12 +733,12 @@ impl LinuxVmHarness {
                  fi\n\
                  qemu-img info \"$HOME/{image_filename}\" >/dev/null\n\
                  {profile_checks}",
-                guest_packages = guest_packages,
+                guest_packages = spec.guest_packages,
                 qemu_packages = arch.qemu_packages,
-                profile_setup = profile_setup,
+                profile_setup = spec.profile_setup,
                 image_filename = arch.cloud_image_filename,
                 image_url = shell_escape(arch.cloud_image_url),
-                profile_checks = profile_checks,
+                profile_checks = spec.profile_checks,
             ),
         )
     }
@@ -733,6 +758,27 @@ impl LinuxVmHarness {
                 command = command,
             ),
         )
+    }
+
+    fn guest_failure_diagnostics(&self) -> String {
+        let guest_workspace = shell_escape(&self.guest_workspace);
+        let script = format!(
+            "set -euo pipefail\noutputs={guest_workspace}/target/cli-test-outputs\nif [ ! -d \
+             \"$outputs\" ]; then\nexit 0\nfi\nlatest=\"$(find \"$outputs\" -maxdepth 1 -type d \
+             -name 'mixed-run-*' | sort | tail -n 1)\"\nif [ -z \"$latest\" ]; \
+             then\nlatest=\"$(find \"$outputs\" -maxdepth 1 -type d | sort | tail -n 1)\"\nfi\nif \
+             [ -z \"$latest\" ]; then\nexit 0\nfi\necho \"latest guest test output: \
+             $latest\"\nfind \"$latest\" -maxdepth 3 -type f | sort\nwhile IFS= read -r path; \
+             do\necho \"----- $path -----\"\nsed -n '1,220p' \"$path\"\ndone < <(find \
+             \"$latest/state\" -maxdepth 2 -type f \\( -name 'manager-state.json' -o -name \
+             'supervisor.log' -o -name 'port-forward.log' -o -name 'site.log' \\) 2>/dev/null | \
+             sort)\n"
+        );
+        self.ssh_output(&script)
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default()
     }
 
     fn failure_context(&self, label: &str, output: Option<&Output>) -> String {
@@ -758,6 +804,10 @@ impl LinuxVmHarness {
             self.serial_log.display(),
             fs::read_to_string(&self.serial_log).unwrap_or_default()
         ));
+        let guest_diagnostics = self.guest_failure_diagnostics();
+        if !guest_diagnostics.trim().is_empty() {
+            message.push_str(&format!("\nguest diagnostics:\n{guest_diagnostics}"));
+        }
         message
     }
 }
@@ -921,4 +971,14 @@ fn linux_vm_runs_mixed_run_local_observability_scenario_smoke() {
 fn linux_vm_runs_mixed_run_recovers_direct_component_failure_after_setup() {
     run_linux_guest_mixed_run_test("mixed_run_recovers_direct_component_failure_after_setup")
         .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+fn provisioned_cache_keys_track_guest_setup() {
+    let vm_smoke_cache_key = ProvisionProfile::VmSmoke.cache_key();
+    let mixed_run_cache_key = ProvisionProfile::MixedRun.cache_key();
+
+    assert!(vm_smoke_cache_key.starts_with("vm-smoke-"));
+    assert!(mixed_run_cache_key.starts_with("mixed-run-"));
+    assert_ne!(vm_smoke_cache_key, mixed_run_cache_key);
 }

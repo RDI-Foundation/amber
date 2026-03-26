@@ -36,6 +36,7 @@ const DIRECT_RUNTIME_STATE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const TCG_VM_RUNTIME_STATE_WAIT_TIMEOUT: Duration = Duration::from_secs(720);
 const EXPORT_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(30);
 const ROUTER_IDENTITY_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_CONTAINER_REQUEST_TIMEOUT_SECS: u64 = 2;
 const CONTROL_CURL_IMAGE: &str = "curlimages/curl:8.12.1";
 const CONTROL_SOCKET_MOUNT_DIR: &str = "/amber/control";
@@ -720,41 +721,49 @@ fn load_proxy_target(output: &Path) -> Result<ProxyTarget> {
     ))
 }
 
-fn load_proxy_metadata_file(path: &Path) -> Result<ProxyMetadata> {
-    let raw = fs::read_to_string(path)
-        .map_err(|err| miette::miette!("failed to read {}: {err}", path.display()))?;
-    serde_json::from_str(&raw)
-        .map_err(|err| miette::miette!("invalid proxy metadata {}: {err}", path.display()))
+pub fn parse_proxy_metadata_json(raw: &str, source: &Path) -> Result<ProxyMetadata> {
+    serde_json::from_str(raw)
+        .map_err(|err| miette::miette!("invalid proxy metadata {}: {err}", source.display()))
 }
 
-fn load_compose_metadata(path: &Path) -> Result<ProxyMetadata> {
-    let raw = fs::read_to_string(path)
-        .map_err(|err| miette::miette!("failed to read {}: {err}", path.display()))?;
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&raw)
+pub fn parse_compose_proxy_metadata(raw: &str, source: &Path) -> Result<ProxyMetadata> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(raw)
         .map_err(|err| miette::miette!("invalid docker-compose YAML: {err}"))?;
-    let mapping = yaml
-        .as_mapping()
-        .ok_or_else(|| miette::miette!("output {} is not a docker-compose file", path.display()))?;
+    let mapping = yaml.as_mapping().ok_or_else(|| {
+        miette::miette!("output {} is not a docker-compose file", source.display())
+    })?;
     let services_key = serde_yaml::Value::String("services".to_string());
     if !mapping.contains_key(&services_key) {
         return Err(miette::miette!(
             "output {} is not a docker-compose file",
-            path.display()
+            source.display()
         ));
     }
     let x_amber_key = serde_yaml::Value::String("x-amber".to_string());
     let x_amber = mapping.get(&x_amber_key).ok_or_else(|| {
         miette::miette!(
             "docker-compose output {} is missing x-amber metadata; re-run `amber compile`",
-            path.display()
+            source.display()
         )
     })?;
     serde_yaml::from_value(x_amber.clone()).map_err(|err| {
         miette::miette!(
             "docker-compose output {} has invalid x-amber metadata: {err}",
-            path.display()
+            source.display()
         )
     })
+}
+
+fn load_proxy_metadata_file(path: &Path) -> Result<ProxyMetadata> {
+    let raw = fs::read_to_string(path)
+        .map_err(|err| miette::miette!("failed to read {}: {err}", path.display()))?;
+    parse_proxy_metadata_json(&raw, path)
+}
+
+fn load_compose_metadata(path: &Path) -> Result<ProxyMetadata> {
+    let raw = fs::read_to_string(path)
+        .map_err(|err| miette::miette!("failed to read {}: {err}", path.display()))?;
+    parse_compose_proxy_metadata(&raw, path)
 }
 
 fn validate_proxy_metadata(metadata: &ProxyMetadata, path: &Path) -> Result<()> {
@@ -1461,13 +1470,23 @@ async fn send_control_request(
 ) -> Result<String, ControlUpdateError> {
     match endpoint {
         ControlEndpoint::Tcp(addr) => {
-            let stream = tokio::net::TcpStream::connect(addr)
-                .await
-                .map_err(|_| ControlUpdateError::Retryable)?;
+            let stream = tokio::time::timeout(
+                CONTROL_REQUEST_TIMEOUT,
+                tokio::net::TcpStream::connect(addr),
+            )
+            .await
+            .map_err(|_| ControlUpdateError::Retryable)?
+            .map_err(|_| ControlUpdateError::Retryable)?;
             send_request(stream, request).await
         }
         ControlEndpoint::Unix(path) => {
-            let stream = tokio::net::UnixStream::connect(path).await.map_err(|err| {
+            let stream = tokio::time::timeout(
+                CONTROL_REQUEST_TIMEOUT,
+                tokio::net::UnixStream::connect(path),
+            )
+            .await
+            .map_err(|_| ControlUpdateError::Retryable)?
+            .map_err(|err| {
                 if is_retryable_unix_connect_error(&err) {
                     ControlUpdateError::Retryable
                 } else {
@@ -1629,14 +1648,17 @@ async fn send_request<S>(mut stream: S, request: &str) -> Result<String, Control
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .map_err(|_| ControlUpdateError::Retryable)?;
+    tokio::time::timeout(
+        CONTROL_REQUEST_TIMEOUT,
+        stream.write_all(request.as_bytes()),
+    )
+    .await
+    .map_err(|_| ControlUpdateError::Retryable)?
+    .map_err(|_| ControlUpdateError::Retryable)?;
     let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
+    tokio::time::timeout(CONTROL_REQUEST_TIMEOUT, stream.read_to_end(&mut buf))
         .await
+        .map_err(|_| ControlUpdateError::Retryable)?
         .map_err(|_| ControlUpdateError::Retryable)?;
     Ok(String::from_utf8_lossy(&buf).to_string())
 }
@@ -2196,5 +2218,27 @@ exit 1
         let err = validate_proxy_bindings(&metadata, &slot_bindings, &[])
             .expect_err("non-HTTP transports should be rejected");
         assert!(err.to_string().contains("HTTP-transport slots"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn try_fetch_router_identity_times_out_stalled_control_requests() {
+        let listener =
+            TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let handle = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("listener should accept");
+            std::thread::sleep(CONTROL_REQUEST_TIMEOUT + Duration::from_secs(1));
+        });
+
+        let started = std::time::Instant::now();
+        let err = try_fetch_router_identity(&ControlEndpoint::Tcp(addr.to_string()))
+            .await
+            .expect_err("stalled control request should fail");
+        assert!(matches!(err, ControlUpdateError::Retryable));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stalled control request should fail quickly"
+        );
+        handle.join().expect("listener thread should finish");
     }
 }

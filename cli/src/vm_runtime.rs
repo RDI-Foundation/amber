@@ -1314,7 +1314,7 @@ fn vm_endpoint_forward_ready_timeout() -> Duration {
     if vm_uses_tcg_accel() {
         TCG_VM_STARTUP_TIMEOUT
     } else {
-        Duration::from_secs(30)
+        Duration::from_secs(120)
     }
 }
 

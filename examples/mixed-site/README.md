@@ -1,177 +1,241 @@
 <!-- amber-docs
-summary: Run one scenario across a direct process, a Compose container, and a VM with a placement file, inspect the startup waves, and verify one host-visible request path that crosses every site.
+summary: Run one app across a direct local process and a Docker Compose service, attach an outside HTTP dependency at run time, and call exported entrypoints on localhost through `amber run`.
 -->
 
-# Mixed-site execution
+# Mixed-site local dev: direct + Compose with one outside service
 
-This example is the smallest useful mixed-site walkthrough in the repo.
+This example runs one app across two local runtimes:
 
-It shows three things at once:
+- `web` runs as a direct process on the host
+- `api` runs in Docker Compose
 
-- the manifest still describes one scenario graph rather than three separate deployments
-- the placement file decides where each runnable component goes
-- `amber run` starts the sites in dependency waves and then stitches them into one routed system
+It also keeps one upstream HTTP service outside the Amber scenario so the whole boundary is easy to
+see:
 
-The graph is deliberately simple:
+- root config comes from outside the app
+- one upstream HTTP service stays outside the app
+- the app exports named HTTP entrypoints back out to localhost
 
-- `console`: a direct/native host process
-- `queue`: a Docker Compose container
-- `vault`: a VM
+That gives one compact walkthrough for:
 
-`console` calls `queue`, and `queue` calls `vault`, so the startup waves should be:
+- externalized config
+- externalized slots
+- externalized exports
+- direct local execution
+- Compose local execution
 
-```json
-[["vm_local"], ["compose_local"], ["direct_local"]]
-```
+## Requirements
 
-That means the host-visible request you make to `console` proves the whole direct -> Compose -> VM
-path, without forcing you to proxy three different exports just to see the example work.
+- Amber
+- Python 3 on the host
+- Docker with Compose
 
-## Files
+## 1) Start the outside service
 
-- `scenario.json5`: the root graph
-- `local-placement.json5`: the explicit site assignment
-- `console.json5`: the direct/native component
-- `console.py`: the direct/native HTTP program
-- `queue.json5`: the Compose component
-- `queue.py`: the Compose HTTP program
-- `vault.json5`: the VM component
-- `vault.cloud-init.yaml`: the VM guest bootstrap
+One thing in this example is intentionally not part of the Amber scenario: a tiny catalog service.
 
-## Prereqs
-
-- `amber` on `PATH`
-- `python3` on the host
-- Docker Compose v2
-- a local sandbox backend for direct execution:
-  - Linux: `bwrap` and `slirp4netns`
-  - macOS: `/usr/bin/sandbox-exec`
-- QEMU for the VM site:
-  - macOS: `qemu`, plus AArch64 firmware such as Homebrew's `edk2-aarch64-code.fd`
-  - Linux: `qemu-system-*`, `qemu-img`, and `xorriso`
-- a matching Ubuntu 24.04 minimal cloud image available locally and exported through
-  `AMBER_CONFIG_BASE_IMAGE`
-
-Examples:
+In one terminal:
 
 ```sh
-# Apple Silicon / AArch64 hosts:
-export AMBER_CONFIG_BASE_IMAGE="$PWD/ubuntu-24.04-minimal-cloudimg-arm64.img"
-
-# Typical x86_64 Linux hosts:
-export AMBER_CONFIG_BASE_IMAGE="$PWD/ubuntu-24.04-minimal-cloudimg-amd64.img"
+cd examples/mixed-site
+python3 mock-catalog.py
 ```
 
-If your Linux host does not expose `/dev/kvm`, force software emulation:
+It listens on `http://127.0.0.1:9100`.
 
-```sh
-export AMBER_VM_FORCE_TCG=1
-```
+Keep that terminal running.
 
-## 1) Inspect the run plan
-
-Compile the scenario into a mixed-site run plan first. This is the easiest way to see what Amber
-will actually launch before you start anything heavy.
-
-```sh
-OUT=/tmp/amber-mixed-site
-STATE=/tmp/amber-mixed-site-state
-rm -rf "$OUT" "$STATE"
-mkdir -p "$OUT"
-
-amber compile examples/mixed-site/scenario.json5 \
-  --placement examples/mixed-site/local-placement.json5 \
-  --run-plan "$OUT/run-plan.json"
-
-jq '.startup_waves' "$OUT/run-plan.json"
-```
-
-Expected output:
-
-```json
-[["vm_local"], ["compose_local"], ["direct_local"]]
-```
-
-That output is the whole point of the example: the VM must exist before the container can route to
-it, and the container must exist before the direct host process can route to it.
-
-## 2) Start the mixed-site run
-
-Run the manifest directly, use the same placement file, and keep the state in one explicit
-directory so the follow-up commands are easy to reason about:
-
-```sh
-RUN_ID="$(
-  amber run examples/mixed-site/scenario.json5 \
-    --placement examples/mixed-site/local-placement.json5 \
-    --storage-root "$STATE" \
-    --observability local \
-    --detach |
-    sed -n 's/^run_id=//p'
-)"
-
-echo "$RUN_ID"
-```
-
-Amber stores everything for that run under:
-
-```sh
-echo "$STATE/runs/$RUN_ID"
-```
-
-## 3) Proxy the direct export
-
-The outside world connects to one site at a time. For this example, expose only the direct
-component. Its `/chain` endpoint is the user-friendly proof that the request crosses all three
-sites.
-
-```sh
-amber proxy "$STATE/runs/$RUN_ID/sites/direct_local/artifact" \
-  --export console_http=127.0.0.1:18080
-```
+## 2) Run the app
 
 In another terminal:
 
 ```sh
-curl -fsS http://127.0.0.1:18080/id | jq .
-curl -fsS http://127.0.0.1:18080/chain | jq .
+cd examples/mixed-site
+amber run .
 ```
 
-Expected shape:
+On a first interactive run, Amber may:
+
+- read `.env` if one already exists
+- prompt for any missing required root config
+- prompt for the outside service URL for this run
+- start the scenario
+- expose the exported entrypoints on localhost
+- print the final URLs
+
+Example:
+
+```text
+config.tenant: acme-local
+config.catalog_token: ********
+slot.catalog_api: http://127.0.0.1:9100
+
+Ready.
+  app  http://127.0.0.1:18080
+  api  http://127.0.0.1:18081
+
+Reuse:
+  amber run . --env-file /path/to/generated.env
+```
+
+Your addresses may differ.
+
+Keep that terminal running.
+
+## 3) Call it
+
+Use the URLs Amber printed.
+
+With the example values above:
+
+```sh
+curl http://127.0.0.1:18080/
+curl http://127.0.0.1:18080/chain
+curl http://127.0.0.1:18081/debug
+```
+
+Expected `/chain` shape:
 
 ```json
 {
   "site": "direct",
-  "queue": {
+  "api": {
     "site": "compose",
-    "vault": "vm-vault"
+    "tenant": "acme-local",
+    "catalog": {
+      "source": "external",
+      "item": "amber mug"
+    }
   }
 }
 ```
 
-That one response confirms:
+That response proves the whole path:
 
-- the host reached the direct site through `amber proxy`
-- the direct site reached the Compose site through Amber routing
-- the Compose site reached the VM site through Amber routing
+- the request entered through a named exported entrypoint on localhost
+- the direct `web` component called the Compose `api` component
+- the Compose `api` component called the outside `catalog_api` service you attached at run time
 
-## 4) Inspect local observability
+## 4) Reuse the same config later
 
-This example uses `--observability local`, which writes the raw OTLP HTTP requests Amber emitted
-during the run to a simple local log:
-
-```sh
-sed -n '1,40p' "$STATE/runs/$RUN_ID/observability/requests.log"
-```
-
-You should see `/v1/logs` and `/v1/traces` entries after the system starts and after you hit
-`/chain`.
-
-## 5) Stop the run
+After a successful interactive start, Amber prints an explicit replay command such as:
 
 ```sh
-amber stop "$RUN_ID" --storage-root "$STATE"
+amber run . --env-file .amber-runs/runs/<run-id>/root-config.env
 ```
 
-That tears down the direct process, the Compose site, and the VM site, and it also stops the local
-observability sink for this run.
+That generated env file contains the root config values Amber collected for that run. It does not
+replace your own project `.env`; it is just the explicit reuse path Amber gives you immediately.
+
+External slot values are still runtime inputs. If you do not provide them in an existing `.env` or
+an explicit `--env-file`, Amber may prompt for them again on the next interactive run.
+
+## 5) Stop the outside service and start it again
+
+While `amber run` is still running, stop `mock-catalog.py` and call `/chain` again:
+
+```sh
+curl http://127.0.0.1:18080/chain
+```
+
+The app should still answer, but the catalog section should report that the outside service is
+unavailable.
+
+Now start `mock-catalog.py` again and repeat the same request. The next request should pick the
+outside service back up.
+
+That is why the root binding for `catalog_api` is weak: outside services can come and go while the
+scenario stays up.
+
+## How the edges work
+
+This example uses three kinds of outside-facing values.
+
+**Config**  
+Values that come from outside the app and are forwarded into components.
+
+**External slots**  
+Services that the app calls, but Amber does not start.
+
+**Exports**  
+Capabilities that the app exposes back out to the outside world.
+
+The top-level manifest brings those together:
+
+```json5
+{
+  manifest_version: "0.3.0",
+
+  config_schema: {
+    type: "object",
+    properties: {
+      tenant: { type: "string" },
+      catalog_token: { type: "string", secret: true },
+    },
+    required: ["tenant", "catalog_token"],
+    additionalProperties: false,
+  },
+
+  slots: {
+    catalog_api: { kind: "http" },
+  },
+
+  components: {
+    web: {
+      manifest: "./web.json5",
+      config: {
+        tenant: "${config.tenant}",
+      },
+    },
+    api: {
+      manifest: "./api.json5",
+      config: {
+        tenant: "${config.tenant}",
+        catalog_token: "${config.catalog_token}",
+      },
+    },
+  },
+
+  bindings: [
+    { to: "#web.api", from: "#api.http" },
+    { to: "#api.catalog_api", from: "slots.catalog_api", weak: true },
+  ],
+
+  exports: {
+    app: "#web.http",
+    api: "#api.http",
+  },
+}
+```
+
+A few details matter here:
+
+- `config_schema` is the part Amber asks for at run time if values are missing
+- `slots.catalog_api` is an upstream service that stays outside the app
+- `exports` are the named entrypoints Amber makes reachable from outside the app
+- the `catalog_api` binding is `weak` because that service is attached at run time rather than
+  started as part of the scenario
+
+## Why this is mixed-site without extra site syntax
+
+This example does not assign sites inside the manifest.
+
+It uses Amber's normal local placement rules:
+
+- `web.json5` uses `program.path`, so Amber runs it as a direct local process
+- `api.json5` uses `program.image`, so Amber runs it in Docker Compose locally
+
+If you want to inspect or override that layout explicitly, there is also a
+`local-placement.json5` in this directory. You do not need it for the default local loop.
+
+## Need explicit control later?
+
+The flow above is the friendly attached interactive path.
+
+If you want explicit control instead:
+
+- use `amber compile` to inspect the run plan or generated artifacts
+- use `amber run --detach` for a managed background run
+- use `amber proxy` for explicit outside-world wiring
+
+Those are the same concepts with more ceremony, not a different model.

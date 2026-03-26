@@ -12,10 +12,14 @@ mod workspace_root_support;
 use std::{
     collections::BTreeSet,
     env, fs,
-    net::{SocketAddr, TcpListener},
+    io::{Read, Write},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -387,6 +391,66 @@ fn wait_for_text(path: &Path, needle: &str, timeout: Duration) -> String {
     );
 }
 
+fn append_debug_file(out: &mut String, label: &str, path: &Path) {
+    if !path.is_file() {
+        return;
+    }
+    out.push_str(&format!(
+        "\n{label} ({}):\n{}",
+        path.display(),
+        fs::read_to_string(path).unwrap_or_default()
+    ));
+}
+
+fn site_debug_context(run_root: &Path, site_id: &str) -> String {
+    let state_root = run_root.join("state").join(site_id);
+    let mut out = String::new();
+    append_debug_file(
+        &mut out,
+        "manager state",
+        &state_root.join("manager-state.json"),
+    );
+    append_debug_file(
+        &mut out,
+        "supervisor log",
+        &state_root.join("supervisor.log"),
+    );
+    append_debug_file(
+        &mut out,
+        "port-forward log",
+        &state_root.join("port-forward.log"),
+    );
+    append_debug_file(&mut out, "site log", &state_root.join("site.log"));
+    out
+}
+
+fn run_debug_context(run_root: &Path) -> String {
+    let state_root = run_root.join("state");
+    let Ok(entries) = fs::read_dir(&state_root) else {
+        return String::new();
+    };
+    let mut site_ids = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|kind| kind.is_dir())
+                .and_then(|_| entry.file_name().into_string().ok())
+        })
+        .collect::<Vec<_>>();
+    site_ids.sort();
+    site_ids
+        .into_iter()
+        .map(|site_id| {
+            format!(
+                "\n== site {site_id} =={}",
+                site_debug_context(run_root, &site_id)
+            )
+        })
+        .collect()
+}
+
 fn spawn_proxy(
     output_dir: &Path,
     export: &str,
@@ -597,9 +661,12 @@ fn kill_pid(pid: u32) {
 
 fn pid_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
-    unsafe {
-        libc::kill(pid as i32, 0) == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    {
+        let alive = unsafe {
+            libc::kill(pid as i32, 0) == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        };
+        alive && process_status_code(pid) != Some('Z')
     }
 
     #[cfg(not(unix))]
@@ -607,6 +674,26 @@ fn pid_is_alive(pid: u32) -> bool {
         let _ = pid;
         true
     }
+}
+
+#[cfg(unix)]
+fn process_status_code(pid: u32) -> Option<char> {
+    let output = Command::new("ps")
+        .arg("-o")
+        .arg("stat=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    output
+        .stdout
+        .split(|byte| byte.is_ascii_whitespace())
+        .find(|field| !field.is_empty())
+        .and_then(|field| field.first().copied())
+        .map(|state| (state as char).to_ascii_uppercase())
 }
 
 #[derive(Debug)]
@@ -712,14 +799,18 @@ fn run_manifest_with_args_and_env(
         .envs(extra_env.iter().copied())
         .output()
         .expect("failed to run amber run");
+    let run_root = wait_for_single_run_root(storage_root, Duration::from_secs(60));
     assert!(
         output.status.success(),
-        "amber run failed\nstdout:\n{}\nstderr:\n{}",
+        "amber run failed\nstdout:\n{}\nstderr:\n{}\nrun root: {}{}",
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&output.stderr),
+        run_root.display(),
+        run_debug_context(&run_root),
     );
     let run_id = parse_run_id(&output.stdout);
-    let run_root = storage_root.join("runs").join(&run_id);
+    let expected_run_root = storage_root.join("runs").join(&run_id);
+    assert_eq!(run_root, expected_run_root);
     let receipt = wait_for_receipt(storage_root, &run_id, Duration::from_secs(240));
     RunHandle {
         run_id,
@@ -1128,36 +1219,83 @@ fn write_vm_component(root: &Path, spec: VmComponentSpec<'_>) {
 }
 
 struct HostHttpServer {
-    child: std::process::Child,
+    port: u16,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl HostHttpServer {
-    fn start(port: u16) -> Self {
-        let child = Command::new("/usr/bin/env")
-            .arg("python3")
-            .arg("-u")
-            .arg("-m")
-            .arg("http.server")
-            .arg(port.to_string())
-            .arg("--bind")
-            .arg("0.0.0.0")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to start host http server");
+    fn start() -> Self {
+        let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
+            .expect("failed to bind host http server");
+        let port = listener.local_addr().expect("host http server addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("host http server should be nonblocking");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => serve_host_http_request(&mut stream),
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
         wait_for_condition(
             Duration::from_secs(10),
             || matches!(http_get(port, "/"), Some((200, _))),
             &format!("host http server on 127.0.0.1:{port}"),
         );
-        Self { child }
+        Self {
+            port,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn port(&self) -> u16 {
+        self.port
     }
 }
 
 impl Drop for HostHttpServer {
     fn drop(&mut self) {
-        stop_child(&mut self.child);
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], self.port)));
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
+}
+
+fn serve_host_http_request(stream: &mut TcpStream) {
+    let mut request = [0u8; 1024];
+    let _ = stream.read(&mut request);
+    let request = String::from_utf8_lossy(&request);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/");
+    let (content_type, body) = match path {
+        "/item/amber-mug" => (
+            "application/json; charset=utf-8",
+            r#"{"source":"external","item":"amber mug"}"#,
+        ),
+        "/health" => ("application/json; charset=utf-8", r#"{"ok":true}"#),
+        _ => ("text/plain; charset=utf-8", "ok"),
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\nConnection: \
+         close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
 }
 
 struct KindClusterGuard {
@@ -1268,6 +1406,49 @@ fn kubectl_cmd(kubeconfig: &Path) -> Command {
 struct ScenarioFixture {
     manifest: PathBuf,
     placement: PathBuf,
+}
+
+fn copy_documented_mixed_site_fixture(root: &Path) -> ScenarioFixture {
+    let source_root = workspace_root().join("examples").join("mixed-site");
+    for file_name in [
+        "scenario.json5",
+        "local-placement.json5",
+        "web.json5",
+        "api.json5",
+        "web.py",
+        "api.py",
+        "mock-catalog.py",
+    ] {
+        fs::copy(source_root.join(file_name), root.join(file_name)).unwrap_or_else(|err| {
+            panic!(
+                "failed to copy documented mixed-site file {}: {err}",
+                source_root.join(file_name).display()
+            )
+        });
+    }
+
+    let web_port = pick_free_port();
+    let mut api_port = pick_free_port();
+    while api_port == web_port {
+        api_port = pick_free_port();
+    }
+    rewrite_documented_port(root.join("web.json5"), web_port);
+    rewrite_documented_port(root.join("api.json5"), api_port);
+
+    ScenarioFixture {
+        manifest: root.join("scenario.json5"),
+        placement: root.join("local-placement.json5"),
+    }
+}
+
+fn rewrite_documented_port(path: PathBuf, port: u16) {
+    let contents = fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+    let contents = contents
+        .replace("PORT: \"8080\"", &format!("PORT: \"{port}\""))
+        .replace("port: 8080", &format!("port: {port}"));
+    fs::write(&path, contents)
+        .unwrap_or_else(|err| panic!("failed to update {}: {err}", path.display()));
 }
 
 fn write_two_site_fixture(root: &Path) -> ScenarioFixture {
@@ -1716,16 +1897,25 @@ fn wait_for_state_status(run_root: &Path, site_id: &str, status: &str, timeout: 
         thread::sleep(Duration::from_millis(250));
     }
     panic!(
-        "timed out waiting for site {site_id} state {status}\nlast state:\n{}",
+        "timed out waiting for site {site_id} state {status}\nlast state:\n{}{}",
         if state_path.is_file() {
             fs::read_to_string(&state_path).unwrap_or_default()
         } else {
             String::from("<missing>")
-        }
+        },
+        site_debug_context(run_root, site_id),
     );
 }
 
 fn compose_ps_ids(project: &str, artifact_dir: &Path) -> String {
+    compose_ps_ids_with_env(project, artifact_dir, &[])
+}
+
+fn compose_ps_ids_with_env(
+    project: &str,
+    artifact_dir: &Path,
+    extra_env: &[(&str, &str)],
+) -> String {
     let output = Command::new("docker")
         .arg("compose")
         .arg("-f")
@@ -1734,6 +1924,7 @@ fn compose_ps_ids(project: &str, artifact_dir: &Path) -> String {
         .arg(project)
         .arg("ps")
         .arg("-q")
+        .envs(extra_env.iter().copied())
         .output()
         .expect("failed to query docker compose ps");
     assert!(
@@ -1766,8 +1957,8 @@ fn mixed_run_five_site_startup_state_and_teardown() {
     let kind_cluster = KindCluster::from_env_or_create(&kubeconfig);
     ensure_kind_internal_images(&kind_cluster);
     let kubeconfig_env = kind_cluster.kubeconfig.display().to_string();
-    let adversarial_port = pick_free_port();
-    let _host_server = HostHttpServer::start(adversarial_port);
+    let host_server = HostHttpServer::start();
+    let adversarial_port = host_server.port();
     let fixture = write_five_site_fixture(temp.path(), &kind_cluster, adversarial_port);
     let storage_root = temp.path().join("state");
     let mut run = run_manifest_with_env(
@@ -2046,6 +2237,7 @@ fn mixed_run_five_site_startup_state_and_teardown() {
         compose_ps_ids(&compose_e_project, &run.site_artifact_dir("compose_e")).is_empty(),
         "compose_e should be torn down"
     );
+    drop(host_server);
     assert!(
         !namespace_exists(
             &kind_namespace,
@@ -2606,10 +2798,113 @@ fn mixed_run_dry_run_emits_launch_bundle_without_starting_sites() {
 }
 
 #[test]
+fn mixed_run_noninteractive_manifest_reports_missing_runtime_inputs() {
+    let temp = temp_output_dir("mixed-run-runtime-inputs-missing-");
+    let fixture = copy_documented_mixed_site_fixture(temp.path());
+    let storage_root = temp.path().join("state");
+
+    let output = amber_command()
+        .arg("run")
+        .arg(&fixture.manifest)
+        .arg("--placement")
+        .arg(&fixture.placement)
+        .arg("--storage-root")
+        .arg(&storage_root)
+        .output()
+        .expect("failed to run amber run for documented mixed-site example");
+
+    assert!(
+        !output.status.success(),
+        "amber run unexpectedly succeeded without required runtime \
+         inputs\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "missing-input failure should not write stdout, got:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for needle in [
+        "missing required runtime inputs",
+        "AMBER_CONFIG_TENANT",
+        "AMBER_CONFIG_CATALOG_TOKEN",
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "missing-input failure should mention `{needle}`\nstderr:\n{stderr}"
+        );
+    }
+    assert!(
+        !storage_root.join("runs").exists(),
+        "missing-input failure should not allocate a run root"
+    );
+}
+
+#[test]
+fn mixed_run_dry_run_accepts_runtime_inputs_from_env_file() {
+    let temp = temp_output_dir("mixed-run-runtime-inputs-env-file-");
+    let fixture = copy_documented_mixed_site_fixture(temp.path());
+    let storage_root = temp.path().join("state");
+    let bundle_root = temp.path().join("launch-bundle");
+    let env_file = temp.path().join("runtime.env");
+    fs::write(
+        &env_file,
+        "\
+AMBER_CONFIG_TENANT=acme-local\n\
+AMBER_CONFIG_CATALOG_TOKEN=demo-token\n\
+AMBER_EXTERNAL_SLOT_CATALOG_API_URL=http://127.0.0.1:9100\n",
+    )
+    .expect("failed to write runtime env file");
+
+    let output = amber_command()
+        .arg("run")
+        .arg("-Z")
+        .arg("unstable-options")
+        .arg(&fixture.manifest)
+        .arg("--placement")
+        .arg(&fixture.placement)
+        .arg("--storage-root")
+        .arg(&storage_root)
+        .arg("--env-file")
+        .arg(&env_file)
+        .arg("--dry-run")
+        .arg("--emit-launch-bundle")
+        .arg(&bundle_root)
+        .output()
+        .expect("failed to run amber run --dry-run with --env-file");
+
+    assert!(
+        output.status.success(),
+        "amber run --dry-run with --env-file failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let compose_supervisor_plan = fs::read_to_string(
+        bundle_root
+            .join("state")
+            .join("compose_local")
+            .join("site-supervisor-plan.json"),
+    )
+    .expect("failed to read compose site-supervisor-plan.json from launch bundle");
+    assert!(
+        compose_supervisor_plan.contains("AMBER_CONFIG_TENANT"),
+        "dry-run launch bundle should include supplied root config in the compose supervisor plan"
+    );
+    assert!(
+        compose_supervisor_plan.contains("acme-local"),
+        "dry-run launch bundle should materialize supplied root config values"
+    );
+}
+
+#[test]
 fn mixed_run_dry_run_tolerates_unresolved_vm_preview_config() {
     let temp = temp_output_dir("mixed-run-dry-run-vm-preview-");
     let bundle_root = temp.path().join("launch-bundle");
-    let manifest = workspace_root().join("examples/mixed-site/scenario.json5");
+    let manifest = workspace_root().join("examples/vm-network-storage/scenario.json5");
 
     let output = amber_command()
         .arg("run")
@@ -2680,8 +2975,6 @@ fn mixed_run_proxy_attaches_by_run_id_smoke() {
     let proxy_args = vec![
         "--storage-root".to_string(),
         storage_root.display().to_string(),
-        "--site".to_string(),
-        "direct_local".to_string(),
     ];
     let mut proxy = spawn_proxy_target(&run.run_id, "a_http", proxy_port, &proxy_args);
     wait_for_path(&mut proxy, proxy_port, "/id", Duration::from_secs(60));
@@ -2763,6 +3056,93 @@ fn mixed_run_detached_stop_smoke() {
         Duration::from_secs(30),
         || !run.run_root.join("receipt.json").exists(),
         "detached run receipt removal",
+    );
+}
+
+#[test]
+#[ignore = "requires docker; run manually or in CI"]
+fn mixed_run_documented_example_detached_stop_smoke() {
+    ensure_internal_images();
+    let temp = temp_output_dir("mixed-run-doc-example-detach-");
+    let fixture = copy_documented_mixed_site_fixture(temp.path());
+    let storage_root = temp.path().join("state");
+    let catalog = HostHttpServer::start();
+    let catalog_url = docker_host_http_url(catalog.port())
+        .trim_end_matches('/')
+        .to_string();
+    let runtime_env = [
+        ("AMBER_CONFIG_TENANT", "acme-local"),
+        ("AMBER_CONFIG_CATALOG_TOKEN", "demo-token"),
+        ("AMBER_EXTERNAL_SLOT_CATALOG_API_URL", catalog_url.as_str()),
+    ];
+    let mut run = run_manifest_with_args_and_env(
+        &fixture.manifest,
+        &fixture.placement,
+        &storage_root,
+        &["--detach"],
+        &runtime_env,
+    );
+
+    let direct_state = wait_for_state_status(
+        &run.run_root,
+        "direct_local",
+        "running",
+        Duration::from_secs(30),
+    );
+    let compose_state = wait_for_state_status(
+        &run.run_root,
+        "compose_local",
+        "running",
+        Duration::from_secs(30),
+    );
+    let direct_pid = direct_state["process_pid"]
+        .as_u64()
+        .expect("direct process pid should be present") as u32;
+    let compose_project = compose_state["compose_project"]
+        .as_str()
+        .expect("compose project should be present")
+        .to_string();
+
+    let proxy_port = pick_free_port();
+    let proxy_args = vec![
+        "--storage-root".to_string(),
+        storage_root.display().to_string(),
+    ];
+    let mut proxy = spawn_proxy_target(&run.run_id, "app", proxy_port, &proxy_args);
+    wait_for_path(&mut proxy, proxy_port, "/chain", Duration::from_secs(60));
+    let body = wait_for_body(&mut proxy, proxy_port, "/chain", Duration::from_secs(60));
+    assert!(
+        body.contains("\"site\": \"direct\""),
+        "documented example should return the direct web response, got:\n{body}"
+    );
+    assert!(
+        body.contains("\"item\": \"amber mug\""),
+        "documented example should reach the outside catalog service, got:\n{body}"
+    );
+    stop_proxy(&mut proxy);
+
+    run.stop();
+    wait_for_condition(
+        Duration::from_secs(30),
+        || !run.run_root.join("receipt.json").exists(),
+        "documented example detached run receipt removal",
+    );
+    wait_for_condition(
+        Duration::from_secs(30),
+        || !pid_is_alive(direct_pid),
+        "documented example direct process exit",
+    );
+    wait_for_condition(
+        Duration::from_secs(30),
+        || {
+            compose_ps_ids_with_env(
+                &compose_project,
+                &run.site_artifact_dir("compose_local"),
+                &runtime_env,
+            )
+            .is_empty()
+        },
+        "documented example compose teardown",
     );
 }
 

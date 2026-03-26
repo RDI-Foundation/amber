@@ -4,11 +4,9 @@
   sites: {
     direct_local: { kind: "direct" },
     compose_local: { kind: "compose" },
-    vm_local: { kind: "vm" },
   },
   defaults: {
     path: "direct_local",
     image: "compose_local",
-    vm: "vm_local",
   },
 }

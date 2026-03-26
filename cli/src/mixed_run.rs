@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     env, fs,
     io::{Read as _, Write as _},
     net::{SocketAddr, TcpListener, TcpStream},
@@ -12,10 +12,16 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use amber_compiler::run_plan::{RunLink, RunPlan, RunSitePlan, SiteKind};
-use amber_manifest::NetworkProtocol;
+use amber_compiler::{
+    mesh::ProxyMetadata,
+    reporter::vm::{VM_PLAN_FILENAME, VmPlan},
+    run_plan::{RunLink, RunPlan, RunSitePlan, SiteKind},
+};
+use amber_manifest::{CapabilityKind, CapabilityTransport, NetworkProtocol};
 use amber_mesh::{
-    MeshIdentityPublic, MeshProtocol, router_export_route_id,
+    InboundRoute, InboundTarget, MeshConfig, MeshConfigPublic, MeshIdentity, MeshIdentityPublic,
+    MeshPeer, MeshProtocol, OutboundRoute, TransportConfig, component_route_id,
+    router_export_route_id,
     telemetry::{SCENARIO_RUN_ID_ENV, SCENARIO_SCOPE_ENV},
 };
 use amber_proxy::{
@@ -31,7 +37,9 @@ use url::Url;
 use crate::{
     DirectLaunchProcessPreview, DirectSiteLaunchPreview, build_direct_site_launch_preview,
     direct_current_control_socket_path, direct_runtime_state_path,
-    tcp_readiness::endpoint_accepts_stable_connection,
+    run_inputs::{collect_run_interface, validate_export_bindings, validate_slot_bindings},
+    site_proxy_metadata::load_site_proxy_metadata,
+    tcp_readiness::{wait_for_http_response, wait_for_stable_endpoint},
     vm_runtime::{
         TCG_VM_STARTUP_TIMEOUT, VmLaunchPreview, VmRuntimeState, VmSiteLaunchPreview,
         build_vm_site_launch_preview, vm_current_control_socket_path, vm_uses_tcg_accel,
@@ -39,7 +47,7 @@ use crate::{
 };
 
 const RECEIPT_SCHEMA: &str = "amber.run.receipt";
-const RECEIPT_VERSION: u32 = 2;
+const RECEIPT_VERSION: u32 = 3;
 const LAUNCH_BUNDLE_SCHEMA: &str = "amber.run.launch_bundle";
 const LAUNCH_BUNDLE_VERSION: u32 = 1;
 const SITE_STATE_SCHEMA: &str = "amber.run.site_state";
@@ -52,13 +60,21 @@ const OTLP_SINK_PLAN_SCHEMA: &str = "amber.run.observability_sink";
 const OTLP_SINK_PLAN_VERSION: u32 = 1;
 const OTELCOL_UPSTREAM_ENV: &str = "AMBER_OTEL_UPSTREAM_OTLP_HTTP_ENDPOINT";
 const TEST_WAVE_DELAY_ENV: &str = "AMBER_TEST_MIXED_RUN_AFTER_WAVE_DELAY_MS";
+const OUTSIDE_PROXY_PLAN_SCHEMA: &str = "amber.run.outside_proxy";
+const OUTSIDE_PROXY_PLAN_VERSION: u32 = 1;
+const OUTSIDE_PROXY_STATE_SCHEMA: &str = "amber.run.outside_proxy_state";
+const OUTSIDE_PROXY_STATE_VERSION: u32 = 1;
 
 const ROUTER_CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const RESTART_BACKOFF: Duration = Duration::from_secs(1);
 const STITCH_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const SITE_DISCOVERY_STABILITY_WINDOW: Duration = Duration::from_secs(1);
 const PROCESS_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(10);
 const KUBERNETES_NAMESPACE_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const KUBERNETES_WORKLOAD_READY_TIMEOUT: Duration = Duration::from_secs(120);
+const KUBERNETES_SITE_READY_BUFFER: Duration = Duration::from_secs(30);
+const VM_LOCAL_TARGET_READY_TIMEOUT: Duration = Duration::from_secs(1);
 
 const DEFAULT_EXTERNAL_ENV_FILE: &str = "router-external.env";
 const DEFAULT_K8S_OTEL_UPSTREAM: &str = "http://host.docker.internal:18890";
@@ -79,7 +95,16 @@ pub(crate) struct RunReceipt {
     pub(crate) run_root: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) observability: Option<ObservabilityReceipt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) bridge_proxies: Vec<BridgeProxyReceipt>,
     pub(crate) sites: BTreeMap<String, SiteReceipt>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct BridgeProxyReceipt {
+    pub(crate) export_name: String,
+    pub(crate) pid: u32,
+    pub(crate) listen: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -366,6 +391,48 @@ struct ObservabilitySinkPlan {
     requests_log: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OutsideProxyPlan {
+    schema: String,
+    version: u32,
+    run_root: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    slot_bindings: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    export_bindings: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OutsideProxyState {
+    schema: String,
+    version: u32,
+    mesh_listen: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    exports: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+struct RunOutsideProxyContext {
+    mesh_scope: String,
+    sites: BTreeMap<String, LaunchedSite>,
+    exports: BTreeMap<String, RunOutsideExport>,
+    slots: BTreeMap<String, RunOutsideSlot>,
+}
+
+#[derive(Clone, Debug)]
+struct RunOutsideExport {
+    site_id: String,
+    protocol: String,
+}
+
+#[derive(Clone, Debug)]
+struct RunOutsideSlot {
+    required: bool,
+    kind: CapabilityKind,
+    url_env: String,
+    consumer_sites: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 struct LaunchedSite {
     receipt: SiteReceipt,
@@ -392,6 +459,18 @@ struct SupervisorChild {
     child: Child,
 }
 
+struct BridgeProxyHandle {
+    child: Child,
+    export_name: String,
+    listen: SocketAddr,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct BridgeProxyKey {
+    export_name: String,
+    consumer_kind: SiteKind,
+}
+
 #[derive(Debug)]
 struct SupervisorRuntime {
     site_process: Option<Child>,
@@ -399,6 +478,7 @@ struct SupervisorRuntime {
     port_forward: Option<Child>,
     last_start_attempt: Option<Instant>,
     last_stitch_refresh: Option<Instant>,
+    ready_since: Option<Instant>,
 }
 
 pub(crate) fn dry_run_run_plan(
@@ -406,6 +486,7 @@ pub(crate) fn dry_run_run_plan(
     run_plan: &RunPlan,
     bundle_root: &Path,
     observability: Option<&str>,
+    runtime_env: &BTreeMap<String, String>,
 ) -> Result<PathBuf> {
     if bundle_root.exists() {
         return Err(miette::miette!(
@@ -428,6 +509,7 @@ pub(crate) fn dry_run_run_plan(
         bundle_root,
         &run_id,
         observability,
+        runtime_env,
     )?;
     Ok(bundle_root.to_path_buf())
 }
@@ -438,6 +520,7 @@ fn materialize_launch_bundle(
     bundle_root: &Path,
     run_id: &str,
     observability: Option<&str>,
+    runtime_env: &BTreeMap<String, String>,
 ) -> Result<MaterializedLaunchBundle> {
     let sites_root = bundle_root.join("sites");
     let state_root = bundle_root.join("state");
@@ -463,7 +546,7 @@ fn materialize_launch_bundle(
         patch_site_artifacts(
             &artifact_dir,
             site_plan.site.kind,
-            &BTreeMap::new(),
+            runtime_env,
             observability_endpoint,
         )?;
         let site_state_root = state_root.join(site_id);
@@ -482,6 +565,7 @@ fn materialize_launch_bundle(
                 run_id,
                 &run_plan.mesh_scope,
                 site_plan.site.kind,
+                runtime_env,
                 &BTreeMap::new(),
                 observability_endpoint,
             )?,
@@ -699,6 +783,7 @@ fn build_launch_bundle_stitching_preview(
                     peer_key_b64,
                     &provider.router_identity_id,
                     link,
+                    provider.kind,
                     consumer.kind,
                 )?),
                 _ => None,
@@ -740,7 +825,7 @@ fn build_launch_bundle_stitching_preview(
                 external_slot_env: amber_compiler::mesh::external_slot_env_var(
                     &link.external_slot_name,
                 ),
-                consumer_mesh_host: container_host_for_consumer(consumer.kind),
+                consumer_mesh_host: container_host_for_consumer(provider.kind, consumer.kind),
                 resolution,
                 preview_external_url,
                 unresolved_reason,
@@ -754,9 +839,10 @@ fn preview_external_slot_url(
     peer_key_b64: &str,
     peer_id: &str,
     link: &RunLink,
+    provider_kind: SiteKind,
     consumer_kind: SiteKind,
 ) -> Result<String> {
-    let host = container_host_for_consumer(consumer_kind);
+    let host = container_host_for_consumer(provider_kind, consumer_kind);
     let mut mesh_url = Url::parse(&format!("mesh://{}:{port}", host))
         .into_diagnostic()
         .wrap_err("failed to build preview mesh link url")?;
@@ -1043,12 +1129,14 @@ async fn start_materialized_observability(
 
 fn prepare_site_launch(
     site: &MaterializedSite,
+    runtime_env: &BTreeMap<String, String>,
     external_env: &BTreeMap<String, String>,
 ) -> Result<()> {
+    let artifact_env = merge_env_maps(runtime_env, external_env);
     patch_site_artifacts(
         &site.artifact_dir,
         site.site_plan.site.kind,
-        external_env,
+        &artifact_env,
         site.base_supervisor_plan.observability_endpoint.as_deref(),
     )?;
     let mut supervisor_plan = site.base_supervisor_plan.clone();
@@ -1084,6 +1172,7 @@ pub(crate) async fn run_run_plan(
     run_plan: &RunPlan,
     storage_root_override: Option<&Path>,
     observability: Option<&str>,
+    site_launch_env: &BTreeMap<String, String>,
 ) -> Result<RunReceipt> {
     let run_id = new_run_id();
     run_run_plan_with_id(
@@ -1092,6 +1181,7 @@ pub(crate) async fn run_run_plan(
         storage_root_override,
         observability,
         &run_id,
+        site_launch_env,
     )
     .await
 }
@@ -1102,6 +1192,7 @@ pub(crate) async fn run_run_plan_with_id(
     storage_root_override: Option<&Path>,
     observability: Option<&str>,
     run_id: &str,
+    site_launch_env: &BTreeMap<String, String>,
 ) -> Result<RunReceipt> {
     let storage_root = mixed_run_storage_root(storage_root_override)?;
     let run_root = storage_root.join("runs").join(run_id);
@@ -1115,8 +1206,14 @@ pub(crate) async fn run_run_plan_with_id(
         .wrap_err_with(|| format!("failed to create state directory {}", state_root.display()))?;
     let _coordinator_lock = hold_coordinator_lock(&run_root)?;
 
-    let launch_bundle =
-        materialize_launch_bundle(source_plan_path, run_plan, &run_root, run_id, observability)?;
+    let launch_bundle = materialize_launch_bundle(
+        source_plan_path,
+        run_plan,
+        &run_root,
+        run_id,
+        observability,
+        site_launch_env,
+    )?;
     let observability_receipt =
         start_materialized_observability(&run_root, launch_bundle.observability.as_ref()).await?;
     init_manager_telemetry(
@@ -1138,6 +1235,7 @@ pub(crate) async fn run_run_plan_with_id(
     let mut launched_by_site = BTreeMap::<String, LaunchedSite>::new();
     let mut started_site_receipts = BTreeMap::<String, SiteReceipt>::new();
     let mut supervisor_children = BTreeMap::<String, SupervisorChild>::new();
+    let mut bridge_proxies = BTreeMap::<BridgeProxyKey, BridgeProxyHandle>::new();
     let test_wave_delay = test_wave_delay()?;
 
     let result = async {
@@ -1153,7 +1251,7 @@ pub(crate) async fn run_run_plan_with_id(
                     &run_plan.links,
                     &launched_by_site,
                 )?;
-                prepare_site_launch(site, &external_env)?;
+                prepare_site_launch(site, site_launch_env, &external_env)?;
 
                 let mut supervisor = spawn_site_supervisor(&site.site_state_root)?;
                 let launched = wait_for_site_ready(
@@ -1174,7 +1272,9 @@ pub(crate) async fn run_run_plan_with_id(
                     &run_plan.links,
                     &mut launched,
                     &launched_by_site,
+                    &run_root,
                     &state_root,
+                    &mut bridge_proxies,
                 )
                 .await?;
 
@@ -1209,6 +1309,14 @@ pub(crate) async fn run_run_plan_with_id(
             source_plan_path: source_plan_path.map(|path| path.display().to_string()),
             run_root: run_root.display().to_string(),
             observability: observability_receipt.clone(),
+            bridge_proxies: bridge_proxies
+                .values()
+                .map(|proxy| BridgeProxyReceipt {
+                    export_name: proxy.export_name.clone(),
+                    pid: proxy.child.id(),
+                    listen: proxy.listen.to_string(),
+                })
+                .collect(),
             sites: launched_by_site
                 .into_iter()
                 .map(|(site_id, launched)| (site_id, launched.receipt))
@@ -1221,8 +1329,14 @@ pub(crate) async fn run_run_plan_with_id(
 
     if result.is_err() {
         let _ = write_stop_marker(&run_root);
+        for bridge in bridge_proxies.values_mut() {
+            send_sigterm(bridge.child.id());
+        }
         for supervisor in supervisor_children.values_mut() {
             send_sigterm(supervisor.child.id());
+        }
+        for bridge in bridge_proxies.values_mut() {
+            let _ = wait_for_child_exit(&mut bridge.child, PROCESS_SHUTDOWN_GRACE_PERIOD).await;
         }
         for supervisor in supervisor_children.values_mut() {
             let _ = wait_for_child_exit(&mut supervisor.child, PROCESS_SHUTDOWN_GRACE_PERIOD).await;
@@ -1240,7 +1354,7 @@ pub(crate) async fn run_run_plan_with_id(
             if already_terminal {
                 continue;
             }
-            let _ = stop_site_from_receipt(receipt);
+            let _ = stop_site_from_receipt(&run_root, site_id, receipt).await;
             let _ = write_site_state(
                 &state_path,
                 SiteManagerState {
@@ -1297,38 +1411,42 @@ pub(crate) async fn stop_run(run_id: &str, storage_root_override: Option<&Path>)
                 break;
             }
             if !pid_is_alive(site.supervisor_pid) {
-                stop_site_from_receipt(site)?;
-                let stopped = SiteManagerState {
-                    schema: SITE_STATE_SCHEMA.to_string(),
-                    version: SITE_STATE_VERSION,
-                    run_id: receipt.run_id.clone(),
-                    site_id: site_id.clone(),
-                    kind: site.kind,
-                    status: SiteLifecycleStatus::Stopped,
-                    artifact_dir: site.artifact_dir.clone(),
-                    supervisor_pid: site.supervisor_pid,
-                    process_pid: None,
-                    compose_project: site.compose_project.clone(),
-                    kubernetes_namespace: site.kubernetes_namespace.clone(),
-                    port_forward_pid: None,
-                    context: site.context.clone(),
-                    router_control: site.router_control.clone(),
-                    router_mesh_addr: site.router_mesh_addr.clone(),
-                    router_identity_id: site.router_identity_id.clone(),
-                    router_public_key_b64: site.router_public_key_b64.clone(),
-                    last_error: None,
-                };
-                write_site_state(&state_path, stopped)?;
                 break;
             }
             sleep(Duration::from_millis(200)).await;
         }
+
+        stop_site_from_receipt(&run_root, site_id, site).await?;
+        let stopped = SiteManagerState {
+            schema: SITE_STATE_SCHEMA.to_string(),
+            version: SITE_STATE_VERSION,
+            run_id: receipt.run_id.clone(),
+            site_id: site_id.clone(),
+            kind: site.kind,
+            status: SiteLifecycleStatus::Stopped,
+            artifact_dir: site.artifact_dir.clone(),
+            supervisor_pid: site.supervisor_pid,
+            process_pid: None,
+            compose_project: site.compose_project.clone(),
+            kubernetes_namespace: site.kubernetes_namespace.clone(),
+            port_forward_pid: None,
+            context: site.context.clone(),
+            router_control: site.router_control.clone(),
+            router_mesh_addr: site.router_mesh_addr.clone(),
+            router_identity_id: site.router_identity_id.clone(),
+            router_public_key_b64: site.router_public_key_b64.clone(),
+            last_error: None,
+        };
+        write_site_state(&state_path, stopped)?;
     }
 
     if let Some(observability) = receipt.observability.as_ref()
         && let Some(pid) = observability.sink_pid
     {
         send_sigterm(pid);
+    }
+    for proxy in &receipt.bridge_proxies {
+        send_sigterm(proxy.pid);
     }
 
     let _ = fs::remove_file(receipt_path(&run_root));
@@ -1368,19 +1486,288 @@ pub(crate) fn maybe_resolve_proxy_run_target(
     resolve_proxy_run_root(&run_root, site_id).map(Some)
 }
 
-fn stop_site_from_receipt(site: &SiteReceipt) -> Result<()> {
+pub(crate) fn maybe_resolve_run_root(
+    target: &str,
+    storage_root_override: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    let target_path = Path::new(target);
+    if target_path.exists() {
+        let path = canonicalize_existing_path(target_path, "run target")?;
+        if path.is_file() && path.file_name().and_then(|name| name.to_str()) == Some("receipt.json")
+        {
+            return Ok(path.parent().map(Path::to_path_buf));
+        }
+        if path.is_dir() && receipt_path(&path).is_file() {
+            return Ok(Some(path));
+        }
+        return Ok(None);
+    }
+
+    let storage_root = mixed_run_storage_root(storage_root_override)?;
+    let run_root = storage_root.join("runs").join(target);
+    if receipt_path(&run_root).is_file() {
+        return Ok(Some(run_root));
+    }
+    Ok(None)
+}
+
+pub(crate) fn spawn_run_outside_proxy(
+    run_root: &Path,
+    slot_bindings: &BTreeMap<String, String>,
+    export_bindings: &BTreeMap<String, SocketAddr>,
+) -> Result<Child> {
+    let plan_path = write_run_outside_proxy_plan(run_root, slot_bindings, export_bindings)?;
+    spawn_detached_child(run_root, &run_root.join("outside-proxy.log"), |cmd| {
+        cmd.arg("run-outside-proxy").arg("--plan").arg(&plan_path);
+    })
+}
+
+pub(crate) fn write_run_outside_proxy_plan(
+    run_root: &Path,
+    slot_bindings: &BTreeMap<String, String>,
+    export_bindings: &BTreeMap<String, SocketAddr>,
+) -> Result<PathBuf> {
+    if slot_bindings.is_empty() && export_bindings.is_empty() {
+        return Err(miette::miette!(
+            "outside proxy requires at least one export or external slot binding"
+        ));
+    }
+    let plan = OutsideProxyPlan {
+        schema: OUTSIDE_PROXY_PLAN_SCHEMA.to_string(),
+        version: OUTSIDE_PROXY_PLAN_VERSION,
+        run_root: run_root.display().to_string(),
+        slot_bindings: slot_bindings.clone(),
+        export_bindings: export_bindings
+            .iter()
+            .map(|(name, addr)| (name.clone(), addr.to_string()))
+            .collect(),
+    };
+    let plan_path = outside_proxy_plan_path(run_root);
+    write_json(&plan_path, &plan)?;
+    Ok(plan_path)
+}
+
+pub(crate) async fn wait_for_run_outside_proxy_ready(run_root: &Path) -> Result<()> {
+    let state_path = outside_proxy_state_path(run_root);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if state_path.is_file() {
+            let _: OutsideProxyState = read_json(&state_path, "outside proxy state")?;
+            return Ok(());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    Err(miette::miette!(
+        "timed out waiting for outside proxy under {}",
+        run_root.display()
+    ))
+}
+
+pub(crate) async fn run_outside_proxy(plan_path: PathBuf) -> Result<()> {
+    let plan: OutsideProxyPlan = read_json(&plan_path, "outside proxy plan")?;
+    if plan.schema != OUTSIDE_PROXY_PLAN_SCHEMA || plan.version != OUTSIDE_PROXY_PLAN_VERSION {
+        return Err(miette::miette!(
+            "invalid outside proxy plan {}",
+            plan_path.display()
+        ));
+    }
+
+    let run_root = PathBuf::from(&plan.run_root);
+    let receipt: RunReceipt = read_json(&receipt_path(&run_root), "run receipt")?;
+    let run_plan: RunPlan = read_json(&run_plan_path(&run_root), "run plan")?;
+    let interface = collect_run_interface(&run_plan)?;
+    let slot_bindings = plan
+        .slot_bindings
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    let export_bindings = plan
+        .export_bindings
+        .iter()
+        .map(|(name, addr)| {
+            Ok((
+                name.clone(),
+                addr.parse::<SocketAddr>()
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("invalid outside proxy export binding `{addr}`"))?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    validate_slot_bindings(&interface, &slot_bindings)?;
+    validate_export_bindings(&interface, &export_bindings)?;
+
+    let context = build_run_outside_proxy_context(&run_root, &run_plan, &receipt)?;
+    let mesh_listen = SocketAddr::from(([127, 0, 0, 1], reserve_loopback_port()?));
+    let outside_identity = build_outside_proxy_identity(&receipt.run_id, &context.mesh_scope);
+    let outside_public = MeshIdentityPublic::from_identity(&outside_identity);
+    let mut peers = BTreeMap::<String, MeshPeer>::new();
+    let mut inbound = Vec::new();
+    let mut outbound = Vec::new();
+    let mut export_urls = BTreeMap::new();
+
+    for (slot_name, raw_url) in &plan.slot_bindings {
+        let slot = context.slots.get(slot_name).ok_or_else(|| {
+            miette::miette!("outside proxy slot `{slot_name}` is not part of the run")
+        })?;
+        let protocol = mesh_protocol_for_capability(slot.kind)?;
+        let route_id = component_route_id(&outside_identity.id, slot_name, protocol);
+        inbound.push(InboundRoute {
+            route_id: route_id.clone(),
+            capability: slot_name.clone(),
+            capability_kind: Some(slot.kind.to_string()),
+            capability_profile: None,
+            protocol,
+            http_plugins: Vec::new(),
+            target: InboundTarget::External {
+                url_env: slot.url_env.clone(),
+                optional: !slot.required,
+            },
+            allowed_issuers: slot
+                .consumer_sites
+                .iter()
+                .map(|site_id| {
+                    context
+                        .sites
+                        .get(site_id)
+                        .expect("consumer site should exist")
+                        .router_identity
+                        .id
+                        .clone()
+                })
+                .collect(),
+        });
+        // This short-lived proxy process owns its environment and uses env vars to feed router
+        // external targets. No other work in this process depends on these keys.
+        unsafe {
+            env::set_var(&slot.url_env, raw_url);
+        }
+        for site_id in &slot.consumer_sites {
+            let consumer = context
+                .sites
+                .get(site_id)
+                .expect("consumer site should exist");
+            peers
+                .entry(consumer.router_identity.id.clone())
+                .or_insert(MeshPeer {
+                    id: consumer.router_identity.id.clone(),
+                    public_key: consumer.router_identity.public_key,
+                });
+            let mesh_url = outside_slot_mesh_url(
+                mesh_listen,
+                &outside_public,
+                &route_id,
+                slot_name,
+                consumer.receipt.kind,
+            )?;
+            register_external_slot_with_retry(
+                &consumer.router_control,
+                slot_name,
+                &mesh_url,
+                ROUTER_CONTROL_TIMEOUT,
+            )
+            .await?;
+        }
+    }
+
+    for (export_name, listen) in &export_bindings {
+        let export = context.exports.get(export_name).ok_or_else(|| {
+            miette::miette!("outside proxy export `{export_name}` is not part of the run")
+        })?;
+        let provider = context
+            .sites
+            .get(&export.site_id)
+            .expect("provider site should exist");
+        let protocol = mesh_protocol_for_export(&export.protocol)?;
+        let peer_key =
+            base64::engine::general_purpose::STANDARD.encode(outside_identity.public_key);
+        register_export_peer_with_retry(
+            &provider.router_control,
+            export_name,
+            &outside_identity.id,
+            &peer_key,
+            &export.protocol,
+            ROUTER_CONTROL_TIMEOUT,
+        )
+        .await?;
+        peers
+            .entry(provider.router_identity.id.clone())
+            .or_insert(MeshPeer {
+                id: provider.router_identity.id.clone(),
+                public_key: provider.router_identity.public_key,
+            });
+        outbound.push(OutboundRoute {
+            route_id: router_export_route_id(export_name, protocol),
+            slot: export_name.clone(),
+            capability_kind: None,
+            capability_profile: None,
+            listen_port: listen.port(),
+            listen_addr: Some(listen.ip().to_string()),
+            protocol,
+            http_plugins: Vec::new(),
+            peer_addr: provider.router_addr.to_string(),
+            peer_id: provider.router_identity.id.clone(),
+            capability: export_name.clone(),
+        });
+        export_urls.insert(
+            export_name.clone(),
+            match export.protocol.as_str() {
+                "tcp" => format!("tcp://{listen}"),
+                _ => format!("http://{listen}"),
+            },
+        );
+    }
+
+    let config = MeshConfig {
+        identity: outside_identity,
+        mesh_listen,
+        control_listen: None,
+        control_allow: None,
+        peers: peers.into_values().collect(),
+        inbound,
+        outbound,
+        transport: TransportConfig::NoiseIk {},
+    };
+
+    let router = tokio::spawn(async move { amber_router::run(config).await });
+    wait_for_socket_listener(mesh_listen).await?;
+    for listen in export_bindings.iter().map(|(_, listen)| *listen) {
+        wait_for_socket_listener(listen).await?;
+    }
+    write_json(
+        &outside_proxy_state_path(&run_root),
+        &OutsideProxyState {
+            schema: OUTSIDE_PROXY_STATE_SCHEMA.to_string(),
+            version: OUTSIDE_PROXY_STATE_VERSION,
+            mesh_listen: mesh_listen.to_string(),
+            exports: export_urls,
+        },
+    )?;
+
+    tokio::select! {
+        result = router => {
+            match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(err)) => Err(miette::miette!("outside proxy failed: {err}")),
+                Err(err) => Err(miette::miette!("outside proxy task failed: {err}")),
+            }
+        }
+        signal = tokio::signal::ctrl_c() => {
+            signal.into_diagnostic().wrap_err("failed to wait for Ctrl-C")?;
+            Ok(())
+        }
+    }
+}
+
+async fn stop_site_from_receipt(run_root: &Path, site_id: &str, site: &SiteReceipt) -> Result<()> {
     match site.kind {
         SiteKind::Direct | SiteKind::Vm => {
-            if let Some(pid) = site.process_pid {
-                send_sigterm(pid);
-            }
-            if let Some(pid) = site.port_forward_pid {
-                send_sigterm(pid);
-            }
+            shutdown_recorded_processes(site).await?;
         }
         SiteKind::Compose => {
             if let Some(project_name) = site.compose_project.as_deref() {
+                let launch_env = read_compose_launch_env(run_root, site_id)?;
                 let status = compose_command(Some(project_name), Path::new(&site.artifact_dir))
+                    .envs(launch_env)
                     .arg("down")
                     .arg("-v")
                     .status()
@@ -1494,6 +1881,158 @@ fn select_proxy_site<'a>(
     Ok((only_site_id.as_str(), only_site))
 }
 
+fn build_run_outside_proxy_context(
+    run_root: &Path,
+    run_plan: &RunPlan,
+    receipt: &RunReceipt,
+) -> Result<RunOutsideProxyContext> {
+    let mut sites = BTreeMap::new();
+    for (site_id, site_receipt) in &receipt.sites {
+        let site_plan = run_plan
+            .sites
+            .get(site_id)
+            .ok_or_else(|| miette::miette!("run plan is missing site `{site_id}`"))?;
+        let state_path = site_state_path(&run_root.join("state"), site_id);
+        let launched = if state_path.is_file() {
+            let state: SiteManagerState = read_json(&state_path, "site manager state")?;
+            launched_site_from_state(site_plan, &state, &receipt.mesh_scope)
+                .or_else(|_| launched_site_from_receipt(site_receipt, &receipt.mesh_scope))
+        } else {
+            launched_site_from_receipt(site_receipt, &receipt.mesh_scope)
+        }?;
+        sites.insert(site_id.clone(), launched);
+    }
+
+    let mut exports = BTreeMap::<String, RunOutsideExport>::new();
+    let mut slots = BTreeMap::<String, RunOutsideSlot>::new();
+
+    for (site_id, site_plan) in &run_plan.sites {
+        let metadata = proxy_metadata_view(site_plan)?;
+        for (name, export) in metadata.exports {
+            if name.starts_with("amber_export_") {
+                continue;
+            }
+            match exports.get(&name) {
+                Some(existing)
+                    if existing.site_id != *site_id || existing.protocol != export.protocol =>
+                {
+                    return Err(miette::miette!(
+                        "run contains conflicting outside export `{name}`"
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    exports.insert(
+                        name.clone(),
+                        RunOutsideExport {
+                            site_id: site_id.clone(),
+                            protocol: export.protocol,
+                        },
+                    );
+                }
+            }
+        }
+        for (name, slot) in metadata.external_slots {
+            if name.starts_with("amber_link_") {
+                continue;
+            }
+            slots
+                .entry(name.clone())
+                .and_modify(|existing| {
+                    existing.required |= slot.required;
+                    if !existing.consumer_sites.contains(site_id) {
+                        existing.consumer_sites.push(site_id.clone());
+                    }
+                })
+                .or_insert(RunOutsideSlot {
+                    required: slot.required,
+                    kind: slot.kind,
+                    url_env: slot.url_env,
+                    consumer_sites: vec![site_id.clone()],
+                });
+        }
+    }
+
+    for slot in slots.values_mut() {
+        slot.consumer_sites.sort();
+        slot.consumer_sites.dedup();
+    }
+
+    Ok(RunOutsideProxyContext {
+        mesh_scope: receipt.mesh_scope.clone(),
+        sites,
+        exports,
+        slots,
+    })
+}
+
+fn proxy_metadata_view(site_plan: &RunSitePlan) -> Result<ProxyMetadata> {
+    load_site_proxy_metadata(site_plan)
+}
+
+fn build_outside_proxy_identity(run_id: &str, mesh_scope: &str) -> MeshIdentity {
+    let mut identity = MeshIdentity::generate("outside", Some(mesh_scope.to_string()));
+    let suffix = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&identity.public_key[..6]);
+    identity.id = format!("/run/{run_id}/outside/{suffix}");
+    identity
+}
+
+fn mesh_protocol_for_capability(kind: CapabilityKind) -> Result<MeshProtocol> {
+    match kind.transport() {
+        CapabilityTransport::Http => Ok(MeshProtocol::Http),
+        CapabilityTransport::NonNetwork => Err(miette::miette!(
+            "capability kind `{kind}` cannot be exposed through the outside proxy"
+        )),
+        _ => Err(miette::miette!(
+            "capability kind `{kind}` cannot be exposed through the outside proxy"
+        )),
+    }
+}
+
+fn mesh_protocol_for_export(protocol: &str) -> Result<MeshProtocol> {
+    Ok(match protocol {
+        "http" | "https" => MeshProtocol::Http,
+        "tcp" => MeshProtocol::Tcp,
+        _ => {
+            return Err(miette::miette!(
+                "unsupported export protocol `{protocol}` for outside proxy"
+            ));
+        }
+    })
+}
+
+fn outside_slot_mesh_url(
+    mesh_listen: SocketAddr,
+    outside_public: &MeshIdentityPublic,
+    route_id: &str,
+    slot_name: &str,
+    consumer_kind: SiteKind,
+) -> Result<String> {
+    let host = container_host_for_consumer(SiteKind::Direct, consumer_kind);
+    let mut mesh_url = Url::parse(&format!("mesh://{}:{}", host, mesh_listen.port()))
+        .into_diagnostic()
+        .wrap_err("failed to build outside slot mesh url")?;
+    let peer_key = base64::engine::general_purpose::STANDARD.encode(outside_public.public_key);
+    mesh_url
+        .query_pairs_mut()
+        .append_pair("peer_id", &outside_public.id)
+        .append_pair("peer_key", &peer_key)
+        .append_pair("route_id", route_id)
+        .append_pair("capability", slot_name);
+    Ok(mesh_url.to_string())
+}
+
+async fn wait_for_socket_listener(addr: SocketAddr) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if router_mesh_listener_ready(addr).await {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    Err(miette::miette!("timed out waiting for listener {}", addr))
+}
+
 pub(crate) async fn run_site_supervisor(plan_path: PathBuf) -> Result<()> {
     let plan: SiteSupervisorPlan = read_json(&plan_path, "site supervisor plan")?;
     let run_root = PathBuf::from(&plan.run_root);
@@ -1524,6 +2063,7 @@ pub(crate) async fn run_site_supervisor(plan_path: PathBuf) -> Result<()> {
         port_forward: None,
         last_start_attempt: None,
         last_stitch_refresh: None,
+        ready_since: None,
     };
     let mut last_written_state = None;
     let result: Result<()> = async {
@@ -1606,6 +2146,7 @@ pub(crate) async fn run_site_supervisor(plan_path: PathBuf) -> Result<()> {
             let discovery = match try_discover_site(&plan, &mut runtime).await {
                 Ok(discovery) => discovery,
                 Err(err) => {
+                    runtime.ready_since = None;
                     write_site_state_if_changed(
                         &state_path,
                         &mut last_written_state,
@@ -1623,6 +2164,22 @@ pub(crate) async fn run_site_supervisor(plan_path: PathBuf) -> Result<()> {
             };
 
             if let Some(discovery) = discovery {
+                let ready_since = runtime.ready_since.get_or_insert_with(Instant::now);
+                if ready_since.elapsed() < SITE_DISCOVERY_STABILITY_WINDOW {
+                    write_site_state_if_changed(
+                        &state_path,
+                        &mut last_written_state,
+                        build_site_state(
+                            &plan,
+                            &runtime,
+                            SiteLifecycleStatus::Starting,
+                            Some(&discovery),
+                            None,
+                        ),
+                    )?;
+                    sleep(SUPERVISOR_POLL_INTERVAL).await;
+                    continue;
+                }
                 if should_refresh_stitching(runtime.last_stitch_refresh) {
                     if let Err(err) = apply_desired_links(&plan, &discovery.control_endpoint).await
                     {
@@ -1670,6 +2227,7 @@ pub(crate) async fn run_site_supervisor(plan_path: PathBuf) -> Result<()> {
                     },
                 )?;
             } else {
+                runtime.ready_since = None;
                 write_site_state_if_changed(
                     &state_path,
                     &mut last_written_state,
@@ -1798,22 +2356,19 @@ fn materialize_site_artifacts(
 fn patch_site_artifacts(
     artifact_dir: &Path,
     kind: SiteKind,
-    external_env: &BTreeMap<String, String>,
+    launch_env: &BTreeMap<String, String>,
     observability_endpoint: Option<&str>,
 ) -> Result<()> {
     if matches!(kind, SiteKind::Kubernetes) {
-        let env_file = artifact_dir.join(DEFAULT_EXTERNAL_ENV_FILE);
-        if env_file.is_file() {
-            let mut lines = String::new();
-            for (key, value) in external_env {
-                lines.push_str(key);
-                lines.push('=');
-                lines.push_str(value);
-                lines.push('\n');
+        for env_file_name in [
+            DEFAULT_EXTERNAL_ENV_FILE,
+            "root-config.env",
+            "root-config-secret.env",
+        ] {
+            let env_file = artifact_dir.join(env_file_name);
+            if env_file.is_file() {
+                patch_generated_env_file(&env_file, launch_env)?;
             }
-            fs::write(&env_file, lines)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to write {}", env_file.display()))?;
         }
 
         if let Some(endpoint) = observability_endpoint {
@@ -1835,6 +2390,29 @@ fn patch_site_artifacts(
         }
     }
     Ok(())
+}
+
+fn patch_generated_env_file(path: &Path, launch_env: &BTreeMap<String, String>) -> Result<()> {
+    let raw = fs::read_to_string(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+    let mut out = String::new();
+    for line in raw.lines() {
+        if let Some((key, _)) = line.split_once('=')
+            && let Some(value) = launch_env.get(key.trim())
+        {
+            out.push_str(key.trim());
+            out.push('=');
+            out.push_str(value);
+            out.push('\n');
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    fs::write(path, out)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write {}", path.display()))
 }
 
 fn external_slot_env_for_site(
@@ -1878,10 +2456,11 @@ fn launch_env(
     run_id: &str,
     mesh_scope: &str,
     kind: SiteKind,
+    runtime_env: &BTreeMap<String, String>,
     external_env: &BTreeMap<String, String>,
     observability_endpoint: Option<&str>,
 ) -> Result<BTreeMap<String, String>> {
-    let mut env = external_env.clone();
+    let mut env = merge_env_maps(runtime_env, external_env);
     env.insert(SCENARIO_RUN_ID_ENV.to_string(), run_id.to_string());
     env.insert(SCENARIO_SCOPE_ENV.to_string(), mesh_scope.to_string());
     if let Some(endpoint) = observability_endpoint {
@@ -1901,6 +2480,15 @@ fn launch_env(
         }
     }
     Ok(env)
+}
+
+fn merge_env_maps(
+    left: &BTreeMap<String, String>,
+    right: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut merged = left.clone();
+    merged.extend(right.clone());
+    merged
 }
 
 fn build_supervisor_plan(
@@ -1939,7 +2527,13 @@ fn build_supervisor_plan(
         compose_project: (input.site_plan.site.kind == SiteKind::Compose)
             .then(|| compose_project_name(input.run_id, input.site_id)),
         kubernetes_namespace: (input.site_plan.site.kind == SiteKind::Kubernetes)
-            .then(|| kubernetes_namespace_from_artifact(input.artifact_dir))
+            .then(|| {
+                prepare_kubernetes_artifact_namespace(
+                    input.run_id,
+                    input.site_id,
+                    input.artifact_dir,
+                )
+            })
             .transpose()?,
         context: input.site_plan.site.context.clone(),
         port_forward_mesh_port: if input.site_plan.site.kind == SiteKind::Kubernetes {
@@ -2042,7 +2636,14 @@ fn site_ready_timeout(site_plan: &RunSitePlan) -> Duration {
     if matches!(site_plan.site.kind, SiteKind::Vm) && vm_uses_tcg_accel() {
         TCG_VM_STARTUP_TIMEOUT
     } else {
-        Duration::from_secs(120)
+        site_ready_timeout_for_kind(site_plan.site.kind)
+    }
+}
+
+fn site_ready_timeout_for_kind(kind: SiteKind) -> Duration {
+    match kind {
+        SiteKind::Kubernetes => KUBERNETES_WORKLOAD_READY_TIMEOUT + KUBERNETES_SITE_READY_BUFFER,
+        SiteKind::Direct | SiteKind::Compose | SiteKind::Vm => Duration::from_secs(120),
     }
 }
 
@@ -2051,7 +2652,9 @@ async fn register_new_site_links(
     links: &[RunLink],
     launched: &mut LaunchedSite,
     launched_by_site: &BTreeMap<String, LaunchedSite>,
+    run_root: &Path,
     state_root: &Path,
+    bridge_proxies: &mut BTreeMap<BridgeProxyKey, BridgeProxyHandle>,
 ) -> Result<()> {
     for link in links {
         if link.consumer_site == site_id {
@@ -2064,7 +2667,14 @@ async fn register_new_site_links(
                     link.provider_site
                 ));
             };
-            let external_url = external_slot_url(provider, link, launched.receipt.kind)?;
+            let external_url = resolve_link_external_url(
+                provider,
+                link,
+                launched.receipt.kind,
+                run_root,
+                bridge_proxies,
+            )
+            .await?;
             let consumer_key = base64::engine::general_purpose::STANDARD
                 .encode(launched.router_identity.public_key);
 
@@ -2107,7 +2717,14 @@ async fn register_new_site_links(
         let Some(consumer) = launched_by_site.get(&link.consumer_site) else {
             continue;
         };
-        let external_url = external_slot_url(launched, link, consumer.receipt.kind)?;
+        let external_url = resolve_link_external_url(
+            launched,
+            link,
+            consumer.receipt.kind,
+            run_root,
+            bridge_proxies,
+        )
+        .await?;
         let consumer_key =
             base64::engine::general_purpose::STANDARD.encode(consumer.router_identity.public_key);
 
@@ -2242,6 +2859,44 @@ fn launched_site_from_state(
     })
 }
 
+fn launched_site_from_receipt(
+    site_receipt: &SiteReceipt,
+    mesh_scope: &str,
+) -> Result<LaunchedSite> {
+    let router_control = parse_control_endpoint(
+        site_receipt
+            .router_control
+            .as_deref()
+            .ok_or_else(|| miette::miette!("site receipt is missing router control"))?,
+    )?;
+    let router_addr = site_receipt
+        .router_mesh_addr
+        .as_deref()
+        .ok_or_else(|| miette::miette!("site receipt is missing router mesh addr"))?
+        .parse()
+        .into_diagnostic()
+        .wrap_err("invalid router mesh addr in site receipt")?;
+    let router_identity = MeshIdentityPublic {
+        id: site_receipt
+            .router_identity_id
+            .clone()
+            .ok_or_else(|| miette::miette!("site receipt is missing router identity id"))?,
+        public_key: decode_public_key(
+            site_receipt
+                .router_public_key_b64
+                .as_deref()
+                .ok_or_else(|| miette::miette!("site receipt is missing router public key"))?,
+        )?,
+        mesh_scope: Some(mesh_scope.to_string()),
+    };
+    Ok(LaunchedSite {
+        receipt: site_receipt.clone(),
+        router_control,
+        router_identity,
+        router_addr,
+    })
+}
+
 async fn ensure_site_running(
     plan: &SiteSupervisorPlan,
     runtime: &mut SupervisorRuntime,
@@ -2253,6 +2908,7 @@ async fn ensure_site_running(
         SiteKind::Direct => {
             if runtime.site_process.is_none() {
                 runtime.last_start_attempt = Some(Instant::now());
+                runtime.ready_since = None;
                 runtime.site_process = Some(spawn_runtime_process(
                     &PathBuf::from(&plan.site_state_root),
                     "site.log",
@@ -2279,6 +2935,7 @@ async fn ensure_site_running(
         SiteKind::Vm => {
             if runtime.site_process.is_none() {
                 runtime.last_start_attempt = Some(Instant::now());
+                runtime.ready_since = None;
                 runtime.site_process = Some(spawn_runtime_process(
                     &PathBuf::from(&plan.site_state_root),
                     "site.log",
@@ -2305,6 +2962,7 @@ async fn ensure_site_running(
         SiteKind::Compose => {
             if !runtime.site_started {
                 runtime.last_start_attempt = Some(Instant::now());
+                runtime.ready_since = None;
                 let status = compose_command(
                     plan.compose_project.as_deref(),
                     Path::new(&plan.artifact_dir),
@@ -2327,6 +2985,7 @@ async fn ensure_site_running(
         SiteKind::Kubernetes => {
             if !runtime.site_started {
                 runtime.last_start_attempt = Some(Instant::now());
+                runtime.ready_since = None;
                 ensure_kubernetes_namespace(plan)?;
                 let status = kubectl_command(plan.context.as_deref())
                     .current_dir(&plan.artifact_dir)
@@ -2344,9 +3003,11 @@ async fn ensure_site_running(
                         plan.site_id
                     ));
                 }
+                ensure_kubernetes_workloads_ready(plan)?;
                 runtime.site_started = true;
             }
             if runtime.port_forward.is_none() {
+                runtime.ready_since = None;
                 runtime.port_forward = Some(spawn_port_forward(plan)?);
             }
         }
@@ -2376,7 +3037,7 @@ async fn try_discover_direct_site(
     plan: &SiteSupervisorPlan,
     runtime: &SupervisorRuntime,
 ) -> Result<Option<RouterDiscovery>> {
-    let Some(site_process) = runtime.site_process.as_ref() else {
+    let Some(_site_process) = runtime.site_process.as_ref() else {
         return Ok(None);
     };
     let artifact_dir =
@@ -2397,10 +3058,6 @@ async fn try_discover_direct_site(
             ControlEndpoint::Unix(direct_current_control_socket_path(&artifact_dir));
         if let Ok(router_identity) = fetch_router_identity(&control_endpoint).await {
             let router_addr = SocketAddr::from(([127, 0, 0, 1], router_mesh_port));
-            if !router_mesh_listener_ready(router_addr).await {
-                return Ok(None);
-            }
-            let _ = site_process;
             return Ok(Some(RouterDiscovery {
                 control_endpoint,
                 router_identity,
@@ -2431,10 +3088,7 @@ async fn try_discover_vm_site(
     let control_endpoint = ControlEndpoint::Unix(vm_current_control_socket_path(&artifact_dir));
     if let Ok(router_identity) = fetch_router_identity(&control_endpoint).await {
         let router_addr = SocketAddr::from(([127, 0, 0, 1], router_mesh_port));
-        if !router_mesh_listener_ready(router_addr).await {
-            return Ok(None);
-        }
-        if !vm_endpoint_forwards_ready(&state) {
+        if !vm_component_targets_ready(plan, &artifact_dir)? {
             return Ok(None);
         }
         return Ok(Some(RouterDiscovery {
@@ -2446,16 +3100,47 @@ async fn try_discover_vm_site(
     Ok(None)
 }
 
-fn vm_endpoint_forwards_ready(state: &VmRuntimeState) -> bool {
-    state
-        .endpoint_forwards_by_component
-        .values()
-        .flat_map(|ports| ports.values().copied())
-        .all(|port| forwarded_endpoint_ready(SocketAddr::from(([127, 0, 0, 1], port))))
+fn vm_component_targets_ready(plan: &SiteSupervisorPlan, artifact_dir: &Path) -> Result<bool> {
+    let runtime_root = Path::new(required_str(
+        plan.runtime_root.as_deref(),
+        "vm runtime root",
+    )?);
+    if !runtime_root.is_dir() {
+        return Ok(false);
+    }
+
+    let vm_plan: VmPlan = read_json(&artifact_dir.join(VM_PLAN_FILENAME), "vm plan")?;
+    for component in &vm_plan.components {
+        if !mesh_config_local_targets_ready(
+            &runtime_root.join(&component.mesh_config_path),
+            VM_LOCAL_TARGET_READY_TIMEOUT,
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
-fn forwarded_endpoint_ready(addr: SocketAddr) -> bool {
-    endpoint_accepts_stable_connection(addr, Duration::from_millis(250), Duration::from_millis(250))
+fn mesh_config_local_targets_ready(path: &Path, timeout: Duration) -> Result<bool> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+
+    let config: MeshConfigPublic = read_json(path, "mesh config")?;
+    for route in config.inbound {
+        let InboundTarget::Local { port } = route.target else {
+            continue;
+        };
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let ready = match route.protocol {
+            MeshProtocol::Http => wait_for_http_response(addr, timeout).is_ok(),
+            MeshProtocol::Tcp => wait_for_stable_endpoint(addr, timeout).is_ok(),
+        };
+        if !ready {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 async fn try_discover_compose_site(plan: &SiteSupervisorPlan) -> Result<Option<RouterDiscovery>> {
@@ -2481,11 +3166,17 @@ async fn try_discover_kubernetes_site(
         .ok_or_else(|| miette::miette!("missing kubernetes mesh port"))?;
     let control_endpoint = ControlEndpoint::Tcp(format!("127.0.0.1:{control_port}"));
     match fetch_router_identity(&control_endpoint).await {
-        Ok(router_identity) => Ok(Some(RouterDiscovery {
-            control_endpoint,
-            router_identity,
-            router_addr: Some(SocketAddr::from(([127, 0, 0, 1], mesh_port))),
-        })),
+        Ok(router_identity) => {
+            let router_addr = SocketAddr::from(([127, 0, 0, 1], mesh_port));
+            if !router_mesh_listener_ready(router_addr).await {
+                return Ok(None);
+            }
+            Ok(Some(RouterDiscovery {
+                control_endpoint,
+                router_identity,
+                router_addr: Some(router_addr),
+            }))
+        }
         Err(_) => Ok(None),
     }
 }
@@ -2531,6 +3222,7 @@ async fn cleanup_site(plan: &SiteSupervisorPlan, runtime: &mut SupervisorRuntime
         SiteKind::Compose => {
             if let Some(project_name) = plan.compose_project.as_deref() {
                 let status = compose_command(Some(project_name), Path::new(&plan.artifact_dir))
+                    .envs(plan.launch_env.clone())
                     .arg("down")
                     .arg("-v")
                     .status()
@@ -2678,6 +3370,15 @@ fn compose_command(project_name: Option<&str>, artifact_dir: &Path) -> Command {
     cmd
 }
 
+fn read_compose_launch_env(run_root: &Path, site_id: &str) -> Result<BTreeMap<String, String>> {
+    let plan_path = site_supervisor_plan_path(&run_root.join("state").join(site_id));
+    if !plan_path.is_file() {
+        return Ok(BTreeMap::new());
+    }
+    let plan: SiteSupervisorPlan = read_json(&plan_path, "site supervisor plan")?;
+    Ok(plan.launch_env)
+}
+
 fn kubectl_command(context: Option<&str>) -> Command {
     let mut cmd = Command::new("kubectl");
     if let Some(context) = context {
@@ -2754,6 +3455,63 @@ fn ensure_kubernetes_namespace(plan: &SiteSupervisorPlan) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
+}
+
+fn ensure_kubernetes_workloads_ready(plan: &SiteSupervisorPlan) -> Result<()> {
+    let namespace = required_str(plan.kubernetes_namespace.as_deref(), "kubernetes namespace")?;
+    let context = plan.context.as_deref();
+    let timeout = format!("{}s", KUBERNETES_WORKLOAD_READY_TIMEOUT.as_secs());
+    let checks = [
+        (
+            "wait for kubernetes jobs",
+            vec![
+                "-n",
+                namespace,
+                "wait",
+                "--for=condition=complete",
+                "--timeout",
+                timeout.as_str(),
+                "job",
+                "--all",
+            ],
+        ),
+        (
+            "wait for kubernetes deployments",
+            vec![
+                "-n",
+                namespace,
+                "wait",
+                "--for=condition=available",
+                "--timeout",
+                timeout.as_str(),
+                "deployment",
+                "--all",
+            ],
+        ),
+    ];
+
+    for (label, args) in checks {
+        let output = kubectl_command(context)
+            .args(args)
+            .output()
+            .into_diagnostic()
+            .wrap_err_with(|| format!("{label} for site `{}`", plan.site_id))?;
+        if output.status.success() {
+            continue;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!("status {}", output.status)
+        } else {
+            stderr
+        };
+        return Err(miette::miette!(
+            "{label} for site `{}` failed: {detail}",
+            plan.site_id
+        ));
+    }
+
+    Ok(())
 }
 
 fn compose_project_name(run_id: &str, site_id: &str) -> String {
@@ -2897,9 +3655,19 @@ fn reap_child(child: &mut Option<Child>) -> Result<()> {
 }
 
 async fn stop_child(child: &mut Child) -> Result<()> {
-    send_sigterm(child.id());
-    let _ = wait_for_child_exit(child, PROCESS_SHUTDOWN_GRACE_PERIOD).await;
-    Ok(())
+    #[cfg(unix)]
+    {
+        terminate_recorded_processes(&[child.id()]).await?;
+        let _ = child.wait();
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        send_sigterm(child.id());
+        let _ = wait_for_child_exit(child, PROCESS_SHUTDOWN_GRACE_PERIOD).await;
+        Ok(())
+    }
 }
 
 async fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<()> {
@@ -2917,12 +3685,140 @@ async fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<()>
     }
 }
 
+async fn resolve_link_external_url(
+    provider: &LaunchedSite,
+    link: &RunLink,
+    consumer_kind: SiteKind,
+    run_root: &Path,
+    bridge_proxies: &mut BTreeMap<BridgeProxyKey, BridgeProxyHandle>,
+) -> Result<String> {
+    if !link_needs_bridge_proxy(provider.receipt.kind, consumer_kind) {
+        return external_slot_url(provider, link, consumer_kind);
+    }
+
+    let port = ensure_bridge_proxy(
+        run_root,
+        provider,
+        &link.export_name,
+        consumer_kind,
+        bridge_proxies,
+    )
+    .await?;
+    bridge_proxy_external_url(port, link.protocol, consumer_kind)
+}
+
+fn link_needs_bridge_proxy(_provider_kind: SiteKind, consumer_kind: SiteKind) -> bool {
+    matches!(consumer_kind, SiteKind::Compose | SiteKind::Kubernetes)
+}
+
+async fn ensure_bridge_proxy(
+    run_root: &Path,
+    provider: &LaunchedSite,
+    export_name: &str,
+    consumer_kind: SiteKind,
+    bridge_proxies: &mut BTreeMap<BridgeProxyKey, BridgeProxyHandle>,
+) -> Result<u16> {
+    let key = BridgeProxyKey {
+        export_name: export_name.to_string(),
+        consumer_kind,
+    };
+    if let Some(proxy) = bridge_proxies.get_mut(&key)
+        && proxy.child.try_wait().into_diagnostic()?.is_none()
+    {
+        return Ok(proxy.listen.port());
+    }
+
+    let listen = bridge_proxy_bind_addr(consumer_kind, reserve_loopback_port()?);
+    let child = spawn_bridge_proxy(run_root, provider, export_name, listen)?;
+    wait_for_socket_listener(bridge_proxy_probe_addr(listen)).await?;
+    bridge_proxies.insert(
+        key,
+        BridgeProxyHandle {
+            child,
+            export_name: export_name.to_string(),
+            listen,
+        },
+    );
+    Ok(listen.port())
+}
+
+fn spawn_bridge_proxy(
+    run_root: &Path,
+    provider: &LaunchedSite,
+    export_name: &str,
+    listen: SocketAddr,
+) -> Result<Child> {
+    let logs_root = run_root.join("bridge-proxies");
+    fs::create_dir_all(&logs_root)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create {}", logs_root.display()))?;
+    let log_path = logs_root.join(format!("{export_name}.log"));
+    spawn_detached_child(run_root, &log_path, |cmd| {
+        cmd.arg("proxy")
+            .arg(&provider.receipt.artifact_dir)
+            .arg("--export")
+            .arg(bridge_proxy_export_binding(export_name, listen));
+        if provider.receipt.kind == SiteKind::Kubernetes {
+            let control = provider.router_control.to_string();
+            cmd.arg("--router-addr")
+                .arg(provider.router_addr.to_string())
+                .arg("--router-control-addr")
+                .arg(control);
+        }
+    })
+}
+
+fn bridge_proxy_export_binding(export_name: &str, listen: SocketAddr) -> String {
+    format!("{export_name}={}:{}", listen.ip(), listen.port())
+}
+
+fn bridge_proxy_bind_addr(consumer_kind: SiteKind, port: u16) -> SocketAddr {
+    match consumer_kind {
+        SiteKind::Compose | SiteKind::Kubernetes => SocketAddr::from(([0, 0, 0, 0], port)),
+        SiteKind::Direct | SiteKind::Vm => SocketAddr::from(([127, 0, 0, 1], port)),
+    }
+}
+
+fn bridge_proxy_probe_addr(listen: SocketAddr) -> SocketAddr {
+    if listen.ip().is_unspecified() {
+        SocketAddr::from(([127, 0, 0, 1], listen.port()))
+    } else {
+        listen
+    }
+}
+
+fn bridge_proxy_external_url(
+    port: u16,
+    protocol: NetworkProtocol,
+    consumer_kind: SiteKind,
+) -> Result<String> {
+    let host = bridge_proxy_host_for_consumer(consumer_kind);
+    Ok(match protocol {
+        NetworkProtocol::Http | NetworkProtocol::Https => format!("http://{host}:{port}"),
+        NetworkProtocol::Tcp => format!("tcp://{host}:{port}"),
+        _ => {
+            return Err(miette::miette!(
+                "mixed-site bridge proxy does not support protocol `{protocol}`"
+            ));
+        }
+    })
+}
+
+fn bridge_proxy_host_for_consumer(consumer_kind: SiteKind) -> String {
+    match consumer_kind {
+        SiteKind::Compose => CONTAINER_HOST_ALIAS.to_string(),
+        SiteKind::Direct | SiteKind::Vm | SiteKind::Kubernetes => {
+            container_host_for_consumer(SiteKind::Direct, consumer_kind)
+        }
+    }
+}
+
 fn external_slot_url(
     provider: &LaunchedSite,
     link: &RunLink,
     consumer_kind: SiteKind,
 ) -> Result<String> {
-    let host = container_host_for_consumer(consumer_kind);
+    let host = container_host_for_consumer(provider.receipt.kind, consumer_kind);
     let mut mesh_url = Url::parse(&format!("mesh://{}:{}", host, provider.router_addr.port()))
         .into_diagnostic()
         .wrap_err("failed to build mesh link url")?;
@@ -2940,32 +3836,47 @@ fn external_slot_url(
     Ok(mesh_url.to_string())
 }
 
-fn container_host_for_consumer(kind: SiteKind) -> String {
-    let kubernetes_host_ip = kubernetes_container_host_ip();
-    container_host_from_resolved_ip(kind, kubernetes_host_ip.as_deref())
+fn container_host_for_consumer(provider_kind: SiteKind, consumer_kind: SiteKind) -> String {
+    let container_host_ip = container_host_ip();
+    container_host_from_resolved_ip(provider_kind, consumer_kind, container_host_ip.as_deref())
 }
 
-fn container_host_from_resolved_ip(kind: SiteKind, kubernetes_host_ip: Option<&str>) -> String {
-    match kind {
+fn container_host_from_resolved_ip(
+    provider_kind: SiteKind,
+    consumer_kind: SiteKind,
+    container_host_ip: Option<&str>,
+) -> String {
+    match consumer_kind {
         SiteKind::Direct | SiteKind::Vm => "127.0.0.1".to_string(),
-        SiteKind::Compose => CONTAINER_HOST_ALIAS.to_string(),
-        SiteKind::Kubernetes => kubernetes_host_ip
+        SiteKind::Compose => {
+            if provider_kind == SiteKind::Kubernetes {
+                container_host_ip
+                    .unwrap_or(CONTAINER_HOST_ALIAS)
+                    .to_string()
+            } else {
+                CONTAINER_HOST_ALIAS.to_string()
+            }
+        }
+        SiteKind::Kubernetes => container_host_ip
             .unwrap_or(CONTAINER_HOST_ALIAS)
             .to_string(),
     }
 }
 
-fn kubernetes_container_host_ip() -> Option<String> {
+fn container_host_ip() -> Option<String> {
     KUBERNETES_CONTAINER_HOST_IP
-        .get_or_init(resolve_kubernetes_container_host_ip)
+        .get_or_init(resolve_container_host_ip)
         .clone()
 }
 
-fn resolve_kubernetes_container_host_ip() -> Option<String> {
-    if !cfg!(target_os = "linux") {
-        return None;
+fn resolve_container_host_ip() -> Option<String> {
+    if cfg!(target_os = "linux") {
+        return resolve_linux_container_host_ip();
     }
+    resolve_desktop_container_host_ip()
+}
 
+fn resolve_linux_container_host_ip() -> Option<String> {
     let output = Command::new("docker")
         .arg("network")
         .arg("inspect")
@@ -2983,6 +3894,28 @@ fn resolve_kubernetes_container_host_ip() -> Option<String> {
     Some(host)
 }
 
+fn resolve_desktop_container_host_ip() -> Option<String> {
+    let output = Command::new("docker")
+        .arg("run")
+        .arg("--rm")
+        .arg("busybox:1.36.1")
+        .arg("nslookup")
+        .arg(CONTAINER_HOST_ALIAS)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8(output.stdout)
+        .ok()?
+        .lines()
+        .flat_map(str::split_whitespace)
+        .filter_map(|token| token.parse::<std::net::Ipv4Addr>().ok())
+        .map(|ip| ip.to_string())
+        .next_back()
+}
+
 fn mesh_protocol(protocol: NetworkProtocol) -> Result<MeshProtocol> {
     Ok(match protocol {
         NetworkProtocol::Http | NetworkProtocol::Https => MeshProtocol::Http,
@@ -2995,49 +3928,78 @@ fn mesh_protocol(protocol: NetworkProtocol) -> Result<MeshProtocol> {
     })
 }
 
-fn kubernetes_namespace_from_artifact(artifact_dir: &Path) -> Result<String> {
+fn prepare_kubernetes_artifact_namespace(
+    run_id: &str,
+    site_id: &str,
+    artifact_dir: &Path,
+) -> Result<String> {
+    let namespace = kubernetes_namespace_name(run_id, site_id);
     let kustomization = artifact_dir.join("kustomization.yaml");
-    if kustomization.is_file() {
-        let contents = fs::read_to_string(&kustomization)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read {}", kustomization.display()))?;
-        for line in contents.lines() {
-            let trimmed = line.trim();
-            if let Some(namespace) = trimmed.strip_prefix("namespace:") {
-                let namespace = namespace.trim();
-                if !namespace.is_empty() {
-                    return Ok(namespace.to_string());
-                }
-            }
+    let contents = fs::read_to_string(&kustomization)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read {}", kustomization.display()))?;
+
+    let mut saw_namespace = false;
+    let mut out = String::new();
+    for line in contents.lines() {
+        if line.trim_start().starts_with("namespace:") {
+            saw_namespace = true;
+            out.push_str("namespace: ");
+            out.push_str(&namespace);
+        } else {
+            out.push_str(line);
         }
+        out.push('\n');
+    }
+    if !saw_namespace {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("namespace: ");
+        out.push_str(&namespace);
+        out.push('\n');
+    }
+    if out != contents {
+        fs::write(&kustomization, out)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to update {}", kustomization.display()))?;
     }
 
-    for entry in walk_files(artifact_dir)? {
-        if entry.extension().and_then(|ext| ext.to_str()) != Some("yaml") {
-            continue;
-        }
-        let contents = fs::read_to_string(&entry)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read kubernetes file {}", entry.display()))?;
-        if !contents.contains("\nkind: Namespace\n") && !contents.starts_with("kind: Namespace\n") {
-            continue;
-        }
-        let mut saw_metadata = false;
-        for line in contents.lines() {
-            let trimmed = line.trim();
-            if trimmed == "metadata:" {
-                saw_metadata = true;
+    Ok(namespace)
+}
+
+fn kubernetes_namespace_name(run_id: &str, site_id: &str) -> String {
+    let raw = format!("amber-{run_id}-{site_id}");
+    let mut out = String::with_capacity(raw.len().min(63));
+    let mut last_was_dash = false;
+
+    for ch in raw.chars() {
+        let next = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+        if next == '-' {
+            if out.is_empty() || last_was_dash {
                 continue;
             }
-            if saw_metadata && let Some(name) = trimmed.strip_prefix("name:") {
-                return Ok(name.trim().to_string());
-            }
+            last_was_dash = true;
+        } else {
+            last_was_dash = false;
+        }
+        out.push(next);
+        if out.len() == 63 {
+            break;
         }
     }
-    Err(miette::miette!(
-        "kubernetes artifact {} does not contain a Namespace resource",
-        artifact_dir.display()
-    ))
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "amber".to_string()
+    } else {
+        out
+    }
 }
 
 fn walk_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -3076,14 +4038,14 @@ fn observability_endpoint_for_site(kind: SiteKind, endpoint: &str) -> Result<Str
                 .unwrap_or(false)
     });
     if should_rewrite {
-        let host = container_host_for_consumer(kind);
+        let host = container_host_for_consumer(SiteKind::Direct, kind);
         url.set_host(Some(&host))
             .map_err(|_| miette::miette!("failed to rewrite observability endpoint {endpoint}"))?;
     }
     Ok(url.to_string())
 }
 
-fn reserve_loopback_port() -> Result<u16> {
+pub(crate) fn reserve_loopback_port() -> Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .into_diagnostic()
         .wrap_err("failed to allocate a loopback port")?;
@@ -3155,6 +4117,14 @@ fn observability_plan_path(run_root: &Path) -> PathBuf {
 
 fn observability_state_path(run_root: &Path) -> PathBuf {
     run_root.join("observability").join("sink-state.json")
+}
+
+fn outside_proxy_plan_path(run_root: &Path) -> PathBuf {
+    run_root.join("outside-proxy-plan.json")
+}
+
+fn outside_proxy_state_path(run_root: &Path) -> PathBuf {
+    run_root.join("outside-proxy-state.json")
 }
 
 fn write_commit_marker(run_root: &Path) -> Result<()> {
@@ -3329,7 +4299,7 @@ fn canonicalize_existing_path(path: &Path, description: &str) -> Result<PathBuf>
         .wrap_err_with(|| format!("failed to resolve {description} {}", path.display()))
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path, label: &str) -> Result<T> {
+pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(path: &Path, label: &str) -> Result<T> {
     let bytes = fs::read(path)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read {} {}", label, path.display()))?;
@@ -3366,10 +4336,11 @@ fn decode_public_key(value: &str) -> Result<[u8; 32]> {
 fn pid_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        unsafe {
+        let alive = unsafe {
             libc::kill(pid as i32, 0) == 0
                 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-        }
+        };
+        alive && process_status_code(pid) != Some('Z')
     }
 
     #[cfg(not(unix))]
@@ -3534,6 +4505,162 @@ fn handle_otlp_connection(stream: &mut TcpStream, requests_log: &Path) -> Result
     Ok(())
 }
 
+#[cfg(unix)]
+fn send_sigkill(pid: u32) {
+    let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+}
+
+#[cfg(unix)]
+async fn shutdown_recorded_processes(site: &SiteReceipt) -> Result<()> {
+    let mut roots = Vec::new();
+    if let Some(pid) = site.process_pid {
+        roots.push(pid);
+    }
+    if let Some(pid) = site.port_forward_pid {
+        roots.push(pid);
+    }
+    terminate_recorded_processes(&roots).await
+}
+
+#[cfg(not(unix))]
+async fn shutdown_recorded_processes(site: &SiteReceipt) -> Result<()> {
+    if let Some(pid) = site.process_pid {
+        send_sigterm(pid);
+    }
+    if let Some(pid) = site.port_forward_pid {
+        send_sigterm(pid);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn terminate_recorded_processes(root_pids: &[u32]) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    let mut ordered = Vec::new();
+    for root_pid in root_pids {
+        for pid in process_tree_postorder(*root_pid)? {
+            if seen.insert(pid) {
+                ordered.push(pid);
+            }
+        }
+    }
+    if ordered.is_empty() {
+        return Ok(());
+    }
+    for pid in &ordered {
+        send_sigterm(*pid);
+    }
+    wait_for_pids_exit(&ordered, PROCESS_SHUTDOWN_GRACE_PERIOD).await;
+    let survivors = ordered
+        .iter()
+        .copied()
+        .filter(|pid| pid_is_alive(*pid))
+        .collect::<Vec<_>>();
+    for pid in &survivors {
+        send_sigkill(*pid);
+    }
+    wait_for_pids_exit(&survivors, Duration::from_secs(2)).await;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_status_code(pid: u32) -> Option<char> {
+    let output = Command::new("ps")
+        .arg("-o")
+        .arg("stat=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_process_status_code(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(unix)]
+fn parse_process_status_code(raw: &str) -> Option<char> {
+    raw.split_whitespace()
+        .next()?
+        .chars()
+        .next()
+        .map(|state| state.to_ascii_uppercase())
+}
+
+#[cfg(unix)]
+async fn wait_for_pids_exit(pids: &[u32], timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if pids.iter().all(|pid| !pid_is_alive(*pid)) {
+            return;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(unix)]
+fn process_tree_postorder(root_pid: u32) -> Result<Vec<u32>> {
+    let output = Command::new("ps")
+        .arg("-axo")
+        .arg("pid=,ppid=")
+        .output()
+        .into_diagnostic()
+        .wrap_err("failed to enumerate process tree")?;
+    if !output.status.success() {
+        return Err(miette::miette!(
+            "failed to enumerate process tree: status {}",
+            output.status
+        ));
+    }
+
+    let parent_by_pid = parse_process_table(&String::from_utf8_lossy(&output.stdout))?;
+    let mut children_by_parent = HashMap::<u32, Vec<u32>>::new();
+    for (pid, ppid) in parent_by_pid {
+        children_by_parent.entry(ppid).or_default().push(pid);
+    }
+
+    let mut ordered = Vec::new();
+    collect_process_tree_postorder(root_pid, &children_by_parent, &mut ordered);
+    Ok(ordered)
+}
+
+#[cfg(unix)]
+fn collect_process_tree_postorder(
+    pid: u32,
+    children_by_parent: &HashMap<u32, Vec<u32>>,
+    ordered: &mut Vec<u32>,
+) {
+    if let Some(children) = children_by_parent.get(&pid) {
+        for child in children {
+            collect_process_tree_postorder(*child, children_by_parent, ordered);
+        }
+    }
+    ordered.push(pid);
+}
+
+fn parse_process_table(raw: &str) -> Result<HashMap<u32, u32>> {
+    let mut parent_by_pid = HashMap::new();
+    for line in raw.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(pid) = fields.next() else {
+            continue;
+        };
+        let Some(ppid) = fields.next() else {
+            continue;
+        };
+        let pid = pid
+            .parse::<u32>()
+            .into_diagnostic()
+            .wrap_err_with(|| format!("invalid process table pid `{pid}`"))?;
+        let ppid = ppid
+            .parse::<u32>()
+            .into_diagnostic()
+            .wrap_err_with(|| format!("invalid process table parent pid `{ppid}`"))?;
+        parent_by_pid.insert(pid, ppid);
+    }
+    Ok(parent_by_pid)
+}
+
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|window| window == b"\r\n\r\n")
 }
@@ -3643,7 +4770,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(500));
         });
 
-        assert!(forwarded_endpoint_ready(addr));
+        assert!(crate::tcp_readiness::endpoint_accepts_stable_connection(
+            addr,
+            Duration::from_millis(250),
+            Duration::from_millis(250),
+        ));
         handle.join().expect("listener thread should finish");
     }
 
@@ -3657,31 +4788,319 @@ mod tests {
             drop(stream);
         });
 
-        assert!(!forwarded_endpoint_ready(addr));
+        assert!(!crate::tcp_readiness::endpoint_accepts_stable_connection(
+            addr,
+            Duration::from_millis(250),
+            Duration::from_millis(250),
+        ));
+        handle.join().expect("listener thread should finish");
+    }
+
+    fn test_local_mesh_config(path: &Path, protocol: MeshProtocol, port: u16) -> Result<()> {
+        write_json(
+            path,
+            &MeshConfigPublic {
+                identity: MeshIdentityPublic {
+                    id: "/site/test/router".to_string(),
+                    public_key: [7; 32],
+                    mesh_scope: Some("test-scope".to_string()),
+                },
+                mesh_listen: SocketAddr::from(([127, 0, 0, 1], 24000)),
+                control_listen: Some(SocketAddr::from(([127, 0, 0, 1], 24100))),
+                control_allow: None,
+                peers: Vec::new(),
+                inbound: vec![InboundRoute {
+                    route_id: "route".to_string(),
+                    capability: "http".to_string(),
+                    capability_kind: None,
+                    capability_profile: None,
+                    protocol,
+                    http_plugins: Vec::new(),
+                    target: InboundTarget::Local { port },
+                    allowed_issuers: Vec::new(),
+                }],
+                outbound: Vec::new(),
+                transport: TransportConfig::NoiseIk {},
+            },
+        )
+    }
+
+    #[test]
+    fn mesh_config_local_targets_ready_accepts_http_inbound_routes() {
+        let temp = tempdir().expect("tempdir should be created");
+        let config_path = temp.path().join("mesh-config.json");
+        let listener =
+            TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        test_local_mesh_config(&config_path, MeshProtocol::Http, addr.port())
+            .expect("mesh config should be written");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("listener should accept");
+            let mut request = [0u8; 256];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(
+                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        });
+
+        assert!(
+            mesh_config_local_targets_ready(&config_path, Duration::from_secs(1))
+                .expect("mesh config should be readable")
+        );
         handle.join().expect("listener thread should finish");
     }
 
     #[test]
-    fn container_host_from_resolved_ip_matches_consumer_kind() {
+    fn mesh_config_local_targets_ready_rejects_unreachable_http_inbound_routes() {
+        let temp = tempdir().expect("tempdir should be created");
+        let config_path = temp.path().join("mesh-config.json");
+        let listener =
+            TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        drop(listener);
+        test_local_mesh_config(&config_path, MeshProtocol::Http, addr.port())
+            .expect("mesh config should be written");
+
+        assert!(
+            !mesh_config_local_targets_ready(&config_path, Duration::from_millis(100))
+                .expect("mesh config should be readable")
+        );
+    }
+
+    #[test]
+    fn read_compose_launch_env_returns_saved_launch_env() {
+        let temp = tempdir().expect("tempdir should be created");
+        let run_root = temp.path().join("run-root");
+        let state_root = run_root.join("state").join("compose_local");
+        write_json(
+            &site_supervisor_plan_path(&state_root),
+            &SiteSupervisorPlan {
+                schema: SITE_PLAN_SCHEMA.to_string(),
+                version: SITE_PLAN_VERSION,
+                run_id: "run-123".to_string(),
+                mesh_scope: "test.scope".to_string(),
+                run_root: run_root.display().to_string(),
+                coordinator_pid: 1,
+                site_id: "compose_local".to_string(),
+                kind: SiteKind::Compose,
+                artifact_dir: temp.path().join("artifact").display().to_string(),
+                site_state_root: state_root.display().to_string(),
+                storage_root: None,
+                runtime_root: None,
+                router_mesh_port: None,
+                compose_project: Some("amber-test".to_string()),
+                kubernetes_namespace: None,
+                context: None,
+                port_forward_mesh_port: None,
+                port_forward_control_port: None,
+                observability_endpoint: None,
+                launch_env: BTreeMap::from([
+                    ("AMBER_CONFIG_TENANT".to_string(), "acme-local".to_string()),
+                    (
+                        "AMBER_CONFIG_CATALOG_TOKEN".to_string(),
+                        "demo-token".to_string(),
+                    ),
+                ]),
+            },
+        )
+        .expect("site supervisor plan should be written");
+
         assert_eq!(
-            container_host_from_resolved_ip(SiteKind::Direct, Some("172.17.0.1")),
+            read_compose_launch_env(&run_root, "compose_local")
+                .expect("compose launch env should be readable"),
+            BTreeMap::from([
+                (
+                    "AMBER_CONFIG_CATALOG_TOKEN".to_string(),
+                    "demo-token".to_string()
+                ),
+                ("AMBER_CONFIG_TENANT".to_string(), "acme-local".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_process_table_reads_ps_output() {
+        assert_eq!(
+            parse_process_table("  42     1\n  84   42\n").expect("process table should parse"),
+            HashMap::from([(42, 1), (84, 42)])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_process_status_code_reads_ps_state() {
+        assert_eq!(parse_process_status_code("S+\n"), Some('S'));
+        assert_eq!(parse_process_status_code("z\n"), Some('Z'));
+        assert_eq!(parse_process_status_code("\n"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_process_tree_postorder_visits_descendants_before_parent() {
+        let children_by_parent = HashMap::from([(1, vec![2, 3]), (2, vec![4]), (3, vec![5, 6])]);
+        let mut ordered = Vec::new();
+        collect_process_tree_postorder(1, &children_by_parent, &mut ordered);
+        assert_eq!(ordered, vec![4, 2, 5, 6, 3, 1]);
+    }
+
+    #[test]
+    fn container_host_from_resolved_ip_matches_provider_and_consumer_kind() {
+        assert_eq!(
+            container_host_from_resolved_ip(
+                SiteKind::Compose,
+                SiteKind::Direct,
+                Some("172.17.0.1"),
+            ),
             "127.0.0.1"
         );
         assert_eq!(
-            container_host_from_resolved_ip(SiteKind::Vm, Some("172.17.0.1")),
+            container_host_from_resolved_ip(SiteKind::Compose, SiteKind::Vm, Some("172.17.0.1"),),
             "127.0.0.1"
         );
         assert_eq!(
-            container_host_from_resolved_ip(SiteKind::Compose, Some("172.17.0.1")),
+            container_host_from_resolved_ip(SiteKind::Vm, SiteKind::Compose, Some("172.17.0.1"),),
             CONTAINER_HOST_ALIAS
         );
         assert_eq!(
-            container_host_from_resolved_ip(SiteKind::Kubernetes, Some("172.17.0.1")),
+            container_host_from_resolved_ip(
+                SiteKind::Direct,
+                SiteKind::Compose,
+                Some("172.17.0.1"),
+            ),
+            CONTAINER_HOST_ALIAS
+        );
+        assert_eq!(
+            container_host_from_resolved_ip(
+                SiteKind::Kubernetes,
+                SiteKind::Compose,
+                Some("172.17.0.1"),
+            ),
             "172.17.0.1"
         );
         assert_eq!(
-            container_host_from_resolved_ip(SiteKind::Kubernetes, None),
+            container_host_from_resolved_ip(SiteKind::Vm, SiteKind::Kubernetes, Some("172.17.0.1"),),
+            "172.17.0.1"
+        );
+        assert_eq!(
+            container_host_from_resolved_ip(SiteKind::Vm, SiteKind::Kubernetes, None),
             CONTAINER_HOST_ALIAS
+        );
+    }
+
+    #[test]
+    fn containerized_consumers_bridge_runtime_links() {
+        assert!(link_needs_bridge_proxy(SiteKind::Direct, SiteKind::Compose));
+        assert!(link_needs_bridge_proxy(SiteKind::Vm, SiteKind::Compose));
+        assert!(link_needs_bridge_proxy(
+            SiteKind::Kubernetes,
+            SiteKind::Compose
+        ));
+        assert!(link_needs_bridge_proxy(
+            SiteKind::Direct,
+            SiteKind::Kubernetes
+        ));
+        assert!(link_needs_bridge_proxy(SiteKind::Vm, SiteKind::Kubernetes));
+        assert!(link_needs_bridge_proxy(
+            SiteKind::Kubernetes,
+            SiteKind::Kubernetes
+        ));
+        assert!(link_needs_bridge_proxy(
+            SiteKind::Compose,
+            SiteKind::Compose
+        ));
+        assert!(!link_needs_bridge_proxy(SiteKind::Vm, SiteKind::Direct));
+    }
+
+    #[test]
+    fn bridge_proxy_bind_and_probe_addresses_match_consumer_kind() {
+        let compose_listen = bridge_proxy_bind_addr(SiteKind::Compose, 41000);
+        assert_eq!(compose_listen, SocketAddr::from(([0, 0, 0, 0], 41000)));
+        assert_eq!(
+            bridge_proxy_probe_addr(compose_listen),
+            SocketAddr::from(([127, 0, 0, 1], 41000))
+        );
+
+        let kind_listen = bridge_proxy_bind_addr(SiteKind::Kubernetes, 42000);
+        assert_eq!(kind_listen, SocketAddr::from(([0, 0, 0, 0], 42000)));
+        assert_eq!(
+            bridge_proxy_probe_addr(kind_listen),
+            SocketAddr::from(([127, 0, 0, 1], 42000))
+        );
+
+        let direct_listen = bridge_proxy_bind_addr(SiteKind::Direct, 43000);
+        assert_eq!(direct_listen, SocketAddr::from(([127, 0, 0, 1], 43000)));
+        assert_eq!(bridge_proxy_probe_addr(direct_listen), direct_listen);
+    }
+
+    #[test]
+    fn bridge_proxy_external_url_uses_consumer_aware_host() {
+        assert_eq!(
+            bridge_proxy_external_url(44000, NetworkProtocol::Http, SiteKind::Compose)
+                .expect("http bridge proxy url should be valid"),
+            "http://host.docker.internal:44000"
+        );
+        assert_eq!(
+            bridge_proxy_external_url(45000, NetworkProtocol::Http, SiteKind::Kubernetes)
+                .expect("http bridge proxy url should be valid"),
+            format!(
+                "http://{}:45000",
+                bridge_proxy_host_for_consumer(SiteKind::Kubernetes)
+            )
+        );
+    }
+
+    #[test]
+    fn bridge_proxy_export_binding_uses_selected_listen_addr() {
+        assert_eq!(
+            bridge_proxy_export_binding("api", SocketAddr::from(([127, 0, 0, 1], 46000))),
+            "api=127.0.0.1:46000"
+        );
+        assert_eq!(
+            bridge_proxy_export_binding("api", SocketAddr::from(([0, 0, 0, 0], 47000))),
+            "api=0.0.0.0:47000"
+        );
+    }
+
+    #[test]
+    fn kubernetes_sites_get_startup_budget_after_workloads_are_ready() {
+        assert_eq!(
+            site_ready_timeout_for_kind(SiteKind::Kubernetes),
+            KUBERNETES_WORKLOAD_READY_TIMEOUT + KUBERNETES_SITE_READY_BUFFER
+        );
+    }
+
+    #[test]
+    fn kubernetes_namespace_name_is_run_scoped() {
+        assert_eq!(
+            kubernetes_namespace_name("run-1234abcd", "kind_c"),
+            "amber-run-1234abcd-kind-c"
+        );
+        assert_ne!(
+            kubernetes_namespace_name("run-1234abcd", "kind_c"),
+            kubernetes_namespace_name("run-5678efgh", "kind_c")
+        );
+    }
+
+    #[test]
+    fn prepare_kubernetes_artifact_namespace_rewrites_kustomization_namespace() {
+        let temp = tempdir().expect("tempdir should be created");
+        let kustomization = temp.path().join("kustomization.yaml");
+        fs::write(
+            &kustomization,
+            "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nnamespace: \
+             scenario-old\n",
+        )
+        .expect("kustomization should be written");
+
+        let namespace =
+            prepare_kubernetes_artifact_namespace("run-1234abcd", "kind_c", temp.path())
+                .expect("artifact namespace should be prepared");
+
+        assert_eq!(namespace, "amber-run-1234abcd-kind-c");
+        assert_eq!(
+            fs::read_to_string(&kustomization).expect("kustomization should be readable"),
+            "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nnamespace: \
+             amber-run-1234abcd-kind-c\n"
         );
     }
 
@@ -3736,6 +5155,7 @@ mod tests {
             source_plan_path: None,
             run_root: run_root.display().to_string(),
             observability: None,
+            bridge_proxies: Vec::new(),
             sites: BTreeMap::from([(
                 "direct_local".to_string(),
                 test_site_receipt(
@@ -3808,6 +5228,7 @@ mod tests {
             source_plan_path: None,
             run_root: run_root.display().to_string(),
             observability: None,
+            bridge_proxies: Vec::new(),
             sites: BTreeMap::from([
                 (
                     "compose_local".to_string(),

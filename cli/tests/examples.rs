@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -310,6 +311,13 @@ fn collect_scenario_variants(dir: &Path) -> Vec<PathBuf> {
             let entry = entry
                 .unwrap_or_else(|err| panic!("failed to read {} entry: {err}", path.display()));
             let entry_path = entry.path();
+            if entry_path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with('.'))
+            {
+                continue;
+            }
             if entry_path.is_dir() {
                 stack.push(entry_path);
                 continue;
@@ -328,4 +336,20 @@ fn collect_scenario_variants(dir: &Path) -> Vec<PathBuf> {
 
     manifests.sort();
     manifests
+}
+
+#[test]
+fn collect_scenario_variants_skips_hidden_runtime_state() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let visible = temp.path().join("visible");
+    let hidden = temp.path().join(".amber-runs");
+    fs::create_dir_all(&visible).expect("visible dir should be created");
+    fs::create_dir_all(&hidden).expect("hidden dir should be created");
+    fs::write(visible.join("scenario-v2.json5"), "{}").expect("visible scenario should be written");
+    fs::write(hidden.join("scenario-v2.json5"), "{}").expect("hidden scenario should be written");
+
+    assert_eq!(
+        collect_scenario_variants(temp.path()),
+        vec![visible.join("scenario-v2.json5")]
+    );
 }
