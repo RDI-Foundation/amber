@@ -26,12 +26,75 @@ struct SpawnedChild {
     log_path: PathBuf,
 }
 
+const PROGRESS_HEARTBEAT: Duration = Duration::from_secs(30);
+const LOG_TAIL_LINE_COUNT: usize = 12;
+
+fn progress(message: impl AsRef<str>) {
+    eprintln!("[vm_smoke] {}", message.as_ref());
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    if minutes == 0 {
+        format!("{seconds}s")
+    } else {
+        format!("{minutes}m{seconds:02}s")
+    }
+}
+
+fn read_log_tail(path: &Path, line_count: usize) -> String {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) => return format!("failed to read {}: {err}", path.display()),
+    };
+    let mut tail = contents.lines().rev().take(line_count).collect::<Vec<_>>();
+    tail.reverse();
+    tail.join("\n")
+}
+
+fn emit_wait_heartbeat(
+    amber_run: &SpawnedChild,
+    proxy: &SpawnedChild,
+    port: u16,
+    path: &str,
+    elapsed: Duration,
+    timeout: Duration,
+) {
+    progress(format!(
+        "still waiting for 127.0.0.1:{port}{path} after {} (timeout {})",
+        format_duration(elapsed),
+        format_duration(timeout),
+    ));
+    let amber_tail = read_log_tail(&amber_run.log_path, LOG_TAIL_LINE_COUNT);
+    if !amber_tail.trim().is_empty() {
+        eprintln!(
+            "[vm_smoke] recent amber run log ({}):\n{}",
+            amber_run.log_path.display(),
+            amber_tail,
+        );
+    }
+    let proxy_tail = read_log_tail(&proxy.log_path, LOG_TAIL_LINE_COUNT);
+    if !proxy_tail.trim().is_empty() {
+        eprintln!(
+            "[vm_smoke] recent amber proxy log ({}):\n{}",
+            proxy.log_path.display(),
+            proxy_tail,
+        );
+    }
+}
+
 fn pick_free_port() -> u16 {
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
     listener.local_addr().unwrap().port()
 }
 
 fn ensure_runtime_binaries_built(workspace_root: &Path) -> PathBuf {
+    progress(format!(
+        "building amber runtime binaries in {}",
+        workspace_root.display()
+    ));
     let build_runtime = Command::new("cargo")
         .current_dir(workspace_root)
         .arg("build")
@@ -50,6 +113,7 @@ fn ensure_runtime_binaries_built(workspace_root: &Path) -> PathBuf {
             String::from_utf8_lossy(&build_runtime.stderr)
         );
     }
+    progress("finished building amber runtime binaries");
     cargo_target_dir(workspace_root).join("debug")
 }
 
@@ -74,6 +138,11 @@ fn smoke_timeout() -> Duration {
 }
 
 fn compile_vm_or_panic(amber: &Path, output_dir: &Path, manifest_path: &Path, base_image: &Path) {
+    progress(format!(
+        "compiling VM output from {} into {}",
+        manifest_path.display(),
+        output_dir.display()
+    ));
     let compile = Command::new(amber)
         .arg("compile")
         .arg("--vm")
@@ -91,6 +160,10 @@ fn compile_vm_or_panic(amber: &Path, output_dir: &Path, manifest_path: &Path, ba
             String::from_utf8_lossy(&compile.stderr),
         );
     }
+    progress(format!(
+        "finished compiling VM output from {}",
+        manifest_path.display()
+    ));
 }
 
 fn spawn_amber_run(
@@ -210,7 +283,13 @@ fn wait_for_body(
     timeout: Duration,
     predicate: impl Fn(&str) -> bool,
 ) -> String {
+    progress(format!(
+        "waiting for 127.0.0.1:{port}{path} (timeout {})",
+        format_duration(timeout)
+    ));
+    let start = Instant::now();
     let deadline = Instant::now() + timeout;
+    let mut next_heartbeat = start + PROGRESS_HEARTBEAT;
     while Instant::now() < deadline {
         if let Ok(Some(status)) = amber_run.child.try_wait() {
             panic_with_process_output(
@@ -229,7 +308,15 @@ fn wait_for_body(
         if let Some((200, body)) = http_request(port, "GET", path, None)
             && predicate(&body)
         {
+            progress(format!(
+                "ready on 127.0.0.1:{port}{path} after {}",
+                format_duration(start.elapsed())
+            ));
             return body;
+        }
+        if Instant::now() >= next_heartbeat {
+            emit_wait_heartbeat(amber_run, proxy, port, path, start.elapsed(), timeout);
+            next_heartbeat += PROGRESS_HEARTBEAT;
         }
         thread::sleep(Duration::from_millis(250));
     }
@@ -337,6 +424,11 @@ fn assert_vm_run(
     let api_port = pick_free_port();
     let bound_port = pick_free_port();
     let unbound_port = pick_free_port();
+    progress(format!(
+        "starting {} with storage root {}",
+        expectation.run_name,
+        storage_root.display()
+    ));
 
     let mut amber_run = spawn_amber_run(
         amber,
@@ -348,6 +440,12 @@ fn assert_vm_run(
     );
     let mut proxy = spawn_amber_proxy(amber, vm_out, api_port, bound_port, unbound_port);
     let timeout = smoke_timeout();
+    progress(format!(
+        "{} logs: amber run {}, amber proxy {}",
+        expectation.run_name,
+        amber_run.log_path.display(),
+        proxy.log_path.display()
+    ));
 
     let version = wait_for_body(
         &mut amber_run,
@@ -443,11 +541,13 @@ fn assert_vm_run(
     }
 
     shutdown_vm_runtime(&mut amber_run, &mut proxy);
+    progress(format!("completed {}", expectation.run_name));
 }
 
 #[test]
 #[ignore = "requires QEMU and a host-arch Ubuntu cloud image"]
 fn vm_smoke_network_storage_and_migration_example() {
+    progress("starting vm-network-storage smoke test");
     let workspace_root = workspace_root();
     let base_image = vm_base_image(&workspace_root);
     let default_image = default_host_arch_cloud_image_filename();
@@ -473,6 +573,10 @@ fn vm_smoke_network_storage_and_migration_example() {
     let runtime_bin_dir = ensure_runtime_binaries_built(&workspace_root);
     let amber = runtime_bin_dir.join("amber");
     let example_dir = workspace_root.join("examples").join("vm-network-storage");
+    progress(format!(
+        "using VM smoke base image {}",
+        base_image.display()
+    ));
 
     compile_vm_or_panic(
         &amber,
@@ -529,4 +633,5 @@ fn vm_smoke_network_storage_and_migration_example() {
             expected_ephemeral: "boot:v2",
         },
     );
+    progress("finished vm-network-storage smoke test");
 }
