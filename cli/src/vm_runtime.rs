@@ -5,7 +5,7 @@ use std::{
     fs::{self, File},
     hash::{Hash as _, Hasher as _},
     io::{Seek as _, SeekFrom, Write as _},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitStatus, Stdio},
 };
@@ -26,6 +26,7 @@ use amber_mesh::{
     MeshConfigPublic, MeshIdentity, MeshIdentityPublic, MeshIdentitySecret, MeshPeer, MeshProtocol,
     MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTarget,
 };
+use amber_router::{LISTENER_FDS_ENV, ListenerFdConfig};
 use amber_template::{
     ConfigTemplatePayload, MountSpec, RuntimeSlotObject, RuntimeTemplateContext, TemplatePart,
 };
@@ -43,6 +44,7 @@ use tokio::{
 
 use crate::{
     cross_site_router_mesh_bind_ip,
+    port_reservation::{ReservedTcpPort, reserve_unique_tcp_port},
     tcp_readiness::{
         endpoint_accepts_stable_connection, endpoint_returns_http_response,
         wait_for_stable_endpoint,
@@ -99,10 +101,58 @@ enum ManagedChildShutdown {
     Qemu { qmp_socket: PathBuf },
 }
 
-#[derive(Clone, Debug)]
 struct VmPortAssignments {
     state: VmRuntimeState,
     route_host_ports_by_component: BTreeMap<usize, BTreeMap<String, Vec<u16>>>,
+    router_listener_reservations: RouterListenerReservations,
+    component_reservations_by_id: BTreeMap<usize, VmComponentPortReservations>,
+}
+
+#[derive(Debug, Default)]
+struct RouterListenerReservations {
+    mesh: Option<ReservedTcpPort>,
+    outbound_by_route_id: BTreeMap<String, ReservedTcpPort>,
+}
+
+#[derive(Debug, Default)]
+struct VmComponentPortReservations {
+    sidecar: RouterListenerReservations,
+    endpoint_forwards_by_guest_port: BTreeMap<u16, ReservedTcpPort>,
+}
+
+impl RouterListenerReservations {
+    #[cfg(unix)]
+    fn inherited_listener_env_json(&self) -> Result<Option<String>> {
+        if self.mesh.is_none() && self.outbound_by_route_id.is_empty() {
+            return Ok(None);
+        }
+
+        let mesh = if let Some(listener) = self.mesh.as_ref() {
+            listener.clear_close_on_exec()?;
+            Some(listener.raw_fd())
+        } else {
+            None
+        };
+
+        let mut outbound_by_route_id = BTreeMap::new();
+        for (route_id, listener) in &self.outbound_by_route_id {
+            listener.clear_close_on_exec()?;
+            outbound_by_route_id.insert(route_id.clone(), listener.raw_fd());
+        }
+
+        serde_json::to_string(&ListenerFdConfig {
+            mesh,
+            outbound_by_route_id,
+        })
+        .into_diagnostic()
+        .map(Some)
+    }
+
+    #[cfg(not(unix))]
+    fn inherited_listener_env_json(&self) -> Result<Option<String>> {
+        let _ = self;
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -285,7 +335,7 @@ pub(crate) async fn run_vm_init(
     let reuse_materialized_runtime = runtime_dir.is_none() && runtime_state_path.is_file();
 
     let supervision = async {
-        let port_assignments = materialize_vm_runtime(
+        let mut port_assignments = materialize_vm_runtime(
             &plan_root,
             &runtime_root,
             &vm_plan,
@@ -302,6 +352,7 @@ pub(crate) async fn run_vm_init(
                     &runtime_root,
                     &plan_root,
                     router,
+                    std::mem::take(&mut port_assignments.router_listener_reservations),
                     &mut children,
                     &mut log_tasks,
                 )
@@ -310,10 +361,16 @@ pub(crate) async fn run_vm_init(
         }
 
         for component in &vm_plan.components {
+            let sidecar_listener_reservations = port_assignments
+                .component_reservations_by_id
+                .get_mut(&component.id)
+                .map(|reservations| std::mem::take(&mut reservations.sidecar))
+                .unwrap_or_default();
             spawn_component_sidecar(
                 &router_binary,
                 &runtime_root,
                 component,
+                sidecar_listener_reservations,
                 &mut children,
                 &mut log_tasks,
             )
@@ -369,6 +426,14 @@ pub(crate) async fn run_vm_init(
                 component_config.as_ref().map(|(config, _)| config),
                 &mount_files,
             )?;
+            let endpoint_forward_reservations = port_assignments
+                .component_reservations_by_id
+                .get_mut(&component.id)
+                .map(|reservations| {
+                    std::mem::take(&mut reservations.endpoint_forwards_by_guest_port)
+                })
+                .unwrap_or_default();
+            drop(endpoint_forward_reservations);
             spawn_command(
                 vm_launch.name,
                 vm_launch.command,
@@ -528,9 +593,13 @@ fn materialize_vm_runtime(
     let runtime_state_path = vm_runtime_state_path(plan_root);
     if reuse_existing && runtime_state_path.is_file() {
         let state = read_vm_runtime_state(&runtime_state_path)?;
+        let (router_listener_reservations, component_reservations_by_id) =
+            reserve_existing_vm_runtime_ports(runtime_root, vm_plan, &state)?;
         return Ok(VmPortAssignments {
             route_host_ports_by_component: state.route_host_ports_by_component.clone(),
             state,
+            router_listener_reservations,
+            component_reservations_by_id,
         });
     }
     if runtime_state_path.exists() {
@@ -561,23 +630,55 @@ fn assign_vm_runtime_ports(
     let mut mesh_port_by_peer_id = HashMap::<String, u16>::new();
     let mut component_configs = Vec::<(PathBuf, MeshConfigPublic)>::new();
     let mut route_host_ports_by_component = BTreeMap::<usize, BTreeMap<String, Vec<u16>>>::new();
+    let mut component_reservations_by_id = BTreeMap::<usize, VmComponentPortReservations>::new();
 
     for component in &vm_plan.components {
         let path = runtime_root.join(&component.mesh_config_path);
         let mut config = read_mesh_config_public(&path)?;
-        let mesh_port = allocate_runtime_port(&mut reserved, None)?;
+        let mesh_reservation = reserve_unique_tcp_port(
+            &mut reserved,
+            config.mesh_listen.ip(),
+            None,
+            "vm component mesh ports",
+        )?;
+        let mesh_port = mesh_reservation.port()?;
         mesh_port_by_peer_id.insert(config.identity.id.clone(), mesh_port);
         config.mesh_listen = SocketAddr::new(config.mesh_listen.ip(), mesh_port);
+        let mut sidecar_listener_reservations = RouterListenerReservations {
+            mesh: Some(mesh_reservation),
+            ..RouterListenerReservations::default()
+        };
 
         let mut route_guest_host_pairs = BTreeMap::<String, Vec<(u16, u16)>>::new();
         for route in &mut config.outbound {
             let guest_port = route.listen_port;
-            let host_port = allocate_runtime_port(&mut reserved, None)?;
+            let listen_ip = route
+                .listen_addr
+                .as_deref()
+                .unwrap_or("127.0.0.1")
+                .parse()
+                .map_err(|err| {
+                    miette::miette!(
+                        "invalid outbound listen address for component {} route {}: {err}",
+                        component.moniker,
+                        route.route_id
+                    )
+                })?;
+            let host_reservation = reserve_unique_tcp_port(
+                &mut reserved,
+                listen_ip,
+                None,
+                "vm sidecar outbound listener ports",
+            )?;
+            let host_port = host_reservation.port()?;
             route.listen_port = host_port;
             route_guest_host_pairs
                 .entry(route.slot.clone())
                 .or_default()
                 .push((guest_port, host_port));
+            sidecar_listener_reservations
+                .outbound_by_route_id
+                .insert(route.route_id.clone(), host_reservation);
         }
         for ports in route_guest_host_pairs.values_mut() {
             ports.sort_unstable_by_key(|(guest_port, _)| *guest_port);
@@ -608,14 +709,22 @@ fn assign_vm_runtime_ports(
             .collect::<BTreeMap<_, _>>();
 
         let mut endpoint_forwards = BTreeMap::new();
+        let mut endpoint_forward_reservations = BTreeMap::new();
         for route in &mut config.inbound {
             if let InboundTarget::Local { port } = &mut route.target {
                 let guest_port = *port;
                 let host_port = if let Some(existing) = endpoint_forwards.get(&guest_port) {
                     *existing
                 } else {
-                    let host_port = allocate_runtime_port(&mut reserved, None)?;
+                    let host_reservation = reserve_unique_tcp_port(
+                        &mut reserved,
+                        IpAddr::V4(Ipv4Addr::LOCALHOST),
+                        None,
+                        "vm endpoint forward ports",
+                    )?;
+                    let host_port = host_reservation.port()?;
                     endpoint_forwards.insert(guest_port, host_port);
+                    endpoint_forward_reservations.insert(guest_port, host_reservation);
                     host_port
                 };
                 *port = host_port;
@@ -644,19 +753,39 @@ fn assign_vm_runtime_ports(
             .insert(component.id, endpoint_forwards);
         route_host_ports_by_component.insert(component.id, slot_host_ports);
         component_configs.push((path, config));
+        component_reservations_by_id.insert(
+            component.id,
+            VmComponentPortReservations {
+                sidecar: sidecar_listener_reservations,
+                endpoint_forwards_by_guest_port: endpoint_forward_reservations,
+            },
+        );
     }
 
     let mut router_config = if let Some(router) = vm_plan.router.as_ref() {
         let path = runtime_root.join(&router.mesh_config_path);
         let mut config = read_mesh_config_public(&path)?;
-        let mesh_port = allocate_runtime_port(&mut reserved, fixed_router_mesh_port)?;
+        let mesh_reservation = reserve_unique_tcp_port(
+            &mut reserved,
+            cross_site_router_mesh_bind_ip(config.mesh_listen.ip(), fixed_router_mesh_port),
+            fixed_router_mesh_port,
+            "vm router mesh ports",
+        )?;
+        let mesh_port = mesh_reservation.port()?;
         mesh_port_by_peer_id.insert(config.identity.id.clone(), mesh_port);
         config.mesh_listen = SocketAddr::new(
             cross_site_router_mesh_bind_ip(config.mesh_listen.ip(), fixed_router_mesh_port),
             mesh_port,
         );
         state.router_mesh_port = Some(mesh_port);
-        Some((path, config))
+        Some((
+            path,
+            config,
+            RouterListenerReservations {
+                mesh: Some(mesh_reservation),
+                ..RouterListenerReservations::default()
+            },
+        ))
     } else {
         None
     };
@@ -664,48 +793,112 @@ fn assign_vm_runtime_ports(
     for (_, config) in &mut component_configs {
         rewrite_mesh_peer_addrs(config, &mesh_port_by_peer_id)?;
     }
-    if let Some((_, config)) = router_config.as_mut() {
+    if let Some((_, config, _)) = router_config.as_mut() {
         rewrite_mesh_peer_addrs(config, &mesh_port_by_peer_id)?;
     }
 
     for (path, config) in component_configs {
         write_mesh_config_public(&path, &config)?;
     }
-    if let Some((path, config)) = router_config {
+    let router_listener_reservations = if let Some((path, config, reservations)) = router_config {
         write_mesh_config_public(&path, &config)?;
-    }
+        reservations
+    } else {
+        RouterListenerReservations::default()
+    };
 
     Ok(VmPortAssignments {
         state,
         route_host_ports_by_component,
+        router_listener_reservations,
+        component_reservations_by_id,
     })
 }
 
-fn allocate_runtime_port(reserved: &mut BTreeSet<u16>, preferred: Option<u16>) -> Result<u16> {
-    if let Some(preferred) = preferred {
-        if reserved.insert(preferred) {
-            return Ok(preferred);
-        }
-        return Err(miette::miette!(
-            "runtime port {} was requested twice in one vm runtime",
-            preferred
-        ));
-    }
-    for _ in 0..256 {
-        let port = pick_free_port()?;
-        if reserved.insert(port) {
-            return Ok(port);
-        }
-    }
-    Err(miette::miette!(
-        "ran out of ports while allocating vm runtime ports"
-    ))
-}
+fn reserve_existing_vm_runtime_ports(
+    runtime_root: &Path,
+    vm_plan: &VmPlan,
+    state: &VmRuntimeState,
+) -> Result<(
+    RouterListenerReservations,
+    BTreeMap<usize, VmComponentPortReservations>,
+)> {
+    let mut reserved = BTreeSet::new();
+    let mut component_reservations_by_id = BTreeMap::new();
 
-fn pick_free_port() -> Result<u16> {
-    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
-        .into_diagnostic()?;
-    Ok(listener.local_addr().into_diagnostic()?.port())
+    for component in &vm_plan.components {
+        let config = read_mesh_config_public(&runtime_root.join(&component.mesh_config_path))?;
+        let mesh_reservation = reserve_unique_tcp_port(
+            &mut reserved,
+            config.mesh_listen.ip(),
+            Some(config.mesh_listen.port()),
+            "vm component mesh ports",
+        )?;
+        let mut sidecar = RouterListenerReservations {
+            mesh: Some(mesh_reservation),
+            ..RouterListenerReservations::default()
+        };
+        for route in &config.outbound {
+            let listen_ip = route
+                .listen_addr
+                .as_deref()
+                .unwrap_or("127.0.0.1")
+                .parse()
+                .map_err(|err| {
+                    miette::miette!(
+                        "invalid outbound listen address for component {} route {}: {err}",
+                        component.moniker,
+                        route.route_id
+                    )
+                })?;
+            let reservation = reserve_unique_tcp_port(
+                &mut reserved,
+                listen_ip,
+                Some(route.listen_port),
+                "vm sidecar outbound listener ports",
+            )?;
+            sidecar
+                .outbound_by_route_id
+                .insert(route.route_id.clone(), reservation);
+        }
+        let mut endpoint_forwards_by_guest_port = BTreeMap::new();
+        if let Some(endpoint_forwards) = state.endpoint_forwards_by_component.get(&component.id) {
+            for (guest_port, host_port) in endpoint_forwards {
+                let reservation = reserve_unique_tcp_port(
+                    &mut reserved,
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    Some(*host_port),
+                    "vm endpoint forward ports",
+                )?;
+                endpoint_forwards_by_guest_port.insert(*guest_port, reservation);
+            }
+        }
+        component_reservations_by_id.insert(
+            component.id,
+            VmComponentPortReservations {
+                sidecar,
+                endpoint_forwards_by_guest_port,
+            },
+        );
+    }
+
+    let router_listener_reservations = if let Some(router) = vm_plan.router.as_ref() {
+        let config = read_mesh_config_public(&runtime_root.join(&router.mesh_config_path))?;
+        let mesh_reservation = reserve_unique_tcp_port(
+            &mut reserved,
+            config.mesh_listen.ip(),
+            Some(config.mesh_listen.port()),
+            "vm router mesh ports",
+        )?;
+        RouterListenerReservations {
+            mesh: Some(mesh_reservation),
+            ..RouterListenerReservations::default()
+        }
+    } else {
+        RouterListenerReservations::default()
+    };
+
+    Ok((router_listener_reservations, component_reservations_by_id))
 }
 
 fn rewrite_mesh_peer_addrs(
@@ -865,6 +1058,7 @@ async fn spawn_vm_router(
     runtime_root: &Path,
     plan_root: &Path,
     router: &VmRouterPlan,
+    listener_reservations: RouterListenerReservations,
     children: &mut Vec<ManagedChild>,
     log_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> Result<VmControlSocketPaths> {
@@ -944,6 +1138,9 @@ async fn spawn_vm_router(
         "AMBER_ROUTER_CONTROL_SOCKET_PATH".to_string(),
         paths.runtime.display().to_string(),
     );
+    if let Some(listener_env_json) = listener_reservations.inherited_listener_env_json()? {
+        env_map.insert(LISTENER_FDS_ENV.to_string(), listener_env_json);
+    }
     for passthrough in &router.env_passthrough {
         if let Ok(value) = env::var(passthrough) {
             env_map.insert(passthrough.clone(), value);
@@ -977,6 +1174,7 @@ async fn spawn_component_sidecar(
     router_binary: &str,
     runtime_root: &Path,
     component: &VmComponentPlan,
+    listener_reservations: RouterListenerReservations,
     children: &mut Vec<ManagedChild>,
     log_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> Result<()> {
@@ -995,6 +1193,9 @@ async fn spawn_component_sidecar(
             .display()
             .to_string(),
     );
+    if let Some(listener_env_json) = listener_reservations.inherited_listener_env_json()? {
+        env_map.insert(LISTENER_FDS_ENV.to_string(), listener_env_json);
+    }
     let work_dir = runtime_root
         .join("work")
         .join("sidecars")
@@ -3676,6 +3877,8 @@ mod tests {
                 7,
                 BTreeMap::from([("api".to_string(), vec![43_071])]),
             )]),
+            router_listener_reservations: RouterListenerReservations::default(),
+            component_reservations_by_id: BTreeMap::new(),
         };
 
         let netdev =
@@ -3742,6 +3945,8 @@ mod tests {
                 7,
                 BTreeMap::from([("api".to_string(), vec![43_071])]),
             )]),
+            router_listener_reservations: RouterListenerReservations::default(),
+            component_reservations_by_id: BTreeMap::new(),
         };
 
         let preview = build_vm_launch_preview(
@@ -3846,6 +4051,8 @@ mod tests {
                 7,
                 BTreeMap::from([("api".to_string(), vec![43_071])]),
             )]),
+            router_listener_reservations: RouterListenerReservations::default(),
+            component_reservations_by_id: BTreeMap::new(),
         };
 
         let preview = build_vm_launch_preview(

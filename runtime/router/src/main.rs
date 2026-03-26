@@ -3,7 +3,7 @@ use amber_mesh::telemetry::{
     init_subscriber, observability_log_scope_name, shutdown_tracer_provider,
     structured_logs_enabled, suppress_otlp_bridge_target,
 };
-use amber_router::{config_from_env, run};
+use amber_router::{config_from_env, prebound_listeners_from_env, run_with_listeners};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -15,10 +15,17 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let listeners = match prebound_listeners_from_env() {
+        Ok(listeners) => listeners,
+        Err(err) => {
+            eprintln!("router listener setup error: {err}");
+            std::process::exit(1);
+        }
+    };
 
     init_tracing(&config);
 
-    if let Err(err) = run(config).await {
+    if let Err(err) = run_with_listeners(config, listeners).await {
         tracing::error!("router failed: {err}");
         shutdown_tracer_provider();
         std::process::exit(1);

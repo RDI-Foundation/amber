@@ -10,7 +10,7 @@ mod workspace_root_support;
 use std::{
     env, fs,
     io::{Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -83,11 +83,6 @@ fn emit_wait_heartbeat(
             proxy_tail,
         );
     }
-}
-
-fn pick_free_port() -> u16 {
-    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-    listener.local_addr().unwrap().port()
 }
 
 fn ensure_runtime_binaries_built(workspace_root: &Path) -> PathBuf {
@@ -199,13 +194,7 @@ fn spawn_amber_run(
     }
 }
 
-fn spawn_amber_proxy(
-    amber: &Path,
-    vm_out: &Path,
-    api_port: u16,
-    bound_port: u16,
-    unbound_port: u16,
-) -> SpawnedChild {
+fn spawn_amber_proxy(amber: &Path, vm_out: &Path) -> SpawnedChild {
     let log_path = vm_out.join(".amber-vm-smoke-proxy.log");
     let stdout = fs::File::create(&log_path).expect("failed to create amber proxy log");
     let stderr = stdout
@@ -215,16 +204,86 @@ fn spawn_amber_proxy(
         .arg("proxy")
         .arg(vm_out)
         .arg("--export")
-        .arg(format!("api=127.0.0.1:{api_port}"))
+        .arg("api=127.0.0.1:0")
         .arg("--export")
-        .arg(format!("bound=127.0.0.1:{bound_port}"))
+        .arg("bound=127.0.0.1:0")
         .arg("--export")
-        .arg(format!("unbound=127.0.0.1:{unbound_port}"))
+        .arg("unbound=127.0.0.1:0")
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()
         .expect("failed to start amber proxy");
     SpawnedChild { child, log_path }
+}
+
+struct ProxyPorts {
+    api: u16,
+    bound: u16,
+    unbound: u16,
+}
+
+fn parse_export_port(line: &str, export: &str) -> Option<u16> {
+    let prefix = format!("export {export} -> ");
+    let addr = line.strip_prefix(&prefix)?;
+    let port = addr.rsplit(':').next()?.parse().ok()?;
+    Some(port)
+}
+
+fn wait_for_proxy_ports(
+    amber_run: &mut SpawnedChild,
+    proxy: &mut SpawnedChild,
+    timeout: Duration,
+) -> ProxyPorts {
+    progress(format!(
+        "waiting for proxy export ports (timeout {})",
+        format_duration(timeout)
+    ));
+    let start = Instant::now();
+    let deadline = start + timeout;
+    while Instant::now() < deadline {
+        if let Ok(Some(status)) = amber_run.child.try_wait() {
+            panic_with_process_output(
+                amber_run,
+                proxy,
+                format!("amber run exited before proxy exports were ready: {status}"),
+            );
+        }
+        if let Ok(Some(status)) = proxy.child.try_wait() {
+            panic_with_process_output(
+                amber_run,
+                proxy,
+                format!("amber proxy exited before proxy exports were ready: {status}"),
+            );
+        }
+
+        let mut api = None;
+        let mut bound = None;
+        let mut unbound = None;
+        for line in read_log(&proxy.log_path).lines() {
+            api = api.or_else(|| parse_export_port(line, "api"));
+            bound = bound.or_else(|| parse_export_port(line, "bound"));
+            unbound = unbound.or_else(|| parse_export_port(line, "unbound"));
+        }
+        if let (Some(api), Some(bound), Some(unbound)) = (api, bound, unbound) {
+            progress(format!(
+                "proxy export ports resolved after {}: api={api}, bound={bound}, unbound={unbound}",
+                format_duration(start.elapsed())
+            ));
+            return ProxyPorts {
+                api,
+                bound,
+                unbound,
+            };
+        }
+
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    panic_with_process_output(
+        amber_run,
+        proxy,
+        "amber proxy did not report export ports before timeout".to_string(),
+    );
 }
 
 fn wait_for_exit(child: &mut SpawnedChild, timeout: Duration) -> Option<std::process::ExitStatus> {
@@ -421,9 +480,6 @@ fn assert_vm_run(
     base_image: &Path,
     expectation: VmRunExpectation<'_>,
 ) {
-    let api_port = pick_free_port();
-    let bound_port = pick_free_port();
-    let unbound_port = pick_free_port();
     progress(format!(
         "starting {} with storage root {}",
         expectation.run_name,
@@ -438,7 +494,7 @@ fn assert_vm_run(
         base_image,
         &logs_dir.join(format!("{}.amber-run.log", expectation.run_name)),
     );
-    let mut proxy = spawn_amber_proxy(amber, vm_out, api_port, bound_port, unbound_port);
+    let mut proxy = spawn_amber_proxy(amber, vm_out);
     let timeout = smoke_timeout();
     progress(format!(
         "{} logs: amber run {}, amber proxy {}",
@@ -446,11 +502,12 @@ fn assert_vm_run(
         amber_run.log_path.display(),
         proxy.log_path.display()
     ));
+    let ports = wait_for_proxy_ports(&mut amber_run, &mut proxy, timeout);
 
     let version = wait_for_body(
         &mut amber_run,
         &mut proxy,
-        api_port,
+        ports.api,
         "/version",
         timeout,
         |body| body == expectation.expected_version,
@@ -460,7 +517,7 @@ fn assert_vm_run(
     let storage = wait_for_body(
         &mut amber_run,
         &mut proxy,
-        api_port,
+        ports.api,
         "/storage",
         timeout,
         |body| body == expectation.expected_storage,
@@ -470,7 +527,7 @@ fn assert_vm_run(
     let bound = wait_for_body(
         &mut amber_run,
         &mut proxy,
-        bound_port,
+        ports.bound,
         "/reachability",
         timeout,
         |body| body == "reachable:api",
@@ -480,7 +537,7 @@ fn assert_vm_run(
     let unbound = wait_for_body(
         &mut amber_run,
         &mut proxy,
-        unbound_port,
+        ports.unbound,
         "/reachability",
         timeout,
         |body| body.starts_with("blocked:"),
@@ -493,7 +550,7 @@ fn assert_vm_run(
     let bound_ephemeral = wait_for_body(
         &mut amber_run,
         &mut proxy,
-        bound_port,
+        ports.bound,
         "/ephemeral",
         timeout,
         |body| body == "own=owned:bound;api_visible=false",
@@ -503,7 +560,7 @@ fn assert_vm_run(
     let unbound_ephemeral = wait_for_body(
         &mut amber_run,
         &mut proxy,
-        unbound_port,
+        ports.unbound,
         "/ephemeral",
         timeout,
         |body| body == "own=owned:unbound;api_visible=false",
@@ -513,7 +570,7 @@ fn assert_vm_run(
     let ephemeral = wait_for_body(
         &mut amber_run,
         &mut proxy,
-        api_port,
+        ports.api,
         "/ephemeral",
         timeout,
         |body| body == expectation.expected_ephemeral,
@@ -524,7 +581,7 @@ fn assert_vm_run(
         let storage_written = put_body_or_dump(
             &mut amber_run,
             &mut proxy,
-            api_port,
+            ports.api,
             "/storage",
             "remembered across runs",
         );
@@ -533,7 +590,7 @@ fn assert_vm_run(
         let ephemeral_written = put_body_or_dump(
             &mut amber_run,
             &mut proxy,
-            api_port,
+            ports.api,
             "/ephemeral",
             "discarded after teardown",
         );

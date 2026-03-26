@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::fd::{FromRawFd as _, OwnedFd, RawFd};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
@@ -754,6 +756,36 @@ const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 const MAX_FRAME: usize = 64 * 1024;
 const MAX_PLAINTEXT: usize = 16 * 1024;
 const CONTROL_SOCKET_PATH_ENV: &str = "AMBER_ROUTER_CONTROL_SOCKET_PATH";
+pub const LISTENER_FDS_ENV: &str = "AMBER_ROUTER_LISTENER_FDS_JSON";
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ListenerFdConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<i32>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub outbound_by_route_id: BTreeMap<String, i32>,
+}
+
+#[derive(Default)]
+pub struct PreboundListeners {
+    mesh: Option<TcpListener>,
+    outbound_by_route_id: HashMap<String, TcpListener>,
+}
+
+impl PreboundListeners {
+    pub fn with_mesh(mut self, listener: TcpListener) -> Self {
+        self.mesh = Some(listener);
+        self
+    }
+
+    pub fn insert_outbound(
+        &mut self,
+        route_id: impl Into<String>,
+        listener: TcpListener,
+    ) -> Option<TcpListener> {
+        self.outbound_by_route_id.insert(route_id.into(), listener)
+    }
+}
 
 pub fn config_from_env() -> Result<MeshConfig, RouterError> {
     if let Ok(path) = env::var("AMBER_ROUTER_CONFIG_PATH") {
@@ -778,6 +810,58 @@ pub fn config_from_env() -> Result<MeshConfig, RouterError> {
     }
 
     Err(RouterError::MissingConfig)
+}
+
+pub fn prebound_listeners_from_env() -> Result<PreboundListeners, RouterError> {
+    let Some(raw) = env::var(LISTENER_FDS_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(PreboundListeners::default());
+    };
+
+    let config: ListenerFdConfig = serde_json::from_str(&raw)
+        .map_err(|err| RouterError::InvalidConfig(format!("invalid {LISTENER_FDS_ENV}: {err}")))?;
+
+    #[cfg(not(unix))]
+    {
+        let _ = config;
+        return Err(RouterError::InvalidConfig(format!(
+            "{LISTENER_FDS_ENV} is only supported on unix targets"
+        )));
+    }
+
+    #[cfg(unix)]
+    {
+        let mut listeners = PreboundListeners::default();
+        if let Some(fd) = config.mesh {
+            listeners = listeners.with_mesh(listener_from_inherited_fd(fd)?);
+        }
+        for (route_id, fd) in config.outbound_by_route_id {
+            listeners.insert_outbound(route_id, listener_from_inherited_fd(fd)?);
+        }
+        Ok(listeners)
+    }
+}
+
+#[cfg(unix)]
+fn listener_from_inherited_fd(fd: RawFd) -> Result<TcpListener, RouterError> {
+    if fd < 0 {
+        return Err(RouterError::InvalidConfig(format!(
+            "invalid inherited listener fd {fd}"
+        )));
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let listener = std::net::TcpListener::from(owned);
+    listener.set_nonblocking(true).map_err(|err| {
+        RouterError::InvalidConfig(format!(
+            "failed to configure inherited listener fd {fd}: {err}"
+        ))
+    })?;
+    TcpListener::from_std(listener).map_err(|err| {
+        RouterError::InvalidConfig(format!("failed to adopt inherited listener fd {fd}: {err}"))
+    })
 }
 
 fn parse_config_json(
@@ -815,6 +899,13 @@ fn parse_identity_json(raw: &str) -> Result<MeshIdentitySecret, RouterError> {
 }
 
 pub async fn run(config: MeshConfig) -> Result<(), RouterError> {
+    run_with_listeners(config, PreboundListeners::default()).await
+}
+
+pub async fn run_with_listeners(
+    config: MeshConfig,
+    mut listeners_by_route: PreboundListeners,
+) -> Result<(), RouterError> {
     let trust = Arc::new(TrustBundle::new(&config)?);
     let inbound_routes = Arc::new(build_inbound_routes(&config)?);
     validate_outbound_routes(&config)?;
@@ -834,27 +925,34 @@ pub async fn run(config: MeshConfig) -> Result<(), RouterError> {
     let mut listeners = JoinSet::new();
 
     {
-        listeners.spawn(run_mesh_listener(InboundRuntime {
-            config: config.clone(),
-            trust: trust.clone(),
-            inbound_routes: inbound_routes.clone(),
-            dynamic_issuers: dynamic_issuers.clone(),
-            external_overrides: external_overrides.clone(),
-            vetted_external_addrs: vetted_external_addrs.clone(),
-            client: Arc::new(client),
-            a2a_url_rewrite_table: a2a_url_rewrite_table.clone(),
-        }));
+        listeners.spawn(run_mesh_listener(
+            InboundRuntime {
+                config: config.clone(),
+                trust: trust.clone(),
+                inbound_routes: inbound_routes.clone(),
+                dynamic_issuers: dynamic_issuers.clone(),
+                external_overrides: external_overrides.clone(),
+                vetted_external_addrs: vetted_external_addrs.clone(),
+                client: Arc::new(client),
+                a2a_url_rewrite_table: a2a_url_rewrite_table.clone(),
+            },
+            listeners_by_route.mesh.take(),
+        ));
     }
 
     for route in config.outbound.clone() {
         let config = config.clone();
         let trust = trust.clone();
         let a2a_url_rewrite_table = a2a_url_rewrite_table.clone();
+        let prebound_listener = listeners_by_route
+            .outbound_by_route_id
+            .remove(route.route_id.as_str());
         listeners.spawn(run_outbound_listener(
             route,
             config,
             trust,
             a2a_url_rewrite_table,
+            prebound_listener,
         ));
     }
 
@@ -983,13 +1081,20 @@ async fn shutdown_signal() {
     }
 }
 
-async fn run_mesh_listener(state: InboundRuntime) -> Result<(), RouterError> {
-    let listener = TcpListener::bind(state.config.mesh_listen)
-        .await
-        .map_err(|source| RouterError::BindFailed {
-            addr: state.config.mesh_listen,
-            source,
-        })?;
+async fn run_mesh_listener(
+    state: InboundRuntime,
+    prebound_listener: Option<TcpListener>,
+) -> Result<(), RouterError> {
+    let listener = if let Some(listener) = prebound_listener {
+        listener
+    } else {
+        TcpListener::bind(state.config.mesh_listen)
+            .await
+            .map_err(|source| RouterError::BindFailed {
+                addr: state.config.mesh_listen,
+                source,
+            })?
+    };
 
     loop {
         let (stream, _) = listener.accept().await?;
@@ -1223,6 +1328,7 @@ async fn run_outbound_listener(
     config: Arc<MeshConfig>,
     trust: Arc<TrustBundle>,
     a2a_url_rewrite_table: Arc<a2a::UrlRewriteTable>,
+    prebound_listener: Option<TcpListener>,
 ) -> Result<(), RouterError> {
     let listen_ip = route
         .listen_addr
@@ -1231,13 +1337,16 @@ async fn run_outbound_listener(
         .parse()
         .map_err(|_| RouterError::InvalidConfig("invalid listen address".to_string()))?;
     let listen_addr = SocketAddr::new(listen_ip, route.listen_port);
-    let listener =
+    let listener = if let Some(listener) = prebound_listener {
+        listener
+    } else {
         TcpListener::bind(listen_addr)
             .await
             .map_err(|source| RouterError::BindFailed {
                 addr: listen_addr,
                 source,
-            })?;
+            })?
+    };
 
     loop {
         let (stream, _) = listener.accept().await?;
