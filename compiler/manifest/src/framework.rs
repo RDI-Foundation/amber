@@ -20,17 +20,30 @@ pub struct FrameworkCapabilitySpec {
 pub fn framework_capabilities() -> &'static [FrameworkCapabilitySpec] {
     static CAPS: OnceLock<Vec<FrameworkCapabilitySpec>> = OnceLock::new();
     CAPS.get_or_init(|| {
-        vec![FrameworkCapabilitySpec {
-            name: FrameworkCapabilityName::try_from("docker")
-                .expect("framework capability names are static and valid"),
-            decl: CapabilityDecl {
-                kind: CapabilityKind::Docker,
-                profile: None,
+        vec![
+            FrameworkCapabilitySpec {
+                name: FrameworkCapabilityName::try_from("docker")
+                    .expect("framework capability names are static and valid"),
+                decl: CapabilityDecl {
+                    kind: CapabilityKind::Docker,
+                    profile: None,
+                },
+                binding_shape: FrameworkBindingShape::Url,
+                required_experimental_feature: Some(ExperimentalFeature::Docker),
+                description: "Docker Engine API access via the Amber framework gateway",
             },
-            binding_shape: FrameworkBindingShape::Url,
-            required_experimental_feature: Some(ExperimentalFeature::Docker),
-            description: "Docker Engine API access via the Amber framework gateway",
-        }]
+            FrameworkCapabilitySpec {
+                name: FrameworkCapabilityName::try_from("kvm")
+                    .expect("framework capability names are static and valid"),
+                decl: CapabilityDecl {
+                    kind: CapabilityKind::Kvm,
+                    profile: None,
+                },
+                binding_shape: FrameworkBindingShape::Opaque,
+                required_experimental_feature: Some(ExperimentalFeature::Kvm),
+                description: "KVM device access for hardware-accelerated virtualization",
+            },
+        ]
     })
     .as_slice()
 }

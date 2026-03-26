@@ -2,11 +2,11 @@ Error: manifest::deserialize_error
 
   × check failed
   ╰─▶ json5 deserialize error at experimental_features[0]: unknown variant
-      `not_a_real_feature`, expected `docker`
+      `not_a_real_feature`, expected `docker` or `kvm`
    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/manifest_unknown_experimental_feature.json5:3:27]
  2 │   manifest_version: "0.1.0",
  3 │   experimental_features: ["not_a_real_feature"],
    ·                           ──────────┬─────────
-   ·                                     ╰── unknown variant `not_a_real_feature`, expected `docker`
+   ·                                     ╰── unknown variant `not_a_real_feature`, expected `docker` or `kvm`
  4 │ }
    ╰────

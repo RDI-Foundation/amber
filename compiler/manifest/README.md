@@ -345,10 +345,16 @@ Supported `from` sources (current):
   `kind: "storage"`.
 * `framework.docker`: requires `experimental_features: ["docker"]`. In Docker Compose output, this
   injects a Docker socket mount backed by the framework docker gateway.
+* `framework.kvm`: requires `experimental_features: ["kvm"]`. In Docker Compose output, adds a
+  `/dev/kvm` device mapping to the container for hardware-accelerated virtualization (QEMU/KVM).
+  Also adds the `kvm` group to the container via `group_add`, using the `AMBER_KVM_GID` environment
+  variable (set this to the GID of the `kvm` group on the host, e.g.
+  `stat -c %g /dev/kvm`). The generated `env.example` includes this variable. Other
+  targets (e.g. Kubernetes) do not yet support this capability.
 
 Reserved (not implemented yet):
 
-* `framework.<capability>` other than `framework.docker`
+* `framework.<capability>` other than `framework.docker` and `framework.kvm`
 
 Mount value formatting:
 
@@ -770,6 +776,7 @@ Current framework capabilities:
 
 * `docker` (`framework.docker`) — requires `experimental_features: ["docker"]` in the same
   manifest.
+* `kvm` (`framework.kvm`) — requires `experimental_features: ["kvm"]`. Docker Compose only. Adds a `/dev/kvm` device mapping to the container.
 
 `weak`:
 
