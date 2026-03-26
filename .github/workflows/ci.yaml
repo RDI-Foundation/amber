@@ -516,7 +516,6 @@ jobs:
       packages: write
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix: ${{ fromJSON(needs.image-matrix.outputs.build_matrix) }}
     steps:
       - uses: actions/checkout@v5

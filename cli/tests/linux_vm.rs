@@ -28,6 +28,8 @@ use workspace_root_support::workspace_root;
 const GUEST_USER: &str = "amber";
 const DEFAULT_ROOT_OVERLAY_SIZE: &str = "40G";
 const QEMU_VIRTIO_NET_DEVICE: &str = "virtio-net-pci,netdev=net0,rombar=0";
+const BASE_GUEST_PACKAGES: &str =
+    "build-essential ca-certificates curl git jq pkg-config libssl-dev";
 const LINUX_VM_KIND_VERSION: &str = "v0.26.0";
 const LINUX_VM_KIND_NODE_IMAGE: &str =
     "kindest/node:v1.32.0@sha256:c48c62eac5da28cdadcf560d1d8616cfa6783b58f0d94cf63ad1bf49600cb027";
@@ -65,7 +67,7 @@ impl ProvisionProfile {
     fn provisioning_spec(self, arch: &GuestArch) -> ProvisioningSpec {
         match self {
             Self::VmSmoke => ProvisioningSpec {
-                guest_packages: "build-essential ca-certificates curl git jq pkg-config libssl-dev",
+                guest_packages: BASE_GUEST_PACKAGES,
                 profile_setup: String::new(),
                 profile_checks: String::new(),
             },
@@ -900,6 +902,17 @@ fn run_linux_guest_mixed_run_test(test_name: &str) -> Result<(), String> {
     )
 }
 
+fn run_linux_guest_direct_smoke_test(test_name: &str) -> Result<(), String> {
+    run_linux_guest_test(
+        format!("linux-vm-{test_name}-"),
+        ProvisionProfile::MixedRun,
+        &format!(
+            "cargo test -p amber-cli --all-features --test direct_smoke {test_name} -- --ignored \
+             --nocapture --test-threads=1"
+        ),
+    )
+}
+
 #[test]
 #[ignore = "requires qemu on macOS; boots Ubuntu and runs the real Linux vm_smoke test inside the \
             guest"]
@@ -970,6 +983,63 @@ fn linux_vm_runs_mixed_run_local_observability_scenario_smoke() {
             inside the guest"]
 fn linux_vm_runs_mixed_run_recovers_direct_component_failure_after_setup() {
     run_linux_guest_mixed_run_test("mixed_run_recovers_direct_component_failure_after_setup")
+        .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the real Linux direct smoke tests inside \
+            the guest"]
+fn linux_vm_runs_direct_smoke_tests() {
+    run_linux_guest_direct_smoke_test("direct_smoke_").unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux direct smoke http startup test \
+            inside the guest"]
+fn linux_vm_runs_direct_smoke_python_http_server_starts_and_stops() {
+    run_linux_guest_direct_smoke_test("direct_smoke_python_http_server_starts_and_stops")
+        .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux direct smoke relative-path \
+            test inside the guest"]
+fn linux_vm_runs_direct_smoke_resolves_relative_program_path_from_manifest_dir() {
+    run_linux_guest_direct_smoke_test(
+        "direct_smoke_resolves_relative_program_path_from_manifest_dir",
+    )
+    .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux direct smoke helper-mount test \
+            inside the guest"]
+fn linux_vm_runs_direct_smoke_mount_under_run_with_helper() {
+    run_linux_guest_direct_smoke_test("direct_smoke_mount_under_run_with_helper")
+        .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux direct smoke storage upgrade \
+            test inside the guest"]
+fn linux_vm_runs_direct_smoke_storage_persists_across_upgrade() {
+    run_linux_guest_direct_smoke_test("direct_smoke_storage_persists_across_upgrade")
+        .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux direct smoke env scrub test \
+            inside the guest"]
+fn linux_vm_runs_direct_smoke_does_not_leak_host_env_into_component() {
+    run_linux_guest_direct_smoke_test("direct_smoke_does_not_leak_host_env_into_component")
+        .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux direct smoke host-fs isolation \
+            test inside the guest"]
+fn linux_vm_runs_direct_smoke_blocks_host_file_reads_outside_allowed_mounts() {
+    run_linux_guest_direct_smoke_test("direct_smoke_blocks_host_file_reads_outside_allowed_mounts")
         .unwrap_or_else(|err| panic!("{err}"));
 }
 

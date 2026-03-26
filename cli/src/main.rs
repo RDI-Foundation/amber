@@ -3133,7 +3133,7 @@ fn direct_resolved_process_preview(
                     value.to_string_lossy().into_owned(),
                 )
             })
-            .collect(),
+            .collect::<BTreeMap<_, _>>(),
         docker_mount_proxies: plan
             .docker_mount_proxies
             .into_iter()

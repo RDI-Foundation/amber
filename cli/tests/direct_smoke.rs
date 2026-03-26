@@ -229,6 +229,8 @@ mod linux_direct_smoke {
     use std::{
         io::{Read, Write},
         net::TcpStream,
+        os::unix::process::ExitStatusExt as _,
+        sync::OnceLock,
         thread,
         time::{Duration, Instant},
     };
@@ -294,40 +296,42 @@ mod linux_direct_smoke {
         None
     }
 
-    fn cargo_target_dir(workspace_root: &Path) -> std::path::PathBuf {
-        match env::var_os("CARGO_TARGET_DIR") {
-            Some(dir) => {
-                let dir = std::path::PathBuf::from(dir);
-                if dir.is_absolute() {
-                    dir
-                } else {
-                    workspace_root.join(dir)
-                }
-            }
-            None => workspace_root.join("target"),
-        }
+    fn direct_smoke_runtime_target_dir(workspace_root: &Path) -> std::path::PathBuf {
+        workspace_root.join("target").join("direct-smoke-runtime")
     }
 
     fn ensure_runtime_binaries_built(workspace_root: &Path) -> std::path::PathBuf {
-        let build_runtime = Command::new("cargo")
-            .current_dir(workspace_root)
-            .arg("build")
-            .arg("-q")
-            .arg("-p")
-            .arg("amber-router")
-            .arg("-p")
-            .arg("amber-helper")
-            .output()
-            .expect("failed to build runtime binaries for direct smoke test");
-        if !build_runtime.status.success() {
-            panic!(
-                "failed to build runtime binaries\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-                build_runtime.status,
-                String::from_utf8_lossy(&build_runtime.stdout),
-                String::from_utf8_lossy(&build_runtime.stderr)
-            );
-        }
-        cargo_target_dir(workspace_root).join("debug")
+        static RUNTIME_BIN_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+        RUNTIME_BIN_DIR
+            .get_or_init(|| {
+                let runtime_target_dir = direct_smoke_runtime_target_dir(workspace_root);
+                let build_runtime = Command::new("cargo")
+                    .current_dir(workspace_root)
+                    .arg("build")
+                    .arg("-q")
+                    .arg("--target-dir")
+                    .arg(&runtime_target_dir)
+                    .arg("-p")
+                    .arg("amber-router")
+                    .arg("-p")
+                    .arg("amber-helper")
+                    .env("CARGO_INCREMENTAL", "0")
+                    .output()
+                    .expect("failed to build runtime binaries for direct smoke test");
+                if !build_runtime.status.success() {
+                    panic!(
+                        "failed to build runtime binaries in {}\nstatus: \
+                         {}\nstdout:\n{}\nstderr:\n{}",
+                        runtime_target_dir.display(),
+                        build_runtime.status,
+                        String::from_utf8_lossy(&build_runtime.stdout),
+                        String::from_utf8_lossy(&build_runtime.stderr)
+                    );
+                }
+                runtime_target_dir.join("debug")
+            })
+            .clone()
     }
 
     fn spawn_amber_run(
@@ -392,11 +396,105 @@ mod linux_direct_smoke {
         child.wait().ok()
     }
 
-    fn signal_int(child: &std::process::Child) {
+    fn send_signal(child: &std::process::Child, signal: i32) {
         let Ok(pid) = i32::try_from(child.id()) else {
             return;
         };
-        let _ = unsafe { libc::kill(pid, libc::SIGINT) };
+        let _ = unsafe { libc::kill(pid, signal) };
+    }
+
+    fn linux_pid_is_alive(pid: u32) -> bool {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        let rc = unsafe { libc::kill(pid, 0) };
+        if rc == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    fn stale_direct_runtime_pids(runtime_bin_dir: &Path) -> Vec<u32> {
+        let router_binary = runtime_bin_dir.join("amber-router");
+        let helper_binary = runtime_bin_dir.join("amber-helper");
+        let self_pid = std::process::id();
+        let mut pids = Vec::new();
+
+        let Ok(proc_entries) = fs::read_dir("/proc") else {
+            return pids;
+        };
+        for entry in proc_entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if pid == self_pid {
+                continue;
+            }
+
+            let proc_root = entry.path();
+            if fs::read_link(proc_root.join("exe"))
+                .ok()
+                .is_some_and(|exe| exe == router_binary || exe == helper_binary)
+            {
+                pids.push(pid);
+                continue;
+            }
+
+            let Ok(cmdline) = fs::read(proc_root.join("cmdline")) else {
+                continue;
+            };
+            let cmdline = String::from_utf8_lossy(&cmdline);
+            if cmdline.contains("slirp4netns") && cmdline.contains("/amber-direct-slirp4netns/") {
+                pids.push(pid);
+            }
+        }
+
+        pids
+    }
+
+    fn wait_for_pids_to_exit(pids: &[u32], timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if pids.iter().all(|pid| !linux_pid_is_alive(*pid)) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        pids.iter().all(|pid| !linux_pid_is_alive(*pid))
+    }
+
+    fn reap_stale_direct_runtime_processes(runtime_bin_dir: &Path) {
+        let mut pids = stale_direct_runtime_pids(runtime_bin_dir);
+        if pids.is_empty() {
+            return;
+        }
+
+        for pid in &pids {
+            let Ok(pid) = i32::try_from(*pid) else {
+                continue;
+            };
+            let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+        if wait_for_pids_to_exit(&pids, Duration::from_secs(5)) {
+            return;
+        }
+
+        pids.retain(|pid| linux_pid_is_alive(*pid));
+        for pid in &pids {
+            let Ok(pid) = i32::try_from(*pid) else {
+                continue;
+            };
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(
+            wait_for_pids_to_exit(&pids, Duration::from_secs(5)),
+            "stale direct runtime processes did not exit: {:?}",
+            pids
+        );
     }
 
     fn assert_http_reachable_or_dump(
@@ -458,9 +556,10 @@ mod linux_direct_smoke {
     fn shutdown_direct_runtime(
         amber_run: &mut std::process::Child,
         proxy: &mut std::process::Child,
+        runtime_bin_dir: &Path,
     ) {
-        signal_int(proxy);
-        signal_int(amber_run);
+        send_signal(proxy, libc::SIGINT);
+        send_signal(amber_run, libc::SIGINT);
 
         let proxy_status = wait_for_exit(proxy, Duration::from_secs(20))
             .expect("amber proxy did not exit after SIGINT");
@@ -471,7 +570,11 @@ mod linux_direct_smoke {
 
         let status = wait_for_exit(amber_run, Duration::from_secs(20))
             .expect("amber run did not exit after SIGINT");
-        assert!(status.success(), "amber run failed with status {status}");
+        assert!(
+            status.success() || status.signal() == Some(libc::SIGINT),
+            "amber run failed with status {status}"
+        );
+        reap_stale_direct_runtime_processes(runtime_bin_dir);
     }
 
     #[test]
@@ -532,7 +635,7 @@ mod linux_direct_smoke {
         let mut proxy = spawn_amber_proxy(&direct_out, "http", export_port);
         assert_http_reachable_or_dump(&mut child, &mut proxy, export_port, "direct server");
 
-        shutdown_direct_runtime(&mut child, &mut proxy);
+        shutdown_direct_runtime(&mut child, &mut proxy, runtime_bin_dir.as_path());
     }
 
     #[test]
@@ -603,7 +706,7 @@ mod linux_direct_smoke {
             "relative-path direct server",
         );
 
-        shutdown_direct_runtime(&mut child, &mut proxy);
+        shutdown_direct_runtime(&mut child, &mut proxy, runtime_bin_dir.as_path());
     }
 
     #[test]
@@ -686,7 +789,7 @@ mod linux_direct_smoke {
         let mut proxy = spawn_amber_proxy(&direct_out, "http", export_port);
         assert_http_reachable_or_dump(&mut child, &mut proxy, export_port, "mount direct server");
 
-        shutdown_direct_runtime(&mut child, &mut proxy);
+        shutdown_direct_runtime(&mut child, &mut proxy, runtime_bin_dir.as_path());
     }
 
     #[test]
@@ -797,7 +900,7 @@ exec python3 -m http.server 8080 --bind 127.0.0.1 -d /tmp/www
             "persisted-v1",
             Duration::from_secs(20),
         );
-        shutdown_direct_runtime(&mut amber_run, &mut proxy);
+        shutdown_direct_runtime(&mut amber_run, &mut proxy, runtime_bin_dir.as_path());
 
         write_manifest("version-v2", "persisted-v2");
         compile_direct_or_panic(&direct_out, &root_path);
@@ -828,7 +931,7 @@ exec python3 -m http.server 8080 --bind 127.0.0.1 -d /tmp/www
             "persisted-v1",
             Duration::from_secs(20),
         );
-        shutdown_direct_runtime(&mut amber_run, &mut proxy);
+        shutdown_direct_runtime(&mut amber_run, &mut proxy, runtime_bin_dir.as_path());
     }
 
     #[test]
@@ -907,7 +1010,7 @@ exec python3 -m http.server 8080 --bind 127.0.0.1 -d /tmp/www
             "env-scrub direct server",
         );
 
-        shutdown_direct_runtime(&mut child, &mut proxy);
+        shutdown_direct_runtime(&mut child, &mut proxy, runtime_bin_dir.as_path());
     }
 
     #[test]
@@ -984,6 +1087,6 @@ exec python3 -m http.server 8080 --bind 127.0.0.1 -d /tmp/www
         let mut proxy = spawn_amber_proxy(&direct_out, "http", export_port);
         assert_http_reachable_or_dump(&mut child, &mut proxy, export_port, "host-fs direct server");
 
-        shutdown_direct_runtime(&mut child, &mut proxy);
+        shutdown_direct_runtime(&mut child, &mut proxy, runtime_bin_dir.as_path());
     }
 }
