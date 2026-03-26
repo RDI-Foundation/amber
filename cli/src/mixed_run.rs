@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     env, fs,
+    future::Future,
     io::{Read as _, Write as _},
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -71,6 +72,8 @@ const RESTART_BACKOFF: Duration = Duration::from_secs(1);
 const STITCH_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const SITE_DISCOVERY_STABILITY_WINDOW: Duration = Duration::from_secs(1);
 const PROCESS_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(10);
+const SITE_SUPERVISOR_STOP_TIMEOUT: Duration = Duration::from_secs(60);
+const FORCED_SUPERVISOR_EXIT_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const KUBERNETES_NAMESPACE_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const KUBERNETES_WORKLOAD_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const KUBERNETES_SITE_READY_BUFFER: Duration = Duration::from_secs(30);
@@ -1394,17 +1397,11 @@ pub(crate) async fn stop_run(run_id: &str, storage_root_override: Option<&Path>)
     let storage_root = mixed_run_storage_root(storage_root_override)?;
     let run_root = storage_root.join("runs").join(run_id);
     let receipt: RunReceipt = read_json(&receipt_path(&run_root), "run receipt")?;
+    let supervisor_stop_timeout = site_supervisor_stop_timeout();
+    let forced_supervisor_exit_grace_period = forced_supervisor_exit_grace_period();
     write_stop_marker(&run_root)?;
     for site in receipt.sites.values() {
         send_sigterm(site.supervisor_pid);
-    }
-    if let Some(observability) = receipt.observability.as_ref()
-        && let Some(pid) = observability.sink_pid
-    {
-        send_sigterm(pid);
-    }
-    for proxy in &receipt.bridge_proxies {
-        send_sigterm(proxy.pid);
     }
 
     let mut shutdown_failures = Vec::new();
@@ -1414,46 +1411,82 @@ pub(crate) async fn stop_run(run_id: &str, storage_root_override: Option<&Path>)
             &state_path,
             site_state_from_receipt(&receipt, site_id, site, SiteLifecycleStatus::Stopping, None),
         )?;
-        let deadline = Instant::now() + PROCESS_SHUTDOWN_GRACE_PERIOD;
-        while Instant::now() < deadline {
-            if let Ok(state) = read_json::<SiteManagerState>(&state_path, "site state")
-                && matches!(
-                    state.status,
-                    SiteLifecycleStatus::Stopped | SiteLifecycleStatus::Failed
-                )
-            {
-                break;
+        match wait_for_site_supervisor_stop(
+            &state_path,
+            site.supervisor_pid,
+            supervisor_stop_timeout,
+        )
+        .await?
+        {
+            SiteSupervisorStopStatus::Graceful { shutdown_failed } => {
+                if shutdown_failed {
+                    finalize_site_stop_via_orphan_cleanup(
+                        &run_root,
+                        &state_path,
+                        &receipt,
+                        site_id,
+                        site,
+                        format!(
+                            "site supervisor `{site_id}` reported failed shutdown; orphan cleanup \
+                             completed"
+                        ),
+                    )
+                    .await?;
+                }
             }
-            if !pid_is_alive(site.supervisor_pid) {
-                break;
-            }
-            sleep(Duration::from_millis(200)).await;
-        }
-
-        stop_site_from_receipt(&run_root, site_id, site).await?;
-        if pid_is_alive(site.supervisor_pid) {
-            let message = format!(
-                "site supervisor `{site_id}` (pid {}) did not stop within {}s",
-                site.supervisor_pid,
-                PROCESS_SHUTDOWN_GRACE_PERIOD.as_secs()
-            );
-            write_site_state(
-                &state_path,
-                site_state_from_receipt(
+            SiteSupervisorStopStatus::Exited => {
+                finalize_site_stop_via_orphan_cleanup(
+                    &run_root,
+                    &state_path,
                     &receipt,
                     site_id,
                     site,
-                    SiteLifecycleStatus::Stopping,
-                    Some(message.clone()),
-                ),
-            )?;
-            shutdown_failures.push(message);
-            continue;
+                    format!(
+                        "site supervisor `{site_id}` exited before confirming stop; orphan \
+                         cleanup completed"
+                    ),
+                )
+                .await?;
+            }
+            SiteSupervisorStopStatus::TimedOut => {
+                let message = format!(
+                    "site supervisor `{site_id}` (pid {}) did not stop within {}s; forcing \
+                     shutdown",
+                    site.supervisor_pid,
+                    supervisor_stop_timeout.as_secs()
+                );
+                #[cfg(unix)]
+                send_sigkill(site.supervisor_pid);
+                #[cfg(not(unix))]
+                send_sigterm(site.supervisor_pid);
+
+                if !wait_for_pid_exit(site.supervisor_pid, forced_supervisor_exit_grace_period)
+                    .await
+                {
+                    shutdown_failures.push(format!(
+                        "site supervisor `{site_id}` (pid {}) did not exit after forced shutdown",
+                        site.supervisor_pid
+                    ));
+                    continue;
+                }
+
+                finalize_site_stop_via_orphan_cleanup(
+                    &run_root,
+                    &state_path,
+                    &receipt,
+                    site_id,
+                    site,
+                    message,
+                )
+                .await?;
+            }
         }
-        write_site_state(
-            &state_path,
-            site_state_from_receipt(&receipt, site_id, site, SiteLifecycleStatus::Stopped, None),
-        )?;
+    }
+
+    if let Some(observability) = receipt.observability.as_ref()
+        && let Some(pid) = observability.sink_pid
+    {
+        send_sigterm(pid);
     }
 
     if let Some(observability) = receipt.observability.as_ref()
@@ -1464,6 +1497,9 @@ pub(crate) async fn stop_run(run_id: &str, storage_root_override: Option<&Path>)
             "observability sink (pid {pid}) did not stop within {}s",
             PROCESS_SHUTDOWN_GRACE_PERIOD.as_secs()
         ));
+    }
+    for proxy in &receipt.bridge_proxies {
+        send_sigterm(proxy.pid);
     }
     for proxy in &receipt.bridge_proxies {
         if !wait_for_pid_exit(proxy.pid, PROCESS_SHUTDOWN_GRACE_PERIOD).await {
@@ -1523,6 +1559,87 @@ fn site_state_from_receipt(
         router_identity_id: site.router_identity_id.clone(),
         router_public_key_b64: site.router_public_key_b64.clone(),
         last_error,
+    }
+}
+
+enum SiteSupervisorStopStatus {
+    Graceful { shutdown_failed: bool },
+    Exited,
+    TimedOut,
+}
+
+fn read_site_state_if_present(path: &Path) -> Option<SiteManagerState> {
+    if !path.is_file() {
+        return None;
+    }
+    read_json::<SiteManagerState>(path, "site state").ok()
+}
+
+async fn wait_for_site_supervisor_stop(
+    state_path: &Path,
+    supervisor_pid: u32,
+    timeout: Duration,
+) -> Result<SiteSupervisorStopStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let state = read_site_state_if_present(state_path);
+        let alive = pid_is_alive(supervisor_pid);
+        if !alive {
+            if state.as_ref().is_some_and(|state| {
+                matches!(
+                    state.status,
+                    SiteLifecycleStatus::Stopped | SiteLifecycleStatus::Failed
+                )
+            }) {
+                return Ok(SiteSupervisorStopStatus::Graceful {
+                    shutdown_failed: state
+                        .as_ref()
+                        .is_some_and(|state| state.status == SiteLifecycleStatus::Failed),
+                });
+            }
+            return Ok(SiteSupervisorStopStatus::Exited);
+        }
+        if Instant::now() >= deadline {
+            return Ok(SiteSupervisorStopStatus::TimedOut);
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn finalize_site_stop_via_orphan_cleanup(
+    run_root: &Path,
+    state_path: &Path,
+    receipt: &RunReceipt,
+    site_id: &str,
+    site: &SiteReceipt,
+    reason: String,
+) -> Result<()> {
+    stop_site_from_receipt(run_root, site_id, site).await?;
+    write_site_state(
+        state_path,
+        site_state_from_receipt(
+            receipt,
+            site_id,
+            site,
+            SiteLifecycleStatus::Stopped,
+            Some(reason),
+        ),
+    )
+}
+
+fn site_supervisor_stop_timeout() -> Duration {
+    if cfg!(test) {
+        Duration::from_secs(1)
+    } else {
+        SITE_SUPERVISOR_STOP_TIMEOUT
+    }
+}
+
+fn forced_supervisor_exit_grace_period() -> Duration {
+    if cfg!(test) {
+        Duration::from_secs(1)
+    } else {
+        FORCED_SUPERVISOR_EXIT_GRACE_PERIOD
     }
 }
 
@@ -2216,25 +2333,28 @@ pub(crate) async fn run_site_supervisor(plan_path: PathBuf) -> Result<()> {
                 ensure_site_running(&plan, &mut runtime).await?;
             }
 
-            let discovery = match try_discover_site(&plan, &mut runtime).await {
-                Ok(discovery) => discovery,
-                Err(err) => {
-                    runtime.ready_since = None;
-                    write_site_state_if_changed(
-                        &state_path,
-                        &mut last_written_state,
-                        build_site_state(
-                            &plan,
-                            &runtime,
-                            SiteLifecycleStatus::Starting,
-                            None,
-                            Some(err.to_string()),
-                        ),
-                    )?;
-                    sleep(SUPERVISOR_POLL_INTERVAL).await;
-                    continue;
-                }
-            };
+            let discovery =
+                match try_discover_site(&plan, &mut runtime, stop_requested.as_ref(), &run_root)
+                    .await
+                {
+                    Ok(discovery) => discovery,
+                    Err(err) => {
+                        runtime.ready_since = None;
+                        write_site_state_if_changed(
+                            &state_path,
+                            &mut last_written_state,
+                            build_site_state(
+                                &plan,
+                                &runtime,
+                                SiteLifecycleStatus::Starting,
+                                None,
+                                Some(err.to_string()),
+                            ),
+                        )?;
+                        sleep(SUPERVISOR_POLL_INTERVAL).await;
+                        continue;
+                    }
+                };
 
             if let Some(discovery) = discovery {
                 let ready_since = runtime.ready_since.get_or_insert_with(Instant::now);
@@ -2254,19 +2374,32 @@ pub(crate) async fn run_site_supervisor(plan_path: PathBuf) -> Result<()> {
                     continue;
                 }
                 if should_refresh_stitching(runtime.last_stitch_refresh) {
-                    if let Err(err) = apply_desired_links(&plan, &discovery.control_endpoint).await
+                    let refreshed = match apply_desired_links(
+                        &plan,
+                        &discovery.control_endpoint,
+                        stop_requested.as_ref(),
+                        &run_root,
+                    )
+                    .await
                     {
-                        write_site_state_if_changed(
-                            &state_path,
-                            &mut last_written_state,
-                            build_site_state(
-                                &plan,
-                                &runtime,
-                                SiteLifecycleStatus::Starting,
-                                Some(&discovery),
-                                Some(err.to_string()),
-                            ),
-                        )?;
+                        Ok(refreshed) => refreshed,
+                        Err(err) => {
+                            write_site_state_if_changed(
+                                &state_path,
+                                &mut last_written_state,
+                                build_site_state(
+                                    &plan,
+                                    &runtime,
+                                    SiteLifecycleStatus::Starting,
+                                    Some(&discovery),
+                                    Some(err.to_string()),
+                                ),
+                            )?;
+                            sleep(SUPERVISOR_POLL_INTERVAL).await;
+                            continue;
+                        }
+                    };
+                    if !refreshed {
                         sleep(SUPERVISOR_POLL_INTERVAL).await;
                         continue;
                     }
@@ -3091,14 +3224,18 @@ async fn ensure_site_running(
 async fn try_discover_site(
     plan: &SiteSupervisorPlan,
     runtime: &mut SupervisorRuntime,
+    stop_requested: &AtomicBool,
+    run_root: &Path,
 ) -> Result<Option<RouterDiscovery>> {
     reap_child(&mut runtime.site_process)?;
     reap_child(&mut runtime.port_forward)?;
     let discovery = match plan.kind {
-        SiteKind::Direct => try_discover_direct_site(plan, runtime).await,
-        SiteKind::Vm => try_discover_vm_site(plan, runtime).await,
-        SiteKind::Compose => try_discover_compose_site(plan).await,
-        SiteKind::Kubernetes => try_discover_kubernetes_site(plan, runtime).await,
+        SiteKind::Direct => try_discover_direct_site(plan, runtime, stop_requested, run_root).await,
+        SiteKind::Vm => try_discover_vm_site(plan, runtime, stop_requested, run_root).await,
+        SiteKind::Compose => try_discover_compose_site(plan, stop_requested, run_root).await,
+        SiteKind::Kubernetes => {
+            try_discover_kubernetes_site(plan, runtime, stop_requested, run_root).await
+        }
     }?;
     if discovery.is_none() && plan.kind == SiteKind::Compose {
         runtime.site_started = false;
@@ -3109,6 +3246,8 @@ async fn try_discover_site(
 async fn try_discover_direct_site(
     plan: &SiteSupervisorPlan,
     runtime: &SupervisorRuntime,
+    stop_requested: &AtomicBool,
+    run_root: &Path,
 ) -> Result<Option<RouterDiscovery>> {
     let Some(_site_process) = runtime.site_process.as_ref() else {
         return Ok(None);
@@ -3129,14 +3268,22 @@ async fn try_discover_direct_site(
         };
         let control_endpoint =
             ControlEndpoint::Unix(direct_current_control_socket_path(&artifact_dir));
-        if let Ok(router_identity) = fetch_router_identity(&control_endpoint).await {
-            let router_addr = SocketAddr::from(([127, 0, 0, 1], router_mesh_port));
-            return Ok(Some(RouterDiscovery {
-                control_endpoint,
-                router_identity,
-                router_addr: Some(router_addr),
-            }));
-        }
+        let router_identity = match run_until_stop(
+            run_root,
+            stop_requested,
+            fetch_router_identity(&control_endpoint),
+        )
+        .await
+        {
+            Ok(Some(router_identity)) => router_identity,
+            Ok(None) | Err(_) => return Ok(None),
+        };
+        let router_addr = SocketAddr::from(([127, 0, 0, 1], router_mesh_port));
+        return Ok(Some(RouterDiscovery {
+            control_endpoint,
+            router_identity,
+            router_addr: Some(router_addr),
+        }));
     }
     Ok(None)
 }
@@ -3144,6 +3291,8 @@ async fn try_discover_direct_site(
 async fn try_discover_vm_site(
     plan: &SiteSupervisorPlan,
     runtime: &SupervisorRuntime,
+    stop_requested: &AtomicBool,
+    run_root: &Path,
 ) -> Result<Option<RouterDiscovery>> {
     let Some(_site_process) = runtime.site_process.as_ref() else {
         return Ok(None);
@@ -3159,18 +3308,25 @@ async fn try_discover_vm_site(
         return Ok(None);
     };
     let control_endpoint = ControlEndpoint::Unix(vm_current_control_socket_path(&artifact_dir));
-    if let Ok(router_identity) = fetch_router_identity(&control_endpoint).await {
-        let router_addr = SocketAddr::from(([127, 0, 0, 1], router_mesh_port));
-        if !vm_component_targets_ready(plan, &artifact_dir)? {
-            return Ok(None);
-        }
-        return Ok(Some(RouterDiscovery {
-            control_endpoint,
-            router_identity,
-            router_addr: Some(router_addr),
-        }));
+    let router_identity = match run_until_stop(
+        run_root,
+        stop_requested,
+        fetch_router_identity(&control_endpoint),
+    )
+    .await
+    {
+        Ok(Some(router_identity)) => router_identity,
+        Ok(None) | Err(_) => return Ok(None),
+    };
+    let router_addr = SocketAddr::from(([127, 0, 0, 1], router_mesh_port));
+    if !vm_component_targets_ready(plan, &artifact_dir)? {
+        return Ok(None);
     }
-    Ok(None)
+    Ok(Some(RouterDiscovery {
+        control_endpoint,
+        router_identity,
+        router_addr: Some(router_addr),
+    }))
 }
 
 fn vm_component_targets_ready(plan: &SiteSupervisorPlan, artifact_dir: &Path) -> Result<bool> {
@@ -3216,16 +3372,25 @@ fn mesh_config_local_targets_ready(path: &Path, timeout: Duration) -> Result<boo
     Ok(true)
 }
 
-async fn try_discover_compose_site(plan: &SiteSupervisorPlan) -> Result<Option<RouterDiscovery>> {
-    discover_router_for_output(&plan.artifact_dir, plan.compose_project.as_deref(), true)
-        .await
-        .map(Some)
-        .wrap_err_with(|| format!("compose router discovery for site `{}`", plan.site_id))
+async fn try_discover_compose_site(
+    plan: &SiteSupervisorPlan,
+    stop_requested: &AtomicBool,
+    run_root: &Path,
+) -> Result<Option<RouterDiscovery>> {
+    run_until_stop(
+        run_root,
+        stop_requested,
+        discover_router_for_output(&plan.artifact_dir, plan.compose_project.as_deref(), true),
+    )
+    .await
+    .wrap_err_with(|| format!("compose router discovery for site `{}`", plan.site_id))
 }
 
 async fn try_discover_kubernetes_site(
     plan: &SiteSupervisorPlan,
     runtime: &mut SupervisorRuntime,
+    stop_requested: &AtomicBool,
+    run_root: &Path,
 ) -> Result<Option<RouterDiscovery>> {
     if runtime.port_forward.is_none() {
         runtime.port_forward = Some(spawn_port_forward(plan)?);
@@ -3238,43 +3403,70 @@ async fn try_discover_kubernetes_site(
         .port_forward_mesh_port
         .ok_or_else(|| miette::miette!("missing kubernetes mesh port"))?;
     let control_endpoint = ControlEndpoint::Tcp(format!("127.0.0.1:{control_port}"));
-    match fetch_router_identity(&control_endpoint).await {
-        Ok(router_identity) => {
-            let router_addr = SocketAddr::from(([127, 0, 0, 1], mesh_port));
-            if !router_mesh_listener_ready(router_addr).await {
-                return Ok(None);
-            }
-            Ok(Some(RouterDiscovery {
-                control_endpoint,
-                router_identity,
-                router_addr: Some(router_addr),
-            }))
-        }
-        Err(_) => Ok(None),
+    let router_identity = match run_until_stop(
+        run_root,
+        stop_requested,
+        fetch_router_identity(&control_endpoint),
+    )
+    .await
+    {
+        Ok(Some(router_identity)) => router_identity,
+        Ok(None) | Err(_) => return Ok(None),
+    };
+    let router_addr = SocketAddr::from(([127, 0, 0, 1], mesh_port));
+    if !router_mesh_listener_ready(router_addr).await {
+        return Ok(None);
     }
+    Ok(Some(RouterDiscovery {
+        control_endpoint,
+        router_identity,
+        router_addr: Some(router_addr),
+    }))
 }
 
-async fn apply_desired_links(plan: &SiteSupervisorPlan, endpoint: &ControlEndpoint) -> Result<()> {
+async fn apply_desired_links(
+    plan: &SiteSupervisorPlan,
+    endpoint: &ControlEndpoint,
+    stop_requested: &AtomicBool,
+    run_root: &Path,
+) -> Result<bool> {
     let desired: DesiredLinkState = read_json(
         &desired_links_path(Path::new(&plan.site_state_root)),
         "desired links",
     )?;
     for (env_var, url) in &desired.external_slots {
         let slot = external_slot_name_from_env_var(env_var);
-        register_external_slot_with_retry(endpoint, &slot, url, Duration::from_secs(2)).await?;
+        if run_until_stop(
+            run_root,
+            stop_requested,
+            register_external_slot_with_retry(endpoint, &slot, url, Duration::from_secs(2)),
+        )
+        .await?
+        .is_none()
+        {
+            return Ok(false);
+        }
     }
     for peer in &desired.export_peers {
-        register_export_peer_with_retry(
-            endpoint,
-            &peer.export_name,
-            &peer.peer_id,
-            &peer.peer_key_b64,
-            &peer.protocol,
-            Duration::from_secs(2),
+        if run_until_stop(
+            run_root,
+            stop_requested,
+            register_export_peer_with_retry(
+                endpoint,
+                &peer.export_name,
+                &peer.peer_id,
+                &peer.peer_key_b64,
+                &peer.protocol,
+                Duration::from_secs(2),
+            ),
         )
-        .await?;
+        .await?
+        .is_none()
+        {
+            return Ok(false);
+        }
     }
-    Ok(())
+    Ok(true)
 }
 
 async fn cleanup_site(plan: &SiteSupervisorPlan, runtime: &mut SupervisorRuntime) -> Result<()> {
@@ -4184,6 +4376,30 @@ fn coordinator_lock_path(run_root: &Path) -> PathBuf {
 
 fn stop_marker_path(run_root: &Path) -> PathBuf {
     run_root.join("stop-requested")
+}
+
+async fn wait_for_stop_request(stop_requested: &AtomicBool, run_root: &Path) {
+    loop {
+        if stop_requested.load(Ordering::SeqCst) || stop_marker_path(run_root).exists() {
+            return;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn run_until_stop<T, F>(
+    run_root: &Path,
+    stop_requested: &AtomicBool,
+    future: F,
+) -> Result<Option<T>>
+where
+    F: Future<Output = Result<T>>,
+{
+    tokio::pin!(future);
+    tokio::select! {
+        result = &mut future => result.map(Some),
+        _ = wait_for_stop_request(stop_requested, run_root) => Ok(None),
+    }
 }
 
 async fn router_mesh_listener_ready(addr: SocketAddr) -> bool {
@@ -5353,7 +5569,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn stop_run_keeps_receipt_when_supervisor_survives_shutdown() {
+    async fn stop_run_forces_supervisor_shutdown_and_cleans_up() {
         let temp = tempdir().expect("tempdir should exist");
         let storage_root = temp.path();
         let run_id = "run-stuck";
@@ -5411,19 +5627,10 @@ mod tests {
         let _ = stubborn_supervisor.kill();
         let _ = stubborn_supervisor.wait();
 
-        let err = result.expect_err("stop_run should fail when the supervisor survives");
-        let message = err.to_string();
+        result.expect("stop_run should force the supervisor down and succeed");
         assert!(
-            message.contains("did not stop completely"),
-            "expected shutdown failure, got: {message}"
-        );
-        assert!(
-            message.contains("direct_local"),
-            "expected site id in error, got: {message}"
-        );
-        assert!(
-            receipt_path(&run_root).is_file(),
-            "receipt should remain so shutdown can be retried"
+            !receipt_path(&run_root).is_file(),
+            "receipt should be removed after forced shutdown cleanup"
         );
         assert!(
             stop_marker_path(&run_root).is_file(),
@@ -5435,13 +5642,13 @@ mod tests {
             "site manager state",
         )
         .expect("updated state should deserialize");
-        assert_eq!(updated_state.status, SiteLifecycleStatus::Stopping);
+        assert_eq!(updated_state.status, SiteLifecycleStatus::Stopped);
         assert!(
-            updated_state
-                .last_error
-                .as_deref()
-                .is_some_and(|value| value.contains("did not stop within")),
-            "expected incomplete shutdown to be recorded, got: {:?}",
+            updated_state.last_error.as_deref().is_some_and(|value| {
+                value.contains("forcing shutdown")
+                    || value.contains("exited before confirming stop")
+            }),
+            "expected escalated shutdown cleanup to be recorded, got: {:?}",
             updated_state.last_error
         );
     }
