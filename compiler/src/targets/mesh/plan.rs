@@ -68,6 +68,7 @@ pub(crate) struct ResolvedComponentBinding {
     pub(crate) provide: String,
     pub(crate) endpoint: EndpointInfo,
     pub(crate) slot: String,
+    pub(crate) weak: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -242,6 +243,7 @@ pub(crate) fn build_mesh_plan(
                     provide: from.name.clone(),
                     endpoint,
                     slot: binding.to.name.clone(),
+                    weak: binding.weak,
                 }));
             }
             BindingFrom::Resource(resource) => {

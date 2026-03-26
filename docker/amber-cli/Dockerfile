@@ -57,6 +57,7 @@ COPY cli ./cli
 COPY compiler ./compiler
 COPY examples ./examples
 COPY images ./images
+COPY runtime/helper ./runtime/helper
 COPY runtime/mesh ./runtime/mesh
 COPY runtime/proxy ./runtime/proxy
 COPY runtime/router ./runtime/router

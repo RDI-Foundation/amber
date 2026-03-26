@@ -1,0 +1,12 @@
+{
+  schema: "amber.run.placement",
+  version: 1,
+  sites: {
+    direct_local: { kind: "direct" },
+    compose_local: { kind: "compose" },
+  },
+  defaults: {
+    path: "direct_local",
+    image: "compose_local",
+  },
+}

@@ -12,10 +12,11 @@ quick multi-agent prototyping.
 - Takes a root component manifest plus any referenced child manifests.
 - Resolves manifests from local files and `http(s)://` URLs.
 - Validates slots, provides, bindings, and exports.
-- Emits outputs such as Scenario IR JSON, Graphviz DOT, Docker Compose
-  directories, Kubernetes manifests, direct/native runtime directories, VM
-  runtime directories, metadata JSON, and offline bundles.
-- Runs direct/native and VM artifacts locally with `amber run`.
+- Emits outputs such as Scenario IR JSON, mixed-site run plans, Graphviz DOT,
+  Docker Compose directories, Kubernetes manifests, direct/native runtime
+  directories, VM runtime directories, metadata JSON, and offline bundles.
+- Runs direct/native and VM artifacts locally with `amber run`, and can also
+  compile a manifest or bundle into a mixed-site run on the fly.
 
 ## Core concepts
 
@@ -84,6 +85,33 @@ If you are working in this repository:
 cargo build -q -p amber-cli
 ./target/debug/amber --help
 ```
+
+## Fastest first run
+
+If you want the shortest path to a real mixed-site run, use the example in
+this repository.
+
+In one terminal:
+
+```sh
+cd examples/mixed-site
+python3 mock-catalog.py
+```
+
+In another terminal:
+
+```sh
+cd examples/mixed-site
+amber run .
+```
+
+Amber will compile the manifest in memory, prompt for any missing root config
+and outside-service values, start the direct and Compose sites, auto-start the
+outside-world proxy, print localhost URLs for the exported entrypoints, and
+stay attached. Call the printed app URL with `curl`, then press Ctrl-C in the
+`amber run` terminal to tear the whole scenario down.
+
+The detailed walkthrough for that flow lives in `examples/mixed-site/README.md`.
 
 ## Tutorial
 
@@ -174,6 +202,26 @@ VM output packages a local VM runtime. Some generated outputs may reference
 Amber runtime images, which Docker Compose and Kubernetes pull automatically
 when needed. Running VM outputs locally also requires QEMU tooling on the host.
 
+When a scenario needs internal Amber runtime images, generated outputs can
+reference:
+
+- `ghcr.io/rdi-foundation/amber-router:v0.1`
+- `ghcr.io/rdi-foundation/amber-provisioner:v0.1`
+- `ghcr.io/rdi-foundation/amber-helper:v0.2`
+- `ghcr.io/rdi-foundation/amber-docker-gateway:v0.1` when using
+  `framework.docker`
+
+Amber writes those references only when needed. Docker Compose and Kubernetes
+pull them automatically; in restricted environments, pre-pull them ahead of
+time.
+
+If you are working in this repository, the image list and versioning policy
+live in `docker/images.json`. CI publishes images from `main` based on that
+manifest. A `version` can be either a concrete semver tag (for example
+`v1.2.3`) or a patch-placeholder template (for example `v1.2.x`), which CI
+resolves to the next available concrete tag before publishing the floating
+compatibility tags Amber-generated outputs use.
+
 ## Common workflows
 
 ### Compile to Scenario IR
@@ -184,6 +232,41 @@ amber compile path/to/root.json5 --output /tmp/scenario.json
 
 You can also use existing Scenario IR as input for other compile outputs,
 except bundles.
+
+### Compile to a mixed-site run plan
+
+```sh
+amber compile path/to/root.json5 \
+  --placement path/to/sites.json5 \
+  --run-plan /tmp/run-plan.json
+```
+
+Run plans are the main lowered execution artifact for mixed-site runs. They
+capture site assignment, cross-site links, and startup ordering without
+freezing machine-local launch details.
+
+### Run a manifest directly
+
+```sh
+amber run path/to/root.json5
+amber run path/to/root.json5 --placement path/to/sites.json5 --detach
+amber run path/to/root.json5 --env-file dev.env --observability local
+```
+
+This is the default mixed-site workflow. In an interactive terminal, `amber
+run` can prompt for missing config, auto-start the outside-world proxy, print
+localhost export URLs, and stay attached as the foreground session owner. Use
+`--detach` when you want a background run instead.
+
+### Run a compiled mixed-site plan
+
+```sh
+amber compile path/to/root.json5 --run-plan /tmp/run-plan.json
+amber run /tmp/run-plan.json --detach
+```
+
+Use this when you want an inspectable execution plan in version control, CI
+artifacts, or a debugging workflow before launch.
 
 ### Check-only
 
@@ -231,19 +314,39 @@ Useful built-in docs:
 
 Top-level commands:
 
-- `amber check <manifest-or-bundle>`: resolve manifests and print diagnostics
-  without writing artifacts.
+- `amber check <manifest-or-bundle>`: resolve manifests, run validation and
+  linting, and print diagnostics without writing artifacts.
 - `amber compile <input> [output flags]`: compile a manifest, bundle, or
   Scenario IR and emit one or more outputs. `amber compile` requires at least
   one output flag.
-- `amber run <output>`: run direct/native or VM artifacts produced by
-  `amber compile`. You can pass the output directory, `direct-plan.json`, or
-  `vm-plan.json`.
+- `amber run <input>`: start a manifest, bundle, mixed-site run plan,
+  direct/native artifact, or VM artifact. Use `--placement` when you want an
+  explicit site layout, `--env-file` when you want explicit runtime inputs,
+  and `--observability` when you want Amber-managed telemetry export for a
+  mixed-site run.
+- `amber ps`: list active mixed-site runs.
+- `amber logs <run-id>`: print persisted logs for a mixed-site run. Add `-f`
+  to keep streaming.
+- `amber stop <run-id>`: stop a mixed-site run by id.
 - `amber proxy <output> --export name=127.0.0.1:PORT`: expose a scenario
   export on localhost. The output can be a Docker Compose, Kubernetes, direct,
-  or VM artifact. Use `--slot` to connect a local upstream at the same time.
+  VM artifact, or a mixed-site run id. Use `--slot` to connect a local
+  upstream at the same time.
 - `amber dashboard [--detach]`: start the Aspire dashboard used by the
   observability examples.
+
+Output-specific pointers:
+
+- Run-plan output is the main lowered execution artifact for mixed-site runs.
+- Docker Compose output is the quickest way to get a runnable multi-container
+  scenario. The generated directory contains `compose.yaml`, `env.example`,
+  and `README.md`.
+- Direct output is for local host binaries that use `program.path`.
+- VM output packages a local VM runtime for `amber run`.
+- Kubernetes output is for cluster deployment; when proxying against it
+  locally, you usually also need router port-forwards and
+  `amber proxy --mesh-addr`.
+- Bundle output is for offline or reproducible recompilation later.
 
 ## More information
 
@@ -256,6 +359,7 @@ If you want deeper details after the quick start:
 - `compiler/scenario/README.md`: Scenario IR data model.
 - `compiler/resolver/README.md`: manifest resolution from files and URLs.
 - `runtime/docker-gateway/README.md`: Docker gateway component.
+- `examples/mixed-site/README.md`: direct + Compose mixed-site walkthrough.
 - `examples/`: end-to-end examples.
 
 ---

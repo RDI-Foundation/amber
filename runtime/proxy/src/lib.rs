@@ -33,8 +33,11 @@ const CONTROL_UPDATE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const DIRECT_RUNTIME_STATE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const VM_RUNTIME_STATE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DIRECT_RUNTIME_STATE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const TCG_VM_RUNTIME_STATE_WAIT_TIMEOUT: Duration = Duration::from_secs(720);
 const EXPORT_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(30);
 const ROUTER_IDENTITY_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const CONTROL_CONTAINER_REQUEST_TIMEOUT_SECS: u64 = 2;
 const CONTROL_CURL_IMAGE: &str = "curlimages/curl:8.12.1";
 const CONTROL_SOCKET_MOUNT_DIR: &str = "/amber/control";
 const COMPOSE_PROJECT_NAME_ENV: &str = "COMPOSE_PROJECT_NAME";
@@ -388,10 +391,17 @@ struct ProxyTarget {
 }
 
 #[derive(Clone, Debug)]
-enum ControlEndpoint {
+pub enum ControlEndpoint {
     Tcp(String),
     Unix(PathBuf),
     VolumeSocket { volume: String, socket_path: String },
+}
+
+#[derive(Clone, Debug)]
+pub struct RouterDiscovery {
+    pub control_endpoint: ControlEndpoint,
+    pub router_identity: MeshIdentityPublic,
+    pub router_addr: Option<SocketAddr>,
 }
 
 #[derive(Clone, Debug)]
@@ -453,6 +463,101 @@ impl fmt::Display for ControlEndpoint {
                 volume,
                 socket_path,
             } => write!(f, "volume://{volume}{socket_path}"),
+        }
+    }
+}
+
+pub async fn discover_router_for_output(
+    output: impl Into<PathBuf>,
+    project_name: Option<&str>,
+    requires_router_mesh: bool,
+) -> Result<RouterDiscovery> {
+    let output = output.into();
+    let target = load_proxy_target(&output)?;
+    let control_endpoint = resolve_control_endpoint(None, project_name, &target)?;
+    let router_identity = resolve_router_identity(None, &control_endpoint).await?;
+    let router_addr =
+        resolve_router_mesh_addr(None, project_name, &target, requires_router_mesh).await?;
+    Ok(RouterDiscovery {
+        control_endpoint,
+        router_identity,
+        router_addr,
+    })
+}
+
+pub async fn fetch_router_identity(endpoint: &ControlEndpoint) -> Result<MeshIdentityPublic> {
+    resolve_router_identity(None, endpoint).await
+}
+
+pub async fn register_external_slot_with_retry(
+    endpoint: &ControlEndpoint,
+    slot: &str,
+    url: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match try_send_control_update(endpoint, slot, url).await {
+            Ok(()) => return Ok(()),
+            Err(ControlUpdateError::Retryable) if Instant::now() < deadline => {
+                sleep(CONTROL_UPDATE_RETRY_INTERVAL).await;
+            }
+            Err(ControlUpdateError::Retryable) => {
+                return Err(miette::miette!(
+                    "timed out after {}s waiting to register slot {} via router control ({})",
+                    timeout.as_secs(),
+                    slot,
+                    endpoint
+                ));
+            }
+            Err(ControlUpdateError::Fatal(err)) => {
+                return Err(miette::miette!(
+                    "failed to register slot {} via router control ({}): {}",
+                    slot,
+                    endpoint,
+                    err
+                ));
+            }
+        }
+    }
+}
+
+pub async fn register_export_peer_with_retry(
+    endpoint: &ControlEndpoint,
+    export: &str,
+    peer_id: &str,
+    peer_key_b64: &str,
+    protocol: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let payload = ControlExportPayload {
+        peer_id: peer_id.to_string(),
+        peer_key: peer_key_b64.to_string(),
+        protocol: protocol.to_string(),
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match try_send_export_update(endpoint, export, &payload).await {
+            Ok(()) => return Ok(()),
+            Err(ControlUpdateError::Retryable) if Instant::now() < deadline => {
+                sleep(CONTROL_UPDATE_RETRY_INTERVAL).await;
+            }
+            Err(ControlUpdateError::Retryable) => {
+                return Err(miette::miette!(
+                    "timed out after {}s waiting to register export {} via router control ({})",
+                    timeout.as_secs(),
+                    export,
+                    endpoint
+                ));
+            }
+            Err(ControlUpdateError::Fatal(err)) => {
+                return Err(miette::miette!(
+                    "failed to register export {} via router control ({}): {}",
+                    export,
+                    endpoint,
+                    err
+                ));
+            }
         }
     }
 }
@@ -616,41 +721,49 @@ fn load_proxy_target(output: &Path) -> Result<ProxyTarget> {
     ))
 }
 
-fn load_proxy_metadata_file(path: &Path) -> Result<ProxyMetadata> {
-    let raw = fs::read_to_string(path)
-        .map_err(|err| miette::miette!("failed to read {}: {err}", path.display()))?;
-    serde_json::from_str(&raw)
-        .map_err(|err| miette::miette!("invalid proxy metadata {}: {err}", path.display()))
+pub fn parse_proxy_metadata_json(raw: &str, source: &Path) -> Result<ProxyMetadata> {
+    serde_json::from_str(raw)
+        .map_err(|err| miette::miette!("invalid proxy metadata {}: {err}", source.display()))
 }
 
-fn load_compose_metadata(path: &Path) -> Result<ProxyMetadata> {
-    let raw = fs::read_to_string(path)
-        .map_err(|err| miette::miette!("failed to read {}: {err}", path.display()))?;
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&raw)
+pub fn parse_compose_proxy_metadata(raw: &str, source: &Path) -> Result<ProxyMetadata> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(raw)
         .map_err(|err| miette::miette!("invalid docker-compose YAML: {err}"))?;
-    let mapping = yaml
-        .as_mapping()
-        .ok_or_else(|| miette::miette!("output {} is not a docker-compose file", path.display()))?;
+    let mapping = yaml.as_mapping().ok_or_else(|| {
+        miette::miette!("output {} is not a docker-compose file", source.display())
+    })?;
     let services_key = serde_yaml::Value::String("services".to_string());
     if !mapping.contains_key(&services_key) {
         return Err(miette::miette!(
             "output {} is not a docker-compose file",
-            path.display()
+            source.display()
         ));
     }
     let x_amber_key = serde_yaml::Value::String("x-amber".to_string());
     let x_amber = mapping.get(&x_amber_key).ok_or_else(|| {
         miette::miette!(
             "docker-compose output {} is missing x-amber metadata; re-run `amber compile`",
-            path.display()
+            source.display()
         )
     })?;
     serde_yaml::from_value(x_amber.clone()).map_err(|err| {
         miette::miette!(
             "docker-compose output {} has invalid x-amber metadata: {err}",
-            path.display()
+            source.display()
         )
     })
+}
+
+fn load_proxy_metadata_file(path: &Path) -> Result<ProxyMetadata> {
+    let raw = fs::read_to_string(path)
+        .map_err(|err| miette::miette!("failed to read {}: {err}", path.display()))?;
+    parse_proxy_metadata_json(&raw, path)
+}
+
+fn load_compose_metadata(path: &Path) -> Result<ProxyMetadata> {
+    let raw = fs::read_to_string(path)
+        .map_err(|err| miette::miette!("failed to read {}: {err}", path.display()))?;
+    parse_compose_proxy_metadata(&raw, path)
 }
 
 fn validate_proxy_metadata(metadata: &ProxyMetadata, path: &Path) -> Result<()> {
@@ -747,7 +860,7 @@ async fn resolve_router_mesh_addr_required(
         )),
         ProxyTargetKind::Vm if router.mesh_port == 0 => SocketAddr::from((
             [127, 0, 0, 1],
-            wait_for_vm_runtime_router_port(&target.source, DIRECT_RUNTIME_STATE_WAIT_TIMEOUT)
+            wait_for_vm_runtime_router_port(&target.source, vm_runtime_state_wait_timeout())
                 .await?,
         )),
         _ => {
@@ -968,18 +1081,16 @@ fn resolve_control_endpoint(
         && let Some(volume) = router.control_socket_volume.as_ref()
     {
         let resolved_volume = expand_env_templates(volume, compose_project.as_deref())?;
-        let raw_socket_path = router
-            .control_socket
-            .as_deref()
-            .unwrap_or("/amber/control/router-control.sock");
-        let socket_path = Path::new(raw_socket_path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| format!("/{name}"))
-            .unwrap_or_else(|| raw_socket_path.to_string());
+        let resolved_socket_path = expand_env_templates(
+            router
+                .control_socket
+                .as_deref()
+                .unwrap_or("/amber/control/router-control.sock"),
+            compose_project.as_deref(),
+        )?;
         return Ok(ControlEndpoint::VolumeSocket {
             volume: resolved_volume,
-            socket_path,
+            socket_path: resolved_socket_path,
         });
     }
     if let Some(socket) = router.control_socket.as_ref() {
@@ -1359,13 +1470,23 @@ async fn send_control_request(
 ) -> Result<String, ControlUpdateError> {
     match endpoint {
         ControlEndpoint::Tcp(addr) => {
-            let stream = tokio::net::TcpStream::connect(addr)
-                .await
-                .map_err(|_| ControlUpdateError::Retryable)?;
+            let stream = tokio::time::timeout(
+                CONTROL_REQUEST_TIMEOUT,
+                tokio::net::TcpStream::connect(addr),
+            )
+            .await
+            .map_err(|_| ControlUpdateError::Retryable)?
+            .map_err(|_| ControlUpdateError::Retryable)?;
             send_request(stream, request).await
         }
         ControlEndpoint::Unix(path) => {
-            let stream = tokio::net::UnixStream::connect(path).await.map_err(|err| {
+            let stream = tokio::time::timeout(
+                CONTROL_REQUEST_TIMEOUT,
+                tokio::net::UnixStream::connect(path),
+            )
+            .await
+            .map_err(|_| ControlUpdateError::Retryable)?
+            .map_err(|err| {
                 if is_retryable_unix_connect_error(&err) {
                     ControlUpdateError::Retryable
                 } else {
@@ -1411,15 +1532,7 @@ async fn send_control_request_via_volume(
             "invalid router control socket path (must be absolute): {socket_path}"
         )));
     }
-    let socket_file = Path::new(socket_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            ControlUpdateError::Fatal(format!(
-                "invalid router control socket path (missing filename): {socket_path}"
-            ))
-        })?;
-    let mounted_socket_path = format!("{CONTROL_SOCKET_MOUNT_DIR}/{socket_file}");
+    let mounted_socket_path = format!("{CONTROL_SOCKET_MOUNT_DIR}{socket_path}");
     send_control_request_via_mount(
         &format!("{volume}:{CONTROL_SOCKET_MOUNT_DIR}"),
         &mounted_socket_path,
@@ -1448,6 +1561,10 @@ async fn send_control_request_via_mount(
             .arg(CONTROL_CURL_IMAGE)
             .arg("--unix-socket")
             .arg(socket_path)
+            .arg("--connect-timeout")
+            .arg(CONTROL_CONTAINER_REQUEST_TIMEOUT_SECS.to_string())
+            .arg("--max-time")
+            .arg(CONTROL_CONTAINER_REQUEST_TIMEOUT_SECS.to_string())
             .arg("-sS")
             .arg("-i")
             .arg("-X")
@@ -1502,6 +1619,8 @@ fn is_retryable_container_connect_error(stderr: &str) -> bool {
     lower.contains("could not connect to server")
         || lower.contains("failed to connect")
         || lower.contains("connection refused")
+        || lower.contains("timed out")
+        || lower.contains("operation timed out")
 }
 
 fn parse_control_request(
@@ -1529,14 +1648,17 @@ async fn send_request<S>(mut stream: S, request: &str) -> Result<String, Control
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .map_err(|_| ControlUpdateError::Retryable)?;
+    tokio::time::timeout(
+        CONTROL_REQUEST_TIMEOUT,
+        stream.write_all(request.as_bytes()),
+    )
+    .await
+    .map_err(|_| ControlUpdateError::Retryable)?
+    .map_err(|_| ControlUpdateError::Retryable)?;
     let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
+    tokio::time::timeout(CONTROL_REQUEST_TIMEOUT, stream.read_to_end(&mut buf))
         .await
+        .map_err(|_| ControlUpdateError::Retryable)?
         .map_err(|_| ControlUpdateError::Retryable)?;
     Ok(String::from_utf8_lossy(&buf).to_string())
 }
@@ -1612,6 +1734,14 @@ async fn wait_for_direct_runtime_router_port(plan_root: &Path, timeout: Duration
          --router-addr",
     )
     .await
+}
+
+fn vm_runtime_state_wait_timeout() -> Duration {
+    if env::var_os("AMBER_VM_FORCE_TCG").is_some() {
+        TCG_VM_RUNTIME_STATE_WAIT_TIMEOUT
+    } else {
+        DIRECT_RUNTIME_STATE_WAIT_TIMEOUT
+    }
 }
 
 async fn wait_for_vm_runtime_router_port(plan_root: &Path, timeout: Duration) -> Result<u16> {
@@ -1970,6 +2100,39 @@ exit 1
     }
 
     #[test]
+    fn resolve_control_endpoint_preserves_nested_compose_volume_socket_path() {
+        let target = ProxyTarget {
+            kind: ProxyTargetKind::DockerCompose,
+            metadata: ProxyMetadata {
+                version: PROXY_METADATA_VERSION.to_string(),
+                router: Some(amber_compiler::mesh::RouterMetadata {
+                    mesh_port: 24000,
+                    control_port: 24100,
+                    control_socket: Some("/site/compose_local/router-control.sock".to_string()),
+                    control_socket_volume: Some(
+                        "${COMPOSE_PROJECT_NAME:-default}_amber-router-control".to_string(),
+                    ),
+                }),
+                ..Default::default()
+            },
+            source: PathBuf::from("/tmp/out/compose.yaml"),
+        };
+
+        let endpoint = resolve_control_endpoint(None, Some("mixed-stack"), &target)
+            .expect("endpoint should resolve");
+
+        let ControlEndpoint::VolumeSocket {
+            volume,
+            socket_path,
+        } = endpoint
+        else {
+            panic!("expected compose volume socket endpoint");
+        };
+        assert_eq!(volume, "mixed-stack_amber-router-control");
+        assert_eq!(socket_path, "/site/compose_local/router-control.sock");
+    }
+
+    #[test]
     fn parse_compose_published_port_addrs_reads_loopback_binding() {
         let addrs = parse_compose_published_port_addrs(
             r#"[{
@@ -2055,5 +2218,27 @@ exit 1
         let err = validate_proxy_bindings(&metadata, &slot_bindings, &[])
             .expect_err("non-HTTP transports should be rejected");
         assert!(err.to_string().contains("HTTP-transport slots"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn try_fetch_router_identity_times_out_stalled_control_requests() {
+        let listener =
+            TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let handle = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("listener should accept");
+            std::thread::sleep(CONTROL_REQUEST_TIMEOUT + Duration::from_secs(1));
+        });
+
+        let started = std::time::Instant::now();
+        let err = try_fetch_router_identity(&ControlEndpoint::Tcp(addr.to_string()))
+            .await
+            .expect_err("stalled control request should fail");
+        assert!(matches!(err, ControlUpdateError::Retryable));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stalled control request should fail quickly"
+        );
+        handle.join().expect("listener thread should finish");
     }
 }

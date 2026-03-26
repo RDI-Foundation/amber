@@ -343,6 +343,7 @@ mod tests {
                         protocol: amber_manifest::NetworkProtocol::Http,
                     },
                     slot: "upstream".to_string(),
+                    weak: false,
                 }),
                 ResolvedBinding::Component(ResolvedComponentBinding {
                     provider: ComponentId(1),
@@ -353,6 +354,7 @@ mod tests {
                         protocol: amber_manifest::NetworkProtocol::Http,
                     },
                     slot: "upstream".to_string(),
+                    weak: false,
                 }),
             ],
             Vec::new(),
@@ -460,6 +462,7 @@ mod tests {
                         protocol: amber_manifest::NetworkProtocol::Http,
                     },
                     slot: "upstream".to_string(),
+                    weak: false,
                 }),
             ],
             Vec::new(),

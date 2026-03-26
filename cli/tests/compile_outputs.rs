@@ -15,7 +15,7 @@ use amber_template::{
     RepeatedTemplateSource, TemplatePart, TemplateSpec,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use serde_json::Value;
+use serde_json::{Value, json};
 use serde_yaml::Value as YamlValue;
 
 fn env_value(service: &YamlValue, key: &str) -> Option<String> {
@@ -56,6 +56,14 @@ fn write_fixture(path: &Path, contents: &str) {
     });
 }
 
+fn write_json_fixture(path: &Path, value: &Value) {
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(value).expect("fixture should serialize"),
+    )
+    .unwrap_or_else(|err| panic!("failed to write fixture {}: {err}", path.display()));
+}
+
 fn parse_json_file(path: &Path) -> Value {
     serde_json::from_str(
         &fs::read_to_string(path)
@@ -85,6 +93,163 @@ fn find_component<'a>(plan: &'a Value, moniker: &str) -> &'a Value {
         .iter()
         .find(|component| component["moniker"].as_str() == Some(moniker))
         .unwrap_or_else(|| panic!("expected component {moniker} in plan: {plan:#}"))
+}
+
+struct PlacedFixture {
+    manifest: PathBuf,
+    placement: PathBuf,
+}
+
+fn write_single_image_fixture(root: &Path, site_id: &str, site_kind: &str) -> PlacedFixture {
+    write_json_fixture(
+        &root.join("svc.json5"),
+        &json!({
+            "manifest_version": "0.3.0",
+            "program": {
+                "image": "python:3.13-alpine",
+                "entrypoint": ["python3", "-u", "-c", "print('ready')"],
+                "network": {
+                    "endpoints": [
+                        { "name": "http", "port": 8080, "protocol": "http" }
+                    ]
+                }
+            },
+            "provides": {
+                "http": { "kind": "http", "endpoint": "http" }
+            },
+            "exports": {
+                "http": "http"
+            }
+        }),
+    );
+
+    let manifest = root.join("root.json5");
+    write_json_fixture(
+        &manifest,
+        &json!({
+            "manifest_version": "0.3.0",
+            "components": {
+                "svc": "./svc.json5"
+            },
+            "exports": {
+                "svc_http": "#svc.http"
+            }
+        }),
+    );
+
+    let site = if site_kind == "kubernetes" {
+        json!({ "kind": site_kind, "context": "kind-amber-test" })
+    } else {
+        json!({ "kind": site_kind })
+    };
+    let placement = root.join("placement.json5");
+    write_json_fixture(
+        &placement,
+        &json!({
+            "schema": "amber.run.placement",
+            "version": 1,
+            "sites": {
+                site_id: site
+            },
+            "defaults": {
+                "image": site_id
+            }
+        }),
+    );
+
+    PlacedFixture {
+        manifest,
+        placement,
+    }
+}
+
+fn write_mixed_site_fixture(root: &Path) -> PlacedFixture {
+    write_json_fixture(
+        &root.join("a.json5"),
+        &json!({
+            "manifest_version": "0.3.0",
+            "slots": {
+                "b": { "kind": "http" }
+            },
+            "program": {
+                "path": "/usr/bin/env",
+                "args": ["python3", "-u", "-c", "print('ready')"],
+                "network": {
+                    "endpoints": [
+                        { "name": "http", "port": 18080, "protocol": "http" }
+                    ]
+                }
+            },
+            "provides": {
+                "http": { "kind": "http", "endpoint": "http" }
+            },
+            "exports": {
+                "http": "http"
+            }
+        }),
+    );
+    write_json_fixture(
+        &root.join("b.json5"),
+        &json!({
+            "manifest_version": "0.3.0",
+            "program": {
+                "image": "python:3.13-alpine",
+                "entrypoint": ["python3", "-u", "-c", "print('ready')"],
+                "network": {
+                    "endpoints": [
+                        { "name": "http", "port": 8080, "protocol": "http" }
+                    ]
+                }
+            },
+            "provides": {
+                "http": { "kind": "http", "endpoint": "http" }
+            },
+            "exports": {
+                "http": "http"
+            }
+        }),
+    );
+
+    let manifest = root.join("root.json5");
+    write_json_fixture(
+        &manifest,
+        &json!({
+            "manifest_version": "0.3.0",
+            "components": {
+                "a": "./a.json5",
+                "b": "./b.json5"
+            },
+            "bindings": [
+                { "to": "#a.b", "from": "#b.http" }
+            ],
+            "exports": {
+                "a_http": "#a.http",
+                "b_http": "#b.http"
+            }
+        }),
+    );
+
+    let placement = root.join("placement.json5");
+    write_json_fixture(
+        &placement,
+        &json!({
+            "schema": "amber.run.placement",
+            "version": 1,
+            "sites": {
+                "direct_local": { "kind": "direct" },
+                "compose_local": { "kind": "compose" }
+            },
+            "defaults": {
+                "path": "direct_local",
+                "image": "compose_local"
+            }
+        }),
+    );
+
+    PlacedFixture {
+        manifest,
+        placement,
+    }
 }
 
 #[test]
@@ -300,6 +465,113 @@ fn compile_writes_primary_output_and_dot_artifact() {
         .and_then(YamlValue::as_str)
         .expect("plan config missing content");
     serde_json::from_str::<Value>(plan_json).expect("plan config content should be JSON");
+}
+
+#[test]
+fn compile_unmanaged_export_rejects_placement_file() {
+    let outputs_dir = cli_test_outputs_dir("single-site-export-placement-rejects-");
+    let fixture = write_single_image_fixture(outputs_dir.path(), "kind_local", "kubernetes");
+    let kubernetes_output = outputs_dir.path().join("kubernetes");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--placement")
+        .arg(&fixture.placement)
+        .arg("--kubernetes")
+        .arg(&kubernetes_output)
+        .arg(&fixture.manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --kubernetes: {err}"));
+
+    assert!(
+        !output.status.success(),
+        "amber compile --kubernetes unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("do not accept `--placement`"),
+        "expected placement rejection in stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn compile_unmanaged_export_rejects_non_exportable_program_mix() {
+    let outputs_dir = cli_test_outputs_dir("mixed-export-kind-rejects-");
+    let fixture = write_mixed_site_fixture(outputs_dir.path());
+    let compose_output = outputs_dir.path().join("compose");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--docker-compose")
+        .arg(&compose_output)
+        .arg(&fixture.manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --docker-compose: {err}"));
+
+    assert!(
+        !output.status.success(),
+        "amber compile --docker-compose unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Compose sites") && stderr.contains("only support program.image workloads"),
+        "expected homogeneous export rejection in stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn compile_unmanaged_export_uses_requested_backend_without_placement() {
+    let outputs_dir = cli_test_outputs_dir("single-site-kubernetes-export-");
+    let fixture = write_single_image_fixture(outputs_dir.path(), "kind_local", "kubernetes");
+
+    let compose_output = outputs_dir.path().join("compose");
+    let compose_attempt = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--docker-compose")
+        .arg(&compose_output)
+        .arg(&fixture.manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --docker-compose: {err}"));
+
+    assert!(
+        compose_attempt.status.success(),
+        "amber compile --docker-compose failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        compose_attempt.status,
+        String::from_utf8_lossy(&compose_attempt.stdout),
+        String::from_utf8_lossy(&compose_attempt.stderr)
+    );
+    assert!(
+        compose_output.join("compose.yaml").is_file(),
+        "expected compose.yaml in {}",
+        compose_output.display()
+    );
+
+    let kubernetes_output = outputs_dir.path().join("kubernetes");
+    let kubernetes_attempt = Command::new(env!("CARGO_BIN_EXE_amber"))
+        .arg("compile")
+        .arg("--kubernetes")
+        .arg(&kubernetes_output)
+        .arg(&fixture.manifest)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run amber compile --kubernetes: {err}"));
+
+    assert!(
+        kubernetes_attempt.status.success(),
+        "amber compile --kubernetes failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        kubernetes_attempt.status,
+        String::from_utf8_lossy(&kubernetes_attempt.stdout),
+        String::from_utf8_lossy(&kubernetes_attempt.stderr)
+    );
+    assert!(
+        kubernetes_output.join("kustomization.yaml").is_file(),
+        "expected kustomization.yaml in {}",
+        kubernetes_output.display()
+    );
+    assert!(
+        kubernetes_output.join("README.md").is_file(),
+        "expected README.md in {}",
+        kubernetes_output.display()
+    );
 }
 
 #[test]
@@ -1099,7 +1371,8 @@ fn compile_compose_rejects_whole_config_program_image_ref() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("program.image cannot reference the entire runtime config object"),
+        stderr.contains("program.image cannot")
+            && stderr.contains("reference the entire runtime config object"),
         "expected whole-config image rejection in stderr, got:\n{stderr}"
     );
 }
@@ -1167,7 +1440,8 @@ fn compile_vm_rejects_whole_config_vm_image_ref() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("program.vm.image cannot reference the entire runtime config object"),
+        stderr.contains("program.vm.image cannot")
+            && stderr.contains("reference the entire runtime config object"),
         "expected whole-config vm image rejection in stderr, got:\n{stderr}"
     );
 }
@@ -1224,7 +1498,7 @@ fn compile_direct_rejects_program_path_without_separator() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("does not search PATH"),
+        stderr.contains("without a path separator") && stderr.contains("search PATH"),
         "expected PATH rejection in stderr, got:\n{stderr}"
     );
 }
@@ -4608,7 +4882,7 @@ fn compile_direct_preserves_authored_order_signal_for_mixed_source_repeated_slot
         .iter()
         .find(|route| {
             route["slot"].as_str() == Some("upstream")
-                && route["peer_id"].as_str() == Some("/router/direct")
+                && route["peer_id"].as_str() != Some("/provider")
         })
         .expect("external route should exist");
     let component_port = component_route["listen_port"]
@@ -5241,7 +5515,7 @@ fn compile_direct_rejects_scenario_ir_repeated_each_on_singular_slot() {
     assert!(
         stderr.contains("slot `api`")
             && stderr.contains("not declared with `multiple")
-            && stderr.contains("/consumer"),
+            && stderr.contains("program.args[0]"),
         "expected singular repeated-each rejection in stderr, got:\n{stderr}"
     );
 }

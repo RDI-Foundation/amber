@@ -20,6 +20,7 @@ mod frontend;
 mod linker;
 pub mod mesh;
 mod mir;
+pub mod run_plan;
 mod runtime_interface;
 mod slots;
 mod targets;

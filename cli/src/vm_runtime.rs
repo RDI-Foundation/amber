@@ -5,7 +5,7 @@ use std::{
     fs::{self, File},
     hash::{Hash as _, Hasher as _},
     io::{Seek as _, SeekFrom, Write as _},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, ExitStatus, Stdio},
 };
@@ -23,7 +23,7 @@ use amber_config::{
 };
 use amber_mesh::{
     InboundTarget, MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MESH_PROVISION_PLAN_VERSION,
-    MeshConfigPublic, MeshIdentity, MeshIdentityPublic, MeshIdentitySecret, MeshPeer,
+    MeshConfigPublic, MeshIdentity, MeshIdentityPublic, MeshIdentitySecret, MeshPeer, MeshProtocol,
     MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTarget,
 };
 use amber_template::{
@@ -41,14 +41,24 @@ use tokio::{
     time::{Duration, Instant, sleep, timeout},
 };
 
+use crate::{
+    cross_site_router_mesh_bind_ip,
+    tcp_readiness::{
+        endpoint_accepts_stable_connection, endpoint_returns_http_response,
+        wait_for_stable_endpoint,
+    },
+};
+
 const VM_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const VM_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(15);
 const VM_GUESTFWD_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const VM_QMP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const TCG_VM_STARTUP_TIMEOUT: Duration = Duration::from_secs(720);
 
 const VM_RUNTIME_DISK_LABEL: [u8; 11] = *b"AMBERRUN   ";
 const VM_RUNTIME_DISK_SIZE: u64 = 64 * 1024 * 1024;
-const VM_HOST_GUESTFWD_IP: &str = "10.0.2.100";
+pub(crate) const VM_HOST_GUESTFWD_IP: &str = "10.0.2.100";
+const QEMU_VIRTIO_NET_DEVICE: &str = "virtio-net-pci,netdev=net0,rombar=0";
 
 const MANAGED_PROCESS_PATH: &str = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/\
                                     local/sbin:/usr/bin:/bin:/usr/sbin:/sbin";
@@ -59,6 +69,8 @@ pub(crate) struct VmRuntimeState {
     pub(crate) slot_ports_by_component: BTreeMap<usize, BTreeMap<String, u16>>,
     #[serde(default)]
     pub(crate) slot_route_ports_by_component: BTreeMap<usize, BTreeMap<String, Vec<u16>>>,
+    #[serde(default)]
+    pub(crate) route_host_ports_by_component: BTreeMap<usize, BTreeMap<String, Vec<u16>>>,
     #[serde(default)]
     pub(crate) endpoint_forwards_by_component: BTreeMap<usize, BTreeMap<u16, u16>>,
     #[serde(default)]
@@ -100,6 +112,52 @@ struct VmLaunchPlan {
     qmp_socket: PathBuf,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct VmPersistentDiskPreview {
+    pub(crate) serial: String,
+    pub(crate) mount_path: String,
+    pub(crate) host_path: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct VmLaunchPreviewIssue {
+    pub(crate) field: String,
+    pub(crate) detail: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct VmLaunchPreview {
+    pub(crate) name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) base_image: Option<String>,
+    pub(crate) overlay_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runtime_disk_path: Option<String>,
+    pub(crate) seed_disk_path: String,
+    pub(crate) qmp_socket: String,
+    pub(crate) serial_log: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cpus: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) memory_mib: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) persistent_disks: Vec<VmPersistentDiskPreview>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) unresolved_fields: Vec<VmLaunchPreviewIssue>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct VmSiteLaunchPreview {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) router_public_key_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) virtual_machines: Vec<VmLaunchPreview>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) inspectability_warnings: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct VmHostContext<'a> {
     runtime_root: &'a Path,
@@ -135,10 +193,11 @@ enum VmArch {
     X86_64,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QemuAccel {
+    #[cfg(target_os = "macos")]
     Hvf,
+    #[cfg(target_os = "linux")]
     Kvm,
     Tcg,
 }
@@ -148,56 +207,92 @@ struct QemuImgInfo {
     format: String,
 }
 
-pub(crate) async fn run_vm_init(plan: PathBuf, storage_root: Option<PathBuf>) -> Result<()> {
+struct VmRuntimeInputs {
+    plan_root: PathBuf,
+    vm_plan: VmPlan,
+    mesh_plan: MeshProvisionPlan,
+}
+
+#[derive(Clone, Debug, Default)]
+struct VmPreviewComponentConfig {
+    config: Option<Value>,
+    schema: Option<Value>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct VmLaunchArtifacts {
+    vm_root: PathBuf,
+    overlay_path: PathBuf,
+    runtime_disk_path: Option<PathBuf>,
+    seed_disk_path: PathBuf,
+    qmp_socket: PathBuf,
+    serial_log: PathBuf,
+    persistent_disks: Vec<VmPersistentDiskArtifact>,
+}
+
+#[derive(Clone, Debug)]
+struct VmPersistentDiskArtifact {
+    serial: String,
+    mount_path: String,
+    host_path: PathBuf,
+}
+
+pub(crate) async fn run_vm_init(
+    plan: PathBuf,
+    storage_root: Option<PathBuf>,
+    runtime_root: Option<PathBuf>,
+    router_mesh_port: Option<u16>,
+) -> Result<()> {
     let plan_path = canonicalize_path(&plan, "vm plan")?;
-    let plan_root = plan_path
-        .parent()
-        .ok_or_else(|| miette::miette!("invalid vm plan path {}", plan_path.display()))?
-        .to_path_buf();
+    let VmRuntimeInputs {
+        plan_root,
+        vm_plan,
+        mesh_plan,
+    } = load_vm_runtime_inputs(&plan_path)?;
     let storage_root = vm_storage_root(&plan_root, storage_root.as_deref())
         .into_diagnostic()
         .wrap_err("failed to resolve vm storage root")?;
 
-    let vm_plan: VmPlan = read_json_file(&plan_path, "vm plan")?;
-    if vm_plan.version != VM_PLAN_VERSION {
-        return Err(miette::miette!(
-            "unsupported vm plan version {} in {}; expected {}",
-            vm_plan.version,
-            plan_path.display(),
-            VM_PLAN_VERSION
-        ));
-    }
-
-    let mesh_plan_path = plan_root.join(&vm_plan.mesh_provision_plan);
-    let mesh_plan: MeshProvisionPlan = read_json_file(&mesh_plan_path, "mesh provision plan")?;
-    if mesh_plan.version != MESH_PROVISION_PLAN_VERSION {
-        return Err(miette::miette!(
-            "unsupported mesh provision plan version {} in {}; expected {}",
-            mesh_plan.version,
-            mesh_plan_path.display(),
-            MESH_PROVISION_PLAN_VERSION
-        ));
-    }
-
-    let runtime_dir = tempfile::Builder::new()
-        .prefix("amber-vm-")
-        .tempdir()
-        .into_diagnostic()
-        .wrap_err("failed to create vm runtime workspace")?;
-    let runtime_root = runtime_dir.path().to_path_buf();
+    let runtime_dir = if let Some(runtime_root) = runtime_root.as_ref() {
+        fs::create_dir_all(runtime_root)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to create vm runtime workspace {}",
+                    runtime_root.display()
+                )
+            })?;
+        None
+    } else {
+        Some(
+            tempfile::Builder::new()
+                .prefix("amber-vm-")
+                .tempdir()
+                .into_diagnostic()
+                .wrap_err("failed to create vm runtime workspace")?,
+        )
+    };
+    let runtime_root = runtime_dir
+        .as_ref()
+        .map(|dir| dir.path().to_path_buf())
+        .or(runtime_root)
+        .expect("runtime root should be available");
     let runtime_state_path = vm_runtime_state_path(&plan_root);
     let mut children = Vec::<ManagedChild>::new();
     let mut log_tasks = Vec::new();
     let mut control_socket_paths = None;
+    let reuse_materialized_runtime = runtime_dir.is_none() && runtime_state_path.is_file();
 
     let supervision = async {
-        provision_mesh_filesystem(&mesh_plan, &runtime_root)?;
-        if runtime_state_path.exists() {
-            let _ = fs::remove_file(&runtime_state_path);
-        }
-
-        let port_assignments = assign_vm_runtime_ports(&runtime_root, &vm_plan)?;
-        write_vm_runtime_state(&plan_root, &port_assignments.state)?;
+        let port_assignments = materialize_vm_runtime(
+            &plan_root,
+            &runtime_root,
+            &vm_plan,
+            &mesh_plan,
+            router_mesh_port,
+            reuse_materialized_runtime,
+        )?;
 
         let router_binary = resolve_host_binary("amber-router")?;
         if let Some(router) = vm_plan.router.as_ref() {
@@ -286,8 +381,19 @@ pub(crate) async fn run_vm_init(plan: PathBuf, storage_root: Option<PathBuf>) ->
                 &mut log_tasks,
             )
             .await?;
+            let child = children.last_mut().ok_or_else(|| {
+                miette::miette!(
+                    "missing managed child for vm component {} after launch",
+                    component.moniker
+                )
+            })?;
+            wait_for_endpoint_forwards(
+                component,
+                &runtime_root,
+                vm_endpoint_forward_ready_timeout(),
+                child,
+            )?;
         }
-
         supervise_children(&mut children).await
     }
     .await;
@@ -369,6 +475,10 @@ where
         .map_err(|err| miette::miette!("invalid {} {}: {err}", description, path.display()))
 }
 
+fn read_vm_runtime_state(path: &Path) -> Result<VmRuntimeState> {
+    read_json_file(path, "vm runtime state")
+}
+
 fn write_vm_runtime_state(plan_root: &Path, state: &VmRuntimeState) -> Result<()> {
     let path = vm_runtime_state_path(plan_root);
     let parent = path
@@ -407,6 +517,31 @@ fn write_vm_runtime_state(plan_root: &Path, state: &VmRuntimeState) -> Result<()
     Ok(())
 }
 
+fn materialize_vm_runtime(
+    plan_root: &Path,
+    runtime_root: &Path,
+    vm_plan: &VmPlan,
+    mesh_plan: &MeshProvisionPlan,
+    fixed_router_mesh_port: Option<u16>,
+    reuse_existing: bool,
+) -> Result<VmPortAssignments> {
+    let runtime_state_path = vm_runtime_state_path(plan_root);
+    if reuse_existing && runtime_state_path.is_file() {
+        let state = read_vm_runtime_state(&runtime_state_path)?;
+        return Ok(VmPortAssignments {
+            route_host_ports_by_component: state.route_host_ports_by_component.clone(),
+            state,
+        });
+    }
+    if runtime_state_path.exists() {
+        let _ = fs::remove_file(&runtime_state_path);
+    }
+    provision_mesh_filesystem(mesh_plan, runtime_root)?;
+    let assignments = assign_vm_runtime_ports(runtime_root, vm_plan, fixed_router_mesh_port)?;
+    write_vm_runtime_state(plan_root, &assignments.state)?;
+    Ok(assignments)
+}
+
 fn hashed_temp_socket_path(namespace: &str, kind: &str, path: &Path) -> PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut hasher);
@@ -416,7 +551,11 @@ fn hashed_temp_socket_path(namespace: &str, kind: &str, path: &Path) -> PathBuf 
         .join(format!("{kind}-{suffix:016x}.sock"))
 }
 
-fn assign_vm_runtime_ports(runtime_root: &Path, vm_plan: &VmPlan) -> Result<VmPortAssignments> {
+fn assign_vm_runtime_ports(
+    runtime_root: &Path,
+    vm_plan: &VmPlan,
+    fixed_router_mesh_port: Option<u16>,
+) -> Result<VmPortAssignments> {
     let mut state = VmRuntimeState::default();
     let mut reserved = BTreeSet::new();
     let mut mesh_port_by_peer_id = HashMap::<String, u16>::new();
@@ -426,14 +565,14 @@ fn assign_vm_runtime_ports(runtime_root: &Path, vm_plan: &VmPlan) -> Result<VmPo
     for component in &vm_plan.components {
         let path = runtime_root.join(&component.mesh_config_path);
         let mut config = read_mesh_config_public(&path)?;
-        let mesh_port = allocate_runtime_port(&mut reserved)?;
+        let mesh_port = allocate_runtime_port(&mut reserved, None)?;
         mesh_port_by_peer_id.insert(config.identity.id.clone(), mesh_port);
         config.mesh_listen = SocketAddr::new(config.mesh_listen.ip(), mesh_port);
 
         let mut route_guest_host_pairs = BTreeMap::<String, Vec<(u16, u16)>>::new();
         for route in &mut config.outbound {
             let guest_port = route.listen_port;
-            let host_port = allocate_runtime_port(&mut reserved)?;
+            let host_port = allocate_runtime_port(&mut reserved, None)?;
             route.listen_port = host_port;
             route_guest_host_pairs
                 .entry(route.slot.clone())
@@ -475,7 +614,7 @@ fn assign_vm_runtime_ports(runtime_root: &Path, vm_plan: &VmPlan) -> Result<VmPo
                 let host_port = if let Some(existing) = endpoint_forwards.get(&guest_port) {
                     *existing
                 } else {
-                    let host_port = allocate_runtime_port(&mut reserved)?;
+                    let host_port = allocate_runtime_port(&mut reserved, None)?;
                     endpoint_forwards.insert(guest_port, host_port);
                     host_port
                 };
@@ -498,6 +637,9 @@ fn assign_vm_runtime_ports(runtime_root: &Path, vm_plan: &VmPlan) -> Result<VmPo
             .slot_route_ports_by_component
             .insert(component.id, slot_guest_ports);
         state
+            .route_host_ports_by_component
+            .insert(component.id, slot_host_ports.clone());
+        state
             .endpoint_forwards_by_component
             .insert(component.id, endpoint_forwards);
         route_host_ports_by_component.insert(component.id, slot_host_ports);
@@ -507,9 +649,12 @@ fn assign_vm_runtime_ports(runtime_root: &Path, vm_plan: &VmPlan) -> Result<VmPo
     let mut router_config = if let Some(router) = vm_plan.router.as_ref() {
         let path = runtime_root.join(&router.mesh_config_path);
         let mut config = read_mesh_config_public(&path)?;
-        let mesh_port = allocate_runtime_port(&mut reserved)?;
+        let mesh_port = allocate_runtime_port(&mut reserved, fixed_router_mesh_port)?;
         mesh_port_by_peer_id.insert(config.identity.id.clone(), mesh_port);
-        config.mesh_listen = SocketAddr::new(config.mesh_listen.ip(), mesh_port);
+        config.mesh_listen = SocketAddr::new(
+            cross_site_router_mesh_bind_ip(config.mesh_listen.ip(), fixed_router_mesh_port),
+            mesh_port,
+        );
         state.router_mesh_port = Some(mesh_port);
         Some((path, config))
     } else {
@@ -536,7 +681,16 @@ fn assign_vm_runtime_ports(runtime_root: &Path, vm_plan: &VmPlan) -> Result<VmPo
     })
 }
 
-fn allocate_runtime_port(reserved: &mut BTreeSet<u16>) -> Result<u16> {
+fn allocate_runtime_port(reserved: &mut BTreeSet<u16>, preferred: Option<u16>) -> Result<u16> {
+    if let Some(preferred) = preferred {
+        if reserved.insert(preferred) {
+            return Ok(preferred);
+        }
+        return Err(miette::miette!(
+            "runtime port {} was requested twice in one vm runtime",
+            preferred
+        ));
+    }
     for _ in 0..256 {
         let port = pick_free_port()?;
         if reserved.insert(port) {
@@ -929,7 +1083,7 @@ async fn cleanup_vm_runtime(
     log_tasks: Vec<tokio::task::JoinHandle<()>>,
     runtime_state_path: &Path,
     control_socket_paths: Option<&VmControlSocketPaths>,
-    runtime_dir: tempfile::TempDir,
+    runtime_dir: Option<tempfile::TempDir>,
 ) {
     terminate_children(children).await;
     for task in log_tasks {
@@ -1119,28 +1273,93 @@ fn wait_for_guestfwd_targets(
     };
     for ports in slot_ports.values() {
         for port in ports {
-            wait_for_local_listener(*port, timeout).map_err(|err| {
-                miette::miette!(
-                    "guestfwd target 127.0.0.1:{} for component {} did not become ready: {err}",
-                    port,
-                    component.moniker
-                )
-            })?;
+            wait_for_stable_endpoint(SocketAddr::from(([127, 0, 0, 1], *port)), timeout).map_err(
+                |err| {
+                    miette::miette!(
+                        "guestfwd target 127.0.0.1:{} for component {} did not become ready: {err}",
+                        port,
+                        component.moniker
+                    )
+                },
+            )?;
         }
     }
     Ok(())
 }
 
-fn wait_for_local_listener(port: u16, timeout: Duration) -> Result<()> {
+fn wait_for_endpoint_forwards(
+    component: &VmComponentPlan,
+    runtime_root: &Path,
+    timeout: Duration,
+    child: &mut ManagedChild,
+) -> Result<()> {
+    let config = read_mesh_config_public(&runtime_root.join(&component.mesh_config_path))?;
+    for route in config.inbound {
+        let InboundTarget::Local { port: host_port } = route.target else {
+            continue;
+        };
+        let addr = SocketAddr::from(([127, 0, 0, 1], host_port));
+        wait_for_endpoint_or_child_exit(
+            child,
+            addr,
+            timeout,
+            match route.protocol {
+                MeshProtocol::Http => endpoint_returns_http_response,
+                MeshProtocol::Tcp => endpoint_accepts_stable_connection,
+            },
+        )
+        .map_err(|err| match route.protocol {
+            MeshProtocol::Http => {
+                miette::miette!(
+                    "forwarded HTTP endpoint 127.0.0.1:{} for component {} did not become ready: \
+                     {err}",
+                    host_port,
+                    component.moniker
+                )
+            }
+            MeshProtocol::Tcp => {
+                miette::miette!(
+                    "forwarded TCP endpoint 127.0.0.1:{} for component {} did not become ready: \
+                     {err}",
+                    host_port,
+                    component.moniker
+                )
+            }
+        })?;
+    }
+    Ok(())
+}
+
+fn wait_for_endpoint_or_child_exit(
+    child: &mut ManagedChild,
+    addr: SocketAddr,
+    timeout: Duration,
+    probe: fn(SocketAddr, Duration, Duration) -> bool,
+) -> Result<()> {
     let deadline = Instant::now() + timeout;
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
     while Instant::now() < deadline {
-        if TcpStream::connect(addr).is_ok() {
+        if probe(addr, Duration::from_millis(250), Duration::from_millis(250)) {
             return Ok(());
+        }
+        if let Some(status) = child.child.try_wait().into_diagnostic()? {
+            return Err(miette::miette!(
+                "vm process {} exited before endpoint {} became ready with status {}",
+                child.name,
+                addr,
+                status
+            ));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     Err(miette::miette!("timeout after {:?}", timeout))
+}
+
+fn vm_endpoint_forward_ready_timeout() -> Duration {
+    if vm_uses_tcg_accel() {
+        TCG_VM_STARTUP_TIMEOUT
+    } else {
+        Duration::from_secs(120)
+    }
 }
 
 fn build_vm_launch_plan(
@@ -1151,35 +1370,29 @@ fn build_vm_launch_plan(
     component_config: Option<&Value>,
     mount_files: &[RenderedMountFile],
 ) -> Result<VmLaunchPlan> {
-    let vm_root = host.runtime_root.join("vms").join(&component.log_name);
-    fs::create_dir_all(&vm_root)
+    let artifacts = build_vm_launch_artifacts(host, component);
+    fs::create_dir_all(&artifacts.vm_root)
         .into_diagnostic()
         .wrap_err_with(|| {
             format!(
                 "failed to create vm runtime directory {}",
-                vm_root.display()
+                artifacts.vm_root.display()
             )
         })?;
 
     let base_image = resolve_vm_base_image(&component.base_image, component_config)?;
-    let overlay_path = vm_root.join("root-overlay.qcow2");
-    create_overlay_image(host.qemu_img, &base_image, &overlay_path)?;
+    create_overlay_image(host.qemu_img, &base_image, &artifacts.overlay_path)?;
 
-    let runtime_disk_path = if mount_files.is_empty() {
-        None
-    } else {
-        let runtime_disk_path = vm_root.join("runtime.img");
+    if let Some(runtime_disk_path) = artifacts.runtime_disk_path.as_ref() {
         let runtime_disk_files = build_runtime_disk_files(mount_files)?;
         write_fat_image(
-            &runtime_disk_path,
+            runtime_disk_path,
             VM_RUNTIME_DISK_SIZE,
             VM_RUNTIME_DISK_LABEL,
             &runtime_disk_files,
         )?;
-        Some(runtime_disk_path)
-    };
+    }
 
-    let seed_disk_path = vm_root.join("seed.iso");
     let instance_id = format!(
         "amber-{}-{}",
         component.id,
@@ -1196,17 +1409,18 @@ fn build_vm_launch_plan(
         runtime_context,
     )?;
     write_cloud_init_seed_image(
-        &seed_disk_path,
+        &artifacts.seed_disk_path,
         &user_data,
         &meta_data,
         vendor_data.as_deref(),
     )?;
 
-    let mut persistent_paths = Vec::new();
-    for mount in &component.storage_mounts {
-        let disk_path = storage_image_path(host.storage_root, mount);
-        ensure_persistent_image(host.qemu_img, &disk_path, &mount.size)?;
-        persistent_paths.push((mount, disk_path));
+    for (mount, disk) in component
+        .storage_mounts
+        .iter()
+        .zip(artifacts.persistent_disks.iter())
+    {
+        ensure_persistent_image(host.qemu_img, &disk.host_path, &mount.size)?;
     }
 
     let cpus = resolve_vm_scalar(&component.cpus, "program.vm.cpus", component_config)?;
@@ -1215,9 +1429,292 @@ fn build_vm_launch_plan(
         "program.vm.memory_mib",
         component_config,
     )?;
+    let qmp_socket_dir = artifacts.qmp_socket.parent().ok_or_else(|| {
+        miette::miette!(
+            "invalid vm qmp socket path {}",
+            artifacts.qmp_socket.display()
+        )
+    })?;
+    fs::create_dir_all(qmp_socket_dir)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to create vm qmp socket directory {}",
+                qmp_socket_dir.display()
+            )
+        })?;
+    if artifacts.qmp_socket.exists() {
+        fs::remove_file(&artifacts.qmp_socket)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to remove stale vm qmp socket {}",
+                    artifacts.qmp_socket.display()
+                )
+            })?;
+    }
+    let command = build_vm_qemu_command(
+        host,
+        component,
+        port_assignments,
+        cpus,
+        memory_mib,
+        &artifacts,
+    )?;
+
+    Ok(VmLaunchPlan {
+        name: component.log_name.clone(),
+        command,
+        qmp_socket: artifacts.qmp_socket,
+    })
+}
+
+fn build_vm_launch_preview(
+    host: VmHostContext<'_>,
+    component: &VmComponentPlan,
+    port_assignments: &VmPortAssignments,
+    runtime_context: &RuntimeTemplateContext,
+    component_config: &VmPreviewComponentConfig,
+) -> VmLaunchPreview {
+    let artifacts = build_vm_launch_artifacts(host, component);
+    let component_config_value = component_config.config.as_ref();
+    let component_schema = component_config.schema.as_ref();
+    let component_config_error = component_config.error.as_deref();
+    let mut unresolved_fields = Vec::new();
+
+    let base_image = match preview_vm_base_image(
+        &component.base_image,
+        component_config_value,
+        component_config_error,
+    ) {
+        Ok(path) => Some(path.display().to_string()),
+        Err(detail) => {
+            unresolved_fields.push(vm_launch_preview_issue("base_image", detail));
+            None
+        }
+    };
+    let cpus = match preview_vm_scalar(
+        &component.cpus,
+        "program.vm.cpus",
+        component_config_value,
+        component_config_error,
+    ) {
+        Ok(value) => Some(value),
+        Err(detail) => {
+            unresolved_fields.push(vm_launch_preview_issue("cpus", detail));
+            None
+        }
+    };
+    let memory_mib = match preview_vm_scalar(
+        &component.memory_mib,
+        "program.vm.memory_mib",
+        component_config_value,
+        component_config_error,
+    ) {
+        Ok(value) => Some(value),
+        Err(detail) => {
+            unresolved_fields.push(vm_launch_preview_issue("memory_mib", detail));
+            None
+        }
+    };
+    if let Err(detail) = preview_vm_mounts(
+        component.mount_spec_b64.as_deref(),
+        component_config_value,
+        component_schema,
+        runtime_context,
+    ) {
+        unresolved_fields.push(vm_launch_preview_issue("runtime_mounts", detail));
+    }
+    if let Err(detail) = preview_vm_template_string(
+        component.cloud_init_user_data.as_ref(),
+        "cloud_init_user_data",
+        component_config_value,
+        component_config_error,
+        runtime_context,
+    ) {
+        unresolved_fields.push(vm_launch_preview_issue("cloud_init_user_data", detail));
+    }
+    if let Err(detail) = preview_vm_template_string(
+        component.cloud_init_vendor_data.as_ref(),
+        "cloud_init_vendor_data",
+        component_config_value,
+        component_config_error,
+        runtime_context,
+    ) {
+        unresolved_fields.push(vm_launch_preview_issue("cloud_init_vendor_data", detail));
+    }
+
+    let command = match (cpus, memory_mib) {
+        (Some(cpus), Some(memory_mib)) => match build_vm_qemu_command(
+            host,
+            component,
+            port_assignments,
+            cpus,
+            memory_mib,
+            &artifacts,
+        ) {
+            Ok(command) => command,
+            Err(err) => {
+                unresolved_fields.push(vm_launch_preview_issue(
+                    "command",
+                    format!("failed to build QEMU launch command: {err}"),
+                ));
+                Vec::new()
+            }
+        },
+        _ => Vec::new(),
+    };
+
+    let persistent_disks = artifacts
+        .persistent_disks
+        .iter()
+        .map(|disk| VmPersistentDiskPreview {
+            serial: disk.serial.clone(),
+            mount_path: disk.mount_path.clone(),
+            host_path: disk.host_path.display().to_string(),
+        })
+        .collect::<Vec<_>>();
+
+    VmLaunchPreview {
+        name: component.log_name.clone(),
+        command,
+        base_image,
+        overlay_path: artifacts.overlay_path.display().to_string(),
+        runtime_disk_path: artifacts
+            .runtime_disk_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        seed_disk_path: artifacts.seed_disk_path.display().to_string(),
+        qmp_socket: artifacts.qmp_socket.display().to_string(),
+        serial_log: artifacts.serial_log.display().to_string(),
+        cpus,
+        memory_mib,
+        persistent_disks,
+        unresolved_fields,
+    }
+}
+
+pub(crate) fn build_vm_site_launch_preview(
+    plan_path: &Path,
+    storage_root: &Path,
+    runtime_root: &Path,
+    router_mesh_port: Option<u16>,
+) -> Result<VmSiteLaunchPreview> {
+    let plan_path = canonicalize_path(plan_path, "vm plan")?;
+    let VmRuntimeInputs {
+        plan_root,
+        vm_plan,
+        mesh_plan,
+    } = load_vm_runtime_inputs(&plan_path)?;
+
+    let port_assignments = materialize_vm_runtime(
+        &plan_root,
+        runtime_root,
+        &vm_plan,
+        &mesh_plan,
+        router_mesh_port,
+        true,
+    )?;
+    let arch = host_arch()?;
+    let (qemu_system, qemu_warning) = preview_qemu_system_binary(arch);
+    let (amber_cli, amber_warning) = preview_amber_binary();
+    let accel = detect_qemu_accel();
+    let components_by_id = vm_plan
+        .components
+        .iter()
+        .map(|component| (component.id, component))
+        .collect::<HashMap<_, _>>();
+    let runtime_context =
+        build_vm_runtime_template_context(&vm_plan.runtime_addresses, &port_assignments.state)?;
+
+    let router_public_key_b64 = vm_plan
+        .router
+        .as_ref()
+        .map(|router| {
+            read_mesh_config_public(&runtime_root.join(&router.mesh_config_path)).map(|config| {
+                base64::engine::general_purpose::STANDARD.encode(config.identity.public_key)
+            })
+        })
+        .transpose()?;
+
+    let mut virtual_machines = Vec::new();
+    let mut inspectability_warnings = Vec::new();
+    inspectability_warnings.extend(qemu_warning);
+    inspectability_warnings.extend(amber_warning);
+    for component_id in &vm_plan.startup_order {
+        let component = components_by_id.get(component_id).copied().ok_or_else(|| {
+            miette::miette!(
+                "vm plan startup order references unknown component id {}",
+                component_id
+            )
+        })?;
+        let component_config =
+            build_vm_preview_component_config(component.runtime_config.as_ref(), &runtime_context);
+        virtual_machines.push(build_vm_launch_preview(
+            VmHostContext {
+                runtime_root,
+                storage_root,
+                qemu_img: Path::new("/dev/null"),
+                qemu_system: &qemu_system,
+                amber_cli: &amber_cli,
+                arch,
+                accel,
+            },
+            component,
+            &port_assignments,
+            &runtime_context,
+            &component_config,
+        ));
+    }
+
+    Ok(VmSiteLaunchPreview {
+        router_public_key_b64,
+        virtual_machines,
+        inspectability_warnings,
+    })
+}
+
+fn build_vm_launch_artifacts(
+    host: VmHostContext<'_>,
+    component: &VmComponentPlan,
+) -> VmLaunchArtifacts {
+    let vm_root = host.runtime_root.join("vms").join(&component.log_name);
+    let qmp_socket = hashed_temp_socket_path(
+        "amber-vm-qmp",
+        &format!("component-{}", component.id),
+        &vm_root,
+    );
+    VmLaunchArtifacts {
+        overlay_path: vm_root.join("root-overlay.qcow2"),
+        runtime_disk_path: component
+            .mount_spec_b64
+            .as_ref()
+            .map(|_| vm_root.join("runtime.img")),
+        seed_disk_path: vm_root.join("seed.iso"),
+        qmp_socket,
+        serial_log: vm_root.join("serial.log"),
+        persistent_disks: component
+            .storage_mounts
+            .iter()
+            .map(|mount| VmPersistentDiskArtifact {
+                serial: mount.serial.clone(),
+                mount_path: mount.mount_path.clone(),
+                host_path: storage_image_path(host.storage_root, mount),
+            })
+            .collect(),
+        vm_root,
+    }
+}
+
+fn build_vm_qemu_command(
+    host: VmHostContext<'_>,
+    component: &VmComponentPlan,
+    port_assignments: &VmPortAssignments,
+    cpus: u32,
+    memory_mib: u32,
+    artifacts: &VmLaunchArtifacts,
+) -> Result<Vec<String>> {
     let netdev_arg = build_qemu_user_netdev_arg(host.amber_cli, component, port_assignments)?;
-    let qmp_socket = vm_root.join("qmp.sock");
-    let serial_log = vm_root.join("serial.log");
     let mut command = vec![
         host.qemu_system.display().to_string(),
         "-name".to_string(),
@@ -1227,9 +1724,9 @@ fn build_vm_launch_plan(
         "-monitor".to_string(),
         "none".to_string(),
         "-serial".to_string(),
-        format!("file:{}", serial_log.display()),
+        format!("file:{}", artifacts.serial_log.display()),
         "-qmp".to_string(),
-        format!("unix:{},server=on,wait=off", qmp_socket.display()),
+        format!("unix:{},server=on,wait=off", artifacts.qmp_socket.display()),
         "-no-reboot".to_string(),
         "-smp".to_string(),
         cpus.to_string(),
@@ -1239,17 +1736,17 @@ fn build_vm_launch_plan(
     command.extend(qemu_machine_args(host.arch, host.accel)?);
     command.extend([
         "-device".to_string(),
-        "virtio-rng-pci".to_string(),
+        "virtio-rng-pci,rombar=0".to_string(),
         "-netdev".to_string(),
         netdev_arg,
         "-device".to_string(),
-        "virtio-net-pci,netdev=net0".to_string(),
+        QEMU_VIRTIO_NET_DEVICE.to_string(),
     ]);
     push_qemu_block_device(
         &mut command,
         "root",
         "qcow2",
-        &overlay_path,
+        &artifacts.overlay_path,
         false,
         None,
         Some(1),
@@ -1258,12 +1755,12 @@ fn build_vm_launch_plan(
         &mut command,
         "seed",
         "raw",
-        &seed_disk_path,
+        &artifacts.seed_disk_path,
         true,
         None,
         None,
     );
-    if let Some(runtime_disk_path) = runtime_disk_path.as_ref() {
+    if let Some(runtime_disk_path) = artifacts.runtime_disk_path.as_ref() {
         push_qemu_block_device(
             &mut command,
             "runtime",
@@ -1274,22 +1771,261 @@ fn build_vm_launch_plan(
             None,
         );
     }
-    for (mount, disk_path) in persistent_paths {
+    for disk in &artifacts.persistent_disks {
         push_qemu_block_device(
             &mut command,
-            &mount.serial,
+            &disk.serial,
             "qcow2",
-            &disk_path,
+            &disk.host_path,
             false,
-            Some(mount.serial.as_str()),
+            Some(disk.serial.as_str()),
             None,
         );
     }
+    Ok(command)
+}
 
-    Ok(VmLaunchPlan {
-        name: component.log_name.clone(),
-        command,
-        qmp_socket,
+fn build_vm_preview_component_config(
+    payload: Option<&DirectRuntimeConfigPayload>,
+    runtime_context: &RuntimeTemplateContext,
+) -> VmPreviewComponentConfig {
+    match build_component_config(payload, runtime_context) {
+        Ok(Some((config, schema))) => VmPreviewComponentConfig {
+            config: Some(config),
+            schema: Some(schema),
+            error: None,
+        },
+        Ok(None) => VmPreviewComponentConfig::default(),
+        Err(err) => VmPreviewComponentConfig {
+            config: None,
+            schema: None,
+            error: Some(err.to_string()),
+        },
+    }
+}
+
+fn preview_vm_scalar(
+    plan: &VmScalarPlanU32,
+    field_name: &str,
+    component_config: Option<&Value>,
+    component_config_error: Option<&str>,
+) -> std::result::Result<u32, String> {
+    match plan {
+        VmScalarPlanU32::Literal { .. } => {
+            resolve_vm_scalar(plan, field_name, component_config).map_err(|err| err.to_string())
+        }
+        VmScalarPlanU32::RuntimeConfig { .. } => {
+            if component_config.is_none() {
+                return Err(preview_vm_config_dependency_error(
+                    field_name,
+                    component_config_error,
+                ));
+            }
+            resolve_vm_scalar(plan, field_name, component_config).map_err(|err| err.to_string())
+        }
+    }
+}
+
+fn preview_vm_base_image(
+    plan: &VmHostPathPlan,
+    component_config: Option<&Value>,
+    component_config_error: Option<&str>,
+) -> std::result::Result<PathBuf, String> {
+    match plan {
+        VmHostPathPlan::Static { path } => {
+            resolve_vm_runtime_host_path(path, None).map_err(|err| err.to_string())
+        }
+        VmHostPathPlan::RuntimeConfig { query, source_dir } => {
+            let path = preview_vm_runtime_config(
+                query,
+                "program.vm.image",
+                component_config,
+                component_config_error,
+            )?;
+            resolve_vm_runtime_host_path(&path, source_dir.as_deref())
+                .map_err(|err| err.to_string())
+        }
+        VmHostPathPlan::RuntimeTemplate { parts, source_dir } => {
+            let rendered = preview_vm_host_path_template(
+                parts,
+                component_config,
+                component_config_error,
+                "program.vm.image",
+            )?;
+            resolve_vm_runtime_host_path(&rendered, source_dir.as_deref())
+                .map_err(|err| err.to_string())
+        }
+    }
+}
+
+fn preview_vm_mounts(
+    mount_spec_b64: Option<&str>,
+    component_config: Option<&Value>,
+    component_schema: Option<&Value>,
+    runtime_context: &RuntimeTemplateContext,
+) -> std::result::Result<(), String> {
+    render_mount_files(
+        mount_spec_b64,
+        component_config,
+        component_schema,
+        runtime_context,
+    )
+    .map(|_| ())
+    .map_err(|err| err.to_string())
+}
+
+fn preview_vm_template_string(
+    plan: Option<&VmTemplateStringPlan>,
+    field_name: &str,
+    component_config: Option<&Value>,
+    component_config_error: Option<&str>,
+    runtime_context: &RuntimeTemplateContext,
+) -> std::result::Result<(), String> {
+    let Some(plan) = plan else {
+        return Ok(());
+    };
+    match plan {
+        VmTemplateStringPlan::Static { .. } => Ok(()),
+        VmTemplateStringPlan::RuntimeTemplate { parts } => {
+            let requires_config = parts
+                .iter()
+                .any(|part| matches!(part, TemplatePart::Config { .. }));
+            if requires_config && component_config.is_none() {
+                return Err(preview_vm_config_dependency_error(
+                    field_name,
+                    component_config_error,
+                ));
+            }
+            let empty = Value::Object(Default::default());
+            let component_config = component_config.unwrap_or(&empty);
+            render_template_string_with_context(parts, component_config, runtime_context)
+                .map(|_| ())
+                .map_err(|err| format!("failed to render {field_name}: {err}"))
+        }
+    }
+}
+
+fn preview_vm_host_path_template(
+    parts: &[VmHostPathPart],
+    component_config: Option<&Value>,
+    component_config_error: Option<&str>,
+    field_name: &str,
+) -> std::result::Result<String, String> {
+    let mut rendered = String::new();
+    for part in parts {
+        match part {
+            VmHostPathPart::Literal { value } => rendered.push_str(value),
+            VmHostPathPart::RuntimeConfig { query } => {
+                rendered.push_str(&preview_vm_runtime_config(
+                    query,
+                    field_name,
+                    component_config,
+                    component_config_error,
+                )?)
+            }
+        }
+    }
+    Ok(rendered)
+}
+
+fn preview_vm_runtime_config(
+    query: &str,
+    field_name: &str,
+    component_config: Option<&Value>,
+    component_config_error: Option<&str>,
+) -> std::result::Result<String, String> {
+    if component_config.is_none() {
+        return Err(preview_vm_config_dependency_error(
+            field_name,
+            component_config_error,
+        ));
+    }
+    resolve_vm_runtime_config(component_config, query, field_name).map_err(|err| err.to_string())
+}
+
+fn preview_vm_config_dependency_error(
+    field_name: &str,
+    component_config_error: Option<&str>,
+) -> String {
+    match component_config_error {
+        Some(err) => {
+            format!("failed to resolve runtime component config needed by {field_name}: {err}")
+        }
+        None => {
+            format!(
+                "{field_name} requires runtime config, but no runtime component config was \
+                 provided"
+            )
+        }
+    }
+}
+
+fn vm_launch_preview_issue(field: &str, detail: impl Into<String>) -> VmLaunchPreviewIssue {
+    VmLaunchPreviewIssue {
+        field: field.to_string(),
+        detail: detail.into(),
+    }
+}
+
+fn preview_qemu_system_binary(arch: VmArch) -> (PathBuf, Option<String>) {
+    match resolve_qemu_system_binary() {
+        Ok(path) => (path, None),
+        Err(err) => {
+            let guessed = PathBuf::from(match arch {
+                VmArch::Aarch64 => "qemu-system-aarch64",
+                VmArch::X86_64 => "qemu-system-x86_64",
+            });
+            (
+                guessed.clone(),
+                Some(format!(
+                    "failed to resolve the host QEMU binary exactly: {err}; preview uses {}",
+                    guessed.display()
+                )),
+            )
+        }
+    }
+}
+
+fn preview_amber_binary() -> (String, Option<String>) {
+    match resolve_host_binary("amber") {
+        Ok(path) => (path, None),
+        Err(err) => (
+            "amber".to_string(),
+            Some(format!(
+                "failed to resolve the host amber binary exactly: {err}; preview uses `amber`"
+            )),
+        ),
+    }
+}
+
+fn load_vm_runtime_inputs(plan_path: &Path) -> Result<VmRuntimeInputs> {
+    let plan_root = plan_path
+        .parent()
+        .ok_or_else(|| miette::miette!("invalid vm plan path {}", plan_path.display()))?
+        .to_path_buf();
+    let vm_plan: VmPlan = read_json_file(plan_path, "vm plan")?;
+    if vm_plan.version != VM_PLAN_VERSION {
+        return Err(miette::miette!(
+            "unsupported vm plan version {} in {}; expected {}",
+            vm_plan.version,
+            plan_path.display(),
+            VM_PLAN_VERSION
+        ));
+    }
+    let mesh_plan_path = plan_root.join(&vm_plan.mesh_provision_plan);
+    let mesh_plan: MeshProvisionPlan = read_json_file(&mesh_plan_path, "mesh provision plan")?;
+    if mesh_plan.version != MESH_PROVISION_PLAN_VERSION {
+        return Err(miette::miette!(
+            "unsupported mesh provision plan version {} in {}; expected {}",
+            mesh_plan.version,
+            mesh_plan_path.display(),
+            MESH_PROVISION_PLAN_VERSION
+        ));
+    }
+    Ok(VmRuntimeInputs {
+        plan_root,
+        vm_plan,
+        mesh_plan,
     })
 }
 
@@ -1309,7 +2045,7 @@ fn push_qemu_block_device(
         path.display()
     ));
     command.push("-device".to_string());
-    let mut device = format!("virtio-blk-pci,drive={id}");
+    let mut device = format!("virtio-blk-pci,drive={id},rombar=0");
     if let Some(serial) = serial {
         device.push_str(",serial=");
         device.push_str(serial);
@@ -2114,7 +2850,10 @@ fn qemu_machine_args(arch: VmArch, accel: QemuAccel) -> Result<Vec<String>> {
             "virt,highmem=off".to_string(),
             "-cpu".to_string(),
             match accel {
-                QemuAccel::Hvf | QemuAccel::Kvm => "host".to_string(),
+                #[cfg(target_os = "macos")]
+                QemuAccel::Hvf => "host".to_string(),
+                #[cfg(target_os = "linux")]
+                QemuAccel::Kvm => "host".to_string(),
                 QemuAccel::Tcg => "max".to_string(),
             },
         ],
@@ -2123,13 +2862,18 @@ fn qemu_machine_args(arch: VmArch, accel: QemuAccel) -> Result<Vec<String>> {
             "q35".to_string(),
             "-cpu".to_string(),
             match accel {
-                QemuAccel::Hvf | QemuAccel::Kvm => "host".to_string(),
+                #[cfg(target_os = "macos")]
+                QemuAccel::Hvf => "host".to_string(),
+                #[cfg(target_os = "linux")]
+                QemuAccel::Kvm => "host".to_string(),
                 QemuAccel::Tcg => "max".to_string(),
             },
         ],
     };
     args.extend(match accel {
+        #[cfg(target_os = "macos")]
         QemuAccel::Hvf => vec!["-accel".to_string(), "hvf".to_string()],
+        #[cfg(target_os = "linux")]
         QemuAccel::Kvm => vec!["-accel".to_string(), "kvm".to_string()],
         QemuAccel::Tcg => vec!["-accel".to_string(), "tcg".to_string()],
     });
@@ -2252,6 +2996,10 @@ fn host_arch() -> Result<VmArch> {
             other
         )),
     }
+}
+
+pub(crate) fn vm_uses_tcg_accel() -> bool {
+    matches!(detect_qemu_accel(), QemuAccel::Tcg)
 }
 
 fn detect_qemu_accel() -> QemuAccel {
@@ -2742,6 +3490,7 @@ mod tests {
                 8,
                 BTreeMap::from([("upstream".to_string(), vec![32001, 32002])]),
             )]),
+            route_host_ports_by_component: BTreeMap::new(),
             endpoint_forwards_by_component: BTreeMap::new(),
             component_mesh_port_by_id: BTreeMap::new(),
             router_mesh_port: None,
@@ -2874,7 +3623,7 @@ mod tests {
             router: None,
         };
 
-        let assignments = assign_vm_runtime_ports(temp.path(), &vm_plan).expect("ports");
+        let assignments = assign_vm_runtime_ports(temp.path(), &vm_plan, None).expect("ports");
         let runtime_ports = assignments
             .state
             .slot_route_ports_by_component
@@ -2912,6 +3661,10 @@ mod tests {
                     7,
                     BTreeMap::from([("api".to_string(), vec![20_000])]),
                 )]),
+                route_host_ports_by_component: BTreeMap::from([(
+                    7,
+                    BTreeMap::from([("api".to_string(), vec![43_071])]),
+                )]),
                 endpoint_forwards_by_component: BTreeMap::from([(
                     7,
                     BTreeMap::from([(8080, 33_655)]),
@@ -2932,6 +3685,202 @@ mod tests {
         assert!(netdev.contains("/tmp/amber cli"));
         assert!(netdev.contains("run-vm-guestfwd-bridge 127.0.0.1:43071"));
         assert!(netdev.contains("hostfwd=tcp:127.0.0.1:33655-:8080"));
+    }
+
+    #[test]
+    fn build_vm_launch_preview_exposes_qemu_command_and_disk_paths() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let runtime_root = temp.path().join("runtime");
+        fs::create_dir_all(&runtime_root).expect("runtime dir");
+        let storage_root = temp.path().join("storage");
+        let base_image = temp.path().join("base.img");
+        fs::write(&base_image, []).expect("base image");
+
+        let component = VmComponentPlan {
+            id: 7,
+            moniker: "/bound".to_string(),
+            log_name: "bound".to_string(),
+            depends_on: Vec::new(),
+            mesh_config_path: "mesh/components/bound/mesh-config.json".to_string(),
+            mesh_identity_path: "mesh/components/bound/mesh-identity.json".to_string(),
+            cpus: VmScalarPlanU32::Literal { value: 1 },
+            memory_mib: VmScalarPlanU32::Literal { value: 512 },
+            base_image: VmHostPathPlan::Static {
+                path: base_image.display().to_string(),
+            },
+            cloud_init_user_data: None,
+            cloud_init_vendor_data: None,
+            egress: VmEgressPlan::None,
+            storage_mounts: vec![VmStorageMount {
+                mount_path: "/data".to_string(),
+                state_subdir: "bound/data-1234".to_string(),
+                serial: "amber-1234".to_string(),
+                size: "1G".to_string(),
+            }],
+            runtime_config: None,
+            mount_spec_b64: Some(base64::engine::general_purpose::STANDARD.encode(b"[]")),
+        };
+        let assignments = VmPortAssignments {
+            state: VmRuntimeState {
+                slot_ports_by_component: BTreeMap::new(),
+                slot_route_ports_by_component: BTreeMap::from([(
+                    7,
+                    BTreeMap::from([("api".to_string(), vec![20_000])]),
+                )]),
+                route_host_ports_by_component: BTreeMap::from([(
+                    7,
+                    BTreeMap::from([("api".to_string(), vec![43_071])]),
+                )]),
+                endpoint_forwards_by_component: BTreeMap::from([(
+                    7,
+                    BTreeMap::from([(8080, 33_655)]),
+                )]),
+                component_mesh_port_by_id: BTreeMap::new(),
+                router_mesh_port: None,
+            },
+            route_host_ports_by_component: BTreeMap::from([(
+                7,
+                BTreeMap::from([("api".to_string(), vec![43_071])]),
+            )]),
+        };
+
+        let preview = build_vm_launch_preview(
+            VmHostContext {
+                runtime_root: &runtime_root,
+                storage_root: &storage_root,
+                qemu_img: Path::new("/tmp/qemu-img"),
+                qemu_system: Path::new("/tmp/qemu-system-x86_64"),
+                amber_cli: "/tmp/amber",
+                arch: VmArch::X86_64,
+                accel: QemuAccel::Tcg,
+            },
+            &component,
+            &assignments,
+            &RuntimeTemplateContext::default(),
+            &VmPreviewComponentConfig::default(),
+        );
+
+        assert_eq!(preview.name, "bound");
+        assert_eq!(preview.command[0], "/tmp/qemu-system-x86_64");
+        let rendered = preview.command.join(" ");
+        assert!(rendered.contains(
+            "guestfwd=tcp:10.0.2.100:20000-cmd:/tmp/amber run-vm-guestfwd-bridge 127.0.0.1:43071"
+        ));
+        assert!(rendered.contains("hostfwd=tcp:127.0.0.1:33655-:8080"));
+        assert!(
+            preview
+                .overlay_path
+                .ends_with("vms/bound/root-overlay.qcow2")
+        );
+        assert!(
+            preview
+                .runtime_disk_path
+                .as_deref()
+                .is_some_and(|path| path.ends_with("vms/bound/runtime.img"))
+        );
+        assert!(preview.seed_disk_path.ends_with("vms/bound/seed.iso"));
+        assert_eq!(preview.cpus, Some(1));
+        assert_eq!(preview.memory_mib, Some(512));
+        assert_eq!(
+            preview.base_image.as_deref(),
+            Some(base_image.to_string_lossy().as_ref())
+        );
+        assert_eq!(preview.persistent_disks.len(), 1);
+        assert_eq!(
+            preview.persistent_disks[0].host_path,
+            storage_root
+                .join("bound/data-1234")
+                .with_extension("qcow2")
+                .display()
+                .to_string()
+        );
+        assert!(preview.unresolved_fields.is_empty());
+    }
+
+    #[test]
+    fn build_vm_launch_preview_keeps_command_when_base_image_is_unresolved() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let runtime_root = temp.path().join("runtime");
+        fs::create_dir_all(&runtime_root).expect("runtime dir");
+        let storage_root = temp.path().join("storage");
+
+        let component = VmComponentPlan {
+            id: 7,
+            moniker: "/bound".to_string(),
+            log_name: "bound".to_string(),
+            depends_on: Vec::new(),
+            mesh_config_path: "mesh/components/bound/mesh-config.json".to_string(),
+            mesh_identity_path: "mesh/components/bound/mesh-identity.json".to_string(),
+            cpus: VmScalarPlanU32::Literal { value: 1 },
+            memory_mib: VmScalarPlanU32::Literal { value: 512 },
+            base_image: VmHostPathPlan::RuntimeConfig {
+                query: "base_image".to_string(),
+                source_dir: None,
+            },
+            cloud_init_user_data: None,
+            cloud_init_vendor_data: None,
+            egress: VmEgressPlan::None,
+            storage_mounts: Vec::new(),
+            runtime_config: None,
+            mount_spec_b64: None,
+        };
+        let assignments = VmPortAssignments {
+            state: VmRuntimeState {
+                slot_ports_by_component: BTreeMap::new(),
+                slot_route_ports_by_component: BTreeMap::from([(
+                    7,
+                    BTreeMap::from([("api".to_string(), vec![20_000])]),
+                )]),
+                route_host_ports_by_component: BTreeMap::from([(
+                    7,
+                    BTreeMap::from([("api".to_string(), vec![43_071])]),
+                )]),
+                endpoint_forwards_by_component: BTreeMap::from([(
+                    7,
+                    BTreeMap::from([(8080, 33_655)]),
+                )]),
+                component_mesh_port_by_id: BTreeMap::new(),
+                router_mesh_port: None,
+            },
+            route_host_ports_by_component: BTreeMap::from([(
+                7,
+                BTreeMap::from([("api".to_string(), vec![43_071])]),
+            )]),
+        };
+
+        let preview = build_vm_launch_preview(
+            VmHostContext {
+                runtime_root: &runtime_root,
+                storage_root: &storage_root,
+                qemu_img: Path::new("/tmp/qemu-img"),
+                qemu_system: Path::new("/tmp/qemu-system-x86_64"),
+                amber_cli: "/tmp/amber",
+                arch: VmArch::X86_64,
+                accel: QemuAccel::Tcg,
+            },
+            &component,
+            &assignments,
+            &RuntimeTemplateContext::default(),
+            &VmPreviewComponentConfig {
+                error: Some(
+                    "failed to resolve runtime component config: \"base_image\" is a required \
+                     property"
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+        );
+
+        assert!(!preview.command.is_empty());
+        assert_eq!(preview.cpus, Some(1));
+        assert_eq!(preview.memory_mib, Some(512));
+        assert_eq!(preview.base_image, None);
+        assert!(preview.unresolved_fields.iter().any(|issue| {
+            issue.field == "base_image"
+                && issue
+                    .detail
+                    .contains("\"base_image\" is a required property")
+        }));
     }
 
     #[test]

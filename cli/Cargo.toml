@@ -9,6 +9,7 @@ path = "src/main.rs"
 [dependencies]
 amber-compiler = { workspace = true }
 amber-config = { workspace = true }
+amber-helper = { path = "../runtime/helper" }
 amber-manifest = { workspace = true }
 amber-mesh = { workspace = true }
 amber-proxy = { workspace = true }
@@ -22,6 +23,7 @@ fatfs = "0.3.6"
 jsonschema = { workspace = true, default-features = false }
 libc = "0.2.177"
 miette = { workspace = true, features = ["fancy"] }
+rpassword = "7.4.0"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
@@ -30,6 +32,7 @@ tokio = { workspace = true, features = ["io-util", "macros", "process", "rt-mult
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
+dotenvy = "0.15.7"
 
 [build-dependencies]
 amber-images = { workspace = true }

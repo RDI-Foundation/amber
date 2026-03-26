@@ -1,4 +1,9 @@
 mod docs;
+mod mixed_run;
+mod run_inputs;
+mod run_logs;
+mod site_proxy_metadata;
+mod tcp_readiness;
 mod vm_runtime;
 
 #[cfg(target_os = "linux")]
@@ -23,16 +28,18 @@ use amber_compiler::{
     reporter::{
         CompiledScenario, Reporter as _,
         direct::{
-            DIRECT_PLAN_FILENAME, DIRECT_PLAN_VERSION, DirectArtifact, DirectComponentPlan,
-            DirectPlan, DirectProgramExecutionPlan, DirectReporter, DirectRuntimeAddressPlan,
-            DirectRuntimeConfigPayload, DirectRuntimeUrlSource, RUN_SCRIPT_FILENAME,
+            DIRECT_PLAN_FILENAME, DIRECT_PLAN_VERSION, DirectComponentPlan, DirectPlan,
+            DirectProgramExecutionPlan, DirectRuntimeAddressPlan, DirectRuntimeConfigPayload,
+            DirectRuntimeUrlSource, RUN_SCRIPT_FILENAME,
         },
-        docker_compose::DockerComposeReporter,
         dot::DotReporter,
-        kubernetes::KubernetesReporter,
         metadata::MetadataReporter,
         scenario_ir::ScenarioIrReporter,
-        vm::{VM_PLAN_FILENAME, VmArtifact, VmReporter},
+        vm::VM_PLAN_FILENAME,
+    },
+    run_plan::{
+        PlacementFile, RUN_PLAN_SCHEMA, RunPlan, SiteKind, build_homogeneous_export_run_plan,
+        build_run_plan, build_unmanaged_export, parse_placement_file,
     },
 };
 use amber_config::{self as config, CONFIG_ENV_PREFIX};
@@ -52,10 +59,11 @@ use amber_mesh::{MeshProtocol, OutboundRoute, TransportConfig};
 use amber_proxy::ProxyCommand;
 use amber_resolver::Resolver;
 use amber_scenario::{SCENARIO_IR_SCHEMA, ScenarioIr};
-use amber_template::{
-    ConfigTemplatePayload, MountSpec, ProgramArgTemplate, RuntimeSlotObject,
-    RuntimeTemplateContext, TemplatePart, TemplateSpec,
-};
+#[cfg(any(target_os = "linux", test))]
+use amber_template::TemplatePart;
+use amber_template::{ConfigTemplatePayload, MountSpec, RuntimeSlotObject, RuntimeTemplateContext};
+#[cfg(target_os = "linux")]
+use amber_template::{ProgramArgTemplate, TemplateSpec};
 use base64::Engine as _;
 use clap::{ArgAction, Args, Parser, Subcommand};
 use miette::{
@@ -70,6 +78,18 @@ use tokio::{
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
+use crate::{
+    run_inputs::{
+        RunInterface, ambient_run_env, collect_run_interface, load_run_env,
+        missing_required_external_slots, missing_required_root_inputs, project_env_path,
+        prompt_for_missing_inputs, render_resolved_input_lines, render_root_reuse_env,
+        resolve_manifest_entry_path, run_interactive, select_external_slot_env, select_root_env,
+        slot_url_from_socket,
+    },
+    run_logs::{RunLogOptions, print_run_logs, print_run_ps, stream_run_logs_until},
+    tcp_readiness::wait_for_stable_endpoint,
+};
+
 const CLI_LONG_ABOUT: &str = "\
 Compile, inspect, and run Amber scenarios.
 
@@ -82,6 +102,9 @@ const CLI_AFTER_HELP: &str = "\
 Common workflows:
   amber check path/to/root.json5
       Validate manifests and print diagnostics without writing outputs.
+
+  amber compile path/to/root.json5 --run-plan /tmp/amber-run-plan.json
+      Generate the mixed-site run plan consumed by `amber run`.
 
   amber compile path/to/root.json5 --docker-compose /tmp/amber-compose
       Generate runtime artifacts. `amber compile --help` lists every output format.
@@ -113,6 +136,9 @@ Outputs:
   --output FILE
       Scenario IR JSON for inspection or downstream tooling.
 
+  --run-plan FILE
+      Mixed-site execution plan JSON for `amber run`.
+
   --dot FILE
       Graphviz DOT for visualizing the resolved graph.
 
@@ -136,6 +162,7 @@ Outputs:
 
 Examples:
   amber compile path/to/root.json5 --output /tmp/scenario.json
+  amber compile path/to/root.json5 --run-plan /tmp/run-plan.json
   amber compile path/to/root.json5 --docker-compose /tmp/amber-compose
   amber compile path/to/root.json5 --direct /tmp/amber-direct
   amber compile path/to/root.json5 --vm /tmp/amber-vm";
@@ -194,13 +221,21 @@ Print the manifest schema README that ships inside the CLI.
 Use this for the detailed manifest format, field semantics, and authoring examples.";
 
 const RUN_LONG_ABOUT: &str = "\
-Start a previously compiled runnable Amber output directory.
+Start a compiled Amber runtime artifact, a mixed-site run plan, or a manifest/bundle.
 
-This command understands direct/native artifacts from `amber compile --direct` and VM artifacts \
-                              from `amber compile --vm`.";
+This command understands direct/native artifacts from `amber compile --direct`, VM artifacts from \
+                              `amber compile --vm`, mixed-site run plans from `amber compile \
+                              --run-plan`, and manifest or bundle inputs that Amber can compile \
+                              into a run plan on the fly.";
 
 const RUN_AFTER_HELP: &str = "\
 Examples:
+  amber run .
+  amber run path/to/root.json5
+  amber run path/to/root.json5 --placement local-sites.json
+  amber run path/to/root.json5 --env-file dev.env
+  amber run -Z unstable-options path/to/root.json5 --dry-run --emit-launch-bundle /tmp/amber-launch
+  amber run /tmp/amber-run-plan.json
   amber run /tmp/amber-direct
   amber run /tmp/amber-direct/direct-plan.json
   amber run /tmp/amber-vm
@@ -225,6 +260,10 @@ const PROXY_AFTER_HELP: &str = "\
 Examples:
   amber proxy /tmp/amber-compose --export public=127.0.0.1:18080
 
+  amber proxy <run-id> --export public=127.0.0.1:18080
+
+  amber proxy <run-id> --site direct_local --export public=127.0.0.1:18080
+
   amber proxy /tmp/amber-compose \\
     --slot ext_api=127.0.0.1:38081 \\
     --export public=127.0.0.1:38080
@@ -237,6 +276,8 @@ Examples:
 
 Notes:
   At least one `--slot NAME=ADDR:PORT` or `--export NAME=ADDR:PORT` is required.
+  Mixed-site run ids expose the whole running scenario by default; add `--site` only when you need \
+                                a specific internal site surface.
   Docker Compose outputs auto-detect router control and, for exports, the published router mesh \
                                 port.
   Direct and VM outputs usually infer local router metadata automatically.
@@ -298,11 +339,17 @@ enum Command {
     )]
     Docs(DocsArgs),
     #[command(
-        about = "Run a direct/native Amber artifact locally",
+        about = "Run a manifest, run plan, or Amber runtime artifact",
         long_about = RUN_LONG_ABOUT,
         after_help = RUN_AFTER_HELP
     )]
     Run(RunArgs),
+    #[command(about = "Stop a mixed-site run by run id")]
+    Stop(StopArgs),
+    #[command(about = "List active mixed-site runs")]
+    Ps(PsArgs),
+    #[command(about = "Print persisted logs for a mixed-site run")]
+    Logs(LogsArgs),
     #[command(
         about = "Bridge scenario exports and external slots to the host",
         long_about = PROXY_LONG_ABOUT,
@@ -317,8 +364,20 @@ enum Command {
     Dashboard(DashboardArgs),
     #[command(hide = true, name = "run-direct-init")]
     RunDirectInit(RunDirectInitArgs),
+    #[command(hide = true, name = "run-vm-init")]
+    RunVmInit(RunVmInitArgs),
+    #[command(hide = true, name = "run-site-supervisor")]
+    RunSiteSupervisor(RunSiteSupervisorArgs),
+    #[command(hide = true, name = "run-detached-coordinator")]
+    RunDetachedCoordinator(RunDetachedCoordinatorArgs),
+    #[command(hide = true, name = "run-observability-sink")]
+    RunObservabilitySink(RunObservabilitySinkArgs),
+    #[command(hide = true, name = "run-outside-proxy")]
+    RunOutsideProxy(RunOutsideProxyArgs),
     #[command(hide = true, name = "run-vm-guestfwd-bridge")]
     RunVmGuestfwdBridge(RunVmGuestfwdBridgeArgs),
+    #[command(hide = true, name = "run-direct-local-probe")]
+    RunDirectLocalProbe(RunDirectLocalProbeArgs),
 }
 
 #[derive(Args)]
@@ -343,6 +402,10 @@ struct CompileArgs {
     #[arg(long = "metadata", value_name = "FILE", allow_hyphen_values = true)]
     metadata: Option<PathBuf>,
 
+    /// Write a mixed-site run plan JSON file.
+    #[arg(long = "run-plan", value_name = "FILE")]
+    run_plan: Option<PathBuf>,
+
     /// Write a manifest bundle to this directory.
     #[arg(long = "bundle", value_name = "DIR")]
     bundle: Option<PathBuf>,
@@ -362,6 +425,10 @@ struct CompileArgs {
     /// Disable compiler optimizations.
     #[arg(long = "no-opt")]
     no_opt: bool,
+
+    /// Placement file used when building the mixed-site run plan.
+    #[arg(long = "placement", value_name = "FILE")]
+    placement: Option<PathBuf>,
 
     /// Root manifest, bundle, or Scenario IR to compile (URL or local path).
     #[arg(value_name = "MANIFEST")]
@@ -416,13 +483,41 @@ struct DocsExamplesArgs {
 
 #[derive(Args)]
 struct RunArgs {
-    /// Runnable output directory, `direct-plan.json`, or `vm-plan.json` from `amber compile`.
-    #[arg(value_name = "OUTPUT")]
+    /// Enable unstable CLI options.
+    #[arg(short = 'Z', value_name = "FLAG")]
+    unstable: Vec<String>,
+
+    /// Manifest, bundle, mixed-site run plan, or direct/vm runnable output from `amber compile`.
+    #[arg(value_name = "TARGET")]
     output: String,
 
     /// Override where Amber stores persistent runtime state.
     #[arg(long = "storage-root", value_name = "DIR")]
     storage_root: Option<PathBuf>,
+
+    /// Placement file used when compiling a manifest or bundle into a mixed-site run plan.
+    #[arg(long = "placement", value_name = "FILE")]
+    placement: Option<PathBuf>,
+
+    /// Load runtime inputs from an env file. Repeat to merge multiple files.
+    #[arg(long = "env-file", value_name = "FILE")]
+    env_file: Vec<PathBuf>,
+
+    /// Start a mixed-site run in detached mode.
+    #[arg(long = "detach")]
+    detach: bool,
+
+    /// Managed observability mode for mixed-site runs (`local` or an OTLP/HTTP endpoint URL).
+    #[arg(long = "observability", value_name = "local|URL")]
+    observability: Option<String>,
+
+    /// Materialize the mixed-site launch bundle without starting workloads.
+    #[arg(long = "dry-run")]
+    dry_run: bool,
+
+    /// Write the materialized mixed-site launch bundle to this directory.
+    #[arg(long = "emit-launch-bundle", value_name = "DIR")]
+    emit_launch_bundle: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -434,6 +529,14 @@ struct RunDirectInitArgs {
     /// Override where Amber stores persistent direct runtime state.
     #[arg(long = "storage-root", value_name = "DIR")]
     storage_root: Option<PathBuf>,
+
+    /// Persistent runtime workspace used by the mixed-site supervisor.
+    #[arg(long = "runtime-root", value_name = "DIR", hide = true)]
+    runtime_root: Option<PathBuf>,
+
+    /// Fixed router mesh port used by the mixed-site supervisor.
+    #[arg(long = "router-mesh-port", value_name = "PORT", hide = true)]
+    router_mesh_port: Option<u16>,
 }
 
 #[derive(Args)]
@@ -444,10 +547,125 @@ struct RunVmGuestfwdBridgeArgs {
 }
 
 #[derive(Args)]
+struct RunVmInitArgs {
+    /// Path to a VM runtime plan JSON file.
+    #[arg(long = "plan", value_name = "FILE")]
+    plan: PathBuf,
+
+    /// Override where Amber stores persistent VM runtime state.
+    #[arg(long = "storage-root", value_name = "DIR")]
+    storage_root: Option<PathBuf>,
+
+    /// Persistent runtime workspace used by the mixed-site supervisor.
+    #[arg(long = "runtime-root", value_name = "DIR", hide = true)]
+    runtime_root: Option<PathBuf>,
+
+    /// Fixed router mesh port used by the mixed-site supervisor.
+    #[arg(long = "router-mesh-port", value_name = "PORT", hide = true)]
+    router_mesh_port: Option<u16>,
+}
+
+#[derive(Args)]
+struct RunDirectLocalProbeArgs {
+    /// Loopback endpoint inside a direct component namespace.
+    #[arg(value_name = "ADDR:PORT")]
+    addr: SocketAddr,
+
+    /// Maximum time to wait for the endpoint to accept stable connections.
+    #[arg(long = "timeout-ms", value_name = "MILLIS")]
+    timeout_ms: u64,
+}
+
+#[derive(Args)]
+struct RunOutsideProxyArgs {
+    /// Path to a run outside proxy plan JSON file.
+    #[arg(long = "plan", value_name = "FILE")]
+    plan: PathBuf,
+}
+
+#[derive(Args)]
+struct RunSiteSupervisorArgs {
+    /// Path to a mixed-site supervisor plan JSON file.
+    #[arg(long = "plan", value_name = "FILE")]
+    plan: PathBuf,
+}
+
+#[derive(Args)]
+struct RunDetachedCoordinatorArgs {
+    /// Path to a mixed-site run plan JSON file.
+    #[arg(long = "plan", value_name = "FILE")]
+    plan: PathBuf,
+
+    /// Run id reserved by the foreground CLI before detaching.
+    #[arg(long = "run-id", value_name = "RUN_ID")]
+    run_id: String,
+
+    /// Override where Amber stores persistent runtime state.
+    #[arg(long = "storage-root", value_name = "DIR")]
+    storage_root: Option<PathBuf>,
+
+    /// Original user-supplied plan path when detaching from an existing run plan.
+    #[arg(long = "source-plan", value_name = "FILE")]
+    source_plan: Option<PathBuf>,
+
+    /// Managed observability mode for mixed-site runs (`local` or an OTLP/HTTP endpoint URL).
+    #[arg(long = "observability", value_name = "local|URL")]
+    observability: Option<String>,
+}
+
+#[derive(Args)]
+struct PsArgs {
+    /// Override where Amber stores persistent mixed-run state.
+    #[arg(long = "storage-root", value_name = "DIR")]
+    storage_root: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct LogsArgs {
+    /// Mixed-site run id.
+    #[arg(value_name = "RUN_ID")]
+    run_id: String,
+
+    /// Override where Amber stores persistent mixed-run state.
+    #[arg(long = "storage-root", value_name = "DIR")]
+    storage_root: Option<PathBuf>,
+
+    /// Keep streaming new log output.
+    #[arg(short = 'f', long = "follow")]
+    follow: bool,
+}
+
+#[derive(Args)]
+struct RunObservabilitySinkArgs {
+    /// Path to an observability sink plan JSON file.
+    #[arg(long = "plan", value_name = "FILE")]
+    plan: PathBuf,
+}
+
+#[derive(Args)]
+struct StopArgs {
+    /// Run id to stop.
+    #[arg(value_name = "RUN_ID")]
+    run_id: String,
+
+    /// Override where Amber stores persistent mixed-run state.
+    #[arg(long = "storage-root", value_name = "DIR")]
+    storage_root: Option<PathBuf>,
+}
+
+#[derive(Args)]
 struct ProxyArgs {
-    /// Docker Compose output directory, direct output directory, VM output directory, or Kubernetes output directory from `amber compile`.
+    /// Docker Compose output directory, direct output directory, VM output directory, Kubernetes output directory, run root, or mixed-site run id.
     #[arg(value_name = "OUTPUT")]
     output: String,
+
+    /// Site id to attach when proxying against a mixed-site run.
+    #[arg(long = "site", value_name = "SITE_ID")]
+    site: Option<String>,
+
+    /// Override where Amber stores persistent mixed-run state when `OUTPUT` is a run id.
+    #[arg(long = "storage-root", value_name = "DIR")]
+    storage_root: Option<PathBuf>,
 
     /// Compose project name override for Docker Compose outputs.
     #[arg(long = "project-name", value_name = "NAME")]
@@ -525,11 +743,19 @@ struct DashboardArgs {
 enum RunTargetKind {
     Direct,
     Vm,
+    MixedRunPlan,
 }
 
 struct RunTarget {
     kind: RunTargetKind,
     plan: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedMixedRunInputs {
+    interface: RunInterface,
+    root_env: BTreeMap<String, String>,
+    external_slot_env: BTreeMap<String, String>,
 }
 
 #[tokio::main]
@@ -541,6 +767,7 @@ async fn main() -> Result<()> {
     let result = match cli.command {
         Command::Proxy(args) => proxy(args, verbose).await,
         Command::RunVmGuestfwdBridge(args) => run_vm_guestfwd_bridge(args).await,
+        Command::RunDirectLocalProbe(args) => run_direct_local_probe(args).await,
         command => {
             init_tracing(verbose)?;
             match command {
@@ -548,15 +775,34 @@ async fn main() -> Result<()> {
                 Command::Check(args) => check(args).await,
                 Command::Docs(args) => docs(args),
                 Command::Run(args) => run(args).await,
+                Command::Stop(args) => stop(args).await,
+                Command::Ps(args) => ps(args),
+                Command::Logs(args) => logs(args).await,
                 Command::Dashboard(args) => dashboard(args).await,
                 Command::RunDirectInit(args) => run_direct_init(args).await,
+                Command::RunVmInit(args) => {
+                    vm_runtime::run_vm_init(
+                        args.plan,
+                        args.storage_root,
+                        args.runtime_root,
+                        args.router_mesh_port,
+                    )
+                    .await
+                }
+                Command::RunSiteSupervisor(args) => mixed_run::run_site_supervisor(args.plan).await,
+                Command::RunDetachedCoordinator(args) => run_detached_coordinator(args).await,
+                Command::RunObservabilitySink(args) => {
+                    mixed_run::run_observability_sink(args.plan).await
+                }
+                Command::RunOutsideProxy(args) => mixed_run::run_outside_proxy(args.plan).await,
                 Command::RunVmGuestfwdBridge(_) => unreachable!("handled above"),
+                Command::RunDirectLocalProbe(_) => unreachable!("handled above"),
                 Command::Proxy(_) => unreachable!("handled above"),
             }
         }
     };
 
-    shutdown_tracer_provider();
+    tokio::task::block_in_place(shutdown_tracer_provider);
     result
 }
 
@@ -645,6 +891,11 @@ async fn run_vm_guestfwd_bridge(args: RunVmGuestfwdBridgeArgs) -> Result<()> {
         .join()
         .map_err(|_| miette::miette!("vm slot bridge writer thread panicked"))??;
     Ok(())
+}
+
+async fn run_direct_local_probe(args: RunDirectLocalProbeArgs) -> Result<()> {
+    wait_for_stable_endpoint(args.addr, Duration::from_millis(args.timeout_ms))
+        .wrap_err_with(|| format!("direct local endpoint {} did not become ready", args.addr))
 }
 
 fn verbosity_level(verbose: u8) -> &'static str {
@@ -749,6 +1000,7 @@ fn init_proxy_tracing(verbose: u8, identity: &MeshIdentityPublic) -> Result<()> 
 async fn compile(args: CompileArgs) -> Result<()> {
     ensure_outputs_requested(&args)?;
     let outputs = resolve_output_paths(&args)?;
+    let placement = load_placement_file(args.placement.as_deref())?;
 
     let mut bundle_tree = None;
     let mut bundle_store = None;
@@ -800,6 +1052,35 @@ async fn compile(args: CompileArgs) -> Result<()> {
         write_primary_output(primary, &compiled)?;
     }
 
+    if placement.is_some()
+        && (outputs.docker_compose.is_some()
+            || outputs.kubernetes.is_some()
+            || outputs.direct.is_some()
+            || outputs.vm.is_some())
+    {
+        return Err(miette::miette!(
+            "`amber compile --docker-compose`, `--kubernetes`, `--direct`, and `--vm` do not \
+             accept `--placement`; use `--run-plan` for placed mixed-site planning"
+        ));
+    }
+
+    let run_plan = if outputs.run_plan.is_some() {
+        Some(
+            build_run_plan(&compiled, placement.as_ref())
+                .into_diagnostic()
+                .wrap_err("failed to build mixed-site run plan")?,
+        )
+    } else {
+        None
+    };
+
+    if let Some(run_plan_path) = outputs.run_plan.as_ref() {
+        write_run_plan_output(
+            run_plan_path,
+            run_plan.as_ref().expect("run plan should be built"),
+        )?;
+    }
+
     if let Some(dot_dest) = outputs.dot {
         let dot = DotReporter.emit(&compiled).map_err(miette::Report::new)?;
         match dot_dest {
@@ -809,29 +1090,31 @@ async fn compile(args: CompileArgs) -> Result<()> {
     }
 
     if let Some(compose_root) = outputs.docker_compose.as_ref() {
-        let compose = DockerComposeReporter
-            .emit(&compiled)
-            .map_err(miette::Report::new)?;
-        write_docker_compose_output(compose_root, &compose)?;
+        let run_plan = build_homogeneous_export_run_plan(&compiled, SiteKind::Compose)
+            .into_diagnostic()
+            .wrap_err("failed to build homogeneous compose export plan")?;
+        write_unmanaged_export_output(compose_root, &run_plan, SiteKind::Compose)?;
     }
 
     if let Some(kubernetes_dest) = outputs.kubernetes {
-        let artifact = KubernetesReporter
-            .emit(&compiled)
-            .map_err(miette::Report::new)?;
-        write_kubernetes_output(&kubernetes_dest, &artifact)?;
+        let run_plan = build_homogeneous_export_run_plan(&compiled, SiteKind::Kubernetes)
+            .into_diagnostic()
+            .wrap_err("failed to build homogeneous kubernetes export plan")?;
+        write_unmanaged_export_output(&kubernetes_dest, &run_plan, SiteKind::Kubernetes)?;
     }
 
     if let Some(direct_dest) = outputs.direct {
-        let artifact = DirectReporter
-            .emit(&compiled)
-            .map_err(miette::Report::new)?;
-        write_direct_output(&direct_dest, &artifact)?;
+        let run_plan = build_homogeneous_export_run_plan(&compiled, SiteKind::Direct)
+            .into_diagnostic()
+            .wrap_err("failed to build homogeneous direct export plan")?;
+        write_unmanaged_export_output(&direct_dest, &run_plan, SiteKind::Direct)?;
     }
 
     if let Some(vm_dest) = outputs.vm {
-        let artifact = VmReporter.emit(&compiled).map_err(miette::Report::new)?;
-        write_vm_output(&vm_dest, &artifact)?;
+        let run_plan = build_homogeneous_export_run_plan(&compiled, SiteKind::Vm)
+            .into_diagnostic()
+            .wrap_err("failed to build homogeneous vm export plan")?;
+        write_unmanaged_export_output(&vm_dest, &run_plan, SiteKind::Vm)?;
     }
 
     if let Some(metadata_dest) = outputs.metadata {
@@ -878,72 +1161,598 @@ fn docs(args: DocsArgs) -> Result<()> {
 }
 
 async fn run(args: RunArgs) -> Result<()> {
-    let target = load_run_target(&args.output)?;
-    match target.kind {
-        RunTargetKind::Direct => {
-            run_direct_init(RunDirectInitArgs {
-                plan: target.plan,
-                storage_root: args.storage_root,
-            })
-            .await
+    let unstable_options = args.unstable.iter().any(|flag| flag == "unstable-options");
+    let interactive = run_interactive();
+    if (args.dry_run || args.emit_launch_bundle.is_some()) && !unstable_options {
+        return Err(miette::miette!(
+            "`amber run --dry-run` and `--emit-launch-bundle` are unstable; pass `-Z \
+             unstable-options`"
+        ));
+    }
+    if args.detach && (args.dry_run || args.emit_launch_bundle.is_some()) {
+        return Err(miette::miette!(
+            "`amber run --detach` does not support `--dry-run` or `--emit-launch-bundle`"
+        ));
+    }
+    if args.dry_run && args.emit_launch_bundle.is_none() {
+        return Err(miette::miette!(
+            "`amber run --dry-run` requires `--emit-launch-bundle <dir>`"
+        ));
+    }
+    if args.emit_launch_bundle.is_some() && !args.dry_run {
+        return Err(miette::miette!(
+            "`--emit-launch-bundle` currently requires `--dry-run`"
+        ));
+    }
+
+    let placement = load_placement_file(args.placement.as_deref())?;
+    let explicit_env = load_run_env(None, &args.env_file)?;
+    if let Some(target) = try_load_run_target(&args.output)? {
+        return match target.kind {
+            RunTargetKind::Direct => {
+                if args.detach || args.dry_run {
+                    return Err(miette::miette!(
+                        "`amber run --detach` and `amber run --dry-run` only support mixed-site \
+                         manifests and run plans"
+                    ));
+                }
+                with_scoped_run_env(&explicit_env, || async {
+                    run_direct_init(RunDirectInitArgs {
+                        plan: target.plan,
+                        storage_root: args.storage_root,
+                        runtime_root: None,
+                        router_mesh_port: None,
+                    })
+                    .await
+                })
+                .await
+            }
+            RunTargetKind::Vm => {
+                if args.detach || args.dry_run {
+                    return Err(miette::miette!(
+                        "`amber run --detach` and `amber run --dry-run` only support mixed-site \
+                         manifests and run plans"
+                    ));
+                }
+                with_scoped_run_env(&explicit_env, || async {
+                    vm_runtime::run_vm_init(target.plan, args.storage_root, None, None).await
+                })
+                .await
+            }
+            RunTargetKind::MixedRunPlan => {
+                let run_plan_raw = fs::read_to_string(&target.plan)
+                    .into_diagnostic()
+                    .wrap_err_with(|| {
+                        format!("failed to read run plan {}", target.plan.display())
+                    })?;
+                let run_plan: RunPlan = serde_json::from_str(&run_plan_raw).map_err(|err| {
+                    miette::miette!("invalid run plan {}: {err}", target.plan.display())
+                })?;
+                let prepared = prepare_mixed_run_inputs(
+                    &run_plan,
+                    None,
+                    &args.env_file,
+                    interactive,
+                    !args.dry_run,
+                )?;
+                if args.dry_run {
+                    let bundle_root = args
+                        .emit_launch_bundle
+                        .as_deref()
+                        .expect("dry-run bundle path should be validated");
+                    return mixed_run::dry_run_run_plan(
+                        Some(&target.plan),
+                        &run_plan,
+                        bundle_root,
+                        args.observability.as_deref(),
+                        &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
+                    )
+                    .map(|_| ());
+                }
+                if args.detach {
+                    return run_detached(
+                        &run_plan,
+                        args.storage_root.as_deref(),
+                        Some(&target.plan),
+                        args.observability.as_deref(),
+                        &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
+                    )
+                    .await;
+                }
+                if interactive {
+                    return run_attached_mixed_run(
+                        &args.output,
+                        Some(&target.plan),
+                        &run_plan,
+                        args.storage_root.as_deref(),
+                        args.observability.as_deref(),
+                        prepared,
+                    )
+                    .await;
+                }
+                mixed_run::run_run_plan(
+                    Some(&target.plan),
+                    &run_plan,
+                    args.storage_root.as_deref(),
+                    args.observability.as_deref(),
+                    &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
+                )
+                .await
+                .map(|receipt| {
+                    println!("run_id={}", receipt.run_id);
+                    println!("run_root={}", receipt.run_root);
+                })
+            }
+        };
+    }
+
+    let compiled = compile_for_run(&args.output).await?;
+    let run_plan = build_run_plan(&compiled, placement.as_ref())
+        .into_diagnostic()
+        .wrap_err("failed to build mixed-site run plan")?;
+    let project_env_root = project_env_root_for_run_input(&args.output)?;
+    let prepared = prepare_mixed_run_inputs(
+        &run_plan,
+        project_env_root.as_deref(),
+        &args.env_file,
+        interactive,
+        !args.dry_run,
+    )?;
+    if args.detach {
+        return run_detached(
+            &run_plan,
+            args.storage_root.as_deref(),
+            None,
+            args.observability.as_deref(),
+            &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
+        )
+        .await;
+    }
+    if args.dry_run {
+        let bundle_root = args
+            .emit_launch_bundle
+            .as_deref()
+            .expect("dry-run bundle path should be validated");
+        return mixed_run::dry_run_run_plan(
+            None,
+            &run_plan,
+            bundle_root,
+            args.observability.as_deref(),
+            &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
+        )
+        .map(|_| ());
+    }
+    if interactive {
+        return run_attached_mixed_run(
+            &args.output,
+            None,
+            &run_plan,
+            args.storage_root.as_deref(),
+            args.observability.as_deref(),
+            prepared,
+        )
+        .await;
+    }
+    mixed_run::run_run_plan(
+        None,
+        &run_plan,
+        args.storage_root.as_deref(),
+        args.observability.as_deref(),
+        &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
+    )
+    .await
+    .map(|receipt| {
+        println!("run_id={}", receipt.run_id);
+        println!("run_root={}", receipt.run_root);
+    })
+}
+
+async fn run_detached(
+    run_plan: &RunPlan,
+    storage_root_override: Option<&Path>,
+    source_plan_path: Option<&Path>,
+    observability: Option<&str>,
+    site_launch_env: &BTreeMap<String, String>,
+) -> Result<()> {
+    let storage_root = mixed_run::mixed_run_storage_root(storage_root_override)?;
+    let run_id = mixed_run::new_run_id();
+    let run_root = storage_root.join("runs").join(&run_id);
+    fs::create_dir_all(&run_root)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create detached run root {}", run_root.display()))?;
+
+    let plan_path = run_root.join("run-plan.json");
+    write_run_plan_output(&plan_path, run_plan)?;
+    let log_path = run_root.join("coordinator.log");
+    let source_plan = source_plan_path.map(|path| canonicalize_user_path(path, "source run plan"));
+    let source_plan = source_plan.transpose()?;
+    mixed_run::spawn_detached_child(&run_root, &log_path, |cmd| {
+        cmd.arg("run-detached-coordinator")
+            .arg("--plan")
+            .arg(&plan_path)
+            .arg("--run-id")
+            .arg(&run_id)
+            .arg("--storage-root")
+            .arg(&storage_root)
+            .envs(site_launch_env);
+        if let Some(source_plan) = source_plan.as_ref() {
+            cmd.arg("--source-plan").arg(source_plan);
         }
-        RunTargetKind::Vm => vm_runtime::run_vm_init(target.plan, args.storage_root).await,
+        if let Some(observability) = observability {
+            cmd.arg("--observability").arg(observability);
+        }
+    })?;
+
+    println!("run_id={run_id}");
+    println!("run_root={}", run_root.display());
+    Ok(())
+}
+
+async fn run_detached_coordinator(args: RunDetachedCoordinatorArgs) -> Result<()> {
+    let plan_path = canonicalize_user_path(&args.plan, "mixed-site run plan")?;
+    let run_plan_raw = fs::read_to_string(&plan_path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read run plan {}", plan_path.display()))?;
+    let run_plan: RunPlan = serde_json::from_str(&run_plan_raw)
+        .map_err(|err| miette::miette!("invalid run plan {}: {err}", plan_path.display()))?;
+    mixed_run::run_run_plan_with_id(
+        args.source_plan.as_deref(),
+        &run_plan,
+        args.storage_root.as_deref(),
+        args.observability.as_deref(),
+        &args.run_id,
+        &ambient_run_env(),
+    )
+    .await
+    .map(|_| ())
+}
+
+fn project_env_root_for_run_input(input: &str) -> Result<Option<PathBuf>> {
+    let Some(path) = local_input_path(input)? else {
+        return Ok(None);
+    };
+    if BundleLoader::from_path(&path)?.is_some() {
+        return Ok(None);
+    }
+    let manifest_path = resolve_manifest_entry_path(&path)?;
+    Ok(manifest_path.parent().map(Path::to_path_buf))
+}
+
+fn prepare_mixed_run_inputs(
+    run_plan: &RunPlan,
+    project_env_root: Option<&Path>,
+    env_files: &[PathBuf],
+    interactive: bool,
+    require_complete_inputs: bool,
+) -> Result<PreparedMixedRunInputs> {
+    let interface = collect_run_interface(run_plan)?;
+    let mut env = load_run_env(project_env_root, env_files)?;
+    if interactive {
+        prompt_for_missing_inputs(&mut env, &interface)?;
+    }
+
+    let missing_root = missing_required_root_inputs(&env, &interface);
+    let missing_slots = missing_required_external_slots(&env, &interface);
+    if require_complete_inputs && (!missing_root.is_empty() || !missing_slots.is_empty()) {
+        let mut message = String::from("missing required runtime inputs:");
+        for input in missing_root {
+            message.push_str(&format!(
+                "\n  - {} for config.{}",
+                input.env_var, input.path
+            ));
+        }
+        for slot in missing_slots {
+            message.push_str(&format!("\n  - {} for slot.{}", slot.env_var, slot.name));
+        }
+        if let Some(project_env_root) = project_env_root {
+            message.push_str(&format!(
+                "\n\nProvide them via ambient environment, `--env-file`, or {}",
+                project_env_path(project_env_root).display()
+            ));
+        } else {
+            message.push_str("\n\nProvide them via ambient environment or `--env-file`.");
+        }
+        return Err(miette::miette!(message));
+    }
+
+    Ok(PreparedMixedRunInputs {
+        root_env: select_root_env(&env, &interface),
+        external_slot_env: select_external_slot_env(&env, &interface),
+        interface,
+    })
+}
+
+fn merged_env_maps(
+    left: &BTreeMap<String, String>,
+    right: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut merged = left.clone();
+    merged.extend(right.clone());
+    merged
+}
+
+fn export_listener_url(protocol: &str, addr: SocketAddr) -> String {
+    match protocol {
+        "tcp" => format!("tcp://{addr}"),
+        _ => format!("http://{addr}"),
     }
 }
 
-fn load_run_target(output: &str) -> Result<RunTarget> {
+async fn with_scoped_run_env<F, Fut, T>(vars: &BTreeMap<String, String>, run: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let _guard = ScopedRunEnv::apply(vars);
+    run().await
+}
+
+async fn run_attached_mixed_run(
+    target: &str,
+    source_plan_path: Option<&Path>,
+    run_plan: &RunPlan,
+    storage_root_override: Option<&Path>,
+    observability: Option<&str>,
+    prepared: PreparedMixedRunInputs,
+) -> Result<()> {
+    let receipt = mixed_run::run_run_plan(
+        source_plan_path,
+        run_plan,
+        storage_root_override,
+        observability,
+        &prepared.root_env,
+    )
+    .await?;
+    let run_root = PathBuf::from(&receipt.run_root);
+
+    let export_bindings = prepared
+        .interface
+        .exports
+        .iter()
+        .map(|export| {
+            Ok((
+                export.name.clone(),
+                SocketAddr::from(([127, 0, 0, 1], mixed_run::reserve_loopback_port()?)),
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let slot_bindings = prepared
+        .interface
+        .external_slots
+        .iter()
+        .filter_map(|slot| {
+            prepared
+                .external_slot_env
+                .get(&slot.env_var)
+                .map(|value| (slot.name.clone(), value.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut proxy_child = if slot_bindings.is_empty() && export_bindings.is_empty() {
+        None
+    } else {
+        Some(mixed_run::spawn_run_outside_proxy(
+            &run_root,
+            &slot_bindings,
+            &export_bindings,
+        )?)
+    };
+    if proxy_child.is_some()
+        && let Err(err) = mixed_run::wait_for_run_outside_proxy_ready(&run_root).await
+    {
+        if let Some(proxy_child) = proxy_child.as_mut() {
+            let _ = proxy_child.kill();
+            let _ = proxy_child.wait();
+        }
+        let _ = mixed_run::stop_run(&receipt.run_id, storage_root_override).await;
+        return Err(err);
+    }
+
+    let reuse_path = if prepared.interface.root_inputs.is_empty() {
+        None
+    } else {
+        let path = run_root.join("root-config.env");
+        fs::write(
+            &path,
+            render_root_reuse_env(&prepared.root_env, &prepared.interface),
+        )
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write {}", path.display()))?;
+        Some(path)
+    };
+
+    for line in render_resolved_input_lines(
+        &merged_env_maps(&prepared.root_env, &prepared.external_slot_env),
+        &prepared.interface,
+    ) {
+        println!("{line}");
+    }
+    if !prepared.interface.root_inputs.is_empty() || !prepared.interface.external_slots.is_empty() {
+        println!();
+    }
+    println!("Ready.");
+    for (name, addr) in &export_bindings {
+        let protocol = prepared
+            .interface
+            .exports
+            .iter()
+            .find(|export| export.name == *name)
+            .map(|export| export.protocol.as_str())
+            .unwrap_or("http");
+        println!("  {name}  {}", export_listener_url(protocol, *addr));
+    }
+    if let Some(path) = reuse_path.as_ref() {
+        println!();
+        println!("Reuse:");
+        println!("  amber run {target} --env-file {}", path.display());
+    }
+
+    let result = stream_run_logs_until(
+        &run_root,
+        RunLogOptions {
+            follow: true,
+            print_existing: false,
+        },
+    )
+    .await;
+    let stop_result = mixed_run::stop_run(&receipt.run_id, storage_root_override).await;
+    if let Some(proxy_child) = proxy_child.as_mut() {
+        let _ = proxy_child.kill();
+        let _ = proxy_child.wait();
+    }
+    result?;
+    stop_result
+}
+
+fn ps(args: PsArgs) -> Result<()> {
+    let storage_root = mixed_run::mixed_run_storage_root(args.storage_root.as_deref())?;
+    print_run_ps(&storage_root)
+}
+
+async fn logs(args: LogsArgs) -> Result<()> {
+    let storage_root = mixed_run::mixed_run_storage_root(args.storage_root.as_deref())?;
+    let run_root = storage_root.join("runs").join(&args.run_id);
+    if args.follow {
+        stream_run_logs_until(
+            &run_root,
+            RunLogOptions {
+                follow: true,
+                print_existing: true,
+            },
+        )
+        .await
+    } else {
+        print_run_logs(&run_root)
+    }
+}
+
+struct ScopedRunEnv {
+    saved: Vec<(String, Option<String>)>,
+}
+
+impl ScopedRunEnv {
+    fn apply(vars: &BTreeMap<String, String>) -> Self {
+        let saved = vars
+            .keys()
+            .map(|key| (key.clone(), env::var(key).ok()))
+            .collect::<Vec<_>>();
+        for (key, value) in vars {
+            // These vars are only scoped to the current amber process and any children it spawns.
+            unsafe {
+                env::set_var(key, value);
+            }
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for ScopedRunEnv {
+    fn drop(&mut self) {
+        for (key, value) in self.saved.drain(..) {
+            if let Some(value) = value {
+                unsafe {
+                    env::set_var(key, value);
+                }
+            } else {
+                unsafe {
+                    env::remove_var(key);
+                }
+            }
+        }
+    }
+}
+
+fn try_load_run_target(output: &str) -> Result<Option<RunTarget>> {
     let output_path = Path::new(output);
     if !output_path.exists() {
-        return Err(miette::miette!("run target not found: {}", output));
+        return Ok(None);
     }
     let abs = canonicalize_user_path(output_path, "run target")?;
 
     if abs.is_dir() {
         let plan = abs.join(DIRECT_PLAN_FILENAME);
         if plan.is_file() {
-            return Ok(RunTarget {
+            return Ok(Some(RunTarget {
                 kind: RunTargetKind::Direct,
                 plan,
-            });
+            }));
         }
         let plan = abs.join(VM_PLAN_FILENAME);
         if plan.is_file() {
-            return Ok(RunTarget {
+            return Ok(Some(RunTarget {
                 kind: RunTargetKind::Vm,
                 plan,
-            });
+            }));
         }
-        return Err(miette::miette!(
-            "output directory {} is not a recognized runnable artifact (missing {} or {})",
-            abs.display(),
-            DIRECT_PLAN_FILENAME,
-            VM_PLAN_FILENAME
-        ));
+        let plan = abs.join("run-plan.json");
+        if plan.is_file() {
+            return Ok(Some(RunTarget {
+                kind: RunTargetKind::MixedRunPlan,
+                plan,
+            }));
+        }
+        return Ok(None);
     }
 
     if abs.file_name().and_then(|name| name.to_str()) == Some(DIRECT_PLAN_FILENAME) {
-        return Ok(RunTarget {
+        return Ok(Some(RunTarget {
             kind: RunTargetKind::Direct,
             plan: abs,
-        });
+        }));
     }
     if abs.file_name().and_then(|name| name.to_str()) == Some(VM_PLAN_FILENAME) {
-        return Ok(RunTarget {
+        return Ok(Some(RunTarget {
             kind: RunTargetKind::Vm,
             plan: abs,
-        });
+        }));
+    }
+    if is_run_plan_file(&abs)? {
+        return Ok(Some(RunTarget {
+            kind: RunTargetKind::MixedRunPlan,
+            plan: abs,
+        }));
     }
 
-    Err(miette::miette!(
-        "output path {} is not a direct or vm artifact directory or plan file",
-        abs.display()
-    ))
+    Ok(None)
+}
+
+async fn stop(_args: StopArgs) -> Result<()> {
+    mixed_run::stop_run(&_args.run_id, _args.storage_root.as_deref()).await
+}
+
+async fn compile_for_run(input: &str) -> Result<CompiledScenario> {
+    match resolve_compile_input(input).await? {
+        CompileInput::ScenarioIr(compiled) => Ok(compiled),
+        CompileInput::Manifest(resolved) => {
+            let compiler = Compiler::new(resolved.resolver, Default::default())
+                .with_registry(resolved.registry);
+            let output = compiler
+                .compile_from_tree(
+                    compiler
+                        .resolve_tree(resolved.manifest, CompileOptions::default().resolve)
+                        .await
+                        .wrap_err("compile failed")?,
+                    CompileOptions::default().optimize,
+                )
+                .wrap_err("compile failed")?;
+            let has_error = print_diagnostics(&output.diagnostics, &DenySet::default())?;
+            if has_error {
+                return Err(miette::miette!("compilation failed"));
+            }
+            CompiledScenario::from_compile_output(&output)
+                .into_diagnostic()
+                .wrap_err("failed to convert compiler output into Scenario IR")
+        }
+    }
 }
 
 #[derive(Debug)]
 struct ManagedChild {
     name: String,
-    child: tokio::process::Child,
+    wrapper: Option<tokio::process::Child>,
+    #[cfg(target_os = "linux")]
+    wrapper_pid: u32,
+    #[cfg(target_os = "linux")]
+    managed_pid: u32,
 }
 
 #[derive(Debug)]
@@ -953,19 +1762,19 @@ struct ProcessSpec {
     args: Vec<String>,
     env: BTreeMap<String, String>,
     work_dir: PathBuf,
+    sandbox: ProcessSandbox,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     drop_all_caps: bool,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(target_os = "linux")]
     read_only_mounts: Vec<ReadOnlyMount>,
     writable_dirs: Vec<PathBuf>,
     bind_dirs: Vec<PathBuf>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     bind_mounts: Vec<BindMount>,
     hidden_paths: Vec<PathBuf>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     network: ProcessNetwork,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReadOnlyMount {
     source: PathBuf,
@@ -979,11 +1788,75 @@ struct BindMount {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 enum ProcessNetwork {
     Host,
+    #[cfg(target_os = "linux")]
     Isolated,
+    #[cfg(target_os = "linux")]
     Join(u32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessSandbox {
+    Sandboxed,
+    Unsandboxed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct DirectMountPreview {
+    pub(crate) source: String,
+    pub(crate) dest: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct DirectDockerMountProxyPreview {
+    pub(crate) path: String,
+    pub(crate) tcp_host: String,
+    pub(crate) tcp_port: u16,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct DirectResolvedProcessPreview {
+    pub(crate) argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) docker_mount_proxies: Vec<DirectDockerMountProxyPreview>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct DirectLaunchProcessPreview {
+    pub(crate) role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) component: Option<String>,
+    pub(crate) name: String,
+    pub(crate) argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) env: BTreeMap<String, String>,
+    pub(crate) current_dir: String,
+    pub(crate) sandbox: String,
+    pub(crate) network: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) writable_dirs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) bind_dirs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) bind_mounts: Vec<DirectMountPreview>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) hidden_paths: Vec<String>,
+    #[cfg(target_os = "linux")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) read_only_mounts: Vec<DirectMountPreview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resolved_process: Option<DirectResolvedProcessPreview>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct DirectSiteLaunchPreview {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) router_public_key_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) processes: Vec<DirectLaunchProcessPreview>,
 }
 
 #[derive(Debug)]
@@ -997,6 +1870,8 @@ enum RuntimeExitReason {
 
 const DIRECT_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const DIRECT_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(150);
+const DIRECT_LOCAL_TARGET_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const DIRECT_MESH_ENDPOINT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DirectControlSocketPaths {
@@ -1005,44 +1880,47 @@ struct DirectControlSocketPaths {
     runtime: PathBuf,
 }
 
+struct DirectRuntimeInputs {
+    plan_root: PathBuf,
+    direct_plan: DirectPlan,
+    mesh_plan: MeshProvisionPlan,
+}
+
 async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
     let plan_path = canonicalize_user_path(&args.plan, "direct plan")?;
-    let plan_root = plan_path
-        .parent()
-        .ok_or_else(|| miette::miette!("invalid direct plan path {}", plan_path.display()))?
-        .to_path_buf();
+    let DirectRuntimeInputs {
+        plan_root,
+        direct_plan,
+        mesh_plan,
+    } = load_direct_runtime_inputs(&plan_path)?;
     let storage_root = direct_storage_root(&plan_root, args.storage_root.as_deref())
         .into_diagnostic()
         .wrap_err("failed to resolve direct storage root")?;
-    let plan_raw = fs::read_to_string(&plan_path)
-        .map_err(|err| miette::miette!("failed to read {}: {err}", plan_path.display()))?;
-    let direct_plan: DirectPlan = serde_json::from_str(&plan_raw)
-        .map_err(|err| miette::miette!("invalid direct plan {}: {err}", plan_path.display()))?;
-    if direct_plan.version != DIRECT_PLAN_VERSION {
-        return Err(miette::miette!(
-            "unsupported direct plan version {} in {}; expected {}",
-            direct_plan.version,
-            plan_path.display(),
-            DIRECT_PLAN_VERSION
-        ));
-    }
 
-    let mesh_plan_path = plan_root.join(&direct_plan.mesh_provision_plan);
-    let mesh_raw = fs::read_to_string(&mesh_plan_path)
-        .map_err(|err| miette::miette!("failed to read {}: {err}", mesh_plan_path.display()))?;
-    let mesh_plan: MeshProvisionPlan = serde_json::from_str(&mesh_raw).map_err(|err| {
-        miette::miette!(
-            "invalid mesh provision plan {}: {err}",
-            mesh_plan_path.display()
+    let runtime_dir = if let Some(runtime_root) = args.runtime_root.as_ref() {
+        fs::create_dir_all(runtime_root)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to create direct runtime workspace {}",
+                    runtime_root.display()
+                )
+            })?;
+        None
+    } else {
+        Some(
+            tempfile::Builder::new()
+                .prefix("amber-direct-")
+                .tempdir()
+                .into_diagnostic()
+                .wrap_err("failed to create direct runtime workspace")?,
         )
-    })?;
-
-    let runtime_dir = tempfile::Builder::new()
-        .prefix("amber-direct-")
-        .tempdir()
-        .into_diagnostic()
-        .wrap_err("failed to create direct runtime workspace")?;
-    let runtime_root = runtime_dir.path().to_path_buf();
+    };
+    let runtime_root = runtime_dir
+        .as_ref()
+        .map(|dir| dir.path().to_path_buf())
+        .or_else(|| args.runtime_root.clone())
+        .expect("runtime root should be available");
     let runtime_state_path = direct_runtime_state_path(&plan_root);
     let mut children = Vec::<ManagedChild>::new();
     let mut log_tasks = Vec::new();
@@ -1050,11 +1928,6 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
     let mut control_socket_paths = None;
 
     let supervision = async {
-        provision_mesh_filesystem(&mesh_plan, &runtime_root)?;
-        if runtime_state_path.exists() {
-            let _ = fs::remove_file(&runtime_state_path);
-        }
-
         let mut sandbox = DirectSandbox::detect(&runtime_root);
         if !sandbox.is_available() {
             return Err(miette::miette!(
@@ -1068,11 +1941,19 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                 "direct runtime requires `slirp4netns` on Linux for isolated component networking"
             )
         })?;
-        let runtime_state = assign_direct_runtime_ports(&runtime_root, &direct_plan)?;
-        write_direct_runtime_state(&plan_root, &runtime_state)?;
-        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+        let runtime_state = materialize_direct_runtime(
+            &plan_root,
+            &runtime_root,
+            &direct_plan,
+            &mesh_plan,
+            args.router_mesh_port,
+            args.runtime_root.is_some() && runtime_state_path.is_file(),
+        )?;
+        #[cfg(target_os = "linux")]
         let mesh_network =
             configure_direct_mesh_network(&runtime_root, &runtime_state, &direct_plan)?;
+        #[cfg(not(target_os = "linux"))]
+        configure_direct_mesh_network(&runtime_root, &runtime_state, &direct_plan)?;
 
         let router_binary = resolve_runtime_binary("amber-router")?;
         if let Some(router) = direct_plan.router.as_ref() {
@@ -1182,7 +2063,9 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                 args: Vec::new(),
                 env,
                 work_dir,
+                sandbox: ProcessSandbox::Unsandboxed,
                 drop_all_caps: true,
+                #[cfg(target_os = "linux")]
                 read_only_mounts: vec![ReadOnlyMount {
                     source: runtime_root.join("mesh"),
                     dest: runtime_root.join("mesh"),
@@ -1234,7 +2117,9 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                 args: Vec::new(),
                 env,
                 work_dir,
+                sandbox: ProcessSandbox::Sandboxed,
                 drop_all_caps: true,
+                #[cfg(target_os = "linux")]
                 read_only_mounts: vec![ReadOnlyMount {
                     source: runtime_root.join("mesh"),
                     dest: runtime_root.join("mesh"),
@@ -1309,8 +2194,26 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
             }
             let _ =
                 spawn_managed_process(spec, &mut sandbox, &mut children, &mut log_tasks).await?;
+            #[cfg(target_os = "linux")]
+            wait_for_component_local_targets(
+                component,
+                &runtime_root,
+                component_sidecar_pid_by_id.get(component_id).copied(),
+                DIRECT_LOCAL_TARGET_READY_TIMEOUT,
+            )
+            .await?;
+            #[cfg(not(target_os = "linux"))]
+            wait_for_component_local_targets(
+                component,
+                &runtime_root,
+                None,
+                DIRECT_LOCAL_TARGET_READY_TIMEOUT,
+            )
+            .await?;
         }
 
+        wait_for_direct_mesh_endpoints(&runtime_state, DIRECT_MESH_ENDPOINT_READY_TIMEOUT).await?;
+        write_direct_runtime_state(&plan_root, &runtime_state)?;
         supervise_children(&mut children).await
     }
     .await;
@@ -1441,7 +2344,7 @@ async fn cleanup_direct_runtime(
     log_tasks: Vec<tokio::task::JoinHandle<()>>,
     runtime_state_path: &Path,
     control_socket_paths: Option<&DirectControlSocketPaths>,
-    runtime_dir: tempfile::TempDir,
+    runtime_dir: Option<tempfile::TempDir>,
 ) {
     terminate_children(children).await;
     for task in log_tasks {
@@ -1473,13 +2376,14 @@ struct DirectRuntimeState {
 
 #[derive(Debug, Default)]
 struct DirectMeshNetworkPlan {
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(target_os = "linux")]
     component_mesh_port_by_id: HashMap<usize, u16>,
 }
 
 fn assign_direct_runtime_ports(
     runtime_root: &Path,
     direct_plan: &DirectPlan,
+    fixed_router_mesh_port: Option<u16>,
 ) -> Result<DirectRuntimeState> {
     let mut state = DirectRuntimeState::default();
     let mut reserved = BTreeSet::new();
@@ -1489,14 +2393,14 @@ fn assign_direct_runtime_ports(
     for component in &direct_plan.components {
         let path = runtime_root.join(&component.sidecar.mesh_config_path);
         let mut config = read_mesh_config_public(path.as_path())?;
-        let mesh_port = allocate_direct_runtime_port(&mut reserved)?;
+        let mesh_port = allocate_direct_runtime_port(&mut reserved, None)?;
         mesh_port_by_peer_id.insert(config.identity.id.clone(), mesh_port);
         config.mesh_listen = SocketAddr::new(config.mesh_listen.ip(), mesh_port);
 
         let mut slot_route_ports: BTreeMap<String, Vec<(u16, u16)>> = BTreeMap::new();
         for route in &mut config.outbound {
             let authored_port = route.listen_port;
-            let port = allocate_direct_runtime_port(&mut reserved)?;
+            let port = allocate_direct_runtime_port(&mut reserved, None)?;
             route.listen_port = port;
             slot_route_ports
                 .entry(route.slot.clone())
@@ -1542,9 +2446,12 @@ fn assign_direct_runtime_ports(
     let mut router_config = if let Some(router) = direct_plan.router.as_ref() {
         let path = runtime_root.join(&router.mesh_config_path);
         let mut config = read_mesh_config_public(path.as_path())?;
-        let mesh_port = allocate_direct_runtime_port(&mut reserved)?;
+        let mesh_port = allocate_direct_runtime_port(&mut reserved, fixed_router_mesh_port)?;
         mesh_port_by_peer_id.insert(config.identity.id.clone(), mesh_port);
-        config.mesh_listen = SocketAddr::new(config.mesh_listen.ip(), mesh_port);
+        config.mesh_listen = SocketAddr::new(
+            cross_site_router_mesh_bind_ip(config.mesh_listen.ip(), fixed_router_mesh_port),
+            mesh_port,
+        );
         state.router_mesh_port = Some(mesh_port);
         Some((path, config))
     } else {
@@ -1568,7 +2475,32 @@ fn assign_direct_runtime_ports(
     Ok(state)
 }
 
-fn allocate_direct_runtime_port(reserved: &mut BTreeSet<u16>) -> Result<u16> {
+pub(crate) fn cross_site_router_mesh_bind_ip(
+    current_ip: IpAddr,
+    fixed_router_mesh_port: Option<u16>,
+) -> IpAddr {
+    if fixed_router_mesh_port.is_none() {
+        return current_ip;
+    }
+    match current_ip {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+    }
+}
+
+fn allocate_direct_runtime_port(
+    reserved: &mut BTreeSet<u16>,
+    preferred: Option<u16>,
+) -> Result<u16> {
+    if let Some(preferred) = preferred {
+        if reserved.insert(preferred) {
+            return Ok(preferred);
+        }
+        return Err(miette::miette!(
+            "runtime port {} was requested twice in one direct runtime",
+            preferred
+        ));
+    }
     for _ in 0..256 {
         let port = pick_free_port()?;
         if reserved.insert(port) {
@@ -1667,6 +2599,39 @@ fn write_direct_runtime_state(plan_root: &Path, state: &DirectRuntimeState) -> R
     Ok(())
 }
 
+fn read_direct_runtime_state(path: &Path) -> Result<DirectRuntimeState> {
+    let raw = fs::read_to_string(path).map_err(|err| {
+        miette::miette!(
+            "failed to read direct runtime state {}: {err}",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&raw)
+        .map_err(|err| miette::miette!("invalid direct runtime state {}: {err}", path.display()))
+}
+
+fn materialize_direct_runtime(
+    plan_root: &Path,
+    runtime_root: &Path,
+    direct_plan: &DirectPlan,
+    mesh_plan: &MeshProvisionPlan,
+    fixed_router_mesh_port: Option<u16>,
+    reuse_existing: bool,
+) -> Result<DirectRuntimeState> {
+    let runtime_state_path = direct_runtime_state_path(plan_root);
+    if reuse_existing && runtime_state_path.is_file() {
+        return read_direct_runtime_state(&runtime_state_path);
+    }
+    if runtime_state_path.exists() {
+        let _ = fs::remove_file(&runtime_state_path);
+    }
+    provision_mesh_filesystem(mesh_plan, runtime_root)?;
+    let runtime_state =
+        assign_direct_runtime_ports(runtime_root, direct_plan, fixed_router_mesh_port)?;
+    write_direct_runtime_state(plan_root, &runtime_state)?;
+    Ok(runtime_state)
+}
+
 fn configure_direct_mesh_network(
     runtime_root: &Path,
     runtime_state: &DirectRuntimeState,
@@ -1759,9 +2724,11 @@ fn component_program_spec(
     runtime_addresses: &DirectRuntimeAddressPlan,
     runtime_state: &DirectRuntimeState,
 ) -> Result<ProcessSpec> {
+    #[cfg(target_os = "linux")]
     let source_dir = component_source_dir(component)?;
     let work_dir = runtime_root.join(&component.program.work_dir);
     let mut writable_dirs = vec![work_dir.clone()];
+    #[cfg(target_os = "linux")]
     let read_only_mounts = component_program_read_only_mounts(component, source_dir.as_deref())?;
     let bind_mounts = direct_storage_bind_mounts(storage_root, component)?;
     match &component.program.execution {
@@ -1775,7 +2742,9 @@ fn component_program_spec(
                 args,
                 env: env.clone(),
                 work_dir,
+                sandbox: ProcessSandbox::Sandboxed,
                 drop_all_caps: false,
+                #[cfg(target_os = "linux")]
                 read_only_mounts,
                 writable_dirs,
                 bind_dirs: Vec::new(),
@@ -1825,7 +2794,9 @@ fn component_program_spec(
                 args: vec!["run".to_string()],
                 env,
                 work_dir,
+                sandbox: ProcessSandbox::Sandboxed,
                 drop_all_caps: false,
+                #[cfg(target_os = "linux")]
                 read_only_mounts,
                 writable_dirs,
                 bind_dirs: Vec::new(),
@@ -1835,6 +2806,344 @@ fn component_program_spec(
             })
         }
     }
+}
+
+pub(crate) fn build_direct_site_launch_preview(
+    plan_path: &Path,
+    storage_root: &Path,
+    runtime_root: &Path,
+    router_mesh_port: Option<u16>,
+) -> Result<DirectSiteLaunchPreview> {
+    let plan_path = canonicalize_user_path(plan_path, "direct plan")?;
+    let DirectRuntimeInputs {
+        plan_root,
+        direct_plan,
+        mesh_plan,
+    } = load_direct_runtime_inputs(&plan_path)?;
+    let runtime_state = materialize_direct_runtime(
+        &plan_root,
+        runtime_root,
+        &direct_plan,
+        &mesh_plan,
+        router_mesh_port,
+        true,
+    )?;
+    #[cfg(target_os = "linux")]
+    configure_direct_mesh_network(runtime_root, &runtime_state, &direct_plan)?;
+    #[cfg(not(target_os = "linux"))]
+    configure_direct_mesh_network(runtime_root, &runtime_state, &direct_plan)?;
+
+    let router_binary = resolve_runtime_binary("amber-router")?;
+    let mut processes = Vec::new();
+    let mut router_public_key_b64 = None;
+    if let Some(router) = direct_plan.router.as_ref() {
+        let router_config = read_mesh_config_public(&runtime_root.join(&router.mesh_config_path))?;
+        router_public_key_b64 = Some(
+            base64::engine::general_purpose::STANDARD.encode(router_config.identity.public_key),
+        );
+        let paths = DirectControlSocketPaths {
+            artifact_link: resolve_direct_artifact_path(&plan_root, &router.control_socket_path),
+            current_link: direct_current_control_socket_path(&plan_root),
+            runtime: direct_runtime_control_socket_path(runtime_root),
+        };
+        let mut env = BTreeMap::new();
+        env.insert(
+            "AMBER_ROUTER_CONFIG_PATH".to_string(),
+            runtime_root
+                .join(&router.mesh_config_path)
+                .display()
+                .to_string(),
+        );
+        env.insert(
+            "AMBER_ROUTER_IDENTITY_PATH".to_string(),
+            runtime_root
+                .join(&router.mesh_identity_path)
+                .display()
+                .to_string(),
+        );
+        env.insert(
+            "AMBER_ROUTER_CONTROL_SOCKET_PATH".to_string(),
+            paths.runtime.display().to_string(),
+        );
+        for passthrough in &router.env_passthrough {
+            if let Ok(value) = env::var(passthrough) {
+                env.insert(passthrough.clone(), value);
+            }
+        }
+        let work_dir = runtime_root.join("work/router");
+        processes.push(direct_process_preview(
+            ProcessSpec {
+                name: "router".to_string(),
+                program: router_binary.clone(),
+                args: Vec::new(),
+                env,
+                work_dir,
+                sandbox: ProcessSandbox::Unsandboxed,
+                drop_all_caps: true,
+                #[cfg(target_os = "linux")]
+                read_only_mounts: vec![ReadOnlyMount {
+                    source: runtime_root.join("mesh"),
+                    dest: runtime_root.join("mesh"),
+                }],
+                writable_dirs: Vec::new(),
+                bind_dirs: vec![
+                    direct_runtime_control_socket_path(runtime_root)
+                        .parent()
+                        .ok_or_else(|| {
+                            miette::miette!("invalid direct runtime control socket path")
+                        })?
+                        .to_path_buf(),
+                ],
+                bind_mounts: Vec::new(),
+                hidden_paths: Vec::new(),
+                network: ProcessNetwork::Host,
+            },
+            "router",
+            None,
+            None,
+            None,
+        ));
+    }
+
+    let components_by_id = direct_plan
+        .components
+        .iter()
+        .map(|component| (component.id, component))
+        .collect::<HashMap<_, _>>();
+    for component in &direct_plan.components {
+        let mut env = BTreeMap::new();
+        env.insert(
+            "AMBER_ROUTER_CONFIG_PATH".to_string(),
+            runtime_root
+                .join(&component.sidecar.mesh_config_path)
+                .display()
+                .to_string(),
+        );
+        env.insert(
+            "AMBER_ROUTER_IDENTITY_PATH".to_string(),
+            runtime_root
+                .join(&component.sidecar.mesh_identity_path)
+                .display()
+                .to_string(),
+        );
+        processes.push(direct_process_preview(
+            ProcessSpec {
+                name: component.sidecar.log_name.clone(),
+                program: router_binary.clone(),
+                args: Vec::new(),
+                env,
+                work_dir: runtime_root.join(&component.program.work_dir),
+                sandbox: ProcessSandbox::Sandboxed,
+                drop_all_caps: true,
+                #[cfg(target_os = "linux")]
+                read_only_mounts: vec![ReadOnlyMount {
+                    source: runtime_root.join("mesh"),
+                    dest: runtime_root.join("mesh"),
+                }],
+                writable_dirs: Vec::new(),
+                bind_dirs: Vec::new(),
+                bind_mounts: Vec::new(),
+                hidden_paths: Vec::new(),
+                network: {
+                    #[cfg(target_os = "linux")]
+                    {
+                        ProcessNetwork::Isolated
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        ProcessNetwork::Host
+                    }
+                },
+            },
+            "sidecar",
+            Some(component.moniker.as_str()),
+            None,
+            None,
+        ));
+    }
+    for component_id in &direct_plan.startup_order {
+        let component = components_by_id.get(component_id).copied().ok_or_else(|| {
+            miette::miette!(
+                "direct plan startup order references unknown component id {}",
+                component_id
+            )
+        })?;
+        let mut spec = component_program_spec(
+            runtime_root,
+            storage_root,
+            component,
+            &direct_plan.runtime_addresses,
+            &runtime_state,
+        )?;
+        spec.hidden_paths.push(runtime_root.join("mesh"));
+        let resolved_process = match &component.program.execution {
+            DirectProgramExecutionPlan::Direct { .. } => None,
+            DirectProgramExecutionPlan::HelperRunner { .. } => {
+                Some(direct_resolved_process_preview(&spec.env)?)
+            }
+        };
+        processes.push(direct_process_preview(
+            spec,
+            "program",
+            Some(component.moniker.as_str()),
+            Some(direct_program_network_override()),
+            resolved_process,
+        ));
+    }
+
+    Ok(DirectSiteLaunchPreview {
+        router_public_key_b64,
+        processes,
+    })
+}
+
+fn load_direct_runtime_inputs(plan_path: &Path) -> Result<DirectRuntimeInputs> {
+    let plan_root = plan_path
+        .parent()
+        .ok_or_else(|| miette::miette!("invalid direct plan path {}", plan_path.display()))?
+        .to_path_buf();
+    let plan_raw = fs::read_to_string(plan_path)
+        .map_err(|err| miette::miette!("failed to read {}: {err}", plan_path.display()))?;
+    let direct_plan: DirectPlan = serde_json::from_str(&plan_raw)
+        .map_err(|err| miette::miette!("invalid direct plan {}: {err}", plan_path.display()))?;
+    if direct_plan.version != DIRECT_PLAN_VERSION {
+        return Err(miette::miette!(
+            "unsupported direct plan version {} in {}; expected {}",
+            direct_plan.version,
+            plan_path.display(),
+            DIRECT_PLAN_VERSION
+        ));
+    }
+    let mesh_plan_path = plan_root.join(&direct_plan.mesh_provision_plan);
+    let mesh_raw = fs::read_to_string(&mesh_plan_path)
+        .map_err(|err| miette::miette!("failed to read {}: {err}", mesh_plan_path.display()))?;
+    let mesh_plan: MeshProvisionPlan = serde_json::from_str(&mesh_raw).map_err(|err| {
+        miette::miette!(
+            "invalid mesh provision plan {}: {err}",
+            mesh_plan_path.display()
+        )
+    })?;
+    Ok(DirectRuntimeInputs {
+        plan_root,
+        direct_plan,
+        mesh_plan,
+    })
+}
+
+fn direct_process_preview(
+    spec: ProcessSpec,
+    role: &str,
+    component: Option<&str>,
+    network_override: Option<&str>,
+    resolved_process: Option<DirectResolvedProcessPreview>,
+) -> DirectLaunchProcessPreview {
+    let mut argv = Vec::with_capacity(1 + spec.args.len());
+    argv.push(spec.program.clone());
+    argv.extend(spec.args.clone());
+    DirectLaunchProcessPreview {
+        role: role.to_string(),
+        component: component.map(ToOwned::to_owned),
+        name: spec.name,
+        argv,
+        env: spec.env,
+        current_dir: spec.work_dir.display().to_string(),
+        sandbox: match spec.sandbox {
+            ProcessSandbox::Sandboxed => "sandboxed",
+            ProcessSandbox::Unsandboxed => "unsandboxed",
+        }
+        .to_string(),
+        network: network_override
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| direct_process_network_label(spec.network)),
+        writable_dirs: spec
+            .writable_dirs
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        bind_dirs: spec
+            .bind_dirs
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        bind_mounts: spec
+            .bind_mounts
+            .into_iter()
+            .map(|mount| DirectMountPreview {
+                source: mount.source.display().to_string(),
+                dest: mount.dest.display().to_string(),
+            })
+            .collect(),
+        hidden_paths: spec
+            .hidden_paths
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        #[cfg(target_os = "linux")]
+        read_only_mounts: spec
+            .read_only_mounts
+            .into_iter()
+            .map(|mount| DirectMountPreview {
+                source: mount.source.display().to_string(),
+                dest: mount.dest.display().to_string(),
+            })
+            .collect(),
+        resolved_process,
+    }
+}
+
+fn direct_process_network_label(network: ProcessNetwork) -> String {
+    match network {
+        ProcessNetwork::Host => "host".to_string(),
+        #[cfg(target_os = "linux")]
+        ProcessNetwork::Isolated => "isolated".to_string(),
+        #[cfg(target_os = "linux")]
+        ProcessNetwork::Join(_) => "join_component_sidecar".to_string(),
+    }
+}
+
+fn direct_program_network_override() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        "join_component_sidecar"
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "host"
+    }
+}
+
+fn direct_resolved_process_preview(
+    env_map: &BTreeMap<String, String>,
+) -> Result<DirectResolvedProcessPreview> {
+    let plan = amber_helper::build_run_plan(env_map.iter().map(|(key, value)| {
+        (
+            std::ffi::OsString::from(key),
+            std::ffi::OsString::from(value),
+        )
+    }))
+    .map_err(|err| miette::miette!("failed to build helper-runner preview: {err}"))?;
+    Ok(DirectResolvedProcessPreview {
+        argv: plan.entrypoint,
+        env: plan
+            .env
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>(),
+        docker_mount_proxies: plan
+            .docker_mount_proxies
+            .into_iter()
+            .map(|(path, tcp_host, tcp_port)| DirectDockerMountProxyPreview {
+                path,
+                tcp_host,
+                tcp_port,
+            })
+            .collect(),
+    })
 }
 
 fn direct_storage_bind_mounts(
@@ -1859,6 +3168,123 @@ fn direct_storage_bind_mounts(
         });
     }
     Ok(mounts)
+}
+
+fn component_local_target_ports(
+    component: &DirectComponentPlan,
+    runtime_root: &Path,
+) -> Result<BTreeSet<u16>> {
+    let config = read_mesh_config_public(&runtime_root.join(&component.sidecar.mesh_config_path))?;
+    Ok(config
+        .inbound
+        .into_iter()
+        .filter_map(|route| match route.target {
+            InboundTarget::Local { port } => Some(port),
+            _ => None,
+        })
+        .collect())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn wait_for_component_local_targets(
+    component: &DirectComponentPlan,
+    runtime_root: &Path,
+    _sidecar_pid: Option<u32>,
+    timeout: Duration,
+) -> Result<()> {
+    for port in component_local_target_ports(component, runtime_root)? {
+        wait_for_stable_endpoint(SocketAddr::from(([127, 0, 0, 1], port)), timeout).map_err(
+            |err| {
+                miette::miette!(
+                    "local target 127.0.0.1:{} for component {} did not become ready: {err}",
+                    port,
+                    component.moniker
+                )
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_component_local_targets(
+    component: &DirectComponentPlan,
+    runtime_root: &Path,
+    sidecar_pid: Option<u32>,
+    timeout: Duration,
+) -> Result<()> {
+    let ports = component_local_target_ports(component, runtime_root)?;
+    if ports.is_empty() {
+        return Ok(());
+    }
+    let sidecar_pid = sidecar_pid.ok_or_else(|| {
+        miette::miette!(
+            "missing sidecar pid while waiting for component {} local targets",
+            component.moniker
+        )
+    })?;
+    let namespace_join = prepare_linux_namespace_join(sidecar_pid)?;
+    let amber_cli = env::current_exe()
+        .into_diagnostic()
+        .wrap_err("failed to locate current amber binary for direct local probe")?;
+    let deadline = Instant::now() + timeout;
+    for port in ports {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(miette::miette!(
+                "local target 127.0.0.1:{port} for component {} did not become ready within {:?}",
+                component.moniker,
+                timeout
+            ));
+        }
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let mut command = TokioCommand::new(&amber_cli);
+        command
+            .arg("run-direct-local-probe")
+            .arg(addr.to_string())
+            .arg("--timeout-ms")
+            .arg(remaining.as_millis().to_string());
+        if let Some(namespace_join) = namespace_join.clone() {
+            unsafe {
+                command.pre_exec(move || enter_linux_namespaces(&namespace_join));
+            }
+        }
+        let status = command.status().await.into_diagnostic().wrap_err_with(|| {
+            format!(
+                "failed to start direct local readiness probe for component {}",
+                component.moniker
+            )
+        })?;
+        if !status.success() {
+            return Err(miette::miette!(
+                "local target {} for component {} did not become ready (status: {})",
+                addr,
+                component.moniker,
+                status
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn wait_for_direct_mesh_endpoints(
+    runtime_state: &DirectRuntimeState,
+    timeout: Duration,
+) -> Result<()> {
+    let mut ports = BTreeSet::new();
+    if let Some(port) = runtime_state.router_mesh_port {
+        ports.insert(port);
+    }
+    ports.extend(runtime_state.component_mesh_port_by_id.values().copied());
+
+    for port in ports {
+        wait_for_stable_endpoint(SocketAddr::from(([127, 0, 0, 1], port)), timeout).map_err(
+            |err| {
+                miette::miette!("direct mesh endpoint 127.0.0.1:{port} did not become ready: {err}")
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn append_runtime_template_context_env(
@@ -2006,6 +3432,7 @@ fn split_entrypoint(entrypoint: &[String]) -> Result<(String, Vec<String>)> {
     Ok((program.clone(), entrypoint[1..].to_vec()))
 }
 
+#[cfg(target_os = "linux")]
 fn component_source_dir(component: &DirectComponentPlan) -> Result<Option<PathBuf>> {
     let Some(raw) = component.source_dir.as_deref() else {
         return Ok(None);
@@ -2021,6 +3448,7 @@ fn component_source_dir(component: &DirectComponentPlan) -> Result<Option<PathBu
     Ok(Some(path))
 }
 
+#[cfg(target_os = "linux")]
 fn component_program_read_only_mounts(
     component: &DirectComponentPlan,
     source_dir: Option<&Path>,
@@ -2054,6 +3482,7 @@ fn component_program_read_only_mounts(
     Ok(mounts.into_values().collect())
 }
 
+#[cfg(target_os = "linux")]
 fn component_execution_program_path(component: &DirectComponentPlan) -> Result<Option<String>> {
     match &component.program.execution {
         DirectProgramExecutionPlan::Direct { entrypoint, .. } => Ok(entrypoint.first().cloned()),
@@ -2073,6 +3502,7 @@ fn component_execution_program_path(component: &DirectComponentPlan) -> Result<O
     }
 }
 
+#[cfg(target_os = "linux")]
 fn decode_entrypoint_payload_program(raw_b64: &str) -> Result<String> {
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(raw_b64.as_bytes())
@@ -2085,6 +3515,7 @@ fn decode_entrypoint_payload_program(raw_b64: &str) -> Result<String> {
         .ok_or_else(|| miette::miette!("entrypoint payload is empty"))
 }
 
+#[cfg(target_os = "linux")]
 fn decode_template_spec_program(raw_b64: &str) -> Result<String> {
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(raw_b64.as_bytes())
@@ -2099,6 +3530,7 @@ fn decode_template_spec_program(raw_b64: &str) -> Result<String> {
     render_program_arg_template_literal(path_template)
 }
 
+#[cfg(target_os = "linux")]
 fn render_program_arg_template_literal(arg: &ProgramArgTemplate) -> Result<String> {
     let ProgramArgTemplate::Arg(parts) = arg else {
         return Err(miette::miette!(
@@ -2108,6 +3540,7 @@ fn render_program_arg_template_literal(arg: &ProgramArgTemplate) -> Result<Strin
     render_template_string_literal(parts)
 }
 
+#[cfg(target_os = "linux")]
 fn render_template_string_literal(parts: &[TemplatePart]) -> Result<String> {
     let mut out = String::new();
     for part in parts {
@@ -2290,11 +3723,24 @@ async fn spawn_managed_process(
     children: &mut Vec<ManagedChild>,
     log_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> Result<u32> {
-    let (program, args) = sandbox.wrap_command(&spec)?;
+    let (program, args) = match spec.sandbox {
+        ProcessSandbox::Sandboxed => sandbox.wrap_command(&spec)?,
+        ProcessSandbox::Unsandboxed => {
+            #[cfg(target_os = "linux")]
+            if !matches!(spec.network, ProcessNetwork::Host) {
+                return Err(miette::miette!(
+                    "unsandboxed direct processes must use host networking"
+                ));
+            }
+            (spec.program.clone(), spec.args.clone())
+        }
+    };
     #[cfg(target_os = "linux")]
     let mut args = args;
     #[cfg(target_os = "linux")]
-    let namespace_join = if matches!(sandbox, DirectSandbox::Bubblewrap { .. }) {
+    let namespace_join = if matches!(spec.sandbox, ProcessSandbox::Sandboxed)
+        && matches!(sandbox, DirectSandbox::Bubblewrap { .. })
+    {
         match spec.network {
             ProcessNetwork::Join(pid) => prepare_linux_namespace_join(pid)?,
             _ => None,
@@ -2303,8 +3749,8 @@ async fn spawn_managed_process(
         None
     };
     #[cfg(target_os = "linux")]
-    let pid_capture = if matches!(sandbox, DirectSandbox::Bubblewrap { .. })
-        && matches!(spec.network, ProcessNetwork::Isolated)
+    let pid_capture = if matches!(spec.sandbox, ProcessSandbox::Sandboxed)
+        && matches!(sandbox, DirectSandbox::Bubblewrap { .. })
     {
         insert_bubblewrap_info_fd(&mut args, 3)?;
         SpawnPidCapture::BubblewrapChild
@@ -2336,6 +3782,7 @@ enum SpawnPidCapture {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone)]
 struct LinuxNamespaceJoin {
     user: Option<CString>,
     net: Option<CString>,
@@ -2423,49 +3870,61 @@ async fn spawn_managed_command(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
-    let mut child = command
+    let mut wrapper = command
         .spawn()
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to spawn process {name}"))?;
 
     #[cfg(target_os = "linux")]
-    let pid = if let Some(pipe) = bubblewrap_info_pipe {
+    let managed_pid = if let Some(pipe) = bubblewrap_info_pipe {
         match read_bubblewrap_child_pid(pipe).await {
             Ok(pid) => pid,
             Err(err) => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                let _ = wrapper.start_kill();
+                let _ = wrapper.wait().await;
                 return Err(err).wrap_err_with(|| {
                     format!("failed to capture bubblewrap child pid for {name}")
                 });
             }
         }
     } else {
-        child
+        wrapper
             .id()
             .ok_or_else(|| miette::miette!("failed to capture process id for {name}"))?
     };
 
     #[cfg(not(target_os = "linux"))]
-    let pid = child
+    let managed_pid = wrapper
         .id()
         .ok_or_else(|| miette::miette!("failed to capture process id for {name}"))?;
 
-    if let Some(stdout) = child.stdout.take() {
+    #[cfg(target_os = "linux")]
+    let wrapper_pid = wrapper
+        .id()
+        .ok_or_else(|| miette::miette!("failed to capture process id for {name}"))?;
+
+    if let Some(stdout) = wrapper.stdout.take() {
         let name = name.clone();
         log_tasks.push(tokio::spawn(async move {
             stream_logs(stdout, name, false).await;
         }));
     }
-    if let Some(stderr) = child.stderr.take() {
+    if let Some(stderr) = wrapper.stderr.take() {
         let name = name.clone();
         log_tasks.push(tokio::spawn(async move {
             stream_logs(stderr, name, true).await;
         }));
     }
 
-    children.push(ManagedChild { name, child });
-    Ok(pid)
+    children.push(ManagedChild {
+        name,
+        wrapper: Some(wrapper),
+        #[cfg(target_os = "linux")]
+        wrapper_pid,
+        #[cfg(target_os = "linux")]
+        managed_pid,
+    });
+    Ok(managed_pid)
 }
 
 #[cfg(target_os = "linux")]
@@ -2587,24 +4046,63 @@ fn enter_linux_namespace(
 #[cfg(target_os = "linux")]
 async fn read_bubblewrap_child_pid(pipe: BubblewrapInfoPipe) -> Result<u32> {
     drop(pipe.write);
+    set_fd_nonblocking(pipe.read.as_raw_fd())?;
     let read = pipe.read;
-    let raw = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::task::spawn_blocking(move || -> Result<String> {
-            let mut file: fs::File = read.into();
-            let mut raw = String::new();
-            file.read_to_string(&mut raw)
-                .into_diagnostic()
-                .wrap_err("failed to read bubblewrap info payload")?;
-            Ok(raw)
-        }),
-    )
+    tokio::task::spawn_blocking(move || -> Result<u32> {
+        let mut file: fs::File = read.into();
+        let mut raw = String::new();
+        let mut buffer = [0_u8; 512];
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) => {
+                    return parse_bubblewrap_child_pid(raw.as_str()).wrap_err(
+                        "bubblewrap info payload ended before a child pid was available",
+                    );
+                }
+                Ok(read) => {
+                    raw.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                    if let Ok(pid) = parse_bubblewrap_child_pid(raw.as_str()) {
+                        return Ok(pid);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(miette::miette!(
+                            "timed out waiting for bubblewrap info payload"
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(err) => {
+                    return Err(err)
+                        .into_diagnostic()
+                        .wrap_err("failed to read bubblewrap info payload");
+                }
+            }
+        }
+    })
     .await
     .into_diagnostic()
-    .wrap_err("timed out waiting for bubblewrap info payload")?
-    .into_diagnostic()
-    .wrap_err("bubblewrap info reader task failed")??;
-    parse_bubblewrap_child_pid(raw.as_str())
+    .wrap_err("bubblewrap info reader task failed")?
+}
+
+#[cfg(target_os = "linux")]
+fn set_fd_nonblocking(fd: RawFd) -> Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(miette::miette!(
+            "failed to read descriptor flags: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(miette::miette!(
+            "failed to make descriptor nonblocking: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -2630,7 +4128,7 @@ async fn spawn_component_slirp4netns(
     children: &mut Vec<ManagedChild>,
     log_tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> Result<()> {
-    let slirp_root = runtime_root.join("network/slirp4netns");
+    let slirp_root = direct_slirp4netns_root();
     fs::create_dir_all(&slirp_root)
         .into_diagnostic()
         .wrap_err_with(|| {
@@ -2639,7 +4137,7 @@ async fn spawn_component_slirp4netns(
                 slirp_root.display()
             )
         })?;
-    let api_socket_path = slirp_root.join(format!("c{}.sock", component.id));
+    let api_socket_path = direct_slirp4netns_api_socket_path(runtime_root, component.id);
     if api_socket_path.exists() {
         fs::remove_file(&api_socket_path)
             .into_diagnostic()
@@ -2683,6 +4181,20 @@ async fn spawn_component_slirp4netns(
                 log_name
             )
         })
+}
+
+#[cfg(target_os = "linux")]
+fn direct_slirp4netns_root() -> PathBuf {
+    env::temp_dir().join("amber-direct-slirp4netns")
+}
+
+#[cfg(target_os = "linux")]
+fn direct_slirp4netns_api_socket_path(runtime_root: &Path, component_id: usize) -> PathBuf {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    runtime_root.hash(&mut hasher);
+    component_id.hash(&mut hasher);
+    let suffix = hasher.finish();
+    direct_slirp4netns_root().join(format!("c{component_id}-{suffix:016x}.sock"))
 }
 
 #[cfg(target_os = "linux")]
@@ -2832,7 +4344,43 @@ async fn supervise_children(children: &mut [ManagedChild]) -> Result<(RuntimeExi
             }
             _ = sleep(DIRECT_CHILD_POLL_INTERVAL) => {
                 for child in children.iter_mut() {
-                    if let Some(status) = child.child.try_wait().into_diagnostic()? {
+                    #[cfg(target_os = "linux")]
+                    if let Some(wrapper) = child.wrapper.as_mut()
+                        && let Some(status) = wrapper.try_wait().into_diagnostic()?
+                    {
+                        child.wrapper = None;
+                        if child.wrapper_pid == child.managed_pid
+                            || !linux_pid_is_alive(child.managed_pid)
+                        {
+                            let exit_code = if status.success() {
+                                0
+                            } else {
+                                status.code().unwrap_or(1).max(1)
+                            };
+                            return Ok((
+                                RuntimeExitReason::ChildExited {
+                                    name: child.name.clone(),
+                                    status,
+                                },
+                                exit_code,
+                            ));
+                        }
+                    }
+                    #[cfg(target_os = "linux")]
+                    if child.wrapper.is_none() && !linux_pid_is_alive(child.managed_pid) {
+                        let status = synthetic_failure_exit_status();
+                        return Ok((
+                            RuntimeExitReason::ChildExited {
+                                name: child.name.clone(),
+                                status,
+                            },
+                            1,
+                        ));
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    if let Some(wrapper) = child.wrapper.as_mut()
+                        && let Some(status) = wrapper.try_wait().into_diagnostic()?
+                    {
                         let exit_code = if status.success() {
                             0
                         } else {
@@ -2854,18 +4402,21 @@ async fn supervise_children(children: &mut [ManagedChild]) -> Result<(RuntimeExi
 
 async fn terminate_children(children: &mut [ManagedChild]) {
     for child in children.iter_mut() {
-        if child.child.try_wait().ok().flatten().is_some() {
-            continue;
+        #[cfg(target_os = "linux")]
+        {
+            if linux_pid_is_alive(child.managed_pid) {
+                let _ = send_sigterm(child.managed_pid);
+            }
+            if child.wrapper_pid != child.managed_pid {
+                let _ = send_sigterm(child.wrapper_pid);
+            }
         }
-        if let Some(pid) = child.child.id() {
-            #[cfg(unix)]
-            {
-                let _ = send_sigterm(pid);
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = child.child.start_kill();
-            }
+        #[cfg(not(target_os = "linux"))]
+        if let Some(wrapper) = child.wrapper.as_mut()
+            && wrapper.try_wait().ok().flatten().is_none()
+            && let Some(pid) = wrapper.id()
+        {
+            let _ = send_sigterm(pid);
         }
     }
 
@@ -2873,7 +4424,26 @@ async fn terminate_children(children: &mut [ManagedChild]) {
     loop {
         let mut all_exited = true;
         for child in children.iter_mut() {
-            if child.child.try_wait().ok().flatten().is_none() {
+            #[cfg(target_os = "linux")]
+            if let Some(wrapper) = child.wrapper.as_mut()
+                && wrapper.try_wait().ok().flatten().is_some()
+            {
+                child.wrapper = None;
+            }
+            #[cfg(target_os = "linux")]
+            if linux_pid_is_alive(child.managed_pid) {
+                all_exited = false;
+            }
+            #[cfg(target_os = "linux")]
+            if child.wrapper.is_some() {
+                all_exited = false;
+            }
+            #[cfg(not(target_os = "linux"))]
+            if child
+                .wrapper
+                .as_mut()
+                .is_some_and(|wrapper| wrapper.try_wait().ok().flatten().is_none())
+            {
                 all_exited = false;
             }
         }
@@ -2884,12 +4454,26 @@ async fn terminate_children(children: &mut [ManagedChild]) {
     }
 
     for child in children.iter_mut() {
-        if child.child.try_wait().ok().flatten().is_none() {
-            let _ = child.child.start_kill();
+        #[cfg(target_os = "linux")]
+        {
+            if linux_pid_is_alive(child.managed_pid) {
+                let _ = kill_pid_force(child.managed_pid);
+            }
+            if child.wrapper_pid != child.managed_pid {
+                let _ = kill_pid_force(child.wrapper_pid);
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        if let Some(wrapper) = child.wrapper.as_mut()
+            && wrapper.try_wait().ok().flatten().is_none()
+        {
+            let _ = wrapper.start_kill();
         }
     }
     for child in children.iter_mut() {
-        let _ = child.child.wait().await;
+        if let Some(mut wrapper) = child.wrapper.take() {
+            let _ = wrapper.wait().await;
+        }
     }
 }
 
@@ -2898,6 +4482,32 @@ fn send_sigterm(pid: u32) -> std::result::Result<(), ()> {
     let pid = i32::try_from(pid).map_err(|_| ())?;
     let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
     if rc == 0 { Ok(()) } else { Err(()) }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pid_is_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(target_os = "linux")]
+fn kill_pid_force(pid: u32) -> std::result::Result<(), ()> {
+    let pid = i32::try_from(pid).map_err(|_| ())?;
+    let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
+    if rc == 0 { Ok(()) } else { Err(()) }
+}
+
+#[cfg(all(target_os = "linux", unix))]
+fn synthetic_failure_exit_status() -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    std::process::ExitStatus::from_raw(1 << 8)
 }
 
 #[derive(Debug)]
@@ -3136,6 +4746,11 @@ impl DirectSandbox {
                 profiles_dir,
                 next_profile_id,
             } => {
+                if !matches!(spec.network, ProcessNetwork::Host) {
+                    return Err(miette::miette!(
+                        "macOS direct runtime does not support non-host process networking"
+                    ));
+                }
                 if spec
                     .bind_mounts
                     .iter()
@@ -3598,7 +5213,69 @@ fn output_dir_for_target(root: &Path, target: &MeshProvisionTarget) -> Result<Pa
 }
 
 async fn proxy(args: ProxyArgs, verbose: u8) -> Result<()> {
-    let mut proxy = ProxyCommand::new(&args.output);
+    if args.site.is_none()
+        && let Some(run_root) =
+            mixed_run::maybe_resolve_run_root(&args.output, args.storage_root.as_deref())?
+    {
+        if args.project_name.is_some()
+            || args.mesh_addr.is_some()
+            || args.router_addr.is_some()
+            || args.router_control_addr.is_some()
+            || args.router_config_b64.is_some()
+            || args.router_config.is_some()
+        {
+            return Err(miette::miette!(
+                "run-scoped `amber proxy <run-id>` does not support site-scoped router overrides; \
+                 pass `--site` to target one internal site explicitly"
+            ));
+        }
+
+        let run_plan: RunPlan = mixed_run::read_json(&run_root.join("run-plan.json"), "run plan")?;
+        let interface = collect_run_interface(&run_plan)?;
+        let mut slot_bindings = BTreeMap::new();
+        for raw in &args.slot {
+            let (slot_name, upstream) = parse_named_socket_addr(raw, "--slot")?;
+            let slot = interface
+                .external_slots
+                .iter()
+                .find(|slot| slot.name == slot_name)
+                .ok_or_else(|| {
+                    miette::miette!(
+                        "run does not declare external slot `{slot_name}`; available external \
+                         slots: {}",
+                        interface
+                            .external_slots
+                            .iter()
+                            .map(|slot| slot.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?;
+            slot_bindings.insert(slot_name, slot_url_from_socket(slot, upstream)?);
+        }
+        let mut export_bindings = BTreeMap::new();
+        for raw in &args.export {
+            let (export_name, listen) = parse_named_socket_addr(raw, "--export")?;
+            export_bindings.insert(export_name, listen);
+        }
+
+        let plan_path =
+            mixed_run::write_run_outside_proxy_plan(&run_root, &slot_bindings, &export_bindings)?;
+        let _ = verbose;
+        return mixed_run::run_outside_proxy(plan_path).await;
+    }
+
+    let run_proxy_target = mixed_run::maybe_resolve_proxy_run_target(
+        &args.output,
+        args.site.as_deref(),
+        args.storage_root.as_deref(),
+    )?;
+    let mut proxy = ProxyCommand::new(
+        run_proxy_target
+            .as_ref()
+            .map(|target| target.artifact_dir.as_path())
+            .unwrap_or_else(|| Path::new(&args.output)),
+    );
     if let Some(project_name) = args.project_name.as_deref() {
         proxy.set_project_name(project_name)?;
     }
@@ -3615,8 +5292,16 @@ async fn proxy(args: ProxyArgs, verbose: u8) -> Result<()> {
     }
     if let Some(router_addr) = args.router_addr {
         proxy.set_router_addr(router_addr);
+    } else if let Some(run_proxy_target) = run_proxy_target.as_ref()
+        && let Some(router_addr) = run_proxy_target.router_addr
+    {
+        proxy.set_router_addr(router_addr);
     }
     if let Some(router_control_addr) = args.router_control_addr.as_deref() {
+        apply_router_control_override(&mut proxy, router_control_addr)?;
+    } else if let Some(run_proxy_target) = run_proxy_target.as_ref()
+        && let Some(router_control_addr) = run_proxy_target.router_control_addr.as_deref()
+    {
         apply_router_control_override(&mut proxy, router_control_addr)?;
     }
     if let Some(config) = load_router_config_optional(&args)? {
@@ -3847,6 +5532,7 @@ fn parse_manifest_ref(input: &str) -> Result<ManifestRef> {
     }
 
     let abs = canonicalize_user_path(Path::new(input), "manifest path")?;
+    let abs = resolve_manifest_entry_path(&abs)?;
     let url = url::Url::from_file_path(&abs)
         .map_err(|_| miette::miette!("could not convert `{}` into a file URL", abs.display()))?;
 
@@ -3926,6 +5612,24 @@ fn load_compiled_scenario_ir(path: &Path) -> Result<Option<CompiledScenario>> {
         .map(Some)
 }
 
+fn is_run_plan_file(path: &Path) -> Result<bool> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+
+    let bytes = fs::read(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read run plan candidate `{}`", path.display()))?;
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+    let Some(obj) = value.as_object() else {
+        return Ok(false);
+    };
+    Ok(obj.get("schema").and_then(serde_json::Value::as_str) == Some(RUN_PLAN_SCHEMA))
+}
+
 fn local_input_path(input: &str) -> Result<Option<PathBuf>> {
     if let Ok(url) = Url::parse(input) {
         if url.scheme() == "file" {
@@ -3954,6 +5658,7 @@ enum ArtifactOutput {
 
 struct OutputPaths {
     primary: Option<PathBuf>,
+    run_plan: Option<PathBuf>,
     dot: Option<ArtifactOutput>,
     docker_compose: Option<PathBuf>,
     metadata: Option<ArtifactOutput>,
@@ -3964,6 +5669,7 @@ struct OutputPaths {
 
 fn ensure_outputs_requested(args: &CompileArgs) -> Result<()> {
     if args.output.is_some()
+        || args.run_plan.is_some()
         || args.dot.is_some()
         || args.docker_compose.is_some()
         || args.metadata.is_some()
@@ -3976,14 +5682,16 @@ fn ensure_outputs_requested(args: &CompileArgs) -> Result<()> {
     }
 
     Err(miette::miette!(
-        help = "Request at least one output with `--output`, `--dot`, `--docker-compose`, \
-                `--metadata`, `--kubernetes`, `--direct`, `--vm`, or `--bundle`.",
+        help = "Request at least one output with `--output`, `--run-plan`, `--dot`, \
+                `--docker-compose`, `--metadata`, `--kubernetes`, `--direct`, `--vm`, or \
+                `--bundle`.",
         "no outputs requested for `amber compile`"
     ))
 }
 
 fn resolve_output_paths(args: &CompileArgs) -> Result<OutputPaths> {
     let primary = args.output.clone();
+    let run_plan = args.run_plan.clone();
     let dot = resolve_optional_output(&args.dot);
     let docker_compose = args.docker_compose.clone();
     let metadata = resolve_optional_output(&args.metadata);
@@ -3993,6 +5701,7 @@ fn resolve_output_paths(args: &CompileArgs) -> Result<OutputPaths> {
 
     let file_outputs = [
         ("primary output", primary.as_deref()),
+        ("run plan output", run_plan.as_deref()),
         ("dot output", artifact_file_path(dot.as_ref())),
         ("metadata output", artifact_file_path(metadata.as_ref())),
     ];
@@ -4057,6 +5766,7 @@ fn resolve_output_paths(args: &CompileArgs) -> Result<OutputPaths> {
 
     Ok(OutputPaths {
         primary,
+        run_plan,
         dot,
         docker_compose,
         metadata,
@@ -4119,6 +5829,27 @@ fn write_primary_output(path: &Path, compiled: &CompiledScenario) -> Result<()> 
         .wrap_err_with(|| format!("failed to write primary output `{}`", path.display()))
 }
 
+fn write_run_plan_output(path: &Path, run_plan: &RunPlan) -> Result<()> {
+    let json = serde_json::to_vec_pretty(run_plan)
+        .map_err(|err| miette::miette!("failed to serialize run plan: {err}"))?;
+    write_artifact(path, &json)
+        .wrap_err_with(|| format!("failed to write run plan output `{}`", path.display()))
+}
+
+fn load_placement_file(path: Option<&Path>) -> Result<Option<PlacementFile>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let path = canonicalize_user_path(path, "placement file")?;
+    let contents = fs::read_to_string(&path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read placement file `{}`", path.display()))?;
+    parse_placement_file(&contents)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("invalid placement file `{}`", path.display()))
+        .map(Some)
+}
+
 fn write_artifact(path: &Path, contents: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -4133,40 +5864,20 @@ fn write_artifact(path: &Path, contents: &[u8]) -> Result<()> {
         .wrap_err_with(|| format!("failed to write `{}`", path.display()))
 }
 
-fn write_docker_compose_output(
-    root: &Path,
-    artifact: &amber_compiler::reporter::docker_compose::DockerComposeArtifact,
-) -> Result<()> {
+fn write_unmanaged_export_output(root: &Path, run_plan: &RunPlan, kind: SiteKind) -> Result<()> {
+    let export = build_unmanaged_export(run_plan, kind)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to derive unmanaged {} export from the resolved run plan",
+                unmanaged_export_label(kind)
+            )
+        })?;
     write_directory_output(
         root,
-        "docker compose output directory",
-        &artifact.files,
-        None,
-    )
-}
-
-fn write_kubernetes_output(
-    root: &Path,
-    artifact: &amber_compiler::reporter::kubernetes::KubernetesArtifact,
-) -> Result<()> {
-    write_directory_output(root, "kubernetes output directory", &artifact.files, None)
-}
-
-fn write_direct_output(root: &Path, artifact: &DirectArtifact) -> Result<()> {
-    write_directory_output(
-        root,
-        "direct output directory",
-        &artifact.files,
-        Some(Path::new(RUN_SCRIPT_FILENAME)),
-    )
-}
-
-fn write_vm_output(root: &Path, artifact: &VmArtifact) -> Result<()> {
-    write_directory_output(
-        root,
-        "vm output directory",
-        &artifact.files,
-        Some(Path::new(RUN_SCRIPT_FILENAME)),
+        unmanaged_export_output_dir_label(kind),
+        &export.files,
+        unmanaged_export_executable_rel_path(kind),
     )
 }
 
@@ -4219,6 +5930,31 @@ fn write_directory_output(
     }
 
     Ok(())
+}
+
+fn unmanaged_export_label(kind: SiteKind) -> &'static str {
+    match kind {
+        SiteKind::Compose => "docker-compose",
+        SiteKind::Kubernetes => "kubernetes",
+        SiteKind::Direct => "direct",
+        SiteKind::Vm => "vm",
+    }
+}
+
+fn unmanaged_export_output_dir_label(kind: SiteKind) -> &'static str {
+    match kind {
+        SiteKind::Compose => "docker compose output directory",
+        SiteKind::Kubernetes => "kubernetes output directory",
+        SiteKind::Direct => "direct output directory",
+        SiteKind::Vm => "vm output directory",
+    }
+}
+
+fn unmanaged_export_executable_rel_path(kind: SiteKind) -> Option<&'static Path> {
+    match kind {
+        SiteKind::Direct | SiteKind::Vm => Some(Path::new(RUN_SCRIPT_FILENAME)),
+        SiteKind::Compose | SiteKind::Kubernetes => None,
+    }
 }
 
 #[cfg(test)]
@@ -4288,6 +6024,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn component_program_read_only_mounts_resolve_parent_escape_paths() {
         let component = DirectComponentPlan {
@@ -4579,8 +6316,8 @@ mod tests {
             router: None,
         };
 
-        let runtime_state =
-            assign_direct_runtime_ports(temp.path(), &direct_plan).expect("ports should assign");
+        let runtime_state = assign_direct_runtime_ports(temp.path(), &direct_plan, None)
+            .expect("ports should assign");
         let rewritten =
             read_mesh_config_public(&mesh_config_path).expect("mesh config should be rewritten");
         let runtime_ports = runtime_state
@@ -4733,15 +6470,29 @@ mod tests {
             .expect("child should spawn");
         let mut children = vec![ManagedChild {
             name: "partial-startup-child".to_string(),
-            child,
+            wrapper: Some(child),
+            #[cfg(target_os = "linux")]
+            wrapper_pid: 0,
+            #[cfg(target_os = "linux")]
+            managed_pid: 0,
         }];
+        #[cfg(target_os = "linux")]
+        {
+            let pid = children[0]
+                .wrapper
+                .as_ref()
+                .and_then(tokio::process::Child::id)
+                .expect("child pid should be available");
+            children[0].wrapper_pid = pid;
+            children[0].managed_pid = pid;
+        }
 
         cleanup_direct_runtime(
             &mut children,
             Vec::new(),
             &runtime_state_path,
             Some(&control_socket_paths),
-            runtime_dir,
+            Some(runtime_dir),
         )
         .await;
 
@@ -4771,14 +6522,9 @@ mod tests {
             "runtime workspace should be removed"
         );
 
-        let status = children[0]
-            .child
-            .wait()
-            .await
-            .expect("child should be reaped after cleanup");
         assert!(
-            !status.success(),
-            "cleanup should terminate partial-startup child"
+            children[0].wrapper.is_none(),
+            "cleanup should reap partial-startup child"
         );
     }
 
@@ -4792,8 +6538,22 @@ mod tests {
             .expect("child should spawn");
         let mut children = vec![ManagedChild {
             name: "ok-child".to_string(),
-            child,
+            wrapper: Some(child),
+            #[cfg(target_os = "linux")]
+            wrapper_pid: 0,
+            #[cfg(target_os = "linux")]
+            managed_pid: 0,
         }];
+        #[cfg(target_os = "linux")]
+        {
+            let pid = children[0]
+                .wrapper
+                .as_ref()
+                .and_then(tokio::process::Child::id)
+                .expect("child pid should be available");
+            children[0].wrapper_pid = pid;
+            children[0].managed_pid = pid;
+        }
 
         let (reason, exit_code) = supervise_children(&mut children)
             .await
@@ -4818,8 +6578,22 @@ mod tests {
             .expect("child should spawn");
         let mut children = vec![ManagedChild {
             name: "fail-child".to_string(),
-            child,
+            wrapper: Some(child),
+            #[cfg(target_os = "linux")]
+            wrapper_pid: 0,
+            #[cfg(target_os = "linux")]
+            managed_pid: 0,
         }];
+        #[cfg(target_os = "linux")]
+        {
+            let pid = children[0]
+                .wrapper
+                .as_ref()
+                .and_then(tokio::process::Child::id)
+                .expect("child pid should be available");
+            children[0].wrapper_pid = pid;
+            children[0].managed_pid = pid;
+        }
 
         let (reason, exit_code) = supervise_children(&mut children)
             .await
@@ -4857,7 +6631,9 @@ mod tests {
             args: vec!["ok".to_string()],
             env: BTreeMap::new(),
             work_dir: PathBuf::from("/tmp/amber-work"),
+            sandbox: ProcessSandbox::Sandboxed,
             drop_all_caps: false,
+            #[cfg(target_os = "linux")]
             read_only_mounts: Vec::new(),
             writable_dirs: Vec::new(),
             bind_dirs: Vec::new(),

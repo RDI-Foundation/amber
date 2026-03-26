@@ -1,0 +1,43 @@
+{
+  manifest_version: "0.3.0",
+
+  config_schema: {
+    type: "object",
+    properties: {
+      tenant: { type: "string" },
+      catalog_token: { type: "string", secret: true },
+    },
+    required: ["tenant", "catalog_token"],
+    additionalProperties: false,
+  },
+
+  slots: {
+    catalog_api: { kind: "http" },
+  },
+
+  components: {
+    web: {
+      manifest: "./web.json5",
+      config: {
+        tenant: "${config.tenant}",
+      },
+    },
+    api: {
+      manifest: "./api.json5",
+      config: {
+        tenant: "${config.tenant}",
+        catalog_token: "${config.catalog_token}",
+      },
+    },
+  },
+
+  bindings: [
+    { to: "#web.api", from: "#api.http" },
+    { to: "#api.catalog_api", from: "slots.catalog_api", weak: true },
+  ],
+
+  exports: {
+    app: "#web.http",
+    api: "#api.http",
+  },
+}

@@ -1,0 +1,36 @@
+{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      tenant: { type: "string" },
+      catalog_token: { type: "string", secret: true },
+    },
+    required: ["tenant", "catalog_token"],
+    additionalProperties: false,
+  },
+  slots: {
+    catalog_api: { kind: "http" },
+  },
+  program: {
+    image: "python:3.13-alpine",
+    entrypoint: ["python3", "-u", "-c", { file: "./api.py" }],
+    env: {
+      PORT: "8080",
+      TENANT: "${config.tenant}",
+      CATALOG_TOKEN: "${config.catalog_token}",
+      CATALOG_API_URL: "${slots.catalog_api.url}",
+    },
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" },
+      ],
+    },
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" },
+  },
+  exports: {
+    http: "http",
+  },
+}

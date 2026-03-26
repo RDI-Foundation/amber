@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -10,7 +11,47 @@ mod example_catalog;
 #[test]
 fn examples_check_deny_warnings() {
     let examples_dir = examples_dir();
-    let mut manifests: Vec<PathBuf> = collect_examples()
+    let examples = collect_examples();
+    for example in &examples {
+        assert!(
+            !example.summary.trim().is_empty(),
+            "example {} should have a non-empty summary",
+            example.name
+        );
+        assert!(
+            example.dir.starts_with(&examples_dir),
+            "example {} dir {} should live under {}",
+            example.name,
+            example.dir.display(),
+            examples_dir.display()
+        );
+        assert!(
+            example.dir.is_dir(),
+            "example {} dir {} should exist",
+            example.name,
+            example.dir.display()
+        );
+        assert!(
+            !example.files.is_empty(),
+            "example {} should contain at least one non-README file",
+            example.name
+        );
+        for file in &example.files {
+            assert!(
+                file.starts_with(&example.dir),
+                "example file {} should live under {}",
+                file.display(),
+                example.dir.display()
+            );
+            assert!(
+                file.is_file(),
+                "example file {} should exist",
+                file.display()
+            );
+        }
+    }
+
+    let mut manifests: Vec<PathBuf> = examples
         .into_iter()
         .map(|example| example.root_manifest)
         .collect();
@@ -131,7 +172,7 @@ fn example_backend(example: &example_catalog::Example) -> ExampleBackend {
         ExampleBackend::Direct
     } else if example.name == "vm-network-storage" {
         ExampleBackend::Vm
-    } else if example.name == "interpolation" {
+    } else if matches!(example.name.as_str(), "interpolation" | "mixed-site") {
         ExampleBackend::CheckOnly
     } else {
         ExampleBackend::DockerCompose
@@ -270,6 +311,13 @@ fn collect_scenario_variants(dir: &Path) -> Vec<PathBuf> {
             let entry = entry
                 .unwrap_or_else(|err| panic!("failed to read {} entry: {err}", path.display()));
             let entry_path = entry.path();
+            if entry_path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with('.'))
+            {
+                continue;
+            }
             if entry_path.is_dir() {
                 stack.push(entry_path);
                 continue;
@@ -288,4 +336,20 @@ fn collect_scenario_variants(dir: &Path) -> Vec<PathBuf> {
 
     manifests.sort();
     manifests
+}
+
+#[test]
+fn collect_scenario_variants_skips_hidden_runtime_state() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let visible = temp.path().join("visible");
+    let hidden = temp.path().join(".amber-runs");
+    fs::create_dir_all(&visible).expect("visible dir should be created");
+    fs::create_dir_all(&hidden).expect("hidden dir should be created");
+    fs::write(visible.join("scenario-v2.json5"), "{}").expect("visible scenario should be written");
+    fs::write(hidden.join("scenario-v2.json5"), "{}").expect("hidden scenario should be written");
+
+    assert_eq!(
+        collect_scenario_variants(temp.path()),
+        vec![visible.join("scenario-v2.json5")]
+    );
 }

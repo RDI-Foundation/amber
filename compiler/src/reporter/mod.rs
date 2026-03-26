@@ -84,6 +84,13 @@ impl CompiledScenario {
         &self.scenario_ir
     }
 
+    pub fn derive_from_ir(&self, scenario_ir: ScenarioIr) -> Result<Self, CompiledScenarioError> {
+        let mut compiled = Self::from_ir(scenario_ir)?;
+        compiled.resolved_urls = self.resolved_urls.clone();
+        compiled.source_context = self.source_context.clone();
+        Ok(compiled)
+    }
+
     pub(crate) fn config_analysis(&self) -> &ScenarioConfigAnalysis {
         &self.config_analysis
     }

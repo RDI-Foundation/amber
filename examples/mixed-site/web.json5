@@ -1,0 +1,34 @@
+{
+  manifest_version: "0.3.0",
+  config_schema: {
+    type: "object",
+    properties: {
+      tenant: { type: "string" },
+    },
+    required: ["tenant"],
+    additionalProperties: false,
+  },
+  slots: {
+    api: { kind: "http" },
+  },
+  program: {
+    path: "/usr/bin/env",
+    args: ["python3", "-u", "-c", { file: "./web.py" }],
+    env: {
+      PORT: "8080",
+      TENANT: "${config.tenant}",
+      API_URL: "${slots.api.url}",
+    },
+    network: {
+      endpoints: [
+        { name: "http", port: 8080, protocol: "http" },
+      ],
+    },
+  },
+  provides: {
+    http: { kind: "http", endpoint: "http" },
+  },
+  exports: {
+    http: "http",
+  },
+}

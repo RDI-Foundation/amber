@@ -5,7 +5,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct Example {
     pub(crate) name: String,
@@ -82,6 +81,13 @@ fn collect_example_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
                 )
             })?;
             let entry_path = entry.path();
+            if entry_path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with('.'))
+            {
+                continue;
+            }
             if entry_path.is_dir() {
                 stack.push(entry_path);
             } else if entry_path.is_file()
@@ -138,6 +144,13 @@ fn collect_root_manifests(dir: &Path) -> Result<Vec<PathBuf>, String> {
                 )
             })?;
             let entry_path = entry.path();
+            if entry_path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with('.'))
+            {
+                continue;
+            }
             if entry_path.is_dir() {
                 stack.push(entry_path);
             }

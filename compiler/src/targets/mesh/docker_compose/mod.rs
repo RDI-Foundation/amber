@@ -53,6 +53,7 @@ use crate::{
 };
 
 const MESH_NETWORK_NAME: &str = "amber_mesh";
+const BOUNDARY_NETWORK_NAME: &str = "amber_boundary";
 
 const ROUTER_SERVICE_NAME: &str = "amber-router";
 const ROUTER_CONTROL_INIT_SERVICE_NAME: &str = "amber-router-control-init";
@@ -165,6 +166,8 @@ struct EmptyMap {}
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct Network {
     driver: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    internal: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -229,6 +232,10 @@ impl Service {
             ..Default::default()
         }
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -578,6 +585,9 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
         .networks
         .insert(MESH_NETWORK_NAME.to_string(), EmptyMap::default());
     otelcol_service
+        .networks
+        .insert(BOUNDARY_NETWORK_NAME.to_string(), EmptyMap::default());
+    otelcol_service
         .extra_hosts
         .push(HOST_GATEWAY_ENTRY.to_string());
     otelcol_service.volumes.push(format!(
@@ -635,6 +645,9 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
         router_service
             .networks
             .insert(MESH_NETWORK_NAME.to_string(), EmptyMap::default());
+        router_service
+            .networks
+            .insert(BOUNDARY_NETWORK_NAME.to_string(), EmptyMap::default());
         if !exports_by_name.is_empty() {
             router_service
                 .ports
@@ -878,6 +891,14 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
         MESH_NETWORK_NAME.to_string(),
         Network {
             driver: "bridge".to_string(),
+            internal: true,
+        },
+    );
+    compose.networks.insert(
+        BOUNDARY_NETWORK_NAME.to_string(),
+        Network {
+            driver: "bridge".to_string(),
+            internal: false,
         },
     );
 

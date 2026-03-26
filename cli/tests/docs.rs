@@ -88,6 +88,19 @@ fn docs_examples_dumps_example_files_with_paths() {
         .into_iter()
         .find(|example| example.name == "reexport")
         .expect("expected reexport example");
+    assert!(
+        example.dir.starts_with(workspace_root.join("examples")),
+        "example dir {} should live under {}",
+        example.dir.display(),
+        workspace_root.join("examples").display()
+    );
+    assert_eq!(
+        example.root_manifest.parent(),
+        Some(example.dir.as_path()),
+        "root manifest {} should live in example dir {}",
+        example.root_manifest.display(),
+        example.dir.display()
+    );
 
     let mut expected = String::new();
     for (index, file) in example.files.iter().enumerate() {
