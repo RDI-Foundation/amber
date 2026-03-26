@@ -1133,7 +1133,13 @@ fn parse_container_create_references(body: &[u8]) -> GatewayResult<ContainerCrea
         for network in networking_config.endpoints_config.keys() {
             let network = network.trim();
             if !network.is_empty() {
-                refs.networks.insert(network.to_string());
+                let builtin = matches!(
+                    network.to_ascii_lowercase().as_str(),
+                    "default" | "bridge" | "host" | "private"
+                );
+                if !builtin {
+                    refs.networks.insert(network.to_string());
+                }
             }
         }
     }
@@ -3244,6 +3250,84 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn create_allows_endpoints_config_with_builtin_default_network() {
+        // Docker CLI v27+ sends EndpointsConfig:{"default":{}} when no
+        // --network flag is given. Builtin names should be skipped, just
+        // like add_network_mode_reference does for NetworkMode.
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+        gateway.enqueue_json(
+            Method::POST,
+            "/containers/create",
+            StatusCode::CREATED,
+            serde_json::json!({"Id":"new-container"}),
+        );
+
+        let body = serde_json::json!({
+            "Image": "busybox",
+            "HostConfig": {
+                "NetworkMode": "default"
+            },
+            "NetworkingConfig": {
+                "EndpointsConfig": {
+                    "default": {}
+                }
+            }
+        });
+
+        let response = send_gateway_request(
+            gateway.addr,
+            Method::POST,
+            "/containers/create",
+            &[("content-type", "application/json")],
+            body.to_string().as_bytes(),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::CREATED);
+
+        let requests = gateway.requests();
+        assert!(
+            !requests
+                .iter()
+                .any(|req| req.method == Method::GET && req.path == "/networks/default"),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_rejects_foreign_network_in_endpoints_config() {
+        // User-defined networks in EndpointsConfig must still be authorized.
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+        gateway.enqueue_json(
+            Method::GET,
+            "/networks/custom-net",
+            StatusCode::OK,
+            resource_labels("other-component", TEST_PROJECT),
+        );
+
+        let body = serde_json::json!({
+            "Image": "busybox",
+            "HostConfig": {
+                "NetworkMode": "custom-net"
+            },
+            "NetworkingConfig": {
+                "EndpointsConfig": {
+                    "custom-net": {}
+                }
+            }
+        });
+
+        let response = send_gateway_request(
+            gateway.addr,
+            Method::POST,
+            "/containers/create",
+            &[("content-type", "application/json")],
+            body.to_string().as_bytes(),
+        )
+        .await;
+        // custom-net is owned by a different component, so this should be denied
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn create_rejects_foreign_network_reference() {
         let gateway = GatewayHarness::start(vec![default_caller()]).await;
         gateway.enqueue_json(
@@ -4692,5 +4776,129 @@ mod tests {
         docker_delete_container_best_effort(&docker_sock, &owned_container_a).await;
         docker_delete_network_best_effort(&docker_sock, &owned_network_a).await;
         docker_delete_network_best_effort(&docker_sock, &owned_network_b).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a reachable Docker daemon via DOCKER_HOST, ~/.docker/run/docker.sock, or \
+                /var/run/docker.sock"]
+    async fn docker_daemon_e2e_container_create_without_network_mode() {
+        let Some(docker_sock) = docker_socket_for_ignored_e2e() else {
+            eprintln!("skipping docker daemon e2e: no docker unix socket found");
+            return;
+        };
+
+        if UnixStream::connect(&docker_sock).await.is_err() {
+            eprintln!(
+                "skipping docker daemon e2e: docker socket exists but is not reachable at {}",
+                docker_sock.display()
+            );
+            return;
+        }
+
+        let ping = send_docker_request(&docker_sock, Method::GET, "/_ping", None).await;
+        if ping.status != StatusCode::OK {
+            eprintln!(
+                "skipping docker daemon e2e: /_ping returned {} with body {}",
+                ping.status,
+                String::from_utf8_lossy(&ping.body)
+            );
+            return;
+        }
+
+        let Some(image) = docker_image_for_ignored_e2e(&docker_sock).await else {
+            return;
+        };
+
+        let suffix = unique_test_suffix();
+        let compose_project = format!("amber-gw-e2e-netmode-{suffix}");
+        let component = format!("amber-gw-e2e-netmode-comp-{suffix}");
+        let container_name = format!("amber-gw-e2e-netmode-ctr-{suffix}");
+
+        let listen = reserve_loopback_socket_addr();
+        let config = DockerGatewayConfig {
+            listen,
+            docker_sock: docker_sock.clone(),
+            compose_project: compose_project.clone(),
+            callers: vec![CallerConfig {
+                host: "127.0.0.1".to_string(),
+                port: None,
+                component: component.clone(),
+                compose_service: component.clone(),
+            }],
+        };
+
+        let gateway_task = tokio::spawn(async move {
+            if let Err(err) = run(config).await {
+                panic!("gateway run failed in network-mode e2e test: {err}");
+            }
+        });
+        wait_until_gateway_listens(listen, &gateway_task).await;
+
+        // Docker CLI v27+ sends EndpointsConfig:{"default":{}} when no
+        // --network flag is given. The gateway should skip builtin names.
+        let create = send_gateway_request(
+            listen,
+            Method::POST,
+            &format!("/containers/create?name={container_name}"),
+            &[("content-type", "application/json")],
+            serde_json::json!({
+                "Image": image.as_str(),
+                "Cmd": ["true"],
+                "HostConfig": {
+                    "NetworkMode": "default"
+                },
+                "NetworkingConfig": {
+                    "EndpointsConfig": {
+                        "default": {}
+                    }
+                }
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .await;
+        assert_eq!(
+            create.status,
+            StatusCode::CREATED,
+            "container create via gateway failed: {}",
+            String::from_utf8_lossy(&create.body)
+        );
+
+        // Verify the container exists and has correct labels.
+        let inspect = send_gateway_request(
+            listen,
+            Method::GET,
+            &format!("/containers/{container_name}/json"),
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(
+            inspect.status,
+            StatusCode::OK,
+            "container inspect failed: {}",
+            String::from_utf8_lossy(&inspect.body)
+        );
+        let inspect_value: serde_json::Value =
+            serde_json::from_slice(&inspect.body).expect("inspect json");
+        let labels = inspect_value
+            .pointer("/Config/Labels")
+            .and_then(|v| v.as_object())
+            .expect("container labels");
+        assert_eq!(
+            labels
+                .get(COMPOSE_PROJECT_LABEL)
+                .and_then(|value| value.as_str()),
+            Some(compose_project.as_str())
+        );
+        assert_eq!(
+            labels
+                .get(AMBER_COMPONENT_LABEL)
+                .and_then(|value| value.as_str()),
+            Some(component.as_str())
+        );
+
+        gateway_task.abort();
+        docker_delete_container_best_effort(&docker_sock, &container_name).await;
     }
 }
