@@ -2493,7 +2493,7 @@ pub(crate) async fn run_observability_sink(plan_path: PathBuf) -> Result<()> {
     )?;
 
     loop {
-        if stop_requested.load(Ordering::SeqCst) || stop_marker_path(&run_root).exists() {
+        if stop_requested.load(Ordering::SeqCst) {
             return Ok(());
         }
 
