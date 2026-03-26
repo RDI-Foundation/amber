@@ -1219,7 +1219,7 @@ async fn failed_pause_keeps_consumer_blocking_provider_delete() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_runtime_cleanup_marks_exports_unavailable() {
-    let harness = TestHarness::new(ManagerFileConfig::default()).await;
+    let harness = TestHarness::new_with_base_backoff(ManagerFileConfig::default(), 60_000).await;
     let provider_url = harness.write_provider_manifest("provider.json5");
 
     let provider = harness.create_scenario(&create_request(provider_url)).await;

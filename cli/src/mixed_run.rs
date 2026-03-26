@@ -1787,7 +1787,8 @@ pub(crate) async fn run_outside_proxy(plan_path: PathBuf) -> Result<()> {
     validate_export_bindings(&interface, &export_bindings)?;
 
     let context = build_run_outside_proxy_context(&run_root, &run_plan, &receipt)?;
-    let mesh_listen = SocketAddr::from(([127, 0, 0, 1], reserve_loopback_port()?));
+    let mesh_listen =
+        outside_proxy_mesh_listen_addr(&context, &slot_bindings, reserve_loopback_port()?)?;
     let outside_identity = build_outside_proxy_identity(&receipt.run_id, &context.mesh_scope);
     let outside_public = MeshIdentityPublic::from_identity(&outside_identity);
     let mut peers = BTreeMap::<String, MeshPeer>::new();
@@ -1919,9 +1920,9 @@ pub(crate) async fn run_outside_proxy(plan_path: PathBuf) -> Result<()> {
     };
 
     let router = tokio::spawn(async move { amber_router::run(config).await });
-    wait_for_socket_listener(mesh_listen).await?;
+    wait_for_socket_listener(listener_probe_addr(mesh_listen)).await?;
     for listen in export_bindings.iter().map(|(_, listen)| *listen) {
-        wait_for_socket_listener(listen).await?;
+        wait_for_socket_listener(listener_probe_addr(listen)).await?;
     }
     write_json(
         &outside_proxy_state_path(&run_root),
@@ -2210,6 +2211,31 @@ fn outside_slot_mesh_url(
         .append_pair("route_id", route_id)
         .append_pair("capability", slot_name);
     Ok(mesh_url.to_string())
+}
+
+fn outside_proxy_mesh_listen_addr(
+    context: &RunOutsideProxyContext,
+    slot_bindings: &[(String, String)],
+    port: u16,
+) -> Result<SocketAddr> {
+    let needs_host_wide_listener = slot_bindings.iter().any(|(slot_name, _)| {
+        context
+            .slots
+            .get(slot_name)
+            .expect("outside proxy slot should exist after validation")
+            .consumer_sites
+            .iter()
+            .any(|site_id| {
+                let consumer_kind = context
+                    .sites
+                    .get(site_id)
+                    .expect("consumer site should exist")
+                    .receipt
+                    .kind;
+                consumer_needs_host_wide_listener(consumer_kind)
+            })
+    });
+    Ok(host_proxy_bind_addr(needs_host_wide_listener, port))
 }
 
 async fn wait_for_socket_listener(addr: SocketAddr) -> Result<()> {
@@ -4051,18 +4077,11 @@ fn bridge_proxy_export_binding(export_name: &str, listen: SocketAddr) -> String 
 }
 
 fn bridge_proxy_bind_addr(consumer_kind: SiteKind, port: u16) -> SocketAddr {
-    match consumer_kind {
-        SiteKind::Compose | SiteKind::Kubernetes => SocketAddr::from(([0, 0, 0, 0], port)),
-        SiteKind::Direct | SiteKind::Vm => SocketAddr::from(([127, 0, 0, 1], port)),
-    }
+    host_proxy_bind_addr(consumer_needs_host_wide_listener(consumer_kind), port)
 }
 
 fn bridge_proxy_probe_addr(listen: SocketAddr) -> SocketAddr {
-    if listen.ip().is_unspecified() {
-        SocketAddr::from(([127, 0, 0, 1], listen.port()))
-    } else {
-        listen
-    }
+    listener_probe_addr(listen)
 }
 
 fn bridge_proxy_external_url(
@@ -4088,6 +4107,26 @@ fn bridge_proxy_host_for_consumer(consumer_kind: SiteKind) -> String {
         SiteKind::Direct | SiteKind::Vm | SiteKind::Kubernetes => {
             container_host_for_consumer(SiteKind::Direct, consumer_kind)
         }
+    }
+}
+
+fn consumer_needs_host_wide_listener(consumer_kind: SiteKind) -> bool {
+    matches!(consumer_kind, SiteKind::Compose | SiteKind::Kubernetes)
+}
+
+fn host_proxy_bind_addr(needs_host_wide_listener: bool, port: u16) -> SocketAddr {
+    if needs_host_wide_listener {
+        SocketAddr::from(([0, 0, 0, 0], port))
+    } else {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+}
+
+fn listener_probe_addr(listen: SocketAddr) -> SocketAddr {
+    if listen.ip().is_unspecified() {
+        SocketAddr::from(([127, 0, 0, 1], listen.port()))
+    } else {
+        listen
     }
 }
 
@@ -5352,6 +5391,74 @@ mod tests {
     }
 
     #[test]
+    fn outside_proxy_mesh_listener_stays_loopback_for_local_consumers() {
+        let context = RunOutsideProxyContext {
+            mesh_scope: "scope".to_string(),
+            sites: BTreeMap::from([(
+                "direct".to_string(),
+                test_launched_site_with_kind(SiteKind::Direct),
+            )]),
+            exports: BTreeMap::new(),
+            slots: BTreeMap::from([(
+                "api".to_string(),
+                RunOutsideSlot {
+                    required: true,
+                    kind: CapabilityKind::Http,
+                    url_env: "AMBER_EXTERNAL_SLOT_API_URL".to_string(),
+                    consumer_sites: vec!["direct".to_string()],
+                },
+            )]),
+        };
+
+        assert_eq!(
+            outside_proxy_mesh_listen_addr(
+                &context,
+                &[("api".to_string(), "http://127.0.0.1:9000".to_string())],
+                48000,
+            )
+            .expect("outside proxy bind addr"),
+            SocketAddr::from(([127, 0, 0, 1], 48000))
+        );
+    }
+
+    #[test]
+    fn outside_proxy_mesh_listener_expands_for_container_consumers() {
+        let context = RunOutsideProxyContext {
+            mesh_scope: "scope".to_string(),
+            sites: BTreeMap::from([
+                (
+                    "direct".to_string(),
+                    test_launched_site_with_kind(SiteKind::Direct),
+                ),
+                (
+                    "compose".to_string(),
+                    test_launched_site_with_kind(SiteKind::Compose),
+                ),
+            ]),
+            exports: BTreeMap::new(),
+            slots: BTreeMap::from([(
+                "api".to_string(),
+                RunOutsideSlot {
+                    required: true,
+                    kind: CapabilityKind::Http,
+                    url_env: "AMBER_EXTERNAL_SLOT_API_URL".to_string(),
+                    consumer_sites: vec!["direct".to_string(), "compose".to_string()],
+                },
+            )]),
+        };
+
+        assert_eq!(
+            outside_proxy_mesh_listen_addr(
+                &context,
+                &[("api".to_string(), "http://127.0.0.1:9000".to_string())],
+                49000,
+            )
+            .expect("outside proxy bind addr"),
+            SocketAddr::from(([0, 0, 0, 0], 49000))
+        );
+    }
+
+    #[test]
     fn bridge_proxy_export_binding_uses_selected_listen_addr() {
         assert_eq!(
             bridge_proxy_export_binding("api", SocketAddr::from(([127, 0, 0, 1], 46000))),
@@ -5361,6 +5468,32 @@ mod tests {
             bridge_proxy_export_binding("api", SocketAddr::from(([0, 0, 0, 0], 47000))),
             "api=0.0.0.0:47000"
         );
+    }
+
+    fn test_launched_site_with_kind(kind: SiteKind) -> LaunchedSite {
+        LaunchedSite {
+            receipt: SiteReceipt {
+                kind,
+                artifact_dir: "/tmp/artifact".to_string(),
+                supervisor_pid: 1,
+                process_pid: None,
+                compose_project: None,
+                context: None,
+                kubernetes_namespace: None,
+                port_forward_pid: None,
+                router_mesh_addr: None,
+                router_control: None,
+                router_identity_id: None,
+                router_public_key_b64: None,
+            },
+            router_identity: MeshIdentityPublic {
+                id: format!("/site/{kind:?}"),
+                public_key: [0; 32],
+                mesh_scope: None,
+            },
+            router_addr: SocketAddr::from(([127, 0, 0, 1], 24000)),
+            router_control: ControlEndpoint::Tcp("127.0.0.1:24100".to_string()),
+        }
     }
 
     #[test]
