@@ -359,9 +359,14 @@ fn render_vm(compiled: &CompiledScenario) -> Result<VmArtifact, MeshError> {
         files.insert(PathBuf::from(DEFAULT_EXTERNAL_ENV_FILE), env_content);
     }
 
-    let execution_guide =
-        build_execution_guide(scenario, &mesh_plan, &config_plan, !storage_plan.is_empty())
-            .map_err(|err: ReporterError| MeshError::new(err.to_string()))?;
+    let execution_guide = build_execution_guide(
+        scenario,
+        &mesh_plan,
+        &config_plan,
+        !storage_plan.is_empty(),
+        false,
+    )
+    .map_err(|err: ReporterError| MeshError::new(err.to_string()))?;
     files.insert(
         PathBuf::from(GENERATED_ENV_SAMPLE_FILENAME),
         execution_guide.render_env_sample(false, "vm"),
