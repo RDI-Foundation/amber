@@ -1394,12 +1394,26 @@ pub(crate) async fn stop_run(run_id: &str, storage_root_override: Option<&Path>)
     let storage_root = mixed_run_storage_root(storage_root_override)?;
     let run_root = storage_root.join("runs").join(run_id);
     let receipt: RunReceipt = read_json(&receipt_path(&run_root), "run receipt")?;
+    write_stop_marker(&run_root)?;
     for site in receipt.sites.values() {
         send_sigterm(site.supervisor_pid);
     }
+    if let Some(observability) = receipt.observability.as_ref()
+        && let Some(pid) = observability.sink_pid
+    {
+        send_sigterm(pid);
+    }
+    for proxy in &receipt.bridge_proxies {
+        send_sigterm(proxy.pid);
+    }
 
+    let mut shutdown_failures = Vec::new();
     for (site_id, site) in &receipt.sites {
         let state_path = site_state_path(&run_root.join("state"), site_id);
+        write_site_state(
+            &state_path,
+            site_state_from_receipt(&receipt, site_id, site, SiteLifecycleStatus::Stopping, None),
+        )?;
         let deadline = Instant::now() + PROCESS_SHUTDOWN_GRACE_PERIOD;
         while Instant::now() < deadline {
             if let Ok(state) = read_json::<SiteManagerState>(&state_path, "site state")
@@ -1417,40 +1431,99 @@ pub(crate) async fn stop_run(run_id: &str, storage_root_override: Option<&Path>)
         }
 
         stop_site_from_receipt(&run_root, site_id, site).await?;
-        let stopped = SiteManagerState {
-            schema: SITE_STATE_SCHEMA.to_string(),
-            version: SITE_STATE_VERSION,
-            run_id: receipt.run_id.clone(),
-            site_id: site_id.clone(),
-            kind: site.kind,
-            status: SiteLifecycleStatus::Stopped,
-            artifact_dir: site.artifact_dir.clone(),
-            supervisor_pid: site.supervisor_pid,
-            process_pid: None,
-            compose_project: site.compose_project.clone(),
-            kubernetes_namespace: site.kubernetes_namespace.clone(),
-            port_forward_pid: None,
-            context: site.context.clone(),
-            router_control: site.router_control.clone(),
-            router_mesh_addr: site.router_mesh_addr.clone(),
-            router_identity_id: site.router_identity_id.clone(),
-            router_public_key_b64: site.router_public_key_b64.clone(),
-            last_error: None,
-        };
-        write_site_state(&state_path, stopped)?;
+        if pid_is_alive(site.supervisor_pid) {
+            let message = format!(
+                "site supervisor `{site_id}` (pid {}) did not stop within {}s",
+                site.supervisor_pid,
+                PROCESS_SHUTDOWN_GRACE_PERIOD.as_secs()
+            );
+            write_site_state(
+                &state_path,
+                site_state_from_receipt(
+                    &receipt,
+                    site_id,
+                    site,
+                    SiteLifecycleStatus::Stopping,
+                    Some(message.clone()),
+                ),
+            )?;
+            shutdown_failures.push(message);
+            continue;
+        }
+        write_site_state(
+            &state_path,
+            site_state_from_receipt(&receipt, site_id, site, SiteLifecycleStatus::Stopped, None),
+        )?;
     }
 
     if let Some(observability) = receipt.observability.as_ref()
         && let Some(pid) = observability.sink_pid
+        && !wait_for_pid_exit(pid, PROCESS_SHUTDOWN_GRACE_PERIOD).await
     {
-        send_sigterm(pid);
+        shutdown_failures.push(format!(
+            "observability sink (pid {pid}) did not stop within {}s",
+            PROCESS_SHUTDOWN_GRACE_PERIOD.as_secs()
+        ));
     }
     for proxy in &receipt.bridge_proxies {
-        send_sigterm(proxy.pid);
+        if !wait_for_pid_exit(proxy.pid, PROCESS_SHUTDOWN_GRACE_PERIOD).await {
+            shutdown_failures.push(format!(
+                "bridge proxy `{}` (pid {}) did not stop within {}s",
+                proxy.export_name,
+                proxy.pid,
+                PROCESS_SHUTDOWN_GRACE_PERIOD.as_secs()
+            ));
+        }
+    }
+
+    if !shutdown_failures.is_empty() {
+        return Err(miette::miette!(
+            "mixed run `{run_id}` did not stop completely:\n{}",
+            shutdown_failures.join("\n")
+        ));
     }
 
     let _ = fs::remove_file(receipt_path(&run_root));
     Ok(())
+}
+
+fn site_state_from_receipt(
+    receipt: &RunReceipt,
+    site_id: &str,
+    site: &SiteReceipt,
+    status: SiteLifecycleStatus,
+    last_error: Option<String>,
+) -> SiteManagerState {
+    let process_pid = if matches!(status, SiteLifecycleStatus::Stopped) {
+        None
+    } else {
+        site.process_pid
+    };
+    let port_forward_pid = if matches!(status, SiteLifecycleStatus::Stopped) {
+        None
+    } else {
+        site.port_forward_pid
+    };
+    SiteManagerState {
+        schema: SITE_STATE_SCHEMA.to_string(),
+        version: SITE_STATE_VERSION,
+        run_id: receipt.run_id.clone(),
+        site_id: site_id.to_string(),
+        kind: site.kind,
+        status,
+        artifact_dir: site.artifact_dir.clone(),
+        supervisor_pid: site.supervisor_pid,
+        process_pid,
+        compose_project: site.compose_project.clone(),
+        kubernetes_namespace: site.kubernetes_namespace.clone(),
+        port_forward_pid,
+        context: site.context.clone(),
+        router_control: site.router_control.clone(),
+        router_mesh_addr: site.router_mesh_addr.clone(),
+        router_identity_id: site.router_identity_id.clone(),
+        router_public_key_b64: site.router_public_key_b64.clone(),
+        last_error,
+    }
 }
 
 pub(crate) fn maybe_resolve_proxy_run_target(
@@ -3685,6 +3758,19 @@ async fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<()>
     }
 }
 
+async fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !pid_is_alive(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn resolve_link_external_url(
     provider: &LaunchedSite,
     link: &RunLink,
@@ -5262,6 +5348,101 @@ mod tests {
         assert!(
             message.contains("--site <site-id>"),
             "expected --site guidance, got: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_run_keeps_receipt_when_supervisor_survives_shutdown() {
+        let temp = tempdir().expect("tempdir should exist");
+        let storage_root = temp.path();
+        let run_id = "run-stuck";
+        let run_root = storage_root.join("runs").join(run_id);
+        let artifact_dir = run_root.join("sites").join("direct_local").join("artifact");
+        fs::create_dir_all(&artifact_dir).expect("artifact dir should exist");
+
+        let mut stubborn_supervisor = Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; while :; do sleep 1 & wait $!; done")
+            .spawn()
+            .expect("stubborn supervisor should spawn");
+
+        let receipt = RunReceipt {
+            schema: RECEIPT_SCHEMA.to_string(),
+            version: RECEIPT_VERSION,
+            run_id: run_id.to_string(),
+            mesh_scope: "mesh.scope.test".to_string(),
+            plan_path: run_plan_path(&run_root).display().to_string(),
+            source_plan_path: None,
+            run_root: run_root.display().to_string(),
+            observability: None,
+            bridge_proxies: Vec::new(),
+            sites: BTreeMap::from([(
+                "direct_local".to_string(),
+                SiteReceipt {
+                    supervisor_pid: stubborn_supervisor.id(),
+                    ..test_site_receipt(
+                        SiteKind::Direct,
+                        &artifact_dir,
+                        Some("unix:///receipt.sock"),
+                        Some("127.0.0.1:18080"),
+                    )
+                },
+            )]),
+        };
+        write_json(&receipt_path(&run_root), &receipt).expect("receipt should serialize");
+
+        let state_root = run_root.join("state");
+        let mut state = test_site_state(
+            run_id,
+            "direct_local",
+            SiteKind::Direct,
+            &artifact_dir,
+            Some("unix:///live.sock"),
+            Some("127.0.0.1:18081"),
+        );
+        state.status = SiteLifecycleStatus::Stopped;
+        state.supervisor_pid = stubborn_supervisor.id();
+        write_json(&site_state_path(&state_root, "direct_local"), &state)
+            .expect("state should serialize");
+
+        let result = stop_run(run_id, Some(storage_root)).await;
+
+        let _ = stubborn_supervisor.kill();
+        let _ = stubborn_supervisor.wait();
+
+        let err = result.expect_err("stop_run should fail when the supervisor survives");
+        let message = err.to_string();
+        assert!(
+            message.contains("did not stop completely"),
+            "expected shutdown failure, got: {message}"
+        );
+        assert!(
+            message.contains("direct_local"),
+            "expected site id in error, got: {message}"
+        );
+        assert!(
+            receipt_path(&run_root).is_file(),
+            "receipt should remain so shutdown can be retried"
+        );
+        assert!(
+            stop_marker_path(&run_root).is_file(),
+            "stop marker should be written for supervisors"
+        );
+
+        let updated_state: SiteManagerState = read_json(
+            &site_state_path(&state_root, "direct_local"),
+            "site manager state",
+        )
+        .expect("updated state should deserialize");
+        assert_eq!(updated_state.status, SiteLifecycleStatus::Stopping);
+        assert!(
+            updated_state
+                .last_error
+                .as_deref()
+                .is_some_and(|value| value.contains("did not stop within")),
+            "expected incomplete shutdown to be recorded, got: {:?}",
+            updated_state.last_error
         );
     }
 }
