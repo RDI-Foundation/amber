@@ -1,0 +1,12 @@
+{
+  manifest_version: "0.3.0",
+  experimental_features: ["kvm"],
+  components: {
+    checker: {
+      manifest: "./checker.json5",
+    },
+  },
+  exports: {
+    result: "#checker.result",
+  },
+}

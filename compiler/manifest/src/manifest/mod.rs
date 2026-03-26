@@ -71,12 +71,14 @@ pub struct RawManifest {
 #[non_exhaustive]
 pub enum ExperimentalFeature {
     Docker,
+    Kvm,
 }
 
 impl fmt::Display for ExperimentalFeature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ExperimentalFeature::Docker => f.write_str("docker"),
+            ExperimentalFeature::Kvm => f.write_str("kvm"),
         }
     }
 }

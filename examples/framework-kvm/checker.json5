@@ -1,0 +1,27 @@
+{
+  manifest_version: "0.3.0",
+  experimental_features: ["kvm"],
+  program: {
+    image: "amber-example-kvm-checker",
+    entrypoint: [
+      "sh",
+      "-c",
+      // Print diagnostics, then verify KVM acceleration works via QEMU.
+      "ls -l /dev/kvm; id; qemu-system-x86_64 -accel kvm -nographic -no-reboot -nic none -boot reboot-timeout=0",
+    ],
+    network: {
+      endpoints: [
+        { name: "result", port: 8080, protocol: "http" },
+      ],
+    },
+    mounts: [
+      { path: "/dev/kvm", from: "framework.kvm" },
+    ],
+  },
+  provides: {
+    result: { kind: "http", endpoint: "result" },
+  },
+  exports: {
+    result: "result",
+  },
+}

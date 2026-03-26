@@ -16,6 +16,7 @@ pub(crate) struct ExecutionGuide {
     external_slots: Vec<GuideExternalSlot>,
     exports: Vec<GuideExport>,
     has_storage: bool,
+    has_kvm: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +48,7 @@ pub(crate) fn build_execution_guide(
     mesh_plan: &MeshPlan,
     config_plan: &ConfigPlan,
     has_storage: bool,
+    has_kvm: bool,
 ) -> Result<ExecutionGuide, ReporterError> {
     let iface = build_runtime_interface(scenario, mesh_plan, config_plan)
         .map_err(|err| ReporterError::new(err.to_string()))?;
@@ -96,6 +98,7 @@ pub(crate) fn build_execution_guide(
         external_slots,
         exports,
         has_storage,
+        has_kvm,
     })
 }
 
@@ -123,6 +126,7 @@ impl ExecutionGuide {
 
         if self.root_inputs.is_empty()
             && (!include_external_slots || self.external_slots.is_empty())
+            && !self.has_kvm
         {
             out.push_str("# No env-based runtime inputs are required for this output.\n");
             return out;
@@ -162,6 +166,14 @@ impl ExecutionGuide {
                     slot.kind, slot.name, slot.env_var
                 ));
             }
+        }
+
+        if self.has_kvm {
+            out.push_str("\n# KVM device group\n");
+            out.push_str(
+                "# Required: GID of the /dev/kvm device on the host (e.g. `stat -c %g /dev/kvm`)\n",
+            );
+            out.push_str("AMBER_KVM_GID=\n");
         }
 
         out
@@ -679,6 +691,7 @@ mod tests {
                 protocol: "http".to_string(),
             }],
             has_storage: false,
+            has_kvm: false,
         }
     }
 
