@@ -39,23 +39,26 @@ COPY compiler/json5/Cargo.toml compiler/json5/
 COPY compiler/manifest/Cargo.toml compiler/manifest/
 COPY runtime/mesh/Cargo.toml runtime/mesh/
 COPY runtime/proxy/Cargo.toml runtime/proxy/
+COPY runtime/provisioner/Cargo.toml runtime/provisioner/
 COPY runtime/router/Cargo.toml runtime/router/
 COPY compiler/resolver/Cargo.toml compiler/resolver/
 COPY compiler/scenario/Cargo.toml compiler/scenario/
 COPY compiler/template/Cargo.toml compiler/template/
 COPY node/Cargo.toml node/
-COPY runtime/provisioner/Cargo.toml runtime/provisioner/
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    mkdir -p cli/src compiler/config/src compiler/src runtime/docker-gateway/src runtime/helper/src images/src manager/src compiler/json5/src compiler/manifest/src runtime/mesh/src runtime/proxy/src runtime/router/src compiler/resolver/src compiler/scenario/src compiler/template/src node/src runtime/provisioner/src && \
-    touch cli/src/main.rs compiler/config/src/lib.rs compiler/src/lib.rs runtime/docker-gateway/src/main.rs runtime/helper/src/main.rs images/src/lib.rs manager/src/lib.rs manager/src/main.rs compiler/json5/src/lib.rs compiler/manifest/src/lib.rs runtime/mesh/src/lib.rs runtime/proxy/src/lib.rs runtime/router/src/main.rs compiler/resolver/src/lib.rs compiler/scenario/src/lib.rs compiler/template/src/lib.rs node/src/main.rs runtime/provisioner/src/main.rs && \
+    mkdir -p cli/src compiler/config/src compiler/src runtime/docker-gateway/src runtime/helper/src images/src manager/src compiler/json5/src compiler/manifest/src runtime/mesh/src runtime/proxy/src runtime/provisioner/src runtime/router/src compiler/resolver/src compiler/scenario/src compiler/template/src node/src && \
+    touch cli/src/main.rs compiler/config/src/lib.rs compiler/src/lib.rs runtime/docker-gateway/src/main.rs runtime/helper/src/main.rs images/src/lib.rs manager/src/lib.rs manager/src/main.rs compiler/json5/src/lib.rs compiler/manifest/src/lib.rs runtime/mesh/src/lib.rs runtime/proxy/src/lib.rs runtime/provisioner/src/main.rs runtime/router/src/main.rs compiler/resolver/src/lib.rs compiler/scenario/src/lib.rs compiler/template/src/lib.rs node/src/main.rs && \
     cargo fetch --locked
 
-COPY compiler/config ./compiler/config
-COPY runtime/helper ./runtime/helper
+COPY compiler ./compiler
+COPY docker/images.json docker/images.json
+COPY images ./images
+COPY manager ./manager
 COPY runtime/mesh ./runtime/mesh
-COPY compiler/template ./compiler/template
+COPY runtime/proxy ./runtime/proxy
+COPY runtime/router ./runtime/router
 
 ARG BUILD_MODE=release
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
@@ -63,18 +66,26 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
     target=$(cat /tmp/rust-target) && \
     if [ "$BUILD_MODE" = "release" ]; then \
-      cargo build --locked --release -p amber-helper --target "${target}"; \
+      cargo build --locked --release -p amber-manager --target "${target}"; \
       build_dir=release; \
     else \
-      cargo build --locked -p amber-helper --target "${target}"; \
+      cargo build --locked -p amber-manager --target "${target}"; \
       build_dir=debug; \
     fi && \
-    install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber-helper /out/amber-helper && \
-    mkdir -p /out/amber/bin /out/amber/mesh
+    install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber-manager /out/amber-manager
 
-FROM scratch
+FROM docker:29.3.0-cli AS docker-cli
 
-COPY --from=builder /out/amber-helper /amber-helper
-COPY --from=builder /out/amber /amber
+FROM alpine:3.23.3 AS runtime
 
-ENTRYPOINT ["/amber-helper"]
+RUN apk add --no-cache ca-certificates && \
+    mkdir -p /usr/local/libexec/docker/cli-plugins /var/lib/amber-manager
+
+COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
+COPY --from=builder /out/amber-manager /usr/local/bin/amber-manager
+
+WORKDIR /var/lib/amber-manager
+EXPOSE 4100
+ENTRYPOINT ["/usr/local/bin/amber-manager"]
+CMD ["--listen", "0.0.0.0:4100", "--data-dir", "/var/lib/amber-manager"]

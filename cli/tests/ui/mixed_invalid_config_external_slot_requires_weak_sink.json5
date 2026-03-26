@@ -1,0 +1,22 @@
+{
+  manifest_version: "0.3.0",
+  program: {
+    image: "sink",
+    entrypoint: ["sink"],
+    network: {
+      endpoints: [{ name: "out", port: 8080 }],
+    },
+    env: {
+      API_URL: "${slots.api.url}",
+    },
+  },
+  slots: {
+    api: { kind: "http" },
+  },
+  provides: {
+    out: { kind: "http", endpoint: "out" },
+  },
+  exports: {
+    out: "provides.out",
+  },
+}

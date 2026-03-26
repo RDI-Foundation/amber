@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
@@ -7,6 +7,7 @@ use std::{
 
 use clap::Parser;
 use serde::Deserialize;
+use serde_json::Value;
 use sqlx::sqlite::SqliteConnectOptions;
 use thiserror::Error;
 use url::Url;
@@ -81,6 +82,12 @@ impl ManagerConfig {
 pub struct ManagerFileConfig {
     #[serde(default)]
     pub bindable_services: BTreeMap<String, OperatorBindableServiceConfig>,
+
+    #[serde(default)]
+    pub bindable_configs: BTreeMap<String, Value>,
+
+    #[serde(default)]
+    pub scenario_source_allowlist: Option<BTreeSet<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

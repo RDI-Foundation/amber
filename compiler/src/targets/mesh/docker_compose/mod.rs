@@ -187,6 +187,8 @@ struct Service {
     image: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    read_only: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     cap_add: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -511,6 +513,8 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
             .volumes
             .push(format!("{HELPER_VOLUME_NAME}:{HELPER_BIN_DIR}"));
         helper_init.restart = Some("no".to_string());
+        apply_default_service_hardening(&mut helper_init);
+        apply_internal_service_rootfs_hardening(&mut helper_init);
         compose
             .services
             .insert(HELPER_INIT_SERVICE.to_string(), helper_init);
@@ -523,10 +527,7 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
 
         let mut provisioner_service = Service::new(images.provisioner.clone());
         provisioner_service.user = Some("0:0".to_string());
-        provisioner_service.cap_drop.push("ALL".to_string());
-        provisioner_service
-            .security_opt
-            .push("no-new-privileges:true".to_string());
+        apply_default_service_hardening(&mut provisioner_service);
         provisioner_service.environment = Some(Environment::List(vec![format!(
             "AMBER_MESH_PROVISION_PLAN_PATH={PROVISIONER_PLAN_PATH}"
         )]));
@@ -593,6 +594,7 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
         "${{AMBER_DOCKER_CONTAINER_LOGS_DIR:-{DOCKER_CONTAINER_LOGS_DIR}}}:\
          {DOCKER_CONTAINER_LOGS_DIR}:ro"
     ));
+    apply_default_service_hardening(&mut otelcol_service);
     compose
         .services
         .insert(OTELCOL_SERVICE_NAME.to_string(), otelcol_service);
@@ -635,6 +637,7 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
         ));
         push_router_observability_env(&mut env_entries);
         let mut router_service = Service::new(images.router.clone());
+        router_service.user = Some(format!("{ROUTER_RUNTIME_UID}:{ROUTER_RUNTIME_GID}"));
         router_service.environment = Some(Environment::List(env_entries));
         router_service
             .extra_hosts
@@ -680,6 +683,8 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
                 ),
             ],
         );
+        apply_default_service_hardening(&mut router_service);
+        apply_internal_service_rootfs_hardening(&mut router_service);
 
         compose
             .services
@@ -691,6 +696,7 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
         let svc = names.get(id).unwrap();
 
         let mut sidecar_service = Service::new(images.router.clone());
+        sidecar_service.user = Some(format!("{ROUTER_RUNTIME_UID}:{ROUTER_RUNTIME_GID}"));
         let mut sidecar_env_entries = vec![
             format!("AMBER_ROUTER_CONFIG_PATH={}", mesh_config_path()),
             format!("AMBER_ROUTER_IDENTITY_PATH={}", mesh_identity_path()),
@@ -715,6 +721,8 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
                 "service_completed_successfully",
             )],
         );
+        apply_default_service_hardening(&mut sidecar_service);
+        apply_internal_service_rootfs_hardening(&mut sidecar_service);
         compose
             .services
             .insert(svc.sidecar.clone(), sidecar_service);
@@ -858,6 +866,7 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
         }
         if Some(*id) == docker_gateway_component {
             configure_injected_docker_gateway_service(&mut program_service, s, *id, svc)?;
+            apply_internal_service_rootfs_hardening(&mut program_service);
         }
         for storage_mount in storage_mounts {
             program_service.volumes.push(format!(
@@ -871,6 +880,7 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
             &label,
             &compose_component_service_name(&label),
         );
+        apply_default_service_hardening(&mut program_service);
 
         compose
             .services
@@ -1031,6 +1041,25 @@ service:
       exporters: [otlphttp/upstream]
 "#
     )
+}
+
+fn apply_default_service_hardening(service: &mut Service) {
+    if !service.cap_drop.iter().any(|cap| cap == "ALL") {
+        service.cap_drop.push("ALL".to_string());
+    }
+    if !service
+        .security_opt
+        .iter()
+        .any(|opt| opt == "no-new-privileges:true")
+    {
+        service
+            .security_opt
+            .push("no-new-privileges:true".to_string());
+    }
+}
+
+fn apply_internal_service_rootfs_hardening(service: &mut Service) {
+    service.read_only = Some(true);
 }
 
 fn push_router_observability_env(env_entries: &mut Vec<String>) {

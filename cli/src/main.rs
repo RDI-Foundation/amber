@@ -1763,6 +1763,8 @@ struct ProcessSpec {
     env: BTreeMap<String, String>,
     work_dir: PathBuf,
     sandbox: ProcessSandbox,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    drop_all_caps: bool,
     #[cfg(target_os = "linux")]
     read_only_mounts: Vec<ReadOnlyMount>,
     writable_dirs: Vec<PathBuf>,
@@ -2062,6 +2064,7 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                 env,
                 work_dir,
                 sandbox: ProcessSandbox::Unsandboxed,
+                drop_all_caps: true,
                 #[cfg(target_os = "linux")]
                 read_only_mounts: vec![ReadOnlyMount {
                     source: runtime_root.join("mesh"),
@@ -2115,6 +2118,7 @@ async fn run_direct_init(args: RunDirectInitArgs) -> Result<()> {
                 env,
                 work_dir,
                 sandbox: ProcessSandbox::Sandboxed,
+                drop_all_caps: true,
                 #[cfg(target_os = "linux")]
                 read_only_mounts: vec![ReadOnlyMount {
                     source: runtime_root.join("mesh"),
@@ -2739,6 +2743,7 @@ fn component_program_spec(
                 env: env.clone(),
                 work_dir,
                 sandbox: ProcessSandbox::Sandboxed,
+                drop_all_caps: false,
                 #[cfg(target_os = "linux")]
                 read_only_mounts,
                 writable_dirs,
@@ -2790,6 +2795,7 @@ fn component_program_spec(
                 env,
                 work_dir,
                 sandbox: ProcessSandbox::Sandboxed,
+                drop_all_caps: false,
                 #[cfg(target_os = "linux")]
                 read_only_mounts,
                 writable_dirs,
@@ -2873,6 +2879,7 @@ pub(crate) fn build_direct_site_launch_preview(
                 env,
                 work_dir,
                 sandbox: ProcessSandbox::Unsandboxed,
+                drop_all_caps: true,
                 #[cfg(target_os = "linux")]
                 read_only_mounts: vec![ReadOnlyMount {
                     source: runtime_root.join("mesh"),
@@ -2927,6 +2934,7 @@ pub(crate) fn build_direct_site_launch_preview(
                 env,
                 work_dir: runtime_root.join(&component.program.work_dir),
                 sandbox: ProcessSandbox::Sandboxed,
+                drop_all_caps: true,
                 #[cfg(target_os = "linux")]
                 read_only_mounts: vec![ReadOnlyMount {
                     source: runtime_root.join("mesh"),
@@ -4589,6 +4597,10 @@ impl DirectSandbox {
                     "--chdir".to_string(),
                     spec.work_dir.display().to_string(),
                 ];
+                if spec.drop_all_caps {
+                    args.push("--cap-drop".to_string());
+                    args.push("ALL".to_string());
+                }
                 if matches!(spec.network, ProcessNetwork::Isolated) {
                     args.push("--unshare-net".to_string());
                 }
@@ -6620,6 +6632,7 @@ mod tests {
             env: BTreeMap::new(),
             work_dir: PathBuf::from("/tmp/amber-work"),
             sandbox: ProcessSandbox::Sandboxed,
+            drop_all_caps: false,
             #[cfg(target_os = "linux")]
             read_only_mounts: Vec::new(),
             writable_dirs: Vec::new(),
@@ -6756,6 +6769,27 @@ mod tests {
         assert!(
             args.contains(&"--unshare-net".to_string()),
             "bubblewrap args missing --unshare-net: {args:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bubblewrap_can_drop_all_caps_for_internal_processes() {
+        let mut sandbox = DirectSandbox::Bubblewrap {
+            binary: PathBuf::from("/usr/bin/bwrap"),
+        };
+        let spec = ProcessSpec {
+            drop_all_caps: true,
+            ..linux_test_process_spec()
+        };
+
+        let (_, args) = sandbox
+            .wrap_command(&spec)
+            .expect("command should be wrapped");
+        assert!(
+            args.windows(2)
+                .any(|window| window[0] == "--cap-drop" && window[1] == "ALL"),
+            "bubblewrap args should drop all caps when requested: {args:?}"
         );
     }
 

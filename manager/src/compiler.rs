@@ -1,6 +1,7 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
+    sync::{Arc, RwLock},
 };
 
 use amber_compiler::{
@@ -22,6 +23,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::{
+    config::ConfigError,
     domain::{
         CreateScenarioRequest, ExportRequest, ExternalSlotBindingRequest, ScenarioTelemetryRequest,
     },
@@ -64,8 +66,11 @@ pub struct SlotRuntimeBinding {
 
 #[derive(Debug, Error)]
 pub enum CompileError {
-    #[error("invalid source URL `{0}`")]
-    InvalidSourceUrl(String),
+    #[error("invalid source URL `{source_url}`: {message}")]
+    InvalidSourceUrl { source_url: String, message: String },
+
+    #[error("scenario source URL `{0}` is not in the operator-managed scenario_source_allowlist")]
+    SourceNotAllowed(String),
 
     #[error("compile failed: {0}")]
     Compile(String),
@@ -95,38 +100,146 @@ pub enum CompileError {
     WriteOutput(String),
 }
 
-pub async fn compile_create(
-    request: &CreateScenarioRequest,
-    bundle_dir: Option<&Path>,
-) -> Result<CompiledMaterialization, CompileError> {
-    compile_and_materialize(
-        &request.source_url,
-        &request.root_config,
-        &request.external_slots,
-        &request.exports,
-        request.store_bundle,
-        bundle_dir,
-    )
-    .await
+#[derive(Debug, Error)]
+pub enum ScenarioSourceAllowlistUpdateError {
+    #[error(transparent)]
+    InvalidSourceUrl(#[from] CompileError),
+
+    #[error("scenario_source_allowlist is not enabled for this manager")]
+    AllowlistDisabled,
+
+    #[error("scenario source URL `{0}` is not present in scenario_source_allowlist")]
+    SourceNotPresent(String),
 }
 
-pub async fn compile_upgrade(
+#[derive(Clone, Debug)]
+pub struct ScenarioSourceAccess {
+    allowlist: ScenarioSourceAllowlist,
+}
+
+impl ScenarioSourceAccess {
+    pub fn from_config(entries: Option<BTreeSet<String>>) -> Result<Self, ConfigError> {
+        Ok(Self {
+            allowlist: ScenarioSourceAllowlist::from_config(entries)?,
+        })
+    }
+
+    pub fn preflight(&self, source_url: &str) -> Result<(), CompileError> {
+        self.allowlist.ensure_allowed(source_url)
+    }
+
+    pub fn remove(&self, source_url: &str) -> Result<String, ScenarioSourceAllowlistUpdateError> {
+        self.allowlist.remove(source_url)
+    }
+
+    pub async fn inspect(&self, source_url: &str) -> Result<CompiledMaterialization, CompileError> {
+        self.preflight(source_url)?;
+        inspect_source_unchecked(source_url).await
+    }
+
+    pub async fn compile_create(
+        &self,
+        request: &CreateScenarioRequest,
+        bundle_dir: Option<&Path>,
+    ) -> Result<CompiledMaterialization, CompileError> {
+        self.preflight(&request.source_url)?;
+        compile_and_materialize(
+            &request.source_url,
+            &request.root_config,
+            &request.external_slots,
+            &request.exports,
+            request.store_bundle,
+            bundle_dir,
+        )
+        .await
+    }
+
+    pub async fn compile_upgrade(
+        &self,
+        source_url: &str,
+        root_config: &Value,
+        external_slots: &BTreeMap<String, ExternalSlotBindingRequest>,
+        exports: &BTreeMap<String, ExportRequest>,
+        store_bundle: bool,
+        bundle_dir: Option<&Path>,
+    ) -> Result<CompiledMaterialization, CompileError> {
+        self.preflight(source_url)?;
+        compile_and_materialize(
+            source_url,
+            root_config,
+            external_slots,
+            exports,
+            store_bundle,
+            bundle_dir,
+        )
+        .await
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ScenarioSourceAllowlist {
+    allowed_sources: Option<Arc<RwLock<BTreeSet<String>>>>,
+}
+
+impl ScenarioSourceAllowlist {
+    fn from_config(entries: Option<BTreeSet<String>>) -> Result<Self, ConfigError> {
+        let Some(entries) = entries else {
+            return Ok(Self::default());
+        };
+
+        let mut allowed_sources = BTreeSet::new();
+        for entry in entries {
+            let normalized = Url::parse(&entry).map_err(|err| {
+                ConfigError::InvalidConfig(format!(
+                    "scenario_source_allowlist entry `{entry}` is not a valid URL: {err}"
+                ))
+            })?;
+            allowed_sources.insert(normalized.to_string());
+        }
+
+        Ok(Self {
+            allowed_sources: Some(Arc::new(RwLock::new(allowed_sources))),
+        })
+    }
+
+    fn ensure_allowed(&self, source_url: &str) -> Result<(), CompileError> {
+        let normalized = normalize_source_url(source_url)?;
+        let Some(allowed_sources) = self.allowed_sources.as_ref() else {
+            return Ok(());
+        };
+        let allowed_sources = allowed_sources
+            .read()
+            .expect("scenario source allowlist lock should not be poisoned");
+
+        if allowed_sources.contains(&normalized) {
+            Ok(())
+        } else {
+            Err(CompileError::SourceNotAllowed(source_url.to_string()))
+        }
+    }
+
+    fn remove(&self, source_url: &str) -> Result<String, ScenarioSourceAllowlistUpdateError> {
+        let normalized = normalize_source_url(source_url)?;
+        let Some(allowed_sources) = self.allowed_sources.as_ref() else {
+            return Err(ScenarioSourceAllowlistUpdateError::AllowlistDisabled);
+        };
+        let mut allowed_sources = allowed_sources
+            .write()
+            .expect("scenario source allowlist lock should not be poisoned");
+        if allowed_sources.remove(&normalized) {
+            Ok(normalized)
+        } else {
+            Err(ScenarioSourceAllowlistUpdateError::SourceNotPresent(
+                normalized,
+            ))
+        }
+    }
+}
+
+async fn inspect_source_unchecked(
     source_url: &str,
-    root_config: &Value,
-    external_slots: &BTreeMap<String, ExternalSlotBindingRequest>,
-    exports: &BTreeMap<String, ExportRequest>,
-    store_bundle: bool,
-    bundle_dir: Option<&Path>,
 ) -> Result<CompiledMaterialization, CompileError> {
-    compile_and_materialize(
-        source_url,
-        root_config,
-        external_slots,
-        exports,
-        store_bundle,
-        bundle_dir,
-    )
-    .await
+    compile_source_materialization(source_url, false, None).await
 }
 
 pub fn inspect_stored_ir(scenario_ir_json: &str) -> Result<CompiledMaterialization, CompileError> {
@@ -271,8 +384,23 @@ async fn compile_and_materialize(
     store_bundle: bool,
     bundle_dir: Option<&Path>,
 ) -> Result<CompiledMaterialization, CompileError> {
-    let url = Url::parse(source_url)
-        .map_err(|_| CompileError::InvalidSourceUrl(source_url.to_string()))?;
+    let mut materialization =
+        compile_source_materialization(source_url, store_bundle, bundle_dir).await?;
+    validate_slot_request(&materialization.proxy_metadata, external_slots)?;
+    validate_export_request(&materialization.proxy_metadata, exports)?;
+    let (non_secret_root_config, secret_root_config) =
+        validate_and_split_root_config(materialization.root_schema.as_ref(), root_config)?;
+    materialization.non_secret_root_config = non_secret_root_config;
+    materialization.secret_root_config = secret_root_config;
+    Ok(materialization)
+}
+
+async fn compile_source_materialization(
+    source_url: &str,
+    store_bundle: bool,
+    bundle_dir: Option<&Path>,
+) -> Result<CompiledMaterialization, CompileError> {
+    let url = parse_source_url(source_url)?;
     let compiler = Compiler::new(Resolver::new(), DigestStore::default());
     let output = if store_bundle {
         let tree = compiler
@@ -305,22 +433,29 @@ async fn compile_and_materialize(
         .emit(&compiled)
         .map_err(|err| CompileError::Compile(err.to_string()))?;
     let proxy_metadata = extract_proxy_metadata(&compose.files)?;
-    validate_slot_request(&proxy_metadata, external_slots)?;
-    validate_export_request(&proxy_metadata, exports)?;
     let root_schema = root_schema_from_ir(&scenario_ir);
-    let (non_secret_root_config, secret_root_config) =
-        validate_and_split_root_config(root_schema.as_ref(), root_config)?;
 
     Ok(CompiledMaterialization {
         scenario_ir,
         scenario_ir_json,
         root_schema,
-        non_secret_root_config,
-        secret_root_config,
+        non_secret_root_config: json!({}),
+        secret_root_config: json!({}),
         compose_files: compose.files,
         proxy_metadata,
         bundle_root: bundle_dir.map(Path::to_path_buf).filter(|_| store_bundle),
     })
+}
+
+fn parse_source_url(source_url: &str) -> Result<Url, CompileError> {
+    Url::parse(source_url).map_err(|err| CompileError::InvalidSourceUrl {
+        source_url: source_url.to_string(),
+        message: err.to_string(),
+    })
+}
+
+fn normalize_source_url(source_url: &str) -> Result<String, CompileError> {
+    Ok(parse_source_url(source_url)?.to_string())
 }
 
 fn validate_slot_request(
@@ -489,5 +624,79 @@ fn escape_env_value(value: &str) -> String {
         format!("{value:?}")
     } else {
         value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::{CompileError, ScenarioSourceAccess, ScenarioSourceAllowlistUpdateError};
+
+    #[test]
+    fn scenario_source_access_preflight_rejects_unlisted_urls() {
+        let access = ScenarioSourceAccess::from_config(Some(BTreeSet::from([String::from(
+            "https://example.com/allowed.json5",
+        )])))
+        .expect("build source access");
+
+        let err = access
+            .preflight("https://example.com/blocked.json5")
+            .expect_err("unlisted source should fail");
+        assert!(matches!(err, CompileError::SourceNotAllowed(_)));
+    }
+
+    #[test]
+    fn scenario_source_access_preflight_rejects_invalid_urls_with_allowlist() {
+        let access = ScenarioSourceAccess::from_config(Some(BTreeSet::from([String::from(
+            "https://example.com/allowed.json5",
+        )])))
+        .expect("build source access");
+
+        let err = access
+            .preflight("not a valid url")
+            .expect_err("invalid source should fail");
+        assert!(matches!(err, CompileError::InvalidSourceUrl { .. }));
+    }
+
+    #[test]
+    fn scenario_source_access_preflight_rejects_invalid_urls_without_allowlist() {
+        let access = ScenarioSourceAccess::from_config(None).expect("build source access");
+
+        let err = access
+            .preflight("not a valid url")
+            .expect_err("invalid source should fail");
+        assert!(matches!(err, CompileError::InvalidSourceUrl { .. }));
+    }
+
+    #[test]
+    fn scenario_source_access_remove_deletes_listed_url() {
+        let access = ScenarioSourceAccess::from_config(Some(BTreeSet::from([String::from(
+            "https://example.com/allowed.json5",
+        )])))
+        .expect("build source access");
+
+        let removed = access
+            .remove("https://example.com/allowed.json5")
+            .expect("remove listed source");
+        assert_eq!(removed, "https://example.com/allowed.json5");
+
+        let err = access
+            .preflight("https://example.com/allowed.json5")
+            .expect_err("removed source should be blocked");
+        assert!(matches!(err, CompileError::SourceNotAllowed(_)));
+    }
+
+    #[test]
+    fn scenario_source_access_remove_requires_enabled_allowlist() {
+        let access = ScenarioSourceAccess::from_config(None).expect("build source access");
+
+        let err = access
+            .remove("https://example.com/allowed.json5")
+            .expect_err("removing without allowlist should fail");
+        assert!(matches!(
+            err,
+            ScenarioSourceAllowlistUpdateError::AllowlistDisabled
+        ));
     }
 }

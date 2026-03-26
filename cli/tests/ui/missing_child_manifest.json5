@@ -1,0 +1,6 @@
+{
+  manifest_version: "0.2.0",
+  components: {
+    foo: "./does-not-exist.json",
+  },
+}

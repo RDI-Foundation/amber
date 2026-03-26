@@ -183,8 +183,8 @@ jobs:
   kubernetes-tests:
     name: Kubernetes Reporter Tests
     runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
     needs: docker-merge
-    if: ${{ always() && (github.event_name != 'pull_request' || needs.docker-merge.result == 'success') }}
     permissions:
       contents: read
       packages: read
@@ -219,7 +219,6 @@ jobs:
           echo "AMBER_TEST_KIND_CLUSTER_NAME=${cluster_name}" >> "$GITHUB_ENV"
           echo "AMBER_TEST_KIND_KUBECONFIG=${kubeconfig}" >> "$GITHUB_ENV"
       - name: Compute image registries
-        if: github.event_name == 'pull_request'
         id: registry
         shell: bash
         run: |
@@ -234,55 +233,21 @@ jobs:
           code_registry="${code_registry%/}"
           echo "CI_IMAGE_REGISTRY=${ci_registry}" >> "$GITHUB_ENV"
           echo "CODE_IMAGE_REGISTRY=${code_registry}" >> "$GITHUB_ENV"
-      - name: Compute semver tag metadata
-        if: github.event_name == 'pull_request'
-        id: version_tags
-        shell: bash
-        run: |
-          set -euo pipefail
-          json="$(cargo run -q -p amber-images --bin version_tags -- docker/images.json)"
-          {
-            echo "json<<EOF"
-            echo "$json"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
       - uses: docker/login-action@v3
-        if: github.event_name == 'pull_request'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Pull and retag images for tests
-        if: github.event_name == 'pull_request'
         shell: bash
         run: |
-          set -euo pipefail
-          version_tags_json='${{ steps.version_tags.outputs.json }}'
-          while IFS= read -r spec; do
-            [ -z "$spec" ] && continue
-            name="$(jq -r '.name' <<< "$spec")"
-            version="$(jq -r '.version' <<< "$spec")"
-            runtime_tag="$(jq -r '.runtime_tag' <<< "$spec")"
-            src="${CI_IMAGE_REGISTRY}/${name}:${GITHUB_SHA}"
-            docker pull "$src"
-            docker tag "$src" "${CODE_IMAGE_REGISTRY}/${name}:${version}"
-            if [ "$runtime_tag" != "$version" ]; then
-              docker tag "$src" "${CODE_IMAGE_REGISTRY}/${name}:${runtime_tag}"
-            fi
-            if [ "$name" = "amber-helper" ]; then
-              docker tag "$src" "amber-helper:e2e"
-            fi
-          done < <(jq -c '.images[]' <<< "$version_tags_json")
+          SOURCE_IMAGE_REGISTRY="$CI_IMAGE_REGISTRY" \
+          TARGET_IMAGE_REGISTRY="$CODE_IMAGE_REGISTRY" \
+          SOURCE_IMAGE_TAG="$GITHUB_SHA" \
+          ./.github/scripts/prepare_prebuilt_images.sh
       - name: Run Kubernetes smoke tests (prebuilt images)
-        if: github.event_name == 'pull_request'
         env:
           AMBER_TEST_USE_PREBUILT_IMAGES: "1"
-        run: |
-          cargo test -p amber-compiler --all-features kubernetes_smoke_config_roundtrip -- --ignored --test-threads=1
-          cargo test -p amber-compiler --all-features kubernetes_smoke_external_slot_routes_to_outside_service -- --ignored --test-threads=1
-          cargo test -p amber-compiler --all-features kubernetes_smoke_export_routes_to_host -- --ignored --test-threads=1
-      - name: Run Kubernetes smoke tests
-        if: github.event_name != 'pull_request'
         run: |
           cargo test -p amber-compiler --all-features kubernetes_smoke_config_roundtrip -- --ignored --test-threads=1
           cargo test -p amber-compiler --all-features kubernetes_smoke_external_slot_routes_to_outside_service -- --ignored --test-threads=1
@@ -683,24 +648,13 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Pull and retag images for tests
         shell: bash
+        env:
+          VERSION_TAGS_JSON: ${{ steps.version_tags.outputs.json }}
         run: |
-          set -euo pipefail
-          version_tags_json='${{ steps.version_tags.outputs.json }}'
-          while IFS= read -r spec; do
-            [ -z "$spec" ] && continue
-            name="$(jq -r '.name' <<< "$spec")"
-            version="$(jq -r '.version' <<< "$spec")"
-            runtime_tag="$(jq -r '.runtime_tag' <<< "$spec")"
-            src="${CI_IMAGE_REGISTRY}/${name}:${GITHUB_SHA}"
-            docker pull "$src"
-            docker tag "$src" "${CODE_IMAGE_REGISTRY}/${name}:${version}"
-            if [ "$runtime_tag" != "$version" ]; then
-              docker tag "$src" "${CODE_IMAGE_REGISTRY}/${name}:${runtime_tag}"
-            fi
-            if [ "$name" = "amber-helper" ]; then
-              docker tag "$src" "amber-helper:e2e"
-            fi
-          done < <(jq -c '.images[]' <<< "$version_tags_json")
+          SOURCE_IMAGE_REGISTRY="$CI_IMAGE_REGISTRY" \
+          TARGET_IMAGE_REGISTRY="$CODE_IMAGE_REGISTRY" \
+          SOURCE_IMAGE_TAG="$GITHUB_SHA" \
+          ./.github/scripts/prepare_prebuilt_images.sh
       - name: Run docker compose smoke tests
         run: |
           cargo test -p amber-compiler --all-features docker_smoke_ocap_blocks_unbound_callers -- --ignored --test-threads=1

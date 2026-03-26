@@ -1606,7 +1606,7 @@ fn is_empty_schema(value: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use serde_json::json;
 
@@ -1652,6 +1652,42 @@ mod tests {
         );
         assert!(by_path["model.reasoning_effort"].has_default());
         assert!(!by_path["model.name"].has_default());
+    }
+
+    #[test]
+    fn prune_schema_preserves_x_annotations_on_allowed_leaves() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "my_config": {
+                    "type": "string",
+                    "x-example-hide": true
+                },
+                "other_config": {
+                    "type": "string",
+                    "x-example-hide": false
+                }
+            },
+            "additionalProperties": false
+        });
+
+        let allowed_leaf_paths = BTreeSet::from(["my_config".to_string()]);
+        let pruned =
+            prune_schema(&schema, &allowed_leaf_paths).expect("schema with x-* annotations");
+
+        assert_eq!(
+            pruned,
+            json!({
+                "type": "object",
+                "properties": {
+                    "my_config": {
+                        "type": "string",
+                        "x-example-hide": true
+                    }
+                },
+                "additionalProperties": false
+            })
+        );
     }
 
     #[test]

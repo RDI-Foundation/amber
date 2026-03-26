@@ -1,3 +1,4 @@
 /target/
 *.img
 .amber-runs/
+/npm/node_modules/

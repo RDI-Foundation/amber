@@ -495,6 +495,7 @@ Rules enforced by this crate:
   * `$ref` is allowed, but must be local-only JSON pointers (`#` or `#/...`).
   * `additionalProperties` must be a boolean when present (schema-form `additionalProperties` is not supported).
   * `secret` is allowed as a boolean annotation; if set on a schema node, that value (and its descendants) are treated as secret.
+  * `x-*` annotations are allowed on schema objects. Amber ignores them for validation semantics, but preserves them when carrying the schema forward.
   * `default` is supported. Amber applies defaults when materializing root runtime config and when resolving component config objects. Defaults fill in absent values; they do not overwrite explicit values.
   * Unsupported keywords include: `anyOf`, `oneOf`, `not`, `if`/`then`/`else`, `patternProperties`, `propertyNames`, `dependentSchemas`, `dependentRequired`, `unevaluatedProperties`, `unevaluatedItems`, `$dynamicRef`, `$recursiveRef`.
 
@@ -519,6 +520,7 @@ config_schema: {
   type: "object",
   properties: {
     api_key: { type: "string", secret: true },
+    model: { type: "string", "x-example-hide": true },
   },
 }
 ```

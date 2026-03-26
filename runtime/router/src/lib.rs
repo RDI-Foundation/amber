@@ -1,9 +1,13 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
+    future::Future,
+    io,
     net::{IpAddr, SocketAddr},
     path::Path,
+    pin::Pin,
     sync::{Arc, Mutex as StdMutex},
+    task::{Context, Poll},
 };
 
 use amber_mesh::{
@@ -26,7 +30,13 @@ use hyper::{
 };
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::{
-    client::legacy::{Client, connect::HttpConnector},
+    client::legacy::{
+        Client,
+        connect::{
+            HttpConnector,
+            dns::{GaiResolver, Name},
+        },
+    },
     rt::{TokioExecutor, TokioIo},
     service::TowerToHyperService,
 };
@@ -47,7 +57,7 @@ use tokio::{
     sync::{Mutex, RwLock},
     task::JoinSet,
 };
-use tower::{ServiceBuilder, ServiceExt as _, service_fn as tower_service_fn};
+use tower::{Service, ServiceBuilder, ServiceExt as _, service_fn as tower_service_fn};
 use tower_http::{compression::CompressionLayer, decompression::Decompression};
 use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
@@ -263,6 +273,7 @@ struct HttpProxyState {
     labels: HttpExchangeLabels,
     config: Arc<MeshConfig>,
     external_overrides: ExternalOverrides,
+    vetted_external_addrs: VettedExternalAddrs,
     mesh_upstream: Arc<Mutex<Option<MeshHttpUpstream>>>,
 }
 
@@ -283,7 +294,7 @@ struct OutboundHttpProxyState {
     labels: HttpExchangeLabels,
 }
 
-type HttpClient = Client<HttpsConnector<HttpConnector>, BoxBody>;
+type HttpClient = Client<HttpsConnector<HttpConnector<ExternalHttpResolver>>, BoxBody>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BodyMode {
@@ -291,10 +302,13 @@ enum BodyMode {
     Collect,
 }
 
-#[allow(dead_code)]
 enum FilterDecision {
     Continue,
-    Reject { status: StatusCode, message: String },
+    #[allow(dead_code)]
+    Reject {
+        status: StatusCode,
+        message: String,
+    },
 }
 
 struct RewriteContext {
@@ -665,9 +679,43 @@ enum ResolvedHttpExternalTarget {
 }
 
 type ExternalOverrides = Arc<RwLock<HashMap<String, String>>>;
+type VettedExternalAddrs = Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>;
 type ControlAllowlist = Arc<HashSet<IpAddr>>;
 type DynamicIssuers = Arc<RwLock<HashMap<String, HashSet<String>>>>;
 type InboundRoutes = HashMap<String, InboundRoute>;
+
+type ExternalHttpResolveFuture =
+    Pin<Box<dyn Future<Output = io::Result<std::vec::IntoIter<SocketAddr>>> + Send>>;
+
+#[derive(Clone)]
+struct ExternalHttpResolver {
+    vetted_external_addrs: VettedExternalAddrs,
+    fallback: GaiResolver,
+}
+
+impl Service<Name> for ExternalHttpResolver {
+    type Response = std::vec::IntoIter<SocketAddr>;
+    type Error = io::Error;
+    type Future = ExternalHttpResolveFuture;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.fallback.poll_ready(cx)
+    }
+
+    fn call(&mut self, name: Name) -> Self::Future {
+        let host = name.as_str().to_string();
+        let vetted_external_addrs = self.vetted_external_addrs.clone();
+        let mut fallback = self.fallback.clone();
+
+        Box::pin(async move {
+            if let Some(addrs) = vetted_external_addrs.read().await.get(&host).cloned() {
+                return Ok(addrs.into_iter());
+            }
+
+            Ok(fallback.call(name).await?.collect::<Vec<_>>().into_iter())
+        })
+    }
+}
 
 #[derive(Clone)]
 struct ControlServiceState {
@@ -685,6 +733,7 @@ struct InboundRuntime {
     inbound_routes: Arc<InboundRoutes>,
     dynamic_issuers: DynamicIssuers,
     external_overrides: ExternalOverrides,
+    vetted_external_addrs: VettedExternalAddrs,
     client: Arc<HttpClient>,
     a2a_url_rewrite_table: Arc<a2a::UrlRewriteTable>,
 }
@@ -781,6 +830,7 @@ pub async fn run(config: MeshConfig) -> Result<(), RouterError> {
     };
     let config = Arc::new(config);
     let external_overrides = Arc::new(RwLock::new(HashMap::new()));
+    let (client, vetted_external_addrs) = build_client();
     let mut listeners = JoinSet::new();
 
     {
@@ -790,7 +840,8 @@ pub async fn run(config: MeshConfig) -> Result<(), RouterError> {
             inbound_routes: inbound_routes.clone(),
             dynamic_issuers: dynamic_issuers.clone(),
             external_overrides: external_overrides.clone(),
-            client: Arc::new(build_client()),
+            vetted_external_addrs: vetted_external_addrs.clone(),
+            client: Arc::new(client),
             a2a_url_rewrite_table: a2a_url_rewrite_table.clone(),
         }));
     }
@@ -961,6 +1012,7 @@ async fn handle_inbound(
         inbound_routes,
         dynamic_issuers,
         external_overrides,
+        vetted_external_addrs,
         client,
         a2a_url_rewrite_table,
     } = state;
@@ -1021,6 +1073,7 @@ async fn handle_inbound(
                     client.clone(),
                     config.clone(),
                     external_overrides.clone(),
+                    vetted_external_addrs.clone(),
                 )
                 .await?;
             }
@@ -2105,6 +2158,7 @@ async fn proxy_noise_to_external(
     client: Arc<HttpClient>,
     config: Arc<MeshConfig>,
     external_overrides: ExternalOverrides,
+    vetted_external_addrs: VettedExternalAddrs,
 ) -> Result<(), RouterError> {
     let (local, remote) = duplex(64 * 1024);
     let mut noise_session = session.clone();
@@ -2117,6 +2171,7 @@ async fn proxy_noise_to_external(
         labels,
         config,
         external_overrides,
+        vetted_external_addrs,
         mesh_upstream: Arc::new(Mutex::new(None)),
     };
 
@@ -2141,7 +2196,10 @@ async fn proxy_noise_to_external_tcp(
     target: ExternalTarget,
 ) -> Result<(), RouterError> {
     let (host, port) = resolve_tcp_target(&target)?;
-    let upstream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
+    let addrs = resolve_external_host(host.as_str(), port)
+        .await
+        .map_err(RouterError::InvalidConfig)?;
+    let upstream = connect_external_addrs(&addrs).await?;
     proxy_noise_to_plain(session, upstream).await
 }
 
@@ -5160,7 +5218,27 @@ async fn resolve_http_external_target(
         let overrides = state.external_overrides.read().await;
         overrides.get(&state.target.name).cloned()
     };
-    resolve_http_external_target_with_override(&state.target, override_url.as_deref(), uri)
+    let resolved =
+        resolve_http_external_target_with_override(&state.target, override_url.as_deref(), uri)?;
+    if let ResolvedHttpExternalTarget::Http(url) = &resolved {
+        let Some(host) = url.host_str() else {
+            return Err(error_response(
+                StatusCode::BAD_GATEWAY,
+                "external slot url missing host",
+            ));
+        };
+        let Some(port) = url.port_or_known_default() else {
+            return Err(error_response(
+                StatusCode::BAD_GATEWAY,
+                "external slot url missing port",
+            ));
+        };
+        let addrs = resolve_external_host(host, port)
+            .await
+            .map_err(|err| error_response(StatusCode::BAD_GATEWAY, &err))?;
+        pin_vetted_external_host(&state.vetted_external_addrs, host, &addrs).await;
+    }
+    Ok(resolved)
 }
 
 #[allow(clippy::result_large_err)]
@@ -5201,6 +5279,14 @@ fn resolve_http_external_target_with_override(
             "external slot url must be http/https",
         ));
     }
+    let Some(host) = base.host_str() else {
+        return Err(error_response(
+            StatusCode::BAD_GATEWAY,
+            "external slot url missing host",
+        ));
+    };
+    validate_external_ip_literal(host)
+        .map_err(|err| error_response(StatusCode::BAD_GATEWAY, &err))?;
 
     Ok(ResolvedHttpExternalTarget::Http(join_url(&base, uri)))
 }
@@ -5223,8 +5309,98 @@ fn resolve_tcp_target(target: &ExternalTarget) -> Result<(String, u16), RouterEr
     let port = parsed.port().ok_or_else(|| {
         RouterError::InvalidConfig("external tcp target url missing port".to_string())
     })?;
+    validate_external_ip_literal(host).map_err(RouterError::InvalidConfig)?;
 
     Ok((host.to_string(), port))
+}
+
+fn validate_external_ip_literal(host: &str) -> Result<(), String> {
+    let Ok(ip) = host.parse::<IpAddr>() else {
+        return Ok(());
+    };
+    if is_disallowed_external_ip(ip) {
+        return Err(format!(
+            "external target {host} resolves to a disallowed address: {ip}"
+        ));
+    }
+    Ok(())
+}
+
+async fn resolve_external_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_disallowed_external_ip(ip) {
+            return Err(format!(
+                "external target {host} resolves to a disallowed address: {ip}"
+            ));
+        }
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|err| format!("failed to resolve external target {host}:{port}: {err}"))?
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Err(format!(
+            "external target {host}:{port} did not resolve to an address"
+        ));
+    }
+    for addr in &addrs {
+        let ip = addr.ip();
+        if is_disallowed_external_ip(ip) {
+            return Err(format!(
+                "external target {host}:{port} resolves to a disallowed address: {ip}"
+            ));
+        }
+    }
+    Ok(addrs)
+}
+
+async fn connect_external_addrs(addrs: &[SocketAddr]) -> io::Result<tokio::net::TcpStream> {
+    let mut last_err = None;
+    for addr in addrs {
+        match tokio::net::TcpStream::connect(*addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) => last_err = Some(err),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "external target did not resolve to an address",
+        )
+    }))
+}
+
+async fn pin_vetted_external_host(
+    vetted_external_addrs: &VettedExternalAddrs,
+    host: &str,
+    addrs: &[SocketAddr],
+) {
+    let pinned_addrs = addrs
+        .iter()
+        .map(|addr| SocketAddr::new(addr.ip(), 0))
+        .collect::<Vec<_>>();
+    vetted_external_addrs
+        .write()
+        .await
+        .insert(host.to_string(), pinned_addrs);
+}
+
+fn is_disallowed_external_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unicast_link_local() {
+                return true;
+            }
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.is_loopback() || v4.is_link_local();
+            }
+            false
+        }
+    }
 }
 
 fn join_url(base: &Url, uri: &Uri) -> Url {
@@ -5374,15 +5550,24 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
-fn build_client() -> HttpClient {
+fn build_client() -> (HttpClient, VettedExternalAddrs) {
     install_default_crypto_provider();
+    let vetted_external_addrs = Arc::new(RwLock::new(HashMap::new()));
+    let mut http = HttpConnector::new_with_resolver(ExternalHttpResolver {
+        vetted_external_addrs: vetted_external_addrs.clone(),
+        fallback: GaiResolver::new(),
+    });
+    http.enforce_http(false);
     let https = HttpsConnectorBuilder::new()
         .with_webpki_roots()
         .https_or_http()
         .enable_http1()
         .enable_http2()
-        .build();
-    Client::builder(TokioExecutor::new()).build(https)
+        .wrap_connector(http);
+    (
+        Client::builder(TokioExecutor::new()).build(https),
+        vetted_external_addrs,
+    )
 }
 
 fn install_default_crypto_provider() {
@@ -6339,7 +6524,7 @@ mod tests {
 
         let resolved = resolve_http_external_target_with_override(
             &target,
-            Some("http://127.0.0.1:6167/base"),
+            Some("http://8.8.8.8:6167/base"),
             &Uri::from_static("/_matrix/client/v3/sync?timeout=30000"),
         )
         .expect("http target should resolve");
@@ -6349,7 +6534,51 @@ mod tests {
         };
         assert_eq!(
             url.as_str(),
-            "http://127.0.0.1:6167/base/_matrix/client/v3/sync?timeout=30000"
+            "http://8.8.8.8:6167/base/_matrix/client/v3/sync?timeout=30000"
+        );
+    }
+
+    #[test]
+    fn resolve_http_external_target_with_override_rejects_loopback_ip_literals() {
+        let target = ExternalTarget {
+            name: "matrix".to_string(),
+            url_env: "MATRIX_URL".to_string(),
+            optional: false,
+            url_override: None,
+        };
+
+        let response = resolve_http_external_target_with_override(
+            &target,
+            Some("http://127.0.0.1:6167/base"),
+            &Uri::from_static("/_matrix/client/v3/sync"),
+        )
+        .expect_err("loopback target should be rejected");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn resolve_http_external_target_with_override_accepts_private_ip_literals() {
+        let target = ExternalTarget {
+            name: "matrix".to_string(),
+            url_env: "MATRIX_URL".to_string(),
+            optional: false,
+            url_override: None,
+        };
+
+        let resolved = resolve_http_external_target_with_override(
+            &target,
+            Some("http://10.0.0.8:6167/base"),
+            &Uri::from_static("/_matrix/client/v3/sync"),
+        )
+        .expect("private target should resolve");
+
+        let ResolvedHttpExternalTarget::Http(url) = resolved else {
+            panic!("expected direct http target");
+        };
+        assert_eq!(
+            url.as_str(),
+            "http://10.0.0.8:6167/base/_matrix/client/v3/sync"
         );
     }
 
@@ -6428,8 +6657,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_http_external_target_reads_live_overrides() {
         let external_overrides: ExternalOverrides = Arc::new(RwLock::new(HashMap::new()));
+        let (client, vetted_external_addrs) = build_client();
         let state = HttpProxyState {
-            client: build_client(),
+            client,
             target: ExternalTarget {
                 name: "matrix".to_string(),
                 url_env: "MATRIX_URL".to_string(),
@@ -6439,6 +6669,7 @@ mod tests {
             labels: test_http_exchange_labels(),
             config: Arc::new(test_mesh_config()),
             external_overrides: external_overrides.clone(),
+            vetted_external_addrs,
             mesh_upstream: Arc::new(Mutex::new(None)),
         };
         let uri = Uri::from_static("/_matrix/client/v3/sync");
@@ -6451,7 +6682,7 @@ mod tests {
         external_overrides
             .write()
             .await
-            .insert("matrix".to_string(), "http://127.0.0.1:6167".to_string());
+            .insert("matrix".to_string(), "http://8.8.8.8:6167".to_string());
 
         let second = resolve_http_external_target(&state, &uri)
             .await
@@ -6459,7 +6690,80 @@ mod tests {
         let ResolvedHttpExternalTarget::Http(url) = second else {
             panic!("expected direct http target after override registration");
         };
-        assert_eq!(url.as_str(), "http://127.0.0.1:6167/_matrix/client/v3/sync");
+        assert_eq!(url.as_str(), "http://8.8.8.8:6167/_matrix/client/v3/sync");
+    }
+
+    #[tokio::test]
+    async fn resolve_http_external_target_rejects_localhost_overrides() {
+        let external_overrides: ExternalOverrides = Arc::new(RwLock::new(HashMap::new()));
+        let (client, vetted_external_addrs) = build_client();
+        let state = HttpProxyState {
+            client,
+            target: ExternalTarget {
+                name: "matrix".to_string(),
+                url_env: "MATRIX_URL".to_string(),
+                optional: false,
+                url_override: None,
+            },
+            labels: test_http_exchange_labels(),
+            config: Arc::new(test_mesh_config()),
+            external_overrides: external_overrides.clone(),
+            vetted_external_addrs,
+            mesh_upstream: Arc::new(Mutex::new(None)),
+        };
+        let uri = Uri::from_static("/_matrix/client/v3/sync");
+
+        external_overrides
+            .write()
+            .await
+            .insert("matrix".to_string(), "http://localhost:6167".to_string());
+
+        let response = resolve_http_external_target(&state, &uri)
+            .await
+            .expect_err("localhost override should be rejected");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn resolve_external_host_rejects_loopback_ip_literals() {
+        let err = resolve_external_host("127.0.0.1", 6167)
+            .await
+            .expect_err("loopback target should be rejected");
+        assert!(
+            err.contains("disallowed address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_external_host_accepts_private_ip_literals() {
+        let resolved = resolve_external_host("10.0.0.8", 6167)
+            .await
+            .expect("private target should resolve");
+        assert_eq!(resolved, vec![SocketAddr::from(([10, 0, 0, 8], 6167))]);
+    }
+
+    #[tokio::test]
+    async fn external_http_resolver_prefers_pinned_addresses() {
+        let resolver = ExternalHttpResolver {
+            vetted_external_addrs: Arc::new(RwLock::new(HashMap::from([(
+                "example.com".to_string(),
+                vec![SocketAddr::from(([203, 0, 113, 10], 0))],
+            )]))),
+            fallback: GaiResolver::new(),
+        };
+        let mut resolver = resolver;
+        let addrs = resolver
+            .call(
+                "example.com"
+                    .parse::<Name>()
+                    .expect("resolver name should parse"),
+            )
+            .await
+            .expect("pinned address should resolve")
+            .collect::<Vec<_>>();
+        assert_eq!(addrs, vec![SocketAddr::from(([203, 0, 113, 10], 0))]);
     }
 
     #[tokio::test]
@@ -6469,8 +6773,9 @@ mod tests {
         let connection_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (mesh_url, mesh_server_task) =
             spawn_test_mesh_http_server(&config.identity, connection_count.clone()).await;
+        let (client, vetted_external_addrs) = build_client();
         let state = HttpProxyState {
-            client: build_client(),
+            client,
             target: ExternalTarget {
                 name: "matrix".to_string(),
                 url_env: "MATRIX_URL".to_string(),
@@ -6480,6 +6785,7 @@ mod tests {
             labels: test_http_exchange_labels(),
             config: config.clone(),
             external_overrides: external_overrides.clone(),
+            vetted_external_addrs,
             mesh_upstream: Arc::new(Mutex::new(None)),
         };
         let (client_side, server_side) = duplex(64 * 1024);

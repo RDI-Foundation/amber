@@ -94,6 +94,22 @@ pub enum Error {
     },
 
     #[error(
+        "failed to resolve manifest reference `{reference}` for component `#{child}` in \
+         {realm_path}: {message}"
+    )]
+    #[diagnostic(code(compiler::manifest_ref_resolution))]
+    ManifestRefResolution {
+        realm_path: Box<str>,
+        child: Box<str>,
+        reference: Box<str>,
+        message: Box<str>,
+        #[source_code]
+        src: Option<NamedSource<Arc<str>>>,
+        #[label(primary, "manifest reference declared here")]
+        span: Option<SourceSpan>,
+    },
+
+    #[error(
         "unknown resolver `{resolver}` referenced by environment `{environment}` in {realm_url}"
     )]
     #[diagnostic(code(compiler::unknown_resolver))]
@@ -276,7 +292,19 @@ async fn resolve_component(
             }
         })?
     };
-    let resolved = resolve_manifest(&svc, &env, &resolved_ref).await?;
+    let resolved = match resolve_manifest(&svc, &env, &resolved_ref).await {
+        Ok(resolved) => resolved,
+        Err(err) if !name.is_empty() => {
+            return Err(wrap_child_manifest_resolution_error(
+                &svc,
+                base_url.as_ref(),
+                name.as_str(),
+                &declared_ref,
+                err,
+            ));
+        }
+        Err(err) => return Err(err),
+    };
     let ResolvedManifest {
         manifest,
         digest,
@@ -373,6 +401,60 @@ fn component_decl_environment(decl: &ComponentDecl) -> Option<String> {
         ComponentDecl::Object(o) => o.environment.clone(),
         ComponentDecl::Reference(_) => None,
         _ => None,
+    }
+}
+
+fn child_manifest_decl_site(
+    svc: &ResolveService,
+    realm_url: &Url,
+    child_name: &str,
+) -> (Option<NamedSource<Arc<str>>>, Option<SourceSpan>) {
+    svc.store
+        .diagnostic_source(realm_url)
+        .map_or((None, None), |(src, spans)| {
+            let span = spans
+                .components
+                .get(child_name)
+                .and_then(|component| component.manifest.or(Some(component.whole)))
+                .unwrap_or((0usize, 0usize).into());
+            (Some(src), Some(span))
+        })
+}
+
+fn wrap_child_manifest_resolution_error(
+    svc: &ResolveService,
+    realm_url: Option<&Url>,
+    child_name: &str,
+    declared_ref: &ManifestRef,
+    err: Error,
+) -> Error {
+    let Error::Resolver(resolver_err) = err else {
+        return err;
+    };
+    if matches!(resolver_err, resolver::Error::Manifest(_)) {
+        return Error::Resolver(resolver_err);
+    }
+
+    let Some(realm_url) = realm_url else {
+        return Error::Resolver(resolver_err);
+    };
+    let (src, span) = child_manifest_decl_site(svc, realm_url, child_name);
+
+    Error::ManifestRefResolution {
+        realm_path: display_url(realm_url).into(),
+        child: child_name.into(),
+        reference: declared_ref.url.as_str().into(),
+        message: resolver_error_message(&resolver_err).into(),
+        src,
+        span,
+    }
+}
+
+fn resolver_error_message(err: &resolver::Error) -> String {
+    match err {
+        resolver::Error::Io(err) => err.to_string(),
+        resolver::Error::Http(err) => err.to_string(),
+        other => other.to_string(),
     }
 }
 

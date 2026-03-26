@@ -623,6 +623,28 @@ async fn handle(mut req: Request<ProxyBody>, conn: Arc<ConnState>) -> Response<P
         return forward(req, conn.state.clone()).await;
     }
 
+    // Allow image pull (POST /images/create?fromImage=...) but block image import (fromSrc)
+    // and bare requests with no query parameters.
+    if req.method() == Method::POST && is_create_endpoint(&segs, "images") {
+        let is_pull = req
+            .uri()
+            .query()
+            .and_then(|q| serde_urlencoded::from_str::<Vec<(String, String)>>(q).ok())
+            .map(|params| {
+                params.iter().any(|(k, _)| k == "fromImage")
+                    && !params.iter().any(|(k, _)| k == "fromSrc")
+            })
+            .unwrap_or(false);
+
+        if is_pull {
+            return forward(req, conn.state.clone()).await;
+        }
+        return docker_error(
+            StatusCode::FORBIDDEN,
+            "only image pull (fromImage) is allowed; build/import is blocked",
+        );
+    }
+
     if requires_owner_label_filters(req.method(), &segs) {
         if let Err(resp) = apply_required_label_filters(&mut req, &conn.state, &id) {
             return *resp;
@@ -1111,7 +1133,13 @@ fn parse_container_create_references(body: &[u8]) -> GatewayResult<ContainerCrea
         for network in networking_config.endpoints_config.keys() {
             let network = network.trim();
             if !network.is_empty() {
-                refs.networks.insert(network.to_string());
+                let builtin = matches!(
+                    network.to_ascii_lowercase().as_str(),
+                    "default" | "bridge" | "host" | "private"
+                );
+                if !builtin {
+                    refs.networks.insert(network.to_string());
+                }
             }
         }
     }
@@ -2949,6 +2977,162 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn allows_image_pull_with_from_image() {
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+        gateway.enqueue_json(
+            Method::POST,
+            "/images/create",
+            StatusCode::OK,
+            serde_json::json!({"status":"Pulling from library/nginx"}),
+        );
+
+        let response = send_gateway_request(
+            gateway.addr,
+            Method::POST,
+            "/images/create?fromImage=nginx&tag=latest",
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+
+        let requests = gateway.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, Method::POST);
+        assert_eq!(requests[0].path, "/images/create");
+        assert_eq!(
+            requests[0].path_and_query,
+            "/images/create?fromImage=nginx&tag=latest"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn allows_image_pull_without_explicit_tag() {
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+        gateway.enqueue_json(
+            Method::POST,
+            "/images/create",
+            StatusCode::OK,
+            serde_json::json!({"status":"Pulling from library/alpine"}),
+        );
+
+        let response = send_gateway_request(
+            gateway.addr,
+            Method::POST,
+            "/images/create?fromImage=alpine",
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+
+        let requests = gateway.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, Method::POST);
+        assert_eq!(
+            requests[0].path_and_query,
+            "/images/create?fromImage=alpine"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn allows_image_pull_with_registry_qualified_name() {
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+        gateway.enqueue_json(
+            Method::POST,
+            "/images/create",
+            StatusCode::OK,
+            serde_json::json!({"status":"Pulling from ghcr.io/org/app"}),
+        );
+
+        let response = send_gateway_request(
+            gateway.addr,
+            Method::POST,
+            "/images/create?fromImage=ghcr.io/org/app&tag=v1.2",
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+
+        let requests = gateway.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].path_and_query,
+            "/images/create?fromImage=ghcr.io/org/app&tag=v1.2"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocks_image_import_with_from_src() {
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+
+        let response = send_gateway_request(
+            gateway.addr,
+            Method::POST,
+            "/images/create?fromSrc=-",
+            &[("content-type", "application/x-tar")],
+            &[],
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert!(response_message(&response.body).contains("only image pull"));
+        assert!(gateway.requests().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocks_image_create_with_no_query_params() {
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+
+        let response =
+            send_gateway_request(gateway.addr, Method::POST, "/images/create", &[], &[]).await;
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert!(response_message(&response.body).contains("only image pull"));
+        assert!(gateway.requests().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocks_image_create_with_both_from_image_and_from_src() {
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+
+        let response = send_gateway_request(
+            gateway.addr,
+            Method::POST,
+            "/images/create?fromImage=nginx&fromSrc=-",
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert!(gateway.requests().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn allows_image_pull_with_version_prefix() {
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+        gateway.enqueue_json(
+            Method::POST,
+            "/v1.45/images/create",
+            StatusCode::OK,
+            serde_json::json!({"status":"Pulling from library/nginx"}),
+        );
+
+        let response = send_gateway_request(
+            gateway.addr,
+            Method::POST,
+            "/v1.45/images/create?fromImage=nginx&tag=latest",
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+
+        let requests = gateway.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, Method::POST);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn allows_info_endpoint() {
         let gateway = GatewayHarness::start(vec![default_caller()]).await;
         gateway.enqueue_json(
@@ -3063,6 +3247,84 @@ mod tests {
                 .any(|req| req.method == Method::GET && req.path == "/containers/json"),
             "container create should not query compose config hash"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_allows_endpoints_config_with_builtin_default_network() {
+        // Docker CLI v27+ sends EndpointsConfig:{"default":{}} when no
+        // --network flag is given. Builtin names should be skipped, just
+        // like add_network_mode_reference does for NetworkMode.
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+        gateway.enqueue_json(
+            Method::POST,
+            "/containers/create",
+            StatusCode::CREATED,
+            serde_json::json!({"Id":"new-container"}),
+        );
+
+        let body = serde_json::json!({
+            "Image": "busybox",
+            "HostConfig": {
+                "NetworkMode": "default"
+            },
+            "NetworkingConfig": {
+                "EndpointsConfig": {
+                    "default": {}
+                }
+            }
+        });
+
+        let response = send_gateway_request(
+            gateway.addr,
+            Method::POST,
+            "/containers/create",
+            &[("content-type", "application/json")],
+            body.to_string().as_bytes(),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::CREATED);
+
+        let requests = gateway.requests();
+        assert!(
+            !requests
+                .iter()
+                .any(|req| req.method == Method::GET && req.path == "/networks/default"),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_rejects_foreign_network_in_endpoints_config() {
+        // User-defined networks in EndpointsConfig must still be authorized.
+        let gateway = GatewayHarness::start(vec![default_caller()]).await;
+        gateway.enqueue_json(
+            Method::GET,
+            "/networks/custom-net",
+            StatusCode::OK,
+            resource_labels("other-component", TEST_PROJECT),
+        );
+
+        let body = serde_json::json!({
+            "Image": "busybox",
+            "HostConfig": {
+                "NetworkMode": "custom-net"
+            },
+            "NetworkingConfig": {
+                "EndpointsConfig": {
+                    "custom-net": {}
+                }
+            }
+        });
+
+        let response = send_gateway_request(
+            gateway.addr,
+            Method::POST,
+            "/containers/create",
+            &[("content-type", "application/json")],
+            body.to_string().as_bytes(),
+        )
+        .await;
+        // custom-net is owned by a different component, so this should be denied
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4186,6 +4448,58 @@ mod tests {
         .await;
         assert_eq!(blocked_connect.status, StatusCode::FORBIDDEN);
 
+        // Image pull: resolve a known image, then pull it through the gateway.
+        if let Some(image) = docker_image_for_ignored_e2e(&docker_sock).await {
+            let (from_image, tag) = image.rsplit_once(':').unwrap_or((image.as_str(), "latest"));
+
+            let pull_result = send_gateway_request(
+                listen,
+                Method::POST,
+                &format!("/images/create?fromImage={from_image}&tag={tag}"),
+                &[],
+                &[],
+            )
+            .await;
+            assert!(
+                pull_result.status.is_success(),
+                "image pull via gateway failed: {} {}",
+                pull_result.status,
+                String::from_utf8_lossy(&pull_result.body)
+            );
+
+            // Verify the pulled image is inspectable through the gateway.
+            let inspect = send_gateway_request(
+                listen,
+                Method::GET,
+                &format!("/images/{image}/json"),
+                &[],
+                &[],
+            )
+            .await;
+            assert_eq!(
+                inspect.status,
+                StatusCode::OK,
+                "image inspect after pull failed: {}",
+                String::from_utf8_lossy(&inspect.body)
+            );
+        }
+
+        // Image import should still be blocked.
+        let blocked_import = send_gateway_request(
+            listen,
+            Method::POST,
+            "/images/create?fromSrc=-",
+            &[("content-type", "application/x-tar")],
+            &[],
+        )
+        .await;
+        assert_eq!(blocked_import.status, StatusCode::FORBIDDEN);
+
+        // Bare image create (no query params) should be blocked.
+        let blocked_bare =
+            send_gateway_request(listen, Method::POST, "/images/create", &[], &[]).await;
+        assert_eq!(blocked_bare.status, StatusCode::FORBIDDEN);
+
         gateway_task.abort();
         docker_delete_network_best_effort(&docker_sock, &owned_network).await;
         docker_delete_network_best_effort(&docker_sock, &foreign_network).await;
@@ -4462,5 +4776,129 @@ mod tests {
         docker_delete_container_best_effort(&docker_sock, &owned_container_a).await;
         docker_delete_network_best_effort(&docker_sock, &owned_network_a).await;
         docker_delete_network_best_effort(&docker_sock, &owned_network_b).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires a reachable Docker daemon via DOCKER_HOST, ~/.docker/run/docker.sock, or \
+                /var/run/docker.sock"]
+    async fn docker_daemon_e2e_container_create_without_network_mode() {
+        let Some(docker_sock) = docker_socket_for_ignored_e2e() else {
+            eprintln!("skipping docker daemon e2e: no docker unix socket found");
+            return;
+        };
+
+        if UnixStream::connect(&docker_sock).await.is_err() {
+            eprintln!(
+                "skipping docker daemon e2e: docker socket exists but is not reachable at {}",
+                docker_sock.display()
+            );
+            return;
+        }
+
+        let ping = send_docker_request(&docker_sock, Method::GET, "/_ping", None).await;
+        if ping.status != StatusCode::OK {
+            eprintln!(
+                "skipping docker daemon e2e: /_ping returned {} with body {}",
+                ping.status,
+                String::from_utf8_lossy(&ping.body)
+            );
+            return;
+        }
+
+        let Some(image) = docker_image_for_ignored_e2e(&docker_sock).await else {
+            return;
+        };
+
+        let suffix = unique_test_suffix();
+        let compose_project = format!("amber-gw-e2e-netmode-{suffix}");
+        let component = format!("amber-gw-e2e-netmode-comp-{suffix}");
+        let container_name = format!("amber-gw-e2e-netmode-ctr-{suffix}");
+
+        let listen = reserve_loopback_socket_addr();
+        let config = DockerGatewayConfig {
+            listen,
+            docker_sock: docker_sock.clone(),
+            compose_project: compose_project.clone(),
+            callers: vec![CallerConfig {
+                host: "127.0.0.1".to_string(),
+                port: None,
+                component: component.clone(),
+                compose_service: component.clone(),
+            }],
+        };
+
+        let gateway_task = tokio::spawn(async move {
+            if let Err(err) = run(config).await {
+                panic!("gateway run failed in network-mode e2e test: {err}");
+            }
+        });
+        wait_until_gateway_listens(listen, &gateway_task).await;
+
+        // Docker CLI v27+ sends EndpointsConfig:{"default":{}} when no
+        // --network flag is given. The gateway should skip builtin names.
+        let create = send_gateway_request(
+            listen,
+            Method::POST,
+            &format!("/containers/create?name={container_name}"),
+            &[("content-type", "application/json")],
+            serde_json::json!({
+                "Image": image.as_str(),
+                "Cmd": ["true"],
+                "HostConfig": {
+                    "NetworkMode": "default"
+                },
+                "NetworkingConfig": {
+                    "EndpointsConfig": {
+                        "default": {}
+                    }
+                }
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .await;
+        assert_eq!(
+            create.status,
+            StatusCode::CREATED,
+            "container create via gateway failed: {}",
+            String::from_utf8_lossy(&create.body)
+        );
+
+        // Verify the container exists and has correct labels.
+        let inspect = send_gateway_request(
+            listen,
+            Method::GET,
+            &format!("/containers/{container_name}/json"),
+            &[],
+            &[],
+        )
+        .await;
+        assert_eq!(
+            inspect.status,
+            StatusCode::OK,
+            "container inspect failed: {}",
+            String::from_utf8_lossy(&inspect.body)
+        );
+        let inspect_value: serde_json::Value =
+            serde_json::from_slice(&inspect.body).expect("inspect json");
+        let labels = inspect_value
+            .pointer("/Config/Labels")
+            .and_then(|v| v.as_object())
+            .expect("container labels");
+        assert_eq!(
+            labels
+                .get(COMPOSE_PROJECT_LABEL)
+                .and_then(|value| value.as_str()),
+            Some(compose_project.as_str())
+        );
+        assert_eq!(
+            labels
+                .get(AMBER_COMPONENT_LABEL)
+                .and_then(|value| value.as_str()),
+            Some(component.as_str())
+        );
+
+        gateway_task.abort();
+        docker_delete_container_best_effort(&docker_sock, &container_name).await;
     }
 }

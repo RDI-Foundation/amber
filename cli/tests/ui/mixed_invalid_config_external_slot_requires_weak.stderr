@@ -1,0 +1,52 @@
+linker::invalid_config
+
+  x invalid config for /cfg: slot interpolation is not allowed in component config templates
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/mixed_invalid_config_external_slot_requires_weak.json5:10:7]
+  9 |       manifest: "./mixed_invalid_config_external_slot_requires_weak_cfg.json5",
+ 10 |       config: {
+    :       ^^^|^^
+    :          `-- config provided here
+ 11 |         url: "${slots.api.url}",
+    `----
+linker::external_slot_requires_weak
+
+  x binding into component /sink.api must be weak because it depends on external slot `api`
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/mixed_invalid_config_external_slot_requires_weak.json5:16:11]
+ 15 |   bindings: [
+ 16 |     { to: "#sink.api", from: "slots.api" },
+    :           ^^^^^|^^^^^
+    :                `-- binding must be weak here
+ 17 |   ],
+    `----
+  help: Any route that depends on an external slot must be weak overall. Make this binding weak or insert a weak binding upstream.
+
+Advice: 
+  > external slot `api` declared on /
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/mixed_invalid_config_external_slot_requires_weak.json5:4:5]
+ 3 |   slots: {
+ 4 |     api: { kind: "http" },
+   :     ^|^
+   :      `-- slot declared here
+ 5 |   },
+   `----
+linker::unbound_slot
+
+  x slot `api` on component /sink is not bound (non-optional slots must be filled)
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/mixed_invalid_config_external_slot_requires_weak_sink.json5:14:5]
+ 13 |   slots: {
+ 14 |     api: { kind: "http" },
+    :     ^|^
+    :      `-- slot declared here
+ 15 |   },
+    `----
+
+Advice: 
+  > component `sink` declared on root component
+   ,-[<CARGO_MANIFEST_DIR>/tests/ui/mixed_invalid_config_external_slot_requires_weak.json5:7:5]
+ 6 |   components: {
+ 7 |     sink: "./mixed_invalid_config_external_slot_requires_weak_sink.json5",
+   :     ^^|^
+   :       `-- component declared here
+ 8 |     cfg: {
+   `----
+Error:   × check failed
