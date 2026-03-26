@@ -43,7 +43,10 @@ use tokio::{
 
 use crate::{
     cross_site_router_mesh_bind_ip,
-    tcp_readiness::{wait_for_http_response, wait_for_stable_endpoint},
+    tcp_readiness::{
+        endpoint_accepts_stable_connection, endpoint_returns_http_response,
+        wait_for_stable_endpoint,
+    },
 };
 
 const VM_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(150);
@@ -378,10 +381,17 @@ pub(crate) async fn run_vm_init(
                 &mut log_tasks,
             )
             .await?;
+            let child = children.last_mut().ok_or_else(|| {
+                miette::miette!(
+                    "missing managed child for vm component {} after launch",
+                    component.moniker
+                )
+            })?;
             wait_for_endpoint_forwards(
                 component,
                 &runtime_root,
                 vm_endpoint_forward_ready_timeout(),
+                child,
             )?;
         }
         supervise_children(&mut children).await
@@ -1281,6 +1291,7 @@ fn wait_for_endpoint_forwards(
     component: &VmComponentPlan,
     runtime_root: &Path,
     timeout: Duration,
+    child: &mut ManagedChild,
 ) -> Result<()> {
     let config = read_mesh_config_public(&runtime_root.join(&component.mesh_config_path))?;
     for route in config.inbound {
@@ -1288,26 +1299,59 @@ fn wait_for_endpoint_forwards(
             continue;
         };
         let addr = SocketAddr::from(([127, 0, 0, 1], host_port));
-        match route.protocol {
-            MeshProtocol::Http => wait_for_http_response(addr, timeout).map_err(|err| {
+        wait_for_endpoint_or_child_exit(
+            child,
+            addr,
+            timeout,
+            match route.protocol {
+                MeshProtocol::Http => endpoint_returns_http_response,
+                MeshProtocol::Tcp => endpoint_accepts_stable_connection,
+            },
+        )
+        .map_err(|err| match route.protocol {
+            MeshProtocol::Http => {
                 miette::miette!(
                     "forwarded HTTP endpoint 127.0.0.1:{} for component {} did not become ready: \
                      {err}",
                     host_port,
                     component.moniker
                 )
-            })?,
-            MeshProtocol::Tcp => wait_for_stable_endpoint(addr, timeout).map_err(|err| {
+            }
+            MeshProtocol::Tcp => {
                 miette::miette!(
                     "forwarded TCP endpoint 127.0.0.1:{} for component {} did not become ready: \
                      {err}",
                     host_port,
                     component.moniker
                 )
-            })?,
-        }
+            }
+        })?;
     }
     Ok(())
+}
+
+fn wait_for_endpoint_or_child_exit(
+    child: &mut ManagedChild,
+    addr: SocketAddr,
+    timeout: Duration,
+    probe: fn(SocketAddr, Duration, Duration) -> bool,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if probe(addr, Duration::from_millis(250), Duration::from_millis(250)) {
+            return Ok(());
+        }
+        if let Some(status) = child.child.try_wait().into_diagnostic()? {
+            return Err(miette::miette!(
+                "vm process {} exited before endpoint {} became ready with status {}",
+                child.name,
+                addr,
+                status
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(miette::miette!("timeout after {:?}", timeout))
 }
 
 fn vm_endpoint_forward_ready_timeout() -> Duration {
