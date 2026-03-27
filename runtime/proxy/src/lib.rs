@@ -67,6 +67,64 @@ pub struct PreparedProxy {
     proxy_identity: MeshIdentity,
     mesh_addr: Option<String>,
     mesh_listen: SocketAddr,
+    reserved_listeners: ReservedProxyListeners,
+}
+
+#[derive(Debug)]
+struct ReservedTcpListener {
+    listener: TcpListener,
+}
+
+#[derive(Debug, Default)]
+struct ReservedProxyListeners {
+    mesh: Option<ReservedTcpListener>,
+    outbound: Vec<ReservedTcpListener>,
+}
+
+impl ReservedTcpListener {
+    fn reserve(listen: SocketAddr) -> Result<Self> {
+        let listener = TcpListener::bind(listen)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to reserve listener at {listen}"))?;
+        Ok(Self { listener })
+    }
+
+    fn local_addr(&self) -> Result<SocketAddr> {
+        self.listener.local_addr().into_diagnostic()
+    }
+
+    fn into_tokio(self) -> Result<tokio::net::TcpListener> {
+        self.listener
+            .set_nonblocking(true)
+            .into_diagnostic()
+            .wrap_err("failed to configure reserved listener as non-blocking")?;
+        tokio::net::TcpListener::from_std(self.listener)
+            .into_diagnostic()
+            .wrap_err("failed to adopt reserved listener")
+    }
+}
+
+impl ReservedProxyListeners {
+    fn into_router_prebound(
+        self,
+        outbound_routes: &[OutboundRoute],
+    ) -> Result<router::PreboundListeners> {
+        let mut listeners = router::PreboundListeners::default();
+        if let Some(mesh) = self.mesh {
+            listeners = listeners.with_mesh(mesh.into_tokio()?);
+        }
+        if self.outbound.len() != outbound_routes.len() {
+            return Err(miette::miette!(
+                "reserved {} outbound listeners for {} outbound routes",
+                self.outbound.len(),
+                outbound_routes.len()
+            ));
+        }
+        for (route, listener) in outbound_routes.iter().zip(self.outbound) {
+            listeners.insert_outbound(route.route_id.clone(), listener.into_tokio()?);
+        }
+        Ok(listeners)
+    }
 }
 
 impl ProxyCommand {
@@ -188,24 +246,28 @@ impl ProxyCommand {
         .await?;
         let proxy_identity = build_proxy_identity("/proxy", &router_identity);
 
-        let (mesh_addr, mesh_listen) = if self.slot_bindings.is_empty() {
-            (None, SocketAddr::from(([127, 0, 0, 1], 0)))
+        let (mesh_addr, mesh_listen, mesh_listener) = if self.slot_bindings.is_empty() {
+            (None, SocketAddr::from(([127, 0, 0, 1], 0)), None)
         } else {
-            let (mesh_addr, mesh_listen) =
-                resolve_mesh_addresses(self.mesh_addr.as_deref(), &target)?;
-            (Some(mesh_addr), mesh_listen)
+            let (mesh_addr, mesh_listen, listener) =
+                reserve_mesh_addresses(self.mesh_addr.as_deref(), &target)?;
+            (Some(mesh_addr), mesh_listen, Some(listener))
         };
+        let (export_bindings, mut reserved_listeners) =
+            reserve_export_bindings(&self.export_bindings)?;
+        reserved_listeners.mesh = mesh_listener;
 
         Ok(PreparedProxy {
             target,
             slot_bindings: self.slot_bindings,
-            export_bindings: self.export_bindings,
+            export_bindings,
             control_endpoint,
             router_identity,
             router_addr,
             proxy_identity,
             mesh_addr,
             mesh_listen,
+            reserved_listeners,
         })
     }
 
@@ -354,8 +416,11 @@ impl PreparedProxy {
             outbound,
             transport: TransportConfig::NoiseIk {},
         };
+        let prebound_listeners = self
+            .reserved_listeners
+            .into_router_prebound(&config.outbound)?;
 
-        let mut router = std::pin::pin!(router::run(config));
+        let mut router = std::pin::pin!(router::run_with_listeners(config, prebound_listeners));
         let mut shutdown = std::pin::pin!(wait_for_shutdown_signal());
         tokio::select! {
             res = &mut router => res.map_err(|err| miette::miette!("proxy failed: {err}")),
@@ -777,27 +842,34 @@ fn validate_proxy_metadata(metadata: &ProxyMetadata, path: &Path) -> Result<()> 
     Ok(())
 }
 
-fn resolve_mesh_addresses(
+fn reserve_mesh_addresses(
     mesh_addr_override: Option<&str>,
     target: &ProxyTarget,
-) -> Result<(String, SocketAddr)> {
+) -> Result<(String, SocketAddr, ReservedTcpListener)> {
     if let Some(mesh_addr) = mesh_addr_override {
         let port = parse_mesh_addr_port(mesh_addr)?;
         let listen_ip = match target.kind {
             ProxyTargetKind::Direct | ProxyTargetKind::Vm => Ipv4Addr::LOCALHOST,
             _ => Ipv4Addr::UNSPECIFIED,
         };
-        let listen = SocketAddr::new(IpAddr::V4(listen_ip), port);
-        return Ok((mesh_addr.to_string(), listen));
+        let listener = ReservedTcpListener::reserve(SocketAddr::new(IpAddr::V4(listen_ip), port))?;
+        let actual_listen = listener.local_addr()?;
+        let actual_mesh_addr = if port == 0 {
+            rewrite_addr_port(mesh_addr, actual_listen.port())?
+        } else {
+            mesh_addr.to_string()
+        };
+        return Ok((actual_mesh_addr, actual_listen, listener));
     }
 
-    let port = pick_free_port()?;
-    let mesh_addr = default_mesh_addr(target, port)?;
     let listen_ip = match target.kind {
         ProxyTargetKind::Direct | ProxyTargetKind::Vm => Ipv4Addr::LOCALHOST,
         _ => Ipv4Addr::UNSPECIFIED,
     };
-    Ok((mesh_addr, SocketAddr::new(IpAddr::V4(listen_ip), port)))
+    let listener = ReservedTcpListener::reserve(SocketAddr::new(IpAddr::V4(listen_ip), 0))?;
+    let actual_listen = listener.local_addr()?;
+    let mesh_addr = default_mesh_addr(target, actual_listen.port())?;
+    Ok((mesh_addr, actual_listen, listener))
 }
 
 fn default_mesh_addr(target: &ProxyTarget, port: u16) -> Result<String> {
@@ -817,10 +889,29 @@ fn parse_mesh_addr_port(addr: &str) -> Result<u16> {
         .ok_or_else(|| miette::miette!("--mesh-addr must include a port (got {addr})"))
 }
 
-fn pick_free_port() -> Result<u16> {
-    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
-        .into_diagnostic()?;
-    Ok(listener.local_addr().into_diagnostic()?.port())
+fn reserve_export_bindings(
+    export_bindings: &[ExportBinding],
+) -> Result<(Vec<ExportBinding>, ReservedProxyListeners)> {
+    let mut actual_bindings = Vec::with_capacity(export_bindings.len());
+    let mut listeners = ReservedProxyListeners::default();
+    for binding in export_bindings {
+        let listener = ReservedTcpListener::reserve(binding.listen)?;
+        let actual_listen = listener.local_addr()?;
+        listeners.outbound.push(listener);
+        actual_bindings.push(ExportBinding {
+            export: binding.export.clone(),
+            listen: actual_listen,
+        });
+    }
+    Ok((actual_bindings, listeners))
+}
+
+fn rewrite_addr_port(addr: &str, port: u16) -> Result<String> {
+    let mut url = Url::parse(&format!("mesh://{addr}"))
+        .map_err(|err| miette::miette!("invalid --mesh-addr {addr}: {err}"))?;
+    url.set_port(Some(port))
+        .map_err(|_| miette::miette!("failed to rewrite --mesh-addr {addr} with port {port}"))?;
+    Ok(url[url::Position::BeforeHost..].to_string())
 }
 
 async fn resolve_router_mesh_addr(
@@ -1916,6 +2007,156 @@ mod tests {
             .block_on(async { ProxyCommand::new("/tmp/out").prepare().await })
             .expect_err("missing bindings should be rejected");
         assert!(err.to_string().contains("at least one --slot"), "{err}");
+    }
+
+    fn test_proxy_target(kind: ProxyTargetKind) -> ProxyTarget {
+        ProxyTarget {
+            kind,
+            metadata: ProxyMetadata {
+                version: PROXY_METADATA_VERSION.to_string(),
+                ..Default::default()
+            },
+            source: PathBuf::from("/tmp/out"),
+        }
+    }
+
+    #[test]
+    fn reserve_mesh_addresses_for_compose_keeps_listener_public() {
+        let target = test_proxy_target(ProxyTargetKind::DockerCompose);
+
+        let (mesh_addr, listen, listener) =
+            reserve_mesh_addresses(None, &target).expect("mesh listener should reserve");
+
+        assert_eq!(mesh_addr, format!("host.docker.internal:{}", listen.port()));
+        assert!(
+            listen.ip().is_unspecified(),
+            "compose proxy mesh listener must stay reachable from containers"
+        );
+        assert_eq!(
+            listener
+                .local_addr()
+                .expect("reserved listener should report its address"),
+            listen
+        );
+    }
+
+    #[test]
+    fn reserve_mesh_addresses_for_direct_keeps_listener_loopback() {
+        let target = test_proxy_target(ProxyTargetKind::Direct);
+
+        let (mesh_addr, listen, listener) =
+            reserve_mesh_addresses(None, &target).expect("mesh listener should reserve");
+
+        assert_eq!(mesh_addr, format!("127.0.0.1:{}", listen.port()));
+        assert!(
+            listen.ip().is_loopback(),
+            "direct proxy mesh listener should stay local to the host"
+        );
+        assert_eq!(
+            listener
+                .local_addr()
+                .expect("reserved listener should report its address"),
+            listen
+        );
+    }
+
+    #[test]
+    fn reserve_mesh_addresses_rewrites_ephemeral_override_port() {
+        let target = test_proxy_target(ProxyTargetKind::Direct);
+
+        let (mesh_addr, listen, _listener) = reserve_mesh_addresses(Some("127.0.0.1:0"), &target)
+            .expect("mesh listener should reserve");
+
+        assert_eq!(mesh_addr, format!("127.0.0.1:{}", listen.port()));
+        assert_ne!(listen.port(), 0);
+    }
+
+    #[test]
+    fn reserve_export_bindings_hold_reserved_ports_until_drop() {
+        let requested = [ExportBinding {
+            export: "api".to_string(),
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        }];
+
+        let (bindings, listeners) =
+            reserve_export_bindings(&requested).expect("export listeners should reserve");
+        let actual = bindings
+            .first()
+            .expect("reserved export should exist")
+            .listen;
+
+        assert_ne!(actual.port(), 0);
+        assert!(
+            TcpListener::bind(actual).is_err(),
+            "reserved export port should stay occupied until the reservation is dropped"
+        );
+
+        drop(listeners);
+        TcpListener::bind(actual).expect("dropping the reservation should release the port");
+    }
+
+    #[tokio::test]
+    async fn reserve_export_bindings_preserve_duplicate_export_listeners() {
+        let requested = vec![
+            ExportBinding {
+                export: "api".to_string(),
+                listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            },
+            ExportBinding {
+                export: "api".to_string(),
+                listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            },
+        ];
+
+        let (bindings, listeners) =
+            reserve_export_bindings(&requested).expect("export listeners should reserve");
+        let routes = vec![
+            OutboundRoute {
+                route_id: "duplicate-route".to_string(),
+                slot: "api".to_string(),
+                capability_kind: None,
+                capability_profile: None,
+                listen_port: bindings[0].listen.port(),
+                listen_addr: Some(bindings[0].listen.ip().to_string()),
+                protocol: MeshProtocol::Http,
+                http_plugins: Vec::new(),
+                peer_addr: "127.0.0.1:1".to_string(),
+                peer_id: "/router".to_string(),
+                capability: "api".to_string(),
+            },
+            OutboundRoute {
+                route_id: "duplicate-route".to_string(),
+                slot: "api".to_string(),
+                capability_kind: None,
+                capability_profile: None,
+                listen_port: bindings[1].listen.port(),
+                listen_addr: Some(bindings[1].listen.ip().to_string()),
+                protocol: MeshProtocol::Http,
+                http_plugins: Vec::new(),
+                peer_addr: "127.0.0.1:1".to_string(),
+                peer_id: "/router".to_string(),
+                capability: "api".to_string(),
+            },
+        ];
+
+        let listeners = listeners
+            .into_router_prebound(&routes)
+            .expect("duplicate export listeners should convert");
+
+        assert!(
+            TcpListener::bind(bindings[0].listen).is_err(),
+            "the first duplicate listener should still be reserved after conversion"
+        );
+        assert!(
+            TcpListener::bind(bindings[1].listen).is_err(),
+            "the second duplicate listener should still be reserved after conversion"
+        );
+
+        drop(listeners);
+        TcpListener::bind(bindings[0].listen)
+            .expect("dropping the converted listeners should release the first port");
+        TcpListener::bind(bindings[1].listen)
+            .expect("dropping the converted listeners should release the second port");
     }
 
     #[test]
