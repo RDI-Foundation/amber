@@ -1,0 +1,13 @@
+manifest::optional_mount_config
+
+  x mount references optional config `file` without `when` (in component /)
+    ,-[<CARGO_MANIFEST_DIR>/tests/ui/lint_optional_mount_config.json5:13:38]
+ 12 |     mounts: [
+ 13 |       { path: "/tmp/file.txt", from: "config.file" },
+    :                                      ^^^^^^|^^^^^^
+    :                                            `-- unguarded optional config interpolation
+ 14 |     ],
+    `----
+  help: warning treated as error because it was denied via `-D warnings`
+        Wrap the mount in `{ when: "config.file", ... }` if it should disappear when unset, or make `config.file` required.
+Error:   × check failed

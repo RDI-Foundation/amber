@@ -6,18 +6,17 @@ use std::{
 #[cfg(test)]
 mod tests;
 
-use amber_manifest::{
-    ExperimentalFeature, Manifest, ManifestRef,
-    lint::{ManifestLint, lint_manifest},
-};
+use amber_manifest::{ExperimentalFeature, Manifest, ManifestRef};
 use amber_resolver::Resolver;
 use amber_scenario::{BindingFrom, ComponentId, Scenario};
+use lint::{ManifestLint, lint_manifest};
 use miette::{Diagnostic, Report};
 use thiserror::Error;
 
 mod config;
 mod frontend;
 mod linker;
+mod lint;
 pub mod mesh;
 mod mir;
 pub mod run_plan;
