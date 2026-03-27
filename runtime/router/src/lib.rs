@@ -755,6 +755,35 @@ const MAX_FRAME: usize = 64 * 1024;
 const MAX_PLAINTEXT: usize = 16 * 1024;
 const CONTROL_SOCKET_PATH_ENV: &str = "AMBER_ROUTER_CONTROL_SOCKET_PATH";
 
+#[derive(Default)]
+pub struct PreboundListeners {
+    mesh: Option<TcpListener>,
+    outbound_by_route_id: HashMap<String, VecDeque<TcpListener>>,
+}
+
+impl PreboundListeners {
+    pub fn with_mesh(mut self, listener: TcpListener) -> Self {
+        self.mesh = Some(listener);
+        self
+    }
+
+    pub fn insert_outbound(&mut self, route_id: impl Into<String>, listener: TcpListener) {
+        self.outbound_by_route_id
+            .entry(route_id.into())
+            .or_default()
+            .push_back(listener)
+    }
+
+    fn take_outbound(&mut self, route_id: &str) -> Option<TcpListener> {
+        let listeners = self.outbound_by_route_id.get_mut(route_id)?;
+        let listener = listeners.pop_front();
+        if listeners.is_empty() {
+            self.outbound_by_route_id.remove(route_id);
+        }
+        listener
+    }
+}
+
 pub fn config_from_env() -> Result<MeshConfig, RouterError> {
     if let Ok(path) = env::var("AMBER_ROUTER_CONFIG_PATH") {
         let raw = std::fs::read_to_string(&path)
@@ -815,6 +844,13 @@ fn parse_identity_json(raw: &str) -> Result<MeshIdentitySecret, RouterError> {
 }
 
 pub async fn run(config: MeshConfig) -> Result<(), RouterError> {
+    run_with_listeners(config, PreboundListeners::default()).await
+}
+
+pub async fn run_with_listeners(
+    config: MeshConfig,
+    mut listeners_by_route: PreboundListeners,
+) -> Result<(), RouterError> {
     let trust = Arc::new(TrustBundle::new(&config)?);
     let inbound_routes = Arc::new(build_inbound_routes(&config)?);
     validate_outbound_routes(&config)?;
@@ -834,27 +870,32 @@ pub async fn run(config: MeshConfig) -> Result<(), RouterError> {
     let mut listeners = JoinSet::new();
 
     {
-        listeners.spawn(run_mesh_listener(InboundRuntime {
-            config: config.clone(),
-            trust: trust.clone(),
-            inbound_routes: inbound_routes.clone(),
-            dynamic_issuers: dynamic_issuers.clone(),
-            external_overrides: external_overrides.clone(),
-            vetted_external_addrs: vetted_external_addrs.clone(),
-            client: Arc::new(client),
-            a2a_url_rewrite_table: a2a_url_rewrite_table.clone(),
-        }));
+        listeners.spawn(run_mesh_listener(
+            InboundRuntime {
+                config: config.clone(),
+                trust: trust.clone(),
+                inbound_routes: inbound_routes.clone(),
+                dynamic_issuers: dynamic_issuers.clone(),
+                external_overrides: external_overrides.clone(),
+                vetted_external_addrs: vetted_external_addrs.clone(),
+                client: Arc::new(client),
+                a2a_url_rewrite_table: a2a_url_rewrite_table.clone(),
+            },
+            listeners_by_route.mesh.take(),
+        ));
     }
 
     for route in config.outbound.clone() {
         let config = config.clone();
         let trust = trust.clone();
         let a2a_url_rewrite_table = a2a_url_rewrite_table.clone();
+        let prebound_listener = listeners_by_route.take_outbound(route.route_id.as_str());
         listeners.spawn(run_outbound_listener(
             route,
             config,
             trust,
             a2a_url_rewrite_table,
+            prebound_listener,
         ));
     }
 
@@ -983,13 +1024,20 @@ async fn shutdown_signal() {
     }
 }
 
-async fn run_mesh_listener(state: InboundRuntime) -> Result<(), RouterError> {
-    let listener = TcpListener::bind(state.config.mesh_listen)
-        .await
-        .map_err(|source| RouterError::BindFailed {
-            addr: state.config.mesh_listen,
-            source,
-        })?;
+async fn run_mesh_listener(
+    state: InboundRuntime,
+    prebound_listener: Option<TcpListener>,
+) -> Result<(), RouterError> {
+    let listener = if let Some(listener) = prebound_listener {
+        listener
+    } else {
+        TcpListener::bind(state.config.mesh_listen)
+            .await
+            .map_err(|source| RouterError::BindFailed {
+                addr: state.config.mesh_listen,
+                source,
+            })?
+    };
 
     loop {
         let (stream, _) = listener.accept().await?;
@@ -1223,6 +1271,7 @@ async fn run_outbound_listener(
     config: Arc<MeshConfig>,
     trust: Arc<TrustBundle>,
     a2a_url_rewrite_table: Arc<a2a::UrlRewriteTable>,
+    prebound_listener: Option<TcpListener>,
 ) -> Result<(), RouterError> {
     let listen_ip = route
         .listen_addr
@@ -1231,13 +1280,16 @@ async fn run_outbound_listener(
         .parse()
         .map_err(|_| RouterError::InvalidConfig("invalid listen address".to_string()))?;
     let listen_addr = SocketAddr::new(listen_ip, route.listen_port);
-    let listener =
+    let listener = if let Some(listener) = prebound_listener {
+        listener
+    } else {
         TcpListener::bind(listen_addr)
             .await
             .map_err(|source| RouterError::BindFailed {
                 addr: listen_addr,
                 source,
-            })?;
+            })?
+    };
 
     loop {
         let (stream, _) = listener.accept().await?;
@@ -6065,6 +6117,124 @@ mod tests {
             RouterError::BindFailed { addr, .. } => assert_eq!(addr, occupied_addr),
             other => panic!("expected bind failure, got {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_with_prebound_outbound_listener_proxies_http_requests() {
+        let reserved = std::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .expect("reserved listener should bind");
+        let reserved_addr = reserved.local_addr().expect("reserved listener addr");
+        reserved
+            .set_nonblocking(true)
+            .expect("reserved listener should be non-blocking");
+        let reserved =
+            TcpListener::from_std(reserved).expect("reserved listener should convert to tokio");
+
+        let mut config = test_mesh_config();
+        let connection_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (mesh_url, mesh_server_task) =
+            spawn_test_mesh_http_server(&config.identity, connection_count.clone()).await;
+        let mesh = parse_mesh_external(&mesh_url).expect("mesh url should parse");
+        config.peers.push(MeshPeer {
+            id: mesh.peer_id.clone(),
+            public_key: mesh.peer_key,
+        });
+        config.outbound.push(OutboundRoute {
+            route_id: "route".to_string(),
+            slot: "matrix".to_string(),
+            capability_kind: Some("http".to_string()),
+            capability_profile: None,
+            listen_port: reserved_addr.port(),
+            listen_addr: Some("127.0.0.1".to_string()),
+            protocol: MeshProtocol::Http,
+            http_plugins: Vec::new(),
+            peer_addr: mesh.peer_addr,
+            peer_id: mesh.peer_id,
+            capability: "matrix".to_string(),
+        });
+
+        let mut listeners = PreboundListeners::default();
+        listeners.insert_outbound("route", reserved);
+        let router_task = tokio::spawn(async move { run_with_listeners(config, listeners).await });
+
+        let stream = tokio::net::TcpStream::connect(reserved_addr)
+            .await
+            .expect("client should connect to prebound listener");
+        let (mut sender, conn) = client_http1::handshake(TokioIo::new(stream))
+            .await
+            .expect("client handshake should succeed");
+        let client_task = tokio::spawn(async move {
+            conn.await.expect("client connection should complete");
+        });
+
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .uri("/_matrix/client/v3/sync")
+                    .header(header::HOST, "tuwunel.test")
+                    .body(empty_box_body())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should arrive through prebound listener");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_text(response).await, "mesh ok");
+        assert_eq!(
+            connection_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "prebound outbound listener should still proxy through the mesh peer"
+        );
+
+        drop(sender);
+        let _ = client_task.await;
+        router_task.abort();
+        let _ = router_task.await;
+        let _ = mesh_server_task.await;
+    }
+
+    #[tokio::test]
+    async fn prebound_listeners_preserve_duplicates_for_the_same_route_id() {
+        let first = std::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .expect("first listener should bind");
+        let second = std::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .expect("second listener should bind");
+        let first_addr = first.local_addr().expect("first listener addr");
+        let second_addr = second.local_addr().expect("second listener addr");
+        first
+            .set_nonblocking(true)
+            .expect("first listener should be non-blocking");
+        second
+            .set_nonblocking(true)
+            .expect("second listener should be non-blocking");
+
+        let mut listeners = PreboundListeners::default();
+        listeners.insert_outbound(
+            "route",
+            TcpListener::from_std(first).expect("first listener should convert to tokio"),
+        );
+        listeners.insert_outbound(
+            "route",
+            TcpListener::from_std(second).expect("second listener should convert to tokio"),
+        );
+
+        let first = listeners
+            .take_outbound("route")
+            .expect("first duplicate listener should be available");
+        let second = listeners
+            .take_outbound("route")
+            .expect("second duplicate listener should be available");
+        assert_eq!(
+            first.local_addr().expect("first listener local addr"),
+            first_addr
+        );
+        assert_eq!(
+            second.local_addr().expect("second listener local addr"),
+            second_addr
+        );
+        assert!(
+            listeners.take_outbound("route").is_none(),
+            "all duplicate listeners should be drained in insertion order"
+        );
     }
 
     #[test]
