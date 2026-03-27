@@ -543,6 +543,8 @@ jobs:
             BUILD_MODE=release
           platforms: linux/${{ matrix.arch }}
           push: true
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
           tags: ${{ steps.registry.outputs.image_registry }}/${{ matrix.image }}:${{ github.sha }}
           cache-from: |
             type=gha,scope=refs/heads/main-${{ matrix.image }}-${{ matrix.arch }}
