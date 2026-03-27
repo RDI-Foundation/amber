@@ -138,6 +138,8 @@ jobs:
             AMBER_BUILD_VERSION=${{ matrix.resolved_version }}
           platforms: linux/${{ matrix.arch }}
           push: true
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
           tags: |
             ${{ steps.registry.outputs.image_registry }}/${{ matrix.image }}:main-${{ matrix.arch }}
             ${{ steps.registry.outputs.image_registry }}/${{ matrix.image }}:${{ github.sha }}-${{ matrix.arch }}
