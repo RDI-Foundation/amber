@@ -1,95 +1,54 @@
 # Amber
 
-Amber is a compiler for shareable AI agent components. You describe components,
-capabilities, and wiring in JSON5 manifests. Amber resolves the graph,
-validates it, and emits runnable, inspectable artifacts.
+Amber is a compiler and runner for systems built from many small parts: agents, model gateways,
+web apps, tool servers, evaluators, environments, and sandboxes. You describe the parts once,
+connect them explicitly, and Amber can run the system locally across multiple runtimes or compile
+it into artifacts you can inspect and ship.
 
-Amber is a good fit for reproducible experiments, evals, RL rollouts, and
-quick multi-agent prototyping.
+Amber is most useful once a project stops fitting in one process. It does not replace your agent
+framework or your orchestrator. It handles the layer around them: how parts are connected, what is
+allowed to talk to what, what stays outside the system, and how the same setup moves from a laptop
+to something more reproducible.
 
-## What Amber does
+## Use Amber when
 
-- Takes a root component manifest plus any referenced child manifests.
-- Resolves manifests from local files and `http(s)://` URLs.
-- Validates slots, provides, bindings, and exports.
-- Emits outputs such as Scenario IR JSON, mixed-site run plans, Graphviz DOT,
-  Docker Compose directories, Kubernetes manifests, direct/native runtime
-  directories, VM runtime directories, metadata JSON, and offline bundles.
-- Runs direct/native and VM artifacts locally with `amber run`, and can also
-  compile a manifest or bundle into a mixed-site run on the fly.
+- one system spans more than one runtime
+- you want a local executable, a container, and a VM to behave like one app
+- you want to swap an agent, evaluator, or model gateway without rewriting glue code
+- you care which component can reach which service, especially for agentic systems
+- you want the same system description to be runnable, inspectable, and shareable
 
-## Core concepts
+## Start with `amber run`
 
-- **Component manifest:** one JSON5 document that describes a component, its
-  program, its capabilities, and any child components. Programs can be
-  container images, native paths, or VMs.
-- **Slots / provides:** what a component needs and what it offers.
-- **Bindings / exports:** how components are wired together and what gets
-  exposed to the parent.
-- **Scenario:** the fully linked, validated graph produced by the compiler.
+The main thing to try in Amber today is one system description, one command, and multiple local
+runtimes.
 
-For the full schema, run `amber docs manifest`. To list embedded examples, run
-`amber docs examples`. To print this README from the CLI, run
-`amber docs readme`.
-
-## Getting started
-
-Amber is easiest to try with Docker. If you want a local `amber` command,
-install the npm package. If you are developing Amber itself, build from source
-in this repo.
-
-### Option A: Use the Dockerized CLI (preferred)
-
-```sh
-docker run --rm -v "$PWD":/work -w /work ghcr.io/rdi-foundation/amber-cli:v0.3 --help
-```
-
-This is the simplest way to use `amber check`, `amber compile`, and
-`amber docs` without installing anything else.
-
-The examples below use `amber ...` as a local command. With Docker, replace
-that prefix with:
-
-```sh
-docker run --rm -v "$PWD":/work -w /work ghcr.io/rdi-foundation/amber-cli:v0.3
-```
-
-For host-side runtime commands such as `amber proxy`, `amber run`, and
-`amber dashboard`, the npm install is usually more convenient.
-
-### Option B: Install from npm
+Install from npm if you want `amber run` locally:
 
 ```sh
 npm install -g @rdif/amber@^0.3
 amber --help
 ```
 
-The npm package installs the CLI as a normal local command and downloads the
-matching platform runtime package needed by `amber run`.
+For zero-install `check`, `compile`, or `docs`, use the Dockerized CLI:
 
-Current published platform packages cover Linux x64, Linux arm64, and macOS
-arm64.
+```sh
+docker run --rm -v "$PWD":/work -w /work ghcr.io/rdi-foundation/amber-cli:v0.3 --help
+```
 
-Direct/native execution with `amber run` has a few host requirements:
-
-- Linux: `bwrap` and `slirp4netns`
-- macOS: `/usr/bin/sandbox-exec`
-
-VM execution also depends on local QEMU tooling.
-
-### Option C: Build from source
-
-If you are working in this repository:
+If you are working on Amber itself:
 
 ```sh
 cargo build -q -p amber-cli
 ./target/debug/amber --help
 ```
 
-## Fastest first run
+The quickest first run is [`examples/mixed-site`](examples/mixed-site/README.md). It runs one app
+across two local runtimes:
 
-If you want the shortest path to a real mixed-site run, use the example in
-this repository.
+- `web` runs as a local process
+- `api` runs in Docker Compose
+- `catalog_api` stays outside Amber and is attached at run time
 
 In one terminal:
 
@@ -98,272 +57,211 @@ cd examples/mixed-site
 python3 mock-catalog.py
 ```
 
-In another terminal:
+In another:
 
 ```sh
 cd examples/mixed-site
 amber run .
 ```
 
-Amber will compile the manifest in memory, prompt for any missing root config
-and outside-service values, start the direct and Compose sites, auto-start the
-outside-world proxy, print localhost URLs for the exported entrypoints, and
-stay attached. Call the printed app URL with `curl`, then press Ctrl-C in the
-`amber run` terminal to tear the whole scenario down.
+On a first interactive run, Amber may read an existing `.env`, prompt for missing config values,
+prompt for the external catalog URL, start the local process and Compose service, and print the
+localhost URLs for the entrypoints the system exposes.
 
-The detailed walkthrough for that flow lives in `examples/mixed-site/README.md`.
+Example:
 
-## Tutorial
-
-Amber is easiest to understand by compiling a tiny manifest pair and inspecting
-the outputs.
-
-Amber also ships embedded examples. Run `amber docs examples` to list them, or
-look in `examples/` in this repository.
-
-### 1) Create a minimal two-file manifest
-
-```sh
-mkdir -p amber-demo
-cat > amber-demo/child.json <<'JSON'
-{
-  "manifest_version": "0.3.0",
-  "program": {
-    "image": "python:3.11-alpine",
-    "entrypoint": ["python", "-m", "http.server", "8080"],
-    "network": { "endpoints": [{ "name": "http", "port": 8080 }] }
-  },
-  "provides": { "api": { "kind": "http", "endpoint": "http" } },
-  "exports": { "api": "api" }
-}
-JSON
-
-cat > amber-demo/parent.json <<'JSON'
-{
-  "manifest_version": "0.3.0",
-  "components": { "child": "./child.json" },
-  "exports": { "api": "#child.api" }
-}
-JSON
+```text
+Ready.
+  app  http://127.0.0.1:18080
+  api  http://127.0.0.1:18081
 ```
 
-This defines one child component that serves HTTP on port 8080 and a parent
-that re-exports that capability.
-
-### 2) Check and compile
+Then call it:
 
 ```sh
-amber check amber-demo/parent.json
-amber compile amber-demo/parent.json --output amber-demo/out/scenario.json
-amber compile amber-demo/parent.json --dot -
+curl http://127.0.0.1:18080/
+curl http://127.0.0.1:18080/chain
+curl http://127.0.0.1:18081/debug
 ```
 
-`amber check` validates the manifest graph without writing artifacts.
-`amber compile` emits the outputs you ask for. Unlike `amber check`, it always
-needs at least one output flag.
+That example shows the default Amber loop:
 
-### 3) Generate Docker Compose and run
+- one app can span multiple runtimes
+- config still comes from outside the app
+- outside services can stay outside the app
+- Amber gives you stable localhost entrypoints for what the app chooses to expose
+
+For background runs and persisted logs, `amber run --detach`, `amber ps`, `amber logs`, and
+`amber stop` give you a managed local workflow without requiring generated artifacts.
+
+## Core ideas
+
+Amber is easier to read once a few terms are clear.
+
+**Manifest**  
+An Amber manifest is a description of one part of the system.
+
+**Component**  
+A component is one reusable part. It might be a runnable workload, or a parent that contains other
+components.
+
+**Capability**  
+A capability is a named interface a component offers, such as HTTP, MCP, A2A, LLM, or storage.
+
+**Slot**  
+A slot is a named dependency a component expects its parent to supply.
+
+**Binding**  
+A binding is a declared connection from one component's capability to another component's slot.
+
+**Export**  
+An export is a capability the parent chooses to expose outside the system.
+
+**Site**  
+A site is one runtime environment, such as the direct local runtime, Docker Compose, a VM runtime,
+or Kubernetes.
+
+**Scenario**  
+A scenario is the fully linked system after Amber resolves and validates the whole manifest tree.
+
+The important design choice is that wiring belongs to the parent. A child says what it needs and
+what it offers; it does not hardcode where dependencies come from. That is what makes components
+reusable.
+
+## Why the capability model matters
+
+A lot of agent systems end up with too much ambient authority. A tool runner can reach whatever is
+on localhost. A helper service can guess ports. A component can accidentally depend on something
+that happens to be nearby instead of something it was deliberately given.
+
+Amber pushes in the other direction.
+
+- A component can only use a named dependency if it declares a slot for it and the parent binds
+  something into that slot.
+- A capability can be available to another component without automatically being available to the
+  host. Host-visible entrypoints are explicit exports.
+- The resulting reachability is visible in the system description instead of being spread across ad
+  hoc port conventions, shell scripts, and environment files.
+
+That matters for ordinary software, and it matters even more for agents. If an agent or tool gets
+tricked into doing something destructive, the blast radius should depend on the connections it was
+given, not on whatever it can discover by poking around the machine.
+
+Amber does not replace application-level auth, review, or careful tool design. What it does give
+you is a concrete reachability model that is easier to inspect, test, and reason about.
+
+The clearest example in this repo is [`examples/direct-security`](examples/direct-security/README.md):
+`allowed` is given access to a secret service and succeeds; `denied` is not, and tries to guess the
+secret's TCP port anyway. On Linux direct runs, that bypass is blocked.
+
+[`examples/vm-network-storage`](examples/vm-network-storage/README.md) shows the same idea in a VM
+setting: the bound VM can reach the API it was given, and the unbound VM stays blocked.
+
+## How Amber works
+
+At a high level, Amber does four things.
+
+1. **You describe the parts and their edges.**  
+   Each part says how it runs, what it offers, and what it needs.
+
+2. **Amber resolves and validates the graph.**  
+   It follows child manifests, checks that bindings make sense, and turns the authored tree into
+   one linked system.
+
+3. **Amber places runnable parts into sites.**  
+   For local runs, Amber already has sensible defaults: local executables go to the direct runtime,
+   container images go to Docker Compose, and VM workloads go to the VM runtime. When you want
+   explicit control, you add a placement file.
+
+4. **Amber runs or compiles the result.**  
+   `amber run` starts the sites, wires cross-site links, attaches outside services, and exposes
+   selected entrypoints on localhost. `amber compile` emits inspectable artifacts when you want
+   them.
+
+Start with `amber run`; use `amber compile` when you want explicit artifacts, custom placement, or
+more control over how the system is launched.
+
+## Things to try
+
+- **Mixed local development across runtimes**  
+  [`examples/mixed-site`](examples/mixed-site/README.md) keeps the whole boundary small and easy to
+  inspect.
+
+- **External services that stay external**  
+  [`examples/externalized-slots`](examples/externalized-slots/README.md) and
+  [`examples/slot-forwarding`](examples/slot-forwarding/README.md) show how to attach host or
+  remote services at run time instead of baking them into the system.
+
+- **Agent, evaluator, and model-router stacks**  
+  [`examples/tau2`](examples/tau2/README.md) wires an environment, evaluator, agent, and
+  LiteLLM-backed routes into one graph.
+
+- **Capability-driven security demos**  
+  [`examples/direct-security`](examples/direct-security/README.md) and
+  [`examples/vm-network-storage`](examples/vm-network-storage/README.md) are the best places to
+  see explicit reachability and isolation in practice.
+
+- **Observability by graph edge**  
+  [`examples/observability-debug`](examples/observability-debug/README.md) shows logs and telemetry
+  in terms of the user-facing connections in the scenario, not just container names.
+
+## Common commands
+
+Most people will spend most of their time in `amber run`:
 
 ```sh
-amber compile amber-demo/parent.json \
-  --docker-compose amber-demo/out/compose
-cd amber-demo/out/compose
-docker compose up -d
-amber proxy . --export api=127.0.0.1:18080
-curl http://127.0.0.1:18080
+amber run .
+amber run path/to/root
+amber run path/to/root --detach
+amber ps
+amber logs <run-id>
+amber stop <run-id>
 ```
 
-Amber writes a self-contained Compose directory with `compose.yaml`,
-`env.example`, and a generated `README.md`.
-
-If you only want to compile with Docker, use the Dockerized CLI for the
-`amber compile` step and then run `docker compose up` on the generated output.
-Install via npm when you want the local `amber proxy` command. The generated
-Compose README includes the exact proxy template for that scenario.
-
-### 3b) Generate direct/native output and run
+Use `amber check` when you want validation without starting anything:
 
 ```sh
-amber compile examples/direct-security/scenario.json5 --direct /tmp/amber-direct
-amber run /tmp/amber-direct
+amber check path/to/root
 ```
 
-Direct output is for components that use `program.path`. Amber does not search
-`PATH`; use an explicit absolute or manifest-relative path.
-
-### 3c) Generate VM output and run
+Use `amber compile` when you want explicit artifacts:
 
 ```sh
-amber compile examples/vm-network-storage/scenario.json5 --vm /tmp/amber-vm
-amber run /tmp/amber-vm
+amber compile path/to/root --run-plan /tmp/amber-run-plan.json
+amber compile path/to/root --docker-compose /tmp/amber-compose
+amber compile path/to/root --kubernetes /tmp/amber-k8s
+amber compile path/to/root --direct /tmp/amber-direct
+amber compile path/to/root --vm /tmp/amber-vm
+amber compile path/to/root --bundle /tmp/amber-bundle
 ```
 
-VM output packages a local VM runtime. Some generated outputs may reference
-Amber runtime images, which Docker Compose and Kubernetes pull automatically
-when needed. Running VM outputs locally also requires QEMU tooling on the host.
-
-When a scenario needs internal Amber runtime images, generated outputs can
-reference:
-
-- `ghcr.io/rdi-foundation/amber-router:v0.1`
-- `ghcr.io/rdi-foundation/amber-provisioner:v0.1`
-- `ghcr.io/rdi-foundation/amber-helper:v0.2`
-- `ghcr.io/rdi-foundation/amber-docker-gateway:v0.1` when using
-  `framework.docker`
-
-Amber writes those references only when needed. Docker Compose and Kubernetes
-pull them automatically; in restricted environments, pre-pull them ahead of
-time.
-
-If you are working in this repository, the image list and versioning policy
-live in `docker/images.json`. CI publishes images from `main` based on that
-manifest. A `version` can be either a concrete semver tag (for example
-`v1.2.3`) or a patch-placeholder template (for example `v1.2.x`), which CI
-resolves to the next available concrete tag before publishing the floating
-compatibility tags Amber-generated outputs use.
-
-## Common workflows
-
-### Compile to Scenario IR
+Use `amber proxy` when you already have compiled output and want to bridge exports or outside
+services yourself:
 
 ```sh
-amber compile path/to/root.json5 --output /tmp/scenario.json
+amber proxy /tmp/amber-compose --export public=127.0.0.1:18080
+amber proxy /tmp/amber-compose \
+  --slot ext_api=127.0.0.1:38081 \
+  --export public=127.0.0.1:38080
 ```
 
-You can also use existing Scenario IR as input for other compile outputs,
-except bundles.
+## Local runtime notes
 
-### Compile to a mixed-site run plan
+- Direct local execution needs a sandbox backend:
+  - Linux: `bwrap` and `slirp4netns`
+  - macOS: `/usr/bin/sandbox-exec`
+- VM execution also needs local QEMU tooling.
+- The mixed-site example uses Docker Compose because one component is a container image.
 
-```sh
-amber compile path/to/root.json5 \
-  --placement path/to/sites.json5 \
-  --run-plan /tmp/run-plan.json
-```
+## Learn more
 
-Run plans are the main lowered execution artifact for mixed-site runs. They
-capture site assignment, cross-site links, and startup ordering without
-freezing machine-local launch details.
+- `amber docs manifest` — detailed authoring reference
+- `amber docs examples` — list embedded examples
+- `amber docs examples <example>` — dump one embedded example from the CLI
+- [`examples/`](examples/) — end-to-end scenarios in this repo
+- [`compiler/manifest/README.md`](compiler/manifest/README.md) — full manifest reference
+- [`examples/mixed-site/README.md`](examples/mixed-site/README.md) — best first walkthrough
 
-### Run a manifest directly
+If you arrive here from a search result and only try one thing, start with
+[`examples/mixed-site`](examples/mixed-site/README.md) and run `amber run .`.
 
-```sh
-amber run path/to/root.json5
-amber run path/to/root.json5 --placement path/to/sites.json5 --detach
-amber run path/to/root.json5 --env-file dev.env --observability local
-```
-
-This is the default mixed-site workflow. In an interactive terminal, `amber
-run` can prompt for missing config, auto-start the outside-world proxy, print
-localhost export URLs, and stay attached as the foreground session owner. Use
-`--detach` when you want a background run instead.
-
-### Run a compiled mixed-site plan
-
-```sh
-amber compile path/to/root.json5 --run-plan /tmp/run-plan.json
-amber run /tmp/run-plan.json --detach
-```
-
-Use this when you want an inspectable execution plan in version control, CI
-artifacts, or a debugging workflow before launch.
-
-### Check-only
-
-```sh
-amber check path/to/root.json5
-```
-
-### Compile + run direct/native
-
-```sh
-amber compile path/to/root.json5 --direct /tmp/direct-out
-amber run /tmp/direct-out
-```
-
-### Compile + run VM
-
-```sh
-amber compile path/to/root.json5 --vm /tmp/vm-out
-amber run /tmp/vm-out
-```
-
-### Create an offline bundle
-
-```sh
-amber compile path/to/root.json5 --bundle /tmp/amber-bundle
-```
-
-## CLI reference
-
-Every command has its own help page:
-
-```sh
-amber --help
-amber compile --help
-amber docs --help
-amber docs examples --help
-```
-
-Useful built-in docs:
-
-- `amber docs readme`: this overview.
-- `amber docs manifest`: manifest schema and authoring details.
-- `amber docs examples`: list embedded examples.
-- `amber docs examples <example>`: dump one embedded example's files.
-
-Top-level commands:
-
-- `amber check <manifest-or-bundle>`: resolve manifests, run validation and
-  linting, and print diagnostics without writing artifacts.
-- `amber compile <input> [output flags]`: compile a manifest, bundle, or
-  Scenario IR and emit one or more outputs. `amber compile` requires at least
-  one output flag.
-- `amber run <input>`: start a manifest, bundle, mixed-site run plan,
-  direct/native artifact, or VM artifact. Use `--placement` when you want an
-  explicit site layout, `--env-file` when you want explicit runtime inputs,
-  and `--observability` when you want Amber-managed telemetry export for a
-  mixed-site run.
-- `amber ps`: list active mixed-site runs.
-- `amber logs <run-id>`: print persisted logs for a mixed-site run. Add `-f`
-  to keep streaming.
-- `amber stop <run-id>`: stop a mixed-site run by id.
-- `amber proxy <output> --export name=127.0.0.1:PORT`: expose a scenario
-  export on localhost. The output can be a Docker Compose, Kubernetes, direct,
-  VM artifact, or a mixed-site run id. Use `--slot` to connect a local
-  upstream at the same time.
-- `amber dashboard [--detach]`: start the Aspire dashboard used by the
-  observability examples.
-
-Output-specific pointers:
-
-- Run-plan output is the main lowered execution artifact for mixed-site runs.
-- Docker Compose output is the quickest way to get a runnable multi-container
-  scenario. The generated directory contains `compose.yaml`, `env.example`,
-  and `README.md`.
-- Direct output is for local host binaries that use `program.path`.
-- VM output packages a local VM runtime for `amber run`.
-- Kubernetes output is for cluster deployment; when proxying against it
-  locally, you usually also need router port-forwards and
-  `amber proxy --mesh-addr`.
-- Bundle output is for offline or reproducible recompilation later.
-
-## More information
-
-If you want deeper details after the quick start:
-
-- `compiler/manifest/README.md` or `amber docs manifest`: manifest format and
-  authoring.
-- `cli/README.md`: CLI behavior and outputs.
-- `compiler/README.md`: compiler pipeline and diagnostics.
-- `compiler/scenario/README.md`: Scenario IR data model.
-- `compiler/resolver/README.md`: manifest resolution from files and URLs.
-- `runtime/docker-gateway/README.md`: Docker gateway component.
-- `examples/mixed-site/README.md`: direct + Compose mixed-site walkthrough.
-- `examples/`: end-to-end examples.
-
----
-
-Start with the minimal example above, run `amber check`, and then add
-components and bindings until the compiled outputs match the system you want to
-run.
