@@ -1533,7 +1533,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
     }
 
     let execution_guide =
-        build_execution_guide(s, &mesh_plan, &config_plan, !storage_plan.is_empty())?;
+        build_execution_guide(s, &mesh_plan, &config_plan, !storage_plan.is_empty(), false)?;
     let mut rollout_commands: Vec<String> = program_components
         .iter()
         .map(|id| {

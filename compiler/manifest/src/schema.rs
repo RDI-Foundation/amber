@@ -1990,6 +1990,7 @@ pub enum CapabilityKind {
     Docker,
     A2a,
     Storage,
+    Kvm,
 }
 
 impl fmt::Display for CapabilityKind {
@@ -2001,6 +2002,7 @@ impl fmt::Display for CapabilityKind {
             CapabilityKind::Docker => "docker",
             CapabilityKind::A2a => "a2a",
             CapabilityKind::Storage => "storage",
+            CapabilityKind::Kvm => "kvm",
         };
         f.write_str(s)
     }
@@ -2017,7 +2019,7 @@ impl CapabilityKind {
     pub const fn transport(self) -> CapabilityTransport {
         match self {
             Self::Mcp | Self::Llm | Self::Http | Self::A2a => CapabilityTransport::Http,
-            Self::Docker | Self::Storage => CapabilityTransport::NonNetwork,
+            Self::Docker | Self::Storage | Self::Kvm => CapabilityTransport::NonNetwork,
         }
     }
 }

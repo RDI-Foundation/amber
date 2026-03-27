@@ -180,6 +180,20 @@ jobs:
       - name: Run Linux VM smoke test
         run: cargo test -p amber-cli --test vm_smoke -- --ignored --nocapture --test-threads=1
 
+  kvm-smoke-tests:
+    name: KVM Smoke Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Run KVM smoke test
+        run: cargo test -p amber-cli --test kvm_smoke -- --ignored --nocapture --test-threads=1
+
   kubernetes-tests:
     name: Kubernetes Reporter Tests
     runs-on: ubuntu-latest

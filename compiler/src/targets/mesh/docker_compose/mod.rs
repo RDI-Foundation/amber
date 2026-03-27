@@ -194,6 +194,10 @@ struct Service {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     cap_drop: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    devices: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    group_add: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     security_opt: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     networks: BTreeMap<String, EmptyMap>,
@@ -691,6 +695,15 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
             .insert(ROUTER_SERVICE_NAME.to_string(), router_service);
     }
 
+    let has_kvm = program_components.iter().any(|id| {
+        s.component(*id)
+            .program
+            .as_ref()
+            .is_some_and(|program| program.mounts().iter().any(|mount| {
+                matches!(mount, ProgramMount::Framework { capability, .. } if capability.as_str() == "kvm")
+            }))
+    });
+
     // Emit services in stable (component id) order, sidecar then program.
     for id in program_components {
         let svc = names.get(id).unwrap();
@@ -880,6 +893,16 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
             &label,
             &compose_component_service_name(&label),
         );
+        if s.component(*id)
+            .program
+            .as_ref()
+            .is_some_and(|program| program.mounts().iter().any(|mount| {
+                matches!(mount, ProgramMount::Framework { capability, .. } if capability.as_str() == "kvm")
+            }))
+        {
+            program_service.devices.push("/dev/kvm:/dev/kvm".to_string());
+            program_service.group_add.push("${AMBER_KVM_GID}".to_string());
+        }
         apply_default_service_hardening(&mut program_service);
 
         compose
@@ -909,9 +932,14 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
     let compose_yaml = serde_yaml::to_string(&compose).map_err(|e| {
         DockerComposeError::Other(format!("failed to serialize docker-compose yaml: {e}"))
     })?;
-    let execution_guide =
-        build_execution_guide(scenario, &mesh_plan, &config_plan, !storage_plan.is_empty())
-            .map_err(|err: ReporterError| DockerComposeError::Other(err.to_string()))?;
+    let execution_guide = build_execution_guide(
+        scenario,
+        &mesh_plan,
+        &config_plan,
+        !storage_plan.is_empty(),
+        has_kvm,
+    )
+    .map_err(|err: ReporterError| DockerComposeError::Other(err.to_string()))?;
     let mut files = BTreeMap::new();
     files.insert(PathBuf::from(GENERATED_COMPOSE_FILENAME), compose_yaml);
     files.insert(
