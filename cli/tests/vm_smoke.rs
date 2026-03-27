@@ -137,7 +137,7 @@ fn smoke_timeout() -> Duration {
         })
 }
 
-fn compile_vm_or_panic(amber: &Path, output_dir: &Path, manifest_path: &Path, base_image: &Path) {
+fn compile_vm_or_panic(amber: &Path, output_dir: &Path, manifest_path: &Path) {
     progress(format!(
         "compiling VM output from {} into {}",
         manifest_path.display(),
@@ -148,7 +148,6 @@ fn compile_vm_or_panic(amber: &Path, output_dir: &Path, manifest_path: &Path, ba
         .arg("--vm")
         .arg(output_dir)
         .arg(manifest_path)
-        .env("AMBER_CONFIG_BASE_IMAGE", base_image)
         .output()
         .expect("failed to run amber compile --vm");
     if !compile.status.success() {
@@ -578,12 +577,7 @@ fn vm_smoke_network_storage_and_migration_example() {
         base_image.display()
     ));
 
-    compile_vm_or_panic(
-        &amber,
-        &vm_out,
-        &example_dir.join("scenario.json5"),
-        &base_image,
-    );
+    compile_vm_or_panic(&amber, &vm_out, &example_dir.join("scenario.json5"));
     assert_vm_run(
         &amber,
         &vm_out,
@@ -617,7 +611,6 @@ fn vm_smoke_network_storage_and_migration_example() {
         &amber,
         &vm_out,
         &example_dir.join("v2").join("scenario.json5"),
-        &base_image,
     );
     assert_vm_run(
         &amber,
