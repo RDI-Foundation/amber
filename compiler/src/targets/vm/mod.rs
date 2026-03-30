@@ -5,7 +5,7 @@ use std::{
 
 use amber_manifest::{InterpolatedPart, VmEgress};
 use amber_mesh::{MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProvisionOutput};
-use amber_scenario::{ComponentId, Program, ProgramVm, Scenario};
+use amber_scenario::{ComponentId, Program, ProgramMount, ProgramVm, Scenario};
 use amber_template::{TemplatePart, TemplateString};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -209,6 +209,30 @@ fn render_vm(compiled: &CompiledScenario) -> Result<VmArtifact, MeshError> {
         },
     )?;
     let program_components = mesh_plan.program_components();
+
+    for &component_id in program_components {
+        let component = scenario.component(component_id);
+        let Some(program) = component.program.as_ref() else {
+            continue;
+        };
+        for mount in program.mounts() {
+            if let ProgramMount::Framework { capability, .. } = mount {
+                match capability.as_str() {
+                    "docker" => {
+                        return Err(MeshError::new(
+                            "vm reporter does not yet support `framework.docker` mounts",
+                        ));
+                    }
+                    "kvm" => {
+                        return Err(MeshError::new(
+                            "vm reporter does not yet support `framework.kvm` mounts",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 
     let component_names: HashMap<ComponentId, VmComponentNames> =
         map_program_components(scenario, program_components, |id, local_name| {
