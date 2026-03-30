@@ -180,13 +180,21 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
             continue;
         };
         for mount in program.mounts() {
-            if let ProgramMount::Framework { capability, .. } = mount
-                && capability.as_str() == "docker"
-            {
-                return Err(ReporterError::new(
-                    "kubernetes reporter does not yet support runtime injection for \
-                     `framework.docker` mounts (missing docker-gateway wiring)",
-                ));
+            if let ProgramMount::Framework { capability, .. } = mount {
+                match capability.as_str() {
+                    "docker" => {
+                        return Err(ReporterError::new(
+                            "kubernetes reporter does not yet support runtime injection for \
+                             `framework.docker` mounts (missing docker-gateway wiring)",
+                        ));
+                    }
+                    "kvm" => {
+                        return Err(ReporterError::new(
+                            "kubernetes reporter does not yet support `framework.kvm` mounts",
+                        ));
+                    }
+                    _ => {}
+                }
             }
         }
     }
