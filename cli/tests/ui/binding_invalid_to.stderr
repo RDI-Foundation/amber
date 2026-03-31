@@ -1,7 +1,7 @@
-Error: manifest::deserialize_error
+Error: manifest::validation_error
 
   × check failed
-  ╰─▶ json5 deserialize error at bindings[0]: invalid binding `green`:
+  ╰─▶ manifest validation error at bindings[0]: invalid binding `green`:
       expected `self` or `#<child>`
     ╭─[<CARGO_MANIFEST_DIR>/tests/ui/binding_invalid_to.json5:24:5]
  23 │   bindings: [

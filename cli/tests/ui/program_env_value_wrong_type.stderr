@@ -1,7 +1,7 @@
-Error: manifest::deserialize_error
+Error: manifest::validation_error
 
   × check failed
-  ╰─▶ json5 deserialize error at program.env.PROFILE: expected an
+  ╰─▶ manifest validation error at program.env.PROFILE: expected an
       interpolation string, a `{ file: ... }` reference, or an object with
       `value`
    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/program_env_value_wrong_type.json5:6:16]

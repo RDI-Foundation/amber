@@ -1,7 +1,7 @@
-Error: manifest::deserialize_error
+Error: manifest::validation_error
 
   × check failed
-  ╰─▶ json5 deserialize error at bindings[0].weak: expected boolean, found
+  ╰─▶ manifest validation error at bindings[0].weak: expected boolean, found
       string
     ╭─[<CARGO_MANIFEST_DIR>/tests/ui/binding_weak_wrong_type.json5:24:58]
  23 │   bindings: [

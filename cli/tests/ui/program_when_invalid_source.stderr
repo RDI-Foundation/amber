@@ -1,7 +1,7 @@
-Error: manifest::deserialize_error
+Error: manifest::validation_error
 
   × check failed
-  ╰─▶ json5 deserialize error at program.args[0]: invalid interpolation
+  ╰─▶ manifest validation error at program.args[0]: invalid interpolation
       `foo.api.url`
    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/program_when_invalid_source.json5:7:15]
  6 │       {

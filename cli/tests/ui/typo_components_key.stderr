@@ -1,7 +1,7 @@
-Error: manifest::deserialize_error
+Error: manifest::validation_error
 
   × check failed
-  ╰─▶ json5 deserialize error at componentz: unknown field `componentz`,
+  ╰─▶ manifest validation error at componentz: unknown field `componentz`,
       expected one of `manifest_version`, `experimental_features`, `program`,
       `components`, `environments`, `config_schema`, `slots`, `provides`,
       `resources`, `bindings`, `exports`, `metadata`

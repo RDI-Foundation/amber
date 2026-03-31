@@ -11,8 +11,12 @@ pub enum Error {
     #[diagnostic(code(manifest::json5_error))]
     Json5(DiagnosticError),
 
-    #[error("{0}")]
-    #[diagnostic(code(manifest::deserialize_error))]
+    #[error(
+        "manifest validation error at {}: {}",
+        manifest_validation_path(.0),
+        .0.detail()
+    )]
+    #[diagnostic(code(manifest::validation_error))]
     Json5Path(DiagnosticError),
 
     #[error("io error: {0}")]
@@ -275,4 +279,8 @@ pub enum Error {
     #[error("component `#{child}` references unknown environment `{environment}`")]
     #[diagnostic(code(manifest::unknown_component_environment))]
     UnknownComponentEnvironment { child: String, environment: String },
+}
+
+fn manifest_validation_path(diag: &DiagnosticError) -> &str {
+    diag.path().unwrap_or(".")
 }

@@ -1,7 +1,7 @@
-Error: manifest::deserialize_error
+Error: manifest::validation_error
 
   × check failed
-  ╰─▶ json5 deserialize error at .: missing field `manifest_version`
+  ╰─▶ manifest validation error at .: missing field `manifest_version`
     ╭─[<CARGO_MANIFEST_DIR>/tests/ui/manifest_missing_version.json5:1:1]
   1 │ ╭─▶ {  components: {
   2 │ │       tau2: "./tau2.json5",

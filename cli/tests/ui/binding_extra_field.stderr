@@ -1,7 +1,7 @@
-Error: manifest::deserialize_error
+Error: manifest::validation_error
 
   × check failed
-  ╰─▶ json5 deserialize error at bindings[0].weakk: unknown field `weakk`,
+  ╰─▶ manifest validation error at bindings[0].weakk: unknown field `weakk`,
       expected one of `to`, `slot`, `from`, `capability`, `weak`
     ╭─[<CARGO_MANIFEST_DIR>/tests/ui/binding_extra_field.json5:24:52]
  23 │   bindings: [
