@@ -3,7 +3,7 @@ use amber_mesh::telemetry::{
     init_subscriber, observability_log_scope_name, shutdown_tracer_provider,
     structured_logs_enabled, suppress_otlp_bridge_target,
 };
-use amber_router::{config_from_env, run};
+use amber_router::control::{config_from_env, run};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
