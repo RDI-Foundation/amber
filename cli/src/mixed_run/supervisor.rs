@@ -245,8 +245,18 @@ pub(super) fn build_supervisor_plan(
             None
         },
         observability_endpoint: input.observability_endpoint.map(ToOwned::to_owned),
+        framework_ccs_plan_path: input
+            .framework_ccs_plan_path
+            .map(|path| path.display().to_string()),
+        site_actuator_plan_path: input
+            .site_actuator_plan_path
+            .map(|path| path.display().to_string()),
         launch_env,
     })
+}
+
+pub(super) fn write_site_actuator_plan(path: &Path, plan: &SiteActuatorPlan) -> Result<()> {
+    write_json(path, plan)
 }
 
 pub(super) fn spawn_site_supervisor(site_state_root: &Path) -> Result<SupervisorChild> {
@@ -338,7 +348,7 @@ pub(super) fn site_ready_timeout(site_plan: &RunSitePlan) -> Duration {
     }
 }
 
-pub(super) fn site_ready_timeout_for_kind(kind: SiteKind) -> Duration {
+pub(crate) fn site_ready_timeout_for_kind(kind: SiteKind) -> Duration {
     match kind {
         SiteKind::Kubernetes => KUBERNETES_WORKLOAD_READY_TIMEOUT + KUBERNETES_SITE_READY_BUFFER,
         SiteKind::Direct | SiteKind::Compose | SiteKind::Vm => Duration::from_secs(120),
@@ -461,7 +471,7 @@ pub(super) async fn register_new_site_links(
     Ok(())
 }
 
-pub(super) fn update_desired_links_for_consumer(
+pub(crate) fn update_desired_links_for_consumer(
     site_state_root: &Path,
     slot_name: &str,
     url: &str,
@@ -484,7 +494,7 @@ pub(super) fn update_desired_links_for_consumer(
     write_json(&path, &state)
 }
 
-pub(super) fn update_desired_links_for_provider(
+pub(crate) fn update_desired_links_for_provider(
     site_state_root: &Path,
     peer: DesiredExportPeer,
 ) -> Result<()> {
@@ -502,6 +512,36 @@ pub(super) fn update_desired_links_for_provider(
     if !state.export_peers.contains(&peer) {
         state.export_peers.push(peer);
     }
+    write_json(&path, &state)
+}
+
+pub(crate) fn clear_desired_links_for_consumer(
+    site_state_root: &Path,
+    slot_name: &str,
+) -> Result<()> {
+    let path = desired_links_path(site_state_root);
+    let mut state: DesiredLinkState = if path.is_file() {
+        read_json(&path, "desired links")?
+    } else {
+        return Ok(());
+    };
+    state
+        .external_slots
+        .remove(&amber_compiler::mesh::external_slot_env_var(slot_name));
+    write_json(&path, &state)
+}
+
+pub(crate) fn clear_desired_links_for_provider(
+    site_state_root: &Path,
+    peer: &DesiredExportPeer,
+) -> Result<()> {
+    let path = desired_links_path(site_state_root);
+    let mut state: DesiredLinkState = if path.is_file() {
+        read_json(&path, "desired links")?
+    } else {
+        return Ok(());
+    };
+    state.export_peers.retain(|candidate| candidate != peer);
     write_json(&path, &state)
 }
 
@@ -557,7 +597,7 @@ pub(super) fn launched_site_from_state(
     })
 }
 
-pub(super) fn launched_site_from_receipt(
+pub(crate) fn launched_site_from_receipt(
     site_receipt: &SiteReceipt,
     mesh_scope: &str,
 ) -> Result<LaunchedSite> {
@@ -601,6 +641,34 @@ pub(super) async fn ensure_site_running(
 ) -> Result<()> {
     reap_child(&mut runtime.site_process)?;
     reap_child(&mut runtime.port_forward)?;
+    reap_child(&mut runtime.framework_ccs)?;
+    reap_child(&mut runtime.site_actuator)?;
+
+    if runtime.framework_ccs.is_none()
+        && let Some(plan_path) = plan.framework_ccs_plan_path.as_deref()
+    {
+        runtime.framework_ccs = Some(spawn_runtime_process(
+            &PathBuf::from(&plan.site_state_root),
+            "framework-ccs.log",
+            &plan.launch_env,
+            |cmd| {
+                cmd.arg("run-framework-ccs").arg("--plan").arg(plan_path);
+            },
+        )?);
+    }
+
+    if runtime.site_actuator.is_none()
+        && let Some(plan_path) = plan.site_actuator_plan_path.as_deref()
+    {
+        runtime.site_actuator = Some(spawn_runtime_process(
+            &PathBuf::from(&plan.site_state_root),
+            "site-actuator.log",
+            &plan.launch_env,
+            |cmd| {
+                cmd.arg("run-site-actuator").arg("--plan").arg(plan_path);
+            },
+        )?);
+    }
 
     match plan.kind {
         SiteKind::Direct => {
@@ -970,6 +1038,8 @@ pub(super) async fn cleanup_site(
 ) -> Result<()> {
     reap_child(&mut runtime.site_process)?;
     reap_child(&mut runtime.port_forward)?;
+    reap_child(&mut runtime.framework_ccs)?;
+    reap_child(&mut runtime.site_actuator)?;
 
     if let Some(child) = runtime.site_process.as_mut() {
         stop_child(child).await?;
@@ -977,9 +1047,17 @@ pub(super) async fn cleanup_site(
     if let Some(child) = runtime.port_forward.as_mut() {
         stop_child(child).await?;
     }
+    if let Some(child) = runtime.framework_ccs.as_mut() {
+        stop_child(child).await?;
+    }
+    if let Some(child) = runtime.site_actuator.as_mut() {
+        stop_child(child).await?;
+    }
     runtime.site_process = None;
     runtime.site_started = false;
     runtime.port_forward = None;
+    runtime.framework_ccs = None;
+    runtime.site_actuator = None;
 
     match plan.kind {
         SiteKind::Compose => {
@@ -1021,6 +1099,7 @@ pub(super) async fn cleanup_site(
         }
         SiteKind::Direct | SiteKind::Vm => {}
     }
+    cleanup_dynamic_site_children(Path::new(&plan.site_state_root), plan.kind)?;
     Ok(())
 }
 
@@ -1464,8 +1543,27 @@ pub(super) async fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
     }
 }
 
-pub(super) async fn resolve_link_external_url(
+pub(crate) async fn resolve_link_external_url(
     provider: &LaunchedSite,
+    link: &RunLink,
+    consumer_kind: SiteKind,
+    run_root: &Path,
+    bridge_proxies: &mut BTreeMap<BridgeProxyKey, BridgeProxyHandle>,
+) -> Result<String> {
+    resolve_link_external_url_for_output(
+        provider,
+        Path::new(&provider.receipt.artifact_dir),
+        link,
+        consumer_kind,
+        run_root,
+        bridge_proxies,
+    )
+    .await
+}
+
+pub(crate) async fn resolve_link_external_url_for_output(
+    provider: &LaunchedSite,
+    provider_output_dir: &Path,
     link: &RunLink,
     consumer_kind: SiteKind,
     run_root: &Path,
@@ -1478,6 +1576,7 @@ pub(super) async fn resolve_link_external_url(
     let port = ensure_bridge_proxy(
         run_root,
         provider,
+        provider_output_dir,
         &link.export_name,
         consumer_kind,
         bridge_proxies,
@@ -1493,11 +1592,13 @@ pub(super) fn link_needs_bridge_proxy(_provider_kind: SiteKind, consumer_kind: S
 pub(super) async fn ensure_bridge_proxy(
     run_root: &Path,
     provider: &LaunchedSite,
+    provider_output_dir: &Path,
     export_name: &str,
     consumer_kind: SiteKind,
     bridge_proxies: &mut BTreeMap<BridgeProxyKey, BridgeProxyHandle>,
 ) -> Result<u16> {
     let key = BridgeProxyKey {
+        provider_output_dir: provider_output_dir.display().to_string(),
         export_name: export_name.to_string(),
         consumer_kind,
     };
@@ -1508,7 +1609,7 @@ pub(super) async fn ensure_bridge_proxy(
     }
 
     let listen = bridge_proxy_bind_addr(consumer_kind, reserve_loopback_port()?);
-    let child = spawn_bridge_proxy(run_root, provider, export_name, listen)?;
+    let child = spawn_bridge_proxy(run_root, provider, provider_output_dir, export_name, listen)?;
     wait_for_socket_listener(bridge_proxy_probe_addr(listen)).await?;
     bridge_proxies.insert(
         key,
@@ -1524,6 +1625,7 @@ pub(super) async fn ensure_bridge_proxy(
 pub(super) fn spawn_bridge_proxy(
     run_root: &Path,
     provider: &LaunchedSite,
+    provider_output_dir: &Path,
     export_name: &str,
     listen: SocketAddr,
 ) -> Result<Child> {
@@ -1534,7 +1636,7 @@ pub(super) fn spawn_bridge_proxy(
     let log_path = logs_root.join(format!("{export_name}.log"));
     spawn_detached_child(run_root, &log_path, |cmd| {
         cmd.arg("proxy")
-            .arg(&provider.receipt.artifact_dir)
+            .arg(provider_output_dir)
             .arg("--export")
             .arg(bridge_proxy_export_binding(export_name, listen));
         if provider.receipt.kind == SiteKind::Kubernetes {

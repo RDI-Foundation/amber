@@ -36,8 +36,8 @@ use crate::{
             },
             internal_images::resolve_internal_images,
             mesh_config::{
-                MeshConfigBuildInput, MeshServiceName, RouterPorts, ServiceMeshAddressing,
-                build_mesh_config_plan, default_mesh_config_build_options,
+                MeshConfigBuildInput, MeshConfigBuildOptions, MeshServiceName, RouterPorts,
+                ServiceMeshAddressing, build_mesh_config_plan, default_mesh_config_build_options,
             },
             plan::{MeshOptions, component_label, map_program_components},
             ports::{LocalRoutePorts, allocate_local_route_ports, allocate_mesh_ports},
@@ -340,11 +340,21 @@ type DcResult<T> = Result<T, DockerComposeError>;
 fn render_docker_compose(
     compiled: &CompiledScenario,
 ) -> Result<DockerComposeArtifact, ReporterError> {
-    render_docker_compose_inner(compiled.scenario())
+    emit_docker_compose_artifact(compiled, false)
+}
+
+pub(crate) fn emit_docker_compose_artifact(
+    compiled: &CompiledScenario,
+    force_router: bool,
+) -> Result<DockerComposeArtifact, ReporterError> {
+    render_docker_compose_inner(compiled.scenario(), force_router)
         .map_err(DockerComposeError::into_reporter_error)
 }
 
-fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArtifact> {
+fn render_docker_compose_inner(
+    scenario: &Scenario,
+    force_router: bool,
+) -> DcResult<DockerComposeArtifact> {
     let transformed = rewrite_framework_docker_as_injected_component(scenario).map_err(dc_other)?;
     let s = &transformed.scenario;
     let endpoint_plan = crate::targets::program_config::build_endpoint_plan(s).map_err(dc_other)?;
@@ -377,7 +387,7 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
     let docker_mount_components: BTreeSet<ComponentId> =
         docker_mount_paths_by_component.keys().copied().collect();
     let docker_gateway_component = transformed.gateway_component;
-    let needs_router = mesh_plan.needs_router();
+    let needs_router = mesh_plan.needs_router() || force_router;
 
     let route_ports = allocate_local_route_ports(s, &endpoint_plan, &mesh_plan)?;
     let mesh_ports_by_component = allocate_mesh_ports(
@@ -422,13 +432,17 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
         mesh_ports_by_component: &mesh_ports_by_component,
         router_ports,
         addressing: &mesh_addressing,
-        options: default_mesh_config_build_options(),
+        options: MeshConfigBuildOptions {
+            force_router,
+            ..default_mesh_config_build_options()
+        },
     })
     .map_err(|err| DockerComposeError::Other(err.to_string()))?;
     let router_metadata = if needs_router {
         Some(RouterMetadata {
             mesh_port: router_mesh_port,
             control_port: router_ports.as_ref().expect("router ports missing").control,
+            compose_project: None,
             control_socket: Some(ROUTER_CONTROL_SOCKET_PATH_IN_VOLUME.to_string()),
             control_socket_volume: Some(compose_control_socket_volume_expr()),
         })
@@ -657,10 +671,12 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
         router_service
             .networks
             .insert(BOUNDARY_NETWORK_NAME.to_string(), EmptyMap::default());
-        if !exports_by_name.is_empty() {
+        if force_router || !exports_by_name.is_empty() {
             router_service
                 .ports
                 .push(format!("127.0.0.1::{router_mesh_port}"));
+        }
+        if !exports_by_name.is_empty() {
             let labels_json = serde_json::to_string(&exports_by_name)
                 .map_err(|err| format!("failed to serialize router export labels: {err}"))?;
             router_service

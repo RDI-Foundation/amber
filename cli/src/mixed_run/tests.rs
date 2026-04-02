@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use tempfile::tempdir;
 
 use super::*;
+use crate::framework_component::DynamicProxyExportRecord;
 
 fn test_site_receipt(
     kind: SiteKind,
@@ -190,6 +191,8 @@ fn read_compose_launch_env_returns_saved_launch_env() {
             port_forward_mesh_port: None,
             port_forward_control_port: None,
             observability_endpoint: None,
+            framework_ccs_plan_path: None,
+            site_actuator_plan_path: None,
             launch_env: BTreeMap::from([
                 ("AMBER_CONFIG_TENANT".to_string(), "acme-local".to_string()),
                 (
@@ -212,6 +215,279 @@ fn read_compose_launch_env_returns_saved_launch_env() {
             ("AMBER_CONFIG_TENANT".to_string(), "acme-local".to_string()),
         ])
     );
+}
+
+#[test]
+fn rewrite_dynamic_proxy_metadata_updates_compose_x_amber_exports() {
+    let temp = tempdir().expect("tempdir should be created");
+    let artifact_root = temp.path();
+    fs::write(
+        artifact_root.join("compose.yaml"),
+        r#"
+services: {}
+x-amber:
+  version: "1"
+  router:
+    mesh_port: 24000
+    control_port: 24100
+  exports:
+    stale:
+      component: /stale
+      provide: old
+      protocol: http
+      router_mesh_port: 24000
+"#,
+    )
+    .expect("compose artifact should be written");
+
+    rewrite_dynamic_proxy_metadata(
+        artifact_root,
+        &DynamicSitePlanRecord {
+            site_id: "compose_local".to_string(),
+            kind: SiteKind::Compose,
+            router_identity_id: "router".to_string(),
+            component_ids: Vec::new(),
+            assigned_components: Vec::new(),
+            artifact_files: BTreeMap::new(),
+            desired_artifact_files: BTreeMap::new(),
+            proxy_exports: BTreeMap::from([(
+                "http".to_string(),
+                DynamicProxyExportRecord {
+                    component: "/job/root".to_string(),
+                    provide: "http".to_string(),
+                    protocol: "http".to_string(),
+                },
+            )]),
+        },
+    )
+    .expect("compose proxy metadata should rewrite");
+
+    let raw = fs::read_to_string(artifact_root.join("compose.yaml"))
+        .expect("compose artifact should be readable");
+    let document: serde_yaml::Value =
+        serde_yaml::from_str(&raw).expect("compose yaml should remain valid");
+    let exports = document["x-amber"]["exports"]
+        .as_mapping()
+        .expect("compose x-amber exports should be a mapping");
+    assert_eq!(exports.len(), 1, "stale compose exports should be replaced");
+    let export = exports
+        .get(serde_yaml::Value::String("http".to_string()))
+        .expect("expected rewritten compose export");
+    assert_eq!(export["component"].as_str(), Some("/job/root"));
+    assert_eq!(export["provide"].as_str(), Some("http"));
+    assert_eq!(export["protocol"].as_str(), Some("http"));
+}
+
+fn write_compose_artifact_with_mesh_plan(artifact_root: &Path, plan: &MeshProvisionPlan) {
+    fs::create_dir_all(artifact_root).expect("compose artifact root should exist");
+    let plan_json = serde_json::to_string(plan).expect("mesh provision plan should serialize");
+    fs::write(
+        artifact_root.join("compose.yaml"),
+        format!(
+            "configs:\n  amber-mesh-provision-plan:\n    content: '{}'\n",
+            plan_json
+        ),
+    )
+    .expect("compose artifact should be written");
+}
+
+#[test]
+fn patch_dynamic_compose_site_mesh_plan_projects_child_routes_into_site_artifact() {
+    let temp = tempdir().expect("tempdir should be created");
+    let site_artifact = temp.path().join("site");
+    let child_artifact = temp.path().join("child");
+    let site_plan = MeshProvisionPlan {
+        version: "2".to_string(),
+        identity_seed: None,
+        targets: vec![
+            amber_mesh::MeshProvisionTarget {
+                kind: MeshProvisionTargetKind::Component,
+                config: amber_mesh::MeshConfigTemplate {
+                    identity: amber_mesh::MeshIdentityTemplate {
+                        id: "/job".to_string(),
+                        mesh_scope: Some("scope".to_string()),
+                    },
+                    mesh_listen: SocketAddr::from(([0, 0, 0, 0], 23000)),
+                    control_listen: None,
+                    control_allow: None,
+                    peers: Vec::new(),
+                    inbound: Vec::new(),
+                    outbound: Vec::new(),
+                    transport: TransportConfig::NoiseIk {},
+                },
+                output: MeshProvisionOutput::Filesystem {
+                    dir: "/amber/provision/c2-job-net".to_string(),
+                },
+            },
+            amber_mesh::MeshProvisionTarget {
+                kind: MeshProvisionTargetKind::Router,
+                config: amber_mesh::MeshConfigTemplate {
+                    identity: amber_mesh::MeshIdentityTemplate {
+                        id: "/site/compose_local/router".to_string(),
+                        mesh_scope: Some("scope".to_string()),
+                    },
+                    mesh_listen: SocketAddr::from(([0, 0, 0, 0], 24000)),
+                    control_listen: None,
+                    control_allow: None,
+                    peers: Vec::new(),
+                    inbound: Vec::new(),
+                    outbound: Vec::new(),
+                    transport: TransportConfig::NoiseIk {},
+                },
+                output: MeshProvisionOutput::Filesystem {
+                    dir: "/amber/provision/amber-router".to_string(),
+                },
+            },
+        ],
+    };
+    let child_plan = MeshProvisionPlan {
+        version: "2".to_string(),
+        identity_seed: None,
+        targets: vec![
+            amber_mesh::MeshProvisionTarget {
+                kind: MeshProvisionTargetKind::Component,
+                config: amber_mesh::MeshConfigTemplate {
+                    identity: amber_mesh::MeshIdentityTemplate {
+                        id: "/job".to_string(),
+                        mesh_scope: Some("scope".to_string()),
+                    },
+                    mesh_listen: SocketAddr::from(([0, 0, 0, 0], 23000)),
+                    control_listen: None,
+                    control_allow: None,
+                    peers: vec![amber_mesh::MeshPeerTemplate {
+                        id: "/site/compose_local/router".to_string(),
+                    }],
+                    inbound: vec![InboundRoute {
+                        route_id: component_route_id("/job", "http", MeshProtocol::Http),
+                        capability: "http".to_string(),
+                        capability_kind: Some("http".to_string()),
+                        capability_profile: None,
+                        protocol: MeshProtocol::Http,
+                        http_plugins: Vec::new(),
+                        target: InboundTarget::Local { port: 8080 },
+                        allowed_issuers: vec!["/site/compose_local/router".to_string()],
+                    }],
+                    outbound: Vec::new(),
+                    transport: TransportConfig::NoiseIk {},
+                },
+                output: MeshProvisionOutput::Filesystem {
+                    dir: "/amber/provision/c1-job-net".to_string(),
+                },
+            },
+            amber_mesh::MeshProvisionTarget {
+                kind: MeshProvisionTargetKind::Router,
+                config: amber_mesh::MeshConfigTemplate {
+                    identity: amber_mesh::MeshIdentityTemplate {
+                        id: "/site/compose_local/router".to_string(),
+                        mesh_scope: Some("scope".to_string()),
+                    },
+                    mesh_listen: SocketAddr::from(([0, 0, 0, 0], 24000)),
+                    control_listen: None,
+                    control_allow: None,
+                    peers: vec![amber_mesh::MeshPeerTemplate {
+                        id: "/job".to_string(),
+                    }],
+                    inbound: vec![InboundRoute {
+                        route_id: router_export_route_id("http", MeshProtocol::Http),
+                        capability: "http".to_string(),
+                        capability_kind: Some("http".to_string()),
+                        capability_profile: None,
+                        protocol: MeshProtocol::Http,
+                        http_plugins: Vec::new(),
+                        target: InboundTarget::MeshForward {
+                            peer_addr: "c1-job-net:23000".to_string(),
+                            peer_id: "/job".to_string(),
+                            route_id: component_route_id("/job", "http", MeshProtocol::Http),
+                            capability: "http".to_string(),
+                        },
+                        allowed_issuers: vec!["/site/compose_local/router".to_string()],
+                    }],
+                    outbound: Vec::new(),
+                    transport: TransportConfig::NoiseIk {},
+                },
+                output: MeshProvisionOutput::Filesystem {
+                    dir: "/amber/provision/amber-router".to_string(),
+                },
+            },
+        ],
+    };
+    write_compose_artifact_with_mesh_plan(&site_artifact, &site_plan);
+    write_compose_artifact_with_mesh_plan(&child_artifact, &child_plan);
+
+    patch_dynamic_compose_site_mesh_plan(&site_artifact, &child_artifact)
+        .expect("compose site mesh plan should be patched");
+
+    let patched = read_embedded_compose_mesh_provision_plan(&site_artifact)
+        .expect("patched mesh provision plan should be readable");
+    let component = patched
+        .targets
+        .iter()
+        .find(|target| {
+            matches!(target.kind, MeshProvisionTargetKind::Component)
+                && target.config.identity.id == "/job"
+        })
+        .expect("patched component target should exist");
+    assert_eq!(component.config.peers.len(), 1);
+    assert_eq!(component.config.peers[0].id, "/site/compose_local/router");
+    assert_eq!(component.config.inbound.len(), 1);
+    assert_eq!(
+        component.config.inbound[0].route_id,
+        component_route_id("/job", "http", MeshProtocol::Http)
+    );
+
+    let router = patched
+        .targets
+        .iter()
+        .find(|target| matches!(target.kind, MeshProvisionTargetKind::Router))
+        .expect("patched router target should exist");
+    assert_eq!(router.config.peers.len(), 1);
+    assert_eq!(router.config.peers[0].id, "/job");
+    assert_eq!(router.config.inbound.len(), 1);
+    let InboundTarget::MeshForward { peer_addr, .. } = &router.config.inbound[0].target else {
+        panic!("patched router route should be a mesh-forward route");
+    };
+    assert_eq!(peer_addr, "c2-job-net:23000");
+}
+
+#[test]
+fn cleanup_dynamic_site_children_removes_child_roots_and_clears_state() {
+    let temp = tempdir().expect("tempdir should be created");
+    let site_state_root = temp.path().join("state").join("direct_local");
+    let child_root = site_actuator_child_root_for_site(&site_state_root, 7);
+    fs::create_dir_all(child_root.join("artifact")).expect("child artifact dir should exist");
+    fs::write(child_root.join("artifact").join("marker.txt"), "marker")
+        .expect("child marker should be written");
+    write_json(
+        &site_actuator_state_path(&site_state_root),
+        &SiteActuatorState {
+            schema: "amber.run.site_actuator_state".to_string(),
+            version: 1,
+            run_id: "run-123".to_string(),
+            site_id: "direct_local".to_string(),
+            kind: SiteKind::Direct,
+            children: BTreeMap::from([(
+                7,
+                SiteActuatorChildRecord {
+                    child_id: 7,
+                    artifact_root: child_root.join("artifact").display().to_string(),
+                    process_pid: None,
+                    published: true,
+                },
+            )]),
+        },
+    )
+    .expect("site actuator state should be written");
+
+    cleanup_dynamic_site_children(&site_state_root, SiteKind::Direct)
+        .expect("dynamic site children should be cleaned");
+
+    let state: SiteActuatorState = read_json(
+        &site_actuator_state_path(&site_state_root),
+        "site actuator state",
+    )
+    .expect("site actuator state should be readable");
+    assert!(state.children.is_empty());
+    assert!(!child_root.exists());
 }
 
 #[test]
@@ -486,6 +762,60 @@ fn prepare_kubernetes_artifact_namespace_rewrites_kustomization_namespace() {
 }
 
 #[test]
+fn prepare_kubernetes_site_artifact_for_apply_rewrites_runtime_artifact_state() {
+    let temp = tempdir().expect("tempdir should be created");
+    let kustomization = temp.path().join("kustomization.yaml");
+    fs::write(
+        &kustomization,
+        "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nnamespace: \
+         scenario-old\n",
+    )
+    .expect("kustomization should be written");
+    let env_file = temp.path().join("root-config.env");
+    fs::write(&env_file, "AMBER_TEST_VALUE=stale\n").expect("env file should be written");
+
+    let mut launch_env = BTreeMap::new();
+    launch_env.insert("AMBER_TEST_VALUE".to_string(), "fresh".to_string());
+    let plan = SiteActuatorPlan {
+        schema: SITE_ACTUATOR_PLAN_SCHEMA.to_string(),
+        version: SITE_PLAN_VERSION,
+        run_id: "run-1234abcd".to_string(),
+        run_root: temp.path().display().to_string(),
+        site_id: "kind_c".to_string(),
+        kind: SiteKind::Kubernetes,
+        router_identity_id: "/site/kind_c/router".to_string(),
+        artifact_dir: temp.path().display().to_string(),
+        site_state_root: temp.path().join("state").display().to_string(),
+        listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        storage_root: None,
+        runtime_root: None,
+        router_mesh_port: None,
+        compose_project: None,
+        kubernetes_namespace: None,
+        context: Some("kind-test".to_string()),
+        observability_endpoint: None,
+        launch_env,
+    };
+
+    let supervisor_plan =
+        prepare_kubernetes_site_artifact_for_apply(&plan).expect("artifact should be prepared");
+
+    assert_eq!(
+        supervisor_plan.kubernetes_namespace.as_deref(),
+        Some("amber-run-1234abcd-kind-c")
+    );
+    assert_eq!(
+        fs::read_to_string(&kustomization).expect("kustomization should be readable"),
+        "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nnamespace: \
+         amber-run-1234abcd-kind-c\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&env_file).expect("env file should be readable"),
+        "AMBER_TEST_VALUE=fresh\n"
+    );
+}
+
+#[test]
 fn external_slot_name_from_env_var_restores_slot_name() {
     assert_eq!(
         external_slot_name_from_env_var("AMBER_EXTERNAL_SLOT_API_URL"),
@@ -535,6 +865,7 @@ fn maybe_resolve_proxy_run_target_resolves_run_id_and_prefers_live_state() {
         plan_path: run_plan_path(&run_root).display().to_string(),
         source_plan_path: None,
         run_root: run_root.display().to_string(),
+        framework_control_state: None,
         observability: None,
         bridge_proxies: Vec::new(),
         sites: BTreeMap::from([(
@@ -607,6 +938,7 @@ fn maybe_resolve_proxy_run_target_requires_site_for_multi_site_run() {
         plan_path: run_plan_path(&run_root).display().to_string(),
         source_plan_path: None,
         run_root: run_root.display().to_string(),
+        framework_control_state: None,
         observability: None,
         bridge_proxies: Vec::new(),
         sites: BTreeMap::from([
@@ -669,6 +1001,7 @@ async fn stop_run_forces_supervisor_shutdown_and_cleans_up() {
         plan_path: run_plan_path(&run_root).display().to_string(),
         source_plan_path: None,
         run_root: run_root.display().to_string(),
+        framework_control_state: None,
         observability: None,
         bridge_proxies: Vec::new(),
         sites: BTreeMap::from([(

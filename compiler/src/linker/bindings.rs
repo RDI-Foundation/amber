@@ -25,7 +25,7 @@ enum CapabilitySource {
     Provide(ProvideRef),
     Resource(ResourceRef),
     Slot(SlotRef),
-    Framework(amber_manifest::FrameworkCapabilityName),
+    Framework(FrameworkRef),
 }
 
 struct ResolvedBindingSource {
@@ -245,7 +245,10 @@ fn resolve_binding_source(
             let spec = framework_capability(name.as_str())
                 .expect("manifest invariant: framework capability exists");
             Ok(ResolvedBindingSource {
-                source: CapabilitySource::Framework(spec.name.clone()),
+                source: CapabilitySource::Framework(FrameworkRef {
+                    authority: site.realm,
+                    capability: spec.name.clone(),
+                }),
                 decl: spec.decl.clone(),
                 range: SlotCardinality::EXACTLY_ONE,
             })
@@ -680,8 +683,8 @@ impl<'a> SlotResolver<'a> {
                 weak: false,
                 first_nonweak: None,
             }]),
-            CapabilitySource::Framework(name) => Some(vec![ResolvedBindingFrom {
-                from: BindingFrom::Framework(name.clone()),
+            CapabilitySource::Framework(framework) => Some(vec![ResolvedBindingFrom {
+                from: BindingFrom::Framework(framework.clone()),
                 weak: false,
                 first_nonweak: None,
             }]),

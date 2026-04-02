@@ -4,6 +4,7 @@ use base64::Engine as _;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 use thiserror::Error;
 
 pub mod component_protocol;
@@ -46,6 +47,29 @@ impl MeshIdentity {
         let public_key = signing_key.verifying_key().to_bytes();
         Self {
             id: id.into(),
+            public_key,
+            private_key: keypair,
+            mesh_scope,
+        }
+    }
+
+    pub fn derive(id: impl Into<String>, mesh_scope: Option<String>, seed: &str) -> Self {
+        let id = id.into();
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"amber.mesh.identity.v1\0");
+        hasher.update(seed.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(id.as_bytes());
+        hasher.update(b"\0");
+        if let Some(scope) = mesh_scope.as_deref() {
+            hasher.update(scope.as_bytes());
+        }
+        let secret: [u8; 32] = hasher.finalize().into();
+        let signing_key = SigningKey::from_bytes(&secret);
+        let keypair = signing_key.to_keypair_bytes();
+        let public_key = signing_key.verifying_key().to_bytes();
+        Self {
+            id,
             public_key,
             private_key: keypair,
             mesh_scope,
@@ -171,11 +195,14 @@ pub struct MeshConfigTemplate {
 pub const MESH_PROVISION_PLAN_VERSION: &str = "2";
 pub const MESH_CONFIG_FILENAME: &str = "mesh-config.json";
 pub const MESH_IDENTITY_FILENAME: &str = "mesh-identity.json";
+pub const FRAMEWORK_COMPONENT_CCS_URL_ENV: &str = "AMBER_FRAMEWORK_COMPONENT_CCS_URL";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct MeshProvisionPlan {
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_seed: Option<String>,
     pub targets: Vec<MeshProvisionTarget>,
 }
 
@@ -292,8 +319,41 @@ pub fn router_external_route_id(slot: &str) -> String {
     format!("router:external:{slot}:http")
 }
 
+pub fn router_framework_route_id(
+    identity_id: &str,
+    slot: &str,
+    capability: &str,
+    protocol: MeshProtocol,
+) -> String {
+    format!(
+        "router:framework:{identity_id}:{slot}:{capability}:{}",
+        protocol_label(protocol)
+    )
+}
+
 pub fn router_export_route_id(export: &str, protocol: MeshProtocol) -> String {
     format!("router:export:{export}:{}", protocol_label(protocol))
+}
+
+pub fn framework_cap_instance_id(
+    authority_realm_moniker: &str,
+    consumer_moniker: &str,
+    slot: &str,
+    capability: &str,
+) -> String {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"amber.framework_component.cap_instance.v1\0");
+    hasher.update(authority_realm_moniker.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(consumer_moniker.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(slot.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(capability.as_bytes());
+    format!(
+        "cap_{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&hasher.finalize()[..12])
+    )
 }
 
 fn protocol_label(protocol: MeshProtocol) -> &'static str {
@@ -306,6 +366,11 @@ fn protocol_label(protocol: MeshProtocol) -> &'static str {
 pub fn encode_config_b64(config: &MeshConfig) -> Result<String, serde_json::Error> {
     let json = serde_json::to_vec(config)?;
     Ok(base64::engine::general_purpose::STANDARD.encode(json))
+}
+
+pub fn generate_identity_seed() -> String {
+    let signing_key = SigningKey::generate(&mut OsRng);
+    base64::engine::general_purpose::STANDARD.encode(signing_key.to_bytes())
 }
 
 #[derive(Debug, Error)]

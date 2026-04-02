@@ -359,6 +359,7 @@ pub(super) async fn stop_site_from_receipt(
             }
         }
     }
+    cleanup_dynamic_site_children(&run_root.join("state").join(site_id), site.kind)?;
     Ok(())
 }
 

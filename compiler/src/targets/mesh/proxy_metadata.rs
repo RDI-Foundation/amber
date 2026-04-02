@@ -28,6 +28,8 @@ pub struct RouterMetadata {
     pub mesh_port: u16,
     pub control_port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compose_project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_socket: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_socket_volume: Option<String>,

@@ -533,11 +533,24 @@ fn resolve_inbound_route_isolated_by_peer_identity() {
         capability_kind: None,
         capability_profile: None,
     };
+    let dynamic_overlays = HashMap::new();
 
-    let a = resolve_inbound_route(&inbound_routes, &open, "peer-a", &HashMap::new())
-        .expect("peer-a route should resolve");
-    let denied = resolve_inbound_route(&inbound_routes, &open, "peer-b", &HashMap::new())
-        .expect_err("peer-c should not be allowed");
+    let a = resolve_inbound_route(
+        &inbound_routes,
+        &dynamic_overlays,
+        &open,
+        "peer-a",
+        &HashMap::new(),
+    )
+    .expect("peer-a route should resolve");
+    let denied = resolve_inbound_route(
+        &inbound_routes,
+        &dynamic_overlays,
+        &open,
+        "peer-b",
+        &HashMap::new(),
+    )
+    .expect_err("peer-c should not be allowed");
 
     match &a.target {
         InboundTarget::Local { port } => assert_eq!(*port, 7001),
@@ -581,8 +594,14 @@ fn resolve_inbound_route_rejects_route_id_spoof() {
         capability_kind: None,
         capability_profile: None,
     };
-    let denied = resolve_inbound_route(&inbound_routes, &spoofed, "peer-a", &HashMap::new())
-        .expect_err("peer-a should not be able to use peer-b route id");
+    let denied = resolve_inbound_route(
+        &inbound_routes,
+        &HashMap::new(),
+        &spoofed,
+        "peer-a",
+        &HashMap::new(),
+    )
+    .expect_err("peer-a should not be able to use peer-b route id");
     match denied {
         RouterError::Auth(message) => {
             assert_eq!(message, "peer peer-a not allowed for route route-b")
@@ -629,13 +648,26 @@ fn resolve_inbound_route_dynamic_issuers_apply_only_to_exports() {
         capability_kind: None,
         capability_profile: None,
     };
+    let dynamic_overlays = HashMap::new();
     let dynamic = HashSet::from([String::from("dynamic-peer")]);
     let issuers = HashMap::from([(String::from("export-route"), dynamic.clone())]);
 
-    let dynamic_route = resolve_inbound_route(&inbound_routes, &open, "dynamic-peer", &issuers)
-        .expect("dynamic issuer should resolve");
-    let denied = resolve_inbound_route(&inbound_routes, &open, "consumer", &HashMap::new())
-        .expect_err("consumer should not be authorized for export route");
+    let dynamic_route = resolve_inbound_route(
+        &inbound_routes,
+        &dynamic_overlays,
+        &open,
+        "dynamic-peer",
+        &issuers,
+    )
+    .expect("dynamic issuer should resolve");
+    let denied = resolve_inbound_route(
+        &inbound_routes,
+        &dynamic_overlays,
+        &open,
+        "consumer",
+        &HashMap::new(),
+    )
+    .expect_err("consumer should not be authorized for export route");
 
     assert!(
         matches!(&dynamic_route.target, InboundTarget::MeshForward { .. }),
@@ -678,6 +710,7 @@ async fn register_export_peer_succeeds_when_export_key_collides_with_external_sl
     ];
     let inbound_routes = build_inbound_routes(&config).expect("build inbound routes");
     let trust = TrustBundle::new(&config).expect("trust");
+    let dynamic_route_overlays: DynamicRouteOverlays = Arc::new(RwLock::new(HashMap::new()));
     let dynamic_issuers: DynamicIssuers = Arc::new(RwLock::new(HashMap::new()));
     let peer = test_peer("dynamic-peer");
     let payload = ControlExportPeer {
@@ -691,6 +724,7 @@ async fn register_export_peer_succeeds_when_export_key_collides_with_external_sl
         payload,
         &trust,
         &inbound_routes,
+        &dynamic_route_overlays,
         &dynamic_issuers,
         &config.identity.id,
     )
@@ -703,6 +737,74 @@ async fn register_export_peer_succeeds_when_export_key_collides_with_external_sl
             .get("export-route")
             .is_some_and(|ids| ids.contains("dynamic-peer")),
         "dynamic issuer should be registered under the export key"
+    );
+}
+
+#[tokio::test]
+async fn unregister_export_peer_removes_only_requested_dynamic_issuer() {
+    let mut config = test_mesh_config();
+    config.inbound = vec![inbound_route(
+        "export-route",
+        "shared",
+        MeshProtocol::Http,
+        InboundTarget::MeshForward {
+            peer_addr: "127.0.0.1:1234".to_string(),
+            peer_id: "provider".to_string(),
+            route_id: "provider-route".to_string(),
+            capability: "upstream".to_string(),
+        },
+        &[config.identity.id.as_str()],
+    )];
+    let inbound_routes = build_inbound_routes(&config).expect("build inbound routes");
+    let trust = TrustBundle::new(&config).expect("trust");
+    let dynamic_route_overlays: DynamicRouteOverlays = Arc::new(RwLock::new(HashMap::new()));
+    let dynamic_issuers: DynamicIssuers = Arc::new(RwLock::new(HashMap::new()));
+    let peer_a = test_peer("dynamic-peer-a");
+    let peer_b = test_peer("dynamic-peer-b");
+
+    for peer in [&peer_a, &peer_b] {
+        register_export_peer(
+            "shared",
+            ControlExportPeer {
+                peer_id: peer.id.clone(),
+                peer_key: base64::engine::general_purpose::STANDARD.encode(peer.public_key),
+                protocol: "http".to_string(),
+            },
+            &trust,
+            &inbound_routes,
+            &dynamic_route_overlays,
+            &dynamic_issuers,
+            &config.identity.id,
+        )
+        .await
+        .expect("export registration should succeed");
+    }
+
+    unregister_export_peer(
+        "shared",
+        ControlExportPeer {
+            peer_id: peer_a.id.clone(),
+            peer_key: String::new(),
+            protocol: "http".to_string(),
+        },
+        &inbound_routes,
+        &dynamic_route_overlays,
+        &dynamic_issuers,
+    )
+    .await
+    .expect("export unregister should succeed");
+
+    let issuers = dynamic_issuers.read().await;
+    let route_issuers = issuers
+        .get("export-route")
+        .expect("remaining issuer set should exist");
+    assert!(
+        !route_issuers.contains(&peer_a.id),
+        "requested issuer should be removed"
+    );
+    assert!(
+        route_issuers.contains(&peer_b.id),
+        "unrelated issuer should remain"
     );
 }
 
@@ -994,6 +1096,28 @@ fn resolve_http_external_target_with_override_rejects_loopback_ip_literals() {
 }
 
 #[test]
+fn resolve_http_external_target_with_override_accepts_framework_loopback_ip_literals() {
+    let target = ExternalTarget {
+        name: "component".to_string(),
+        url_env: amber_mesh::FRAMEWORK_COMPONENT_CCS_URL_ENV.to_string(),
+        optional: false,
+        url_override: None,
+    };
+
+    let resolved = resolve_http_external_target_with_override(
+        &target,
+        Some("http://127.0.0.1:6167/base"),
+        &Uri::from_static("/v1/children"),
+    )
+    .expect("framework target should resolve");
+
+    let ResolvedHttpExternalTarget::Http(url) = resolved else {
+        panic!("expected direct http target");
+    };
+    assert_eq!(url.as_str(), "http://127.0.0.1:6167/base/v1/children");
+}
+
+#[test]
 fn resolve_http_external_target_with_override_accepts_private_ip_literals() {
     let target = ExternalTarget {
         name: "matrix".to_string(),
@@ -1107,6 +1231,8 @@ async fn resolve_http_external_target_reads_live_overrides() {
         external_overrides: external_overrides.clone(),
         vetted_external_addrs,
         mesh_upstream: Arc::new(Mutex::new(None)),
+        route_id: None,
+        peer_id: None,
     };
     let uri = Uri::from_static("/_matrix/client/v3/sync");
 
@@ -1146,6 +1272,8 @@ async fn resolve_http_external_target_rejects_localhost_overrides() {
         external_overrides: external_overrides.clone(),
         vetted_external_addrs,
         mesh_upstream: Arc::new(Mutex::new(None)),
+        route_id: None,
+        peer_id: None,
     };
     let uri = Uri::from_static("/_matrix/client/v3/sync");
 
@@ -1170,6 +1298,14 @@ async fn resolve_external_host_rejects_loopback_ip_literals() {
         err.contains("disallowed address"),
         "unexpected error: {err}"
     );
+}
+
+#[tokio::test]
+async fn resolve_external_host_with_policy_accepts_loopback_for_framework_targets() {
+    let resolved = resolve_external_host_with_policy("127.0.0.1", 6167, true)
+        .await
+        .expect("framework target should allow loopback");
+    assert_eq!(resolved, vec![SocketAddr::from(([127, 0, 0, 1], 6167))]);
 }
 
 #[tokio::test]
@@ -1223,6 +1359,8 @@ async fn late_mesh_slot_registration_succeeds_on_same_http_connection() {
         external_overrides: external_overrides.clone(),
         vetted_external_addrs,
         mesh_upstream: Arc::new(Mutex::new(None)),
+        route_id: None,
+        peer_id: None,
     };
     let (client_side, server_side) = duplex(64 * 1024);
     let proxy_state = state.clone();

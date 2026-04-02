@@ -59,6 +59,13 @@ impl ResolvedBinding {
             Self::Component(_) | Self::Framework(_) => None,
         }
     }
+
+    pub(crate) fn as_framework(&self) -> Option<&ResolvedFrameworkBinding> {
+        match self {
+            Self::Framework(binding) => Some(binding),
+            Self::Component(_) | Self::External(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +97,7 @@ pub(crate) struct ResolvedExternalBinding {
 pub(crate) struct ResolvedFrameworkBinding {
     pub(crate) consumer: ComponentId,
     pub(crate) slot: String,
+    pub(crate) authority_realm: ComponentId,
     pub(crate) capability: FrameworkCapabilityName,
 }
 
@@ -143,11 +151,19 @@ impl MeshPlan {
             .filter_map(ResolvedBinding::as_external)
     }
 
-    pub(crate) fn needs_router(&self) -> bool {
+    pub(crate) fn framework_bindings(&self) -> impl Iterator<Item = &ResolvedFrameworkBinding> {
         self.bindings
             .iter()
-            .any(|binding| binding.as_external().is_some())
-            || !self.exports.is_empty()
+            .filter_map(ResolvedBinding::as_framework)
+    }
+
+    pub(crate) fn needs_router(&self) -> bool {
+        self.bindings.iter().any(|binding| {
+            binding.as_external().is_some()
+                || binding
+                    .as_framework()
+                    .is_some_and(|binding| binding.capability.as_str() == "component")
+        }) || !self.exports.is_empty()
     }
 
     pub(crate) fn exports(&self) -> &[ResolvedExport] {
@@ -263,21 +279,23 @@ pub(crate) fn build_mesh_plan(
                     external_slot: slot.name.clone(),
                 }));
             }
-            BindingFrom::Framework(name) => {
-                let Some(spec) = framework_capability(name.as_str()) else {
+            BindingFrom::Framework(framework) => {
+                let Some(spec) = framework_capability(framework.capability.as_str()) else {
                     return Err(MeshError::new(format!(
-                        "{} does not support unknown framework binding `framework.{name}` (bound \
-                         to {}.{})",
+                        "{} does not support unknown framework binding `framework.{}` (bound to \
+                         {}.{})",
                         options.backend_label,
+                        framework.capability,
                         component_label(scenario, binding.to.component),
                         binding.to.name
                     )));
                 };
                 if spec.binding_shape != FrameworkBindingShape::Url {
                     return Err(MeshError::new(format!(
-                        "{} does not support non-URL framework binding `framework.{name}` (bound \
-                         to {}.{})",
+                        "{} does not support non-URL framework binding `framework.{}` (bound to \
+                         {}.{})",
                         options.backend_label,
+                        framework.capability,
                         component_label(scenario, binding.to.component),
                         binding.to.name
                     )));
@@ -285,7 +303,8 @@ pub(crate) fn build_mesh_plan(
                 bindings.push(ResolvedBinding::Framework(ResolvedFrameworkBinding {
                     consumer: binding.to.component,
                     slot: binding.to.name.clone(),
-                    capability: name.clone(),
+                    authority_realm: framework.authority,
+                    capability: framework.capability.clone(),
                 }));
             }
         }

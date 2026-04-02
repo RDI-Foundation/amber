@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use amber_manifest::{FrameworkCapabilityName, Manifest, Program, ProvideDecl, SlotDecl};
 use amber_scenario::{
-    BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, ResourceDecl,
-    ResourceRef, Scenario, ScenarioExport, SlotRef, StorageResourceParams,
+    BindingEdge, BindingFrom, Component, ComponentId, FrameworkRef, Moniker, ProvideRef,
+    ResourceDecl, ResourceRef, Scenario, ScenarioExport, SlotRef, StorageResourceParams,
 };
 use serde_json::json;
 
@@ -114,9 +114,11 @@ fn component_binding(
 
 fn framework_binding(capability: &str, to_component: usize, to_name: &str) -> BindingEdge {
     BindingEdge {
-        from: BindingFrom::Framework(
-            FrameworkCapabilityName::try_from(capability).expect("framework capability"),
-        ),
+        from: BindingFrom::Framework(FrameworkRef {
+            authority: ComponentId(0),
+            capability: FrameworkCapabilityName::try_from(capability)
+                .expect("framework capability"),
+        }),
         to: slot(to_component, to_name),
         weak: false,
     }

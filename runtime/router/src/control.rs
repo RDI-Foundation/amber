@@ -5,6 +5,7 @@ pub(super) struct ControlServiceState {
     external_overrides: ExternalOverrides,
     trust: Arc<TrustBundle>,
     inbound_routes: Arc<InboundRoutes>,
+    dynamic_route_overlays: DynamicRouteOverlays,
     dynamic_issuers: DynamicIssuers,
     identity: MeshIdentityPublic,
 }
@@ -14,6 +15,7 @@ pub(super) struct InboundRuntime {
     config: Arc<MeshConfig>,
     trust: Arc<TrustBundle>,
     inbound_routes: Arc<InboundRoutes>,
+    dynamic_route_overlays: DynamicRouteOverlays,
     dynamic_issuers: DynamicIssuers,
     external_overrides: ExternalOverrides,
     vetted_external_addrs: VettedExternalAddrs,
@@ -31,6 +33,20 @@ pub(super) struct ControlExportPeer {
     pub(crate) peer_id: String,
     pub(crate) peer_key: String,
     pub(crate) protocol: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(super) struct ControlRouteOverlayPeer {
+    pub(crate) peer_id: String,
+    pub(crate) peer_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(super) struct ControlRouteOverlay {
+    #[serde(default)]
+    pub(crate) peers: Vec<ControlRouteOverlayPeer>,
+    #[serde(default)]
+    pub(crate) inbound_routes: Vec<InboundRoute>,
 }
 
 pub(super) const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
@@ -142,6 +158,7 @@ pub async fn run_with_listeners(
         &config.outbound,
     ));
     let dynamic_issuers = Arc::new(RwLock::new(HashMap::new()));
+    let dynamic_route_overlays = Arc::new(RwLock::new(HashMap::new()));
     let identity_public = MeshIdentityPublic::from_identity(&config.identity);
     let control_allow = match config.control_allow.as_ref() {
         Some(entries) => Some(resolve_control_allowlist(entries).await?),
@@ -158,6 +175,7 @@ pub async fn run_with_listeners(
                 config: config.clone(),
                 trust: trust.clone(),
                 inbound_routes: inbound_routes.clone(),
+                dynamic_route_overlays: dynamic_route_overlays.clone(),
                 dynamic_issuers: dynamic_issuers.clone(),
                 external_overrides: external_overrides.clone(),
                 vetted_external_addrs: vetted_external_addrs.clone(),
@@ -190,18 +208,16 @@ pub async fn run_with_listeners(
     if let Some(path) = control_socket_path.clone() {
         #[cfg(unix)]
         {
-            let external_overrides = external_overrides.clone();
-            let trust = trust.clone();
-            let inbound_routes = inbound_routes.clone();
-            let dynamic_issuers = dynamic_issuers.clone();
-            let identity_public = identity_public.clone();
             listeners.spawn(run_control_server_unix(
                 path,
-                external_overrides,
-                trust,
-                inbound_routes,
-                dynamic_issuers,
-                identity_public,
+                ControlServiceState {
+                    external_overrides: external_overrides.clone(),
+                    trust: trust.clone(),
+                    inbound_routes: inbound_routes.clone(),
+                    dynamic_route_overlays: dynamic_route_overlays.clone(),
+                    dynamic_issuers: dynamic_issuers.clone(),
+                    identity: identity_public.clone(),
+                },
             ));
         }
         #[cfg(not(unix))]
@@ -215,20 +231,18 @@ pub async fn run_with_listeners(
     if control_socket_path.is_none()
         && let Some(addr) = config.control_listen
     {
-        let external_overrides = external_overrides.clone();
         let control_allow = control_allow.clone();
-        let trust = trust.clone();
-        let inbound_routes = inbound_routes.clone();
-        let dynamic_issuers = dynamic_issuers.clone();
-        let identity_public = identity_public.clone();
         listeners.spawn(run_control_server(
             addr,
-            external_overrides,
             control_allow,
-            trust,
-            inbound_routes,
-            dynamic_issuers,
-            identity_public,
+            ControlServiceState {
+                external_overrides: external_overrides.clone(),
+                trust: trust.clone(),
+                inbound_routes: inbound_routes.clone(),
+                dynamic_route_overlays: dynamic_route_overlays.clone(),
+                dynamic_issuers: dynamic_issuers.clone(),
+                identity: identity_public.clone(),
+            },
         ));
     }
 
@@ -341,6 +355,7 @@ pub(super) async fn handle_inbound(
         config,
         trust,
         inbound_routes,
+        dynamic_route_overlays,
         dynamic_issuers,
         external_overrides,
         vetted_external_addrs,
@@ -355,8 +370,16 @@ pub(super) async fn handle_inbound(
         .ok_or_else(|| RouterError::Auth("unknown peer".to_string()))?;
     let open = session.recv_open().await?;
     let route = {
+        let overlays = dynamic_route_overlays.read().await;
         let issuers = dynamic_issuers.read().await;
-        resolve_inbound_route(inbound_routes.as_ref(), &open, &remote_id, &issuers)?.clone()
+        resolve_inbound_route(
+            inbound_routes.as_ref(),
+            &overlays,
+            &open,
+            &remote_id,
+            &issuers,
+        )?
+        .clone()
     };
 
     match route.target {
@@ -366,6 +389,7 @@ pub(super) async fn handle_inbound(
                 proxy_noise_to_local_http(
                     &mut session,
                     route.route_id.clone().into(),
+                    remote_id.clone().into(),
                     port,
                     client.clone(),
                     plugins,
@@ -387,31 +411,42 @@ pub(super) async fn handle_inbound(
             optional,
         } => match route.protocol {
             MeshProtocol::Http => {
+                let framework_route_id = (url_env == amber_mesh::FRAMEWORK_COMPONENT_CCS_URL_ENV)
+                    .then(|| Arc::<str>::from(route.route_id.as_str()));
+                let framework_peer_id = (url_env == amber_mesh::FRAMEWORK_COMPONENT_CCS_URL_ENV)
+                    .then(|| Arc::<str>::from(remote_id.as_str()));
                 proxy_noise_to_external(
                     &mut session,
-                    HttpExchangeLabels::inbound_from_route(
-                        config.identity.id.clone().into(),
-                        remote_id.clone().into(),
-                        &route,
-                        &open,
-                    ),
-                    ExternalTarget {
-                        name: route.capability.clone(),
-                        url_env: url_env.clone(),
-                        optional,
-                        url_override: None,
+                    ExternalProxyRequest {
+                        route_id: framework_route_id,
+                        peer_id: framework_peer_id,
+                        labels: HttpExchangeLabels::inbound_from_route(
+                            config.identity.id.clone().into(),
+                            remote_id.clone().into(),
+                            &route,
+                            &open,
+                        ),
+                        target: ExternalTarget {
+                            name: route.capability.clone(),
+                            url_env: url_env.clone(),
+                            optional,
+                            url_override: None,
+                        },
+                        client: client.clone(),
+                        config: config.clone(),
+                        external_overrides: external_overrides.clone(),
+                        vetted_external_addrs: vetted_external_addrs.clone(),
                     },
-                    client.clone(),
-                    config.clone(),
-                    external_overrides.clone(),
-                    vetted_external_addrs.clone(),
                 )
                 .await?;
             }
             MeshProtocol::Tcp => {
                 let override_url = {
-                    let overrides = external_overrides.read().await;
-                    overrides.get(&route.capability).cloned()
+                    external_overrides
+                        .read()
+                        .await
+                        .get(&route.capability)
+                        .cloned()
                 }
                 .and_then(|value| {
                     let trimmed = value.trim().to_string();
@@ -627,23 +662,12 @@ pub(super) async fn handle_outbound(
 
 pub(super) async fn run_control_server(
     addr: SocketAddr,
-    external_overrides: ExternalOverrides,
     control_allow: Option<ControlAllowlist>,
-    trust: Arc<TrustBundle>,
-    inbound_routes: Arc<InboundRoutes>,
-    dynamic_issuers: DynamicIssuers,
-    identity: MeshIdentityPublic,
+    state: ControlServiceState,
 ) -> Result<(), RouterError> {
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|source| RouterError::BindFailed { addr, source })?;
-    let state = ControlServiceState {
-        external_overrides,
-        trust,
-        inbound_routes,
-        dynamic_issuers,
-        identity,
-    };
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -663,20 +687,9 @@ pub(super) async fn run_control_server(
 #[cfg(unix)]
 pub(super) async fn run_control_server_unix(
     path: String,
-    external_overrides: ExternalOverrides,
-    trust: Arc<TrustBundle>,
-    inbound_routes: Arc<InboundRoutes>,
-    dynamic_issuers: DynamicIssuers,
-    identity: MeshIdentityPublic,
+    state: ControlServiceState,
 ) -> Result<(), RouterError> {
     let listener = bind_unix_listener(path.as_str())?;
-    let state = ControlServiceState {
-        external_overrides,
-        trust,
-        inbound_routes,
-        dynamic_issuers,
-        identity,
-    };
 
     loop {
         let (stream, _) = listener.accept().await?;
@@ -747,6 +760,7 @@ where
                 external_overrides,
                 trust,
                 inbound_routes,
+                dynamic_route_overlays,
                 dynamic_issuers,
                 identity,
             } = state;
@@ -755,6 +769,7 @@ where
                 external_overrides,
                 trust,
                 inbound_routes,
+                dynamic_route_overlays,
                 dynamic_issuers,
                 identity,
             )
@@ -811,6 +826,7 @@ pub(super) async fn control_service(
     external_overrides: ExternalOverrides,
     trust: Arc<TrustBundle>,
     inbound_routes: Arc<InboundRoutes>,
+    dynamic_route_overlays: DynamicRouteOverlays,
     dynamic_issuers: DynamicIssuers,
     identity: MeshIdentityPublic,
 ) -> Result<Response<BoxBody>, hyper::Error> {
@@ -906,6 +922,7 @@ pub(super) async fn control_service(
                     payload,
                     trust.as_ref(),
                     inbound_routes.as_ref(),
+                    &dynamic_route_overlays,
                     &dynamic_issuers,
                     &identity.id,
                 )
@@ -913,6 +930,64 @@ pub(super) async fn control_service(
                 {
                     return Ok(error_response(StatusCode::BAD_REQUEST, &err));
                 }
+                Ok(control_empty(StatusCode::NO_CONTENT))
+            }
+            Method::DELETE => {
+                let body = req.into_body().collect().await?.to_bytes();
+                let payload: ControlExportPeer = match serde_json::from_slice(&body) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return Ok(error_response(
+                            StatusCode::BAD_REQUEST,
+                            &format!("invalid json: {err}"),
+                        ));
+                    }
+                };
+                if let Err(err) = unregister_export_peer(
+                    export,
+                    payload,
+                    inbound_routes.as_ref(),
+                    &dynamic_route_overlays,
+                    &dynamic_issuers,
+                )
+                .await
+                {
+                    return Ok(error_response(StatusCode::BAD_REQUEST, &err));
+                }
+                Ok(control_empty(StatusCode::NO_CONTENT))
+            }
+            _ => Ok(error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed",
+            )),
+        },
+        ControlRoute::Overlay(overlay_id) => match *req.method() {
+            Method::PUT => {
+                let body = req.into_body().collect().await?.to_bytes();
+                let payload: ControlRouteOverlay = match serde_json::from_slice(&body) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return Ok(error_response(
+                            StatusCode::BAD_REQUEST,
+                            &format!("invalid json: {err}"),
+                        ));
+                    }
+                };
+                if let Err(err) = apply_route_overlay(
+                    overlay_id,
+                    payload,
+                    trust.as_ref(),
+                    inbound_routes.as_ref(),
+                    &dynamic_route_overlays,
+                )
+                .await
+                {
+                    return Ok(error_response(StatusCode::BAD_REQUEST, &err));
+                }
+                Ok(control_empty(StatusCode::NO_CONTENT))
+            }
+            Method::DELETE => {
+                revoke_route_overlay(overlay_id, &dynamic_route_overlays, &dynamic_issuers).await;
                 Ok(control_empty(StatusCode::NO_CONTENT))
             }
             _ => Ok(error_response(
@@ -927,6 +1002,7 @@ pub(super) enum ControlRoute<'a> {
     Identity,
     ExternalSlot(&'a str),
     Export(&'a str),
+    Overlay(&'a str),
 }
 
 pub(super) fn control_route(path: &str) -> Option<ControlRoute<'_>> {
@@ -952,6 +1028,13 @@ pub(super) fn control_route(path: &str) -> Option<ControlRoute<'_>> {
                 return None;
             }
             Some(ControlRoute::Identity)
+        }
+        "overlays" => {
+            let overlay_id = parts.next()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(ControlRoute::Overlay(overlay_id))
         }
         _ => None,
     }
@@ -1008,6 +1091,7 @@ pub(super) async fn register_export_peer(
     payload: ControlExportPeer,
     trust: &TrustBundle,
     inbound_routes: &InboundRoutes,
+    dynamic_route_overlays: &DynamicRouteOverlays,
     dynamic_issuers: &DynamicIssuers,
     router_id: &str,
 ) -> Result<(), String> {
@@ -1020,7 +1104,8 @@ pub(super) async fn register_export_peer(
     }
     let peer_key = decode_peer_key(&payload.peer_key)?;
     let protocol = control_protocol(payload.protocol.trim())?;
-    let mut export_routes = inbound_routes.values().filter(|route| {
+    let overlays = dynamic_route_overlays.read().await;
+    let mut export_routes = effective_inbound_routes(inbound_routes, &overlays).filter(|route| {
         route.capability == export
             && route.protocol == protocol
             && matches!(route.target, InboundTarget::MeshForward { .. })
@@ -1051,6 +1136,130 @@ pub(super) async fn register_export_peer(
         .or_default()
         .insert(peer.id.clone());
     Ok(())
+}
+
+pub(super) async fn unregister_export_peer(
+    export: &str,
+    payload: ControlExportPeer,
+    inbound_routes: &InboundRoutes,
+    dynamic_route_overlays: &DynamicRouteOverlays,
+    dynamic_issuers: &DynamicIssuers,
+) -> Result<(), String> {
+    let peer_id = payload.peer_id.trim();
+    if peer_id.is_empty() {
+        return Err("peer_id must not be empty".to_string());
+    }
+    let protocol = control_protocol(payload.protocol.trim())?;
+    let overlays = dynamic_route_overlays.read().await;
+    let mut export_routes = effective_inbound_routes(inbound_routes, &overlays).filter(|route| {
+        route.capability == export
+            && route.protocol == protocol
+            && matches!(route.target, InboundTarget::MeshForward { .. })
+    });
+    let Some(route) = export_routes.next() else {
+        return Err(format!("capability {} is not an export", export));
+    };
+    if export_routes.next().is_some() {
+        return Err(format!(
+            "ambiguous export {} for protocol {}",
+            export,
+            protocol_string(protocol)
+        ));
+    }
+
+    let mut issuers = dynamic_issuers.write().await;
+    let Some(route_issuers) = issuers.get_mut(&route.route_id) else {
+        return Ok(());
+    };
+    route_issuers.remove(peer_id);
+    if route_issuers.is_empty() {
+        issuers.remove(&route.route_id);
+    }
+    Ok(())
+}
+
+pub(super) async fn apply_route_overlay(
+    overlay_id: &str,
+    payload: ControlRouteOverlay,
+    trust: &TrustBundle,
+    inbound_routes: &InboundRoutes,
+    dynamic_route_overlays: &DynamicRouteOverlays,
+) -> Result<(), String> {
+    if overlay_id.trim().is_empty() {
+        return Err("overlay id must not be empty".to_string());
+    }
+
+    let mut routes = HashMap::new();
+    for route in payload.inbound_routes {
+        if routes.insert(route.route_id.clone(), route).is_some() {
+            return Err("overlay contains duplicate route ids".to_string());
+        }
+    }
+
+    {
+        let overlays = dynamic_route_overlays.read().await;
+        for route_id in routes.keys() {
+            if inbound_routes.contains_key(route_id) {
+                return Err(format!(
+                    "overlay route {route_id} collides with a static route"
+                ));
+            }
+            if overlays
+                .iter()
+                .filter(|(existing_id, _)| existing_id.as_str() != overlay_id)
+                .any(|(_, overlay)| overlay.routes.contains_key(route_id))
+            {
+                return Err(format!(
+                    "overlay route {route_id} collides with another overlay"
+                ));
+            }
+        }
+    }
+
+    for peer in payload.peers {
+        let mesh_peer = MeshPeer {
+            id: peer.peer_id.trim().to_string(),
+            public_key: decode_peer_key(&peer.peer_key)?,
+        };
+        if mesh_peer.id.is_empty() {
+            return Err("overlay peer_id must not be empty".to_string());
+        }
+        trust
+            .insert_peer(&mesh_peer)
+            .await
+            .map_err(|err| format!("invalid overlay peer {}: {err}", mesh_peer.id))?;
+    }
+
+    dynamic_route_overlays
+        .write()
+        .await
+        .insert(overlay_id.to_string(), DynamicRouteOverlay { routes });
+    Ok(())
+}
+
+pub(super) async fn revoke_route_overlay(
+    overlay_id: &str,
+    dynamic_route_overlays: &DynamicRouteOverlays,
+    dynamic_issuers: &DynamicIssuers,
+) {
+    let removed = dynamic_route_overlays.write().await.remove(overlay_id);
+    if let Some(overlay) = removed {
+        let mut issuers = dynamic_issuers.write().await;
+        for route_id in overlay.routes.keys() {
+            issuers.remove(route_id);
+        }
+    }
+}
+
+fn effective_inbound_routes<'a>(
+    inbound_routes: &'a InboundRoutes,
+    dynamic_route_overlays: &'a HashMap<String, DynamicRouteOverlay>,
+) -> impl Iterator<Item = &'a InboundRoute> + 'a {
+    inbound_routes.values().chain(
+        dynamic_route_overlays
+            .values()
+            .flat_map(|overlay| overlay.routes.values()),
+    )
 }
 
 pub(super) fn decode_peer_key(value: &str) -> Result<[u8; 32], String> {
@@ -1113,19 +1322,27 @@ pub(super) fn validate_outbound_routes(config: &MeshConfig) -> Result<(), Router
 
 pub(super) fn resolve_inbound_route<'a>(
     inbound_routes: &'a InboundRoutes,
+    dynamic_route_overlays: &'a HashMap<String, DynamicRouteOverlay>,
     open: &OpenFrame,
     remote_id: &str,
     dynamic_issuers: &HashMap<String, HashSet<String>>,
 ) -> Result<&'a InboundRoute, RouterError> {
-    let route = inbound_routes.get(&open.route_id).ok_or_else(|| {
-        RouterError::Auth(format!(
-            "unknown route {} for peer {} capability {} protocol {}",
-            open.route_id,
-            remote_id,
-            open.capability,
-            protocol_string(open.protocol)
-        ))
-    })?;
+    let route = inbound_routes
+        .get(&open.route_id)
+        .or_else(|| {
+            dynamic_route_overlays
+                .values()
+                .find_map(|overlay| overlay.routes.get(&open.route_id))
+        })
+        .ok_or_else(|| {
+            RouterError::Auth(format!(
+                "unknown route {} for peer {} capability {} protocol {}",
+                open.route_id,
+                remote_id,
+                open.capability,
+                protocol_string(open.protocol)
+            ))
+        })?;
 
     if open.capability != route.capability || open.protocol != route.protocol {
         return Err(RouterError::Auth(format!(

@@ -21,10 +21,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::{
-    reporter::{
-        CompiledScenario, DirectReporter, DockerComposeReporter, Reporter as _,
-        kubernetes::KubernetesReporter, vm::VmReporter,
-    },
+    reporter::CompiledScenario,
     targets::{
         mesh::plan::{MeshOptions, ResolvedComponentBinding, build_mesh_plan},
         program_config::build_endpoint_plan,
@@ -42,6 +39,8 @@ pub struct RunPlan {
     pub schema: String,
     pub version: u32,
     pub mesh_scope: String,
+    #[serde(default = "default_base_scenario")]
+    pub base_scenario: ScenarioIr,
     #[serde(default)]
     pub offered_sites: BTreeMap<String, SiteDefinition>,
     #[serde(default)]
@@ -56,10 +55,24 @@ pub struct RunPlan {
     pub control_only_sites: Vec<String>,
     #[serde(default)]
     pub active_site_capabilities: BTreeMap<String, ActiveSiteCapabilities>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub placement_components: BTreeMap<String, String>,
     pub assignments: BTreeMap<String, String>,
     pub sites: BTreeMap<String, RunSitePlan>,
     pub links: Vec<RunLink>,
     pub startup_waves: Vec<Vec<String>>,
+}
+
+fn default_base_scenario() -> ScenarioIr {
+    ScenarioIr {
+        schema: amber_scenario::SCENARIO_IR_SCHEMA.to_string(),
+        version: amber_scenario::SCENARIO_IR_VERSION,
+        root: 0,
+        components: Vec::new(),
+        bindings: Vec::new(),
+        exports: Vec::new(),
+        manifest_catalog: BTreeMap::new(),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,11 +246,12 @@ pub fn build_run_plan(
     )
     .map_err(|err| RunPlanError::Other(format!("failed to build mesh plan: {err}")))?;
 
+    let placement_components = placement_component_overrides(placement);
     let assignments_by_component = resolve_assignments(
         scenario,
         &offered_sites,
         &defaults,
-        placement_component_overrides(placement),
+        placement_components.clone(),
     )?;
     validate_storage_locality(scenario, &assignments_by_component)?;
 
@@ -263,7 +277,7 @@ pub fn build_run_plan(
         .filter(|site_id| !control_only_site_set.contains(*site_id))
         .cloned()
         .collect::<Vec<_>>();
-    let active_site_capabilities = initial_active_sites
+    let active_site_capabilities: BTreeMap<String, ActiveSiteCapabilities> = initial_active_sites
         .iter()
         .map(|site_id| {
             (
@@ -353,6 +367,13 @@ pub fn build_run_plan(
             &site_compiled,
             &site_router_identity_id(site_id),
             &mesh_scope,
+            active_site_capabilities
+                .get(site_id)
+                .is_some_and(|capabilities| {
+                    capabilities.cross_site_routing
+                        || capabilities.dynamic_workloads
+                        || capabilities.privileged_control
+                }),
         )?;
         let assigned_components = program_components
             .iter()
@@ -374,6 +395,7 @@ pub fn build_run_plan(
         schema: RUN_PLAN_SCHEMA.to_string(),
         version: RUN_PLAN_VERSION,
         mesh_scope,
+        base_scenario: compiled.scenario_ir().clone(),
         offered_sites,
         defaults,
         initial_active_sites,
@@ -381,6 +403,7 @@ pub fn build_run_plan(
         dynamic_enabled_sites,
         control_only_sites,
         active_site_capabilities,
+        placement_components,
         assignments,
         sites,
         links,
@@ -1607,31 +1630,29 @@ fn render_site_artifact_files(
     compiled: &CompiledScenario,
     router_identity_id: &str,
     mesh_scope: &str,
+    force_router: bool,
 ) -> Result<BTreeMap<String, String>, RunPlanError> {
     let mut files = match site_kind {
         SiteKind::Direct => {
-            DirectReporter
-                .emit(compiled)
+            crate::targets::direct::emit_direct_artifact(compiled, force_router)
                 .map_err(|err| RunPlanError::Other(format!("failed to render direct site: {err}")))?
                 .files
         }
         SiteKind::Vm => {
-            VmReporter
-                .emit(compiled)
+            crate::targets::vm::emit_vm_artifact(compiled, force_router)
                 .map_err(|err| RunPlanError::Other(format!("failed to render vm site: {err}")))?
                 .files
         }
         SiteKind::Compose => {
-            DockerComposeReporter
-                .emit(compiled)
-                .map_err(|err| {
-                    RunPlanError::Other(format!("failed to render compose site: {err}"))
-                })?
-                .files
+            crate::targets::mesh::docker_compose::emit_docker_compose_artifact(
+                compiled,
+                force_router,
+            )
+            .map_err(|err| RunPlanError::Other(format!("failed to render compose site: {err}")))?
+            .files
         }
         SiteKind::Kubernetes => {
-            KubernetesReporter
-                .emit(compiled)
+            crate::targets::mesh::kubernetes::emit_kubernetes_artifact(compiled, force_router)
                 .map_err(|err| {
                     RunPlanError::Other(format!("failed to render kubernetes site: {err}"))
                 })?
@@ -2024,6 +2045,17 @@ mod tests {
             plan.sites["direct_local"]
                 .artifact_files
                 .contains_key("run.sh")
+        );
+        let direct_plan: serde_json::Value = serde_json::from_str(
+            plan.sites["direct_local"]
+                .artifact_files
+                .get("direct-plan.json")
+                .expect("direct standby site should include a direct plan"),
+        )
+        .expect("direct standby plan should be valid json");
+        assert!(
+            direct_plan["router"].is_object(),
+            "standby direct site should materialize a router substrate"
         );
         assert!(plan.active_site_capabilities["direct_local"].dynamic_workloads);
 

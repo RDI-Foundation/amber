@@ -189,7 +189,9 @@ impl Scenario {
                 BindingFrom::External(slot) => {
                     let _ = self.component(slot.component);
                 }
-                BindingFrom::Framework(_) => {}
+                BindingFrom::Framework(framework) => {
+                    let _ = self.component(framework.authority);
+                }
             }
             let _ = self.component(binding.to.component);
         }
@@ -330,10 +332,28 @@ pub struct ResourceRef {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FrameworkRef {
+    pub authority: ComponentId,
+    pub capability: FrameworkCapabilityName,
+}
+
+impl FrameworkRef {
+    pub fn as_str(&self) -> &str {
+        self.capability.as_str()
+    }
+}
+
+impl std::fmt::Display for FrameworkRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.capability.fmt(f)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BindingFrom {
     Component(ProvideRef),
     Resource(ResourceRef),
-    Framework(FrameworkCapabilityName),
+    Framework(FrameworkRef),
     External(SlotRef),
 }
 

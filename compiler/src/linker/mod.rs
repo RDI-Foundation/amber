@@ -22,8 +22,8 @@ use amber_manifest::{
 };
 use amber_scenario::{
     BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
-    ManifestCatalogEntry, ProgramMount, ProvideRef, ResourceDecl as ScenarioResourceDecl,
-    ResourceRef, Scenario, ScenarioExport, SlotRef,
+    FrameworkRef, ManifestCatalogEntry, ProgramMount, ProvideRef,
+    ResourceDecl as ScenarioResourceDecl, ResourceRef, Scenario, ScenarioExport, SlotRef,
     StorageResourceParams as ScenarioStorageResourceParams, TemplateBinding, TemplateConfigField,
     graph::component_path_for,
 };
@@ -619,15 +619,16 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
                                     });
                                     None
                                 }
-                                BindingFrom::Framework(name) => {
+                                BindingFrom::Framework(framework) => {
                                     errors.push(Error::InvalidExport {
                                         component_path: describe_component_path(
                                             &component_path_for(&components, root),
                                         ),
                                         name: export_name.to_string(),
                                         message: format!(
-                                            "target resolves to framework.{name}, which cannot be \
-                                             exported"
+                                            "target resolves to framework.{}, which cannot be \
+                                             exported",
+                                            framework.capability
                                         ),
                                         help: "Export a component provide or child export instead."
                                             .to_string(),

@@ -562,6 +562,33 @@ async fn cleanup_direct_runtime_removes_partial_startup_artifacts() {
     );
 }
 
+#[test]
+fn write_direct_runtime_state_preserves_projected_router_mesh_port() {
+    let plan_root = tempfile::tempdir().expect("temp dir should be created");
+    let existing = DirectRuntimeState {
+        router_mesh_port: Some(24000),
+        component_mesh_port_by_id: BTreeMap::from([(1, 20001)]),
+        ..Default::default()
+    };
+    write_direct_runtime_state(plan_root.path(), &existing)
+        .expect("existing runtime state should be written");
+
+    let replacement = DirectRuntimeState {
+        component_mesh_port_by_id: BTreeMap::from([(2, 20002)]),
+        ..Default::default()
+    };
+    write_direct_runtime_state(plan_root.path(), &replacement)
+        .expect("replacement runtime state should be written");
+
+    let persisted = read_direct_runtime_state(&direct_runtime_state_path(plan_root.path()))
+        .expect("persisted runtime state should be readable");
+    assert_eq!(persisted.router_mesh_port, Some(24000));
+    assert_eq!(
+        persisted.component_mesh_port_by_id,
+        replacement.component_mesh_port_by_id
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn supervise_children_treats_zero_exit_as_success() {

@@ -149,8 +149,12 @@ async fn run() -> Result<()> {
         if identities.contains_key(id) {
             continue;
         }
-        let identity =
-            MeshIdentity::generate(id.clone(), target.config.identity.mesh_scope.clone());
+        let identity = match plan.identity_seed.as_deref() {
+            Some(seed) => {
+                MeshIdentity::derive(id.clone(), target.config.identity.mesh_scope.clone(), seed)
+            }
+            None => MeshIdentity::generate(id.clone(), target.config.identity.mesh_scope.clone()),
+        };
         identities.insert(id.clone(), identity);
     }
 
@@ -696,6 +700,7 @@ mod tests {
 
         let plan = MeshProvisionPlan {
             version: MESH_PROVISION_PLAN_VERSION.to_string(),
+            identity_seed: None,
             targets: vec![MeshProvisionTarget {
                 kind: MeshProvisionTargetKind::Component,
                 config: template.clone(),

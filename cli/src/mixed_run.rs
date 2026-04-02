@@ -15,35 +15,58 @@ use std::{
 
 use amber_compiler::{
     mesh::ProxyMetadata,
-    reporter::vm::{VM_PLAN_FILENAME, VmPlan},
+    reporter::{
+        direct::DirectPlan,
+        vm::{VM_PLAN_FILENAME, VmPlan},
+    },
     run_plan::{RunLink, RunPlan, RunSitePlan, SiteKind},
 };
 use amber_manifest::{CapabilityKind, CapabilityTransport, NetworkProtocol};
 use amber_mesh::{
-    InboundRoute, InboundTarget, MeshConfig, MeshConfigPublic, MeshIdentity, MeshIdentityPublic,
-    MeshPeer, MeshProtocol, OutboundRoute, TransportConfig, component_route_id,
-    router_export_route_id,
+    InboundRoute, InboundTarget, MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshConfig,
+    MeshConfigPublic, MeshIdentity, MeshIdentityPublic, MeshIdentitySecret, MeshPeer, MeshProtocol,
+    MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTargetKind, OutboundRoute,
+    TransportConfig, component_route_id, router_export_route_id,
     telemetry::{SCENARIO_RUN_ID_ENV, SCENARIO_SCOPE_ENV},
 };
 use amber_proxy::{
-    ControlEndpoint, RouterDiscovery, discover_router_for_output, fetch_router_identity,
-    register_export_peer_with_retry, register_external_slot_with_retry,
+    ControlEndpoint, RouterDiscovery, apply_route_overlay_with_retry, discover_router_for_output,
+    fetch_router_identity, register_export_peer_with_retry, register_external_slot_with_retry,
+    revoke_route_overlay_with_retry,
+};
+use axum::{
+    Router,
+    extract::{Path as AxumPath, State},
+    http::StatusCode,
+    routing::{get, post},
 };
 use base64::Engine as _;
 use miette::{Context as _, IntoDiagnostic as _, Result};
 use serde::{Deserialize, Serialize};
-use tokio::time::{Instant, sleep};
+use serde_json::{Map as JsonMap, Value as JsonValue};
+use tokio::{
+    net::TcpListener as TokioTcpListener,
+    sync::Mutex as AsyncMutex,
+    time::{Instant, sleep},
+};
 use url::Url;
 
 use crate::{
     DirectLaunchProcessPreview, DirectSiteLaunchPreview, build_direct_site_launch_preview,
-    direct_current_control_socket_path, direct_runtime_state_path,
+    direct_current_control_socket_path,
+    direct_runtime::ensure_direct_control_socket_link,
+    direct_runtime_state_path,
+    framework_component::{
+        DynamicSitePlanRecord, SiteActuatorDestroyRequest, SiteActuatorPrepareRequest,
+        SiteActuatorPublishRequest,
+    },
     run_inputs::{collect_run_interface, validate_export_bindings, validate_slot_bindings},
     site_proxy_metadata::load_site_proxy_metadata,
     tcp_readiness::{wait_for_http_response, wait_for_stable_endpoint},
     vm_runtime::{
         TCG_VM_STARTUP_TIMEOUT, VmLaunchPreview, VmRuntimeState, VmSiteLaunchPreview,
-        build_vm_site_launch_preview, vm_current_control_socket_path, vm_uses_tcg_accel,
+        build_vm_site_launch_preview, ensure_control_socket_link, vm_current_control_socket_path,
+        vm_uses_tcg_accel,
     },
 };
 mod launch_bundle;
@@ -60,6 +83,8 @@ const SITE_STATE_SCHEMA: &str = "amber.run.site_state";
 const SITE_STATE_VERSION: u32 = 2;
 const SITE_PLAN_SCHEMA: &str = "amber.run.site_supervisor_plan";
 const SITE_PLAN_VERSION: u32 = 1;
+const SITE_ACTUATOR_PLAN_SCHEMA: &str = "amber.run.site_actuator_plan";
+const SITE_ACTUATOR_PLAN_VERSION: u32 = 1;
 const DESIRED_LINKS_SCHEMA: &str = "amber.run.desired_links";
 const DESIRED_LINKS_VERSION: u32 = 1;
 const OTLP_SINK_PLAN_SCHEMA: &str = "amber.run.observability_sink";
@@ -102,10 +127,18 @@ pub(crate) struct RunReceipt {
     pub(crate) source_plan_path: Option<String>,
     pub(crate) run_root: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) framework_control_state: Option<FrameworkControlStateReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) observability: Option<ObservabilityReceipt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) bridge_proxies: Vec<BridgeProxyReceipt>,
     pub(crate) sites: BTreeMap<String, SiteReceipt>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct FrameworkControlStateReceipt {
+    pub(crate) pid: u32,
+    pub(crate) url: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -288,7 +321,7 @@ struct SiteManagerState {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct SiteSupervisorPlan {
+pub(crate) struct SiteSupervisorPlan {
     schema: String,
     version: u32,
     run_id: String,
@@ -317,8 +350,62 @@ struct SiteSupervisorPlan {
     port_forward_control_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     observability_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    framework_ccs_plan_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    site_actuator_plan_path: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     launch_env: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct SiteActuatorPlan {
+    pub(crate) schema: String,
+    pub(crate) version: u32,
+    pub(crate) run_id: String,
+    pub(crate) run_root: String,
+    pub(crate) site_id: String,
+    pub(crate) kind: SiteKind,
+    pub(crate) router_identity_id: String,
+    pub(crate) artifact_dir: String,
+    pub(crate) site_state_root: String,
+    pub(crate) listen_addr: SocketAddr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) storage_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runtime_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) router_mesh_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) compose_project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kubernetes_namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) observability_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) launch_env: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SiteActuatorState {
+    schema: String,
+    version: u32,
+    run_id: String,
+    site_id: String,
+    kind: SiteKind,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    children: BTreeMap<u64, SiteActuatorChildRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SiteActuatorChildRecord {
+    child_id: u64,
+    artifact_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_pid: Option<u32>,
+    published: bool,
 }
 
 struct SupervisorPlanInput<'a> {
@@ -330,6 +417,8 @@ struct SupervisorPlanInput<'a> {
     artifact_dir: &'a Path,
     site_state_root: &'a Path,
     observability_endpoint: Option<&'a str>,
+    framework_ccs_plan_path: Option<&'a Path>,
+    site_actuator_plan_path: Option<&'a Path>,
 }
 
 #[derive(Clone, Debug)]
@@ -339,16 +428,23 @@ struct MaterializedObservability {
 }
 
 #[derive(Clone, Debug)]
-struct MaterializedSite {
-    site_plan: RunSitePlan,
-    artifact_dir: PathBuf,
-    site_state_root: PathBuf,
-    base_supervisor_plan: SiteSupervisorPlan,
+struct MaterializedFrameworkControlState {
+    plan_path: PathBuf,
+    receipt: FrameworkControlStateReceipt,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MaterializedSite {
+    pub(crate) site_plan: RunSitePlan,
+    pub(crate) artifact_dir: PathBuf,
+    pub(crate) site_state_root: PathBuf,
+    pub(crate) base_supervisor_plan: SiteSupervisorPlan,
 }
 
 #[derive(Clone, Debug)]
 struct MaterializedLaunchBundle {
     run_plan_path: PathBuf,
+    framework_control_state: Option<MaterializedFrameworkControlState>,
     observability: Option<MaterializedObservability>,
     sites: BTreeMap<String, MaterializedSite>,
 }
@@ -370,21 +466,21 @@ struct SiteStitchContext {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct DesiredLinkState {
-    schema: String,
-    version: u32,
+pub(crate) struct DesiredLinkState {
+    pub(crate) schema: String,
+    pub(crate) version: u32,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    external_slots: BTreeMap<String, String>,
+    pub(crate) external_slots: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    export_peers: Vec<DesiredExportPeer>,
+    pub(crate) export_peers: Vec<DesiredExportPeer>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct DesiredExportPeer {
-    export_name: String,
-    peer_id: String,
-    peer_key_b64: String,
-    protocol: String,
+pub(crate) struct DesiredExportPeer {
+    pub(crate) export_name: String,
+    pub(crate) peer_id: String,
+    pub(crate) peer_key_b64: String,
+    pub(crate) protocol: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -442,11 +538,11 @@ struct RunOutsideSlot {
 }
 
 #[derive(Clone, Debug)]
-struct LaunchedSite {
-    receipt: SiteReceipt,
-    router_control: ControlEndpoint,
-    router_identity: MeshIdentityPublic,
-    router_addr: SocketAddr,
+pub(crate) struct LaunchedSite {
+    pub(crate) receipt: SiteReceipt,
+    pub(crate) router_control: ControlEndpoint,
+    pub(crate) router_identity: MeshIdentityPublic,
+    pub(crate) router_addr: SocketAddr,
 }
 
 #[derive(Clone, Debug)]
@@ -467,16 +563,17 @@ struct SupervisorChild {
     child: Child,
 }
 
-struct BridgeProxyHandle {
-    child: Child,
-    export_name: String,
-    listen: SocketAddr,
+pub(crate) struct BridgeProxyHandle {
+    pub(crate) child: Child,
+    pub(crate) export_name: String,
+    pub(crate) listen: SocketAddr,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct BridgeProxyKey {
-    export_name: String,
-    consumer_kind: SiteKind,
+pub(crate) struct BridgeProxyKey {
+    pub(crate) provider_output_dir: String,
+    pub(crate) export_name: String,
+    pub(crate) consumer_kind: SiteKind,
 }
 
 #[derive(Debug)]
@@ -484,6 +581,8 @@ struct SupervisorRuntime {
     site_process: Option<Child>,
     site_started: bool,
     port_forward: Option<Child>,
+    framework_ccs: Option<Child>,
+    site_actuator: Option<Child>,
     last_start_attempt: Option<Instant>,
     last_stitch_refresh: Option<Instant>,
     ready_since: Option<Instant>,
@@ -637,6 +736,8 @@ pub(crate) async fn run_site_supervisor(plan_path: PathBuf) -> Result<()> {
         site_process: None,
         site_started: false,
         port_forward: None,
+        framework_ccs: None,
+        site_actuator: None,
         last_start_attempt: None,
         last_stitch_refresh: None,
         ready_since: None,
@@ -897,6 +998,1601 @@ pub(crate) async fn run_observability_sink(plan_path: PathBuf) -> Result<()> {
     }
 }
 
+pub(crate) async fn run_site_actuator(plan_path: PathBuf) -> Result<()> {
+    let plan: SiteActuatorPlan = read_json(&plan_path, "site actuator plan")?;
+    let state_path = site_actuator_state_path(Path::new(&plan.site_state_root));
+    let initial_state = if state_path.is_file() {
+        read_json(&state_path, "site actuator state")?
+    } else {
+        let state = SiteActuatorState {
+            schema: "amber.run.site_actuator_state".to_string(),
+            version: 1,
+            run_id: plan.run_id.clone(),
+            site_id: plan.site_id.clone(),
+            kind: plan.kind,
+            children: BTreeMap::new(),
+        };
+        write_json(&state_path, &state)?;
+        state
+    };
+    let app = SiteActuatorApp {
+        plan,
+        state_path,
+        state: Arc::new(AsyncMutex::new(initial_state)),
+    };
+    let stop_requested = install_signal_flag();
+    let listener = TokioTcpListener::bind(app.plan.listen_addr)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to bind site actuator on {}", app.plan.listen_addr))?;
+    let router = Router::new()
+        .route("/healthz", get(site_actuator_healthz))
+        .route(
+            "/v1/children/{child_id}/prepare",
+            post(site_actuator_prepare),
+        )
+        .route(
+            "/v1/children/{child_id}/publish",
+            post(site_actuator_publish),
+        )
+        .route(
+            "/v1/children/{child_id}/rollback",
+            post(site_actuator_rollback),
+        )
+        .route(
+            "/v1/children/{child_id}/destroy",
+            post(site_actuator_destroy),
+        )
+        .with_state(app);
+    axum::serve(listener, router.into_make_service())
+        .with_graceful_shutdown(async move {
+            while !stop_requested.load(Ordering::SeqCst) {
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("site actuator failed")
+}
+
+#[derive(Clone)]
+struct SiteActuatorApp {
+    plan: SiteActuatorPlan,
+    state_path: PathBuf,
+    state: Arc<AsyncMutex<SiteActuatorState>>,
+}
+
+type ActuatorHttpResult<T> = std::result::Result<T, (StatusCode, String)>;
+
+async fn site_actuator_healthz() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+async fn site_actuator_prepare(
+    State(app): State<SiteActuatorApp>,
+    AxumPath(child_id): AxumPath<u64>,
+    axum::Json(request): axum::Json<SiteActuatorPrepareRequest>,
+) -> ActuatorHttpResult<StatusCode> {
+    actuator_prepare_child(&app, child_id, request.site_plan)
+        .await
+        .map_err(actuator_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn site_actuator_publish(
+    State(app): State<SiteActuatorApp>,
+    AxumPath(child_id): AxumPath<u64>,
+    axum::Json(request): axum::Json<SiteActuatorPublishRequest>,
+) -> ActuatorHttpResult<StatusCode> {
+    actuator_publish_child(&app, child_id, request.site_plan)
+        .await
+        .map_err(actuator_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn site_actuator_rollback(
+    State(app): State<SiteActuatorApp>,
+    AxumPath(child_id): AxumPath<u64>,
+) -> ActuatorHttpResult<StatusCode> {
+    actuator_rollback_child(&app, child_id)
+        .await
+        .map_err(actuator_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn site_actuator_destroy(
+    State(app): State<SiteActuatorApp>,
+    AxumPath(child_id): AxumPath<u64>,
+    axum::Json(request): axum::Json<SiteActuatorDestroyRequest>,
+) -> ActuatorHttpResult<StatusCode> {
+    actuator_destroy_child(&app, child_id, request.desired_site_plan)
+        .await
+        .map_err(actuator_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn actuator_error(err: miette::Report) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+}
+
+fn site_actuator_state_path(site_state_root: &Path) -> PathBuf {
+    site_state_root.join("site-actuator-state.json")
+}
+
+fn site_actuator_child_root(plan: &SiteActuatorPlan, child_id: u64) -> PathBuf {
+    Path::new(&plan.site_state_root)
+        .join("framework-component")
+        .join("children")
+        .join(child_id.to_string())
+}
+
+pub(super) fn site_actuator_child_root_for_site(site_state_root: &Path, child_id: u64) -> PathBuf {
+    site_state_root
+        .join("framework-component")
+        .join("children")
+        .join(child_id.to_string())
+}
+
+fn site_actuator_child_artifact_root(plan: &SiteActuatorPlan, child_id: u64) -> PathBuf {
+    site_actuator_child_root(plan, child_id).join("artifact")
+}
+
+fn site_actuator_child_runtime_root(plan: &SiteActuatorPlan, child_id: u64) -> PathBuf {
+    site_actuator_child_root(plan, child_id).join("runtime")
+}
+
+fn site_actuator_child_storage_root(plan: &SiteActuatorPlan, child_id: u64) -> PathBuf {
+    site_actuator_child_root(plan, child_id).join("storage")
+}
+
+fn site_actuator_child_peer_ports_path(plan: &SiteActuatorPlan, child_id: u64) -> PathBuf {
+    site_actuator_child_root(plan, child_id).join("existing-peer-ports.json")
+}
+
+fn site_actuator_child_peer_identities_path(plan: &SiteActuatorPlan, child_id: u64) -> PathBuf {
+    site_actuator_child_root(plan, child_id).join("existing-peer-identities.json")
+}
+
+pub(super) fn cleanup_dynamic_site_children(site_state_root: &Path, kind: SiteKind) -> Result<()> {
+    let state_path = site_actuator_state_path(site_state_root);
+    if !state_path.is_file() {
+        return Ok(());
+    }
+    let mut state: SiteActuatorState = read_json(&state_path, "site actuator state")?;
+    for child in state.children.values() {
+        if let Some(pid) = child.process_pid {
+            terminate_pid(pid, site_ready_timeout_for_kind(kind))?;
+        }
+        remove_dir_if_exists(&site_actuator_child_root_for_site(
+            site_state_root,
+            child.child_id,
+        ))?;
+    }
+    if state.children.is_empty() {
+        return Ok(());
+    }
+    state.children.clear();
+    write_json(&state_path, &state)
+}
+
+fn rewrite_dynamic_proxy_metadata(
+    artifact_root: &Path,
+    site_plan: &DynamicSitePlanRecord,
+) -> Result<()> {
+    if site_plan.proxy_exports.is_empty() {
+        return Ok(());
+    }
+    if site_plan.kind == SiteKind::Compose {
+        let path = artifact_root.join("compose.yaml");
+        let raw = fs::read_to_string(&path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+        let mut document: serde_yaml::Value = serde_yaml::from_str(&raw)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("invalid compose file {}", path.display()))?;
+        let Some(root) = document.as_mapping_mut() else {
+            return Err(miette::miette!(
+                "compose file {} is not a YAML mapping",
+                path.display()
+            ));
+        };
+        let x_amber_key = serde_yaml::Value::String("x-amber".to_string());
+        let Some(x_amber) = root.get_mut(&x_amber_key) else {
+            return Err(miette::miette!(
+                "compose file {} is missing x-amber metadata",
+                path.display()
+            ));
+        };
+        let exports = site_plan
+            .proxy_exports
+            .iter()
+            .map(|(name, export)| {
+                (
+                    serde_yaml::Value::String(name.clone()),
+                    serde_yaml::Value::Mapping(serde_yaml::Mapping::from_iter([
+                        (
+                            serde_yaml::Value::String("component".to_string()),
+                            serde_yaml::Value::String(export.component.clone()),
+                        ),
+                        (
+                            serde_yaml::Value::String("provide".to_string()),
+                            serde_yaml::Value::String(export.provide.clone()),
+                        ),
+                        (
+                            serde_yaml::Value::String("protocol".to_string()),
+                            serde_yaml::Value::String(export.protocol.clone()),
+                        ),
+                        (
+                            serde_yaml::Value::String("router_mesh_port".to_string()),
+                            serde_yaml::Value::Number(0u64.into()),
+                        ),
+                    ])),
+                )
+            })
+            .collect::<serde_yaml::Mapping>();
+        let mut metadata = x_amber.as_mapping().cloned().ok_or_else(|| {
+            miette::miette!(
+                "compose file {} has non-mapping x-amber metadata",
+                path.display()
+            )
+        })?;
+        metadata.insert(
+            serde_yaml::Value::String("exports".to_string()),
+            serde_yaml::Value::Mapping(exports),
+        );
+        *x_amber = serde_yaml::Value::Mapping(metadata);
+        let rendered = serde_yaml::to_string(&document)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to serialize {}", path.display()))?;
+        fs::write(&path, rendered)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to write {}", path.display()))
+    } else {
+        let exports = site_plan
+            .proxy_exports
+            .iter()
+            .map(|(name, export)| {
+                (
+                    name.clone(),
+                    JsonValue::Object(JsonMap::from_iter([
+                        (
+                            "component".to_string(),
+                            JsonValue::String(export.component.clone()),
+                        ),
+                        (
+                            "provide".to_string(),
+                            JsonValue::String(export.provide.clone()),
+                        ),
+                        (
+                            "protocol".to_string(),
+                            JsonValue::String(export.protocol.clone()),
+                        ),
+                        ("router_mesh_port".to_string(), JsonValue::from(0u64)),
+                    ])),
+                )
+            })
+            .collect::<JsonMap<_, _>>();
+        let path = artifact_root.join("amber-proxy.json");
+        let mut metadata: JsonValue = read_json(&path, "proxy metadata")?;
+        let Some(object) = metadata.as_object_mut() else {
+            return Err(miette::miette!(
+                "proxy metadata {} is not a JSON object",
+                path.display()
+            ));
+        };
+        object.insert("exports".to_string(), JsonValue::Object(exports));
+        write_json(&path, &metadata)
+    }
+}
+
+fn rewrite_dynamic_compose_proxy_metadata(
+    artifact_root: &Path,
+    compose_project: &str,
+) -> Result<()> {
+    let path = artifact_root.join("compose.yaml");
+    let raw = fs::read_to_string(&path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+    let mut document: serde_yaml::Value = serde_yaml::from_str(&raw)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("invalid compose file {}", path.display()))?;
+    let Some(root) = document.as_mapping_mut() else {
+        return Err(miette::miette!(
+            "compose file {} is not a YAML mapping",
+            path.display()
+        ));
+    };
+    let x_amber_key = serde_yaml::Value::String("x-amber".to_string());
+    let Some(x_amber) = root.get_mut(&x_amber_key) else {
+        return Err(miette::miette!(
+            "compose file {} is missing x-amber metadata",
+            path.display()
+        ));
+    };
+    let mut metadata: ProxyMetadata = serde_yaml::from_value(x_amber.clone())
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "compose file {} has invalid x-amber metadata",
+                path.display()
+            )
+        })?;
+    if let Some(router) = metadata.router.as_mut() {
+        router.compose_project = Some(compose_project.to_string());
+    }
+    *x_amber = serde_yaml::to_value(&metadata)
+        .into_diagnostic()
+        .wrap_err("failed to serialize compose proxy metadata")?;
+    let rendered = serde_yaml::to_string(&document)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to serialize {}", path.display()))?;
+    fs::write(&path, rendered)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write {}", path.display()))
+}
+
+fn read_compose_document(path: &Path) -> Result<serde_yaml::Value> {
+    let raw = fs::read_to_string(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+    serde_yaml::from_str(&raw)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("invalid compose file {}", path.display()))
+}
+
+fn read_embedded_compose_mesh_provision_plan(artifact_root: &Path) -> Result<MeshProvisionPlan> {
+    let path = artifact_root.join("compose.yaml");
+    let document = read_compose_document(&path)?;
+    let Some(root) = document.as_mapping() else {
+        return Err(miette::miette!(
+            "compose file {} is not a YAML mapping",
+            path.display()
+        ));
+    };
+    let configs_key = serde_yaml::Value::String("configs".to_string());
+    let config_name = serde_yaml::Value::String("amber-mesh-provision-plan".to_string());
+    let content_key = serde_yaml::Value::String("content".to_string());
+    let content = root
+        .get(&configs_key)
+        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(|configs| configs.get(&config_name))
+        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(|config| config.get(&content_key))
+        .and_then(serde_yaml::Value::as_str)
+        .ok_or_else(|| {
+            miette::miette!(
+                "compose file {} is missing configs.amber-mesh-provision-plan.content",
+                path.display()
+            )
+        })?;
+    serde_json::from_str(content).map_err(|err| {
+        miette::miette!(
+            "compose file {} has invalid embedded mesh provision plan: {err}",
+            path.display()
+        )
+    })
+}
+
+fn write_embedded_compose_mesh_provision_plan(
+    artifact_root: &Path,
+    plan: &MeshProvisionPlan,
+) -> Result<()> {
+    let path = artifact_root.join("compose.yaml");
+    let mut document = read_compose_document(&path)?;
+    let Some(root) = document.as_mapping_mut() else {
+        return Err(miette::miette!(
+            "compose file {} is not a YAML mapping",
+            path.display()
+        ));
+    };
+    let configs_key = serde_yaml::Value::String("configs".to_string());
+    let config_name = serde_yaml::Value::String("amber-mesh-provision-plan".to_string());
+    let content_key = serde_yaml::Value::String("content".to_string());
+    let Some(configs) = root
+        .get_mut(&configs_key)
+        .and_then(serde_yaml::Value::as_mapping_mut)
+    else {
+        return Err(miette::miette!(
+            "compose file {} is missing configs",
+            path.display()
+        ));
+    };
+    let Some(config) = configs
+        .get_mut(&config_name)
+        .and_then(serde_yaml::Value::as_mapping_mut)
+    else {
+        return Err(miette::miette!(
+            "compose file {} is missing configs.amber-mesh-provision-plan",
+            path.display()
+        ));
+    };
+    config.insert(
+        content_key,
+        serde_yaml::Value::String(
+            serde_json::to_string(plan)
+                .map_err(|err| miette::miette!("failed to serialize mesh provision plan: {err}"))?,
+        ),
+    );
+    let rendered = serde_yaml::to_string(&document)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to serialize {}", path.display()))?;
+    fs::write(&path, rendered)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write {}", path.display()))
+}
+
+fn upsert_mesh_peer_template(
+    peers: &mut Vec<amber_mesh::MeshPeerTemplate>,
+    peer: amber_mesh::MeshPeerTemplate,
+) {
+    if let Some(existing) = peers.iter_mut().find(|existing| existing.id == peer.id) {
+        *existing = peer;
+        return;
+    }
+    peers.push(peer);
+}
+
+fn upsert_inbound_route(routes: &mut Vec<InboundRoute>, route: InboundRoute) {
+    if let Some(existing) = routes
+        .iter_mut()
+        .find(|existing| existing.route_id == route.route_id)
+    {
+        *existing = route;
+        return;
+    }
+    routes.push(route);
+}
+
+fn compose_mesh_service_name(target: &amber_mesh::MeshProvisionTarget) -> Result<String> {
+    let MeshProvisionOutput::Filesystem { dir } = &target.output else {
+        return Err(miette::miette!(
+            "compose mesh target {} does not use filesystem output",
+            target.config.identity.id
+        ));
+    };
+    Path::new(dir)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            miette::miette!(
+                "compose mesh target {} has invalid output dir {}",
+                target.config.identity.id,
+                dir
+            )
+        })
+}
+
+fn parse_mesh_peer_port(peer_addr: &str) -> Result<u16> {
+    peer_addr
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .ok_or_else(|| miette::miette!("invalid mesh peer address `{peer_addr}`"))
+}
+
+fn patch_dynamic_compose_site_mesh_plan(
+    site_artifact_root: &Path,
+    child_artifact_root: &Path,
+) -> Result<()> {
+    let mut site_plan = read_embedded_compose_mesh_provision_plan(site_artifact_root)?;
+    let child_plan = read_embedded_compose_mesh_provision_plan(child_artifact_root)?;
+    let Some(site_router_index) = site_plan
+        .targets
+        .iter()
+        .position(|target| matches!(target.kind, MeshProvisionTargetKind::Router))
+    else {
+        return Err(miette::miette!(
+            "compose site artifact {} is missing a router target",
+            site_artifact_root.display()
+        ));
+    };
+    let site_mesh_service_by_peer_id = site_plan
+        .targets
+        .iter()
+        .filter(|target| matches!(target.kind, MeshProvisionTargetKind::Component))
+        .map(|target| {
+            compose_mesh_service_name(target)
+                .map(|service_name| (target.config.identity.id.clone(), service_name))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+
+    for child_target in child_plan
+        .targets
+        .iter()
+        .filter(|target| matches!(target.kind, MeshProvisionTargetKind::Component))
+    {
+        let Some(site_target) = site_plan.targets.iter_mut().find(|target| {
+            matches!(target.kind, MeshProvisionTargetKind::Component)
+                && target.config.identity.id == child_target.config.identity.id
+        }) else {
+            return Err(miette::miette!(
+                "compose site artifact {} is missing component target {}",
+                site_artifact_root.display(),
+                child_target.config.identity.id
+            ));
+        };
+        for peer in child_target.config.peers.iter().cloned() {
+            upsert_mesh_peer_template(&mut site_target.config.peers, peer);
+        }
+        for route in child_target.config.inbound.iter().cloned() {
+            upsert_inbound_route(&mut site_target.config.inbound, route);
+        }
+    }
+
+    let child_router = child_plan
+        .targets
+        .iter()
+        .find(|target| matches!(target.kind, MeshProvisionTargetKind::Router))
+        .ok_or_else(|| {
+            miette::miette!(
+                "compose child artifact {} is missing a router target",
+                child_artifact_root.display()
+            )
+        })?
+        .clone();
+    let site_router = &mut site_plan.targets[site_router_index];
+    for peer in child_router.config.peers {
+        upsert_mesh_peer_template(&mut site_router.config.peers, peer);
+    }
+    for mut route in child_router.config.inbound {
+        if let InboundTarget::MeshForward {
+            peer_id, peer_addr, ..
+        } = &mut route.target
+        {
+            let port = parse_mesh_peer_port(peer_addr)?;
+            *peer_addr = format!(
+                "{}:{port}",
+                site_mesh_service_by_peer_id
+                    .get(peer_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        miette::miette!(
+                            "compose site artifact {} is missing a mesh service for {}",
+                            site_artifact_root.display(),
+                            peer_id
+                        )
+                    })?
+            );
+        }
+        upsert_inbound_route(&mut site_router.config.inbound, route);
+    }
+    write_embedded_compose_mesh_provision_plan(site_artifact_root, &site_plan)
+}
+
+fn project_dynamic_child_mesh_scope(artifact_root: &Path, mesh_scope: Option<&str>) -> Result<()> {
+    let Some(mesh_scope) = mesh_scope else {
+        return Ok(());
+    };
+    let path = artifact_root.join("mesh-provision-plan.json");
+    let mut plan: MeshProvisionPlan = read_json(&path, "mesh provision plan")?;
+    let mut changed = false;
+    for target in &mut plan.targets {
+        if target.config.identity.mesh_scope.as_deref() == Some(mesh_scope) {
+            continue;
+        }
+        target.config.identity.mesh_scope = Some(mesh_scope.to_string());
+        changed = true;
+    }
+    if !changed {
+        return Ok(());
+    }
+    write_json(&path, &plan)
+}
+
+fn reconcile_artifact_files(site_plan: &DynamicSitePlanRecord) -> &BTreeMap<String, String> {
+    if site_plan.desired_artifact_files.is_empty() {
+        &site_plan.artifact_files
+    } else {
+        &site_plan.desired_artifact_files
+    }
+}
+
+fn reconcile_site_proxy_metadata(
+    site_artifact_root: &Path,
+    site_plan: &DynamicSitePlanRecord,
+) -> Result<()> {
+    let Some(proxy_metadata) = reconcile_artifact_files(site_plan).get("amber-proxy.json") else {
+        return Ok(());
+    };
+    let path = site_artifact_root.join("amber-proxy.json");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(&path, proxy_metadata)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write {}", path.display()))
+}
+
+fn project_dynamic_direct_router_surface(
+    plan: &SiteActuatorPlan,
+    child: &SiteActuatorChildRecord,
+) -> Result<()> {
+    let state_path = direct_runtime_state_path(Path::new(&child.artifact_root));
+    let router_mesh_port = plan.router_mesh_port.ok_or_else(|| {
+        miette::miette!(
+            "direct site `{}` is missing its router mesh port",
+            plan.site_id
+        )
+    })?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut state: crate::direct_runtime::DirectRuntimeState =
+            read_json(&state_path, "direct runtime state")?;
+        if state.router_mesh_port == Some(router_mesh_port) {
+            break;
+        }
+        state.router_mesh_port = Some(router_mesh_port);
+        write_json(&state_path, &state)?;
+        std::thread::sleep(Duration::from_millis(100));
+        let state: crate::direct_runtime::DirectRuntimeState =
+            read_json(&state_path, "direct runtime state")?;
+        if state.router_mesh_port == Some(router_mesh_port) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(miette::miette!(
+                "timed out projecting direct child router mesh port into {}",
+                state_path.display()
+            ));
+        }
+    }
+
+    let site_current = direct_current_control_socket_path(Path::new(&plan.artifact_dir));
+    let child_current = direct_current_control_socket_path(Path::new(&child.artifact_root));
+    if let Some(parent) = child_current.parent() {
+        fs::create_dir_all(parent)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
+    }
+    ensure_direct_control_socket_link(
+        &child_current,
+        &site_current,
+        "dynamic child router control symlink",
+    )?;
+    let artifact_link = Path::new(&child.artifact_root)
+        .join(".amber")
+        .join("control")
+        .join("router-control.sock");
+    if let Some(parent) = artifact_link.parent() {
+        fs::create_dir_all(parent)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
+    }
+    ensure_direct_control_socket_link(
+        &artifact_link,
+        &child_current,
+        "dynamic child router control artifact symlink",
+    )
+}
+
+fn project_dynamic_vm_router_surface(
+    plan: &SiteActuatorPlan,
+    child: &SiteActuatorChildRecord,
+) -> Result<()> {
+    let state_path = Path::new(&child.artifact_root)
+        .join(".amber")
+        .join("vm-runtime.json");
+    let router_mesh_port = plan.router_mesh_port.ok_or_else(|| {
+        miette::miette!("vm site `{}` is missing its router mesh port", plan.site_id)
+    })?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut state: VmRuntimeState = read_json(&state_path, "vm runtime state")?;
+        if state.router_mesh_port == Some(router_mesh_port) {
+            break;
+        }
+        state.router_mesh_port = Some(router_mesh_port);
+        write_json(&state_path, &state)?;
+        std::thread::sleep(Duration::from_millis(100));
+        let state: VmRuntimeState = read_json(&state_path, "vm runtime state")?;
+        if state.router_mesh_port == Some(router_mesh_port) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(miette::miette!(
+                "timed out projecting vm child router mesh port into {}",
+                state_path.display()
+            ));
+        }
+    }
+
+    let site_current = vm_current_control_socket_path(Path::new(&plan.artifact_dir));
+    let child_current = vm_current_control_socket_path(Path::new(&child.artifact_root));
+    if let Some(parent) = child_current.parent() {
+        fs::create_dir_all(parent)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
+    }
+    ensure_control_socket_link(
+        &child_current,
+        &site_current,
+        "dynamic child vm router control symlink",
+    )?;
+    let artifact_link = Path::new(&child.artifact_root)
+        .join(".amber")
+        .join("control")
+        .join("router-control.sock");
+    if let Some(parent) = artifact_link.parent() {
+        fs::create_dir_all(parent)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
+    }
+    ensure_control_socket_link(
+        &artifact_link,
+        &child_current,
+        "dynamic child vm router control artifact symlink",
+    )
+}
+
+fn dynamic_child_route_overlay_id(plan: &SiteActuatorPlan, child_id: u64) -> String {
+    format!("framework-child:{}:{child_id}", plan.site_id)
+}
+
+fn site_router_control_endpoint(plan: &SiteActuatorPlan) -> Result<ControlEndpoint> {
+    match plan.kind {
+        SiteKind::Direct => Ok(ControlEndpoint::Unix(direct_current_control_socket_path(
+            Path::new(&plan.artifact_dir),
+        ))),
+        SiteKind::Vm => Ok(ControlEndpoint::Unix(vm_current_control_socket_path(
+            Path::new(&plan.artifact_dir),
+        ))),
+        SiteKind::Compose | SiteKind::Kubernetes => Err(miette::miette!(
+            "site `{}` does not expose a local unix router control endpoint",
+            plan.site_id
+        )),
+    }
+}
+
+fn child_router_overlay_payload(
+    artifact_root: &Path,
+    runtime_root: &Path,
+) -> Result<(Vec<MeshPeer>, Vec<InboundRoute>)> {
+    let provision: MeshProvisionPlan = read_json(
+        &artifact_root.join("mesh-provision-plan.json"),
+        "mesh provision plan",
+    )?;
+    let Some(router_target) = provision
+        .targets
+        .iter()
+        .find(|target| matches!(target.kind, MeshProvisionTargetKind::Router))
+    else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let mut peers = Vec::new();
+    let mut peer_addr_by_id = BTreeMap::new();
+    for peer in &router_target.config.peers {
+        let component_target = provision
+            .targets
+            .iter()
+            .find(|target| {
+                matches!(target.kind, MeshProvisionTargetKind::Component)
+                    && target.config.identity.id == peer.id
+            })
+            .ok_or_else(|| {
+                miette::miette!(
+                    "router overlay peer {} is missing from mesh provision plan",
+                    peer.id
+                )
+            })?;
+        let MeshProvisionOutput::Filesystem { dir } = &component_target.output else {
+            return Err(miette::miette!(
+                "router overlay peer {} does not use filesystem mesh output",
+                peer.id
+            ));
+        };
+        let identity: MeshIdentitySecret = read_json(
+            &runtime_root.join(dir).join(MESH_IDENTITY_FILENAME),
+            "mesh identity",
+        )?;
+        let runtime_config: MeshConfigPublic = read_json(
+            &runtime_root.join(dir).join(MESH_CONFIG_FILENAME),
+            "mesh config",
+        )?;
+        let public_key = identity.public_key().into_diagnostic()?;
+        peer_addr_by_id.insert(
+            runtime_config.identity.id.clone(),
+            runtime_config.mesh_listen,
+        );
+        peers.push(MeshPeer {
+            id: identity.id,
+            public_key,
+        });
+    }
+    let mut inbound_routes = router_target.config.inbound.clone();
+    for route in &mut inbound_routes {
+        if let InboundTarget::MeshForward {
+            peer_id, peer_addr, ..
+        } = &mut route.target
+            && let Some(resolved) = peer_addr_by_id.get(peer_id)
+        {
+            *peer_addr = resolved.to_string();
+        }
+    }
+    Ok((peers, inbound_routes))
+}
+
+async fn apply_dynamic_site_router_overlay(
+    plan: &SiteActuatorPlan,
+    child_id: u64,
+    artifact_root: &Path,
+    runtime_root: &Path,
+) -> Result<()> {
+    let (peers, inbound_routes) = child_router_overlay_payload(artifact_root, runtime_root)?;
+    if inbound_routes.is_empty() {
+        return Ok(());
+    }
+    let endpoint = site_router_control_endpoint(plan)?;
+    apply_route_overlay_with_retry(
+        &endpoint,
+        &dynamic_child_route_overlay_id(plan, child_id),
+        &peers,
+        &inbound_routes,
+        Duration::from_secs(30),
+    )
+    .await
+}
+
+async fn revoke_dynamic_site_router_overlay(plan: &SiteActuatorPlan, child_id: u64) -> Result<()> {
+    let endpoint = site_router_control_endpoint(plan)?;
+    revoke_route_overlay_with_retry(
+        &endpoint,
+        &dynamic_child_route_overlay_id(plan, child_id),
+        Duration::from_secs(30),
+    )
+    .await
+}
+
+async fn actuator_prepare_child(
+    app: &SiteActuatorApp,
+    child_id: u64,
+    site_plan: DynamicSitePlanRecord,
+) -> Result<()> {
+    let artifact_root = site_actuator_child_artifact_root(&app.plan, child_id);
+    replace_artifact_snapshot(&artifact_root, &site_plan.artifact_files)?;
+    if site_plan.kind == SiteKind::Kubernetes {
+        let _ = prepare_kubernetes_artifact_namespace(
+            &app.plan.run_id,
+            &app.plan.site_id,
+            &artifact_root,
+        )?;
+    }
+    patch_site_artifacts(
+        &artifact_root,
+        site_plan.kind,
+        &app.plan.launch_env,
+        app.plan.observability_endpoint.as_deref(),
+    )?;
+    match site_plan.kind {
+        SiteKind::Direct => filter_direct_stage_plan(&artifact_root, &site_plan.component_ids)?,
+        SiteKind::Vm => filter_vm_stage_plan(&artifact_root, &site_plan.component_ids)?,
+        SiteKind::Compose | SiteKind::Kubernetes => {}
+    }
+    rewrite_dynamic_proxy_metadata(&artifact_root, &site_plan)?;
+    if site_plan.kind == SiteKind::Compose
+        && let Some(compose_project) = app.plan.compose_project.as_deref()
+    {
+        rewrite_dynamic_compose_proxy_metadata(&artifact_root, compose_project)?;
+    }
+    let mut state = app.state.lock().await;
+    state.children.insert(
+        child_id,
+        SiteActuatorChildRecord {
+            child_id,
+            artifact_root: artifact_root.display().to_string(),
+            process_pid: None,
+            published: false,
+        },
+    );
+    write_json(&app.state_path, &*state)
+}
+
+async fn actuator_publish_child(
+    app: &SiteActuatorApp,
+    child_id: u64,
+    site_plan: DynamicSitePlanRecord,
+) -> Result<()> {
+    let child = {
+        let state = app.state.lock().await;
+        state
+            .children
+            .get(&child_id)
+            .cloned()
+            .ok_or_else(|| miette::miette!("site actuator child {child_id} is not prepared"))?
+    };
+    if child.published {
+        return Ok(());
+    }
+
+    match app.plan.kind {
+        SiteKind::Direct => {
+            let state = app.state.lock().await;
+            let existing_peer_ports = local_direct_peer_ports(&app.plan, &state)?;
+            let existing_peer_identities = local_direct_peer_identities(&app.plan, &state)?;
+            drop(state);
+            write_json(
+                &site_actuator_child_peer_ports_path(&app.plan, child_id),
+                &existing_peer_ports,
+            )?;
+            write_json(
+                &site_actuator_child_peer_identities_path(&app.plan, child_id),
+                &existing_peer_identities,
+            )?;
+            project_dynamic_child_mesh_scope(
+                Path::new(&child.artifact_root),
+                existing_peer_identities
+                    .get(&app.plan.router_identity_id)
+                    .and_then(|identity| identity.mesh_scope.as_deref()),
+            )?;
+            let runtime_root = site_actuator_child_runtime_root(&app.plan, child_id);
+            let storage_root = site_actuator_child_storage_root(&app.plan, child_id);
+            let child_root = site_actuator_child_root(&app.plan, child_id);
+            fs::create_dir_all(&runtime_root)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to create {}", runtime_root.display()))?;
+            fs::create_dir_all(&storage_root)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to create {}", storage_root.display()))?;
+            let process = spawn_detached_child(&child_root, &child_root.join("site.log"), |cmd| {
+                cmd.arg("run-direct-init")
+                    .arg("--plan")
+                    .arg(Path::new(&child.artifact_root).join("direct-plan.json"))
+                    .arg("--storage-root")
+                    .arg(&storage_root)
+                    .arg("--runtime-root")
+                    .arg(&runtime_root)
+                    .arg("--existing-peer-ports")
+                    .arg(site_actuator_child_peer_ports_path(&app.plan, child_id))
+                    .arg("--existing-peer-identities")
+                    .arg(site_actuator_child_peer_identities_path(
+                        &app.plan, child_id,
+                    ))
+                    .arg("--skip-router");
+            })?;
+            wait_for_detached_child_runtime_state(
+                process.id(),
+                &direct_runtime_state_path(Path::new(&child.artifact_root)),
+                site_ready_timeout_for_kind(SiteKind::Direct),
+                &child_root.join("site.log"),
+            )
+            .await?;
+            let mut state = app.state.lock().await;
+            {
+                let record = state
+                    .children
+                    .get_mut(&child_id)
+                    .expect("prepared child should remain present");
+                record.process_pid = Some(process.id());
+            }
+            write_json(&app.state_path, &*state)?;
+            drop(state);
+            project_dynamic_direct_router_surface(&app.plan, &child)?;
+            apply_dynamic_site_router_overlay(
+                &app.plan,
+                child_id,
+                Path::new(&child.artifact_root),
+                &runtime_root,
+            )
+            .await?;
+            reconcile_site_proxy_metadata(Path::new(&app.plan.artifact_dir), &site_plan)?;
+            let mut state = app.state.lock().await;
+            let record = state
+                .children
+                .get_mut(&child_id)
+                .expect("prepared child should remain present");
+            record.published = true;
+            write_json(&app.state_path, &*state)?;
+        }
+        SiteKind::Vm => {
+            let state = app.state.lock().await;
+            let existing_peer_ports = local_vm_peer_ports(&app.plan, &state)?;
+            let existing_peer_identities = local_vm_peer_identities(&app.plan, &state)?;
+            drop(state);
+            write_json(
+                &site_actuator_child_peer_ports_path(&app.plan, child_id),
+                &existing_peer_ports,
+            )?;
+            write_json(
+                &site_actuator_child_peer_identities_path(&app.plan, child_id),
+                &existing_peer_identities,
+            )?;
+            project_dynamic_child_mesh_scope(
+                Path::new(&child.artifact_root),
+                existing_peer_identities
+                    .get(&app.plan.router_identity_id)
+                    .and_then(|identity| identity.mesh_scope.as_deref()),
+            )?;
+            let runtime_root = site_actuator_child_runtime_root(&app.plan, child_id);
+            let storage_root = site_actuator_child_storage_root(&app.plan, child_id);
+            let child_root = site_actuator_child_root(&app.plan, child_id);
+            fs::create_dir_all(&runtime_root)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to create {}", runtime_root.display()))?;
+            fs::create_dir_all(&storage_root)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to create {}", storage_root.display()))?;
+            let process = spawn_detached_child(&child_root, &child_root.join("site.log"), |cmd| {
+                cmd.arg("run-vm-init")
+                    .arg("--plan")
+                    .arg(Path::new(&child.artifact_root).join("vm-plan.json"))
+                    .arg("--storage-root")
+                    .arg(&storage_root)
+                    .arg("--runtime-root")
+                    .arg(&runtime_root)
+                    .arg("--existing-peer-ports")
+                    .arg(site_actuator_child_peer_ports_path(&app.plan, child_id))
+                    .arg("--existing-peer-identities")
+                    .arg(site_actuator_child_peer_identities_path(
+                        &app.plan, child_id,
+                    ))
+                    .arg("--skip-router");
+            })?;
+            wait_for_detached_child_runtime_state(
+                process.id(),
+                &Path::new(&child.artifact_root)
+                    .join(".amber")
+                    .join("vm-runtime.json"),
+                site_ready_timeout_for_kind(SiteKind::Vm),
+                &child_root.join("site.log"),
+            )
+            .await?;
+            let mut state = app.state.lock().await;
+            {
+                let record = state
+                    .children
+                    .get_mut(&child_id)
+                    .expect("prepared child should remain present");
+                record.process_pid = Some(process.id());
+            }
+            write_json(&app.state_path, &*state)?;
+            drop(state);
+            project_dynamic_vm_router_surface(&app.plan, &child)?;
+            apply_dynamic_site_router_overlay(
+                &app.plan,
+                child_id,
+                Path::new(&child.artifact_root),
+                &runtime_root,
+            )
+            .await?;
+            reconcile_site_proxy_metadata(Path::new(&app.plan.artifact_dir), &site_plan)?;
+            let mut state = app.state.lock().await;
+            let record = state
+                .children
+                .get_mut(&child_id)
+                .expect("prepared child should remain present");
+            record.published = true;
+            write_json(&app.state_path, &*state)?;
+        }
+        SiteKind::Compose => {
+            replace_artifact_snapshot(
+                Path::new(&app.plan.artifact_dir),
+                reconcile_artifact_files(&site_plan),
+            )?;
+            patch_dynamic_compose_site_mesh_plan(
+                Path::new(&app.plan.artifact_dir),
+                Path::new(&child.artifact_root),
+            )?;
+            let status = compose_command(
+                app.plan.compose_project.as_deref(),
+                Path::new(&app.plan.artifact_dir),
+            )
+            .envs(app.plan.launch_env.clone())
+            .arg("up")
+            .arg("-d")
+            .arg("--remove-orphans")
+            .status()
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to publish compose site `{}`", app.plan.site_id))?;
+            if !status.success() {
+                return Err(miette::miette!(
+                    "compose site `{}` publish failed with status {status}",
+                    app.plan.site_id
+                ));
+            }
+            let mut state = app.state.lock().await;
+            let record = state
+                .children
+                .get_mut(&child_id)
+                .expect("prepared child should remain present");
+            record.published = true;
+            write_json(&app.state_path, &*state)?;
+        }
+        SiteKind::Kubernetes => {
+            replace_artifact_snapshot(
+                Path::new(&app.plan.artifact_dir),
+                reconcile_artifact_files(&site_plan),
+            )?;
+            let supervisor_plan = prepare_kubernetes_site_artifact_for_apply(&app.plan)?;
+            ensure_kubernetes_namespace(&supervisor_plan)?;
+            let status = kubectl_command(app.plan.context.as_deref())
+                .current_dir(&app.plan.artifact_dir)
+                .arg("apply")
+                .arg("-k")
+                .arg(".")
+                .arg("--prune")
+                .arg("-l")
+                .arg("app.kubernetes.io/managed-by=amber")
+                .status()
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!("failed to publish kubernetes site `{}`", app.plan.site_id)
+                })?;
+            if !status.success() {
+                return Err(miette::miette!(
+                    "kubernetes site `{}` publish failed with status {status}",
+                    app.plan.site_id
+                ));
+            }
+            ensure_kubernetes_workloads_ready(&supervisor_plan)?;
+            let mut state = app.state.lock().await;
+            let record = state
+                .children
+                .get_mut(&child_id)
+                .expect("prepared child should remain present");
+            record.published = true;
+            write_json(&app.state_path, &*state)?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn actuator_rollback_child(app: &SiteActuatorApp, child_id: u64) -> Result<()> {
+    let child = {
+        let mut state = app.state.lock().await;
+        let removed = state.children.remove(&child_id);
+        write_json(&app.state_path, &*state)?;
+        removed
+    };
+    let Some(child) = child else {
+        return Ok(());
+    };
+    if let Some(pid) = child.process_pid {
+        terminate_pid(pid, site_ready_timeout_for_kind(app.plan.kind))?;
+    }
+    remove_dir_if_exists(&site_actuator_child_root(&app.plan, child_id))
+}
+
+async fn actuator_destroy_child(
+    app: &SiteActuatorApp,
+    child_id: u64,
+    desired_site_plan: Option<DynamicSitePlanRecord>,
+) -> Result<()> {
+    let child = {
+        let state = app.state.lock().await;
+        state.children.get(&child_id).cloned()
+    };
+    if child.as_ref().is_some_and(|child| child.published)
+        && matches!(app.plan.kind, SiteKind::Direct | SiteKind::Vm)
+    {
+        revoke_dynamic_site_router_overlay(&app.plan, child_id).await?;
+    }
+    if let Some(child) = child
+        && let Some(pid) = child.process_pid
+    {
+        terminate_pid(pid, site_ready_timeout_for_kind(app.plan.kind))?;
+    }
+
+    match app.plan.kind {
+        SiteKind::Compose => {
+            let desired = desired_site_plan.ok_or_else(|| {
+                miette::miette!(
+                    "compose destroy for site `{}` is missing the desired site snapshot",
+                    app.plan.site_id
+                )
+            })?;
+            replace_artifact_snapshot(Path::new(&app.plan.artifact_dir), &desired.artifact_files)?;
+            patch_site_artifacts(
+                Path::new(&app.plan.artifact_dir),
+                app.plan.kind,
+                &app.plan.launch_env,
+                app.plan.observability_endpoint.as_deref(),
+            )?;
+            let status = compose_command(
+                app.plan.compose_project.as_deref(),
+                Path::new(&app.plan.artifact_dir),
+            )
+            .envs(app.plan.launch_env.clone())
+            .arg("up")
+            .arg("-d")
+            .arg("--remove-orphans")
+            .status()
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to reconcile compose site `{}`", app.plan.site_id))?;
+            if !status.success() {
+                return Err(miette::miette!(
+                    "compose site `{}` reconcile failed with status {status}",
+                    app.plan.site_id
+                ));
+            }
+        }
+        SiteKind::Kubernetes => {
+            let desired = desired_site_plan.ok_or_else(|| {
+                miette::miette!(
+                    "kubernetes destroy for site `{}` is missing the desired site snapshot",
+                    app.plan.site_id
+                )
+            })?;
+            replace_artifact_snapshot(Path::new(&app.plan.artifact_dir), &desired.artifact_files)?;
+            let _ = prepare_kubernetes_site_artifact_for_apply(&app.plan)?;
+            let status = kubectl_command(app.plan.context.as_deref())
+                .current_dir(&app.plan.artifact_dir)
+                .arg("apply")
+                .arg("-k")
+                .arg(".")
+                .arg("--prune")
+                .arg("-l")
+                .arg("app.kubernetes.io/managed-by=amber")
+                .status()
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!("failed to reconcile kubernetes site `{}`", app.plan.site_id)
+                })?;
+            if !status.success() {
+                return Err(miette::miette!(
+                    "kubernetes site `{}` reconcile failed with status {status}",
+                    app.plan.site_id
+                ));
+            }
+        }
+        SiteKind::Direct | SiteKind::Vm => {
+            if let Some(desired) = desired_site_plan.as_ref() {
+                reconcile_site_proxy_metadata(Path::new(&app.plan.artifact_dir), desired)?;
+            }
+        }
+    }
+
+    let mut state = app.state.lock().await;
+    state.children.remove(&child_id);
+    write_json(&app.state_path, &*state)?;
+    remove_dir_if_exists(&site_actuator_child_root(&app.plan, child_id))
+}
+
+fn replace_artifact_snapshot(root: &Path, files: &BTreeMap<String, String>) -> Result<()> {
+    fs::create_dir_all(root)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create {}", root.display()))?;
+    let expected = files.keys().map(PathBuf::from).collect::<BTreeSet<_>>();
+    for path in walk_files(root)? {
+        let relative = path
+            .strip_prefix(root)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to relativize {}", path.display()))?
+            .to_path_buf();
+        if !expected.contains(&relative) {
+            fs::remove_file(&path)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to remove stale artifact {}", path.display()))?;
+        }
+    }
+    for (relative, contents) in files {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::write(&path, contents)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to write {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn filter_direct_stage_plan(artifact_root: &Path, component_ids: &[usize]) -> Result<()> {
+    let keep = component_ids.iter().copied().collect::<BTreeSet<_>>();
+    let plan_path = artifact_root.join("direct-plan.json");
+    let mut plan: DirectPlan = read_json(&plan_path, "direct plan")?;
+    plan.components
+        .retain(|component| keep.contains(&component.id));
+    plan.startup_order
+        .retain(|component_id| keep.contains(component_id));
+    plan.router = None;
+    write_json(&plan_path, &plan)
+}
+
+fn filter_vm_stage_plan(artifact_root: &Path, component_ids: &[usize]) -> Result<()> {
+    let keep = component_ids.iter().copied().collect::<BTreeSet<_>>();
+    let plan_path = artifact_root.join("vm-plan.json");
+    let mut plan: VmPlan = read_json(&plan_path, "vm plan")?;
+    plan.components
+        .retain(|component| keep.contains(&component.id));
+    plan.startup_order
+        .retain(|component_id| keep.contains(component_id));
+    plan.router = None;
+    write_json(&plan_path, &plan)
+}
+
+async fn wait_for_detached_child_runtime_state(
+    pid: u32,
+    state_path: &Path,
+    timeout: Duration,
+    log_path: &Path,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if state_path.is_file() {
+            return Ok(());
+        }
+        if !pid_is_alive(pid) {
+            let log = fs::read_to_string(log_path).unwrap_or_default();
+            return Err(miette::miette!(
+                "dynamic child runtime exited before becoming ready\nlog ({}):\n{}",
+                log_path.display(),
+                log
+            ));
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    let log = fs::read_to_string(log_path).unwrap_or_default();
+    Err(miette::miette!(
+        "timed out waiting for dynamic child runtime state {}\nlog ({}):\n{}",
+        state_path.display(),
+        log_path.display(),
+        log
+    ))
+}
+
+fn local_direct_peer_ports(
+    plan: &SiteActuatorPlan,
+    state: &SiteActuatorState,
+) -> Result<BTreeMap<String, u16>> {
+    let site_runtime_root = Path::new(plan.runtime_root.as_deref().ok_or_else(|| {
+        miette::miette!("direct site `{}` is missing its runtime root", plan.site_id)
+    })?);
+    let mut peers = BTreeMap::new();
+    peers.insert(
+        plan.router_identity_id.clone(),
+        plan.router_mesh_port.ok_or_else(|| {
+            miette::miette!(
+                "direct site `{}` is missing its router mesh port",
+                plan.site_id
+            )
+        })?,
+    );
+    peers.extend(direct_peer_ports_for_artifact(
+        Path::new(&plan.artifact_dir),
+        site_runtime_root,
+    )?);
+    for child in state.children.values().filter(|child| child.published) {
+        peers.extend(direct_peer_ports_for_artifact(
+            Path::new(&child.artifact_root),
+            &site_actuator_child_runtime_root(plan, child.child_id),
+        )?);
+    }
+    Ok(peers)
+}
+
+fn local_direct_peer_identities(
+    plan: &SiteActuatorPlan,
+    state: &SiteActuatorState,
+) -> Result<BTreeMap<String, MeshIdentityPublic>> {
+    let site_runtime_root = Path::new(plan.runtime_root.as_deref().ok_or_else(|| {
+        miette::miette!("direct site `{}` is missing its runtime root", plan.site_id)
+    })?);
+    let mut peers = BTreeMap::new();
+    let router =
+        direct_router_identity_for_artifact(Path::new(&plan.artifact_dir), site_runtime_root)?
+            .ok_or_else(|| {
+                miette::miette!(
+                    "direct site `{}` is missing its live router identity",
+                    plan.site_id
+                )
+            })?;
+    peers.insert(router.id.clone(), router);
+    peers.extend(direct_peer_identities_for_artifact(
+        Path::new(&plan.artifact_dir),
+        site_runtime_root,
+    )?);
+    for child in state.children.values().filter(|child| child.published) {
+        peers.extend(direct_peer_identities_for_artifact(
+            Path::new(&child.artifact_root),
+            &site_actuator_child_runtime_root(plan, child.child_id),
+        )?);
+    }
+    Ok(peers)
+}
+
+fn direct_peer_ports_for_artifact(
+    artifact_root: &Path,
+    runtime_root: &Path,
+) -> Result<BTreeMap<String, u16>> {
+    let state: crate::direct_runtime::DirectRuntimeState = read_json(
+        &direct_runtime_state_path(artifact_root),
+        "direct runtime state",
+    )?;
+    let plan: DirectPlan = read_json(&artifact_root.join("direct-plan.json"), "direct plan")?;
+    let mut peers = BTreeMap::new();
+    for component in &plan.components {
+        let config: MeshConfigPublic = read_json(
+            &runtime_root.join(&component.sidecar.mesh_config_path),
+            "mesh config",
+        )?;
+        let port = state
+            .component_mesh_port_by_id
+            .get(&component.id)
+            .copied()
+            .ok_or_else(|| {
+                miette::miette!(
+                    "direct runtime state is missing mesh port for component {}",
+                    component.moniker
+                )
+            })?;
+        peers.insert(config.identity.id, port);
+    }
+    Ok(peers)
+}
+
+fn direct_peer_identities_for_artifact(
+    artifact_root: &Path,
+    runtime_root: &Path,
+) -> Result<BTreeMap<String, MeshIdentityPublic>> {
+    let plan: DirectPlan = read_json(&artifact_root.join("direct-plan.json"), "direct plan")?;
+    let mut peers = BTreeMap::new();
+    for component in &plan.components {
+        let config: MeshConfigPublic = read_json(
+            &runtime_root.join(&component.sidecar.mesh_config_path),
+            "mesh config",
+        )?;
+        peers.insert(config.identity.id.clone(), config.identity);
+    }
+    Ok(peers)
+}
+
+fn direct_router_identity_for_artifact(
+    artifact_root: &Path,
+    runtime_root: &Path,
+) -> Result<Option<MeshIdentityPublic>> {
+    let plan: DirectPlan = read_json(&artifact_root.join("direct-plan.json"), "direct plan")?;
+    let Some(router) = plan.router.as_ref() else {
+        return Ok(None);
+    };
+    let config: MeshConfigPublic =
+        read_json(&runtime_root.join(&router.mesh_config_path), "mesh config")?;
+    Ok(Some(config.identity))
+}
+
+fn local_vm_peer_ports(
+    plan: &SiteActuatorPlan,
+    state: &SiteActuatorState,
+) -> Result<BTreeMap<String, u16>> {
+    let site_runtime_root = Path::new(plan.runtime_root.as_deref().ok_or_else(|| {
+        miette::miette!("vm site `{}` is missing its runtime root", plan.site_id)
+    })?);
+    let mut peers = BTreeMap::new();
+    peers.insert(
+        plan.router_identity_id.clone(),
+        plan.router_mesh_port.ok_or_else(|| {
+            miette::miette!("vm site `{}` is missing its router mesh port", plan.site_id)
+        })?,
+    );
+    peers.extend(vm_peer_ports_for_artifact(
+        Path::new(&plan.artifact_dir),
+        site_runtime_root,
+    )?);
+    for child in state.children.values().filter(|child| child.published) {
+        peers.extend(vm_peer_ports_for_artifact(
+            Path::new(&child.artifact_root),
+            &site_actuator_child_runtime_root(plan, child.child_id),
+        )?);
+    }
+    Ok(peers)
+}
+
+fn local_vm_peer_identities(
+    plan: &SiteActuatorPlan,
+    state: &SiteActuatorState,
+) -> Result<BTreeMap<String, MeshIdentityPublic>> {
+    let site_runtime_root = Path::new(plan.runtime_root.as_deref().ok_or_else(|| {
+        miette::miette!("vm site `{}` is missing its runtime root", plan.site_id)
+    })?);
+    let mut peers = BTreeMap::new();
+    let router = vm_router_identity_for_artifact(Path::new(&plan.artifact_dir), site_runtime_root)?
+        .ok_or_else(|| {
+            miette::miette!(
+                "vm site `{}` is missing its live router identity",
+                plan.site_id
+            )
+        })?;
+    peers.insert(router.id.clone(), router);
+    peers.extend(vm_peer_identities_for_artifact(
+        Path::new(&plan.artifact_dir),
+        site_runtime_root,
+    )?);
+    for child in state.children.values().filter(|child| child.published) {
+        peers.extend(vm_peer_identities_for_artifact(
+            Path::new(&child.artifact_root),
+            &site_actuator_child_runtime_root(plan, child.child_id),
+        )?);
+    }
+    Ok(peers)
+}
+
+fn vm_peer_ports_for_artifact(
+    artifact_root: &Path,
+    runtime_root: &Path,
+) -> Result<BTreeMap<String, u16>> {
+    let state: VmRuntimeState = read_json(
+        &artifact_root.join(".amber").join("vm-runtime.json"),
+        "vm runtime state",
+    )?;
+    let plan: VmPlan = read_json(&artifact_root.join("vm-plan.json"), "vm plan")?;
+    let mut peers = BTreeMap::new();
+    for component in &plan.components {
+        let config: MeshConfigPublic = read_json(
+            &runtime_root.join(&component.mesh_config_path),
+            "mesh config",
+        )?;
+        let port = state
+            .component_mesh_port_by_id
+            .get(&component.id)
+            .copied()
+            .ok_or_else(|| {
+                miette::miette!(
+                    "vm runtime state is missing mesh port for component {}",
+                    component.moniker
+                )
+            })?;
+        peers.insert(config.identity.id, port);
+    }
+    Ok(peers)
+}
+
+fn vm_peer_identities_for_artifact(
+    artifact_root: &Path,
+    runtime_root: &Path,
+) -> Result<BTreeMap<String, MeshIdentityPublic>> {
+    let plan: VmPlan = read_json(&artifact_root.join("vm-plan.json"), "vm plan")?;
+    let mut peers = BTreeMap::new();
+    for component in &plan.components {
+        let config: MeshConfigPublic = read_json(
+            &runtime_root.join(&component.mesh_config_path),
+            "mesh config",
+        )?;
+        peers.insert(config.identity.id.clone(), config.identity);
+    }
+    Ok(peers)
+}
+
+fn vm_router_identity_for_artifact(
+    artifact_root: &Path,
+    runtime_root: &Path,
+) -> Result<Option<MeshIdentityPublic>> {
+    let plan: VmPlan = read_json(&artifact_root.join("vm-plan.json"), "vm plan")?;
+    let Some(router) = plan.router.as_ref() else {
+        return Ok(None);
+    };
+    let config: MeshConfigPublic =
+        read_json(&runtime_root.join(&router.mesh_config_path), "mesh config")?;
+    Ok(Some(config.identity))
+}
+
+fn terminate_pid(pid: u32, timeout: Duration) -> Result<()> {
+    send_sigterm(pid);
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !pid_is_alive(pid) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    #[cfg(unix)]
+    {
+        let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+    Ok(())
+}
+
+fn remove_dir_if_exists(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    fs::remove_dir_all(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to remove {}", path.display()))
+}
+
 fn prepare_kubernetes_artifact_namespace(
     run_id: &str,
     site_id: &str,
@@ -935,6 +2631,54 @@ fn prepare_kubernetes_artifact_namespace(
     }
 
     Ok(namespace)
+}
+
+fn site_supervisor_plan_for_actuator(
+    plan: &SiteActuatorPlan,
+    kubernetes_namespace: Option<String>,
+) -> SiteSupervisorPlan {
+    SiteSupervisorPlan {
+        schema: SITE_PLAN_SCHEMA.to_string(),
+        version: SITE_PLAN_VERSION,
+        run_id: plan.run_id.clone(),
+        mesh_scope: String::new(),
+        run_root: plan.run_root.clone(),
+        coordinator_pid: 0,
+        site_id: plan.site_id.clone(),
+        kind: plan.kind,
+        artifact_dir: plan.artifact_dir.clone(),
+        site_state_root: plan.site_state_root.clone(),
+        storage_root: plan.storage_root.clone(),
+        runtime_root: plan.runtime_root.clone(),
+        router_mesh_port: plan.router_mesh_port,
+        compose_project: plan.compose_project.clone(),
+        kubernetes_namespace,
+        context: plan.context.clone(),
+        port_forward_mesh_port: None,
+        port_forward_control_port: None,
+        observability_endpoint: plan.observability_endpoint.clone(),
+        framework_ccs_plan_path: None,
+        site_actuator_plan_path: None,
+        launch_env: plan.launch_env.clone(),
+    }
+}
+
+fn prepare_kubernetes_site_artifact_for_apply(
+    plan: &SiteActuatorPlan,
+) -> Result<SiteSupervisorPlan> {
+    debug_assert_eq!(plan.kind, SiteKind::Kubernetes);
+    let namespace = prepare_kubernetes_artifact_namespace(
+        &plan.run_id,
+        &plan.site_id,
+        Path::new(&plan.artifact_dir),
+    )?;
+    patch_site_artifacts(
+        Path::new(&plan.artifact_dir),
+        plan.kind,
+        &plan.launch_env,
+        plan.observability_endpoint.as_deref(),
+    )?;
+    Ok(site_supervisor_plan_for_actuator(plan, Some(namespace)))
 }
 
 fn kubernetes_namespace_name(run_id: &str, site_id: &str) -> String {
@@ -1041,7 +2785,7 @@ fn launch_bundle_manifest_path(run_root: &Path) -> PathBuf {
     run_root.join("launch-bundle.json")
 }
 
-fn site_state_path(state_root: &Path, site_id: &str) -> PathBuf {
+pub(crate) fn site_state_path(state_root: &Path, site_id: &str) -> PathBuf {
     state_root.join(site_id).join("manager-state.json")
 }
 
@@ -1053,7 +2797,11 @@ fn site_supervisor_plan_path(site_state_root: &Path) -> PathBuf {
     site_state_root.join("site-supervisor-plan.json")
 }
 
-fn desired_links_path(site_state_root: &Path) -> PathBuf {
+fn site_actuator_plan_path(site_state_root: &Path) -> PathBuf {
+    site_state_root.join("site-actuator-plan.json")
+}
+
+pub(crate) fn desired_links_path(site_state_root: &Path) -> PathBuf {
     site_state_root.join("desired-links.json")
 }
 
@@ -1300,7 +3048,7 @@ pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(path: &Path, label: &str) 
         .map_err(|err| miette::miette!("invalid {} {}: {err}", label, path.display()))
 }
 
-fn parse_control_endpoint(raw: &str) -> Result<ControlEndpoint> {
+pub(crate) fn parse_control_endpoint(raw: &str) -> Result<ControlEndpoint> {
     if let Some(path) = raw.strip_prefix("unix://") {
         return Ok(ControlEndpoint::Unix(PathBuf::from(path)));
     }
@@ -1315,7 +3063,7 @@ fn parse_control_endpoint(raw: &str) -> Result<ControlEndpoint> {
     Ok(ControlEndpoint::Tcp(raw.to_string()))
 }
 
-fn decode_public_key(value: &str) -> Result<[u8; 32]> {
+pub(crate) fn decode_public_key(value: &str) -> Result<[u8; 32]> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(value)
         .into_diagnostic()

@@ -1375,12 +1375,15 @@ pub(crate) fn provision_mesh_filesystem(plan: &MeshProvisionPlan, root: &Path) -
     let mut identities: HashMap<String, MeshIdentity> = HashMap::new();
     for target in &plan.targets {
         let id = target.config.identity.id.clone();
-        identities.entry(id).or_insert_with(|| {
-            MeshIdentity::generate(
-                target.config.identity.id.clone(),
-                target.config.identity.mesh_scope.clone(),
-            )
-        });
+        let mesh_scope = target.config.identity.mesh_scope.clone();
+        identities
+            .entry(id)
+            .or_insert_with(|| match plan.identity_seed.as_deref() {
+                Some(seed) => {
+                    MeshIdentity::derive(target.config.identity.id.clone(), mesh_scope, seed)
+                }
+                None => MeshIdentity::generate(target.config.identity.id.clone(), mesh_scope),
+            });
     }
 
     for target in &plan.targets {

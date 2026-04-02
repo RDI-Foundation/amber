@@ -584,6 +584,38 @@ pub async fn register_external_slot_with_retry(
     }
 }
 
+pub async fn clear_external_slot_with_retry(
+    endpoint: &ControlEndpoint,
+    slot: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match try_delete_control_update(endpoint, slot).await {
+            Ok(()) => return Ok(()),
+            Err(ControlUpdateError::Retryable) if Instant::now() < deadline => {
+                sleep(CONTROL_UPDATE_RETRY_INTERVAL).await;
+            }
+            Err(ControlUpdateError::Retryable) => {
+                return Err(miette::miette!(
+                    "timed out after {}s waiting to clear slot {} via router control ({})",
+                    timeout.as_secs(),
+                    slot,
+                    endpoint
+                ));
+            }
+            Err(ControlUpdateError::Fatal(err)) => {
+                return Err(miette::miette!(
+                    "failed to clear slot {} via router control ({}): {}",
+                    slot,
+                    endpoint,
+                    err
+                ));
+            }
+        }
+    }
+}
+
 pub async fn register_export_peer_with_retry(
     endpoint: &ControlEndpoint,
     export: &str,
@@ -616,6 +648,121 @@ pub async fn register_export_peer_with_retry(
                 return Err(miette::miette!(
                     "failed to register export {} via router control ({}): {}",
                     export,
+                    endpoint,
+                    err
+                ));
+            }
+        }
+    }
+}
+
+pub async fn unregister_export_peer_with_retry(
+    endpoint: &ControlEndpoint,
+    export: &str,
+    peer_id: &str,
+    peer_key_b64: &str,
+    protocol: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let payload = ControlExportPayload {
+        peer_id: peer_id.to_string(),
+        peer_key: peer_key_b64.to_string(),
+        protocol: protocol.to_string(),
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match try_delete_export_update(endpoint, export, &payload).await {
+            Ok(()) => return Ok(()),
+            Err(ControlUpdateError::Retryable) if Instant::now() < deadline => {
+                sleep(CONTROL_UPDATE_RETRY_INTERVAL).await;
+            }
+            Err(ControlUpdateError::Retryable) => {
+                return Err(miette::miette!(
+                    "timed out after {}s waiting to revoke export {} via router control ({})",
+                    timeout.as_secs(),
+                    export,
+                    endpoint
+                ));
+            }
+            Err(ControlUpdateError::Fatal(err)) => {
+                return Err(miette::miette!(
+                    "failed to revoke export {} via router control ({}): {}",
+                    export,
+                    endpoint,
+                    err
+                ));
+            }
+        }
+    }
+}
+
+pub async fn apply_route_overlay_with_retry(
+    endpoint: &ControlEndpoint,
+    overlay_id: &str,
+    peers: &[MeshPeer],
+    inbound_routes: &[InboundRoute],
+    timeout: Duration,
+) -> Result<()> {
+    let payload = serde_json::json!({
+        "peers": peers.iter().map(|peer| serde_json::json!({
+            "peer_id": peer.id,
+            "peer_key": base64::engine::general_purpose::STANDARD.encode(peer.public_key),
+        })).collect::<Vec<_>>(),
+        "inbound_routes": inbound_routes,
+    });
+    let path = format!("/overlays/{overlay_id}");
+    let deadline = Instant::now() + timeout;
+    loop {
+        match send_control_put_json(endpoint, &path, &payload).await {
+            Ok(()) => return Ok(()),
+            Err(ControlUpdateError::Retryable) if Instant::now() < deadline => {
+                sleep(CONTROL_UPDATE_RETRY_INTERVAL).await;
+            }
+            Err(ControlUpdateError::Retryable) => {
+                return Err(miette::miette!(
+                    "timed out after {}s waiting to apply overlay {} via router control ({})",
+                    timeout.as_secs(),
+                    overlay_id,
+                    endpoint
+                ));
+            }
+            Err(ControlUpdateError::Fatal(err)) => {
+                return Err(miette::miette!(
+                    "failed to apply overlay {} via router control ({}): {}",
+                    overlay_id,
+                    endpoint,
+                    err
+                ));
+            }
+        }
+    }
+}
+
+pub async fn revoke_route_overlay_with_retry(
+    endpoint: &ControlEndpoint,
+    overlay_id: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let path = format!("/overlays/{overlay_id}");
+    let deadline = Instant::now() + timeout;
+    loop {
+        match send_control_delete_json(endpoint, &path, None).await {
+            Ok(()) => return Ok(()),
+            Err(ControlUpdateError::Retryable) if Instant::now() < deadline => {
+                sleep(CONTROL_UPDATE_RETRY_INTERVAL).await;
+            }
+            Err(ControlUpdateError::Retryable) => {
+                return Err(miette::miette!(
+                    "timed out after {}s waiting to revoke overlay {} via router control ({})",
+                    timeout.as_secs(),
+                    overlay_id,
+                    endpoint
+                ));
+            }
+            Err(ControlUpdateError::Fatal(err)) => {
+                return Err(miette::miette!(
+                    "failed to revoke overlay {} via router control ({}): {}",
+                    overlay_id,
                     endpoint,
                     err
                 ));
@@ -938,9 +1085,12 @@ async fn resolve_router_mesh_addr_required(
         .as_ref()
         .ok_or_else(|| miette::miette!("router metadata missing; re-run `amber compile`"))?;
     let router_addr = match target.kind {
-        ProxyTargetKind::DockerCompose => {
-            resolve_compose_router_mesh_addr(project_name, &target.source, router.mesh_port)?
-        }
+        ProxyTargetKind::DockerCompose => resolve_compose_router_mesh_addr(
+            project_name,
+            router.compose_project.as_deref(),
+            &target.source,
+            router.mesh_port,
+        )?,
         ProxyTargetKind::Direct if router.mesh_port == 0 => SocketAddr::from((
             [127, 0, 0, 1],
             wait_for_direct_runtime_router_port(&target.source, DIRECT_RUNTIME_STATE_WAIT_TIMEOUT)
@@ -965,6 +1115,7 @@ async fn resolve_router_mesh_addr_required(
 
 fn resolve_compose_router_mesh_addr(
     explicit_project_name: Option<&str>,
+    metadata_project_name: Option<&str>,
     compose_file: &Path,
     router_container_port: u16,
 ) -> Result<SocketAddr> {
@@ -973,8 +1124,9 @@ fn resolve_compose_router_mesh_addr(
             "router mesh port is 0; compile output is missing router metadata"
         ));
     }
-    let compose_project = resolve_compose_project_name(explicit_project_name, compose_file)?
-        .ok_or_else(|| {
+    let compose_project =
+        resolve_compose_project_name(explicit_project_name, metadata_project_name, compose_file)?
+            .ok_or_else(|| {
             miette::miette!(
                 "could not determine the Compose project name for {}. Pass `--project-name` or \
                  `--router-addr`.",
@@ -1160,9 +1312,11 @@ fn resolve_control_endpoint(
         .as_ref()
         .ok_or_else(|| miette::miette!("router metadata missing; re-run `amber compile`"))?;
     let compose_project = match target.kind {
-        ProxyTargetKind::DockerCompose => {
-            resolve_compose_project_name(explicit_project_name, &target.source)?
-        }
+        ProxyTargetKind::DockerCompose => resolve_compose_project_name(
+            explicit_project_name,
+            router.compose_project.as_deref(),
+            &target.source,
+        )?,
         ProxyTargetKind::Direct | ProxyTargetKind::Vm | ProxyTargetKind::Kubernetes => None,
     };
     if matches!(target.kind, ProxyTargetKind::DockerCompose)
@@ -1211,6 +1365,7 @@ fn resolve_control_endpoint(
 
 fn resolve_compose_project_name(
     explicit_project_name: Option<&str>,
+    metadata_project_name: Option<&str>,
     compose_file: &Path,
 ) -> Result<Option<String>> {
     if let Some(explicit_project_name) = explicit_project_name {
@@ -1218,11 +1373,18 @@ fn resolve_compose_project_name(
     }
 
     let env_project = env_var_non_empty(COMPOSE_PROJECT_NAME_ENV).ok();
+    let inferred = infer_default_compose_project_name(compose_file);
+    if let Some(metadata_project_name) = metadata_project_name {
+        return Ok(Some(expand_env_templates(
+            metadata_project_name,
+            env_project.as_deref().or(inferred.as_deref()),
+        )?));
+    }
     let discovered = discover_running_compose_projects(compose_file);
     choose_compose_project_name(
         env_project.as_deref(),
         &discovered,
-        infer_default_compose_project_name(compose_file).as_deref(),
+        inferred.as_deref(),
         compose_file,
     )
 }
@@ -1492,6 +1654,13 @@ async fn try_send_control_update(
     .await
 }
 
+async fn try_delete_control_update(
+    endpoint: &ControlEndpoint,
+    slot: &str,
+) -> Result<(), ControlUpdateError> {
+    send_control_delete_json(endpoint, &format!("/external-slots/{slot}"), None).await
+}
+
 async fn try_send_export_update(
     endpoint: &ControlEndpoint,
     export: &str,
@@ -1505,6 +1674,23 @@ async fn try_send_export_update(
             "peer_key": payload.peer_key,
             "protocol": payload.protocol,
         }),
+    )
+    .await
+}
+
+async fn try_delete_export_update(
+    endpoint: &ControlEndpoint,
+    export: &str,
+    payload: &ControlExportPayload,
+) -> Result<(), ControlUpdateError> {
+    send_control_delete_json(
+        endpoint,
+        &format!("/exports/{export}"),
+        Some(&serde_json::json!({
+            "peer_id": payload.peer_id,
+            "peer_key": payload.peer_key,
+            "protocol": payload.protocol,
+        })),
     )
     .await
 }
@@ -1530,6 +1716,32 @@ async fn send_control_put_json(
         "PUT {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: \
          application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
         payload.len()
+    );
+    let response = send_control_request(endpoint, &request).await?;
+    let (code, _) = parse_http_response(&response).ok_or(ControlUpdateError::Retryable)?;
+    control_status(code)
+}
+
+async fn send_control_delete_json(
+    endpoint: &ControlEndpoint,
+    path: &str,
+    payload: Option<&serde_json::Value>,
+) -> Result<(), ControlUpdateError> {
+    let (body, headers) = if let Some(payload) = payload {
+        let body = payload.to_string();
+        let body_len = body.len();
+        (
+            body,
+            format!(
+                "Content-Type: application/json\r\nContent-Length: {}\r\n",
+                body_len
+            ),
+        )
+    } else {
+        (String::new(), "Content-Length: 0\r\n".to_string())
+    };
+    let request = format!(
+        "DELETE {path} HTTP/1.1\r\nHost: localhost\r\n{headers}Connection: close\r\n\r\n{body}"
     );
     let response = send_control_request(endpoint, &request).await?;
     let (code, _) = parse_http_response(&response).ok_or(ControlUpdateError::Retryable)?;

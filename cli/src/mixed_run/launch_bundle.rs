@@ -53,6 +53,9 @@ pub(super) fn materialize_launch_bundle(
     let run_plan_path = run_plan_path(bundle_root);
     write_json(&run_plan_path, run_plan)?;
 
+    let framework_control_state =
+        materialize_framework_control_state(run_plan, &state_root, run_id)?;
+
     let observability =
         materialize_observability(bundle_root, run_id, &run_plan.mesh_scope, observability)?;
     let observability_endpoint = observability
@@ -62,13 +65,57 @@ pub(super) fn materialize_launch_bundle(
     let mut sites = BTreeMap::new();
     for (site_id, site_plan) in &run_plan.sites {
         let artifact_dir = materialize_site_artifacts(&sites_root, site_id, site_plan)?;
+        let site_state_root = state_root.join(site_id);
+        let mut framework_env = BTreeMap::new();
+        let framework_ccs_plan_path = if let Some(control_state) = framework_control_state.as_ref()
+            && run_plan
+                .dynamic_enabled_sites
+                .iter()
+                .any(|active| active == site_id)
+        {
+            let listen_addr = SocketAddr::from(([127, 0, 0, 1], reserve_loopback_port()?));
+            framework_env.insert(
+                amber_mesh::FRAMEWORK_COMPONENT_CCS_URL_ENV.to_string(),
+                crate::framework_component::ccs_url_for_site(
+                    site_plan.site.kind,
+                    listen_addr.port(),
+                ),
+            );
+            let plan_path = site_state_root.join("framework-ccs-plan.json");
+            crate::framework_component::write_framework_ccs_plan(
+                &plan_path,
+                site_id,
+                listen_addr,
+                control_state.receipt.url.as_str(),
+            )?;
+            Some(plan_path)
+        } else {
+            None
+        };
         patch_site_artifacts(
             &artifact_dir,
             site_plan.site.kind,
-            runtime_env,
+            &merge_env_maps(runtime_env, &framework_env),
             observability_endpoint,
         )?;
-        let site_state_root = state_root.join(site_id);
+        let site_actuator_plan_path = if framework_control_state.is_some()
+            && run_plan
+                .dynamic_enabled_sites
+                .iter()
+                .any(|active| active == site_id)
+        {
+            Some(site_actuator_plan_path(&site_state_root))
+        } else {
+            None
+        };
+        let launch_env = launch_env(
+            run_id,
+            &run_plan.mesh_scope,
+            site_plan.site.kind,
+            runtime_env,
+            &framework_env,
+            observability_endpoint,
+        )?;
         let base_supervisor_plan = build_supervisor_plan(
             SupervisorPlanInput {
                 run_root: bundle_root,
@@ -79,16 +126,36 @@ pub(super) fn materialize_launch_bundle(
                 artifact_dir: &artifact_dir,
                 site_state_root: &site_state_root,
                 observability_endpoint,
+                framework_ccs_plan_path: framework_ccs_plan_path.as_deref(),
+                site_actuator_plan_path: site_actuator_plan_path.as_deref(),
             },
-            launch_env(
-                run_id,
-                &run_plan.mesh_scope,
-                site_plan.site.kind,
-                runtime_env,
-                &BTreeMap::new(),
-                observability_endpoint,
-            )?,
+            launch_env.clone(),
         )?;
+        if let Some(site_actuator_plan_path) = site_actuator_plan_path.as_ref() {
+            write_site_actuator_plan(
+                site_actuator_plan_path,
+                &SiteActuatorPlan {
+                    schema: SITE_ACTUATOR_PLAN_SCHEMA.to_string(),
+                    version: SITE_ACTUATOR_PLAN_VERSION,
+                    run_id: run_id.to_string(),
+                    run_root: bundle_root.display().to_string(),
+                    site_id: site_id.clone(),
+                    kind: site_plan.site.kind,
+                    router_identity_id: site_plan.router_identity_id.clone(),
+                    artifact_dir: artifact_dir.display().to_string(),
+                    site_state_root: site_state_root.display().to_string(),
+                    listen_addr: SocketAddr::from(([127, 0, 0, 1], reserve_loopback_port()?)),
+                    storage_root: base_supervisor_plan.storage_root.clone(),
+                    runtime_root: base_supervisor_plan.runtime_root.clone(),
+                    router_mesh_port: base_supervisor_plan.router_mesh_port,
+                    compose_project: base_supervisor_plan.compose_project.clone(),
+                    kubernetes_namespace: base_supervisor_plan.kubernetes_namespace.clone(),
+                    context: base_supervisor_plan.context.clone(),
+                    observability_endpoint: base_supervisor_plan.observability_endpoint.clone(),
+                    launch_env: launch_env.clone(),
+                },
+            )?;
+        }
         write_json(
             &site_supervisor_plan_path(&site_state_root),
             &base_supervisor_plan,
@@ -126,9 +193,44 @@ pub(super) fn materialize_launch_bundle(
 
     Ok(MaterializedLaunchBundle {
         run_plan_path,
+        framework_control_state,
         observability,
         sites,
     })
+}
+
+fn materialize_framework_control_state(
+    run_plan: &RunPlan,
+    state_root: &Path,
+    run_id: &str,
+) -> Result<Option<MaterializedFrameworkControlState>> {
+    let control_state = crate::framework_component::build_control_state(run_id, run_plan)?;
+    if control_state.capability_instances.is_empty() {
+        return Ok(None);
+    }
+
+    let root = state_root.join("framework-component");
+    let state_path = root.join("control-state.json");
+    crate::framework_component::write_control_state(&state_path, &control_state)?;
+
+    let listen_addr = SocketAddr::from(([127, 0, 0, 1], reserve_loopback_port()?));
+    let plan_path = root.join("control-state-plan.json");
+    crate::framework_component::write_control_state_service_plan(
+        &plan_path,
+        listen_addr,
+        &state_path,
+        state_root.parent().unwrap_or(state_root),
+        state_root,
+        &run_plan.mesh_scope,
+    )?;
+
+    Ok(Some(MaterializedFrameworkControlState {
+        plan_path,
+        receipt: FrameworkControlStateReceipt {
+            pid: 0,
+            url: crate::framework_component::control_state_service_url(listen_addr),
+        },
+    }))
 }
 
 pub(super) fn build_launch_bundle_manifest(
@@ -646,6 +748,58 @@ pub(super) async fn start_materialized_observability(
     Err(miette::miette!("timed out waiting for observability sink"))
 }
 
+pub(super) async fn start_materialized_framework_control_state(
+    run_root: &Path,
+    framework_control_state: Option<&MaterializedFrameworkControlState>,
+) -> Result<Option<FrameworkControlStateReceipt>> {
+    let Some(framework_control_state) = framework_control_state else {
+        return Ok(None);
+    };
+
+    let mut child = spawn_detached_child(
+        run_root,
+        &run_root
+            .join("state")
+            .join("framework-component")
+            .join("control-state.log"),
+        |cmd| {
+            cmd.arg("run-framework-control-state")
+                .arg("--plan")
+                .arg(&framework_control_state.plan_path);
+        },
+    )?;
+    let listen_addr = framework_control_state
+        .receipt
+        .url
+        .strip_prefix("http://")
+        .ok_or_else(|| {
+            miette::miette!(
+                "framework control-state receipt url `{}` is not an http:// socket address",
+                framework_control_state.receipt.url
+            )
+        })?
+        .parse::<SocketAddr>()
+        .into_diagnostic()
+        .wrap_err("invalid framework control-state listen address")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().into_diagnostic()? {
+            return Err(miette::miette!(
+                "framework control-state service exited before becoming ready with status {status}"
+            ));
+        }
+        if wait_for_http_response(listen_addr, Duration::from_millis(250)).is_ok() {
+            let mut receipt = framework_control_state.receipt.clone();
+            receipt.pid = child.id();
+            return Ok(Some(receipt));
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    Err(miette::miette!(
+        "timed out waiting for framework control-state service"
+    ))
+}
+
 pub(super) fn prepare_site_launch(
     site: &MaterializedSite,
     runtime_env: &BTreeMap<String, String>,
@@ -733,6 +887,11 @@ pub(crate) async fn run_run_plan_with_id(
         observability,
         site_launch_env,
     )?;
+    let framework_control_state_receipt = start_materialized_framework_control_state(
+        &run_root,
+        launch_bundle.framework_control_state.as_ref(),
+    )
+    .await?;
     let observability_receipt =
         start_materialized_observability(&run_root, launch_bundle.observability.as_ref()).await?;
     init_manager_telemetry(
@@ -827,6 +986,7 @@ pub(crate) async fn run_run_plan_with_id(
             plan_path: launch_bundle.run_plan_path.display().to_string(),
             source_plan_path: source_plan_path.map(|path| path.display().to_string()),
             run_root: run_root.display().to_string(),
+            framework_control_state: framework_control_state_receipt.clone(),
             observability: observability_receipt.clone(),
             bridge_proxies: bridge_proxies
                 .values()
@@ -901,6 +1061,12 @@ pub(crate) async fn run_run_plan_with_id(
         if let Some(pid) = observability_receipt
             .as_ref()
             .and_then(|value| value.sink_pid)
+        {
+            send_sigterm(pid);
+        }
+        if let Some(pid) = framework_control_state_receipt
+            .as_ref()
+            .map(|value| value.pid)
         {
             send_sigterm(pid);
         }
@@ -1004,6 +1170,9 @@ pub(crate) async fn stop_run(run_id: &str, storage_root_override: Option<&Path>)
     {
         send_sigterm(pid);
     }
+    if let Some(framework_control_state) = receipt.framework_control_state.as_ref() {
+        send_sigterm(framework_control_state.pid);
+    }
 
     if let Some(observability) = receipt.observability.as_ref()
         && let Some(pid) = observability.sink_pid
@@ -1011,6 +1180,15 @@ pub(crate) async fn stop_run(run_id: &str, storage_root_override: Option<&Path>)
     {
         shutdown_failures.push(format!(
             "observability sink (pid {pid}) did not stop within {}s",
+            PROCESS_SHUTDOWN_GRACE_PERIOD.as_secs()
+        ));
+    }
+    if let Some(framework_control_state) = receipt.framework_control_state.as_ref()
+        && !wait_for_pid_exit(framework_control_state.pid, PROCESS_SHUTDOWN_GRACE_PERIOD).await
+    {
+        shutdown_failures.push(format!(
+            "framework control-state service (pid {}) did not stop within {}s",
+            framework_control_state.pid,
             PROCESS_SHUTDOWN_GRACE_PERIOD.as_secs()
         ));
     }

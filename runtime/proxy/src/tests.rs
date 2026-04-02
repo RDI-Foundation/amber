@@ -287,6 +287,17 @@ fn choose_compose_project_name_prefers_env_override() {
 }
 
 #[test]
+fn resolve_compose_project_name_prefers_router_metadata_project() {
+    let selected = resolve_compose_project_name(
+        None,
+        Some("dynamic-stack"),
+        Path::new("/tmp/child/compose.yaml"),
+    )
+    .expect("selection should succeed");
+    assert_eq!(selected.as_deref(), Some("dynamic-stack"));
+}
+
+#[test]
 fn choose_compose_project_name_rejects_multiple_running_stacks() {
     let discovered = BTreeSet::from(["stack-a".to_string(), "stack-b".to_string()]);
     let err =
@@ -403,6 +414,7 @@ fn resolve_control_endpoint_uses_short_direct_control_socket_alias() {
             router: Some(amber_compiler::mesh::RouterMetadata {
                 mesh_port: 0,
                 control_port: 0,
+                compose_project: None,
                 control_socket: Some(".amber/router-control.sock".to_string()),
                 control_socket_volume: None,
             }),
@@ -433,6 +445,7 @@ fn resolve_control_endpoint_preserves_nested_compose_volume_socket_path() {
             router: Some(amber_compiler::mesh::RouterMetadata {
                 mesh_port: 24000,
                 control_port: 24100,
+                compose_project: None,
                 control_socket: Some("/site/compose_local/router-control.sock".to_string()),
                 control_socket_volume: Some(
                     "${COMPOSE_PROJECT_NAME:-default}_amber-router-control".to_string(),
@@ -454,6 +467,39 @@ fn resolve_control_endpoint_preserves_nested_compose_volume_socket_path() {
         panic!("expected compose volume socket endpoint");
     };
     assert_eq!(volume, "mixed-stack_amber-router-control");
+    assert_eq!(socket_path, "/site/compose_local/router-control.sock");
+}
+
+#[test]
+fn resolve_control_endpoint_prefers_router_metadata_compose_project() {
+    let target = ProxyTarget {
+        kind: ProxyTargetKind::DockerCompose,
+        metadata: ProxyMetadata {
+            version: PROXY_METADATA_VERSION.to_string(),
+            router: Some(amber_compiler::mesh::RouterMetadata {
+                mesh_port: 24000,
+                control_port: 24100,
+                compose_project: Some("dynamic-stack".to_string()),
+                control_socket: Some("/site/compose_local/router-control.sock".to_string()),
+                control_socket_volume: Some(
+                    "${COMPOSE_PROJECT_NAME:-default}_amber-router-control".to_string(),
+                ),
+            }),
+            ..Default::default()
+        },
+        source: PathBuf::from("/tmp/out/compose.yaml"),
+    };
+
+    let endpoint = resolve_control_endpoint(None, None, &target).expect("endpoint should resolve");
+
+    let ControlEndpoint::VolumeSocket {
+        volume,
+        socket_path,
+    } = endpoint
+    else {
+        panic!("expected compose volume socket endpoint");
+    };
+    assert_eq!(volume, "dynamic-stack_amber-router-control");
     assert_eq!(socket_path, "/site/compose_local/router-control.sock");
 }
 

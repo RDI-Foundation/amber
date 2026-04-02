@@ -9,8 +9,8 @@ use serde_json::Value;
 
 use crate::{
     BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
-    ManifestCatalogEntry, Moniker, Program, ProgramMount, ProvideRef, ResourceDecl, ResourceRef,
-    Scenario, ScenarioExport, SlotRef, TemplateBinding, TemplateConfigField,
+    FrameworkRef, ManifestCatalogEntry, Moniker, Program, ProgramMount, ProvideRef, ResourceDecl,
+    ResourceRef, Scenario, ScenarioExport, SlotRef, TemplateBinding, TemplateConfigField,
 };
 
 pub const SCENARIO_IR_SCHEMA: &str = "amber.scenario.ir";
@@ -154,8 +154,14 @@ impl TryFrom<ScenarioIr> for Scenario {
                 BindingFromIr::Resource { resource, .. } => {
                     ensure_name_no_dot(resource)?;
                 }
-                BindingFromIr::Framework { capability } => {
+                BindingFromIr::Framework {
+                    capability,
+                    authority_realm,
+                } => {
                     ensure_name_no_dot(capability)?;
+                    ensure_component(&components, *authority_realm, || {
+                        format!("framework authority realm for {}", binding.to.slot)
+                    })?;
                 }
                 BindingFromIr::External { slot } => {
                     ensure_name_no_dot(&slot.slot)?;
@@ -484,10 +490,21 @@ impl ManifestCatalogEntryIr {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BindingFromIr {
-    Component { component: usize, provide: String },
-    Resource { component: usize, resource: String },
-    Framework { capability: String },
-    External { slot: SlotRefIr },
+    Component {
+        component: usize,
+        provide: String,
+    },
+    Resource {
+        component: usize,
+        resource: String,
+    },
+    Framework {
+        capability: String,
+        authority_realm: usize,
+    },
+    External {
+        slot: SlotRefIr,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -532,8 +549,9 @@ impl From<&BindingFrom> for BindingFromIr {
                 component: resource.component.0,
                 resource: resource.name.clone(),
             },
-            BindingFrom::Framework(name) => Self::Framework {
-                capability: name.to_string(),
+            BindingFrom::Framework(framework) => Self::Framework {
+                capability: framework.capability.to_string(),
+                authority_realm: framework.authority.0,
             },
             BindingFrom::External(slot) => Self::External {
                 slot: SlotRefIr::from(slot),
@@ -558,14 +576,20 @@ impl BindingFromIr {
                 component: ComponentId(component),
                 name: resource,
             })),
-            BindingFromIr::Framework { capability } => {
+            BindingFromIr::Framework {
+                capability,
+                authority_realm,
+            } => {
                 let name =
                     FrameworkCapabilityName::try_from(capability.as_str()).map_err(|_| {
                         ScenarioIrError::InvalidName {
                             name: capability.clone(),
                         }
                     })?;
-                Ok(BindingFrom::Framework(name))
+                Ok(BindingFrom::Framework(FrameworkRef {
+                    authority: ComponentId(authority_realm),
+                    capability: name,
+                }))
             }
             BindingFromIr::External { slot } => Ok(BindingFrom::External(slot.into_slot_ref())),
         }
@@ -1041,14 +1065,15 @@ fn validate_bindings(scenario: &Scenario) -> Result<(), ScenarioIrError> {
                     CapabilityDecl::builder().kind(resource_decl.kind).build(),
                 )
             }
-            BindingFrom::Framework(name) => {
-                let spec = framework_capability(name.as_str()).ok_or_else(|| {
+            BindingFrom::Framework(framework) => {
+                let capability = framework.capability.as_str();
+                let spec = framework_capability(capability).ok_or_else(|| {
                     invalid_scenario(format!(
                         "binding into {target_label} references unknown framework capability \
-                         `framework.{name}`"
+                         `framework.{capability}`"
                     ))
                 })?;
-                (format!("framework.{name}"), spec.decl.clone())
+                (format!("framework.{capability}"), spec.decl.clone())
             }
             BindingFrom::External(slot) => {
                 ensure_name_no_dot(&slot.name)?;
@@ -1181,7 +1206,7 @@ fn describe_binding_source(
             .as_str(),
             resource.name
         )),
-        BindingFrom::Framework(name) => Ok(format!("framework.{name}")),
+        BindingFrom::Framework(framework) => Ok(format!("framework.{}", framework.capability)),
         BindingFrom::External(slot) => Ok(format!(
             "external {}.{}",
             component_ref(&scenario.components, slot.component, || {
@@ -1240,7 +1265,7 @@ mod tests {
     use super::{SCENARIO_IR_SCHEMA, SCENARIO_IR_VERSION, ScenarioIr, ScenarioIrError};
     use crate::{
         BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
-        ManifestCatalogEntry, Moniker, ProvideRef, Scenario, ScenarioExport, SlotRef,
+        FrameworkRef, ManifestCatalogEntry, Moniker, ProvideRef, Scenario, ScenarioExport, SlotRef,
         TemplateBinding, TemplateConfigField,
     };
 
@@ -1513,7 +1538,10 @@ mod tests {
             root: ComponentId(0),
             components,
             bindings: vec![BindingEdge {
-                from: BindingFrom::Framework(FrameworkCapabilityName::try_from("docker").unwrap()),
+                from: BindingFrom::Framework(FrameworkRef {
+                    authority: ComponentId(0),
+                    capability: FrameworkCapabilityName::try_from("docker").unwrap(),
+                }),
                 to: SlotRef {
                     component: ComponentId(0),
                     name: "docker".to_string(),
@@ -1659,7 +1687,11 @@ mod tests {
             ],
             "bindings": [
                 {
-                    "from": { "kind": "framework", "capability": "bad.name" },
+                    "from": {
+                        "kind": "framework",
+                        "capability": "bad.name",
+                        "authority_realm": 0
+                    },
                     "to": { "component": 0, "slot": "docker" },
                     "weak": false
                 }

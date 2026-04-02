@@ -42,7 +42,7 @@ use tokio::{
 };
 
 use crate::{
-    cross_site_router_mesh_bind_ip,
+    cross_site_router_mesh_bind_ip, read_existing_peer_identities,
     tcp_readiness::{
         endpoint_accepts_stable_connection, endpoint_returns_http_response,
         wait_for_stable_endpoint,
@@ -54,7 +54,8 @@ mod state;
 
 use self::{artifacts::*, preview::*, state::*};
 pub(crate) use self::{
-    preview::build_vm_site_launch_preview, state::vm_current_control_socket_path,
+    preview::build_vm_site_launch_preview,
+    state::{ensure_control_socket_link, vm_current_control_socket_path},
 };
 
 const VM_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(150);
@@ -251,6 +252,9 @@ pub(crate) async fn run_vm_init(
     storage_root: Option<PathBuf>,
     runtime_root: Option<PathBuf>,
     router_mesh_port: Option<u16>,
+    existing_peer_ports: Option<PathBuf>,
+    existing_peer_identities: Option<PathBuf>,
+    skip_router: bool,
 ) -> Result<()> {
     let plan_path = canonicalize_path(&plan, "vm plan")?;
     let VmRuntimeInputs {
@@ -291,19 +295,42 @@ pub(crate) async fn run_vm_init(
     let mut log_tasks = Vec::new();
     let mut control_socket_paths = None;
     let reuse_materialized_runtime = runtime_dir.is_none() && runtime_state_path.is_file();
+    let existing_peer_ports_by_id =
+        read_existing_peer_ports(existing_peer_ports.as_deref(), "vm existing peer ports")?;
+    let existing_peer_identities_by_id = read_existing_peer_identities(
+        existing_peer_identities.as_deref(),
+        "vm existing peer identities",
+    )?;
 
     let supervision = async {
-        let port_assignments = materialize_vm_runtime(
-            &plan_root,
+        let port_assignments = if skip_router || !existing_peer_ports_by_id.is_empty() {
+            materialize_vm_runtime_with_existing(
+                &plan_root,
+                &runtime_root,
+                &vm_plan,
+                &mesh_plan,
+                router_mesh_port,
+                reuse_materialized_runtime,
+                &existing_peer_ports_by_id,
+            )?
+        } else {
+            materialize_vm_runtime(
+                &plan_root,
+                &runtime_root,
+                &vm_plan,
+                &mesh_plan,
+                router_mesh_port,
+                reuse_materialized_runtime,
+            )?
+        };
+        project_existing_vm_peer_identities(
             &runtime_root,
             &vm_plan,
-            &mesh_plan,
-            router_mesh_port,
-            reuse_materialized_runtime,
+            &existing_peer_identities_by_id,
         )?;
 
         let router_binary = resolve_host_binary("amber-router")?;
-        if let Some(router) = vm_plan.router.as_ref() {
+        if !skip_router && let Some(router) = vm_plan.router.as_ref() {
             control_socket_paths = Some(
                 spawn_vm_router(
                     &router_binary,
@@ -426,6 +453,19 @@ pub(crate) async fn run_vm_init(
             }
         }
     }
+}
+
+fn read_existing_peer_ports(
+    path: Option<&Path>,
+    description: &str,
+) -> Result<BTreeMap<String, u16>> {
+    let Some(path) = path else {
+        return Ok(BTreeMap::new());
+    };
+    let raw = fs::read_to_string(path)
+        .map_err(|err| miette::miette!("failed to read {description} {}: {err}", path.display()))?;
+    serde_json::from_str(&raw)
+        .map_err(|err| miette::miette!("invalid {description} {}: {err}", path.display()))
 }
 
 fn build_vm_launch_plan(

@@ -393,6 +393,51 @@ fn control_socket_volume_name_uses_compose_project() {
 }
 
 #[test]
+fn forced_router_without_exports_publishes_router_mesh_port_on_host() {
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: Some(lower_test_program(
+            0,
+            json!({
+                "image": "busybox:1.36.1",
+                "entrypoint": ["sh", "-lc", "sleep infinity"]
+            }),
+        )),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        metadata: None,
+        child_templates: BTreeMap::new(),
+        children: Vec::new(),
+    };
+    let output = compile_output(Scenario {
+        manifest_catalog: BTreeMap::new(),
+        root: ComponentId(0),
+        components: vec![Some(root)],
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    });
+
+    let artifact = super::emit_docker_compose_artifact(&compiled_scenario(&output), true)
+        .expect("forced-router compose render should succeed");
+    let compose = parse_compose(&artifact);
+    let router_service = service(&compose, "amber-router");
+    assert!(
+        router_service
+            .ports
+            .iter()
+            .any(|port| port == "127.0.0.1::24000"),
+        "forced-router compose artifacts should publish the router mesh port for mixed-run site \
+         discovery"
+    );
+}
+
+#[test]
 fn docker_compose_emits_gateway_for_framework_docker_binding() {
     let program = lower_test_program(
         0,
@@ -426,7 +471,10 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: vec![BindingEdge {
-            from: BindingFrom::Framework(FrameworkCapabilityName::try_from("docker").unwrap()),
+            from: BindingFrom::Framework(amber_scenario::FrameworkRef {
+                authority: ComponentId(0),
+                capability: FrameworkCapabilityName::try_from("docker").unwrap(),
+            }),
             to: SlotRef {
                 component: ComponentId(0),
                 name: "docker".to_string(),

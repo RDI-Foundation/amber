@@ -448,6 +448,7 @@ mod tests {
                 ResolvedBinding::Framework(ResolvedFrameworkBinding {
                     consumer: ComponentId(1),
                     slot: "upstream".to_string(),
+                    authority_realm: ComponentId(0),
                     capability: FrameworkCapabilityName::try_from("docker")
                         .expect("framework capability"),
                 }),

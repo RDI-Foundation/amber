@@ -32,8 +32,9 @@ use crate::{
             },
             internal_images::resolve_internal_images,
             mesh_config::{
-                MeshConfigBuildInput, MeshServiceName, RouterPorts, ServiceMeshAddressing,
-                build_mesh_config_plan, default_mesh_config_build_options, scenario_ir_digest,
+                MeshConfigBuildInput, MeshConfigBuildOptions, MeshServiceName, RouterPorts,
+                ServiceMeshAddressing, build_mesh_config_plan, default_mesh_config_build_options,
+                scenario_ir_digest,
             },
             plan::{MeshOptions, component_label, map_program_components},
             ports::{allocate_local_route_ports, allocate_mesh_ports},
@@ -109,7 +110,7 @@ impl Reporter for KubernetesReporter {
     type Artifact = KubernetesArtifact;
 
     fn emit(&self, compiled: &CompiledScenario) -> Result<Self::Artifact, ReporterError> {
-        render_kubernetes(compiled)
+        emit_kubernetes_artifact(compiled, false)
     }
 }
 
@@ -159,10 +160,13 @@ pub fn render_kubernetes_with_output(
 ) -> KubernetesResult<KubernetesArtifact> {
     let compiled = CompiledScenario::from_compile_output(output)
         .map_err(|err| ReporterError::new(err.to_string()))?;
-    render_kubernetes(&compiled)
+    emit_kubernetes_artifact(&compiled, false)
 }
 
-fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<KubernetesArtifact> {
+pub(crate) fn emit_kubernetes_artifact(
+    compiled: &CompiledScenario,
+    force_router: bool,
+) -> KubernetesResult<KubernetesArtifact> {
     let s = compiled.scenario();
     let scenario_digest =
         scenario_ir_digest(s).map_err(|err| ReporterError::new(err.to_string()))?;
@@ -214,7 +218,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
             }
         });
     let provisioner_job_name = provisioner_job_name(&scenario_digest);
-    let needs_router = mesh_plan.needs_router();
+    let needs_router = mesh_plan.needs_router() || force_router;
 
     let route_ports = allocate_local_route_ports(s, &endpoint_plan, &mesh_plan)
         .map_err(|e| ReporterError::new(e.to_string()))?;
@@ -264,7 +268,10 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
         mesh_ports_by_component: &mesh_ports_by_component,
         router_ports,
         addressing: &mesh_addressing,
-        options: default_mesh_config_build_options(),
+        options: MeshConfigBuildOptions {
+            force_router,
+            ..default_mesh_config_build_options()
+        },
     })
     .map_err(|e| ReporterError::new(e.to_string()))?;
     let mesh_provision_plan = build_mesh_provision_plan(
@@ -1528,6 +1535,7 @@ fn render_kubernetes(compiled: &CompiledScenario) -> KubernetesResult<Kubernetes
         let router_metadata = RouterMetadata {
             mesh_port: router_mesh_port,
             control_port: router_ports.as_ref().expect("router ports missing").control,
+            compose_project: None,
             control_socket: None,
             control_socket_volume: None,
         };

@@ -198,10 +198,13 @@ impl Reporter for DirectReporter {
 }
 
 fn render_direct(compiled: &CompiledScenario) -> Result<DirectArtifact, ReporterError> {
-    render_direct_inner(compiled).map_err(|err| ReporterError::new(err.to_string()))
+    emit_direct_artifact(compiled, false).map_err(|err| ReporterError::new(err.to_string()))
 }
 
-fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, MeshError> {
+pub(crate) fn emit_direct_artifact(
+    compiled: &CompiledScenario,
+    force_router: bool,
+) -> Result<DirectArtifact, MeshError> {
     let scenario = compiled.scenario();
     let endpoint_plan = crate::targets::program_config::build_endpoint_plan(scenario)?;
     let mesh_plan = build_mesh_plan(
@@ -228,7 +231,7 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
     let route_ports = placeholder_local_route_ports(scenario, &endpoint_plan, &mesh_plan);
     let mesh_ports_by_component = placeholder_mesh_ports(program_components);
 
-    let needs_router = mesh_plan.needs_router();
+    let needs_router = mesh_plan.needs_router() || force_router;
     let router_ports = needs_router.then_some(RouterPorts {
         mesh: 0,
         control: 0,
@@ -276,6 +279,7 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
             component_mesh_listen_addr: "127.0.0.1",
             router_mesh_listen_addr: "127.0.0.1",
             router_control_listen_addr: "127.0.0.1",
+            force_router,
         },
     })?;
 
@@ -295,6 +299,7 @@ fn render_direct_inner(compiled: &CompiledScenario) -> Result<DirectArtifact, Me
     let router_metadata = router_ports.map(|ports| RouterMetadata {
         mesh_port: ports.mesh,
         control_port: 0,
+        compose_project: None,
         control_socket: Some(DIRECT_CONTROL_SOCKET_RELATIVE_PATH.to_string()),
         control_socket_volume: None,
     });
