@@ -49,6 +49,7 @@ fn collect_program_slot_uses_includes_slot_conditions() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
@@ -97,6 +98,7 @@ fn collect_program_slot_uses_includes_lowered_mount_slots() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 

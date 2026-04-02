@@ -550,7 +550,10 @@ fn is_synthetic_external_slot_name(name: &str) -> bool {
 mod tests {
     use amber_compiler::{
         mesh::PROXY_METADATA_FILENAME,
-        run_plan::{RunLink, RunPlan, RunSitePlan, SiteDefinition, SiteKind},
+        run_plan::{
+            ActiveSiteCapabilities, PlacementDefaults, RunLink, RunPlan, RunSitePlan,
+            SiteDefinition, SiteKind,
+        },
     };
     use amber_scenario::ScenarioIr;
 
@@ -571,6 +574,7 @@ mod tests {
                 components: Vec::new(),
                 bindings: Vec::new(),
                 exports: Vec::new(),
+                manifest_catalog: BTreeMap::new(),
             },
             artifact_files,
         }
@@ -624,8 +628,28 @@ mod tests {
                            config.catalog_token\nAMBER_CONFIG_CATALOG_TOKEN=\n";
         let run_plan = RunPlan {
             schema: "amber.run.plan".to_string(),
-            version: 1,
+            version: 2,
             mesh_scope: "scope".to_string(),
+            offered_sites: BTreeMap::from([(
+                "direct_local".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Direct,
+                    context: None,
+                },
+            )]),
+            defaults: PlacementDefaults::default(),
+            initial_active_sites: vec!["direct_local".to_string()],
+            standby_sites: Vec::new(),
+            dynamic_enabled_sites: vec!["direct_local".to_string()],
+            control_only_sites: Vec::new(),
+            active_site_capabilities: BTreeMap::from([(
+                "direct_local".to_string(),
+                ActiveSiteCapabilities {
+                    cross_site_routing: true,
+                    dynamic_workloads: true,
+                    privileged_control: true,
+                },
+            )]),
             assignments: BTreeMap::new(),
             sites: BTreeMap::from([(
                 "direct_local".to_string(),
@@ -698,8 +722,23 @@ mod tests {
     fn collect_run_interface_reads_compose_proxy_metadata_from_compose_yaml() {
         let run_plan: RunPlan = serde_json::from_value(serde_json::json!({
             "schema": "amber.run.plan",
-            "version": 1,
+            "version": 2,
             "mesh_scope": "scope",
+            "offered_sites": {
+                "compose_local": { "kind": "compose" }
+            },
+            "defaults": {},
+            "initial_active_sites": ["compose_local"],
+            "standby_sites": [],
+            "dynamic_enabled_sites": ["compose_local"],
+            "control_only_sites": [],
+            "active_site_capabilities": {
+                "compose_local": {
+                    "cross_site_routing": true,
+                    "dynamic_workloads": true,
+                    "privileged_control": true
+                }
+            },
             "assignments": { "/api": "compose_local" },
             "sites": {
                 "compose_local": {

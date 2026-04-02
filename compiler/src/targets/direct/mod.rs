@@ -1054,6 +1054,7 @@ mod tests {
         .expect("manifest");
 
         Scenario {
+            manifest_catalog: BTreeMap::new(),
             root: ComponentId(0),
             components: vec![Some(Component {
                 id: ComponentId(0),
@@ -1071,6 +1072,7 @@ mod tests {
                 provides: BTreeMap::new(),
                 resources: BTreeMap::new(),
                 metadata: None,
+                child_templates: BTreeMap::new(),
                 children: Vec::new(),
             })],
             bindings: Vec::<BindingEdge>::new(),

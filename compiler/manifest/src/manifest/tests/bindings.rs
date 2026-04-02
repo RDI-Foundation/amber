@@ -421,7 +421,8 @@ fn binding_from_framework_requires_known_capability_explicit_form() {
     match err {
         Error::UnknownFrameworkCapability { capability, help } => {
             assert_eq!(capability, "dynamic_children");
-            assert!(help.contains("Known framework capabilities: docker"));
+            assert!(help.contains("component"));
+            assert!(help.contains("docker"));
         }
         other => panic!("expected UnknownFrameworkCapability error, got: {other}"),
     }
@@ -447,7 +448,8 @@ fn binding_from_framework_requires_known_capability_dot_form() {
     match err {
         Error::UnknownFrameworkCapability { capability, help } => {
             assert_eq!(capability, "dynamic_children");
-            assert!(help.contains("Known framework capabilities: docker"));
+            assert!(help.contains("component"));
+            assert!(help.contains("docker"));
         }
         other => panic!("expected UnknownFrameworkCapability error, got: {other}"),
     }
@@ -508,6 +510,33 @@ fn binding_from_framework_docker_is_allowed_with_experimental_feature() {
         panic!("expected framework binding source");
     };
     assert_eq!(name.as_str(), "docker");
+}
+
+#[test]
+fn binding_from_framework_component_is_allowed_without_experimental_feature() {
+    let raw = parse_raw(
+        r#"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            child: "https://example.com/child",
+          },
+          bindings: [
+            { to: "\#child.realm", from: "framework.component" },
+          ],
+        }
+        "#,
+    );
+    let manifest = raw.validate().expect("manifest should validate");
+    let target = BindingTarget::ChildSlot {
+        child: ChildName::try_from("child").unwrap(),
+        slot: SlotName::try_from("realm").unwrap(),
+    };
+    let binding = find_binding(&manifest, &target);
+    let BindingSource::Framework(name) = &binding.from else {
+        panic!("expected framework binding source");
+    };
+    assert_eq!(name.as_str(), "component");
 }
 
 #[test]

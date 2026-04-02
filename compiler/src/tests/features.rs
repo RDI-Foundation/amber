@@ -1,3 +1,5 @@
+use amber_scenario::{TemplateBinding, TemplateConfigField};
+
 use super::*;
 
 #[tokio::test]
@@ -252,6 +254,137 @@ async fn resolution_environments_allow_parent_to_enable_resolvers_for_children()
 
     assert_eq!(compilation.scenario.components.len(), 3);
     assert_eq!(backend.call_count(), 1);
+}
+
+#[tokio::test]
+async fn child_template_selector_expands_into_sorted_frozen_catalog() {
+    let dir = tmp_dir("scenario-child-template-selector");
+    let root_path = dir.path().join("root.json5");
+    let jobs_dir = dir.path().join("jobs");
+    fs::create_dir_all(&jobs_dir).unwrap();
+    let alpha_path = jobs_dir.join("alpha.json5");
+    let beta_path = jobs_dir.join("beta.json5");
+    let nested_dir = jobs_dir.join("nested");
+    fs::create_dir_all(&nested_dir).unwrap();
+    let leaf_path = nested_dir.join("leaf.json5");
+
+    write_file(
+        &alpha_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: {
+            realm: { kind: "component" },
+          },
+        }
+        "#,
+    );
+    write_file(
+        &leaf_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+        }
+        "#,
+    );
+    write_file(
+        &beta_path,
+        &format!(
+            r##"
+            {{
+              manifest_version: "0.1.0",
+              slots: {{
+                realm: {{ kind: "component" }},
+              }},
+              components: {{
+                leaf: "{leaf}",
+              }},
+            }}
+            "##,
+            leaf = file_url(&leaf_path),
+        ),
+    );
+    write_file(
+        &root_path,
+        r#"
+        {
+          manifest_version: "0.1.0",
+          slots: {
+            realm: { kind: "component", optional: true },
+          },
+          child_templates: {
+            worker: {
+              allowed_manifests: {
+                root: "./jobs",
+                include: ["**/*.json5"],
+              },
+              bindings: {
+                realm: "slots.realm",
+              },
+            },
+          },
+        }
+        "#,
+    );
+
+    let compiler = default_compiler();
+    let compilation = compiler
+        .compile(
+            manifest_ref_for_path(&root_path),
+            standard_compile_options(),
+        )
+        .await
+        .unwrap();
+
+    let root = compilation.scenario.component(compilation.scenario.root);
+    let template = root
+        .child_templates
+        .get("worker")
+        .expect("child template should be linked");
+    let allowed = template
+        .allowed_manifests
+        .as_ref()
+        .expect("open template should carry allowed manifest keys");
+
+    assert_eq!(
+        allowed,
+        &vec![
+            file_url(&alpha_path).to_string(),
+            file_url(&beta_path).to_string(),
+            file_url(&leaf_path).to_string(),
+        ]
+    );
+    assert_eq!(
+        template.bindings.get("realm"),
+        Some(&TemplateBinding::Prefilled {
+            selector: "slots.realm".parse().unwrap(),
+        })
+    );
+    assert!(template.manifest.is_none());
+    assert!(template.config.is_empty());
+    assert!(matches!(
+        template.bindings.get("realm"),
+        Some(TemplateBinding::Prefilled { .. })
+    ));
+    assert!(!matches!(
+        template.config.get("realm"),
+        Some(TemplateConfigField::Open { .. })
+    ));
+
+    let catalog_keys = compilation
+        .scenario
+        .manifest_catalog
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        catalog_keys,
+        vec![
+            file_url(&alpha_path).to_string(),
+            file_url(&beta_path).to_string(),
+            file_url(&leaf_path).to_string(),
+        ]
+    );
 }
 
 #[tokio::test]

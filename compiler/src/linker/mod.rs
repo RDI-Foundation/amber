@@ -16,13 +16,16 @@ use std::{
 use amber_config as rc;
 use amber_manifest::{
     BindingSource, BindingTarget, BindingTargetKey, CapabilityDecl, CapabilityKind, ChildName,
-    ExportName, ExportTarget, InterpolatedPart, InterpolatedString, InterpolationSource, Manifest,
-    ManifestDigest, ProgramConfigUseSite, framework_capability, span_for_json_pointer,
+    ChildTemplateAllowedManifests, ExportName, ExportTarget, InterpolatedPart, InterpolatedString,
+    InterpolationSource, Manifest, ManifestDigest, ProgramConfigUseSite, framework_capability,
+    span_for_json_pointer,
 };
 use amber_scenario::{
-    BindingEdge, BindingFrom, Component, ComponentId, ProgramMount, ProvideRef,
-    ResourceDecl as ScenarioResourceDecl, ResourceRef, Scenario, ScenarioExport, SlotRef,
-    StorageResourceParams as ScenarioStorageResourceParams, graph::component_path_for,
+    BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
+    ManifestCatalogEntry, ProgramMount, ProvideRef, ResourceDecl as ScenarioResourceDecl,
+    ResourceRef, Scenario, ScenarioExport, SlotRef,
+    StorageResourceParams as ScenarioStorageResourceParams, TemplateBinding, TemplateConfigField,
+    graph::component_path_for,
 };
 use jsonschema::Validator;
 use miette::{Diagnostic, NamedSource, SourceSpan};
@@ -394,17 +397,30 @@ struct ResolvedExport {
     decl: CapabilityDecl,
 }
 
+struct FlattenState<'a> {
+    store: &'a DigestStore,
+    manifest_catalog: &'a mut BTreeMap<String, ManifestCatalogEntry>,
+    out: &'a mut Vec<Option<Component>>,
+    provenance: &'a mut Provenance,
+    link_index: &'a mut Vec<LinkIndex>,
+}
+
 pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Provenance), Error> {
     let mut components = Vec::new();
     let mut link_index = Vec::new();
     let mut provenance = Provenance::default();
+    let mut manifest_catalog = BTreeMap::new();
     let root = flatten(
         &tree.root,
         None,
         "/",
-        &mut components,
-        &mut provenance,
-        &mut link_index,
+        &mut FlattenState {
+            store,
+            manifest_catalog: &mut manifest_catalog,
+            out: &mut components,
+            provenance: &mut provenance,
+            link_index: &mut link_index,
+        },
     );
 
     debug_assert_eq!(components.len(), provenance.components.len());
@@ -734,6 +750,7 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         components,
         bindings: binding_edges,
         exports,
+        manifest_catalog,
     };
     scenario.normalize_order();
 
@@ -749,11 +766,9 @@ fn flatten(
     node: &ResolvedNode,
     parent: Option<ComponentId>,
     parent_path: &str,
-    out: &mut Vec<Option<Component>>,
-    prov: &mut Provenance,
-    link_index: &mut Vec<LinkIndex>,
+    state: &mut FlattenState<'_>,
 ) -> ComponentId {
-    let id = ComponentId(out.len());
+    let id = ComponentId(state.out.len());
 
     let authored_moniker: Arc<str> = if parent.is_none() {
         Arc::from("/")
@@ -764,8 +779,9 @@ fn flatten(
     };
 
     let moniker = Arc::clone(&authored_moniker).into();
+    let child_templates = lower_child_templates(node, state.store, state.manifest_catalog);
 
-    out.push(Some(Component {
+    state.out.push(Some(Component {
         id,
         parent,
         moniker,
@@ -776,12 +792,13 @@ fn flatten(
         slots: BTreeMap::new(),
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
+        child_templates,
         metadata: None,
         children: Vec::new(),
     }));
-    link_index.push(LinkIndex::default());
+    state.link_index.push(LinkIndex::default());
 
-    prov.components.push(ComponentProvenance {
+    state.provenance.components.push(ComponentProvenance {
         authored_moniker: Arc::clone(&authored_moniker).into(),
         declared_ref: node.declared_ref.clone(),
         resolved_url: node.resolved_url.clone(),
@@ -792,23 +809,130 @@ fn flatten(
     let mut children = Vec::with_capacity(node.children.len());
     let mut child_by_name = BTreeMap::new();
     for (child_name, child_node) in node.children.iter() {
-        let child_id = flatten(
-            child_node,
-            Some(id),
-            authored_moniker.as_ref(),
-            out,
-            prov,
-            link_index,
-        );
+        let child_id = flatten(child_node, Some(id), authored_moniker.as_ref(), state);
         children.push(child_id);
         let child_name =
             ChildName::try_from(child_name.as_str()).expect("child name should be validated");
         child_by_name.insert(child_name, child_id);
     }
 
-    out[id.0].as_mut().expect("component should exist").children = children;
-    link_index[id.0].child_by_name = child_by_name;
+    state.out[id.0]
+        .as_mut()
+        .expect("component should exist")
+        .children = children;
+    state.link_index[id.0].child_by_name = child_by_name;
     id
+}
+
+fn lower_child_templates(
+    node: &ResolvedNode,
+    store: &DigestStore,
+    manifest_catalog: &mut BTreeMap<String, ManifestCatalogEntry>,
+) -> BTreeMap<String, ChildTemplate> {
+    let mut out = BTreeMap::new();
+
+    for (template_name, template) in &node.child_templates {
+        for manifest in &template.manifests {
+            collect_manifest_catalog_entries(&manifest.root, store, manifest_catalog);
+        }
+
+        let manifest_keys = template
+            .manifests
+            .iter()
+            .map(|manifest| catalog_key(&manifest.source_ref))
+            .collect::<Vec<_>>();
+
+        let (manifest, allowed_manifests) = match (
+            template.decl.manifest.as_ref(),
+            template.decl.allowed_manifests.as_ref(),
+        ) {
+            (Some(_), None) => (manifest_keys.first().cloned(), None),
+            (None, Some(ChildTemplateAllowedManifests::Refs(_)))
+            | (None, Some(ChildTemplateAllowedManifests::Selector(_))) => {
+                (None, Some(manifest_keys))
+            }
+            (Some(_), Some(_)) | (None, None) => unreachable!("manifest validation handles this"),
+            (None, Some(_)) => unreachable!("manifest validation handles this"),
+        };
+
+        out.insert(
+            template_name.clone(),
+            ChildTemplate {
+                manifest,
+                allowed_manifests,
+                config: template
+                    .decl
+                    .config
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.clone(),
+                            TemplateConfigField::Prefilled {
+                                value: value.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+                bindings: template
+                    .decl
+                    .bindings
+                    .iter()
+                    .map(|(name, selector)| {
+                        (
+                            name.clone(),
+                            TemplateBinding::Prefilled {
+                                selector: selector.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+                visible_exports: (!template.decl.visible_exports.is_empty())
+                    .then(|| template.decl.visible_exports.clone()),
+                limits: template
+                    .decl
+                    .limits
+                    .as_ref()
+                    .map(|limits| ChildTemplateLimits {
+                        max_live_children: limits.max_live_children,
+                        name_pattern: limits.name_pattern.clone(),
+                    }),
+                possible_backends: template.decl.possible_backends.clone(),
+            },
+        );
+    }
+
+    out
+}
+
+fn collect_manifest_catalog_entries(
+    node: &ResolvedNode,
+    store: &DigestStore,
+    manifest_catalog: &mut BTreeMap<String, ManifestCatalogEntry>,
+) {
+    let key = catalog_key(&node.resolved_url);
+    manifest_catalog.entry(key).or_insert_with(|| {
+        let manifest = store
+            .get(&node.digest)
+            .expect("resolved manifest should exist in digest store");
+        ManifestCatalogEntry {
+            source_ref: node.resolved_url.to_string(),
+            digest: node.digest,
+            manifest: (*manifest).clone(),
+        }
+    });
+
+    for child in node.children.values() {
+        collect_manifest_catalog_entries(child, store, manifest_catalog);
+    }
+    for template in node.child_templates.values() {
+        for manifest in &template.manifests {
+            collect_manifest_catalog_entries(&manifest.root, store, manifest_catalog);
+        }
+    }
+}
+
+fn catalog_key(url: &url::Url) -> String {
+    url.to_string()
 }
 
 fn validate_config_tree(

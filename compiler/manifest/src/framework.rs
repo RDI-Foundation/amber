@@ -22,6 +22,17 @@ pub fn framework_capabilities() -> &'static [FrameworkCapabilitySpec] {
     CAPS.get_or_init(|| {
         vec![
             FrameworkCapabilitySpec {
+                name: FrameworkCapabilityName::try_from("component")
+                    .expect("framework capability names are static and valid"),
+                decl: CapabilityDecl {
+                    kind: CapabilityKind::Component,
+                    profile: None,
+                },
+                binding_shape: FrameworkBindingShape::Url,
+                required_experimental_feature: None,
+                description: "Amber realm-management capability for dynamic child components",
+            },
+            FrameworkCapabilitySpec {
                 name: FrameworkCapabilityName::try_from("docker")
                     .expect("framework capability names are static and valid"),
                 decl: CapabilityDecl {

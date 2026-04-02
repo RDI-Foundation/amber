@@ -279,6 +279,31 @@ fn framework_docker_mount_is_allowed_with_experimental_feature() {
 }
 
 #[test]
+fn framework_component_mount_is_rejected() {
+    let err = r#"
+        {
+          manifest_version: "0.1.0",
+          program: {
+            image: "x",
+            entrypoint: ["x"],
+            mounts: [
+              { path: "/run/component.sock", from: "framework.component" },
+            ]
+          }
+        }
+        "#
+    .parse::<Manifest>()
+    .unwrap_err();
+
+    match err {
+        Error::UnsupportedMountSource { mount } => {
+            assert_eq!(mount, "framework.component");
+        }
+        other => panic!("expected UnsupportedMountSource error, got: {other}"),
+    }
+}
+
+#[test]
 fn config_mount_accepts_secret_path() {
     let manifest: Manifest = r#"
         {

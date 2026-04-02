@@ -22,6 +22,7 @@ fn component(id: usize, moniker: &str) -> Component {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     }
 }
@@ -114,6 +115,7 @@ fn dot_renders_clusters_and_edges() {
         components,
         bindings,
         exports: Vec::new(),
+        manifest_catalog: BTreeMap::new(),
     };
 
     let dot = render_dot(&scenario);
@@ -158,6 +160,7 @@ fn dot_renders_root_program_node() {
         components,
         bindings: Vec::new(),
         exports: Vec::new(),
+        manifest_catalog: BTreeMap::new(),
     };
 
     let dot = render_dot(&scenario);
@@ -193,6 +196,7 @@ fn dot_renders_framework_bindings() {
         components,
         bindings,
         exports: Vec::new(),
+        manifest_catalog: BTreeMap::new(),
     };
 
     let dot = render_dot(&scenario);
@@ -297,6 +301,7 @@ fn dot_renders_root_exports_as_endpoints() {
                 name: "out".to_string(),
             },
         }],
+        manifest_catalog: BTreeMap::new(),
     };
 
     let dot = render_dot_with_exports(&scenario).expect("dot rendering");
@@ -360,6 +365,7 @@ fn dot_renders_root_exports_from_root_component() {
                 name: "out".to_string(),
             },
         }],
+        manifest_catalog: BTreeMap::new(),
     };
 
     let dot = render_dot_with_exports(&scenario).expect("dot rendering");

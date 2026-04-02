@@ -1,19 +1,20 @@
 use std::collections::BTreeMap;
 
 use amber_manifest::{
-    CapabilityDecl, CapabilityKind, FrameworkCapabilityName, ManifestDigest, ProvideDecl, SlotDecl,
-    framework_capability,
+    CapabilityDecl, CapabilityKind, FrameworkCapabilityName, Manifest, ManifestDigest, ProvideDecl,
+    RealmSelector, RuntimeBackend, SlotDecl, framework_capability,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    BindingEdge, BindingFrom, Component, ComponentId, Moniker, Program, ProgramMount, ProvideRef,
-    ResourceDecl, ResourceRef, Scenario, ScenarioExport, SlotRef,
+    BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
+    ManifestCatalogEntry, Moniker, Program, ProgramMount, ProvideRef, ResourceDecl, ResourceRef,
+    Scenario, ScenarioExport, SlotRef, TemplateBinding, TemplateConfigField,
 };
 
 pub const SCENARIO_IR_SCHEMA: &str = "amber.scenario.ir";
-pub const SCENARIO_IR_VERSION: u32 = 4;
+pub const SCENARIO_IR_VERSION: u32 = 5;
 const MIN_SCENARIO_IR_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -24,6 +25,9 @@ pub struct ScenarioIr {
     pub components: Vec<ComponentIr>,
     pub bindings: Vec<BindingIr>,
     pub exports: Vec<ExportIr>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub manifest_catalog: BTreeMap<String, ManifestCatalogEntryIr>,
 }
 
 impl From<&Scenario> for ScenarioIr {
@@ -42,6 +46,11 @@ impl From<&Scenario> for ScenarioIr {
             components,
             bindings,
             exports,
+            manifest_catalog: scenario
+                .manifest_catalog
+                .iter()
+                .map(|(key, entry)| (key.clone(), ManifestCatalogEntryIr::from(entry)))
+                .collect(),
         }
     }
 }
@@ -85,6 +94,35 @@ impl TryFrom<ScenarioIr> for Scenario {
             }
             for name in component.resources.keys() {
                 ensure_name_no_dot(name)?;
+            }
+            for name in component.child_templates.keys() {
+                ensure_name_no_dot(name)?;
+            }
+            for (name, template) in &component.child_templates {
+                match (&template.manifest, &template.allowed_manifests) {
+                    (Some(_), None) | (None, Some(_)) => {}
+                    (Some(_), Some(_)) => {
+                        return Err(invalid_scenario(format!(
+                            "child template `{name}` must not specify both `manifest` and \
+                             `allowed_manifests`"
+                        )));
+                    }
+                    (None, None) => {
+                        return Err(invalid_scenario(format!(
+                            "child template `{name}` must specify one of `manifest` or \
+                             `allowed_manifests`"
+                        )));
+                    }
+                }
+                if template
+                    .allowed_manifests
+                    .as_ref()
+                    .is_some_and(|allowed| allowed.is_empty())
+                {
+                    return Err(invalid_scenario(format!(
+                        "child template `{name}` must not have an empty `allowed_manifests` list"
+                    )));
+                }
             }
             components[id] = Some(component.into_component());
         }
@@ -172,6 +210,11 @@ impl TryFrom<ScenarioIr> for Scenario {
                 .map(BindingIr::into_binding)
                 .collect::<Result<Vec<_>, _>>()?,
             exports: ir.exports.into_iter().map(ExportIr::into_export).collect(),
+            manifest_catalog: ir
+                .manifest_catalog
+                .into_iter()
+                .map(|(key, entry)| (key, entry.into_entry()))
+                .collect(),
         };
         validate_scenario(&scenario)?;
         scenario.normalize_order();
@@ -202,6 +245,9 @@ pub struct ComponentIr {
     #[serde(default)]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub resources: BTreeMap<String, ResourceDecl>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub child_templates: BTreeMap<String, ChildTemplateIr>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
 }
@@ -221,6 +267,11 @@ impl ComponentIr {
             slots: component.slots.clone(),
             provides: component.provides.clone(),
             resources: component.resources.clone(),
+            child_templates: component
+                .child_templates
+                .iter()
+                .map(|(name, template)| (name.clone(), ChildTemplateIr::from(template)))
+                .collect(),
             metadata: component.metadata.clone(),
         }
     }
@@ -237,8 +288,195 @@ impl ComponentIr {
             slots: self.slots,
             provides: self.provides,
             resources: self.resources,
+            child_templates: self
+                .child_templates
+                .into_iter()
+                .map(|(name, template)| (name, template.into_template()))
+                .collect(),
             metadata: self.metadata,
             children: self.children.into_iter().map(ComponentId).collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChildTemplateIr {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_manifests: Option<Vec<String>>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub config: BTreeMap<String, TemplateConfigFieldIr>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub bindings: BTreeMap<String, TemplateBindingIr>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visible_exports: Option<Vec<String>>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ChildTemplateLimitsIr>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub possible_backends: Vec<RuntimeBackend>,
+}
+
+impl From<&ChildTemplate> for ChildTemplateIr {
+    fn from(template: &ChildTemplate) -> Self {
+        Self {
+            manifest: template.manifest.clone(),
+            allowed_manifests: template.allowed_manifests.clone(),
+            config: template
+                .config
+                .iter()
+                .map(|(name, field)| (name.clone(), TemplateConfigFieldIr::from(field)))
+                .collect(),
+            bindings: template
+                .bindings
+                .iter()
+                .map(|(name, field)| (name.clone(), TemplateBindingIr::from(field)))
+                .collect(),
+            visible_exports: template.visible_exports.clone(),
+            limits: template.limits.as_ref().map(ChildTemplateLimitsIr::from),
+            possible_backends: template.possible_backends.clone(),
+        }
+    }
+}
+
+impl ChildTemplateIr {
+    fn into_template(self) -> ChildTemplate {
+        ChildTemplate {
+            manifest: self.manifest,
+            allowed_manifests: self.allowed_manifests,
+            config: self
+                .config
+                .into_iter()
+                .map(|(name, field)| (name, field.into_field()))
+                .collect(),
+            bindings: self
+                .bindings
+                .into_iter()
+                .map(|(name, field)| (name, field.into_field()))
+                .collect(),
+            visible_exports: self.visible_exports,
+            limits: self.limits.map(ChildTemplateLimitsIr::into_limits),
+            possible_backends: self.possible_backends,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum TemplateConfigFieldIr {
+    Prefilled { value: Value },
+    Open { required: bool },
+}
+
+impl From<&TemplateConfigField> for TemplateConfigFieldIr {
+    fn from(field: &TemplateConfigField) -> Self {
+        match field {
+            TemplateConfigField::Prefilled { value } => Self::Prefilled {
+                value: value.clone(),
+            },
+            TemplateConfigField::Open { required } => Self::Open {
+                required: *required,
+            },
+        }
+    }
+}
+
+impl TemplateConfigFieldIr {
+    fn into_field(self) -> TemplateConfigField {
+        match self {
+            Self::Prefilled { value } => TemplateConfigField::Prefilled { value },
+            Self::Open { required } => TemplateConfigField::Open { required },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum TemplateBindingIr {
+    Prefilled { selector: RealmSelector },
+    Open { optional: bool },
+}
+
+impl From<&TemplateBinding> for TemplateBindingIr {
+    fn from(field: &TemplateBinding) -> Self {
+        match field {
+            TemplateBinding::Prefilled { selector } => Self::Prefilled {
+                selector: selector.clone(),
+            },
+            TemplateBinding::Open { optional } => Self::Open {
+                optional: *optional,
+            },
+        }
+    }
+}
+
+impl TemplateBindingIr {
+    fn into_field(self) -> TemplateBinding {
+        match self {
+            Self::Prefilled { selector } => TemplateBinding::Prefilled { selector },
+            Self::Open { optional } => TemplateBinding::Open { optional },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChildTemplateLimitsIr {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_live_children: Option<u32>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_pattern: Option<String>,
+}
+
+impl From<&ChildTemplateLimits> for ChildTemplateLimitsIr {
+    fn from(limits: &ChildTemplateLimits) -> Self {
+        Self {
+            max_live_children: limits.max_live_children,
+            name_pattern: limits.name_pattern.clone(),
+        }
+    }
+}
+
+impl ChildTemplateLimitsIr {
+    fn into_limits(self) -> ChildTemplateLimits {
+        ChildTemplateLimits {
+            max_live_children: self.max_live_children,
+            name_pattern: self.name_pattern,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ManifestCatalogEntryIr {
+    pub source_ref: String,
+    pub digest: ManifestDigest,
+    pub manifest: Manifest,
+}
+
+impl From<&ManifestCatalogEntry> for ManifestCatalogEntryIr {
+    fn from(entry: &ManifestCatalogEntry) -> Self {
+        Self {
+            source_ref: entry.source_ref.clone(),
+            digest: entry.digest,
+            manifest: entry.manifest.clone(),
+        }
+    }
+}
+
+impl ManifestCatalogEntryIr {
+    fn into_entry(self) -> ManifestCatalogEntry {
+        ManifestCatalogEntry {
+            source_ref: self.source_ref,
+            digest: self.digest,
+            manifest: self.manifest,
         }
     }
 }
@@ -554,6 +792,7 @@ fn validate_scenario(scenario: &Scenario) -> Result<(), ScenarioIrError> {
     validate_bindings(scenario)?;
     validate_mounted_storage_slots(scenario)?;
     validate_exports(scenario)?;
+    validate_child_templates(scenario)?;
     Ok(())
 }
 
@@ -585,6 +824,9 @@ fn validate_component_tree(scenario: &Scenario) -> Result<(), ScenarioIrError> {
             ensure_name_no_dot(name)?;
         }
         for name in component.provides.keys() {
+            ensure_name_no_dot(name)?;
+        }
+        for name in component.child_templates.keys() {
             ensure_name_no_dot(name)?;
         }
 
@@ -667,6 +909,71 @@ fn validate_component_tree(scenario: &Scenario) -> Result<(), ScenarioIrError> {
                 )));
             };
             cur = parent;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_child_templates(scenario: &Scenario) -> Result<(), ScenarioIrError> {
+    for component in scenario.components.iter().flatten() {
+        for (name, template) in &component.child_templates {
+            match (&template.manifest, &template.allowed_manifests) {
+                (Some(_), None) | (None, Some(_)) => {}
+                (Some(_), Some(_)) => {
+                    return Err(invalid_scenario(format!(
+                        "component {} child template `{name}` specifies both `manifest` and \
+                         `allowed_manifests`",
+                        component.moniker.as_str()
+                    )));
+                }
+                (None, None) => {
+                    return Err(invalid_scenario(format!(
+                        "component {} child template `{name}` must specify one of `manifest` or \
+                         `allowed_manifests`",
+                        component.moniker.as_str()
+                    )));
+                }
+            }
+
+            if let Some(key) = &template.manifest
+                && !scenario.manifest_catalog.contains_key(key)
+            {
+                return Err(invalid_scenario(format!(
+                    "component {} child template `{name}` references missing manifest catalog key \
+                     `{key}`",
+                    component.moniker.as_str()
+                )));
+            }
+
+            if let Some(keys) = &template.allowed_manifests {
+                if keys.is_empty() {
+                    return Err(invalid_scenario(format!(
+                        "component {} child template `{name}` has an empty `allowed_manifests` \
+                         list",
+                        component.moniker.as_str()
+                    )));
+                }
+                for key in keys {
+                    if !scenario.manifest_catalog.contains_key(key) {
+                        return Err(invalid_scenario(format!(
+                            "component {} child template `{name}` references missing manifest \
+                             catalog key `{key}`",
+                            component.moniker.as_str()
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    for (key, entry) in &scenario.manifest_catalog {
+        if entry.digest != entry.manifest.digest() {
+            return Err(invalid_scenario(format!(
+                "manifest catalog entry `{key}` digest {} does not match manifest digest {}",
+                entry.digest,
+                entry.manifest.digest()
+            )));
         }
     }
 
@@ -927,13 +1234,14 @@ fn validate_exports(scenario: &Scenario) -> Result<(), ScenarioIrError> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use amber_manifest::{FrameworkCapabilityName, ManifestDigest};
+    use amber_manifest::{FrameworkCapabilityName, ManifestDigest, RuntimeBackend};
     use serde_json::json;
 
     use super::{SCENARIO_IR_SCHEMA, SCENARIO_IR_VERSION, ScenarioIr, ScenarioIrError};
     use crate::{
-        BindingEdge, BindingFrom, Component, ComponentId, Moniker, ProvideRef, Scenario,
-        ScenarioExport, SlotRef,
+        BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
+        ManifestCatalogEntry, Moniker, ProvideRef, Scenario, ScenarioExport, SlotRef,
+        TemplateBinding, TemplateConfigField,
     };
 
     fn slot_decl(kind: &str) -> amber_manifest::SlotDecl {
@@ -955,6 +1263,7 @@ mod tests {
                 provides: BTreeMap::new(),
                 resources: BTreeMap::new(),
                 metadata: None,
+                child_templates: BTreeMap::new(),
                 children: vec![ComponentId(1)],
             }),
             Some(Component {
@@ -996,6 +1305,7 @@ mod tests {
                 )]),
                 resources: BTreeMap::new(),
                 metadata: None,
+                child_templates: BTreeMap::new(),
                 children: Vec::new(),
             }),
         ];
@@ -1025,6 +1335,7 @@ mod tests {
                     name: "api".to_string(),
                 },
             }],
+            manifest_catalog: BTreeMap::new(),
         };
         scenario.normalize_order();
 
@@ -1194,6 +1505,7 @@ mod tests {
             provides: BTreeMap::new(),
             resources: BTreeMap::new(),
             metadata: None,
+            child_templates: BTreeMap::new(),
             children: Vec::new(),
         })];
 
@@ -1209,6 +1521,7 @@ mod tests {
                 weak: false,
             }],
             exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
         };
         scenario.normalize_order();
 
@@ -1236,6 +1549,93 @@ mod tests {
                 panic!("unexpected external binding slots.{}", slot.name)
             }
         }
+    }
+
+    #[test]
+    fn scenario_ir_roundtrips_child_templates_and_manifest_catalog() {
+        let catalog_manifest: amber_manifest::Manifest = r#"
+            {
+              manifest_version: "0.1.0",
+              slots: {
+                realm: { kind: "component" },
+              },
+            }
+        "#
+        .parse()
+        .expect("manifest");
+        let catalog_key = "file:///templates/worker.json5".to_string();
+
+        let components = vec![Some(Component {
+            id: ComponentId(0),
+            parent: None,
+            moniker: Moniker::from("/".to_string()),
+            digest: ManifestDigest::new([0u8; 32]),
+            config: None,
+            config_schema: None,
+            program: None,
+            slots: BTreeMap::from([("realm".to_string(), slot_decl("component"))]),
+            provides: BTreeMap::new(),
+            resources: BTreeMap::new(),
+            metadata: None,
+            child_templates: BTreeMap::from([(
+                "worker".to_string(),
+                ChildTemplate {
+                    manifest: Some(catalog_key.clone()),
+                    allowed_manifests: None,
+                    config: BTreeMap::from([(
+                        "mode".to_string(),
+                        TemplateConfigField::Prefilled {
+                            value: json!("batch"),
+                        },
+                    )]),
+                    bindings: BTreeMap::from([(
+                        "realm".to_string(),
+                        TemplateBinding::Prefilled {
+                            selector: "slots.realm".parse().unwrap(),
+                        },
+                    )]),
+                    visible_exports: Some(vec!["api".to_string()]),
+                    limits: Some(ChildTemplateLimits {
+                        max_live_children: Some(4),
+                        name_pattern: Some("job-[0-9]+".to_string()),
+                    }),
+                    possible_backends: vec![RuntimeBackend::Direct],
+                },
+            )]),
+            children: Vec::new(),
+        })];
+
+        let mut scenario = Scenario {
+            root: ComponentId(0),
+            components,
+            bindings: Vec::new(),
+            exports: Vec::new(),
+            manifest_catalog: BTreeMap::from([(
+                catalog_key.clone(),
+                ManifestCatalogEntry {
+                    source_ref: catalog_key.clone(),
+                    digest: catalog_manifest.digest(),
+                    manifest: catalog_manifest.clone(),
+                },
+            )]),
+        };
+        scenario.normalize_order();
+
+        let ir = ScenarioIr::from(&scenario);
+        let roundtripped: Scenario = ir.try_into().expect("deserialize scenario IR");
+        assert_eq!(roundtripped, scenario);
+        assert_eq!(
+            roundtripped
+                .component(ComponentId(0))
+                .child_templates
+                .get("worker")
+                .and_then(|template| template.manifest.as_ref()),
+            Some(&catalog_key)
+        );
+        assert_eq!(
+            roundtripped.manifest_catalog.get(&catalog_key),
+            scenario.manifest_catalog.get(&catalog_key)
+        );
     }
 
     #[test]

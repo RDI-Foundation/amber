@@ -4,11 +4,11 @@ Error: manifest::validation_error
   ╰─▶ manifest validation error at componentz: unknown field `componentz`,
       expected one of `manifest_version`, `experimental_features`, `program`,
       `components`, `environments`, `config_schema`, `slots`, `provides`,
-      `resources`, `bindings`, `exports`, `metadata`
+      `resources`, `child_templates`, `bindings`, `exports`, `metadata`
    ╭─[<CARGO_MANIFEST_DIR>/tests/ui/typo_components_key.json5:3:3]
  2 │   manifest_version: "0.1.0",
  3 │   componentz: {
    ·   ─────┬────
-   ·        ╰── unknown field `componentz`, expected one of `manifest_version`, `experimental_features`, `program`, `components`, `environments`, `config_schema`, `slots`, `provides`, `resources`, `bindings`, `exports`, `metadata`
+   ·        ╰── unknown field `componentz`, expected one of `manifest_version`, `experimental_features`, `program`, `components`, `environments`, `config_schema`, `slots`, `provides`, `resources`, `child_templates`, `bindings`, `exports`, `metadata`
  4 │     tau2: "./tau2.json5",
    ╰────

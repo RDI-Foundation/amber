@@ -23,9 +23,11 @@ fn compose_artifact_emits_env_sample_and_readme() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
     let output = compile_output(Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: Vec::new(),
@@ -67,10 +69,12 @@ fn compose_emits_storage_volume_mounts() {
         provides: BTreeMap::new(),
         resources: BTreeMap::from([("state".to_string(), storage_resource_decl(None))]),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: Vec::new(),
@@ -143,9 +147,11 @@ fn compose_emits_otelcol_agent_and_wires_router_otel_env() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: Vec::new(),
@@ -412,9 +418,11 @@ fn docker_compose_emits_gateway_for_framework_docker_binding() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: vec![BindingEdge {
@@ -503,9 +511,11 @@ fn docker_compose_emits_framework_docker_mount_proxy_wiring() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: Vec::new(),
@@ -614,6 +624,7 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: vec![ComponentId(2), ComponentId(1)],
     };
 
@@ -629,6 +640,7 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
@@ -644,10 +656,12 @@ fn compose_emits_sidecars_and_programs_and_slot_urls() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root), Some(server), Some(client)],
         bindings: vec![BindingEdge {
@@ -811,6 +825,7 @@ fn compose_emits_minimal_peer_keys() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: vec![ComponentId(1), ComponentId(2), ComponentId(3)],
     };
 
@@ -826,6 +841,7 @@ fn compose_emits_minimal_peer_keys() {
         provides: BTreeMap::from([("api1".to_string(), provide_api1)]),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
@@ -841,6 +857,7 @@ fn compose_emits_minimal_peer_keys() {
         provides: BTreeMap::from([("api2".to_string(), provide_api2)]),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
@@ -856,10 +873,12 @@ fn compose_emits_minimal_peer_keys() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root), Some(server1), Some(server2), Some(client)],
         bindings: vec![BindingEdge {
@@ -935,10 +954,12 @@ fn compose_emits_named_volumes_for_storage_mounts() {
         provides: BTreeMap::new(),
         resources: BTreeMap::from([("state".to_string(), storage_resource_decl(None))]),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: Vec::new(),
@@ -993,10 +1014,12 @@ fn compose_escapes_entrypoint_dollars() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root)],
         bindings: vec![],
@@ -1051,6 +1074,7 @@ fn compose_emits_export_metadata_and_labels() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: vec![ComponentId(1)],
     };
 
@@ -1066,10 +1090,12 @@ fn compose_emits_export_metadata_and_labels() {
         provides: BTreeMap::from([("api".to_string(), provide_http)]),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root), Some(server)],
         bindings: vec![],
@@ -1189,6 +1215,7 @@ fn compose_routes_external_slots_through_router() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: vec![ComponentId(1)],
     };
 
@@ -1204,10 +1231,12 @@ fn compose_routes_external_slots_through_router() {
         provides: BTreeMap::new(),
         resources: BTreeMap::new(),
         metadata: None,
+        child_templates: BTreeMap::new(),
         children: Vec::new(),
     };
 
     let scenario = Scenario {
+        manifest_catalog: BTreeMap::new(),
         root: ComponentId(0),
         components: vec![Some(root), Some(client)],
         bindings: vec![BindingEdge {

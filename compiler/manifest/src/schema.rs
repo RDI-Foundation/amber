@@ -268,6 +268,7 @@ pub enum CapabilityKind {
     Mcp,
     Llm,
     Http,
+    Component,
     Docker,
     A2a,
     Storage,
@@ -280,6 +281,7 @@ impl fmt::Display for CapabilityKind {
             CapabilityKind::Mcp => "mcp",
             CapabilityKind::Llm => "llm",
             CapabilityKind::Http => "http",
+            CapabilityKind::Component => "component",
             CapabilityKind::Docker => "docker",
             CapabilityKind::A2a => "a2a",
             CapabilityKind::Storage => "storage",
@@ -299,7 +301,9 @@ pub enum CapabilityTransport {
 impl CapabilityKind {
     pub const fn transport(self) -> CapabilityTransport {
         match self {
-            Self::Mcp | Self::Llm | Self::Http | Self::A2a => CapabilityTransport::Http,
+            Self::Mcp | Self::Llm | Self::Http | Self::Component | Self::A2a => {
+                CapabilityTransport::Http
+            }
             Self::Docker | Self::Storage | Self::Kvm => CapabilityTransport::NonNetwork,
         }
     }
@@ -378,6 +382,162 @@ pub struct ResourceDecl {
     pub kind: CapabilityKind,
     #[serde(default)]
     pub params: StorageResourceParams,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RuntimeBackend {
+    Direct,
+    Vm,
+    Compose,
+    Kubernetes,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub struct RealmSelector(String);
+
+impl RealmSelector {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RealmSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for RealmSelector {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RealmSelector {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl FromStr for RealmSelector {
+    type Err = Error;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        fn parse_leaf(selector: &str, prefix: &str, kind: &'static str) -> Result<(), Error> {
+            let Some(name) = selector.strip_prefix(prefix) else {
+                return Err(Error::InvalidRealmSelector {
+                    selector: selector.to_string(),
+                    message: format!("expected prefix `{prefix}`"),
+                });
+            };
+            if name.is_empty() {
+                return Err(Error::InvalidRealmSelector {
+                    selector: selector.to_string(),
+                    message: "selector name must not be empty".to_string(),
+                });
+            }
+            ensure_name_no_dot(name, kind)
+        }
+
+        if input.starts_with("slots.") {
+            parse_leaf(input, "slots.", "slot")?;
+            return Ok(Self(input.to_string()));
+        }
+        if input.starts_with("provides.") {
+            parse_leaf(input, "provides.", "provide")?;
+            return Ok(Self(input.to_string()));
+        }
+        if input.starts_with("resources.") {
+            parse_leaf(input, "resources.", "resource")?;
+            return Ok(Self(input.to_string()));
+        }
+        if input.starts_with("external.") {
+            parse_leaf(input, "external.", "external binding")?;
+            return Ok(Self(input.to_string()));
+        }
+        if let Some(rest) = input.strip_prefix("children.") {
+            let Some((child, suffix)) = rest.split_once(".exports.") else {
+                return Err(Error::InvalidRealmSelector {
+                    selector: input.to_string(),
+                    message: "expected `children.<child>.exports.<export>`".to_string(),
+                });
+            };
+            ensure_name_no_dot(child, "child")?;
+            ensure_name_no_dot(suffix, "export")?;
+            return Ok(Self(input.to_string()));
+        }
+
+        Err(Error::InvalidRealmSelector {
+            selector: input.to_string(),
+            message: "expected `slots.<name>`, `provides.<name>`, `resources.<name>`, \
+                      `external.<name>`, or `children.<child>.exports.<export>`"
+                .to_string(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ChildTemplateManifestSelector {
+    pub root: String,
+    #[serde(default)]
+    #[builder(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    #[builder(default)]
+    pub exclude: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+#[non_exhaustive]
+pub enum ChildTemplateAllowedManifests {
+    Refs(Vec<ManifestRef>),
+    Selector(ChildTemplateManifestSelector),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ChildTemplateLimitsDecl {
+    #[serde(default)]
+    pub max_live_children: Option<u32>,
+    #[serde(default)]
+    pub name_pattern: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ChildTemplateDecl {
+    #[serde(default)]
+    pub manifest: Option<ManifestRef>,
+    #[serde(default)]
+    pub allowed_manifests: Option<ChildTemplateAllowedManifests>,
+    #[serde(default)]
+    pub config: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub bindings: BTreeMap<String, RealmSelector>,
+    #[serde(default)]
+    pub visible_exports: Vec<String>,
+    #[serde(default)]
+    pub limits: Option<ChildTemplateLimitsDecl>,
+    #[serde(default)]
+    pub possible_backends: Vec<RuntimeBackend>,
 }
 
 #[derive(

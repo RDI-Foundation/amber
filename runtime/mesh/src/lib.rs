@@ -6,6 +6,7 @@ use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod component_protocol;
 pub mod telemetry;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

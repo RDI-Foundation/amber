@@ -3,7 +3,9 @@ use std::{
     sync::Arc,
 };
 
-use amber_manifest::{BindingSource, BindingTarget, Manifest};
+use amber_manifest::{
+    BindingSource, BindingTarget, CapabilityKind, ExportTarget, Manifest, framework_capability,
+};
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, ProgramMount, Scenario, SlotRef,
 };
@@ -108,6 +110,7 @@ fn take_scenario(scenario: &mut Scenario) -> Scenario {
             components: Vec::new(),
             bindings: Vec::new(),
             exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
         },
     )
 }
@@ -307,8 +310,11 @@ fn rewrite_bindings(
 }
 
 fn is_pure_routing(
+    scenario: &Scenario,
     component: &Component,
     manifest: &Manifest,
+    manifests: &[Option<Arc<Manifest>>],
+    child_index: &[BTreeMap<String, ComponentId>],
     forward_map: &HashMap<(ComponentId, String), Vec<ForwardEdge>>,
 ) -> bool {
     if component.program.is_some()
@@ -322,6 +328,9 @@ fn is_pure_routing(
         return false;
     }
     if !component.resources.is_empty() {
+        return false;
+    }
+    if is_realm_significant(scenario, component, manifest, manifests, child_index) {
         return false;
     }
     if component.children.is_empty() {
@@ -350,8 +359,148 @@ fn is_pure_routing(
     true
 }
 
+fn is_realm_significant(
+    scenario: &Scenario,
+    component: &Component,
+    manifest: &Manifest,
+    manifests: &[Option<Arc<Manifest>>],
+    child_index: &[BTreeMap<String, ComponentId>],
+) -> bool {
+    if !component.child_templates.is_empty() {
+        return true;
+    }
+    if component
+        .slots
+        .values()
+        .any(|slot| slot.decl.kind == CapabilityKind::Component)
+    {
+        return true;
+    }
+    if component
+        .provides
+        .values()
+        .any(|provide| provide.decl.kind == CapabilityKind::Component)
+    {
+        return true;
+    }
+    if manifest.exports().values().any(|target| {
+        export_target_kind(scenario, manifests, child_index, component.id, target)
+            == Some(CapabilityKind::Component)
+    }) {
+        return true;
+    }
+    manifest.bindings().iter().any(|binding| {
+        binding_source_kind(
+            scenario,
+            manifests,
+            child_index,
+            component.id,
+            &binding.binding.from,
+        ) == Some(CapabilityKind::Component)
+            || binding_target_kind(
+                scenario,
+                manifests,
+                child_index,
+                component.id,
+                &binding.target,
+            ) == Some(CapabilityKind::Component)
+    })
+}
+
+fn binding_source_kind(
+    scenario: &Scenario,
+    manifests: &[Option<Arc<Manifest>>],
+    child_index: &[BTreeMap<String, ComponentId>],
+    component_id: ComponentId,
+    source: &BindingSource,
+) -> Option<CapabilityKind> {
+    let component = scenario.component(component_id);
+    match source {
+        BindingSource::SelfProvide(name) => component
+            .provides
+            .get(name.as_str())
+            .map(|provide| provide.decl.kind),
+        BindingSource::SelfSlot(name) => component
+            .slots
+            .get(name.as_str())
+            .map(|slot| slot.decl.kind),
+        BindingSource::Resource(_) => None,
+        BindingSource::Framework(name) => {
+            framework_capability(name.as_str()).map(|capability| capability.decl.kind)
+        }
+        BindingSource::ChildExport { child, export } => {
+            let child_id = *child_index[component_id.0].get(child.as_str())?;
+            component_export_kind(scenario, manifests, child_index, child_id, export.as_str())
+        }
+        _ => None,
+    }
+}
+
+fn binding_target_kind(
+    scenario: &Scenario,
+    _manifests: &[Option<Arc<Manifest>>],
+    child_index: &[BTreeMap<String, ComponentId>],
+    component_id: ComponentId,
+    target: &BindingTarget,
+) -> Option<CapabilityKind> {
+    let component = scenario.component(component_id);
+    match target {
+        BindingTarget::SelfSlot(name) => component
+            .slots
+            .get(name.as_str())
+            .map(|slot| slot.decl.kind),
+        BindingTarget::ChildSlot { child, slot } => {
+            let child_id = *child_index[component_id.0].get(child.as_str())?;
+            scenario
+                .component(child_id)
+                .slots
+                .get(slot.as_str())
+                .map(|slot| slot.decl.kind)
+        }
+        _ => None,
+    }
+}
+
+fn export_target_kind(
+    scenario: &Scenario,
+    manifests: &[Option<Arc<Manifest>>],
+    child_index: &[BTreeMap<String, ComponentId>],
+    component_id: ComponentId,
+    target: &ExportTarget,
+) -> Option<CapabilityKind> {
+    let component = scenario.component(component_id);
+    match target {
+        ExportTarget::SelfProvide(name) => component
+            .provides
+            .get(name.as_str())
+            .map(|provide| provide.decl.kind),
+        ExportTarget::SelfSlot(name) => component
+            .slots
+            .get(name.as_str())
+            .map(|slot| slot.decl.kind),
+        ExportTarget::ChildExport { child, export } => {
+            let child_id = *child_index[component_id.0].get(child.as_str())?;
+            component_export_kind(scenario, manifests, child_index, child_id, export.as_str())
+        }
+        _ => None,
+    }
+}
+
+fn component_export_kind(
+    scenario: &Scenario,
+    manifests: &[Option<Arc<Manifest>>],
+    child_index: &[BTreeMap<String, ComponentId>],
+    component_id: ComponentId,
+    export_name: &str,
+) -> Option<CapabilityKind> {
+    let manifest = manifests[component_id.0].as_ref()?;
+    let target = manifest.exports().get(export_name)?;
+    export_target_kind(scenario, manifests, child_index, component_id, target)
+}
+
 fn flatten_pure_routing_with_graph(scenario: Scenario, graph: &BindingGraph) -> Scenario {
     let n = scenario.components.len();
+    let child_index = build_child_index(&scenario.components);
 
     let mut referenced_by_binding = vec![false; n];
     for b in &scenario.bindings {
@@ -381,7 +530,14 @@ fn flatten_pure_routing_with_graph(scenario: Scenario, graph: &BindingGraph) -> 
         if referenced_by_binding[idx] {
             continue;
         }
-        if is_pure_routing(component, manifest, &graph.forward_map) {
+        if is_pure_routing(
+            &scenario,
+            component,
+            manifest,
+            &graph.manifests,
+            &child_index,
+            &graph.forward_map,
+        ) {
             remove[idx] = true;
         }
     }
@@ -432,6 +588,7 @@ fn prune_and_rebuild_scenario(
         mut components,
         bindings,
         exports,
+        manifest_catalog,
     } = scenario;
 
     debug_assert_eq!(removed.len(), components.len());
@@ -500,6 +657,7 @@ fn prune_and_rebuild_scenario(
         components,
         bindings: new_bindings,
         exports,
+        manifest_catalog,
     };
     scenario.normalize_order();
     scenario
@@ -890,6 +1048,7 @@ mod tests {
             provides: BTreeMap::new(),
             resources: BTreeMap::new(),
             metadata: None,
+            child_templates: BTreeMap::new(),
             children: Vec::new(),
         }
     }
@@ -943,6 +1102,7 @@ mod tests {
                 },
             ],
             exports: Vec::new(),
+            manifest_catalog: BTreeMap::new(),
         };
         scenario.normalize_order();
 
