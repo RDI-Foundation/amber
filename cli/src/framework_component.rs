@@ -14,8 +14,8 @@ use amber_compiler::{
     CompileOptions, Compiler, DigestStore,
     reporter::CompiledScenario,
     run_plan::{
-        PlacementDefaults, PlacementFile, RunLink, RunPlan, SiteDefinition, SiteKind,
-        build_run_plan,
+        ActiveSiteCapabilities, PlacementDefaults, PlacementFile, RunLink, RunPlan,
+        RunPlanActivationState, SiteDefinition, SiteKind, build_run_plan_with_activation,
     },
 };
 use amber_manifest::{
@@ -23,7 +23,7 @@ use amber_manifest::{
     Manifest, ManifestRef, ManifestSpans, NetworkProtocol, RawBinding, RawExportTarget, SlotDecl,
 };
 use amber_mesh::{
-    MeshProtocol,
+    MeshIdentity, MeshProtocol,
     component_protocol::{
         BindingInputDescription, ChildDescribeResponse, ChildHandle, ChildListResponse, ChildState,
         ChildSummary, ConfigFieldDescription, CreateChildRequest, CreateChildResponse, InputState,
@@ -58,12 +58,12 @@ use serde_json::json;
 use tokio::{net::TcpListener, signal, sync::Mutex};
 
 use crate::mixed_run::{
-    BridgeProxyHandle, BridgeProxyKey, DesiredExportPeer, LaunchedSite, SiteActuatorPlan,
-    SiteReceipt, clear_desired_links_for_consumer, clear_desired_links_for_provider,
-    host_service_bind_addr_for_consumer, host_service_host_for_consumer,
-    launched_site_from_receipt, read_json as read_run_json, resolve_link_external_url_for_output,
-    site_actuator_child_root_for_site, site_state_path, stop_bridge_proxies,
-    update_desired_links_for_consumer, update_desired_links_for_provider,
+    BridgeProxyHandle, BridgeProxyKey, DesiredExportPeerOverlay, DesiredExternalSlotOverlay,
+    LaunchedSite, SiteActuatorPlan, SiteReceipt, clear_desired_overlay_for_consumer,
+    clear_desired_overlay_for_provider, host_service_bind_addr_for_consumer,
+    host_service_host_for_consumer, launched_site_from_receipt, read_json as read_run_json,
+    resolve_link_external_url_for_output, site_actuator_child_root_for_site, site_state_path,
+    stop_bridge_proxies, update_desired_overlay_for_consumer, update_desired_overlay_for_provider,
 };
 
 const CONTROL_STATE_SCHEMA: &str = "amber.framework_component.control_state";
@@ -75,11 +75,22 @@ const CCS_PLAN_VERSION: u32 = 1;
 const CONTROL_SERVICE_PATH: &str = "/v1/control-state";
 const FRAMEWORK_ROUTE_ID_HEADER: &str = "x-amber-route-id";
 const FRAMEWORK_PEER_ID_HEADER: &str = "x-amber-peer-id";
+const FRAMEWORK_AUTH_HEADER: &str = "x-amber-framework-auth";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct FrozenPlacementState {
     pub(crate) offered_sites: BTreeMap<String, SiteDefinition>,
     pub(crate) defaults: PlacementDefaults,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) standby_sites: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) initial_active_sites: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) dynamic_enabled_sites: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) control_only_sites: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) active_site_capabilities: BTreeMap<String, ActiveSiteCapabilities>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) placement_components: BTreeMap<String, String>,
     pub(crate) assignments: BTreeMap<String, String>,
@@ -266,6 +277,7 @@ pub(crate) struct FrameworkControlStateServicePlan {
     pub(crate) run_root: String,
     pub(crate) state_root: String,
     pub(crate) mesh_scope: String,
+    pub(crate) auth_token: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -275,6 +287,8 @@ pub(crate) struct FrameworkCcsPlan {
     pub(crate) site_id: String,
     pub(crate) listen_addr: SocketAddr,
     pub(crate) control_state_url: String,
+    pub(crate) router_auth_token: String,
+    pub(crate) control_state_auth_token: String,
 }
 
 pub(crate) fn build_control_state(
@@ -298,6 +312,11 @@ pub(crate) fn build_control_state(
         placement: FrozenPlacementState {
             offered_sites: run_plan.offered_sites.clone(),
             defaults: run_plan.defaults.clone(),
+            standby_sites: run_plan.standby_sites.clone(),
+            initial_active_sites: run_plan.initial_active_sites.clone(),
+            dynamic_enabled_sites: run_plan.dynamic_enabled_sites.clone(),
+            control_only_sites: run_plan.control_only_sites.clone(),
+            active_site_capabilities: run_plan.active_site_capabilities.clone(),
             placement_components: run_plan.placement_components.clone(),
             assignments: run_plan.assignments.clone(),
         },
@@ -311,6 +330,16 @@ pub(crate) fn build_control_state(
     };
     refresh_capability_instances(&mut state)?;
     Ok(state)
+}
+
+pub(crate) fn generate_framework_auth_token(mesh_scope: &str, purpose: &str) -> String {
+    base64::engine::general_purpose::STANDARD.encode(
+        MeshIdentity::generate(
+            format!("/framework/{purpose}"),
+            Some(mesh_scope.to_string()),
+        )
+        .public_key,
+    )
 }
 
 pub(crate) fn control_state_service_url(listen_addr: SocketAddr) -> String {
@@ -366,6 +395,7 @@ pub(crate) fn write_control_state_service_plan(
     run_root: &Path,
     state_root: &Path,
     mesh_scope: &str,
+    auth_token: &str,
 ) -> Result<FrameworkControlStateServicePlan> {
     let plan = FrameworkControlStateServicePlan {
         schema: CONTROL_SERVICE_PLAN_SCHEMA.to_string(),
@@ -375,6 +405,7 @@ pub(crate) fn write_control_state_service_plan(
         run_root: run_root.display().to_string(),
         state_root: state_root.display().to_string(),
         mesh_scope: mesh_scope.to_string(),
+        auth_token: auth_token.to_string(),
     };
     write_json(path, &plan)?;
     Ok(plan)
@@ -385,6 +416,8 @@ pub(crate) fn write_framework_ccs_plan(
     site_id: &str,
     listen_addr: SocketAddr,
     control_state_url: &str,
+    router_auth_token: &str,
+    control_state_auth_token: &str,
 ) -> Result<FrameworkCcsPlan> {
     let plan = FrameworkCcsPlan {
         schema: CCS_PLAN_SCHEMA.to_string(),
@@ -392,6 +425,8 @@ pub(crate) fn write_framework_ccs_plan(
         site_id: site_id.to_string(),
         listen_addr,
         control_state_url: control_state_url.to_string(),
+        router_auth_token: router_auth_token.to_string(),
+        control_state_auth_token: control_state_auth_token.to_string(),
     };
     write_json(path, &plan)?;
     Ok(plan)
@@ -420,12 +455,31 @@ pub(crate) fn authorize_capability_instance<'a>(
     Ok(record)
 }
 
+fn scenario_component_checked(
+    scenario: &Scenario,
+    component_id: ComponentId,
+) -> std::result::Result<&Component, ProtocolErrorResponse> {
+    scenario
+        .components
+        .get(component_id.0)
+        .and_then(Option::as_ref)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!(
+                    "framework authority realm {} is missing from the authoritative live graph",
+                    component_id.0
+                ),
+            )
+        })
+}
+
 pub(crate) fn list_templates(
     state: &FrameworkControlState,
     authority_realm_id: usize,
 ) -> std::result::Result<TemplateListResponse, ProtocolErrorResponse> {
-    let scenario = decode_base_scenario(state)?;
-    let component = scenario.component(ComponentId(authority_realm_id));
+    let scenario = decode_live_scenario(state)?;
+    let component = scenario_component_checked(&scenario, ComponentId(authority_realm_id))?;
     Ok(TemplateListResponse {
         templates: component
             .child_templates
@@ -448,9 +502,9 @@ pub(crate) fn describe_template(
     authority_realm_id: usize,
     template_name: &str,
 ) -> std::result::Result<TemplateDescribeResponse, ProtocolErrorResponse> {
-    let scenario = decode_base_scenario(state)?;
-    let scenario_ir = &state.base_scenario;
-    let component = scenario.component(ComponentId(authority_realm_id));
+    let scenario = decode_live_scenario(state)?;
+    let scenario_ir = live_scenario_ir(state)?;
+    let component = scenario_component_checked(&scenario, ComponentId(authority_realm_id))?;
     let template = component
         .child_templates
         .get(template_name)
@@ -460,7 +514,7 @@ pub(crate) fn describe_template(
     let manifest = template_manifest_description(&scenario, template)?;
     let bindable_sources = bindable_source_candidates(
         &scenario,
-        scenario_ir,
+        &scenario_ir,
         state,
         ComponentId(authority_realm_id),
     )?;
@@ -650,6 +704,7 @@ struct ResolvedTemplateBinding {
 
 #[derive(Clone)]
 struct SyntheticSourceRecord {
+    slot_name: String,
     actual_source: BindingFrom,
     source_child_id: Option<u64>,
     weak: bool,
@@ -737,23 +792,23 @@ async fn prepare_child_record(
     let mut temporary_child = child.clone();
     temporary_child.state = ChildState::Live;
     temporary.live_children.push(temporary_child);
-    let planned = build_run_plan(
-        &CompiledScenario::from_ir(live_scenario_ir(&temporary)?).map_err(|err| {
-            protocol_error(
-                ProtocolErrorCode::PlacementUnsatisfied,
-                &format!("failed to materialize live scenario for placement: {err}"),
-            )
-        })?,
-        Some(&placement_file_from_state(state)),
-    )
-    .map_err(|err| {
-        protocol_error(
-            ProtocolErrorCode::PlacementUnsatisfied,
-            &format!("child placement could not be satisfied: {err}"),
-        )
-    })?;
+    let planned = rebuild_live_run_plan(&temporary)?;
     child.assignments =
         child_fragment_assignments(&planned, child.fragment.as_ref().expect("fragment set"));
+    let allowed_dynamic_sites = run_plan_activation_from_state(state).dynamic_enabled_sites;
+    if let Some(disallowed_site) = child
+        .assignments
+        .values()
+        .find(|site_id| !allowed_dynamic_sites.contains(*site_id))
+    {
+        return Err(protocol_error(
+            ProtocolErrorCode::PlacementUnsatisfied,
+            &format!(
+                "child placement selected site `{disallowed_site}`, but the frozen run plan does \
+                 not allow dynamic workloads there"
+            ),
+        ));
+    }
     child.overlays =
         dynamic_overlay_records(&planned, child.fragment.as_ref().expect("fragment set"));
     let routed_inputs = dynamic_input_route_records(
@@ -874,6 +929,13 @@ fn child_is_visible(child: &LiveChildRecord) -> bool {
     matches!(child.state, ChildState::Live | ChildState::DestroyRequested)
 }
 
+fn child_counts_toward_template_limits(child: &LiveChildRecord) -> bool {
+    !matches!(
+        child.state,
+        ChildState::CreateAborted | ChildState::DestroyCommitted
+    )
+}
+
 fn validate_child_name(name: &str) -> std::result::Result<(), ProtocolErrorResponse> {
     if name.trim().is_empty() {
         return Err(protocol_error(
@@ -924,7 +986,7 @@ fn validate_template_limits(
             .live_children
             .iter()
             .filter(|child| child.authority_realm_id == authority_realm_id)
-            .filter(|child| child_is_visible(child))
+            .filter(|child| child_counts_toward_template_limits(child))
             .count() as u32;
         if live >= limit {
             return Err(protocol_error(
@@ -1173,6 +1235,7 @@ fn build_wrapper_manifest(
             synthetic_sources.insert(
                 synthetic_name.clone(),
                 SyntheticSourceRecord {
+                    slot_name: binding.slot_name.clone(),
                     actual_source,
                     source_child_id,
                     weak: source.weak,
@@ -1752,9 +1815,6 @@ fn extract_live_child_fragment(
         .collect::<Vec<_>>();
     components.sort_by(|left, right| left.id.cmp(&right.id));
 
-    let framework_source = synthetic_sources.iter().find_map(|(_, source)| {
-        matches!(source.actual_source, BindingFrom::Framework(_)).then_some(source.clone())
-    });
     let mut bindings = Vec::new();
     for binding in &compiled.scenario_ir().bindings {
         if binding.to.component == wrapper_root {
@@ -1804,15 +1864,29 @@ fn extract_live_child_fragment(
             BindingFromIr::Framework {
                 authority_realm, ..
             } if *authority_realm == wrapper_root => {
-                let Some(synthetic) = framework_source.as_ref() else {
+                let Some(synthetic) = synthetic_sources.values().find(|source| {
+                    source.slot_name == binding.to.slot
+                        && matches!(source.actual_source, BindingFrom::Framework(_))
+                }) else {
                     return Err(protocol_error(
                         ProtocolErrorCode::ControlStateUnavailable,
-                        "missing framework synthetic source mapping",
+                        &format!(
+                            "missing framework synthetic source mapping for slot `{}`",
+                            binding.to.slot
+                        ),
                     ));
                 };
                 rewritten.from = BindingFromIr::from(&synthetic.actual_source);
                 rewritten.weak = synthetic.weak;
                 synthetic.source_child_id
+            }
+            BindingFromIr::Framework {
+                authority_realm, ..
+            } => {
+                if let Some(remapped) = id_map.get(authority_realm) {
+                    *authority_realm = *remapped;
+                }
+                None
             }
             BindingFromIr::Component { component, .. } => {
                 *component = *id_map
@@ -1826,7 +1900,7 @@ fn extract_live_child_fragment(
                     .expect("internal binding resource source should be remapped");
                 None
             }
-            BindingFromIr::Framework { .. } | BindingFromIr::External { .. } => None,
+            BindingFromIr::External { .. } => None,
         };
         bindings.push(LiveFragmentBindingRecord {
             binding: rewritten,
@@ -2131,6 +2205,56 @@ fn placement_file_from_state(state: &FrameworkControlState) -> PlacementFile {
         defaults: state.placement.defaults.clone(),
         components,
     }
+}
+
+fn run_plan_activation_from_state(state: &FrameworkControlState) -> RunPlanActivationState {
+    let mut initial_active_sites = state.placement.initial_active_sites.clone();
+    let mut dynamic_enabled_sites = state.placement.dynamic_enabled_sites.clone();
+    let mut active_site_capabilities = state.placement.active_site_capabilities.clone();
+    for site_id in state.placement.placement_components.values() {
+        if !initial_active_sites.contains(site_id) {
+            initial_active_sites.push(site_id.clone());
+        }
+        if !dynamic_enabled_sites.contains(site_id) {
+            dynamic_enabled_sites.push(site_id.clone());
+        }
+        active_site_capabilities
+            .entry(site_id.clone())
+            .or_insert(ActiveSiteCapabilities {
+                cross_site_routing: true,
+                dynamic_workloads: true,
+                privileged_control: true,
+            });
+    }
+    RunPlanActivationState {
+        standby_sites: state.placement.standby_sites.clone(),
+        initial_active_sites,
+        dynamic_enabled_sites,
+        control_only_sites: state.placement.control_only_sites.clone(),
+        active_site_capabilities,
+    }
+}
+
+fn rebuild_live_run_plan(
+    state: &FrameworkControlState,
+) -> std::result::Result<RunPlan, ProtocolErrorResponse> {
+    let compiled = CompiledScenario::from_ir(live_scenario_ir(state)?).map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::PlacementUnsatisfied,
+            &format!("failed to materialize live scenario for placement: {err}"),
+        )
+    })?;
+    build_run_plan_with_activation(
+        &compiled,
+        Some(&placement_file_from_state(state)),
+        Some(&run_plan_activation_from_state(state)),
+    )
+    .map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::PlacementUnsatisfied,
+            &format!("child placement could not be satisfied: {err}"),
+        )
+    })
 }
 
 fn live_scenario_ir(
@@ -2969,6 +3093,8 @@ struct ControlStateApp {
     run_root: PathBuf,
     state_root: PathBuf,
     mesh_scope: Arc<str>,
+    control_state_auth_token: Arc<str>,
+    authority_locks: Arc<Mutex<BTreeMap<usize, Arc<Mutex<()>>>>>,
     bridge_proxies: Arc<Mutex<BTreeMap<BridgeProxyKey, BridgeProxyHandle>>>,
 }
 
@@ -2976,6 +3102,8 @@ struct ControlStateApp {
 struct CcsApp {
     client: ReqwestClient,
     control_state_url: Arc<str>,
+    router_auth_token: Arc<str>,
+    control_state_auth_token: Arc<str>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -3158,7 +3286,7 @@ fn full_site_plan_record(
 fn desired_site_plan_map(
     state: &FrameworkControlState,
 ) -> std::result::Result<BTreeMap<String, DynamicSitePlanRecord>, ProtocolErrorResponse> {
-    let planned = build_run_plan(
+    let planned = build_run_plan_with_activation(
         &CompiledScenario::from_ir(live_scenario_ir(state)?).map_err(|err| {
             protocol_error(
                 ProtocolErrorCode::ControlStateUnavailable,
@@ -3166,6 +3294,7 @@ fn desired_site_plan_map(
             )
         })?,
         Some(&placement_file_from_state(state)),
+        Some(&run_plan_activation_from_state(state)),
     )
     .map_err(|err| {
         protocol_error(
@@ -3346,6 +3475,9 @@ async fn publish_external_slot_overlay(
     child: &LiveChildRecord,
     link: &RunLink,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
+    let overlay_id = overlay_id_for_link_action(child, link, |action| {
+        matches!(action, DynamicOverlayAction::ExternalSlot { .. })
+    })?;
     let provider = load_launched_site(app, &link.provider_site)?;
     let consumer = load_launched_site(app, &link.consumer_site)?;
     let provider_output_dir =
@@ -3385,10 +3517,13 @@ async fn publish_external_slot_overlay(
             err,
         )
     })?;
-    update_desired_links_for_consumer(
+    update_desired_overlay_for_consumer(
         &site_state_root_for(app, &link.consumer_site),
-        &link.external_slot_name,
-        &external_url,
+        overlay_id,
+        DesiredExternalSlotOverlay {
+            slot_name: link.external_slot_name.clone(),
+            url: external_url,
+        },
     )
     .map_err(|err| {
         actuator_protocol_error(
@@ -3405,6 +3540,9 @@ async fn publish_export_peer_overlay(
     child: &LiveChildRecord,
     link: &RunLink,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
+    let overlay_id = overlay_id_for_link_action(child, link, |action| {
+        matches!(action, DynamicOverlayAction::ExportPeer { .. })
+    })?;
     let provider = load_launched_site(app, &link.provider_site)?;
     let consumer = load_launched_site(app, &link.consumer_site)?;
     let consumer_key =
@@ -3428,9 +3566,10 @@ async fn publish_export_peer_overlay(
             err,
         )
     })?;
-    update_desired_links_for_provider(
+    update_desired_overlay_for_provider(
         &site_state_root_for(app, &link.provider_site),
-        DesiredExportPeer {
+        overlay_id,
+        DesiredExportPeerOverlay {
             export_name: link.export_name.clone(),
             peer_id: consumer.router_identity.id,
             peer_key_b64: consumer_key,
@@ -3465,6 +3604,33 @@ fn child_link_records(child: &LiveChildRecord) -> Vec<RunLink> {
         );
     }
     links.into_values().collect()
+}
+
+fn child_link_overlays_are_active(child: &LiveChildRecord) -> bool {
+    matches!(
+        child.state,
+        ChildState::CreateCommittedHidden
+            | ChildState::Live
+            | ChildState::DestroyRequested
+            | ChildState::DestroyRetracted
+    )
+}
+
+fn link_still_required(
+    state: &FrameworkControlState,
+    removed_child_id: u64,
+    link: &RunLink,
+) -> bool {
+    state
+        .live_children
+        .iter()
+        .filter(|candidate| candidate.child_id != removed_child_id)
+        .filter(|candidate| child_link_overlays_are_active(candidate))
+        .any(|candidate| {
+            child_link_records(candidate)
+                .iter()
+                .any(|candidate_link| candidate_link == link)
+        })
 }
 
 fn provider_output_dir_for_link(
@@ -3515,6 +3681,29 @@ fn export_peer_route_id(
     })
 }
 
+fn overlay_id_for_link_action<'a>(
+    child: &'a LiveChildRecord,
+    link: &RunLink,
+    match_action: impl Fn(&DynamicOverlayAction) -> bool,
+) -> std::result::Result<&'a str, ProtocolErrorResponse> {
+    child
+        .overlays
+        .iter()
+        .find(|overlay| match &overlay.action {
+            DynamicOverlayAction::ExternalSlot { link: overlay_link }
+            | DynamicOverlayAction::ExportPeer { link: overlay_link } => {
+                overlay_link == link && match_action(&overlay.action)
+            }
+        })
+        .map(|overlay| overlay.overlay_id.as_str())
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                "authoritative child overlay metadata is incomplete",
+            )
+        })
+}
+
 fn link_mesh_protocol(protocol: NetworkProtocol) -> Result<MeshProtocol> {
     Ok(match protocol {
         NetworkProtocol::Http | NetworkProtocol::Https => MeshProtocol::Http,
@@ -3541,14 +3730,34 @@ async fn retract_link_overlays(
     child: &LiveChildRecord,
     link: &RunLink,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
-    clear_external_slot_overlay(app, link).await?;
-    clear_export_peer_overlay(app, child, link).await
+    clear_external_slot_overlay(app, child.child_id, child, link).await?;
+    clear_export_peer_overlay(app, child.child_id, child, link).await
 }
 
 async fn clear_external_slot_overlay(
     app: &ControlStateApp,
+    child_id: u64,
+    child: &LiveChildRecord,
     link: &RunLink,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
+    let overlay_id = overlay_id_for_link_action(child, link, |action| {
+        matches!(action, DynamicOverlayAction::ExternalSlot { .. })
+    })?;
+    clear_desired_overlay_for_consumer(&site_state_root_for(app, &link.consumer_site), overlay_id)
+        .map_err(|err| {
+            actuator_protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &link.consumer_site,
+                "persist external slot overlay removal",
+                err,
+            )
+        })?;
+    {
+        let state = app.control_state.lock().await;
+        if link_still_required(&state, child_id, link) {
+            return Ok(());
+        }
+    }
     let consumer = load_launched_site(app, &link.consumer_site)?;
     clear_external_slot_with_retry(
         &consumer.router_control,
@@ -3563,26 +3772,33 @@ async fn clear_external_slot_overlay(
             "retract external slot overlay",
             err,
         )
-    })?;
-    clear_desired_links_for_consumer(
-        &site_state_root_for(app, &link.consumer_site),
-        &link.external_slot_name,
-    )
-    .map_err(|err| {
-        actuator_protocol_error(
-            ProtocolErrorCode::ControlStateUnavailable,
-            &link.consumer_site,
-            "persist external slot retraction",
-            err,
-        )
     })
 }
 
 async fn clear_export_peer_overlay(
     app: &ControlStateApp,
+    child_id: u64,
     child: &LiveChildRecord,
     link: &RunLink,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
+    let overlay_id = overlay_id_for_link_action(child, link, |action| {
+        matches!(action, DynamicOverlayAction::ExportPeer { .. })
+    })?;
+    clear_desired_overlay_for_provider(&site_state_root_for(app, &link.provider_site), overlay_id)
+        .map_err(|err| {
+            actuator_protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &link.provider_site,
+                "persist export-peer overlay removal",
+                err,
+            )
+        })?;
+    {
+        let state = app.control_state.lock().await;
+        if link_still_required(&state, child_id, link) {
+            return Ok(());
+        }
+    }
     let provider = load_launched_site(app, &link.provider_site)?;
     let consumer = load_launched_site(app, &link.consumer_site)?;
     let consumer_key =
@@ -3603,24 +3819,6 @@ async fn clear_export_peer_overlay(
             ProtocolErrorCode::ControlStateUnavailable,
             &link.provider_site,
             "retract export-peer overlay",
-            err,
-        )
-    })?;
-    clear_desired_links_for_provider(
-        &site_state_root_for(app, &link.provider_site),
-        &DesiredExportPeer {
-            export_name: link.export_name.clone(),
-            peer_id: consumer.router_identity.id,
-            peer_key_b64: consumer_key,
-            protocol: link.protocol.to_string(),
-            route_id: Some(route_id),
-        },
-    )
-    .map_err(|err| {
-        actuator_protocol_error(
-            ProtocolErrorCode::ControlStateUnavailable,
-            &link.provider_site,
-            "persist export-peer retraction",
             err,
         )
     })
@@ -3741,6 +3939,20 @@ async fn rollback_prepared_sites(
     Ok(())
 }
 
+async fn acquire_authority_lock(
+    app: &ControlStateApp,
+    authority_realm_id: usize,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = {
+        let mut locks = app.authority_locks.lock().await;
+        locks
+            .entry(authority_realm_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    lock.lock_owned().await
+}
+
 async fn continue_create_committed_hidden(
     app: &ControlStateApp,
     child_id: u64,
@@ -3759,9 +3971,20 @@ async fn continue_create_committed_hidden(
         .iter()
         .map(|site_plan| (site_plan.site_id.clone(), site_plan))
         .collect::<BTreeMap<_, _>>();
+    let child_sites = site_plans.keys().cloned().collect::<BTreeSet<_>>();
+    let links = child_link_records(&child);
+    let mut published_child_sites = BTreeSet::new();
     for site_id in child_site_publish_order(&child) {
+        for link in links.iter().filter(|link| link.consumer_site == site_id) {
+            let provider_ready = !child_sites.contains(&link.provider_site)
+                || published_child_sites.contains(&link.provider_site);
+            if provider_ready {
+                publish_link_overlays(app, &child, link).await?;
+            }
+        }
         let site_plan = site_plans.get(&site_id).expect("site plan should exist");
         publish_child_on_site(app, child.child_id, site_plan).await?;
+        published_child_sites.insert(site_id);
     }
     publish_child_overlays(app, &child).await?;
 
@@ -3856,6 +4079,7 @@ async fn execute_create_child(
     authority_realm_id: usize,
     request: CreateChildRequest,
 ) -> std::result::Result<CreateChildResponse, ProtocolApiError> {
+    let _authority_guard = acquire_authority_lock(app, authority_realm_id).await;
     let child = {
         let mut state = app.control_state.lock().await;
         let child = prepare_child_record(&mut state, authority_realm_id, &request).await?;
@@ -3945,6 +4169,7 @@ async fn execute_destroy_child(
     authority_realm_id: usize,
     child_name: &str,
 ) -> std::result::Result<(), ProtocolApiError> {
+    let _authority_guard = acquire_authority_lock(app, authority_realm_id).await;
     let next = {
         let mut state = app.control_state.lock().await;
         let Some(child) = state
@@ -4091,6 +4316,8 @@ pub(crate) async fn run_framework_control_state(plan_path: PathBuf) -> Result<()
         run_root: PathBuf::from(&plan.run_root),
         state_root: PathBuf::from(&plan.state_root),
         mesh_scope: Arc::<str>::from(plan.mesh_scope.clone()),
+        control_state_auth_token: Arc::<str>::from(plan.auth_token),
+        authority_locks: Arc::new(Mutex::new(BTreeMap::new())),
         bridge_proxies: Arc::new(Mutex::new(BTreeMap::new())),
     };
     recover_control_state(&app_state).await?;
@@ -4150,6 +4377,8 @@ pub(crate) async fn run_framework_ccs(plan_path: PathBuf) -> Result<()> {
         .with_state(CcsApp {
             client: ReqwestClient::new(),
             control_state_url: Arc::<str>::from(plan.control_state_url),
+            router_auth_token: Arc::<str>::from(plan.router_auth_token),
+            control_state_auth_token: Arc::<str>::from(plan.control_state_auth_token),
         });
     let listener = TcpListener::bind(plan.listen_addr)
         .await
@@ -4174,14 +4403,20 @@ async fn cleanup_dynamic_bridge_proxies(app: &ControlStateApp) -> Result<()> {
     stop_bridge_proxies(&mut bridge_proxies).await
 }
 
-async fn get_control_state(State(app): State<ControlStateApp>) -> Json<FrameworkControlState> {
-    Json(app.control_state.lock().await.clone())
+async fn get_control_state(
+    State(app): State<ControlStateApp>,
+    headers: HeaderMap,
+) -> std::result::Result<Json<FrameworkControlState>, ProtocolApiError> {
+    authorize_framework_auth_header(&headers, app.control_state_auth_token.as_ref())?;
+    Ok(Json(app.control_state.lock().await.clone()))
 }
 
 async fn control_create_child(
     State(app): State<ControlStateApp>,
+    headers: HeaderMap,
     Json(request): Json<ControlCreateChildRequest>,
 ) -> std::result::Result<Json<CreateChildResponse>, ProtocolApiError> {
+    authorize_framework_auth_header(&headers, app.control_state_auth_token.as_ref())?;
     Ok(Json(
         execute_create_child(&app, request.authority_realm_id, request.request).await?,
     ))
@@ -4189,9 +4424,11 @@ async fn control_create_child(
 
 async fn control_destroy_child(
     State(app): State<ControlStateApp>,
+    headers: HeaderMap,
     AxumPath(child): AxumPath<String>,
     Json(request): Json<ControlDestroyChildRequest>,
 ) -> std::result::Result<StatusCode, ProtocolApiError> {
+    authorize_framework_auth_header(&headers, app.control_state_auth_token.as_ref())?;
     execute_destroy_child(&app, request.authority_realm_id, &child).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -4272,6 +4509,7 @@ async fn authorize_request(
     headers: &HeaderMap,
 ) -> std::result::Result<(String, CapabilityInstanceRecord, FrameworkControlState), ProtocolApiError>
 {
+    authorize_framework_auth_header(headers, app.router_auth_token.as_ref())?;
     let route_id = required_header(headers, FRAMEWORK_ROUTE_ID_HEADER)?;
     let peer_id = required_header(headers, FRAMEWORK_PEER_ID_HEADER)?;
     let state = fetch_control_state(app).await?;
@@ -4279,6 +4517,19 @@ async fn authorize_request(
         .map_err(ProtocolApiError::from)?
         .clone();
     Ok((peer_id, record, state))
+}
+
+fn authorize_framework_auth_header(
+    headers: &HeaderMap,
+    expected: &str,
+) -> std::result::Result<(), ProtocolApiError> {
+    let actual = required_header(headers, FRAMEWORK_AUTH_HEADER)?;
+    if actual != expected {
+        return Err(ProtocolApiError::unauthorized(
+            "invalid authenticated framework request header",
+        ));
+    }
+    Ok(())
 }
 
 fn required_header(
@@ -4306,11 +4557,17 @@ async fn fetch_control_state(
         app.control_state_url.trim_end_matches('/'),
         CONTROL_SERVICE_PATH
     );
-    let response = app.client.get(&url).send().await.map_err(|err| {
-        ProtocolApiError::control_state_unavailable(format!(
-            "failed to reach authoritative control-state service: {err}"
-        ))
-    })?;
+    let response = app
+        .client
+        .get(&url)
+        .header(FRAMEWORK_AUTH_HEADER, app.control_state_auth_token.as_ref())
+        .send()
+        .await
+        .map_err(|err| {
+            ProtocolApiError::control_state_unavailable(format!(
+                "failed to reach authoritative control-state service: {err}"
+            ))
+        })?;
     if !response.status().is_success() {
         return Err(ProtocolApiError::control_state_unavailable(format!(
             "authoritative control-state service returned {}",
@@ -4336,6 +4593,7 @@ async fn forward_create_child(
     let response = app
         .client
         .post(&url)
+        .header(FRAMEWORK_AUTH_HEADER, app.control_state_auth_token.as_ref())
         .json(&ControlCreateChildRequest {
             authority_realm_id,
             request,
@@ -4362,6 +4620,7 @@ async fn forward_destroy_child(
     let response = app
         .client
         .post(&url)
+        .header(FRAMEWORK_AUTH_HEADER, app.control_state_auth_token.as_ref())
         .json(&ControlDestroyChildRequest { authority_realm_id })
         .send()
         .await
@@ -4497,6 +4756,28 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
                 tmp_path.display()
             )
         })?;
+    sync_parent_directory(path)?;
+    Ok(())
+}
+
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to open parent directory {}", parent.display()))?
+                .sync_all()
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!("failed to sync parent directory {}", parent.display())
+                })?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
     Ok(())
 }
 
@@ -4512,6 +4793,7 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path, label: &str) -> Result<T
 mod tests {
     use std::fs;
 
+    use amber_compiler::run_plan::build_run_plan;
     use tempfile::TempDir;
     use url::Url;
 
@@ -4729,6 +5011,8 @@ mod tests {
             run_root,
             state_root,
             mesh_scope: Arc::<str>::from("test-mesh"),
+            control_state_auth_token: Arc::<str>::from("test-control-state-auth"),
+            authority_locks: Arc::new(Mutex::new(BTreeMap::new())),
             bridge_proxies: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -5432,6 +5716,269 @@ mod tests {
         assert_eq!(snapshot_err.code, ProtocolErrorCode::ScopeNotAllowed);
     }
 
+    #[test]
+    fn framework_auth_header_must_match_expected_token() {
+        let mut headers = HeaderMap::new();
+        let missing = authorize_framework_auth_header(&headers, "expected")
+            .expect_err("missing auth header should be rejected");
+        assert_eq!(missing.0.code, ProtocolErrorCode::Unauthorized);
+
+        headers.insert(
+            FRAMEWORK_AUTH_HEADER,
+            "wrong".parse().expect("header should parse"),
+        );
+        let wrong = authorize_framework_auth_header(&headers, "expected")
+            .expect_err("mismatched auth header should be rejected");
+        assert_eq!(wrong.0.code, ProtocolErrorCode::Unauthorized);
+
+        headers.insert(
+            FRAMEWORK_AUTH_HEADER,
+            "expected".parse().expect("header should parse"),
+        );
+        authorize_framework_auth_header(&headers, "expected")
+            .expect("matching auth header should succeed");
+    }
+
+    #[tokio::test]
+    async fn dynamic_authority_templates_are_listed_and_created_from_live_realm() {
+        let dir = TempDir::new().expect("temp dir");
+        let root_path = dir.path().join("root.json5");
+        let worker_path = dir.path().join("worker.json5");
+        let admin_path = dir.path().join("admin.json5");
+        let nested_path = dir.path().join("nested.json5");
+
+        write_file(
+            &admin_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              slots: {
+                realm: { kind: "component", optional: true }
+              },
+              program: {
+                path: "/bin/echo",
+                args: ["admin", "${slots.realm.url}"],
+                network: { endpoints: [{ name: "http", port: 8081, protocol: "http" }] }
+              },
+              provides: { http: { kind: "http", endpoint: "http" } },
+              exports: { http: "provides.http" },
+            }
+            "#,
+        );
+        write_file(
+            &nested_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                path: "/bin/echo",
+                args: ["nested"],
+                network: { endpoints: [{ name: "http", port: 8082, protocol: "http" }] }
+              },
+              provides: { http: { kind: "http", endpoint: "http" } },
+              exports: { http: "provides.http" },
+            }
+            "#,
+        );
+        write_file(
+            &worker_path,
+            &format!(
+                r##"
+                {{
+                  manifest_version: "0.3.0",
+                  slots: {{
+                    realm_cap: {{ kind: "component", optional: true }}
+                  }},
+                  program: {{
+                    path: "/bin/echo",
+                    args: ["worker"],
+                    network: {{ endpoints: [{{ name: "http", port: 8080, protocol: "http" }}] }}
+                  }},
+                  provides: {{ http: {{ kind: "http", endpoint: "http" }} }},
+                  exports: {{ http: "provides.http" }},
+                  components: {{
+                    admin: "{admin}"
+                  }},
+                  child_templates: {{
+                    nested: {{ manifest: "{nested}" }}
+                  }},
+                  bindings: [
+                    {{ to: "#admin.realm", from: "framework.component" }}
+                  ],
+                }}
+                "##,
+                admin = file_url(&admin_path),
+                nested = file_url(&nested_path),
+            ),
+        );
+        write_file(
+            &root_path,
+            &format!(
+                r#"
+                {{
+                  manifest_version: "0.3.0",
+                  slots: {{
+                    realm: {{ kind: "component", optional: true }}
+                  }},
+                  child_templates: {{
+                    worker: {{ manifest: "{worker}" }}
+                  }},
+                }}
+                "#,
+                worker = file_url(&worker_path),
+            ),
+        );
+
+        let mut state = compile_control_state(&root_path).await;
+        let state_path = dir.path().join("control-state.json");
+        write_control_state(&state_path, &state).expect("state should write");
+        let root_authority = state.base_scenario.root;
+
+        create_child(
+            &mut state,
+            root_authority,
+            CreateChildRequest {
+                template: "worker".to_string(),
+                name: "delegate".to_string(),
+                manifest: None,
+                config: BTreeMap::new(),
+                bindings: BTreeMap::new(),
+            },
+            &state_path,
+        )
+        .await
+        .expect("delegate child should be created");
+
+        let delegated_realm = state
+            .capability_instances
+            .values()
+            .find(|record| record.recipient_component_moniker == "/delegate/admin")
+            .cloned()
+            .expect("dynamic admin should receive a framework capability instance");
+        assert_eq!(
+            delegated_realm.authority_realm_moniker, "/delegate",
+            "delegated capability should originate from the dynamic child realm",
+        );
+
+        let listed = list_templates(&state, delegated_realm.authority_realm_id)
+            .expect("dynamic realm templates should be available");
+        assert_eq!(
+            listed
+                .templates
+                .iter()
+                .map(|template| template.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["nested"],
+        );
+        let described = describe_template(&state, delegated_realm.authority_realm_id, "nested")
+            .expect("dynamic realm template description should use the live realm");
+        assert_eq!(described.name, "nested");
+
+        create_child(
+            &mut state,
+            delegated_realm.authority_realm_id,
+            CreateChildRequest {
+                template: "nested".to_string(),
+                name: "inner".to_string(),
+                manifest: None,
+                config: BTreeMap::new(),
+                bindings: BTreeMap::new(),
+            },
+            &state_path,
+        )
+        .await
+        .expect("dynamic delegated authority should create inside the live child realm");
+
+        let live = decode_live_scenario(&state).expect("live scenario should decode");
+        assert!(
+            live.components_iter()
+                .any(|(_, component)| component.moniker.as_str() == "/delegate/inner"),
+            "nested child should be created under the dynamic authority realm",
+        );
+        assert!(
+            !live
+                .components_iter()
+                .any(|(_, component)| component.moniker.as_str() == "/inner"),
+            "delegated dynamic authority must not fall back to the base realm",
+        );
+    }
+
+    #[test]
+    fn shared_cross_site_link_is_retained_while_another_child_still_needs_it() {
+        let link = RunLink {
+            provider_site: "provider".to_string(),
+            consumer_site: "consumer".to_string(),
+            provider_component: "/provider".to_string(),
+            provide: "api".to_string(),
+            consumer_component: "/consumer-a".to_string(),
+            slot: "api".to_string(),
+            weak: false,
+            protocol: NetworkProtocol::Http,
+            export_name: "amber_export_shared".to_string(),
+            external_slot_name: "amber_link_shared".to_string(),
+        };
+        let mut first = empty_live_child(0, "a", 1, ChildState::Live);
+        first.overlays = vec![DynamicOverlayRecord {
+            overlay_id: "a".to_string(),
+            site_id: "consumer".to_string(),
+            action: DynamicOverlayAction::ExternalSlot { link: link.clone() },
+        }];
+        let mut second = empty_live_child(0, "b", 2, ChildState::Live);
+        second.overlays = vec![DynamicOverlayRecord {
+            overlay_id: "b".to_string(),
+            site_id: "consumer".to_string(),
+            action: DynamicOverlayAction::ExternalSlot { link: link.clone() },
+        }];
+        let state = FrameworkControlState {
+            schema: CONTROL_STATE_SCHEMA.to_string(),
+            version: CONTROL_STATE_VERSION,
+            run_id: "test".to_string(),
+            base_scenario: ScenarioIr {
+                schema: amber_scenario::SCENARIO_IR_SCHEMA.to_string(),
+                version: amber_scenario::SCENARIO_IR_VERSION,
+                root: 0,
+                components: Vec::new(),
+                bindings: Vec::new(),
+                exports: Vec::new(),
+                manifest_catalog: BTreeMap::new(),
+            },
+            placement: FrozenPlacementState {
+                offered_sites: BTreeMap::new(),
+                defaults: PlacementDefaults::default(),
+                standby_sites: Vec::new(),
+                initial_active_sites: Vec::new(),
+                dynamic_enabled_sites: Vec::new(),
+                control_only_sites: Vec::new(),
+                active_site_capabilities: BTreeMap::new(),
+                placement_components: BTreeMap::new(),
+                assignments: BTreeMap::new(),
+            },
+            generation: 0,
+            next_child_id: 2,
+            next_tx_id: 0,
+            next_component_id: 0,
+            capability_instances: BTreeMap::new(),
+            journal: Vec::new(),
+            live_children: vec![first, second],
+        };
+
+        assert!(
+            link_still_required(&state, 1, &link),
+            "retracting one child must keep a shared cross-site link in place for the survivor",
+        );
+        assert!(
+            !link_still_required(
+                &state,
+                2,
+                &RunLink {
+                    consumer_component: "/different".to_string(),
+                    ..link
+                }
+            ),
+            "different links should not be retained accidentally",
+        );
+    }
+
     #[tokio::test]
     async fn create_rejects_duplicate_names_and_destroy_is_idempotent() {
         let dir = TempDir::new().expect("temp dir");
@@ -5673,7 +6220,60 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_distinct_creates_commit_both_children() {
-        let (dir, state, state_path) = compile_exact_template_control_state().await;
+        let dir = TempDir::new().expect("temp dir");
+        let root_path = dir.path().join("root.json5");
+        let child_path = dir.path().join("child.json5");
+        write_file(
+            &child_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                image: "busybox:1.36.1",
+                entrypoint: ["/bin/sh", "-c", "sleep 1"],
+                network: { endpoints: [{ name: "http", port: 8080, protocol: "http" }] }
+              },
+              provides: { http: { kind: "http", endpoint: "http" } },
+              exports: { http: "provides.http" },
+            }
+            "#,
+        );
+        write_file(
+            &root_path,
+            &format!(
+                r#"
+                {{
+                  manifest_version: "0.3.0",
+                  slots: {{
+                    realm: {{ kind: "component", optional: true }}
+                  }},
+                  child_templates: {{
+                    worker: {{ manifest: "{child}" }}
+                  }},
+                }}
+                "#,
+                child = file_url(&child_path),
+            ),
+        );
+        let placement = PlacementFile {
+            schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+            version: amber_compiler::run_plan::PLACEMENT_VERSION,
+            sites: BTreeMap::from([(
+                "compose_local".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Compose,
+                    context: None,
+                },
+            )]),
+            defaults: PlacementDefaults {
+                image: Some("compose_local".to_string()),
+                ..PlacementDefaults::default()
+            },
+            components: BTreeMap::new(),
+        };
+        let state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
+        let state_path = dir.path().join("control-state.json");
+        write_control_state(&state_path, &state).expect("state should write");
         let root_authority = state.base_scenario.root;
         let app = test_control_state_app(&dir, state, state_path);
         let actuators = install_success_site_actuator(&app).await;

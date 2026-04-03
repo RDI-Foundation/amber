@@ -80,12 +80,18 @@ pub(super) fn materialize_launch_bundle(
                 amber_mesh::FRAMEWORK_COMPONENT_CCS_URL_ENV.to_string(),
                 crate::framework_component::ccs_url_for_site(site_plan.site.kind, port),
             );
+            framework_env.insert(
+                amber_mesh::FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV.to_string(),
+                control_state.router_auth_token.clone(),
+            );
             let plan_path = site_state_root.join("framework-ccs-plan.json");
             crate::framework_component::write_framework_ccs_plan(
                 &plan_path,
                 site_id,
                 listen_addr,
                 control_state.receipt.url.as_str(),
+                &control_state.router_auth_token,
+                &control_state.control_state_auth_token,
             )?;
             Some(plan_path)
         } else {
@@ -167,6 +173,8 @@ pub(super) fn materialize_launch_bundle(
                 version: DESIRED_LINKS_VERSION,
                 external_slots: BTreeMap::new(),
                 export_peers: Vec::new(),
+                external_slot_overlays: BTreeMap::new(),
+                export_peer_overlays: BTreeMap::new(),
             },
         )?;
         sites.insert(
@@ -212,6 +220,12 @@ fn materialize_framework_control_state(
     let root = state_root.join("framework-component");
     let state_path = root.join("control-state.json");
     crate::framework_component::write_control_state(&state_path, &control_state)?;
+    let router_auth_token =
+        crate::framework_component::generate_framework_auth_token(&run_plan.mesh_scope, "router");
+    let control_state_auth_token = crate::framework_component::generate_framework_auth_token(
+        &run_plan.mesh_scope,
+        "control-state",
+    );
 
     let listen_addr = SocketAddr::from(([127, 0, 0, 1], reserve_loopback_port()?));
     let plan_path = root.join("control-state-plan.json");
@@ -222,6 +236,7 @@ fn materialize_framework_control_state(
         state_root.parent().unwrap_or(state_root),
         state_root,
         &run_plan.mesh_scope,
+        &control_state_auth_token,
     )?;
 
     Ok(Some(MaterializedFrameworkControlState {
@@ -230,6 +245,8 @@ fn materialize_framework_control_state(
             pid: 0,
             url: crate::framework_component::control_state_service_url(listen_addr),
         },
+        router_auth_token,
+        control_state_auth_token,
     }))
 }
 
@@ -836,6 +853,8 @@ pub(super) fn prepare_site_launch(
                 })
                 .collect(),
             export_peers: Vec::new(),
+            external_slot_overlays: BTreeMap::new(),
+            export_peer_overlays: BTreeMap::new(),
         },
     )
 }

@@ -63,6 +63,15 @@ pub struct RunPlan {
     pub startup_waves: Vec<Vec<String>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunPlanActivationState {
+    pub standby_sites: Vec<String>,
+    pub initial_active_sites: Vec<String>,
+    pub dynamic_enabled_sites: Vec<String>,
+    pub control_only_sites: Vec<String>,
+    pub active_site_capabilities: BTreeMap<String, ActiveSiteCapabilities>,
+}
+
 fn default_base_scenario() -> ScenarioIr {
     ScenarioIr {
         schema: amber_scenario::SCENARIO_IR_SCHEMA.to_string(),
@@ -230,6 +239,14 @@ pub fn build_run_plan(
     compiled: &CompiledScenario,
     placement: Option<&PlacementFile>,
 ) -> Result<RunPlan, RunPlanError> {
+    build_run_plan_with_activation(compiled, placement, None)
+}
+
+pub fn build_run_plan_with_activation(
+    compiled: &CompiledScenario,
+    placement: Option<&PlacementFile>,
+    activation_override: Option<&RunPlanActivationState>,
+) -> Result<RunPlan, RunPlanError> {
     let scenario = compiled.scenario();
     let offered_sites = placement_site_definitions(placement);
     let defaults = placement
@@ -255,41 +272,80 @@ pub fn build_run_plan(
     )?;
     validate_storage_locality(scenario, &assignments_by_component)?;
 
-    let standby_sites = analyze_standby_sites(scenario, &offered_sites, &defaults)?
-        .into_iter()
-        .collect::<Vec<_>>();
-    let static_active_sites = assignments_by_component
-        .values()
-        .cloned()
+    let (
+        standby_sites,
+        initial_active_sites,
+        dynamic_enabled_sites,
+        control_only_sites,
+        active_site_capabilities,
+    ) = if let Some(activation) = activation_override {
+        validate_activation_override(&offered_sites, activation)?;
+        (
+            activation.standby_sites.clone(),
+            activation.initial_active_sites.clone(),
+            activation.dynamic_enabled_sites.clone(),
+            activation.control_only_sites.clone(),
+            activation.active_site_capabilities.clone(),
+        )
+    } else {
+        let standby_sites = analyze_standby_sites(scenario, &offered_sites, &defaults)?
+            .into_iter()
+            .collect::<Vec<_>>();
+        let static_active_sites = assignments_by_component
+            .values()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let standby_site_set = standby_sites.iter().cloned().collect::<BTreeSet<_>>();
+        let control_only_sites = Vec::new();
+        let control_only_site_set = control_only_sites.iter().cloned().collect::<BTreeSet<_>>();
+        let initial_active_sites = static_active_sites
+            .union(&standby_site_set)
+            .cloned()
+            .chain(control_only_site_set.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let dynamic_enabled_sites = initial_active_sites
+            .iter()
+            .filter(|site_id| !control_only_site_set.contains(*site_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let active_site_capabilities: BTreeMap<String, ActiveSiteCapabilities> =
+            initial_active_sites
+                .iter()
+                .map(|site_id| {
+                    (
+                        site_id.clone(),
+                        ActiveSiteCapabilities {
+                            cross_site_routing: true,
+                            dynamic_workloads: dynamic_enabled_sites.contains(site_id),
+                            privileged_control: true,
+                        },
+                    )
+                })
+                .collect();
+        (
+            standby_sites,
+            initial_active_sites,
+            dynamic_enabled_sites,
+            control_only_sites,
+            active_site_capabilities,
+        )
+    };
+    let initial_active_site_set = initial_active_sites
+        .iter()
+        .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    let standby_site_set = standby_sites.iter().cloned().collect::<BTreeSet<_>>();
-    let control_only_sites = Vec::new();
-    let control_only_site_set = control_only_sites.iter().cloned().collect::<BTreeSet<_>>();
-    let initial_active_sites = static_active_sites
-        .union(&standby_site_set)
-        .cloned()
-        .chain(control_only_site_set.iter().cloned())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let dynamic_enabled_sites = initial_active_sites
-        .iter()
-        .filter(|site_id| !control_only_site_set.contains(*site_id))
-        .cloned()
-        .collect::<Vec<_>>();
-    let active_site_capabilities: BTreeMap<String, ActiveSiteCapabilities> = initial_active_sites
-        .iter()
-        .map(|site_id| {
-            (
-                site_id.clone(),
-                ActiveSiteCapabilities {
-                    cross_site_routing: true,
-                    dynamic_workloads: dynamic_enabled_sites.contains(site_id),
-                    privileged_control: true,
-                },
-            )
-        })
-        .collect();
+    let assigned_outside_active = assignments_by_component
+        .values()
+        .find(|site_id| !initial_active_site_set.contains(site_id.as_str()))
+        .cloned();
+    if let Some(site_id) = assigned_outside_active {
+        return Err(RunPlanError::Other(format!(
+            "component placement selected site `{site_id}`, but the frozen activation state does \
+             not allow that site to be active"
+        )));
+    }
 
     let mesh_scope = scenario_mesh_scope(compiled.scenario_ir())?;
     let links = build_cross_site_links(scenario, &mesh_plan, &assignments_by_component);
@@ -409,6 +465,27 @@ pub fn build_run_plan(
         links,
         startup_waves,
     })
+}
+
+fn validate_activation_override(
+    offered_sites: &BTreeMap<String, SiteDefinition>,
+    activation: &RunPlanActivationState,
+) -> Result<(), RunPlanError> {
+    for site_id in activation
+        .standby_sites
+        .iter()
+        .chain(&activation.initial_active_sites)
+        .chain(&activation.dynamic_enabled_sites)
+        .chain(&activation.control_only_sites)
+        .chain(activation.active_site_capabilities.keys())
+    {
+        if !offered_sites.contains_key(site_id) {
+            return Err(RunPlanError::UnknownSite {
+                site_id: site_id.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub fn build_homogeneous_export_run_plan(

@@ -300,6 +300,15 @@ struct LocalHttpProxyState {
 
 const AMBER_ROUTE_ID_HEADER: &str = "x-amber-route-id";
 const AMBER_PEER_ID_HEADER: &str = "x-amber-peer-id";
+const AMBER_FRAMEWORK_AUTH_HEADER: &str = "x-amber-framework-auth";
+
+fn framework_component_auth_header_value() -> Option<HeaderValue> {
+    env::var(amber_mesh::FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .and_then(|value| HeaderValue::from_str(&value).ok())
+}
 
 #[derive(Clone)]
 struct OutboundHttpProxyState {
@@ -954,6 +963,12 @@ async fn proxy_local_http_request(
             HeaderValue::from_str(state.peer_id.as_ref())
                 .expect("peer id header value should be valid"),
         );
+        if let Some(auth_token) = framework_component_auth_header_value() {
+            request_parts.headers.insert(
+                header::HeaderName::from_static(AMBER_FRAMEWORK_AUTH_HEADER),
+                auth_token,
+            );
+        }
         if emit_telemetry {
             inject_trace_context(&span, &mut request_parts.headers);
         }
@@ -1635,6 +1650,12 @@ async fn proxy_http_request(state: HttpProxyState, req: Request<Incoming>) -> Re
                 header::HeaderName::from_static(AMBER_PEER_ID_HEADER),
                 HeaderValue::from_str(peer_id.as_ref())
                     .expect("peer id header value should be valid"),
+            );
+        }
+        if let Some(auth_token) = framework_component_auth_header_value() {
+            parts.0.headers.insert(
+                header::HeaderName::from_static(AMBER_FRAMEWORK_AUTH_HEADER),
+                auth_token,
             );
         }
         inject_trace_context(&span, &mut parts.0.headers);

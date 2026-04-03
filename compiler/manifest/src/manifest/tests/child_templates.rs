@@ -51,7 +51,7 @@ fn child_template_requires_exactly_one_manifest_source() {
 }
 
 #[test]
-fn child_templates_allow_framework_component_binding_without_component_slot() {
+fn child_templates_do_not_allow_framework_component_binding_without_component_slot() {
     let raw = parse_raw(
         r##"
         {
@@ -74,10 +74,9 @@ fn child_templates_allow_framework_component_binding_without_component_slot() {
         "##,
     );
 
-    raw.validate().expect(
-        "framework.component delegation should allow child templates without a declared component \
-         slot",
-    );
+    let err = raw.validate().unwrap_err();
+
+    assert!(matches!(err, Error::ChildTemplatesRequireComponentSlot));
 }
 
 #[test]

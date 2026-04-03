@@ -196,6 +196,7 @@ pub const MESH_PROVISION_PLAN_VERSION: &str = "2";
 pub const MESH_CONFIG_FILENAME: &str = "mesh-config.json";
 pub const MESH_IDENTITY_FILENAME: &str = "mesh-identity.json";
 pub const FRAMEWORK_COMPONENT_CCS_URL_ENV: &str = "AMBER_FRAMEWORK_COMPONENT_CCS_URL";
+pub const FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV: &str = "AMBER_FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

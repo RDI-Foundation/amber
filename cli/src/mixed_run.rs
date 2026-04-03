@@ -478,6 +478,8 @@ struct MaterializedObservability {
 struct MaterializedFrameworkControlState {
     plan_path: PathBuf,
     receipt: FrameworkControlStateReceipt,
+    router_auth_token: String,
+    control_state_auth_token: String,
 }
 
 #[derive(Clone, Debug)]
@@ -520,10 +522,30 @@ pub(crate) struct DesiredLinkState {
     pub(crate) external_slots: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) export_peers: Vec<DesiredExportPeer>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) external_slot_overlays: BTreeMap<String, DesiredExternalSlotOverlay>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) export_peer_overlays: BTreeMap<String, DesiredExportPeerOverlay>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DesiredExportPeer {
+    pub(crate) export_name: String,
+    pub(crate) peer_id: String,
+    pub(crate) peer_key_b64: String,
+    pub(crate) protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) route_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DesiredExternalSlotOverlay {
+    pub(crate) slot_name: String,
+    pub(crate) url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DesiredExportPeerOverlay {
     pub(crate) export_name: String,
     pub(crate) peer_id: String,
     pub(crate) peer_key_b64: String,

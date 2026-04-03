@@ -501,12 +501,7 @@ pub(crate) fn update_desired_links_for_consumer(
     let mut state: DesiredLinkState = if path.is_file() {
         read_json(&path, "desired links")?
     } else {
-        DesiredLinkState {
-            schema: DESIRED_LINKS_SCHEMA.to_string(),
-            version: DESIRED_LINKS_VERSION,
-            external_slots: BTreeMap::new(),
-            export_peers: Vec::new(),
-        }
+        empty_desired_link_state()
     };
     state.external_slots.insert(
         amber_compiler::mesh::external_slot_env_var(slot_name),
@@ -523,12 +518,7 @@ pub(crate) fn update_desired_links_for_provider(
     let mut state: DesiredLinkState = if path.is_file() {
         read_json(&path, "desired links")?
     } else {
-        DesiredLinkState {
-            schema: DESIRED_LINKS_SCHEMA.to_string(),
-            version: DESIRED_LINKS_VERSION,
-            external_slots: BTreeMap::new(),
-            export_peers: Vec::new(),
-        }
+        empty_desired_link_state()
     };
     if !state.export_peers.contains(&peer) {
         state.export_peers.push(peer);
@@ -536,25 +526,43 @@ pub(crate) fn update_desired_links_for_provider(
     write_json(&path, &state)
 }
 
-pub(crate) fn clear_desired_links_for_consumer(
+pub(crate) fn update_desired_overlay_for_consumer(
     site_state_root: &Path,
-    slot_name: &str,
+    overlay_id: &str,
+    overlay: DesiredExternalSlotOverlay,
 ) -> Result<()> {
     let path = desired_links_path(site_state_root);
     let mut state: DesiredLinkState = if path.is_file() {
         read_json(&path, "desired links")?
     } else {
-        return Ok(());
+        empty_desired_link_state()
     };
     state
-        .external_slots
-        .remove(&amber_compiler::mesh::external_slot_env_var(slot_name));
+        .external_slot_overlays
+        .insert(overlay_id.to_string(), overlay);
     write_json(&path, &state)
 }
 
-pub(crate) fn clear_desired_links_for_provider(
+pub(crate) fn update_desired_overlay_for_provider(
     site_state_root: &Path,
-    peer: &DesiredExportPeer,
+    overlay_id: &str,
+    overlay: DesiredExportPeerOverlay,
+) -> Result<()> {
+    let path = desired_links_path(site_state_root);
+    let mut state: DesiredLinkState = if path.is_file() {
+        read_json(&path, "desired links")?
+    } else {
+        empty_desired_link_state()
+    };
+    state
+        .export_peer_overlays
+        .insert(overlay_id.to_string(), overlay);
+    write_json(&path, &state)
+}
+
+pub(crate) fn clear_desired_overlay_for_consumer(
+    site_state_root: &Path,
+    overlay_id: &str,
 ) -> Result<()> {
     let path = desired_links_path(site_state_root);
     let mut state: DesiredLinkState = if path.is_file() {
@@ -562,8 +570,33 @@ pub(crate) fn clear_desired_links_for_provider(
     } else {
         return Ok(());
     };
-    state.export_peers.retain(|candidate| candidate != peer);
+    state.external_slot_overlays.remove(overlay_id);
     write_json(&path, &state)
+}
+
+pub(crate) fn clear_desired_overlay_for_provider(
+    site_state_root: &Path,
+    overlay_id: &str,
+) -> Result<()> {
+    let path = desired_links_path(site_state_root);
+    let mut state: DesiredLinkState = if path.is_file() {
+        read_json(&path, "desired links")?
+    } else {
+        return Ok(());
+    };
+    state.export_peer_overlays.remove(overlay_id);
+    write_json(&path, &state)
+}
+
+fn empty_desired_link_state() -> DesiredLinkState {
+    DesiredLinkState {
+        schema: DESIRED_LINKS_SCHEMA.to_string(),
+        version: DESIRED_LINKS_VERSION,
+        external_slots: BTreeMap::new(),
+        export_peers: Vec::new(),
+        external_slot_overlays: BTreeMap::new(),
+        export_peer_overlays: BTreeMap::new(),
+    }
 }
 
 pub(super) fn launched_site_from_state(
@@ -1031,6 +1064,23 @@ pub(super) async fn apply_desired_links(
             return Ok(false);
         }
     }
+    for overlay in desired.external_slot_overlays.values() {
+        if run_until_stop(
+            run_root,
+            stop_requested,
+            register_external_slot_with_retry(
+                endpoint,
+                &overlay.slot_name,
+                &overlay.url,
+                Duration::from_secs(2),
+            ),
+        )
+        .await?
+        .is_none()
+        {
+            return Ok(false);
+        }
+    }
     for peer in &desired.export_peers {
         if run_until_stop(
             run_root,
@@ -1042,6 +1092,26 @@ pub(super) async fn apply_desired_links(
                 &peer.peer_key_b64,
                 &peer.protocol,
                 peer.route_id.as_deref(),
+                Duration::from_secs(2),
+            ),
+        )
+        .await?
+        .is_none()
+        {
+            return Ok(false);
+        }
+    }
+    for overlay in desired.export_peer_overlays.values() {
+        if run_until_stop(
+            run_root,
+            stop_requested,
+            register_export_peer_with_retry(
+                endpoint,
+                &overlay.export_name,
+                &overlay.peer_id,
+                &overlay.peer_key_b64,
+                &overlay.protocol,
+                overlay.route_id.as_deref(),
                 Duration::from_secs(2),
             ),
         )

@@ -113,6 +113,71 @@ fn forwarded_endpoint_ready_rejects_reset_connection() {
     handle.join().expect("listener thread should finish");
 }
 
+#[test]
+fn desired_link_overlays_are_owned_per_overlay_id() {
+    let temp = tempdir().expect("tempdir");
+    let site_state_root = temp.path();
+
+    super::supervisor::update_desired_overlay_for_consumer(
+        site_state_root,
+        "overlay-a",
+        DesiredExternalSlotOverlay {
+            slot_name: "api".to_string(),
+            url: "http://provider".to_string(),
+        },
+    )
+    .expect("first consumer overlay should persist");
+    super::supervisor::update_desired_overlay_for_consumer(
+        site_state_root,
+        "overlay-b",
+        DesiredExternalSlotOverlay {
+            slot_name: "api".to_string(),
+            url: "http://provider".to_string(),
+        },
+    )
+    .expect("second consumer overlay should persist");
+    super::supervisor::update_desired_overlay_for_provider(
+        site_state_root,
+        "provider-a",
+        DesiredExportPeerOverlay {
+            export_name: "amber_export_shared".to_string(),
+            peer_id: "consumer-a".to_string(),
+            peer_key_b64: "a2V5".to_string(),
+            protocol: "http".to_string(),
+            route_id: Some("route-a".to_string()),
+        },
+    )
+    .expect("first provider overlay should persist");
+    super::supervisor::update_desired_overlay_for_provider(
+        site_state_root,
+        "provider-b",
+        DesiredExportPeerOverlay {
+            export_name: "amber_export_shared".to_string(),
+            peer_id: "consumer-b".to_string(),
+            peer_key_b64: "a2V5".to_string(),
+            protocol: "http".to_string(),
+            route_id: Some("route-b".to_string()),
+        },
+    )
+    .expect("second provider overlay should persist");
+
+    let path = desired_links_path(site_state_root);
+    let desired: DesiredLinkState = read_json(&path, "desired links").expect("desired links");
+    assert_eq!(desired.external_slot_overlays.len(), 2);
+    assert_eq!(desired.export_peer_overlays.len(), 2);
+
+    super::supervisor::clear_desired_overlay_for_consumer(site_state_root, "overlay-a")
+        .expect("consumer overlay removal should persist");
+    super::supervisor::clear_desired_overlay_for_provider(site_state_root, "provider-a")
+        .expect("provider overlay removal should persist");
+
+    let desired: DesiredLinkState = read_json(&path, "desired links").expect("desired links");
+    assert_eq!(desired.external_slot_overlays.len(), 1);
+    assert_eq!(desired.export_peer_overlays.len(), 1);
+    assert!(desired.external_slot_overlays.contains_key("overlay-b"));
+    assert!(desired.export_peer_overlays.contains_key("provider-b"));
+}
+
 fn test_local_mesh_config(path: &Path, protocol: MeshProtocol, port: u16) -> Result<()> {
     write_json(
         path,
