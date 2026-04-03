@@ -387,7 +387,16 @@ fn compose_file_exists(compose_dir: &Path) -> bool {
 
 fn is_expected_exited_service(service: &ComposePsEntry) -> bool {
     let name = service.service_name();
-    EXPECTED_EXITED_SERVICES.contains(&name)
+    if !is_expected_exited_state(service.state.as_str()) {
+        return false;
+    }
+
+    EXPECTED_EXITED_SERVICES.contains(&name) || name.ends_with("-egress-init")
+}
+
+fn is_expected_exited_state(state: &str) -> bool {
+    let state = state.trim().to_ascii_lowercase();
+    state == "exited" || state == "exited (0)"
 }
 
 fn classify_compose_services(services: &[ComposePsEntry]) -> ScenarioHealth {
@@ -596,8 +605,19 @@ mod tests {
             classify_compose_services(&[
                 service("controller", "running"),
                 service("amber-init", "exited (0)"),
+                service("c0-component-net-egress-init", "exited"),
             ]),
             ScenarioHealth::Healthy
+        );
+    }
+
+    #[test]
+    fn compose_health_treats_failed_egress_init_as_failed() {
+        assert_eq!(
+            classify_compose_services(&[service("c0-component-net-egress-init", "exited (1)")]),
+            ScenarioHealth::Failed(
+                "service c0-component-net-egress-init is exited (1)".to_string()
+            )
         );
     }
 

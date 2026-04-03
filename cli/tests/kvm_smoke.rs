@@ -11,9 +11,10 @@ use std::{
     fs,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
+use amber_images::{AMBER_HELPER, AMBER_PROVISIONER, AMBER_ROUTER};
 use outputs_root_support::cli_test_outputs_root;
 use target_dir_support::cargo_target_dir;
 use workspace_root_support::workspace_root;
@@ -72,6 +73,59 @@ fn build_checker_image(workspace_root: &Path) {
         );
     }
     progress("finished building Docker image");
+}
+
+fn ensure_internal_images(workspace_root: &Path) {
+    build_internal_image_if_needed(
+        AMBER_HELPER.reference,
+        &workspace_root.join("docker/amber-helper/Dockerfile"),
+    );
+    build_internal_image_if_needed(
+        AMBER_PROVISIONER.reference,
+        &workspace_root.join("docker/amber-provisioner/Dockerfile"),
+    );
+    build_internal_image_if_needed(
+        AMBER_ROUTER.reference,
+        &workspace_root.join("docker/amber-router/Dockerfile"),
+    );
+}
+
+fn build_internal_image_if_needed(tag: &str, dockerfile: &Path) {
+    if docker_image_exists(tag) {
+        return;
+    }
+
+    progress(format!("building internal image {tag}"));
+    let output = Command::new("docker")
+        .arg("buildx")
+        .arg("build")
+        .arg("--load")
+        .arg("-t")
+        .arg(tag)
+        .arg("-f")
+        .arg(dockerfile)
+        .arg(workspace_root())
+        .output()
+        .expect("failed to run docker buildx build");
+    if !output.status.success() {
+        panic!(
+            "docker buildx build failed for {tag}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
+fn docker_image_exists(tag: &str) -> bool {
+    Command::new("docker")
+        .arg("image")
+        .arg("inspect")
+        .arg(tag)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn compile_docker_compose_or_panic(amber: &Path, output_dir: &Path, manifest_path: &Path) {
@@ -178,6 +232,7 @@ fn kvm_smoke_framework_kvm_example() {
     let amber = runtime_bin_dir.join("amber");
     let example_dir = workspace_root.join("examples").join("framework-kvm");
 
+    ensure_internal_images(&workspace_root);
     build_checker_image(&workspace_root);
     compile_docker_compose_or_panic(&amber, &compose_out, &example_dir.join("scenario.json5"));
 

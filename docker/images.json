@@ -11,7 +11,7 @@
       "name": "amber-helper",
       "context": ".",
       "dockerfile": "docker/amber-helper/Dockerfile",
-      "version": "v0.2.x"
+      "version": "v0.3.x"
     },
     {
       "name": "amber-router",
