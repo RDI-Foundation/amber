@@ -719,6 +719,9 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
         sidecar_service
             .networks
             .insert(MESH_NETWORK_NAME.to_string(), EmptyMap::default());
+        sidecar_service
+            .networks
+            .insert(BOUNDARY_NETWORK_NAME.to_string(), EmptyMap::default());
         let sidecar_volume = mesh_volume_name(&svc.sidecar);
         compose
             .volumes

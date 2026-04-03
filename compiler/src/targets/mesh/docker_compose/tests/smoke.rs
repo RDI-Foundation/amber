@@ -2,6 +2,161 @@ use super::*;
 
 #[test]
 #[ignore = "requires docker + docker compose; run manually"]
+fn docker_smoke_component_reaches_public_internet_by_default() {
+    use tempfile::tempdir;
+
+    struct ComposeGuard {
+        project: PathBuf,
+    }
+
+    impl ComposeGuard {
+        fn new(project: &Path) -> Self {
+            Self {
+                project: project.to_path_buf(),
+            }
+        }
+    }
+
+    impl Drop for ComposeGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("docker")
+                .current_dir(&self.project)
+                .arg("compose")
+                .args([
+                    "down",
+                    "-v",
+                    "--remove-orphans",
+                    "--rmi",
+                    "local",
+                    "--timeout",
+                    "1",
+                ])
+                .status();
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let project = dir.path();
+    let router_platform = build_router_image();
+    let provisioner_platform = build_provisioner_image();
+    let images = internal_images();
+    let platform = require_same_platform(&[
+        (&images.router, router_platform),
+        (&images.provisioner, provisioner_platform),
+    ]);
+    ensure_image_platform("busybox:1.36.1", &platform);
+
+    let client_program = lower_test_program(
+        1,
+        json!({
+            "image": "busybox:1.36.1",
+            "entrypoint": ["sh", "-lc", "sleep infinity"],
+        }),
+    );
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        metadata: None,
+        children: vec![ComponentId(1)],
+    };
+
+    let client = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/client"),
+        digest: digest(1),
+        config: None,
+        config_schema: None,
+        program: Some(client_program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(client)],
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    };
+
+    let output = compile_output(scenario);
+    let yaml = render_compose(&output).expect("compose render ok");
+    fs::write(project.join(super::COMPOSE_FILENAME), yaml).unwrap();
+
+    let _compose_guard = ComposeGuard::new(project);
+    let compose = |args: &[&str]| {
+        let mut cmd = Command::new("docker");
+        cmd.current_dir(project).arg("compose").args(args);
+        cmd
+    };
+
+    let status = compose(&["up", "-d"]).status().unwrap();
+    assert!(status.success(), "docker compose up failed");
+
+    let probe = [
+        "HOST=example.com",
+        "BODY=/tmp/public-egress-body.txt",
+        "DNS=/tmp/public-egress-dns.txt",
+        "timeout 5 nslookup \"$HOST\" >\"$DNS\" 2>&1",
+        "wget -qO- --timeout=3 --tries=1 \"http://$HOST/\" >\"$BODY\" \
+         2>/tmp/public-egress-wget.txt",
+        "grep -q 'Example Domain' \"$BODY\"",
+    ]
+    .join(" && ");
+
+    let mut ok = false;
+    for _ in 0..5 {
+        let output = compose(&["exec", "-T", "c1-client", "sh", "-lc", probe.as_str()])
+            .output()
+            .unwrap();
+        if output.status.success() {
+            ok = true;
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    if !ok {
+        let compose_logs = compose(&["logs", "--no-color"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_else(|err| format!("failed to capture compose logs: {err}"));
+        let client_diag = compose(&[
+            "exec",
+            "-T",
+            "c1-client",
+            "sh",
+            "-lc",
+            "echo '=== /etc/resolv.conf ==='; cat /etc/resolv.conf 2>&1 || true; \
+             echo; echo '=== nslookup example.com ==='; nslookup example.com 2>&1 || true; \
+             echo; echo '=== wget http://example.com/ ==='; wget -O- --timeout=3 --tries=1 \
+             http://example.com/ 2>&1 || true",
+        ])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_else(|err| format!("failed to capture client diagnostics: {err}"));
+        panic!(
+            "client could not reach the public internet with default Compose egress\nclient \
+             diagnostics:\n{}\ncompose logs:\n{}",
+            client_diag, compose_logs
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires docker + docker compose; run manually"]
 fn docker_smoke_external_slot_routes_to_outside_service() {
     use tempfile::tempdir;
 
