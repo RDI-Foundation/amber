@@ -1,0 +1,49 @@
+# .github/workflows/test-egress-dns.yml
+name: Repro egress DNS
+
+on:
+  push:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      AMBER_IMAGE: ghcr.io/rdi-foundation/amber-cli:v0.3
+      OUT: /tmp/amber-egress-dns
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install amber CLI
+        run: |
+          docker pull "$AMBER_IMAGE"
+          cid=$(docker create "$AMBER_IMAGE")
+          docker cp "$cid:/amber" /usr/local/bin/amber
+          docker rm "$cid"
+          chmod +x /usr/local/bin/amber
+
+      - name: Compile scenario
+        run: |
+          rm -rf "$OUT"
+          amber compile examples/egress-dns/scenario.json5 --docker-compose "$OUT"
+
+      - name: Show sidecar networks
+        run: yq '.services.c0-component-net.networks' "$OUT/compose.yaml"
+
+      - name: Run scenario
+        run: |
+          docker compose -f "$OUT/compose.yaml" up -d
+          sleep 15
+          docker compose -f "$OUT/compose.yaml" logs
+
+      - name: Assert DNS fails
+        run: |
+          logs=$(docker compose -f "$OUT/compose.yaml" logs 2>&1)
+          echo "$logs" | grep -E "OK|FAIL"
+          if echo "$logs" | grep -q "FAIL nslookup"; then
+            echo "::error::BUG CONFIRMED: DNS resolution fails for components with external HTTP slots on Linux Docker"
+            exit 1
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: docker compose -f "$OUT/compose.yaml" down -v || true
