@@ -703,6 +703,8 @@ type DynamicRouteOverlays = Arc<RwLock<HashMap<String, DynamicRouteOverlay>>>;
 #[derive(Clone, Debug)]
 struct DynamicRouteOverlay {
     routes: HashMap<String, InboundRoute>,
+    peers: Vec<MeshPeer>,
+    static_issuer_grants: HashMap<String, HashSet<String>>,
 }
 
 type ExternalHttpResolveFuture =

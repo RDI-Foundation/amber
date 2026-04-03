@@ -79,6 +79,7 @@ impl TryFrom<ScenarioIr> for Scenario {
             .chain(std::iter::once(ir.root))
             .max()
             .expect("root id should be present");
+        let mut component_irs = vec![None; max_id + 1];
         let mut components = vec![None; max_id + 1];
 
         for component in ir.components {
@@ -90,6 +91,9 @@ impl TryFrom<ScenarioIr> for Scenario {
                 ensure_name_no_dot(name)?;
             }
             for name in component.provides.keys() {
+                ensure_name_no_dot(name)?;
+            }
+            for name in component.exports.keys() {
                 ensure_name_no_dot(name)?;
             }
             for name in component.resources.keys() {
@@ -124,6 +128,7 @@ impl TryFrom<ScenarioIr> for Scenario {
                     )));
                 }
             }
+            component_irs[id] = Some(component.clone());
             components[id] = Some(component.into_component());
         }
 
@@ -141,6 +146,8 @@ impl TryFrom<ScenarioIr> for Scenario {
                 })?;
             }
         }
+
+        validate_component_exports(&component_irs, &components)?;
 
         for binding in &ir.bindings {
             if let Some(name) = binding.name.as_deref() {
@@ -250,6 +257,9 @@ pub struct ComponentIr {
     pub provides: BTreeMap<String, ProvideDecl>,
     #[serde(default)]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub exports: BTreeMap<String, ComponentExportTargetIr>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub resources: BTreeMap<String, ResourceDecl>,
     #[serde(default)]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -272,6 +282,7 @@ impl ComponentIr {
             program: component.program.clone(),
             slots: component.slots.clone(),
             provides: component.provides.clone(),
+            exports: BTreeMap::new(),
             resources: component.resources.clone(),
             child_templates: component
                 .child_templates
@@ -303,6 +314,14 @@ impl ComponentIr {
             children: self.children.into_iter().map(ComponentId).collect(),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "target", rename_all = "snake_case")]
+pub enum ComponentExportTargetIr {
+    SelfProvide { provide: String },
+    SelfSlot { slot: String },
+    ChildExport { child: String, export: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -820,6 +839,126 @@ fn validate_scenario(scenario: &Scenario) -> Result<(), ScenarioIrError> {
     Ok(())
 }
 
+fn validate_component_exports(
+    component_irs: &[Option<ComponentIr>],
+    components: &[Option<Component>],
+) -> Result<(), ScenarioIrError> {
+    for component in component_irs.iter().flatten() {
+        for export_name in component.exports.keys() {
+            let mut visited = Vec::new();
+            validate_component_export_target(
+                component_irs,
+                components,
+                ComponentId(component.id),
+                export_name,
+                &mut visited,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_component_export_target(
+    component_irs: &[Option<ComponentIr>],
+    components: &[Option<Component>],
+    component_id: ComponentId,
+    export_name: &str,
+    visited: &mut Vec<(usize, String)>,
+) -> Result<(), ScenarioIrError> {
+    let visit_key = (component_id.0, export_name.to_string());
+    if visited.contains(&visit_key) {
+        return Err(invalid_scenario(format!(
+            "component export cycle detected while validating component {} export `{export_name}`",
+            component_id.0
+        )));
+    }
+    visited.push(visit_key.clone());
+
+    let result = validate_component_export_target_inner(
+        component_irs,
+        components,
+        component_id,
+        export_name,
+        visited,
+    );
+    visited.pop();
+    result
+}
+
+fn validate_component_export_target_inner(
+    component_irs: &[Option<ComponentIr>],
+    components: &[Option<Component>],
+    component_id: ComponentId,
+    export_name: &str,
+    visited: &mut Vec<(usize, String)>,
+) -> Result<(), ScenarioIrError> {
+    let context = || {
+        format!(
+            "component export `{export_name}` on component {}",
+            component_id.0
+        )
+    };
+    let component_ir = component_irs
+        .get(component_id.0)
+        .and_then(|component| component.as_ref())
+        .ok_or_else(|| invalid_scenario(context()))?;
+    let target = component_ir
+        .exports
+        .get(export_name)
+        .ok_or_else(|| invalid_scenario(context()))?;
+
+    match target {
+        ComponentExportTargetIr::SelfProvide { provide } => {
+            let _ = ensure_provide(components, component_id, provide, context)?;
+        }
+        ComponentExportTargetIr::SelfSlot { slot } => {
+            let _ = ensure_slot(components, component_id, slot, context)?;
+        }
+        ComponentExportTargetIr::ChildExport { child, export } => {
+            let parent_moniker = component_ir.moniker.as_str();
+            let child_id = component_ir
+                .children
+                .iter()
+                .copied()
+                .find(|child_id| {
+                    component_irs
+                        .get(*child_id)
+                        .and_then(|component| component.as_ref())
+                        .and_then(|component| {
+                            child_alias(parent_moniker, component.moniker.as_str())
+                        })
+                        == Some(child.as_str())
+                })
+                .ok_or_else(|| {
+                    invalid_scenario(format!("{} references missing child `{child}`", context()))
+                })?;
+            validate_component_export_target(
+                component_irs,
+                components,
+                ComponentId(child_id),
+                export,
+                visited,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn child_alias<'a>(parent_moniker: &str, child_moniker: &'a str) -> Option<&'a str> {
+    if child_moniker == "/" {
+        return None;
+    }
+    let remainder = if parent_moniker == "/" {
+        child_moniker.strip_prefix('/')?
+    } else {
+        child_moniker
+            .strip_prefix(parent_moniker)?
+            .strip_prefix('/')?
+    };
+    remainder.split('/').find(|segment| !segment.is_empty())
+}
+
 fn validate_component_tree(scenario: &Scenario) -> Result<(), ScenarioIrError> {
     let root = component_ref(&scenario.components, scenario.root, || "root".to_string())?;
     if let Some(parent) = root.parent {
@@ -1262,7 +1401,10 @@ mod tests {
     use amber_manifest::{FrameworkCapabilityName, ManifestDigest, RuntimeBackend};
     use serde_json::json;
 
-    use super::{SCENARIO_IR_SCHEMA, SCENARIO_IR_VERSION, ScenarioIr, ScenarioIrError};
+    use super::{
+        ComponentExportTargetIr, SCENARIO_IR_SCHEMA, SCENARIO_IR_VERSION, ScenarioIr,
+        ScenarioIrError,
+    };
     use crate::{
         BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
         FrameworkRef, ManifestCatalogEntry, Moniker, ProvideRef, Scenario, ScenarioExport, SlotRef,
@@ -1664,6 +1806,140 @@ mod tests {
             roundtripped.manifest_catalog.get(&catalog_key),
             scenario.manifest_catalog.get(&catalog_key)
         );
+    }
+
+    #[test]
+    fn scenario_ir_deserializes_component_exports() {
+        let ir = serde_json::from_value::<ScenarioIr>(json!({
+            "schema": SCENARIO_IR_SCHEMA,
+            "version": SCENARIO_IR_VERSION,
+            "root": 0,
+            "components": [
+                {
+                    "id": 0,
+                    "moniker": "/",
+                    "parent": null,
+                    "children": [1],
+                    "digest": ManifestDigest::new([0u8; 32]),
+                    "config": null,
+                    "program": null,
+                    "slots": {},
+                    "provides": {},
+                    "exports": {
+                        "api": {
+                            "target": "child_export",
+                            "child": "worker",
+                            "export": "api"
+                        }
+                    },
+                    "resources": {},
+                    "child_templates": {},
+                    "metadata": null
+                },
+                {
+                    "id": 1,
+                    "moniker": "/worker",
+                    "parent": 0,
+                    "children": [],
+                    "digest": ManifestDigest::new([1u8; 32]),
+                    "config": null,
+                    "program": null,
+                    "slots": {},
+                    "provides": {
+                        "api": {
+                            "kind": "http"
+                        }
+                    },
+                    "exports": {
+                        "api": {
+                            "target": "self_provide",
+                            "provide": "api"
+                        }
+                    },
+                    "resources": {},
+                    "child_templates": {},
+                    "metadata": null
+                }
+            ],
+            "bindings": [],
+            "exports": [],
+            "manifest_catalog": {}
+        }))
+        .expect("scenario IR should decode");
+        assert_eq!(
+            ir.components[0].exports.get("api"),
+            Some(&ComponentExportTargetIr::ChildExport {
+                child: "worker".to_string(),
+                export: "api".to_string(),
+            })
+        );
+        let scenario: Scenario = ir.try_into().expect("scenario should validate");
+        assert_eq!(scenario.root, ComponentId(0));
+    }
+
+    #[test]
+    fn scenario_ir_validates_child_export_aliases_through_nested_child_roots() {
+        let ir = serde_json::from_value::<ScenarioIr>(json!({
+            "schema": SCENARIO_IR_SCHEMA,
+            "version": SCENARIO_IR_VERSION,
+            "root": 0,
+            "components": [
+                {
+                    "id": 0,
+                    "moniker": "/",
+                    "parent": null,
+                    "children": [1],
+                    "digest": ManifestDigest::new([0u8; 32]),
+                    "config": null,
+                    "program": null,
+                    "slots": {},
+                    "provides": {},
+                    "exports": {
+                        "vm_http": {
+                            "target": "child_export",
+                            "child": "vm_helper",
+                            "export": "http"
+                        }
+                    },
+                    "resources": {},
+                    "child_templates": {},
+                    "metadata": null
+                },
+                {
+                    "id": 1,
+                    "moniker": "/vm_helper/root",
+                    "parent": 0,
+                    "children": [],
+                    "digest": ManifestDigest::new([1u8; 32]),
+                    "config": null,
+                    "program": null,
+                    "slots": {},
+                    "provides": {
+                        "http": {
+                            "kind": "http"
+                        }
+                    },
+                    "exports": {
+                        "http": {
+                            "target": "self_provide",
+                            "provide": "http"
+                        }
+                    },
+                    "resources": {},
+                    "child_templates": {},
+                    "metadata": null
+                }
+            ],
+            "bindings": [],
+            "exports": [],
+            "manifest_catalog": {}
+        }))
+        .expect("scenario IR should decode");
+
+        let scenario: Scenario = ir
+            .try_into()
+            .expect("nested child-root export should validate");
+        assert_eq!(scenario.root, ComponentId(0));
     }
 
     #[test]

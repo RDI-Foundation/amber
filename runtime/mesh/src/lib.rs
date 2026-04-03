@@ -203,6 +203,8 @@ pub struct MeshProvisionPlan {
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_seed: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub existing_peer_identities: Vec<MeshIdentityPublic>,
     pub targets: Vec<MeshProvisionTarget>,
 }
 
@@ -275,7 +277,7 @@ pub struct OutboundRoute {
     pub capability: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum InboundTarget {
     Local {
@@ -333,6 +335,17 @@ pub fn router_framework_route_id(
 
 pub fn router_export_route_id(export: &str, protocol: MeshProtocol) -> String {
     format!("router:export:{export}:{}", protocol_label(protocol))
+}
+
+pub fn router_dynamic_export_route_id(
+    provider_peer_id: &str,
+    export: &str,
+    protocol: MeshProtocol,
+) -> String {
+    format!(
+        "router:dynamic-export:{provider_peer_id}:{export}:{}",
+        protocol_label(protocol)
+    )
 }
 
 pub fn framework_cap_instance_id(

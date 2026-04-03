@@ -289,8 +289,11 @@ impl PreparedProxy {
         for binding in &self.export_bindings {
             let export_meta = &self.target.metadata.exports[&binding.export];
             let protocol = mesh_protocol_from_metadata(&export_meta.protocol)?;
-            let register_payload =
-                ControlExportPayload::new(&self.proxy_identity, &export_meta.protocol);
+            let register_payload = ControlExportPayload::new(
+                &self.proxy_identity,
+                &export_meta.protocol,
+                export_meta.route_id.as_deref(),
+            );
             register_export_with_retry(
                 &self.control_endpoint,
                 &binding.export,
@@ -315,8 +318,12 @@ impl PreparedProxy {
                 "registered export {} via router control ({})",
                 binding.export, self.control_endpoint
             );
+            let route_id = export_meta
+                .route_id
+                .clone()
+                .unwrap_or_else(|| router_export_route_id(&binding.export, protocol));
             outbound.push(OutboundRoute {
-                route_id: router_export_route_id(&binding.export, protocol),
+                route_id,
                 slot: binding.export.clone(),
                 capability_kind: None,
                 capability_profile: None,
@@ -622,12 +629,14 @@ pub async fn register_export_peer_with_retry(
     peer_id: &str,
     peer_key_b64: &str,
     protocol: &str,
+    route_id: Option<&str>,
     timeout: Duration,
 ) -> Result<()> {
     let payload = ControlExportPayload {
         peer_id: peer_id.to_string(),
         peer_key: peer_key_b64.to_string(),
         protocol: protocol.to_string(),
+        route_id: route_id.map(str::to_string),
     };
     let deadline = Instant::now() + timeout;
     loop {
@@ -662,12 +671,14 @@ pub async fn unregister_export_peer_with_retry(
     peer_id: &str,
     peer_key_b64: &str,
     protocol: &str,
+    route_id: Option<&str>,
     timeout: Duration,
 ) -> Result<()> {
     let payload = ControlExportPayload {
         peer_id: peer_id.to_string(),
         peer_key: peer_key_b64.to_string(),
         protocol: protocol.to_string(),
+        route_id: route_id.map(str::to_string),
     };
     let deadline = Instant::now() + timeout;
     loop {
@@ -961,6 +972,10 @@ pub fn parse_compose_proxy_metadata(raw: &str, source: &Path) -> Result<ProxyMet
             source.display()
         )
     })
+}
+
+pub fn load_output_proxy_metadata(output: &Path) -> Result<ProxyMetadata> {
+    Ok(load_proxy_target(output)?.metadata)
 }
 
 fn load_proxy_metadata_file(path: &Path) -> Result<ProxyMetadata> {
@@ -1544,15 +1559,17 @@ struct ControlExportPayload {
     peer_id: String,
     peer_key: String,
     protocol: String,
+    route_id: Option<String>,
 }
 
 impl ControlExportPayload {
-    fn new(identity: &MeshIdentity, protocol: &str) -> Self {
+    fn new(identity: &MeshIdentity, protocol: &str, route_id: Option<&str>) -> Self {
         let peer_key = base64::engine::general_purpose::STANDARD.encode(identity.public_key);
         Self {
             peer_id: identity.id.clone(),
             peer_key,
             protocol: protocol.to_string(),
+            route_id: route_id.map(str::to_string),
         }
     }
 }
@@ -1636,7 +1653,7 @@ async fn try_fetch_router_identity(
     let request = "GET /identity HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     let response = send_control_request(endpoint, request).await?;
     let (code, body) = parse_http_response(&response).ok_or(ControlUpdateError::Retryable)?;
-    control_status(code)?;
+    control_status(code, body)?;
     serde_json::from_str(body.trim())
         .map_err(|err| ControlUpdateError::Fatal(format!("invalid router identity payload: {err}")))
 }
@@ -1666,16 +1683,15 @@ async fn try_send_export_update(
     export: &str,
     payload: &ControlExportPayload,
 ) -> Result<(), ControlUpdateError> {
-    send_control_put_json(
-        endpoint,
-        &format!("/exports/{export}"),
-        &serde_json::json!({
-            "peer_id": payload.peer_id,
-            "peer_key": payload.peer_key,
-            "protocol": payload.protocol,
-        }),
-    )
-    .await
+    let mut body = serde_json::json!({
+        "peer_id": payload.peer_id,
+        "peer_key": payload.peer_key,
+        "protocol": payload.protocol,
+    });
+    if let Some(route_id) = payload.route_id.as_deref() {
+        body["route_id"] = serde_json::Value::String(route_id.to_string());
+    }
+    send_control_put_json(endpoint, &format!("/exports/{export}"), &body).await
 }
 
 async fn try_delete_export_update(
@@ -1683,26 +1699,30 @@ async fn try_delete_export_update(
     export: &str,
     payload: &ControlExportPayload,
 ) -> Result<(), ControlUpdateError> {
-    send_control_delete_json(
-        endpoint,
-        &format!("/exports/{export}"),
-        Some(&serde_json::json!({
-            "peer_id": payload.peer_id,
-            "peer_key": payload.peer_key,
-            "protocol": payload.protocol,
-        })),
-    )
-    .await
+    let mut body = serde_json::json!({
+        "peer_id": payload.peer_id,
+        "peer_key": payload.peer_key,
+        "protocol": payload.protocol,
+    });
+    if let Some(route_id) = payload.route_id.as_deref() {
+        body["route_id"] = serde_json::Value::String(route_id.to_string());
+    }
+    send_control_delete_json(endpoint, &format!("/exports/{export}"), Some(&body)).await
 }
 
-fn control_status(code: u16) -> Result<(), ControlUpdateError> {
+fn control_status(code: u16, body: &str) -> Result<(), ControlUpdateError> {
     if (200..300).contains(&code) {
         return Ok(());
     }
     Err(if code >= 500 {
         ControlUpdateError::Retryable
     } else {
-        ControlUpdateError::Fatal(format!("router control returned HTTP {code}"))
+        let detail = body.trim();
+        if detail.is_empty() {
+            ControlUpdateError::Fatal(format!("router control returned HTTP {code}"))
+        } else {
+            ControlUpdateError::Fatal(format!("router control returned HTTP {code}: {detail}"))
+        }
     })
 }
 
@@ -1718,8 +1738,8 @@ async fn send_control_put_json(
         payload.len()
     );
     let response = send_control_request(endpoint, &request).await?;
-    let (code, _) = parse_http_response(&response).ok_or(ControlUpdateError::Retryable)?;
-    control_status(code)
+    let (code, body) = parse_http_response(&response).ok_or(ControlUpdateError::Retryable)?;
+    control_status(code, body)
 }
 
 async fn send_control_delete_json(
@@ -1744,8 +1764,8 @@ async fn send_control_delete_json(
         "DELETE {path} HTTP/1.1\r\nHost: localhost\r\n{headers}Connection: close\r\n\r\n{body}"
     );
     let response = send_control_request(endpoint, &request).await?;
-    let (code, _) = parse_http_response(&response).ok_or(ControlUpdateError::Retryable)?;
-    control_status(code)
+    let (code, body) = parse_http_response(&response).ok_or(ControlUpdateError::Retryable)?;
+    control_status(code, body)
 }
 
 fn parse_http_response(response: &str) -> Option<(u16, &str)> {

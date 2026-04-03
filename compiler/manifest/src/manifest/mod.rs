@@ -17,8 +17,8 @@ use crate::{
     error::Error,
     framework::{framework_capabilities, framework_capability},
     names::{
-        ChildName, ExportName, ProvideName, ResourceName, SlotName, TemplateName,
-        ensure_name_no_dot,
+        ChildName, ExportName, FrameworkCapabilityName, ProvideName, ResourceName, SlotName,
+        TemplateName, ensure_name_no_dot,
     },
     refs::{ManifestDigest, ManifestRef, ManifestUrl},
     schema::{
@@ -334,11 +334,19 @@ fn validate_no_ambiguous_capability(
 fn validate_child_templates(
     child_templates: &BTreeMap<TemplateName, ChildTemplateDecl>,
     slots: &BTreeMap<SlotName, SlotDecl>,
+    bindings: &[RawBinding],
 ) -> Result<(), Error> {
     if !child_templates.is_empty()
         && !slots
             .values()
             .any(|slot| slot.decl.kind == CapabilityKind::Component)
+        && !bindings.iter().any(|binding| {
+            matches!(binding.from, BindingSourceRef::Framework)
+                && binding.capability
+                    == FrameworkCapabilityName::try_from("component")
+                        .expect("framework.component should be a valid capability name")
+                        .as_str()
+        })
     {
         return Err(Error::ChildTemplatesRequireComponentSlot);
     }
@@ -886,7 +894,7 @@ impl RawManifest {
         validate_component_environments(&components, &environments)?;
         validate_no_ambiguous_capability(&slots, &provides)?;
         validate_resource_decls(&resources)?;
-        validate_child_templates(&child_templates, &slots)?;
+        validate_child_templates(&child_templates, &slots, &bindings)?;
 
         let ctx = ValidateCtx {
             components: &components,

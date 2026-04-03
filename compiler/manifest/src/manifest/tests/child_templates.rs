@@ -51,6 +51,36 @@ fn child_template_requires_exactly_one_manifest_source() {
 }
 
 #[test]
+fn child_templates_allow_framework_component_binding_without_component_slot() {
+    let raw = parse_raw(
+        r##"
+        {
+          manifest_version: "0.1.0",
+          components: {
+            admin: "https://example.com/admin.json5",
+          },
+          child_templates: {
+            worker: {
+              manifest: "https://example.com/worker.json5",
+            },
+          },
+          bindings: [
+            {
+              to: "#admin.realm",
+              from: "framework.component",
+            },
+          ],
+        }
+        "##,
+    );
+
+    raw.validate().expect(
+        "framework.component delegation should allow child templates without a declared component \
+         slot",
+    );
+}
+
+#[test]
 fn child_template_allowed_manifests_must_be_non_empty() {
     let raw = parse_raw(
         r#"

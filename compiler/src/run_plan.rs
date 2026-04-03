@@ -1368,16 +1368,30 @@ fn build_site_scenario(
         component
             .children
             .retain(|child| included_set.contains(child));
-        if component.id == root_id {
-            component.slots.retain(|name, _| {
-                scenario.bindings.iter().any(|binding| {
-                    matches!(&binding.from, BindingFrom::External(slot) if slot.component == root_id && slot.name == *name)
-                        && included_set.contains(&binding.to.component)
-                })
-            });
-            component.slots.extend(synthetic_slots.clone());
-        }
         components[component_id.0] = Some(component);
+    }
+
+    let retained_root_slots = scenario
+        .bindings
+        .iter()
+        .filter_map(|binding| {
+            let BindingFrom::External(slot) = &binding.from else {
+                return None;
+            };
+            if slot.component != root_id || !included_set.contains(&binding.to.component) {
+                return None;
+            }
+            components[binding.to.component.0]
+                .as_ref()
+                .and_then(|component| component.program.as_ref())
+                .map(|_| slot.name.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    if let Some(root_component) = components[root_id.0].as_mut() {
+        root_component
+            .slots
+            .retain(|name, _| retained_root_slots.contains(name));
+        root_component.slots.extend(synthetic_slots.clone());
     }
 
     let consumer_link_by_slot = consumed_links.iter().fold(
@@ -1403,6 +1417,12 @@ fn build_site_scenario(
         else {
             continue;
         };
+        let target_component = components[binding.to.component.0]
+            .as_ref()
+            .expect("included binding target should exist");
+        if slot_decl.decl.kind != CapabilityKind::Storage && target_component.program.is_none() {
+            continue;
+        }
         if slot_decl.decl.kind == CapabilityKind::Storage {
             bindings.push(binding.clone());
             continue;

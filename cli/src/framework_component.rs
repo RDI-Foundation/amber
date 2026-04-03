@@ -20,9 +20,10 @@ use amber_compiler::{
 };
 use amber_manifest::{
     CapabilityDecl, CapabilityTransport, ComponentDecl, ComponentRef, FrameworkCapabilityName,
-    Manifest, ManifestRef, ManifestSpans, RawBinding, RawExportTarget, SlotDecl,
+    Manifest, ManifestRef, ManifestSpans, NetworkProtocol, RawBinding, RawExportTarget, SlotDecl,
 };
 use amber_mesh::{
+    MeshProtocol,
     component_protocol::{
         BindingInputDescription, ChildDescribeResponse, ChildHandle, ChildListResponse, ChildState,
         ChildSummary, ConfigFieldDescription, CreateChildRequest, CreateChildResponse, InputState,
@@ -30,7 +31,7 @@ use amber_mesh::{
         TemplateExportsDescription, TemplateLimits, TemplateListResponse,
         TemplateManifestDescription, TemplateMode, TemplateSummary,
     },
-    framework_cap_instance_id,
+    framework_cap_instance_id, router_dynamic_export_route_id, router_export_route_id,
 };
 use amber_proxy::{
     clear_external_slot_with_retry, register_export_peer_with_retry,
@@ -40,7 +41,7 @@ use amber_resolver::{Backend, RemoteResolver, Resolution, Resolver};
 use amber_scenario::{
     BindingFrom, ChildTemplate, Component, ComponentId, FrameworkRef, ProvideRef, ResourceRef,
     Scenario, ScenarioIr, SlotRef, TemplateBinding, TemplateConfigField,
-    ir::{BindingFromIr, BindingIr, ComponentIr, ManifestCatalogEntryIr},
+    ir::{BindingFromIr, BindingIr, ComponentExportTargetIr, ComponentIr, ManifestCatalogEntryIr},
 };
 use axum::{
     Json, Router,
@@ -60,8 +61,8 @@ use crate::mixed_run::{
     BridgeProxyHandle, BridgeProxyKey, DesiredExportPeer, LaunchedSite, SiteActuatorPlan,
     SiteReceipt, clear_desired_links_for_consumer, clear_desired_links_for_provider,
     launched_site_from_receipt, read_json as read_run_json, resolve_link_external_url_for_output,
-    site_actuator_child_root_for_site, site_state_path, update_desired_links_for_consumer,
-    update_desired_links_for_provider,
+    site_actuator_child_root_for_site, site_state_path, stop_bridge_proxies,
+    update_desired_links_for_consumer, update_desired_links_for_provider,
 };
 
 const CONTROL_STATE_SCHEMA: &str = "amber.framework_component.control_state";
@@ -138,13 +139,40 @@ pub(crate) struct DynamicSitePlanRecord {
     pub(crate) desired_artifact_files: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) proxy_exports: BTreeMap<String, DynamicProxyExportRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) routed_inputs: Vec<DynamicInputRouteRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct DynamicProxyExportRecord {
+    pub(crate) component_id: usize,
     pub(crate) component: String,
     pub(crate) provide: String,
     pub(crate) protocol: String,
+    pub(crate) capability_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) capability_profile: Option<String>,
+    pub(crate) target_port: u16,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct DynamicInputRouteRecord {
+    pub(crate) component: String,
+    pub(crate) slot: String,
+    pub(crate) provider_component: String,
+    pub(crate) protocol: String,
+    pub(crate) capability_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) capability_profile: Option<String>,
+    #[serde(flatten)]
+    pub(crate) target: DynamicInputRouteTarget,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "route_kind", rename_all = "snake_case")]
+pub(crate) enum DynamicInputRouteTarget {
+    ComponentProvide { provide: String },
+    DynamicExport { export_name: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -419,6 +447,7 @@ pub(crate) fn describe_template(
     template_name: &str,
 ) -> std::result::Result<TemplateDescribeResponse, ProtocolErrorResponse> {
     let scenario = decode_base_scenario(state)?;
+    let scenario_ir = &state.base_scenario;
     let component = scenario.component(ComponentId(authority_realm_id));
     let template = component
         .child_templates
@@ -427,8 +456,12 @@ pub(crate) fn describe_template(
             protocol_error(ProtocolErrorCode::UnknownTemplate, "unknown child template")
         })?;
     let manifest = template_manifest_description(&scenario, template)?;
-    let bindable_sources =
-        bindable_source_candidates(&scenario, state, ComponentId(authority_realm_id))?;
+    let bindable_sources = bindable_source_candidates(
+        &scenario,
+        scenario_ir,
+        state,
+        ComponentId(authority_realm_id),
+    )?;
     let template_config = template_config_fields(&scenario, template)?;
     let template_bindings = template_binding_fields(&scenario, template)?;
 
@@ -568,15 +601,11 @@ pub(crate) fn snapshot(
             "snapshot is allowed only for the scenario root authority",
         ));
     }
-    let mut live_scenario = Scenario::try_from(live_scenario_ir(state)?).map_err(|err| {
-        protocol_error(
-            ProtocolErrorCode::ControlStateUnavailable,
-            &format!("failed to materialize live snapshot scenario: {err}"),
-        )
-    })?;
-    let required_catalog_keys = live_scenario
-        .components_iter()
-        .flat_map(|(_, component)| component.child_templates.values())
+    let mut live_scenario_ir = live_scenario_ir(state)?;
+    let required_catalog_keys = live_scenario_ir
+        .components
+        .iter()
+        .flat_map(|component| component.child_templates.values())
         .flat_map(|template| {
             template
                 .manifest
@@ -585,11 +614,10 @@ pub(crate) fn snapshot(
                 .chain(template.allowed_manifests.clone().unwrap_or_default())
         })
         .collect::<BTreeSet<_>>();
-    live_scenario
+    live_scenario_ir
         .manifest_catalog
         .retain(|key, _| required_catalog_keys.contains(key));
-    live_scenario.normalize_order();
-    let live_scenario_ir = ScenarioIr::from(&live_scenario);
+    normalize_scenario_ir_order(&mut live_scenario_ir);
     let mut assignments = state.placement.assignments.clone();
     for child in state
         .live_children
@@ -615,12 +643,23 @@ struct ResolvedTemplateBinding {
     slot_decl: amber_manifest::SlotDecl,
     sources: Vec<ResolvedBindingSource>,
     source_child_id: Option<u64>,
+    dynamic_child_output: Option<DynamicChildOutputSource>,
 }
 
 #[derive(Clone)]
 struct SyntheticSourceRecord {
     actual_source: BindingFrom,
     source_child_id: Option<u64>,
+    weak: bool,
+}
+
+#[derive(Clone)]
+struct DynamicChildOutputSource {
+    export_name: String,
+    provider_component: String,
+    protocol: String,
+    capability_kind: String,
+    capability_profile: Option<String>,
 }
 
 async fn prepare_child_record(
@@ -629,6 +668,7 @@ async fn prepare_child_record(
     request: &CreateChildRequest,
 ) -> std::result::Result<LiveChildRecord, ProtocolErrorResponse> {
     validate_child_name(&request.name)?;
+    let current_live_scenario_ir = live_scenario_ir(state)?;
     let live_scenario = decode_live_scenario(state)?;
     let authority_realm = ComponentId(authority_realm_id);
     let authority_component = live_scenario.component(authority_realm);
@@ -640,7 +680,12 @@ async fn prepare_child_record(
         })?;
     validate_child_name_available(state, authority_realm_id, &request.name)?;
     validate_template_limits(state, authority_realm_id, &request.name, template)?;
-    let bindable_sources = bindable_source_candidates(&live_scenario, state, authority_realm)?;
+    let bindable_sources = bindable_source_candidates(
+        &live_scenario,
+        &current_live_scenario_ir,
+        state,
+        authority_realm,
+    )?;
     let selected_manifest_catalog_key = select_manifest_catalog_key(template, request)?;
     let rendered_config = build_child_config(&live_scenario, template, request)?;
     let resolved_bindings =
@@ -709,12 +754,18 @@ async fn prepare_child_record(
         child_fragment_assignments(&planned, child.fragment.as_ref().expect("fragment set"));
     child.overlays =
         dynamic_overlay_records(&planned, child.fragment.as_ref().expect("fragment set"));
+    let routed_inputs = dynamic_input_route_records(
+        &planned,
+        child.fragment.as_ref().expect("fragment set"),
+        &resolved_bindings,
+    );
     child.site_plans = dynamic_site_plans(
         &planned,
         child.fragment.as_ref().expect("fragment set"),
         &child.outputs,
         &child.overlays,
-    );
+        &routed_inputs,
+    )?;
     child.overlay_ids = child
         .overlays
         .iter()
@@ -1050,6 +1101,7 @@ fn resolve_template_bindings(
                 slot_decl,
                 sources: candidate.sources.clone(),
                 source_child_id: candidate.source_child_id,
+                dynamic_child_output: candidate.dynamic_child_output.clone(),
             }))
         })
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -1089,8 +1141,6 @@ fn build_wrapper_manifest(
     })?;
 
     let mut slots = BTreeMap::new();
-    let mut provides = BTreeMap::new();
-    let mut resources = BTreeMap::new();
     let mut bindings = Vec::new();
     let mut synthetic_sources = BTreeMap::new();
     let mut next_synthetic = 0usize;
@@ -1099,114 +1149,60 @@ fn build_wrapper_manifest(
         for source in &binding.sources {
             let synthetic_name = format!("__amber_src_{next_synthetic}");
             next_synthetic += 1;
-            let mut bind_child_from_synthetic_slot = true;
-            if !matches!(source.from, BindingFrom::Framework(_)) {
-                slots.insert(
-                    synthetic_name.clone(),
-                    SlotDecl::builder()
-                        .decl(binding.slot_decl.decl.clone())
-                        .optional(false)
-                        .multiple(false)
-                        .build(),
-                );
-            }
-
-            match &source.from {
-                BindingFrom::Component(provide) => {
-                    provides.insert(
-                        synthetic_name.clone(),
-                        amber_manifest::ProvideDecl::builder()
-                            .decl(binding.slot_decl.decl.clone())
-                            .build(),
-                    );
-                    bindings.push(raw_binding(
-                        "self",
-                        synthetic_name.clone(),
-                        "provides",
-                        synthetic_name.clone(),
-                        false,
-                    )?);
-                    synthetic_sources.insert(
-                        synthetic_name.clone(),
-                        SyntheticSourceRecord {
-                            actual_source: BindingFrom::Component(provide.clone()),
-                            source_child_id: binding
-                                .source_child_id
-                                .or_else(|| live_child_component_owner(state, provide.component.0)),
-                        },
-                    );
-                }
-                BindingFrom::Resource(resource) => {
-                    let resource_decl = scenario
-                        .component(resource.component)
-                        .resources
-                        .get(resource.name.as_str())
-                        .cloned()
-                        .ok_or_else(|| {
-                            protocol_error(
-                                ProtocolErrorCode::BindingSourceNotFound,
-                                &format!("resource source `{}` no longer exists", resource.name),
-                            )
-                        })?;
-                    resources.insert(
-                        synthetic_name.clone(),
-                        amber_manifest::ResourceDecl::builder()
-                            .kind(resource_decl.kind)
-                            .params(Default::default())
-                            .build(),
-                    );
-                    bindings.push(raw_binding(
-                        "self",
-                        synthetic_name.clone(),
-                        "resources",
-                        synthetic_name.clone(),
-                        false,
-                    )?);
-                    synthetic_sources.insert(
-                        synthetic_name.clone(),
-                        SyntheticSourceRecord {
-                            actual_source: BindingFrom::Resource(resource.clone()),
-                            source_child_id: binding.source_child_id,
-                        },
-                    );
-                }
-                BindingFrom::Framework(framework) => {
-                    bindings.push(raw_binding(
-                        &format!("#{child_name}"),
-                        binding.slot_name.clone(),
-                        "framework",
-                        framework.capability.to_string(),
-                        source.weak,
-                    )?);
-                    bind_child_from_synthetic_slot = false;
-                    synthetic_sources.insert(
-                        synthetic_name.clone(),
-                        SyntheticSourceRecord {
-                            actual_source: BindingFrom::Framework(framework.clone()),
-                            source_child_id: binding.source_child_id,
-                        },
-                    );
-                }
+            let (actual_source, source_child_id) = match &source.from {
+                BindingFrom::Component(provide) => (
+                    BindingFrom::Component(provide.clone()),
+                    binding
+                        .source_child_id
+                        .or_else(|| live_child_component_owner(state, provide.component.0)),
+                ),
+                BindingFrom::Resource(resource) => (
+                    BindingFrom::Resource(resource.clone()),
+                    binding.source_child_id,
+                ),
+                BindingFrom::Framework(framework) => (
+                    BindingFrom::Framework(framework.clone()),
+                    binding.source_child_id,
+                ),
                 BindingFrom::External(slot) => {
-                    synthetic_sources.insert(
-                        synthetic_name.clone(),
-                        SyntheticSourceRecord {
-                            actual_source: BindingFrom::External(slot.clone()),
-                            source_child_id: binding.source_child_id,
-                        },
-                    );
+                    (BindingFrom::External(slot.clone()), binding.source_child_id)
                 }
-            }
+            };
+            synthetic_sources.insert(
+                synthetic_name.clone(),
+                SyntheticSourceRecord {
+                    actual_source,
+                    source_child_id,
+                    weak: source.weak,
+                },
+            );
 
-            if bind_child_from_synthetic_slot {
+            if let BindingFrom::Framework(framework) = &source.from {
                 bindings.push(raw_binding(
                     &format!("#{child_name}"),
                     binding.slot_name.clone(),
-                    "slots",
-                    synthetic_name,
+                    "framework",
+                    framework.capability.to_string(),
                     source.weak,
                 )?);
+                continue;
             }
+
+            slots.insert(
+                synthetic_name.clone(),
+                SlotDecl::builder()
+                    .decl(binding.slot_decl.decl.clone())
+                    .optional(false)
+                    .multiple(false)
+                    .build(),
+            );
+            bindings.push(raw_binding(
+                &format!("#{child_name}"),
+                binding.slot_name.clone(),
+                "slots",
+                synthetic_name,
+                true,
+            )?);
         }
     }
 
@@ -1234,8 +1230,6 @@ fn build_wrapper_manifest(
             )?),
         )]))
         .slots(slots)
-        .provides(provides)
-        .resources(resources)
         .bindings(bindings)
         .exports(exports)
         .build()
@@ -1358,7 +1352,8 @@ fn dynamic_site_plans(
     fragment: &LiveScenarioFragment,
     outputs: &BTreeMap<String, OutputHandleRecord>,
     overlays: &[DynamicOverlayRecord],
-) -> Vec<DynamicSitePlanRecord> {
+    routed_inputs: &[DynamicInputRouteRecord],
+) -> std::result::Result<Vec<DynamicSitePlanRecord>, ProtocolErrorResponse> {
     let child_moniker_set = fragment
         .components
         .iter()
@@ -1369,86 +1364,262 @@ fn dynamic_site_plans(
         .iter()
         .map(|component| (component.id, component.moniker.as_str()))
         .collect::<BTreeMap<_, _>>();
-    desired_run_plan
-        .sites
-        .iter()
-        .filter_map(|(site_id, desired_site_plan)| {
-            let component_ids = desired_site_plan
-                .scenario_ir
-                .components
-                .iter()
-                .filter(|component| child_moniker_set.contains(component.moniker.as_str()))
-                .map(|component| component.id)
-                .collect::<Vec<_>>();
-            if component_ids.is_empty() {
-                return None;
-            }
-            let assigned_components = desired_site_plan
-                .assigned_components
-                .iter()
-                .filter(|moniker| {
-                    fragment
-                        .components
-                        .iter()
-                        .any(|component| component.moniker == **moniker)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            let mut proxy_exports = outputs
-                .iter()
-                .filter_map(|(name, output)| {
-                    let source = output.sources.iter().find_map(|source| {
-                        let BindingFromIr::Component { component, provide } = &source.from else {
-                            return None;
-                        };
-                        let moniker = child_monikers.get(component)?;
-                        (desired_run_plan.assignments.get(*moniker)? == site_id)
-                            .then_some((*moniker, provide.as_str()))
-                    })?;
-                    Some((
-                        name.clone(),
-                        DynamicProxyExportRecord {
-                            component: source.0.to_string(),
-                            provide: source.1.to_string(),
-                            protocol: match output.decl.kind.transport() {
-                                CapabilityTransport::Http => "http",
-                                CapabilityTransport::NonNetwork => return None,
-                                _ => return None,
-                            }
-                            .to_string(),
-                        },
+    let mut site_plans = Vec::new();
+    for (site_id, desired_site_plan) in &desired_run_plan.sites {
+        let component_ids = desired_site_plan
+            .scenario_ir
+            .components
+            .iter()
+            .filter(|component| child_moniker_set.contains(component.moniker.as_str()))
+            .map(|component| component.id)
+            .collect::<Vec<_>>();
+        if component_ids.is_empty() {
+            continue;
+        }
+        let assigned_components = desired_site_plan
+            .assigned_components
+            .iter()
+            .filter(|moniker| {
+                fragment
+                    .components
+                    .iter()
+                    .any(|component| component.moniker == **moniker)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut proxy_exports = BTreeMap::new();
+        for (name, output) in outputs {
+            let Some((component_id, component_moniker, provide_name)) =
+                output.sources.iter().find_map(|source| {
+                    let BindingFromIr::Component { component, provide } = &source.from else {
+                        return None;
+                    };
+                    let moniker = child_monikers.get(component)?;
+                    (desired_run_plan.assignments.get(*moniker)? == site_id).then_some((
+                        *component,
+                        *moniker,
+                        provide.as_str(),
                     ))
                 })
-                .collect::<BTreeMap<_, _>>();
-            for overlay in overlays {
-                let DynamicOverlayAction::ExportPeer { link } = &overlay.action else {
-                    continue;
-                };
-                if link.provider_site != *site_id
-                    || !child_moniker_set.contains(link.provider_component.as_str())
-                {
-                    continue;
-                }
-                proxy_exports
-                    .entry(link.export_name.clone())
-                    .or_insert_with(|| DynamicProxyExportRecord {
-                        component: link.provider_component.clone(),
-                        provide: link.provide.clone(),
-                        protocol: link.protocol.to_string(),
-                    });
+            else {
+                continue;
+            };
+            let protocol = match output.decl.kind.transport() {
+                CapabilityTransport::Http => "http",
+                CapabilityTransport::NonNetwork => continue,
+                _ => continue,
+            };
+            let export =
+                dynamic_proxy_export_record(fragment, component_id, provide_name, protocol)
+                    .ok_or_else(|| {
+                        protocol_error(
+                            ProtocolErrorCode::ControlStateUnavailable,
+                            &format!(
+                                "dynamic export `{name}` on component `{component_moniker}` could \
+                                 not be resolved to a concrete network endpoint"
+                            ),
+                        )
+                    })?;
+            proxy_exports.insert(name.clone(), export);
+        }
+        for overlay in overlays {
+            let DynamicOverlayAction::ExportPeer { link } = &overlay.action else {
+                continue;
+            };
+            if link.provider_site != *site_id
+                || !child_moniker_set.contains(link.provider_component.as_str())
+            {
+                continue;
             }
-            Some(DynamicSitePlanRecord {
-                site_id: site_id.clone(),
-                kind: desired_site_plan.site.kind,
-                router_identity_id: desired_site_plan.router_identity_id.clone(),
-                component_ids,
-                assigned_components,
-                artifact_files: desired_site_plan.artifact_files.clone(),
-                desired_artifact_files: desired_site_plan.artifact_files.clone(),
-                proxy_exports,
+            if proxy_exports.contains_key(&link.export_name) {
+                continue;
+            }
+            let component = fragment
+                .components
+                .iter()
+                .find(|component| component.moniker == link.provider_component)
+                .ok_or_else(|| {
+                    protocol_error(
+                        ProtocolErrorCode::ControlStateUnavailable,
+                        &format!(
+                            "dynamic export provider `{}` is missing from the live child fragment",
+                            link.provider_component
+                        ),
+                    )
+                })?;
+            let export = dynamic_proxy_export_record(
+                fragment,
+                component.id,
+                &link.provide,
+                &link.protocol.to_string(),
+            )
+            .ok_or_else(|| {
+                protocol_error(
+                    ProtocolErrorCode::ControlStateUnavailable,
+                    &format!(
+                        "dynamic export `{}` on component `{}` could not be resolved to a \
+                         concrete network endpoint",
+                        link.export_name, link.provider_component
+                    ),
+                )
+            })?;
+            proxy_exports.insert(link.export_name.clone(), export);
+        }
+        site_plans.push(DynamicSitePlanRecord {
+            site_id: site_id.clone(),
+            kind: desired_site_plan.site.kind,
+            router_identity_id: desired_site_plan.router_identity_id.clone(),
+            component_ids,
+            assigned_components,
+            artifact_files: desired_site_plan.artifact_files.clone(),
+            desired_artifact_files: desired_site_plan.artifact_files.clone(),
+            proxy_exports,
+            routed_inputs: routed_inputs
+                .iter()
+                .filter(|input| input.component == child_monikers[&fragment.root_component_id])
+                .filter(|input| {
+                    desired_run_plan
+                        .assignments
+                        .get(input.component.as_str())
+                        .is_some_and(|assigned_site| assigned_site == site_id)
+                })
+                .cloned()
+                .collect(),
+        });
+    }
+    Ok(site_plans)
+}
+
+fn dynamic_input_route_records(
+    run_plan: &RunPlan,
+    fragment: &LiveScenarioFragment,
+    resolved_bindings: &[ResolvedTemplateBinding],
+) -> Vec<DynamicInputRouteRecord> {
+    let Some(root_component) = fragment
+        .components
+        .iter()
+        .find(|component| component.id == fragment.root_component_id)
+    else {
+        return Vec::new();
+    };
+    let Some(child_site) = run_plan.assignments.get(root_component.moniker.as_str()) else {
+        return Vec::new();
+    };
+    let fragment_component_ids = fragment
+        .components
+        .iter()
+        .map(|component| component.id)
+        .collect::<BTreeSet<_>>();
+
+    resolved_bindings
+        .iter()
+        .filter_map(|binding| {
+            if let Some(dynamic_output) = binding.dynamic_child_output.as_ref() {
+                let provider_site = run_plan
+                    .assignments
+                    .get(dynamic_output.provider_component.as_str())?;
+                if provider_site == child_site {
+                    return Some(DynamicInputRouteRecord {
+                        component: root_component.moniker.clone(),
+                        slot: binding.slot_name.clone(),
+                        provider_component: dynamic_output.provider_component.clone(),
+                        protocol: dynamic_output.protocol.clone(),
+                        capability_kind: dynamic_output.capability_kind.clone(),
+                        capability_profile: dynamic_output.capability_profile.clone(),
+                        target: DynamicInputRouteTarget::DynamicExport {
+                            export_name: dynamic_output.export_name.clone(),
+                        },
+                    });
+                }
+            }
+
+            let [source] = binding.sources.as_slice() else {
+                return None;
+            };
+            let BindingFrom::Component(provide) = &source.from else {
+                return None;
+            };
+            if fragment_component_ids.contains(&provide.component.0) {
+                return None;
+            }
+            let provider_component = run_plan
+                .base_scenario
+                .components
+                .iter()
+                .find(|component| component.id == provide.component.0)
+                .map(|component| component.moniker.clone())?;
+            let provider_site = run_plan.assignments.get(provider_component.as_str())?;
+            (provider_site == child_site).then_some(DynamicInputRouteRecord {
+                component: root_component.moniker.clone(),
+                slot: binding.slot_name.clone(),
+                provider_component,
+                protocol: match binding.slot_decl.decl.kind.transport() {
+                    CapabilityTransport::Http => "http".to_string(),
+                    CapabilityTransport::NonNetwork => return None,
+                    _ => return None,
+                },
+                capability_kind: binding.slot_decl.decl.kind.to_string(),
+                capability_profile: binding.slot_decl.decl.profile.clone(),
+                target: DynamicInputRouteTarget::ComponentProvide {
+                    provide: provide.name.clone(),
+                },
             })
         })
         .collect()
+}
+
+fn dynamic_proxy_export_record(
+    fragment: &LiveScenarioFragment,
+    component_id: usize,
+    provide_name: &str,
+    protocol: &str,
+) -> Option<DynamicProxyExportRecord> {
+    let component = fragment
+        .components
+        .iter()
+        .find(|component| component.id == component_id)?;
+    let network = component.program.as_ref()?.network()?;
+    let protocol = protocol.parse::<NetworkProtocol>().ok()?;
+    let resolve_provide = |name: &str| {
+        let provide = component.provides.get(name)?;
+        let endpoint_name = provide.endpoint.as_deref()?;
+        let endpoint = network
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.name == endpoint_name)?;
+        Some((provide, endpoint))
+    };
+    let (provide_name, provide, endpoint) =
+        if let Some((provide, endpoint)) = resolve_provide(provide_name) {
+            (provide_name.to_string(), provide, endpoint)
+        } else {
+            let mut candidates = component
+                .provides
+                .iter()
+                .filter_map(|(name, provide)| {
+                    let endpoint_name = provide.endpoint.as_deref()?;
+                    let endpoint = network
+                        .endpoints
+                        .iter()
+                        .find(|endpoint| endpoint.name == endpoint_name)?;
+                    (endpoint.protocol == protocol).then_some((name.clone(), provide, endpoint))
+                })
+                .collect::<Vec<_>>();
+            if candidates.len() != 1 {
+                return None;
+            }
+            let (name, provide, endpoint) = candidates.pop()?;
+            (name, provide, endpoint)
+        };
+    Some(DynamicProxyExportRecord {
+        component_id,
+        component: component.moniker.clone(),
+        provide: provide_name,
+        protocol: protocol.to_string(),
+        capability_kind: provide.decl.kind.to_string(),
+        capability_profile: provide.decl.profile.clone(),
+        target_port: endpoint.port,
+    })
 }
 
 fn dynamic_overlay_records(
@@ -1600,6 +1771,7 @@ fn extract_live_child_fragment(
                     )
                 })?;
                 rewritten.from = BindingFromIr::from(&synthetic.actual_source);
+                rewritten.weak = synthetic.weak;
                 synthetic.source_child_id
             }
             BindingFromIr::Resource {
@@ -1613,6 +1785,7 @@ fn extract_live_child_fragment(
                     )
                 })?;
                 rewritten.from = BindingFromIr::from(&synthetic.actual_source);
+                rewritten.weak = synthetic.weak;
                 synthetic.source_child_id
             }
             BindingFromIr::External { slot } if slot.component == wrapper_root => {
@@ -1623,6 +1796,7 @@ fn extract_live_child_fragment(
                     )
                 })?;
                 rewritten.from = BindingFromIr::from(&synthetic.actual_source);
+                rewritten.weak = synthetic.weak;
                 synthetic.source_child_id
             }
             BindingFromIr::Framework {
@@ -1635,6 +1809,7 @@ fn extract_live_child_fragment(
                     ));
                 };
                 rewritten.from = BindingFromIr::from(&synthetic.actual_source);
+                rewritten.weak = synthetic.weak;
                 synthetic.source_child_id
             }
             BindingFromIr::Component { component, .. } => {
@@ -1939,6 +2114,7 @@ struct BindableSourceCandidate {
     decl: CapabilityDecl,
     sources: Vec<ResolvedBindingSource>,
     source_child_id: Option<u64>,
+    dynamic_child_output: Option<DynamicChildOutputSource>,
 }
 
 fn placement_file_from_state(state: &FrameworkControlState) -> PlacementFile {
@@ -2045,6 +2221,24 @@ fn decode_live_scenario(
     })
 }
 
+fn normalize_scenario_ir_order(scenario_ir: &mut ScenarioIr) {
+    let monikers = scenario_ir
+        .components
+        .iter()
+        .map(|component| (component.id, component.moniker.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for component in &mut scenario_ir.components {
+        component.children.sort_by(|left, right| {
+            let left_moniker = monikers.get(left).map(String::as_str).unwrap_or("/");
+            let right_moniker = monikers.get(right).map(String::as_str).unwrap_or("/");
+            left_moniker.cmp(right_moniker)
+        });
+    }
+    scenario_ir
+        .exports
+        .sort_by(|left, right| left.name.cmp(&right.name));
+}
+
 fn live_child_component_owner(state: &FrameworkControlState, component_id: usize) -> Option<u64> {
     state
         .live_children
@@ -2077,6 +2271,7 @@ fn output_sources_from_record(
 
 fn bindable_source_candidates(
     scenario: &Scenario,
+    scenario_ir: &ScenarioIr,
     state: &FrameworkControlState,
     authority_realm: ComponentId,
 ) -> std::result::Result<Vec<BindableSourceCandidate>, ProtocolErrorResponse> {
@@ -2084,21 +2279,13 @@ fn bindable_source_candidates(
     let mut out = Vec::new();
 
     for (name, slot) in &component.slots {
-        let sources = scenario
-            .bindings
-            .iter()
-            .filter(|binding| binding.to.component == authority_realm && binding.to.name == *name)
-            .map(|binding| ResolvedBindingSource {
-                from: binding.from.clone(),
-                weak: binding.weak,
-            })
-            .collect::<Vec<_>>();
         out.push(BindableSourceCandidate {
             selector: format!("slots.{name}"),
             handle: None,
             decl: slot.decl.clone(),
-            sources,
+            sources: slot_binding_sources(scenario, authority_realm, name),
             source_child_id: None,
+            dynamic_child_output: None,
         });
     }
 
@@ -2118,6 +2305,7 @@ fn bindable_source_candidates(
                     weak: false,
                 }],
                 source_child_id: None,
+                dynamic_child_output: None,
             }),
     );
     out.extend(
@@ -2136,8 +2324,15 @@ fn bindable_source_candidates(
                     weak: false,
                 }],
                 source_child_id: None,
+                dynamic_child_output: None,
             }),
     );
+    out.extend(static_child_export_candidates(
+        scenario,
+        scenario_ir,
+        state,
+        authority_realm,
+    )?);
 
     for child in state
         .live_children
@@ -2152,6 +2347,7 @@ fn bindable_source_candidates(
                 decl: output.decl.clone(),
                 sources: output_sources_from_record(output)?,
                 source_child_id: Some(child.child_id),
+                dynamic_child_output: dynamic_child_output_source(child, export_name, output),
             });
         }
     }
@@ -2180,15 +2376,295 @@ fn bindable_source_candidates(
                                     component: scenario.root,
                                     name: external_name,
                                 }),
-                                weak: false,
+                                weak: true,
                             }],
                             source_child_id: None,
+                            dynamic_child_output: None,
                         })
                 }),
         );
     }
 
     Ok(out)
+}
+
+fn slot_binding_sources(
+    scenario: &Scenario,
+    component_id: ComponentId,
+    slot_name: &str,
+) -> Vec<ResolvedBindingSource> {
+    scenario
+        .bindings
+        .iter()
+        .filter(|binding| binding.to.component == component_id && binding.to.name == slot_name)
+        .map(|binding| ResolvedBindingSource {
+            from: binding.from.clone(),
+            weak: binding.weak,
+        })
+        .collect()
+}
+
+fn static_child_export_candidates(
+    scenario: &Scenario,
+    scenario_ir: &ScenarioIr,
+    state: &FrameworkControlState,
+    authority_realm: ComponentId,
+) -> std::result::Result<Vec<BindableSourceCandidate>, ProtocolErrorResponse> {
+    let authority_component = scenario.component(authority_realm);
+    let authority_component_ir = component_ir(scenario_ir, authority_realm)?;
+    let dynamic_child_roots = state
+        .live_children
+        .iter()
+        .filter(|child| child.authority_realm_id == authority_realm.0)
+        .filter(|child| child_is_visible(child))
+        .filter_map(|child| {
+            child
+                .fragment
+                .as_ref()
+                .map(|fragment| fragment.root_component_id)
+        })
+        .collect::<BTreeSet<_>>();
+    let mut out = Vec::new();
+
+    for child_id in &authority_component_ir.children {
+        if dynamic_child_roots.contains(child_id) {
+            continue;
+        }
+        let child_component_id = ComponentId(*child_id);
+        let child_component = scenario.component(child_component_id);
+        let Some(child_name) = child_alias(
+            authority_component.moniker.as_str(),
+            child_component.moniker.as_str(),
+        ) else {
+            continue;
+        };
+        let child_component_ir = component_ir(scenario_ir, child_component_id)?;
+        for export_name in child_component_ir.exports.keys() {
+            let resolved = resolve_component_export_candidate(
+                scenario,
+                scenario_ir,
+                child_component_id,
+                export_name,
+            )?;
+            out.push(BindableSourceCandidate {
+                selector: format!("children.{child_name}.exports.{export_name}"),
+                handle: None,
+                decl: resolved.decl,
+                sources: resolved.sources,
+                source_child_id: None,
+                dynamic_child_output: None,
+            });
+        }
+    }
+
+    Ok(out)
+}
+
+fn component_ir(
+    scenario_ir: &ScenarioIr,
+    component_id: ComponentId,
+) -> std::result::Result<&ComponentIr, ProtocolErrorResponse> {
+    scenario_ir
+        .components
+        .iter()
+        .find(|component| component.id == component_id.0)
+        .ok_or_else(|| {
+            protocol_error(
+                ProtocolErrorCode::ControlStateUnavailable,
+                &format!(
+                    "component id {} is missing from frozen scenario IR",
+                    component_id.0
+                ),
+            )
+        })
+}
+
+struct ResolvedComponentExportCandidate {
+    decl: CapabilityDecl,
+    sources: Vec<ResolvedBindingSource>,
+}
+
+fn resolve_component_export_candidate(
+    scenario: &Scenario,
+    scenario_ir: &ScenarioIr,
+    component_id: ComponentId,
+    export_name: &str,
+) -> std::result::Result<ResolvedComponentExportCandidate, ProtocolErrorResponse> {
+    resolve_component_export_candidate_inner(
+        scenario,
+        scenario_ir,
+        component_id,
+        export_name,
+        &mut BTreeSet::new(),
+    )
+}
+
+fn resolve_component_export_candidate_inner(
+    scenario: &Scenario,
+    scenario_ir: &ScenarioIr,
+    component_id: ComponentId,
+    export_name: &str,
+    visited: &mut BTreeSet<(usize, String)>,
+) -> std::result::Result<ResolvedComponentExportCandidate, ProtocolErrorResponse> {
+    if !visited.insert((component_id.0, export_name.to_string())) {
+        return Err(protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!(
+                "component export cycle detected while resolving component {} export \
+                 `{export_name}`",
+                component_id.0
+            ),
+        ));
+    }
+
+    let result = resolve_component_export_candidate_target(
+        scenario,
+        scenario_ir,
+        component_id,
+        export_name,
+        visited,
+    );
+    visited.remove(&(component_id.0, export_name.to_string()));
+    result
+}
+
+fn resolve_component_export_candidate_target(
+    scenario: &Scenario,
+    scenario_ir: &ScenarioIr,
+    component_id: ComponentId,
+    export_name: &str,
+    visited: &mut BTreeSet<(usize, String)>,
+) -> std::result::Result<ResolvedComponentExportCandidate, ProtocolErrorResponse> {
+    let component = scenario.component(component_id);
+    let component_ir = component_ir(scenario_ir, component_id)?;
+    let target = component_ir.exports.get(export_name).ok_or_else(|| {
+        protocol_error(
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!(
+                "component {} export `{export_name}` is missing from frozen scenario IR",
+                component_id.0
+            ),
+        )
+    })?;
+
+    match target {
+        ComponentExportTargetIr::SelfProvide { provide } => {
+            let provide_decl = component.provides.get(provide).ok_or_else(|| {
+                protocol_error(
+                    ProtocolErrorCode::ControlStateUnavailable,
+                    &format!(
+                        "component {} export `{export_name}` references missing provide \
+                         `{provide}`",
+                        component_id.0
+                    ),
+                )
+            })?;
+            Ok(ResolvedComponentExportCandidate {
+                decl: provide_decl.decl.clone(),
+                sources: vec![ResolvedBindingSource {
+                    from: BindingFrom::Component(ProvideRef {
+                        component: component_id,
+                        name: provide.clone(),
+                    }),
+                    weak: false,
+                }],
+            })
+        }
+        ComponentExportTargetIr::SelfSlot { slot } => {
+            let slot_decl = component.slots.get(slot).ok_or_else(|| {
+                protocol_error(
+                    ProtocolErrorCode::ControlStateUnavailable,
+                    &format!(
+                        "component {} export `{export_name}` references missing slot `{slot}`",
+                        component_id.0
+                    ),
+                )
+            })?;
+            Ok(ResolvedComponentExportCandidate {
+                decl: slot_decl.decl.clone(),
+                sources: slot_binding_sources(scenario, component_id, slot),
+            })
+        }
+        ComponentExportTargetIr::ChildExport { child, export } => {
+            let parent_moniker = component.moniker.as_str();
+            let child_component_id = component_ir
+                .children
+                .iter()
+                .copied()
+                .find(|child_id| {
+                    child_alias(
+                        parent_moniker,
+                        scenario.component(ComponentId(*child_id)).moniker.as_str(),
+                    ) == Some(child.as_str())
+                })
+                .map(ComponentId)
+                .ok_or_else(|| {
+                    protocol_error(
+                        ProtocolErrorCode::ControlStateUnavailable,
+                        &format!(
+                            "component {} export `{export_name}` references missing child \
+                             `{child}`",
+                            component_id.0
+                        ),
+                    )
+                })?;
+            resolve_component_export_candidate_inner(
+                scenario,
+                scenario_ir,
+                child_component_id,
+                export,
+                visited,
+            )
+        }
+    }
+}
+
+fn child_alias<'a>(parent_moniker: &str, child_moniker: &'a str) -> Option<&'a str> {
+    if child_moniker == "/" {
+        return None;
+    }
+    let remainder = if parent_moniker == "/" {
+        child_moniker.strip_prefix('/')?
+    } else {
+        child_moniker
+            .strip_prefix(parent_moniker)?
+            .strip_prefix('/')?
+    };
+    remainder.split('/').find(|segment| !segment.is_empty())
+}
+
+fn dynamic_child_output_source(
+    child: &LiveChildRecord,
+    export_name: &str,
+    output: &OutputHandleRecord,
+) -> Option<DynamicChildOutputSource> {
+    let BindingFromIr::Component {
+        component,
+        provide: _,
+    } = output.sources.first()?.from.clone()
+    else {
+        return None;
+    };
+    let provider_component = child
+        .fragment
+        .as_ref()?
+        .components
+        .iter()
+        .find(|candidate| candidate.id == component)?
+        .moniker
+        .clone();
+    let protocol = match output.decl.kind.transport() {
+        CapabilityTransport::Http => "http",
+        CapabilityTransport::NonNetwork => return None,
+        _ => return None,
+    };
+    Some(DynamicChildOutputSource {
+        export_name: export_name.to_string(),
+        provider_component,
+        protocol: protocol.to_string(),
+        capability_kind: output.decl.kind.to_string(),
+        capability_profile: output.decl.profile.clone(),
+    })
 }
 
 fn find_bindable_source<'a>(
@@ -2673,6 +3149,7 @@ fn full_site_plan_record(
         artifact_files: site_plan.artifact_files.clone(),
         desired_artifact_files: site_plan.artifact_files.clone(),
         proxy_exports: BTreeMap::new(),
+        routed_inputs: Vec::new(),
     }
 }
 
@@ -2923,18 +3400,21 @@ async fn publish_external_slot_overlay(
 
 async fn publish_export_peer_overlay(
     app: &ControlStateApp,
+    child: &LiveChildRecord,
     link: &RunLink,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
     let provider = load_launched_site(app, &link.provider_site)?;
     let consumer = load_launched_site(app, &link.consumer_site)?;
     let consumer_key =
         base64::engine::general_purpose::STANDARD.encode(consumer.router_identity.public_key);
+    let route_id = export_peer_route_id(child, link)?;
     register_export_peer_with_retry(
         &provider.router_control,
         &link.export_name,
         &consumer.router_identity.id,
         &consumer_key,
         &link.protocol.to_string(),
+        Some(&route_id),
         Duration::from_secs(30),
     )
     .await
@@ -2953,6 +3433,7 @@ async fn publish_export_peer_overlay(
             peer_id: consumer.router_identity.id,
             peer_key_b64: consumer_key,
             protocol: link.protocol.to_string(),
+            route_id: Some(route_id),
         },
     )
     .map_err(|err| {
@@ -3006,21 +3487,60 @@ fn provider_output_dir_for_link(
     .join("artifact")
 }
 
+fn export_peer_route_id(
+    child: &LiveChildRecord,
+    link: &RunLink,
+) -> std::result::Result<String, ProtocolErrorResponse> {
+    let protocol = link_mesh_protocol(link.protocol).map_err(|err| {
+        protocol_error(
+            ProtocolErrorCode::PublishFailed,
+            &format!(
+                "provider link `{}` uses an unsupported mesh transport: {err}",
+                link.export_name
+            ),
+        )
+    })?;
+    let provider_in_child = child.fragment.as_ref().is_some_and(|fragment| {
+        fragment
+            .components
+            .iter()
+            .any(|component| component.moniker == link.provider_component)
+    });
+    Ok(if provider_in_child {
+        router_dynamic_export_route_id(&link.provider_component, &link.export_name, protocol)
+    } else {
+        router_export_route_id(&link.export_name, protocol)
+    })
+}
+
+fn link_mesh_protocol(protocol: NetworkProtocol) -> Result<MeshProtocol> {
+    Ok(match protocol {
+        NetworkProtocol::Http | NetworkProtocol::Https => MeshProtocol::Http,
+        NetworkProtocol::Tcp => MeshProtocol::Tcp,
+        _ => {
+            return Err(miette::miette!(
+                "mixed-site mesh links do not support protocol `{protocol}`"
+            ));
+        }
+    })
+}
+
 async fn publish_link_overlays(
     app: &ControlStateApp,
     child: &LiveChildRecord,
     link: &RunLink,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
     publish_external_slot_overlay(app, child, link).await?;
-    publish_export_peer_overlay(app, link).await
+    publish_export_peer_overlay(app, child, link).await
 }
 
 async fn retract_link_overlays(
     app: &ControlStateApp,
+    child: &LiveChildRecord,
     link: &RunLink,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
     clear_external_slot_overlay(app, link).await?;
-    clear_export_peer_overlay(app, link).await
+    clear_export_peer_overlay(app, child, link).await
 }
 
 async fn clear_external_slot_overlay(
@@ -3058,18 +3578,21 @@ async fn clear_external_slot_overlay(
 
 async fn clear_export_peer_overlay(
     app: &ControlStateApp,
+    child: &LiveChildRecord,
     link: &RunLink,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
     let provider = load_launched_site(app, &link.provider_site)?;
     let consumer = load_launched_site(app, &link.consumer_site)?;
     let consumer_key =
         base64::engine::general_purpose::STANDARD.encode(consumer.router_identity.public_key);
+    let route_id = export_peer_route_id(child, link)?;
     unregister_export_peer_with_retry(
         &provider.router_control,
         &link.export_name,
         &consumer.router_identity.id,
         &consumer_key,
         &link.protocol.to_string(),
+        Some(&route_id),
         Duration::from_secs(30),
     )
     .await
@@ -3088,6 +3611,7 @@ async fn clear_export_peer_overlay(
             peer_id: consumer.router_identity.id,
             peer_key_b64: consumer_key,
             protocol: link.protocol.to_string(),
+            route_id: Some(route_id),
         },
     )
     .map_err(|err| {
@@ -3115,7 +3639,7 @@ async fn retract_child_overlays(
     child: &LiveChildRecord,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
     for link in child_link_records(child) {
-        retract_link_overlays(app, &link).await?;
+        retract_link_overlays(app, child, &link).await?;
     }
     Ok(())
 }
@@ -3577,7 +4101,7 @@ pub(crate) async fn run_framework_control_state(plan_path: PathBuf) -> Result<()
             "/v1/control-state/children/{child}/destroy",
             post(control_destroy_child),
         )
-        .with_state(app_state);
+        .with_state(app_state.clone());
     let listener = TcpListener::bind(plan.listen_addr)
         .await
         .into_diagnostic()
@@ -3587,11 +4111,22 @@ pub(crate) async fn run_framework_control_state(plan_path: PathBuf) -> Result<()
                 plan.listen_addr
             )
         })?;
-    axum::serve(listener, app.into_make_service())
+    let serve_result = axum::serve(listener, app.into_make_service())
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .into_diagnostic()
-        .wrap_err("framework control-state service failed")
+        .into_diagnostic();
+    let cleanup_result = cleanup_dynamic_bridge_proxies(&app_state).await;
+    match (serve_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(err), Ok(())) => Err(err).wrap_err("framework control-state service failed"),
+        (Ok(()), Err(err)) => {
+            Err(err).wrap_err("framework control-state service failed to stop bridge proxies")
+        }
+        (Err(serve_err), Err(cleanup_err)) => Err(miette::miette!(
+            "framework control-state service failed: {serve_err}\nbridge proxy cleanup failed: \
+             {cleanup_err}"
+        )),
+    }
 }
 
 pub(crate) async fn run_framework_ccs(plan_path: PathBuf) -> Result<()> {
@@ -3627,6 +4162,14 @@ pub(crate) async fn run_framework_ccs(plan_path: PathBuf) -> Result<()> {
 
 async fn healthz() -> Json<serde_json::Value> {
     Json(json!({ "ok": true }))
+}
+
+async fn cleanup_dynamic_bridge_proxies(app: &ControlStateApp) -> Result<()> {
+    let mut bridge_proxies = {
+        let mut guard = app.bridge_proxies.lock().await;
+        std::mem::take(&mut *guard)
+    };
+    stop_bridge_proxies(&mut bridge_proxies).await
 }
 
 async fn get_control_state(State(app): State<ControlStateApp>) -> Json<FrameworkControlState> {
@@ -4007,6 +4550,45 @@ mod tests {
         compile_control_state_with_placement(root_path, None).await
     }
 
+    async fn compile_control_state_from_ir(
+        scenario_ir: ScenarioIr,
+        placement: Option<&PlacementFile>,
+    ) -> FrameworkControlState {
+        let compiled = CompiledScenario::from_ir(scenario_ir).expect("fixture should load from ir");
+        let run_plan =
+            build_run_plan(&compiled, placement).expect("fixture should produce replay run plan");
+        build_control_state("test-run", &run_plan).expect("fixture should build replay state")
+    }
+
+    #[derive(Deserialize)]
+    struct SnapshotPlacementFixture {
+        offered_sites: BTreeMap<String, SiteDefinition>,
+        defaults: PlacementDefaults,
+        #[serde(default)]
+        assignments: BTreeMap<String, String>,
+    }
+
+    fn placement_from_snapshot(snapshot: &SnapshotResponse) -> PlacementFile {
+        let placement: SnapshotPlacementFixture =
+            serde_json::from_value(snapshot.placement.clone()).expect("snapshot placement");
+        PlacementFile {
+            schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+            version: amber_compiler::run_plan::PLACEMENT_VERSION,
+            sites: placement.offered_sites,
+            defaults: placement.defaults,
+            components: placement.assignments,
+        }
+    }
+
+    async fn compile_control_state_from_snapshot(
+        snapshot: &SnapshotResponse,
+    ) -> FrameworkControlState {
+        let scenario_ir: ScenarioIr =
+            serde_json::from_value(snapshot.scenario.clone()).expect("snapshot scenario");
+        let placement = placement_from_snapshot(snapshot);
+        compile_control_state_from_ir(scenario_ir, Some(&placement)).await
+    }
+
     async fn compile_empty_control_state() -> (TempDir, FrameworkControlState, PathBuf) {
         let dir = TempDir::new().expect("temp dir");
         let root_path = dir.path().join("root.json5");
@@ -4108,6 +4690,73 @@ mod tests {
             mesh_scope: Arc::<str>::from("test-mesh"),
             bridge_proxies: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    async fn install_success_site_actuator(
+        app: &ControlStateApp,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let offered_sites = {
+            let state = app.control_state.lock().await;
+            state
+                .placement
+                .offered_sites
+                .iter()
+                .map(|(site_id, site)| (site_id.clone(), site.kind))
+                .collect::<Vec<_>>()
+        };
+        let mut handles = Vec::with_capacity(offered_sites.len());
+        for (site_id, site_kind) in offered_sites {
+            let site_state_root = Path::new(&app.state_root).join(&site_id);
+            fs::create_dir_all(&site_state_root).expect("site state root should exist");
+            let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .expect("actuator listener");
+            let listen_addr = listener.local_addr().expect("actuator addr");
+            write_json(
+                &site_state_root.join("site-actuator-plan.json"),
+                &SiteActuatorPlan {
+                    schema: "amber.run.site_actuator_plan".to_string(),
+                    version: 1,
+                    run_id: "test-run".to_string(),
+                    mesh_scope: "test-mesh".to_string(),
+                    run_root: app.run_root.display().to_string(),
+                    site_id: site_id.clone(),
+                    kind: site_kind,
+                    router_identity_id: format!("/site/{site_id}/router"),
+                    artifact_dir: site_state_root.join("artifact").display().to_string(),
+                    site_state_root: site_state_root.display().to_string(),
+                    listen_addr,
+                    storage_root: None,
+                    runtime_root: None,
+                    router_mesh_port: None,
+                    compose_project: None,
+                    kubernetes_namespace: None,
+                    context: None,
+                    observability_endpoint: None,
+                    launch_env: BTreeMap::new(),
+                },
+            )
+            .expect("site actuator plan should write");
+            let app = Router::new()
+                .route(
+                    "/v1/children/{child_id}/prepare",
+                    post(|| async { StatusCode::NO_CONTENT }),
+                )
+                .route(
+                    "/v1/children/{child_id}/publish",
+                    post(|| async { StatusCode::NO_CONTENT }),
+                )
+                .route(
+                    "/v1/children/{child_id}/destroy",
+                    post(|| async { StatusCode::NO_CONTENT }),
+                );
+            handles.push(tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("site actuator should serve");
+            }));
+        }
+        handles
     }
 
     #[tokio::test]
@@ -4312,6 +4961,172 @@ mod tests {
         assert!(
             rendered_program.contains("beta"),
             "snapshot should contain the selected manifest, got {rendered_program}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_template_replay_uses_frozen_manifest_catalog_after_source_mutation() {
+        let dir = TempDir::new().expect("temp dir");
+        let root_path = dir.path().join("root.json5");
+        let alpha_path = dir.path().join("alpha.json5");
+        let beta_path = dir.path().join("beta.json5");
+        write_file(
+            &alpha_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                path: "/bin/echo",
+                args: ["alpha-original"],
+                network: { endpoints: [{ name: "out", port: 8081 }] }
+              },
+              provides: { out: { kind: "http", endpoint: "out" } },
+              exports: { out: "provides.out" },
+            }
+            "#,
+        );
+        write_file(
+            &beta_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                path: "/bin/echo",
+                args: ["beta-original"],
+                network: { endpoints: [{ name: "out", port: 8082 }] }
+              },
+              provides: { out: { kind: "http", endpoint: "out" } },
+              exports: { out: "provides.out" },
+            }
+            "#,
+        );
+        write_file(
+            &root_path,
+            &format!(
+                r#"
+                {{
+                  manifest_version: "0.3.0",
+                  slots: {{
+                    realm: {{ kind: "component", optional: true }}
+                  }},
+                  child_templates: {{
+                    worker: {{
+                      allowed_manifests: ["{alpha}", "{beta}"]
+                    }}
+                  }},
+                }}
+                "#,
+                alpha = file_url(&alpha_path),
+                beta = file_url(&beta_path),
+            ),
+        );
+
+        let mut state = compile_control_state(&root_path).await;
+        let state_path = dir.path().join("control-state.json");
+        write_control_state(&state_path, &state).expect("state should write");
+        let root_authority = state.base_scenario.root;
+        let beta_key = file_url(&beta_path);
+
+        write_file(
+            &beta_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                path: "/bin/echo",
+                args: ["beta-mutated-on-disk"],
+                network: { endpoints: [{ name: "out", port: 8082 }] }
+              },
+              provides: { out: { kind: "http", endpoint: "out" } },
+              exports: { out: "provides.out" },
+            }
+            "#,
+        );
+        fs::remove_file(&alpha_path).expect("alpha source should be removable after compile");
+
+        create_child(
+            &mut state,
+            root_authority,
+            CreateChildRequest {
+                template: "worker".to_string(),
+                name: "job-open".to_string(),
+                manifest: Some(
+                    amber_mesh::component_protocol::CreateChildManifestSelection {
+                        catalog_key: beta_key.clone(),
+                    },
+                ),
+                config: BTreeMap::new(),
+                bindings: BTreeMap::new(),
+            },
+            &state_path,
+        )
+        .await
+        .expect("open-template create should use the frozen catalog");
+
+        let snapshot_response =
+            snapshot(&state, root_authority).expect("snapshot should succeed after create");
+        let scenario_ir: ScenarioIr = serde_json::from_value(snapshot_response.scenario.clone())
+            .expect("snapshot scenario should decode");
+        let created_child = scenario_ir
+            .components
+            .iter()
+            .find(|component| component.moniker == "/job-open")
+            .expect("snapshot should contain the created child");
+        let created_program =
+            serde_json::to_string(&created_child.program).expect("program should encode");
+        assert!(
+            created_program.contains("beta-original"),
+            "snapshot should preserve the frozen selected manifest, got {created_program}"
+        );
+        assert!(
+            !created_program.contains("beta-mutated-on-disk"),
+            "snapshot must not reread the current disk manifest, got {created_program}"
+        );
+
+        fs::remove_file(&beta_path).expect("beta source should be removable before replay");
+
+        let mut replayed = compile_control_state_from_snapshot(&snapshot_response).await;
+        let replay_state_path = dir.path().join("replay-control-state.json");
+        write_control_state(&replay_state_path, &replayed).expect("replay state should write");
+        let replay_root_authority = replayed.base_scenario.root;
+
+        create_child(
+            &mut replayed,
+            replay_root_authority,
+            CreateChildRequest {
+                template: "worker".to_string(),
+                name: "job-replay".to_string(),
+                manifest: Some(
+                    amber_mesh::component_protocol::CreateChildManifestSelection {
+                        catalog_key: file_url(&alpha_path),
+                    },
+                ),
+                config: BTreeMap::new(),
+                bindings: BTreeMap::new(),
+            },
+            &replay_state_path,
+        )
+        .await
+        .expect("replayed snapshot should preserve future dynamic create affordances");
+
+        let replay_snapshot =
+            snapshot(&replayed, replay_root_authority).expect("replay snapshot should succeed");
+        let replay_ir: ScenarioIr = serde_json::from_value(replay_snapshot.scenario)
+            .expect("replay scenario should decode");
+        let replay_child = replay_ir
+            .components
+            .iter()
+            .find(|component| component.moniker == "/job-replay")
+            .expect("replay should contain the newly created child");
+        let replay_program =
+            serde_json::to_string(&replay_child.program).expect("program should encode");
+        assert!(
+            replay_program.contains("alpha-original"),
+            "replay should still use the frozen manifest content, got {replay_program}"
+        );
+        assert!(
+            !replay_program.contains("beta-mutated-on-disk"),
+            "replay must not fall back to mutated on-disk content, got {replay_program}"
         );
     }
 
@@ -4660,6 +5475,230 @@ mod tests {
             state.live_children.is_empty(),
             "destroy should remove the child"
         );
+    }
+
+    #[tokio::test]
+    async fn create_rejects_unoffered_backend_without_committing_child_state() {
+        let dir = TempDir::new().expect("temp dir");
+        let root_path = dir.path().join("root.json5");
+        let direct_child_path = dir.path().join("child-direct.json5");
+        let compose_child_path = dir.path().join("child-compose.json5");
+        write_file(
+            &direct_child_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                path: "/bin/echo",
+                args: ["direct-only"],
+                network: { endpoints: [{ name: "http", port: 8080, protocol: "http" }] }
+              },
+              provides: { http: { kind: "http", endpoint: "http" } },
+              exports: { http: "provides.http" },
+            }
+            "#,
+        );
+        write_file(
+            &compose_child_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                image: "busybox:1.36.1",
+                entrypoint: ["/bin/sh", "-c", "sleep 1"],
+                network: { endpoints: [{ name: "http", port: 8080, protocol: "http" }] }
+              },
+              provides: { http: { kind: "http", endpoint: "http" } },
+              exports: { http: "provides.http" },
+            }
+            "#,
+        );
+        write_file(
+            &root_path,
+            &format!(
+                r#"
+                {{
+                  manifest_version: "0.3.0",
+                  slots: {{
+                    realm: {{ kind: "component", optional: true }}
+                  }},
+                  child_templates: {{
+                    worker: {{
+                      allowed_manifests: ["{compose_child}", "{direct_child}"]
+                    }}
+                  }},
+                }}
+                "#,
+                compose_child = file_url(&compose_child_path),
+                direct_child = file_url(&direct_child_path),
+            ),
+        );
+        let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+        let output = compiler
+            .compile(
+                ManifestRef::from_url(
+                    Url::from_file_path(&root_path).expect("root path should convert to URL"),
+                ),
+                CompileOptions::default(),
+            )
+            .await
+            .expect("fixture should compile");
+        let compiled = CompiledScenario::from_compile_output(&output)
+            .expect("fixture should materialize compiled scenario");
+        let placement = PlacementFile {
+            schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+            version: amber_compiler::run_plan::PLACEMENT_VERSION,
+            sites: BTreeMap::from([(
+                "compose_local".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Compose,
+                    context: None,
+                },
+            )]),
+            defaults: PlacementDefaults {
+                image: Some("compose_local".to_string()),
+                ..PlacementDefaults::default()
+            },
+            components: BTreeMap::new(),
+        };
+        let err = build_run_plan(&compiled, Some(&placement))
+            .expect_err("run planning should reject future direct children without a direct site");
+        let message = err.to_string();
+        assert!(
+            message.contains("program.path"),
+            "placement failure should point operators at the missing future direct site, got \
+             {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_name_creates_serialize_to_one_live_child() {
+        let (dir, state, state_path) = compile_exact_template_control_state().await;
+        let root_authority = state.base_scenario.root;
+        let app = test_control_state_app(&dir, state, state_path);
+        let actuators = install_success_site_actuator(&app).await;
+        let request = CreateChildRequest {
+            template: "worker".to_string(),
+            name: "job".to_string(),
+            manifest: None,
+            config: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+        };
+
+        let (left, right) = tokio::join!(
+            execute_create_child(&app, root_authority, request.clone()),
+            execute_create_child(&app, root_authority, request),
+        );
+        let results = [left, right];
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "exactly one racing create should succeed",
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .filter(|err| err.0.code == ProtocolErrorCode::NameConflict)
+                .count(),
+            1,
+            "exactly one racing create should fail with name_conflict",
+        );
+
+        let state = app.control_state.lock().await.clone();
+        assert_eq!(
+            state.live_children.len(),
+            1,
+            "only one child should be committed"
+        );
+        assert_eq!(state.live_children[0].name, "job");
+        let snapshot_response =
+            snapshot(&state, root_authority).expect("snapshot should succeed after the race");
+        let scenario_ir: ScenarioIr = serde_json::from_value(snapshot_response.scenario)
+            .expect("snapshot scenario should decode");
+        assert_eq!(
+            scenario_ir
+                .components
+                .iter()
+                .filter(|component| component.moniker == "/job")
+                .count(),
+            1,
+            "snapshot should remain clean after the same-name race",
+        );
+        for actuator in actuators {
+            actuator.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_distinct_creates_commit_both_children() {
+        let (dir, state, state_path) = compile_exact_template_control_state().await;
+        let root_authority = state.base_scenario.root;
+        let app = test_control_state_app(&dir, state, state_path);
+        let actuators = install_success_site_actuator(&app).await;
+
+        let (left, right) = tokio::join!(
+            execute_create_child(
+                &app,
+                root_authority,
+                CreateChildRequest {
+                    template: "worker".to_string(),
+                    name: "job-a".to_string(),
+                    manifest: None,
+                    config: BTreeMap::new(),
+                    bindings: BTreeMap::new(),
+                },
+            ),
+            execute_create_child(
+                &app,
+                root_authority,
+                CreateChildRequest {
+                    template: "worker".to_string(),
+                    name: "job-b".to_string(),
+                    manifest: None,
+                    config: BTreeMap::new(),
+                    bindings: BTreeMap::new(),
+                },
+            ),
+        );
+        left.expect("first distinct create should succeed");
+        right.expect("second distinct create should succeed");
+
+        let state = app.control_state.lock().await.clone();
+        assert_eq!(
+            state.live_children.len(),
+            2,
+            "both children should be committed"
+        );
+        assert_eq!(
+            state
+                .live_children
+                .iter()
+                .map(|child| child.name.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["job-a", "job-b"]),
+        );
+        let snapshot_response =
+            snapshot(&state, root_authority).expect("snapshot should succeed after both creates");
+        let scenario_ir: ScenarioIr = serde_json::from_value(snapshot_response.scenario)
+            .expect("snapshot scenario should decode");
+        assert!(
+            scenario_ir
+                .components
+                .iter()
+                .any(|component| component.moniker == "/job-a"),
+            "snapshot should contain the first child",
+        );
+        assert!(
+            scenario_ir
+                .components
+                .iter()
+                .any(|component| component.moniker == "/job-b"),
+            "snapshot should contain the second child",
+        );
+        for actuator in actuators {
+            actuator.abort();
+        }
     }
 
     #[tokio::test]
@@ -5134,6 +6173,143 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate == "children.source.exports.out"),
             "dynamic child exports should enter the authority realm bindable source set"
+        );
+    }
+
+    #[tokio::test]
+    async fn describe_template_exposes_static_child_exports_as_binding_candidates() {
+        let dir = TempDir::new().expect("temp dir");
+        let root_path = dir.path().join("root.json5");
+        let provider_path = dir.path().join("provider.json5");
+        let consumer_path = dir.path().join("consumer.json5");
+        write_file(
+            &provider_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                path: "/bin/echo",
+                args: ["provider"],
+                network: { endpoints: [{ name: "out", port: 8080 }] }
+              },
+              provides: { out: { kind: "http", endpoint: "out" } },
+              exports: { out: "provides.out" },
+            }
+            "#,
+        );
+        write_file(
+            &consumer_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              slots: {
+                upstream: { kind: "http" }
+              },
+              program: {
+                path: "/bin/echo",
+                args: ["consumer", "${slots.upstream.url}"]
+              },
+            }
+            "#,
+        );
+        write_file(
+            &root_path,
+            &format!(
+                r#"
+                {{
+                  manifest_version: "0.3.0",
+                  slots: {{
+                    realm: {{ kind: "component", optional: true }}
+                  }},
+                  components: {{
+                    provider: "{provider}"
+                  }},
+                  child_templates: {{
+                    consumer: {{ manifest: "{consumer}" }}
+                  }},
+                }}
+                "#,
+                provider = file_url(&provider_path),
+                consumer = file_url(&consumer_path),
+            ),
+        );
+
+        let state = compile_control_state(&root_path).await;
+        let description = describe_template(&state, state.base_scenario.root, "consumer")
+            .expect("template should exist");
+        let upstream = description
+            .bindings
+            .get("upstream")
+            .expect("consumer should expose the upstream binding");
+        assert_eq!(upstream.state, InputState::Open);
+        assert!(
+            upstream
+                .candidates
+                .iter()
+                .any(|candidate| candidate == "children.provider.exports.out"),
+            "static child exports should enter the authority realm bindable source set"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_external_bindable_sources_are_listed_and_weak() {
+        let dir = TempDir::new().expect("temp dir");
+        let root_path = dir.path().join("root.json5");
+        let worker_path = dir.path().join("worker.json5");
+        write_file(
+            &worker_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              slots: {
+                catalog_api: { kind: "http" }
+              },
+              program: {
+                path: "/bin/echo",
+                args: ["worker", "${slots.catalog_api.url}"]
+              }
+            }
+            "#,
+        );
+        write_file(
+            &root_path,
+            &format!(
+                r#"
+                {{
+                  manifest_version: "0.3.0",
+                  slots: {{
+                    realm: {{ kind: "component", optional: true }},
+                    catalog_api: {{ kind: "http" }}
+                  }},
+                  program: {{
+                    path: "/bin/echo",
+                    args: ["root"]
+                  }},
+                  child_templates: {{
+                    worker: {{
+                      manifest: "{worker}"
+                    }}
+                  }}
+                }}
+                "#,
+                worker = file_url(&worker_path),
+            ),
+        );
+
+        let state = compile_control_state(&root_path).await;
+        let scenario = Scenario::try_from(state.base_scenario.clone()).expect("base scenario");
+        let candidates =
+            bindable_source_candidates(&scenario, &state.base_scenario, &state, scenario.root)
+                .expect("candidates");
+        let external = candidates
+            .iter()
+            .find(|candidate| candidate.selector == "external.catalog_api")
+            .expect("root external source should be listed");
+        assert_eq!(external.sources.len(), 1);
+        assert!(
+            external.sources[0].weak,
+            "root external bindable sources must remain weak because they depend on the external \
+             site"
         );
     }
 

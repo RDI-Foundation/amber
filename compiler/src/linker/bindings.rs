@@ -83,6 +83,81 @@ impl std::fmt::Display for SlotCardinality {
     }
 }
 
+fn effective_self_slot_range(
+    components: &[Option<Component>],
+    manifests: &[Option<Arc<Manifest>>],
+    link_index: &[LinkIndex],
+    realm: ComponentId,
+    slot_name: &str,
+) -> SlotCardinality {
+    let manifest = manifests[realm.0].as_ref().expect("manifest should exist");
+    let slot_decl = manifest
+        .slots()
+        .get(slot_name)
+        .expect("manifest invariant: self slot exists");
+    let declared = SlotCardinality::from_slot_decl(slot_decl);
+    if declared == SlotCardinality::EXACTLY_ONE {
+        return declared;
+    }
+
+    guaranteed_incoming_exact_slot_binding_range(
+        components, manifests, link_index, realm, slot_name,
+    )
+    .unwrap_or(declared)
+}
+
+fn guaranteed_incoming_exact_slot_binding_range(
+    components: &[Option<Component>],
+    manifests: &[Option<Arc<Manifest>>],
+    link_index: &[LinkIndex],
+    realm: ComponentId,
+    slot_name: &str,
+) -> Option<SlotCardinality> {
+    let component = component(components, realm);
+    let parent = component.parent?;
+    let parent_manifest = manifests[parent.0].as_ref().expect("manifest should exist");
+    let child_name = component_local_name(component);
+
+    parent_manifest
+        .bindings()
+        .iter()
+        .filter(|binding| !binding.binding.weak)
+        .find_map(|binding| match (&binding.target, &binding.binding.from) {
+            (BindingTarget::ChildSlot { child, slot }, source)
+                if child.as_str() == child_name && slot.as_str() == slot_name =>
+            {
+                source_guaranteed_exact_range(components, manifests, link_index, parent, source)
+            }
+            _ => None,
+        })
+}
+
+fn source_guaranteed_exact_range(
+    components: &[Option<Component>],
+    manifests: &[Option<Arc<Manifest>>],
+    link_index: &[LinkIndex],
+    realm: ComponentId,
+    source: &BindingSource,
+) -> Option<SlotCardinality> {
+    match source {
+        BindingSource::SelfProvide(_)
+        | BindingSource::Resource(_)
+        | BindingSource::Framework(_) => Some(SlotCardinality::EXACTLY_ONE),
+        BindingSource::SelfSlot(slot_name) => {
+            let range = effective_self_slot_range(
+                components,
+                manifests,
+                link_index,
+                realm,
+                slot_name.as_str(),
+            );
+            (range == SlotCardinality::EXACTLY_ONE).then_some(range)
+        }
+        BindingSource::ChildExport { .. } => None,
+        _ => None,
+    }
+}
+
 fn push_error<T>(errors: &mut Vec<Error>, res: Result<T, Error>) -> Option<T> {
     match res {
         Ok(value) => Some(value),
@@ -168,7 +243,13 @@ fn resolve_binding_source(
                     name: slot_name.to_string(),
                 }),
                 decl: slot_decl.decl.clone(),
-                range: SlotCardinality::from_slot_decl(slot_decl),
+                range: effective_self_slot_range(
+                    site.components,
+                    manifests,
+                    link_index,
+                    from_id,
+                    slot_name.as_str(),
+                ),
             })
         }
         BindingSource::Resource(resource_name) => {

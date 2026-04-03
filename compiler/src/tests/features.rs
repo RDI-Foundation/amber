@@ -111,6 +111,55 @@ async fn delegated_export_chain_resolves_binding_source() {
     assert_eq!(from.name, "api");
 }
 
+#[tokio::test]
+async fn scenario_ir_omits_component_exports_for_pruned_child_branches() {
+    let root_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("examples")
+        .join("tau2")
+        .join("scenario.json5")
+        .canonicalize()
+        .unwrap();
+
+    let compilation = default_compiler()
+        .compile(
+            manifest_ref_for_path(&root_path),
+            optimized_compile_options(),
+        )
+        .await
+        .unwrap();
+
+    let compiled = compiled_scenario(&compilation);
+    let green_router = compiled
+        .scenario_ir()
+        .components
+        .iter()
+        .find(|component| component.moniker == "/green_router")
+        .expect("green_router component should exist in Scenario IR");
+
+    assert_eq!(
+        green_router.exports,
+        BTreeMap::from([(
+            "llm".to_string(),
+            amber_scenario::ir::ComponentExportTargetIr::ChildExport {
+                child: "proxy".to_string(),
+                export: "llm".to_string(),
+            },
+        )])
+    );
+
+    let purple_router = compiled
+        .scenario_ir()
+        .components
+        .iter()
+        .find(|component| component.moniker == "/purple_router")
+        .expect("purple_router component should exist in Scenario IR");
+    assert!(
+        purple_router.exports.contains_key("admin_api"),
+        "live delegated exports should still be preserved in Scenario IR"
+    );
+}
+
 pub(super) struct CountingBackend {
     calls: AtomicUsize,
 }

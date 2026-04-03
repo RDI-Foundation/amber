@@ -117,15 +117,26 @@ pub(crate) fn materialize_vm_runtime(
     fixed_router_mesh_port: Option<u16>,
     reuse_existing: bool,
 ) -> Result<VmPortAssignments> {
+    let empty_peer_ports = BTreeMap::new();
+    let empty_peer_identities = BTreeMap::new();
     materialize_vm_runtime_with_existing(
         plan_root,
         runtime_root,
         vm_plan,
         mesh_plan,
         fixed_router_mesh_port,
-        reuse_existing,
-        &BTreeMap::new(),
+        VmExistingMeshState {
+            reuse_existing,
+            peer_ports_by_id: &empty_peer_ports,
+            peer_identities_by_id: &empty_peer_identities,
+        },
     )
+}
+
+pub(crate) struct VmExistingMeshState<'a> {
+    pub(crate) reuse_existing: bool,
+    pub(crate) peer_ports_by_id: &'a BTreeMap<String, u16>,
+    pub(crate) peer_identities_by_id: &'a BTreeMap<String, MeshIdentityPublic>,
 }
 
 pub(crate) fn materialize_vm_runtime_with_existing(
@@ -134,11 +145,10 @@ pub(crate) fn materialize_vm_runtime_with_existing(
     vm_plan: &VmPlan,
     mesh_plan: &MeshProvisionPlan,
     fixed_router_mesh_port: Option<u16>,
-    reuse_existing: bool,
-    existing_peer_ports_by_id: &BTreeMap<String, u16>,
+    existing: VmExistingMeshState<'_>,
 ) -> Result<VmPortAssignments> {
     let runtime_state_path = vm_runtime_state_path(plan_root);
-    if reuse_existing && runtime_state_path.is_file() {
+    if existing.reuse_existing && runtime_state_path.is_file() {
         let state = read_vm_runtime_state(&runtime_state_path)?;
         return Ok(VmPortAssignments {
             route_host_ports_by_component: state.route_host_ports_by_component.clone(),
@@ -148,15 +158,24 @@ pub(crate) fn materialize_vm_runtime_with_existing(
     if runtime_state_path.exists() {
         let _ = fs::remove_file(&runtime_state_path);
     }
-    provision_mesh_filesystem(mesh_plan, runtime_root)?;
-    let assignments = if existing_peer_ports_by_id.is_empty() {
+    let existing_mesh_peer_identities =
+        crate::direct_runtime::required_existing_mesh_peer_identities(
+            mesh_plan,
+            existing.peer_identities_by_id,
+        )?;
+    crate::direct_runtime::provision_mesh_filesystem_with_peer_identities(
+        mesh_plan,
+        runtime_root,
+        &existing_mesh_peer_identities,
+    )?;
+    let assignments = if existing.peer_ports_by_id.is_empty() {
         assign_vm_runtime_ports(runtime_root, vm_plan, fixed_router_mesh_port)?
     } else {
         assign_vm_runtime_ports_with_existing(
             runtime_root,
             vm_plan,
             fixed_router_mesh_port,
-            existing_peer_ports_by_id,
+            existing.peer_ports_by_id,
         )?
     };
     write_vm_runtime_state(plan_root, &assignments.state)?;
@@ -262,7 +281,7 @@ pub(crate) fn assign_vm_runtime_ports_with_existing(
 
         let mut endpoint_forwards = BTreeMap::new();
         for route in &mut config.inbound {
-            if let InboundTarget::Local { port } = &mut route.target {
+            if let InboundTarget::Local { ref mut port } = route.target {
                 let guest_port = *port;
                 let host_port = if let Some(existing) = endpoint_forwards.get(&guest_port) {
                     *existing
@@ -390,8 +409,10 @@ pub(crate) fn rewrite_mesh_peer_addrs(
 
     for route in &mut config.inbound {
         if let InboundTarget::MeshForward {
-            peer_addr, peer_id, ..
-        } = &mut route.target
+            ref mut peer_addr,
+            ref peer_id,
+            ..
+        } = route.target
         {
             let port = mesh_port_by_peer_id
                 .get(peer_id.as_str())
@@ -446,111 +467,6 @@ pub(crate) fn project_existing_vm_peer_identities(
         )?;
     }
     Ok(())
-}
-
-pub(crate) fn provision_mesh_filesystem(plan: &MeshProvisionPlan, root: &Path) -> Result<()> {
-    let mut identities = HashMap::<String, MeshIdentity>::new();
-    for target in &plan.targets {
-        let id = target.config.identity.id.clone();
-        identities.entry(id).or_insert_with(|| {
-            MeshIdentity::generate(
-                target.config.identity.id.clone(),
-                target.config.identity.mesh_scope.clone(),
-            )
-        });
-    }
-
-    for target in &plan.targets {
-        let output_dir = output_dir_for_target(root, target)?;
-        fs::create_dir_all(&output_dir)
-            .into_diagnostic()
-            .wrap_err_with(|| {
-                format!(
-                    "failed to create mesh output directory {}",
-                    output_dir.display()
-                )
-            })?;
-
-        let identity = identities
-            .get(&target.config.identity.id)
-            .ok_or_else(|| {
-                miette::miette!(
-                    "missing generated identity for {}",
-                    target.config.identity.id
-                )
-            })?
-            .clone();
-        let identity_secret = MeshIdentitySecret::from_identity(&identity);
-        let public_config = render_public_mesh_config(&target.config, &identities)?;
-
-        let identity_json = serde_json::to_string_pretty(&identity_secret)
-            .map_err(|err| miette::miette!("failed to serialize mesh identity: {err}"))?;
-        let config_json = serde_json::to_string_pretty(&public_config)
-            .map_err(|err| miette::miette!("failed to serialize mesh config: {err}"))?;
-        let identity_path = output_dir.join(MESH_IDENTITY_FILENAME);
-        let config_path = output_dir.join(MESH_CONFIG_FILENAME);
-        fs::write(&identity_path, identity_json)
-            .into_diagnostic()
-            .wrap_err_with(|| {
-                format!("failed to write mesh identity {}", identity_path.display())
-            })?;
-        fs::write(&config_path, config_json)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to write mesh config {}", config_path.display()))?;
-    }
-
-    Ok(())
-}
-
-pub(crate) fn render_public_mesh_config(
-    template: &amber_mesh::MeshConfigTemplate,
-    identities: &HashMap<String, MeshIdentity>,
-) -> Result<MeshConfigPublic> {
-    let peers = template
-        .peers
-        .iter()
-        .map(|peer| {
-            let identity = identities
-                .get(&peer.id)
-                .ok_or_else(|| miette::miette!("missing mesh peer identity {}", peer.id))?;
-            Ok(MeshPeer {
-                id: identity.id.clone(),
-                public_key: identity.public_key,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let identity = identities
-        .get(&template.identity.id)
-        .ok_or_else(|| miette::miette!("missing mesh identity {}", template.identity.id))?;
-    Ok(MeshConfigPublic {
-        identity: MeshIdentityPublic::from_identity(identity),
-        mesh_listen: template.mesh_listen,
-        control_listen: template.control_listen,
-        control_allow: template.control_allow.clone(),
-        peers,
-        inbound: template.inbound.clone(),
-        outbound: template.outbound.clone(),
-        transport: template.transport.clone(),
-    })
-}
-
-pub(crate) fn output_dir_for_target(root: &Path, target: &MeshProvisionTarget) -> Result<PathBuf> {
-    match &target.output {
-        MeshProvisionOutput::Filesystem { dir } => {
-            let path = Path::new(dir);
-            if path.is_absolute() {
-                return Err(miette::miette!(
-                    "mesh provision plan contains absolute filesystem output path {}",
-                    path.display()
-                ));
-            }
-            Ok(root.join(path))
-        }
-        MeshProvisionOutput::KubernetesSecret { name, .. } => Err(miette::miette!(
-            "vm runtime does not support kubernetes provision target {}",
-            name
-        )),
-    }
 }
 
 pub(crate) async fn spawn_vm_router(

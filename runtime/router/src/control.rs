@@ -33,6 +33,8 @@ pub(super) struct ControlExportPeer {
     pub(crate) peer_id: String,
     pub(crate) peer_key: String,
     pub(crate) protocol: String,
+    #[serde(default)]
+    pub(crate) route_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -946,6 +948,7 @@ pub(super) async fn control_service(
                 if let Err(err) = unregister_export_peer(
                     export,
                     payload,
+                    trust.as_ref(),
                     inbound_routes.as_ref(),
                     &dynamic_route_overlays,
                     &dynamic_issuers,
@@ -979,6 +982,7 @@ pub(super) async fn control_service(
                     trust.as_ref(),
                     inbound_routes.as_ref(),
                     &dynamic_route_overlays,
+                    &dynamic_issuers,
                 )
                 .await
                 {
@@ -987,7 +991,13 @@ pub(super) async fn control_service(
                 Ok(control_empty(StatusCode::NO_CONTENT))
             }
             Method::DELETE => {
-                revoke_route_overlay(overlay_id, &dynamic_route_overlays, &dynamic_issuers).await;
+                revoke_route_overlay(
+                    overlay_id,
+                    trust.as_ref(),
+                    &dynamic_route_overlays,
+                    &dynamic_issuers,
+                )
+                .await;
                 Ok(control_empty(StatusCode::NO_CONTENT))
             }
             _ => Ok(error_response(
@@ -1105,21 +1115,13 @@ pub(super) async fn register_export_peer(
     let peer_key = decode_peer_key(&payload.peer_key)?;
     let protocol = control_protocol(payload.protocol.trim())?;
     let overlays = dynamic_route_overlays.read().await;
-    let mut export_routes = effective_inbound_routes(inbound_routes, &overlays).filter(|route| {
-        route.capability == export
-            && route.protocol == protocol
-            && matches!(route.target, InboundTarget::MeshForward { .. })
-    });
-    let Some(route) = export_routes.next() else {
-        return Err(format!("capability {} is not an export", export));
-    };
-    if export_routes.next().is_some() {
-        return Err(format!(
-            "ambiguous export {} for protocol {}",
-            export,
-            protocol_string(protocol)
-        ));
-    }
+    let route = resolve_export_route(
+        export,
+        protocol,
+        payload.route_id.as_deref(),
+        inbound_routes,
+        &overlays,
+    )?;
 
     let peer = MeshPeer {
         id: peer_id.to_string(),
@@ -1141,6 +1143,7 @@ pub(super) async fn register_export_peer(
 pub(super) async fn unregister_export_peer(
     export: &str,
     payload: ControlExportPeer,
+    trust: &TrustBundle,
     inbound_routes: &InboundRoutes,
     dynamic_route_overlays: &DynamicRouteOverlays,
     dynamic_issuers: &DynamicIssuers,
@@ -1149,9 +1152,64 @@ pub(super) async fn unregister_export_peer(
     if peer_id.is_empty() {
         return Err("peer_id must not be empty".to_string());
     }
+    let peer_key = decode_peer_key(&payload.peer_key)?;
     let protocol = control_protocol(payload.protocol.trim())?;
     let overlays = dynamic_route_overlays.read().await;
-    let mut export_routes = effective_inbound_routes(inbound_routes, &overlays).filter(|route| {
+    let route = resolve_export_route(
+        export,
+        protocol,
+        payload.route_id.as_deref(),
+        inbound_routes,
+        &overlays,
+    )?;
+
+    let mut issuers = dynamic_issuers.write().await;
+    let Some(route_issuers) = issuers.get_mut(&route.route_id) else {
+        return Ok(());
+    };
+    route_issuers.remove(peer_id);
+    if route_issuers.is_empty() {
+        issuers.remove(&route.route_id);
+    }
+    trust
+        .remove_peer(&MeshPeer {
+            id: peer_id.to_string(),
+            public_key: peer_key,
+        })
+        .await
+        .map_err(|err| format!("invalid peer: {err}"))?;
+    Ok(())
+}
+
+fn resolve_export_route<'a>(
+    export: &str,
+    protocol: MeshProtocol,
+    route_id: Option<&str>,
+    inbound_routes: &'a InboundRoutes,
+    overlays: &'a HashMap<String, DynamicRouteOverlay>,
+) -> Result<&'a InboundRoute, String> {
+    if let Some(route_id) = route_id
+        .map(str::trim)
+        .filter(|route_id| !route_id.is_empty())
+    {
+        return effective_inbound_routes(inbound_routes, overlays)
+            .find(|route| {
+                route.route_id == route_id
+                    && route.capability == export
+                    && route.protocol == protocol
+                    && matches!(route.target, InboundTarget::MeshForward { .. })
+            })
+            .ok_or_else(|| {
+                format!(
+                    "route {} is not a mesh export for capability {} and protocol {}",
+                    route_id,
+                    export,
+                    protocol_string(protocol)
+                )
+            });
+    }
+
+    let mut export_routes = effective_inbound_routes(inbound_routes, overlays).filter(|route| {
         route.capability == export
             && route.protocol == protocol
             && matches!(route.target, InboundTarget::MeshForward { .. })
@@ -1166,16 +1224,7 @@ pub(super) async fn unregister_export_peer(
             protocol_string(protocol)
         ));
     }
-
-    let mut issuers = dynamic_issuers.write().await;
-    let Some(route_issuers) = issuers.get_mut(&route.route_id) else {
-        return Ok(());
-    };
-    route_issuers.remove(peer_id);
-    if route_issuers.is_empty() {
-        issuers.remove(&route.route_id);
-    }
-    Ok(())
+    Ok(route)
 }
 
 pub(super) async fn apply_route_overlay(
@@ -1184,26 +1233,38 @@ pub(super) async fn apply_route_overlay(
     trust: &TrustBundle,
     inbound_routes: &InboundRoutes,
     dynamic_route_overlays: &DynamicRouteOverlays,
+    dynamic_issuers: &DynamicIssuers,
 ) -> Result<(), String> {
     if overlay_id.trim().is_empty() {
         return Err("overlay id must not be empty".to_string());
     }
 
+    let mut seen_route_ids = HashSet::new();
     let mut routes = HashMap::new();
+    let mut static_issuer_grants = HashMap::<String, HashSet<String>>::new();
     for route in payload.inbound_routes {
-        if routes.insert(route.route_id.clone(), route).is_some() {
+        if !seen_route_ids.insert(route.route_id.clone()) {
             return Err("overlay contains duplicate route ids".to_string());
         }
+        if let Some(static_route) = inbound_routes.get(&route.route_id) {
+            if !static_route_compatible_with_overlay(static_route, &route) {
+                return Err(format!(
+                    "overlay route {} collides with a static route",
+                    route.route_id
+                ));
+            }
+            static_issuer_grants
+                .entry(route.route_id.clone())
+                .or_default()
+                .extend(route.allowed_issuers.iter().cloned());
+            continue;
+        }
+        routes.insert(route.route_id.clone(), route);
     }
 
     {
         let overlays = dynamic_route_overlays.read().await;
         for route_id in routes.keys() {
-            if inbound_routes.contains_key(route_id) {
-                return Err(format!(
-                    "overlay route {route_id} collides with a static route"
-                ));
-            }
             if overlays
                 .iter()
                 .filter(|(existing_id, _)| existing_id.as_str() != overlay_id)
@@ -1216,6 +1277,7 @@ pub(super) async fn apply_route_overlay(
         }
     }
 
+    let mut overlay_peers = Vec::with_capacity(payload.peers.len());
     for peer in payload.peers {
         let mesh_peer = MeshPeer {
             id: peer.peer_id.trim().to_string(),
@@ -1224,28 +1286,113 @@ pub(super) async fn apply_route_overlay(
         if mesh_peer.id.is_empty() {
             return Err("overlay peer_id must not be empty".to_string());
         }
-        trust
-            .insert_peer(&mesh_peer)
-            .await
-            .map_err(|err| format!("invalid overlay peer {}: {err}", mesh_peer.id))?;
+        overlay_peers.push(mesh_peer);
     }
 
-    dynamic_route_overlays
-        .write()
-        .await
-        .insert(overlay_id.to_string(), DynamicRouteOverlay { routes });
+    let existing_overlay = dynamic_route_overlays.write().await.remove(overlay_id);
+    if let Some(existing_overlay) = existing_overlay.as_ref() {
+        let mut issuers = dynamic_issuers.write().await;
+        remove_dynamic_issuer_grants(&mut issuers, &existing_overlay.static_issuer_grants);
+        for peer in &existing_overlay.peers {
+            trust
+                .remove_peer(peer)
+                .await
+                .map_err(|err| format!("failed to replace overlay peer {}: {err}", peer.id))?;
+        }
+    }
+
+    let mut inserted_peers = Vec::new();
+    for peer in &overlay_peers {
+        if let Err(err) = trust.insert_peer(peer).await {
+            for inserted_peer in inserted_peers.iter().rev() {
+                let _ = trust.remove_peer(inserted_peer).await;
+            }
+            if let Some(existing_overlay) = existing_overlay {
+                for existing_peer in &existing_overlay.peers {
+                    let _ = trust.insert_peer(existing_peer).await;
+                }
+                let mut issuers = dynamic_issuers.write().await;
+                add_dynamic_issuer_grants(&mut issuers, &existing_overlay.static_issuer_grants);
+                dynamic_route_overlays
+                    .write()
+                    .await
+                    .insert(overlay_id.to_string(), existing_overlay);
+            }
+            return Err(format!("invalid overlay peer {}: {err}", peer.id));
+        }
+        inserted_peers.push(peer.clone());
+    }
+
+    dynamic_route_overlays.write().await.insert(
+        overlay_id.to_string(),
+        DynamicRouteOverlay {
+            routes,
+            peers: overlay_peers,
+            static_issuer_grants: static_issuer_grants.clone(),
+        },
+    );
+    if !static_issuer_grants.is_empty() {
+        let mut issuers = dynamic_issuers.write().await;
+        add_dynamic_issuer_grants(&mut issuers, &static_issuer_grants);
+    }
     Ok(())
 }
 
 pub(super) async fn revoke_route_overlay(
     overlay_id: &str,
+    trust: &TrustBundle,
     dynamic_route_overlays: &DynamicRouteOverlays,
     dynamic_issuers: &DynamicIssuers,
 ) {
     let removed = dynamic_route_overlays.write().await.remove(overlay_id);
     if let Some(overlay) = removed {
+        for peer in &overlay.peers {
+            let _ = trust.remove_peer(peer).await;
+        }
         let mut issuers = dynamic_issuers.write().await;
         for route_id in overlay.routes.keys() {
+            issuers.remove(route_id);
+        }
+        remove_dynamic_issuer_grants(&mut issuers, &overlay.static_issuer_grants);
+    }
+}
+
+fn static_route_compatible_with_overlay(
+    static_route: &InboundRoute,
+    overlay_route: &InboundRoute,
+) -> bool {
+    static_route.capability == overlay_route.capability
+        && static_route.capability_kind == overlay_route.capability_kind
+        && static_route.capability_profile == overlay_route.capability_profile
+        && static_route.protocol == overlay_route.protocol
+        && static_route.http_plugins == overlay_route.http_plugins
+        && static_route.target == overlay_route.target
+}
+
+fn add_dynamic_issuer_grants(
+    issuers: &mut HashMap<String, HashSet<String>>,
+    grants: &HashMap<String, HashSet<String>>,
+) {
+    for (route_id, route_grants) in grants {
+        issuers
+            .entry(route_id.clone())
+            .or_default()
+            .extend(route_grants.iter().cloned());
+    }
+}
+
+fn remove_dynamic_issuer_grants(
+    issuers: &mut HashMap<String, HashSet<String>>,
+    grants: &HashMap<String, HashSet<String>>,
+) {
+    for (route_id, route_grants) in grants {
+        let Some(existing) = issuers.get_mut(route_id) else {
+            continue;
+        };
+        for issuer in route_grants {
+            existing.remove(issuer);
+        }
+        if existing.is_empty() {
             issuers.remove(route_id);
         }
     }
@@ -1377,9 +1524,6 @@ pub(super) fn route_allowed(
         .any(|issuer| issuer == remote_id)
     {
         return true;
-    }
-    if !matches!(route.target, InboundTarget::MeshForward { .. }) {
-        return false;
     }
     dynamic_issuers_for_key
         .map(|issuers| issuers.contains(remote_id))

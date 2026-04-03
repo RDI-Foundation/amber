@@ -544,6 +544,11 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
     let root_manifest = manifests[root.0]
         .as_ref()
         .expect("root manifest should exist");
+    let root_has_program = components[root.0]
+        .as_ref()
+        .expect("root component should exist")
+        .program
+        .is_some();
     let root_program_slots = collect_program_slot_uses(
         components[root.0]
             .as_ref()
@@ -559,6 +564,17 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
         root_program_slots.clone(),
     );
     let binding_edges = resolve_binding_edges(&mut resolver, &bindings, &mut errors);
+    if root_has_program {
+        for slot_name in root_manifest.slots().keys() {
+            let _ = resolver.resolve_slot(
+                &SlotRef {
+                    component: root,
+                    name: slot_name.to_string(),
+                },
+                &mut errors,
+            );
+        }
+    }
     let external_root_slots = resolver.external_root_slots();
     validate_all_slots_bound(
         &components,
@@ -723,14 +739,16 @@ pub fn link(tree: ResolvedTree, store: &DigestStore) -> Result<(Scenario, Proven
     }
 
     let mut binding_edges = binding_edges;
-    if !root_program_slots.is_empty() {
+    if root_has_program {
         let mut seen = HashSet::new();
         for edge in &binding_edges {
             if edge.to.component == root {
                 seen.insert(edge.to.name.clone());
             }
         }
-        for slot in root_program_slots {
+        let mut external_root_slots = external_root_slots.into_iter().collect::<Vec<_>>();
+        external_root_slots.sort();
+        for slot in external_root_slots {
             if seen.contains(&slot) {
                 continue;
             }

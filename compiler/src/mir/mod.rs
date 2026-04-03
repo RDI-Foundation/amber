@@ -765,6 +765,7 @@ impl<'a> DceSolver<'a> {
             self.mark_provide(export.from.component.0, &export.from.name);
         }
         self.seed_externally_rooted_programs();
+        self.seed_dynamic_control_affordances();
 
         while let Some(item) = self.work.pop_front() {
             match item {
@@ -793,6 +794,47 @@ impl<'a> DceSolver<'a> {
             if self.program_used_slots[binding.to.component.0].contains(binding.to.name.as_str()) {
                 self.mark_program_live(binding.to.component.0);
             }
+        }
+    }
+
+    fn seed_dynamic_control_affordances(&mut self) {
+        for (id, component) in self.scenario.components_iter() {
+            if component.child_templates.is_empty() {
+                continue;
+            }
+            if component.program.is_some() {
+                self.mark_program_live(id.0);
+            }
+            for child in &component.children {
+                self.mark_dynamic_realm_subtree(child.0);
+            }
+        }
+
+        let root = self.scenario.root;
+        if self.scenario.component(root).program.is_none() {
+            return;
+        }
+
+        let mut root_external_slots = BTreeSet::new();
+        for binding in &self.scenario.bindings {
+            let BindingFrom::External(slot) = &binding.from else {
+                continue;
+            };
+            if slot.component == root
+                && binding.to.component == root
+                && slot.name == binding.to.name
+            {
+                root_external_slots.insert(binding.to.name.clone());
+            }
+        }
+
+        if root_external_slots.is_empty() {
+            return;
+        }
+
+        self.mark_program_live(root.0);
+        for slot_name in root_external_slots {
+            self.mark_slot(root.0, &slot_name);
         }
     }
 
@@ -911,6 +953,33 @@ impl<'a> DceSolver<'a> {
             self.mark_resource(component.0, &resource);
         }
     }
+
+    fn mark_dynamic_realm_subtree(&mut self, component: usize) {
+        let mut stack = vec![ComponentId(component)];
+        while let Some(id) = stack.pop() {
+            let component = self.scenario.component(id);
+            let slots = component.slots.keys().cloned().collect::<Vec<_>>();
+            let provides = component.provides.keys().cloned().collect::<Vec<_>>();
+            let resources = component.resources.keys().cloned().collect::<Vec<_>>();
+            let children = component.children.clone();
+            let has_program = component.program.is_some();
+
+            self.mark_component_and_ancestors(id.0);
+            if has_program {
+                self.mark_program_live(id.0);
+            }
+            for slot in slots {
+                self.mark_slot(id.0, &slot);
+            }
+            for provide in provides {
+                self.mark_provide(id.0, &provide);
+            }
+            for resource in resources {
+                self.mark_resource(id.0, &resource);
+            }
+            stack.extend(children);
+        }
+    }
 }
 
 fn dce_with_semantics(scenario: Scenario) -> Scenario {
@@ -920,6 +989,7 @@ fn dce_with_semantics(scenario: Scenario) -> Scenario {
     let keep = compute_keep_set(
         &scenario,
         &results.keep_components,
+        &results.live_programs,
         &results.live_slots,
         &results.live_provides,
         &results.live_resources,
@@ -989,6 +1059,7 @@ fn collect_program_used_resources(component: &amber_scenario::Component) -> Vec<
 fn compute_keep_set(
     scenario: &Scenario,
     keep_components: &[bool],
+    live_programs: &[bool],
     live_slots: &HashSet<CapKey>,
     live_provides: &HashSet<CapKey>,
     live_resources: &HashSet<CapKey>,
@@ -998,6 +1069,9 @@ fn compute_keep_set(
     keep[scenario.root.0] = true;
 
     for (idx, &live) in keep_components.iter().enumerate() {
+        keep[idx] |= live;
+    }
+    for (idx, &live) in live_programs.iter().enumerate() {
         keep[idx] |= live;
     }
     for key in live_slots {

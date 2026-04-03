@@ -1489,6 +1489,9 @@ fn project_env_root_for_run_input(input: &str) -> Result<Option<PathBuf>> {
     let Some(path) = local_input_path(input)? else {
         return Ok(None);
     };
+    if load_compiled_scenario_ir(&path)?.is_some() {
+        return Ok(None);
+    }
     if BundleLoader::from_path(&path)?.is_some() {
         return Ok(None);
     }

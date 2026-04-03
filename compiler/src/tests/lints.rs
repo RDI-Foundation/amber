@@ -226,6 +226,81 @@ async fn optimized_compile_keeps_root_program_driven_by_external_slot_without_ex
 }
 
 #[tokio::test]
+async fn optimized_compile_keeps_future_dynamic_root_external_slot_and_template_owner_program() {
+    let dir = tmp_dir("dynamic-root-external-future-affordance");
+    let root_path = dir.path().join("root.json5");
+    let worker_path = dir.path().join("worker.json5");
+
+    write_file(
+        &worker_path,
+        r#"
+        {
+          manifest_version: "0.3.0",
+          program: {
+            image: "worker",
+            entrypoint: ["worker"]
+          }
+        }
+        "#,
+    );
+    write_file(
+        &root_path,
+        &format!(
+            r#"
+            {{
+              manifest_version: "0.3.0",
+              slots: {{
+                realm: {{ kind: "component", optional: true }},
+                api: {{ kind: "http" }}
+              }},
+              program: {{
+                image: "root",
+                entrypoint: ["root"]
+              }},
+              child_templates: {{
+                worker: {{
+                  manifest: "{worker}"
+                }}
+              }}
+            }}
+            "#,
+            worker = file_url(&worker_path),
+        ),
+    );
+
+    let compiler = default_compiler();
+    let output = compiler
+        .compile(
+            manifest_ref_for_path(&root_path),
+            optimized_compile_options(),
+        )
+        .await
+        .unwrap();
+
+    let root = output.scenario.component(output.scenario.root);
+    assert!(
+        root.program.is_some(),
+        "optimized compile must preserve the root template owner program for future dynamic use",
+    );
+    assert!(
+        root.child_templates.contains_key("worker"),
+        "optimized compile must preserve child templates on the root realm",
+    );
+    assert!(
+        root.slots.contains_key("api"),
+        "optimized compile must preserve future-dynamic root external slots",
+    );
+    assert!(output.scenario.bindings.iter().any(|binding| {
+        matches!(
+            &binding.from,
+            BindingFrom::External(slot)
+                if slot.component == output.scenario.root && slot.name == "api"
+        ) && binding.to.component == output.scenario.root
+            && binding.to.name == "api"
+    }));
+}
+
+#[tokio::test]
 async fn optimized_compile_keeps_externally_rooted_child_with_repeated_each_without_exports() {
     let dir = tmp_dir("external-rooted-repeated-each-dce");
     let root_path = dir.path().join("root.json5");

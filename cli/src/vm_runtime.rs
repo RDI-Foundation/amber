@@ -22,9 +22,8 @@ use amber_config::{
     resolve_runtime_component_config,
 };
 use amber_mesh::{
-    InboundTarget, MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MESH_PROVISION_PLAN_VERSION,
-    MeshConfigPublic, MeshIdentity, MeshIdentityPublic, MeshIdentitySecret, MeshPeer, MeshProtocol,
-    MeshProvisionOutput, MeshProvisionPlan, MeshProvisionTarget,
+    InboundTarget, MESH_CONFIG_FILENAME, MESH_PROVISION_PLAN_VERSION, MeshConfigPublic,
+    MeshIdentityPublic, MeshProtocol, MeshProvisionPlan,
 };
 use amber_template::{
     ConfigTemplatePayload, MountSpec, RuntimeSlotObject, RuntimeTemplateContext, TemplatePart,
@@ -55,7 +54,7 @@ mod state;
 use self::{artifacts::*, preview::*, state::*};
 pub(crate) use self::{
     preview::build_vm_site_launch_preview,
-    state::{ensure_control_socket_link, vm_current_control_socket_path},
+    state::{ensure_control_socket_link, vm_current_control_socket_path, write_vm_runtime_state},
 };
 
 const VM_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(150);
@@ -310,8 +309,11 @@ pub(crate) async fn run_vm_init(
                 &vm_plan,
                 &mesh_plan,
                 router_mesh_port,
-                reuse_materialized_runtime,
-                &existing_peer_ports_by_id,
+                VmExistingMeshState {
+                    reuse_existing: reuse_materialized_runtime,
+                    peer_ports_by_id: &existing_peer_ports_by_id,
+                    peer_identities_by_id: &existing_peer_identities_by_id,
+                },
             )?
         } else {
             materialize_vm_runtime(

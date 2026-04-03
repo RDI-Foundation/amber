@@ -78,6 +78,20 @@ async fn run() -> Result<()> {
             )));
         }
     }
+    for peer in &plan.existing_peer_identities {
+        if seen_ids.contains(&peer.id) {
+            return Err(ProvisionerError::InvalidPlan(format!(
+                "existing peer identity {} collides with a provision target",
+                peer.id
+            )));
+        }
+        if !seen_ids.insert(peer.id.clone()) {
+            return Err(ProvisionerError::InvalidPlan(format!(
+                "duplicate existing peer identity {}",
+                peer.id
+            )));
+        }
+    }
 
     let needs_kube = plan
         .targets
@@ -144,6 +158,17 @@ async fn run() -> Result<()> {
     }
 
     let mut identities = existing_identities;
+    for peer in &plan.existing_peer_identities {
+        identities.insert(
+            peer.id.clone(),
+            MeshIdentity {
+                id: peer.id.clone(),
+                public_key: peer.public_key,
+                private_key: [0; 64],
+                mesh_scope: peer.mesh_scope.clone(),
+            },
+        );
+    }
     for target in &plan.targets {
         let id = &target.config.identity.id;
         if identities.contains_key(id) {
@@ -701,6 +726,7 @@ mod tests {
         let plan = MeshProvisionPlan {
             version: MESH_PROVISION_PLAN_VERSION.to_string(),
             identity_seed: None,
+            existing_peer_identities: Vec::new(),
             targets: vec![MeshProvisionTarget {
                 kind: MeshProvisionTargetKind::Component,
                 config: template.clone(),

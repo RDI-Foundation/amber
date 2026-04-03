@@ -717,6 +717,7 @@ async fn register_export_peer_succeeds_when_export_key_collides_with_external_sl
         peer_id: peer.id.clone(),
         peer_key: base64::engine::general_purpose::STANDARD.encode(peer.public_key),
         protocol: "http".to_string(),
+        route_id: None,
     };
 
     register_export_peer(
@@ -737,6 +738,85 @@ async fn register_export_peer_succeeds_when_export_key_collides_with_external_sl
             .get("export-route")
             .is_some_and(|ids| ids.contains("dynamic-peer")),
         "dynamic issuer should be registered under the export key"
+    );
+}
+
+#[tokio::test]
+async fn register_export_peer_uses_route_id_to_disambiguate_duplicate_dynamic_exports() {
+    let config = test_mesh_config();
+    let inbound_routes = build_inbound_routes(&config).expect("build inbound routes");
+    let trust = TrustBundle::new(&config).expect("trust");
+    let dynamic_route_overlays: DynamicRouteOverlays = Arc::new(RwLock::new(HashMap::from([(
+        "child-exports".to_string(),
+        DynamicRouteOverlay {
+            routes: HashMap::from([
+                (
+                    "router:dynamic-export:/child-a:http:http".to_string(),
+                    inbound_route(
+                        "router:dynamic-export:/child-a:http:http",
+                        "http",
+                        MeshProtocol::Http,
+                        InboundTarget::MeshForward {
+                            peer_addr: "127.0.0.1:23001".to_string(),
+                            peer_id: "/child-a".to_string(),
+                            route_id: "component:/child-a:http:http".to_string(),
+                            capability: "http".to_string(),
+                        },
+                        &[config.identity.id.as_str()],
+                    ),
+                ),
+                (
+                    "router:dynamic-export:/child-b:http:http".to_string(),
+                    inbound_route(
+                        "router:dynamic-export:/child-b:http:http",
+                        "http",
+                        MeshProtocol::Http,
+                        InboundTarget::MeshForward {
+                            peer_addr: "127.0.0.1:23002".to_string(),
+                            peer_id: "/child-b".to_string(),
+                            route_id: "component:/child-b:http:http".to_string(),
+                            capability: "http".to_string(),
+                        },
+                        &[config.identity.id.as_str()],
+                    ),
+                ),
+            ]),
+            peers: Vec::new(),
+            static_issuer_grants: HashMap::new(),
+        },
+    )])));
+    let dynamic_issuers: DynamicIssuers = Arc::new(RwLock::new(HashMap::new()));
+    let peer = test_peer("dynamic-peer");
+
+    register_export_peer(
+        "http",
+        ControlExportPeer {
+            peer_id: peer.id.clone(),
+            peer_key: base64::engine::general_purpose::STANDARD.encode(peer.public_key),
+            protocol: "http".to_string(),
+            route_id: Some("router:dynamic-export:/child-b:http:http".to_string()),
+        },
+        &trust,
+        &inbound_routes,
+        &dynamic_route_overlays,
+        &dynamic_issuers,
+        &config.identity.id,
+    )
+    .await
+    .expect("route-scoped export registration should succeed");
+
+    let issuers = dynamic_issuers.read().await;
+    assert!(
+        issuers
+            .get("router:dynamic-export:/child-b:http:http")
+            .is_some_and(|ids| ids.contains("dynamic-peer")),
+        "issuer should be attached only to the addressed route"
+    );
+    assert!(
+        !issuers
+            .get("router:dynamic-export:/child-a:http:http")
+            .is_some_and(|ids| ids.contains("dynamic-peer")),
+        "unaddressed dynamic export route should remain untouched"
     );
 }
 
@@ -769,6 +849,7 @@ async fn unregister_export_peer_removes_only_requested_dynamic_issuer() {
                 peer_id: peer.id.clone(),
                 peer_key: base64::engine::general_purpose::STANDARD.encode(peer.public_key),
                 protocol: "http".to_string(),
+                route_id: None,
             },
             &trust,
             &inbound_routes,
@@ -784,9 +865,11 @@ async fn unregister_export_peer_removes_only_requested_dynamic_issuer() {
         "shared",
         ControlExportPeer {
             peer_id: peer_a.id.clone(),
-            peer_key: String::new(),
+            peer_key: base64::engine::general_purpose::STANDARD.encode(peer_a.public_key),
             protocol: "http".to_string(),
+            route_id: None,
         },
+        &trust,
         &inbound_routes,
         &dynamic_route_overlays,
         &dynamic_issuers,
@@ -805,6 +888,240 @@ async fn unregister_export_peer_removes_only_requested_dynamic_issuer() {
     assert!(
         route_issuers.contains(&peer_b.id),
         "unrelated issuer should remain"
+    );
+}
+
+#[tokio::test]
+async fn unregister_export_peer_allows_same_peer_id_with_new_key_after_cleanup() {
+    let mut config = test_mesh_config();
+    config.inbound = vec![inbound_route(
+        "export-route",
+        "shared",
+        MeshProtocol::Http,
+        InboundTarget::MeshForward {
+            peer_addr: "127.0.0.1:1234".to_string(),
+            peer_id: "provider".to_string(),
+            route_id: "provider-route".to_string(),
+            capability: "upstream".to_string(),
+        },
+        &[config.identity.id.as_str()],
+    )];
+    let inbound_routes = build_inbound_routes(&config).expect("build inbound routes");
+    let trust = TrustBundle::new(&config).expect("trust");
+    let dynamic_route_overlays: DynamicRouteOverlays = Arc::new(RwLock::new(HashMap::new()));
+    let dynamic_issuers: DynamicIssuers = Arc::new(RwLock::new(HashMap::new()));
+    let first_peer = test_peer("dynamic-peer");
+    let second_peer = test_peer("dynamic-peer");
+    assert_ne!(
+        first_peer.public_key, second_peer.public_key,
+        "test peers should use distinct keys for the same peer id"
+    );
+
+    register_export_peer(
+        "shared",
+        ControlExportPeer {
+            peer_id: first_peer.id.clone(),
+            peer_key: base64::engine::general_purpose::STANDARD.encode(first_peer.public_key),
+            protocol: "http".to_string(),
+            route_id: None,
+        },
+        &trust,
+        &inbound_routes,
+        &dynamic_route_overlays,
+        &dynamic_issuers,
+        &config.identity.id,
+    )
+    .await
+    .expect("first export registration should succeed");
+
+    unregister_export_peer(
+        "shared",
+        ControlExportPeer {
+            peer_id: first_peer.id.clone(),
+            peer_key: base64::engine::general_purpose::STANDARD.encode(first_peer.public_key),
+            protocol: "http".to_string(),
+            route_id: None,
+        },
+        &trust,
+        &inbound_routes,
+        &dynamic_route_overlays,
+        &dynamic_issuers,
+    )
+    .await
+    .expect("export unregister should succeed");
+
+    register_export_peer(
+        "shared",
+        ControlExportPeer {
+            peer_id: second_peer.id.clone(),
+            peer_key: base64::engine::general_purpose::STANDARD.encode(second_peer.public_key),
+            protocol: "http".to_string(),
+            route_id: None,
+        },
+        &trust,
+        &inbound_routes,
+        &dynamic_route_overlays,
+        &dynamic_issuers,
+        &config.identity.id,
+    )
+    .await
+    .expect("same peer id should be reusable after unregister cleanup");
+}
+
+#[tokio::test]
+async fn revoke_route_overlay_allows_same_peer_id_with_new_key_after_cleanup() {
+    let config = test_mesh_config();
+    let inbound_routes = build_inbound_routes(&config).expect("build inbound routes");
+    let trust = TrustBundle::new(&config).expect("trust");
+    let dynamic_route_overlays: DynamicRouteOverlays = Arc::new(RwLock::new(HashMap::new()));
+    let dynamic_issuers: DynamicIssuers = Arc::new(RwLock::new(HashMap::new()));
+    let first_peer = test_peer("dynamic-peer");
+    let second_peer = test_peer("dynamic-peer");
+    assert_ne!(
+        first_peer.public_key, second_peer.public_key,
+        "test peers should use distinct keys for the same peer id"
+    );
+
+    apply_route_overlay(
+        "overlay-a",
+        ControlRouteOverlay {
+            peers: vec![ControlRouteOverlayPeer {
+                peer_id: first_peer.id.clone(),
+                peer_key: base64::engine::general_purpose::STANDARD.encode(first_peer.public_key),
+            }],
+            inbound_routes: vec![inbound_route(
+                "dynamic-route",
+                "dynamic",
+                MeshProtocol::Http,
+                InboundTarget::Local { port: 8080 },
+                &["dynamic-peer"],
+            )],
+        },
+        &trust,
+        &inbound_routes,
+        &dynamic_route_overlays,
+        &dynamic_issuers,
+    )
+    .await
+    .expect("first overlay should apply");
+
+    revoke_route_overlay(
+        "overlay-a",
+        &trust,
+        &dynamic_route_overlays,
+        &dynamic_issuers,
+    )
+    .await;
+
+    apply_route_overlay(
+        "overlay-b",
+        ControlRouteOverlay {
+            peers: vec![ControlRouteOverlayPeer {
+                peer_id: second_peer.id.clone(),
+                peer_key: base64::engine::general_purpose::STANDARD.encode(second_peer.public_key),
+            }],
+            inbound_routes: vec![inbound_route(
+                "dynamic-route",
+                "dynamic",
+                MeshProtocol::Http,
+                InboundTarget::Local { port: 8080 },
+                &["dynamic-peer"],
+            )],
+        },
+        &trust,
+        &inbound_routes,
+        &dynamic_route_overlays,
+        &dynamic_issuers,
+    )
+    .await
+    .expect("same peer id should be reusable after overlay revoke cleanup");
+}
+
+#[tokio::test]
+async fn overlay_can_augment_static_external_route_issuers() {
+    let mut config = test_mesh_config();
+    config.inbound = vec![inbound_route(
+        "router:external:catalog_api:http",
+        "catalog_api",
+        MeshProtocol::Http,
+        InboundTarget::External {
+            url_env: "AMBER_EXTERNAL_SLOT_CATALOG_API_URL".to_string(),
+            optional: false,
+        },
+        &["static-consumer"],
+    )];
+    let inbound_routes = build_inbound_routes(&config).expect("build inbound routes");
+    let trust = TrustBundle::new(&config).expect("trust");
+    let dynamic_route_overlays: DynamicRouteOverlays = Arc::new(RwLock::new(HashMap::new()));
+    let dynamic_issuers: DynamicIssuers = Arc::new(RwLock::new(HashMap::new()));
+    let peer = test_peer("dynamic-child");
+
+    apply_route_overlay(
+        "overlay-static-external",
+        ControlRouteOverlay {
+            peers: vec![ControlRouteOverlayPeer {
+                peer_id: peer.id.clone(),
+                peer_key: base64::engine::general_purpose::STANDARD.encode(peer.public_key),
+            }],
+            inbound_routes: vec![inbound_route(
+                "router:external:catalog_api:http",
+                "catalog_api",
+                MeshProtocol::Http,
+                InboundTarget::External {
+                    url_env: "AMBER_EXTERNAL_SLOT_CATALOG_API_URL".to_string(),
+                    optional: false,
+                },
+                &["dynamic-child"],
+            )],
+        },
+        &trust,
+        &inbound_routes,
+        &dynamic_route_overlays,
+        &dynamic_issuers,
+    )
+    .await
+    .expect("compatible overlay should augment static external issuers");
+
+    let issuers = dynamic_issuers.read().await;
+    assert!(
+        issuers
+            .get("router:external:catalog_api:http")
+            .is_some_and(|ids| ids.contains("dynamic-child")),
+        "overlay should register the dynamic child as an allowed issuer"
+    );
+    drop(issuers);
+
+    let open = OpenFrame {
+        route_id: "router:external:catalog_api:http".to_string(),
+        capability: "catalog_api".to_string(),
+        protocol: MeshProtocol::Http,
+        slot: None,
+        capability_kind: None,
+        capability_profile: None,
+    };
+    let overlays = dynamic_route_overlays.read().await;
+    let issuers = dynamic_issuers.read().await;
+    resolve_inbound_route(&inbound_routes, &overlays, &open, "dynamic-child", &issuers)
+        .expect("dynamic child should be authorized for the static external route");
+    drop(issuers);
+    drop(overlays);
+
+    revoke_route_overlay(
+        "overlay-static-external",
+        &trust,
+        &dynamic_route_overlays,
+        &dynamic_issuers,
+    )
+    .await;
+
+    let overlays = dynamic_route_overlays.read().await;
+    let issuers = dynamic_issuers.read().await;
+    let denied =
+        resolve_inbound_route(&inbound_routes, &overlays, &open, "dynamic-child", &issuers)
+            .expect_err("revoking the overlay should remove the dynamic issuer grant");
+    assert!(
+        matches!(denied, RouterError::Auth(_)),
+        "expected auth denial after revoking overlay, got {denied}"
     );
 }
 

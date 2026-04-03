@@ -138,6 +138,7 @@ pub(super) fn materialize_launch_bundle(
                     schema: SITE_ACTUATOR_PLAN_SCHEMA.to_string(),
                     version: SITE_ACTUATOR_PLAN_VERSION,
                     run_id: run_id.to_string(),
+                    mesh_scope: run_plan.mesh_scope.clone(),
                     run_root: bundle_root.display().to_string(),
                     site_id: site_id.clone(),
                     kind: site_plan.site.kind,

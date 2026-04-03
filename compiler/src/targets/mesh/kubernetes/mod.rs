@@ -8,7 +8,10 @@ use std::{
 
 use amber_config as rc;
 use amber_manifest::span_for_json_pointer;
-use amber_mesh::{MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProvisionOutput};
+use amber_mesh::{
+    MESH_CONFIG_FILENAME, MESH_IDENTITY_FILENAME, MeshProtocol, MeshProvisionOutput,
+    router_export_route_id,
+};
 use amber_scenario::{ComponentId, ProgramMount, Scenario};
 use base64::Engine as _;
 use jsonptr::PointerBuf;
@@ -377,7 +380,8 @@ pub(crate) fn emit_kubernetes_artifact(
         PathBuf::from("01-configmaps/amber-otelcol-config.yaml"),
         to_yaml(&otelcol_config)?,
     );
-    let otelcol_service_account = ServiceAccount::new(OTELCOL_SERVICE_ACCOUNT, &namespace);
+    let otelcol_service_account =
+        ServiceAccount::new(OTELCOL_SERVICE_ACCOUNT, &namespace, otelcol_labels.clone());
     files.insert(
         PathBuf::from("02-rbac/amber-otelcol-sa.yaml"),
         to_yaml(&otelcol_service_account)?,
@@ -386,6 +390,7 @@ pub(crate) fn emit_kubernetes_artifact(
     let otelcol_role = Role::new(
         OTELCOL_ROLE_NAME,
         &namespace,
+        otelcol_labels.clone(),
         vec![PolicyRule {
             api_groups: vec!["".to_string()],
             resources: vec!["pods".to_string()],
@@ -401,6 +406,7 @@ pub(crate) fn emit_kubernetes_artifact(
     let otelcol_role_binding = RoleBinding::new(
         OTELCOL_ROLE_BINDING_NAME,
         &namespace,
+        otelcol_labels.clone(),
         Subject {
             kind: "ServiceAccount".to_string(),
             name: OTELCOL_SERVICE_ACCOUNT.to_string(),
@@ -1344,6 +1350,14 @@ pub(crate) fn emit_kubernetes_artifact(
     let export_metadata: BTreeMap<String, ExportMetadata> = export_descriptors
         .into_iter()
         .map(|(name, export)| {
+            let route_protocol = match export.protocol {
+                amber_manifest::NetworkProtocol::Http | amber_manifest::NetworkProtocol::Https => {
+                    MeshProtocol::Http
+                }
+                amber_manifest::NetworkProtocol::Tcp => MeshProtocol::Tcp,
+                other => panic!("unsupported kubernetes export protocol: {other}"),
+            };
+            let route_id = router_export_route_id(&name, route_protocol);
             (
                 name,
                 ExportMetadata {
@@ -1351,6 +1365,7 @@ pub(crate) fn emit_kubernetes_artifact(
                     provide: export.provide,
                     protocol: export.protocol.to_string(),
                     router_mesh_port,
+                    route_id: Some(route_id),
                 },
             )
         })
@@ -1430,7 +1445,12 @@ pub(crate) fn emit_kubernetes_artifact(
             to_yaml(&plan_cm)?,
         );
 
-        let service_account = ServiceAccount::new(PROVISIONER_SERVICE_ACCOUNT, &namespace);
+        let provisioner_labels = scenario_labels(&[("amber.io/type", "provisioner")]);
+        let service_account = ServiceAccount::new(
+            PROVISIONER_SERVICE_ACCOUNT,
+            &namespace,
+            provisioner_labels.clone(),
+        );
         files.insert(
             PathBuf::from("02-rbac/amber-provisioner-sa.yaml"),
             to_yaml(&service_account)?,
@@ -1439,6 +1459,7 @@ pub(crate) fn emit_kubernetes_artifact(
         let role = Role::new(
             PROVISIONER_ROLE_NAME,
             &namespace,
+            provisioner_labels.clone(),
             vec![
                 PolicyRule {
                     api_groups: vec!["".to_string()],
@@ -1462,6 +1483,7 @@ pub(crate) fn emit_kubernetes_artifact(
         let role_binding = RoleBinding::new(
             PROVISIONER_ROLE_BINDING_NAME,
             &namespace,
+            provisioner_labels,
             Subject {
                 kind: "ServiceAccount".to_string(),
                 name: PROVISIONER_SERVICE_ACCOUNT.to_string(),

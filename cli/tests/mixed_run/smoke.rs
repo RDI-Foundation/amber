@@ -31,6 +31,30 @@ def call(method, path, payload=None):
         return response.read().decode("utf-8")
 
 class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        try:
+            if self.path == "/create":
+                length = int(self.headers.get("content-length", "0") or "0")
+                payload = self.rfile.read(length).decode("utf-8") if length else "{}"
+                request = json.loads(payload)
+                send(
+                    self,
+                    200,
+                    call("POST", "/v1/children", request),
+                    "application/json",
+                )
+                return
+            if self.path == "/snapshot":
+                send(self, 200, call("POST", "/v1/snapshot", {}), "application/json")
+                return
+            send(self, 404, "missing")
+        except HTTPError as err:
+            body = err.read().decode("utf-8", errors="replace").strip()
+            detail = f"{err.__class__.__name__}: HTTP {err.code}: {body or err.reason}"
+            send(self, 502, detail)
+        except Exception as err:
+            send(self, 502, f"{err.__class__.__name__}: {err}")
+
     def do_GET(self):
         try:
             if self.path == "/id":
@@ -55,6 +79,21 @@ class Handler(BaseHTTPRequestHandler):
                     "application/json",
                 )
                 return
+            if self.path.startswith("/destroy/"):
+                name = self.path.removeprefix("/destroy/")
+                call("DELETE", f"/v1/children/{name}")
+                send(self, 200, "destroyed")
+                return
+            send(self, 404, "missing")
+        except HTTPError as err:
+            body = err.read().decode("utf-8", errors="replace").strip()
+            detail = f"{err.__class__.__name__}: HTTP {err.code}: {body or err.reason}"
+            send(self, 502, detail)
+        except Exception as err:
+            send(self, 502, f"{err.__class__.__name__}: {err}")
+
+    def do_DELETE(self):
+        try:
             if self.path.startswith("/destroy/"):
                 name = self.path.removeprefix("/destroy/")
                 call("DELETE", f"/v1/children/{name}")
@@ -143,6 +182,96 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         print(f"[matrix] {fmt % args}", flush=True)
+
+ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+"#;
+
+const FRAMEWORK_EXTERNAL_BIND_APP: &str = r#"import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.request import Request, urlopen
+
+NAME = os.environ["NAME"]
+PORT = int(os.environ["PORT"])
+UPSTREAM_URL = os.environ["UPSTREAM_URL"].rstrip("/")
+
+def fetch_text(url: str, timeout: float = 10.0) -> str:
+    request = Request(url, headers={"Connection": "close"})
+    with urlopen(request, timeout=timeout) as response:
+        return response.read().decode("utf-8")
+
+def send(handler, status, body):
+    payload = body.encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("content-type", "text/plain; charset=utf-8")
+    handler.send_header("content-length", str(len(payload)))
+    handler.end_headers()
+    handler.wfile.write(payload)
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/id":
+            send(self, 200, NAME)
+            return
+        if self.path == "/probe":
+            send(self, 200, fetch_text(f"{UPSTREAM_URL}/item/amber-mug"))
+            return
+        send(self, 200, "ok")
+
+    def log_message(self, fmt, *args):
+        print(f"[external-bind] {fmt % args}", flush=True)
+
+ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+"#;
+
+const FRAMEWORK_BARRIER_PROBE_APP: &str = r#"import json
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.request import Request, urlopen
+
+NAME = os.environ["NAME"]
+PORT = int(os.environ["PORT"])
+REQUIRED_URL = os.environ["REQUIRED_URL"].rstrip("/")
+WEAK_URL = os.environ["WEAK_URL"].rstrip("/")
+
+def fetch_id(url: str, timeout: float = 2.0):
+    request = Request(f"{url}/id", headers={"Connection": "close"})
+    with urlopen(request, timeout=timeout) as response:
+        return response.read().decode("utf-8")
+
+def probe(url: str):
+    try:
+        return {"ok": True, "body": fetch_id(url)}
+    except Exception as err:
+        return {"ok": False, "error": err.__class__.__name__}
+
+STARTUP = json.dumps(
+    {
+        "required": probe(REQUIRED_URL),
+        "weak": probe(WEAK_URL),
+    },
+    sort_keys=True,
+)
+
+def send(handler, status, body, content_type="text/plain; charset=utf-8"):
+    payload = body.encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("content-type", content_type)
+    handler.send_header("content-length", str(len(payload)))
+    handler.end_headers()
+    handler.wfile.write(payload)
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/id":
+            send(self, 200, NAME)
+            return
+        if self.path == "/startup":
+            send(self, 200, STARTUP, "application/json")
+            return
+        send(self, 200, "ok")
+
+    def log_message(self, fmt, *args):
+        print(f"[barrier] {fmt % args}", flush=True)
 
 ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 "#;
@@ -289,8 +418,20 @@ fn framework_child_artifact(run: &RunHandle, site_id: &str, child_id: u64) -> Pa
         .join("artifact")
 }
 
+fn framework_manifest_catalog_key(path: &Path) -> String {
+    let canonical = path
+        .canonicalize()
+        .unwrap_or_else(|err| panic!("failed to canonicalize {}: {err}", path.display()));
+    url::Url::from_file_path(&canonical)
+        .unwrap_or_else(|_| panic!("failed to build file URL for {}", canonical.display()))
+        .to_string()
+}
+
 fn framework_proxy_args_for_site_state(site_state: &Value) -> Vec<String> {
-    if site_state["kind"] != "kubernetes" {
+    if !matches!(
+        site_state["kind"].as_str(),
+        Some("direct" | "vm" | "kubernetes")
+    ) {
         return Vec::new();
     }
     vec![
@@ -831,6 +972,62 @@ fn assert_string_array_members(value: &Value, expected: &[&str], message: &str) 
     assert_eq!(actual, expected, "{message}");
 }
 
+fn framework_create_child_with_request(port: u16, request: &Value) -> (u16, String) {
+    let body = serde_json::to_string(request).expect("create request should serialize");
+    http_request_with_timeout(
+        "POST",
+        port,
+        "/create",
+        Some(&body),
+        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
+    )
+    .expect("create request should return an HTTP response")
+}
+
+fn framework_destroy_child_via_admin(port: u16, name: &str) -> (u16, String) {
+    http_request_with_timeout(
+        "DELETE",
+        port,
+        &format!("/destroy/{name}"),
+        None,
+        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
+    )
+    .expect("destroy request should return an HTTP response")
+}
+
+fn framework_snapshot_via_admin(port: u16) -> Value {
+    let (status, body) = http_request_with_timeout(
+        "POST",
+        port,
+        "/snapshot",
+        Some("{}"),
+        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
+    )
+    .expect("snapshot request should return an HTTP response");
+    assert_eq!(status, 200, "snapshot request should succeed: {body}");
+    serde_json::from_str(&body).expect("snapshot response should be valid json")
+}
+
+fn write_snapshot_run_inputs(root: &Path, snapshot: &Value) -> (PathBuf, PathBuf) {
+    let scenario_path = root.join("snapshot-scenario.json");
+    let placement_path = root.join("snapshot-placement.json5");
+    write_json(&scenario_path, &snapshot["scenario"]);
+    write_json(
+        &placement_path,
+        &json!({
+            "schema": "amber.run.placement",
+            "version": 1,
+            "sites": snapshot["placement"]["offered_sites"],
+            "defaults": snapshot["placement"]["defaults"],
+            "components": snapshot["placement"]
+                .get("assignments")
+                .cloned()
+                .unwrap_or_else(|| json!({}))
+        }),
+    );
+    (scenario_path, placement_path)
+}
+
 #[test]
 #[ignore = "requires a working direct runtime sandbox; run manually or in CI"]
 fn framework_component_direct_create_destroy_live() {
@@ -842,7 +1039,38 @@ fn framework_component_direct_create_destroy_live() {
     fs::write(temp.path().join("worker.py"), FRAMEWORK_WORKER_APP)
         .expect("failed to write worker.py");
     write_framework_admin_component(temp.path(), "admin.json5", false, admin_port);
-    write_framework_worker_component(temp.path(), "worker.json5", false, "worker", worker_port);
+    write_json(
+        &temp.path().join("worker.json5"),
+        &json!({
+            "manifest_version": "0.3.0",
+            "config_schema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" }
+                },
+                "required": ["name"]
+            },
+            "program": {
+                "path": "/usr/bin/env",
+                "args": ["python3", "-u", "-c", { "file": "./worker.py" }],
+                "env": {
+                    "NAME": "${config.name}",
+                    "PORT": worker_port.to_string()
+                },
+                "network": {
+                    "endpoints": [
+                        { "name": "http", "port": worker_port, "protocol": "http" }
+                    ]
+                }
+            },
+            "provides": {
+                "http": { "kind": "http", "endpoint": "http" }
+            },
+            "exports": {
+                "http": "http"
+            }
+        }),
+    );
     let manifest = temp.path().join("root.json5");
     write_json(
         &manifest,
@@ -898,12 +1126,16 @@ fn framework_component_direct_create_destroy_live() {
         "admin"
     );
 
-    let (create_status, create_response) = http_get_with_timeout(
+    let (create_status, create_response) = framework_create_child_with_request(
         admin_port,
-        "/create/job-1",
-        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
-    )
-    .expect("create request should return an HTTP response");
+        &json!({
+            "template": "worker",
+            "name": "job-1",
+            "config": {
+                "name": "worker-one"
+            }
+        }),
+    );
     assert_eq!(create_status, 200, "create request should succeed");
     let create_json: Value =
         serde_json::from_str(&create_response).expect("create response should be valid json");
@@ -933,33 +1165,1341 @@ fn framework_component_direct_create_destroy_live() {
             "/id",
             Duration::from_secs(60)
         ),
-        "worker"
+        "worker-one"
     );
 
+    stop_proxy(&mut child_proxy);
+
+    let (destroy_status, destroy_response) = framework_destroy_child_via_admin(admin_port, "job-1");
     assert_eq!(
-        wait_for_body(
-            &mut admin_proxy,
-            admin_port,
-            "/destroy/job-1",
-            Duration::from_secs(60)
-        ),
-        "destroyed"
+        destroy_status, 200,
+        "destroy request should succeed; response: {destroy_response}"
     );
+    let child_root = child_artifact
+        .parent()
+        .expect("child artifact should have a parent")
+        .to_path_buf();
     wait_for_condition(
         Duration::from_secs(60),
         || {
-            !child_artifact
-                .parent()
-                .expect("child artifact should have a parent")
-                .exists()
+            !child_root.exists()
                 && read_json(&control_state_path)["live_children"]
                     .as_array()
                     .is_some_and(|children| children.iter().all(|child| child["name"] != "job-1"))
         },
         "dynamic child teardown",
     );
-    stop_proxy(&mut child_proxy);
+
+    let (recreate_status, recreate_response) = framework_create_child_with_request(
+        admin_port,
+        &json!({
+            "template": "worker",
+            "name": "job-1",
+            "config": {
+                "name": "worker-two"
+            }
+        }),
+    );
+    assert_eq!(
+        recreate_status, 200,
+        "recreate request should succeed; response: {recreate_response}"
+    );
+    let recreate_json: Value =
+        serde_json::from_str(&recreate_response).expect("recreate response should be valid json");
+    assert_eq!(recreate_json["child"]["name"], "job-1");
+
+    let recreated_child_id = wait_for_live_child(&control_state_path, "job-1");
+    assert_ne!(
+        recreated_child_id, child_id,
+        "recreate should allocate a fresh dynamic child id"
+    );
+
+    let recreated_artifact = framework_child_artifact(&run, "direct_local", recreated_child_id);
+    wait_for_file(
+        &recreated_artifact
+            .join(".amber")
+            .join("direct-runtime.json"),
+        Duration::from_secs(60),
+    );
+
+    let recreated_proxy_port = pick_free_port();
+    let mut recreated_proxy = spawn_proxy(&recreated_artifact, "http", recreated_proxy_port, &[]);
+    wait_for_path(
+        &mut recreated_proxy,
+        recreated_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+    assert_eq!(
+        wait_for_body(
+            &mut recreated_proxy,
+            recreated_proxy_port,
+            "/id",
+            Duration::from_secs(60)
+        ),
+        "worker-two",
+        "recreated child must serve the new config, not a leaked stale workload"
+    );
+
+    stop_proxy(&mut recreated_proxy);
     stop_proxy(&mut admin_proxy);
+    run.stop();
+}
+
+#[test]
+#[ignore = "requires a working direct runtime sandbox; run manually or in CI"]
+fn framework_component_open_template_frozen_source_replay_live() {
+    let temp = temp_output_dir("framework-component-frozen-open-template-");
+    let admin_port = pick_free_port();
+    let alpha_port = pick_free_port();
+    let beta_port = pick_free_port();
+
+    fs::write(temp.path().join("admin.py"), FRAMEWORK_ADMIN_APP).expect("failed to write admin.py");
+    fs::write(temp.path().join("worker.py"), FRAMEWORK_WORKER_APP)
+        .expect("failed to write worker.py");
+    write_framework_admin_component(temp.path(), "admin.json5", false, admin_port);
+    write_framework_worker_component(
+        temp.path(),
+        "alpha.json5",
+        false,
+        "alpha-original",
+        alpha_port,
+    );
+    write_framework_worker_component(temp.path(), "beta.json5", false, "beta-original", beta_port);
+    let alpha_path = temp.path().join("alpha.json5");
+    let beta_path = temp.path().join("beta.json5");
+    let alpha_key = framework_manifest_catalog_key(&alpha_path);
+    let beta_key = framework_manifest_catalog_key(&beta_path);
+
+    let manifest = temp.path().join("root.json5");
+    write_json(
+        &manifest,
+        &json!({
+            "manifest_version": "0.3.0",
+            "slots": {
+                "realm": { "kind": "component", "optional": true }
+            },
+            "components": {
+                "admin": "./admin.json5"
+            },
+            "child_templates": {
+                "worker": {
+                    "allowed_manifests": [alpha_key.clone(), beta_key.clone()]
+                }
+            },
+            "bindings": [
+                { "to": "#admin.ctl", "from": "framework.component" }
+            ],
+            "exports": {
+                "admin_http": "#admin.http"
+            }
+        }),
+    );
+    let placement = temp.path().join("placement.json5");
+    write_json(
+        &placement,
+        &json!({
+            "schema": "amber.run.placement",
+            "version": 1,
+            "sites": {
+                "direct_local": { "kind": "direct" }
+            },
+            "defaults": {
+                "path": "direct_local"
+            }
+        }),
+    );
+
+    let storage_root = temp.path().join("state");
+    let mut run = run_manifest(&manifest, &placement, &storage_root);
+
+    let admin_proxy_port = pick_free_port();
+    let mut admin_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_local"),
+        "admin_http",
+        admin_proxy_port,
+        &[],
+    );
+    wait_for_path(
+        &mut admin_proxy,
+        admin_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+
+    write_framework_worker_component(
+        temp.path(),
+        "beta.json5",
+        false,
+        "beta-mutated-on-disk",
+        beta_port,
+    );
+    fs::remove_file(&alpha_path).expect("alpha manifest should be removable after run start");
+
+    let (create_status, create_response) = framework_create_child_with_request(
+        admin_proxy_port,
+        &json!({
+            "template": "worker",
+            "name": "job-beta",
+            "manifest": {
+                "catalog_key": beta_key
+            }
+        }),
+    );
+    assert_eq!(
+        create_status, 200,
+        "open-template create should use the frozen catalog; response: {create_response}"
+    );
+
+    let control_state_path = framework_control_state_path(&run);
+    let beta_child_id = wait_for_live_child(&control_state_path, "job-beta");
+    let beta_artifact = framework_child_artifact(&run, "direct_local", beta_child_id);
+    let beta_proxy_port = pick_free_port();
+    let mut beta_proxy = spawn_proxy(&beta_artifact, "http", beta_proxy_port, &[]);
+    wait_for_path(
+        &mut beta_proxy,
+        beta_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+    assert_eq!(
+        wait_for_body(
+            &mut beta_proxy,
+            beta_proxy_port,
+            "/id",
+            Duration::from_secs(60)
+        ),
+        "beta-original",
+        "live create should use the frozen manifest contents, not the mutated disk source"
+    );
+
+    let snapshot = framework_snapshot_via_admin(admin_proxy_port);
+    stop_proxy(&mut beta_proxy);
+    stop_proxy(&mut admin_proxy);
+    run.stop();
+
+    fs::remove_file(&beta_path).expect("beta manifest should be removable before replay");
+    let replay_root = temp.path().join("replay");
+    fs::create_dir_all(&replay_root).expect("failed to create replay dir");
+    let (snapshot_scenario, snapshot_placement) =
+        write_snapshot_run_inputs(&replay_root, &snapshot);
+
+    let replay_storage_root = temp.path().join("replay-state");
+    let mut replay_run = run_manifest(
+        &snapshot_scenario,
+        &snapshot_placement,
+        &replay_storage_root,
+    );
+    let replay_admin_port = pick_free_port();
+    let mut replay_admin_proxy = spawn_proxy(
+        &replay_run.site_artifact_dir("direct_local"),
+        "admin_http",
+        replay_admin_port,
+        &[],
+    );
+    wait_for_path(
+        &mut replay_admin_proxy,
+        replay_admin_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+
+    let (replay_status, replay_response) = framework_create_child_with_request(
+        replay_admin_port,
+        &json!({
+            "template": "worker",
+            "name": "job-alpha",
+            "manifest": {
+                "catalog_key": alpha_key
+            }
+        }),
+    );
+    assert_eq!(
+        replay_status, 200,
+        "replay should preserve future dynamic create affordances; response: {replay_response}"
+    );
+
+    let replay_control_state = framework_control_state_path(&replay_run);
+    let alpha_child_id = wait_for_live_child(&replay_control_state, "job-alpha");
+    let alpha_artifact = framework_child_artifact(&replay_run, "direct_local", alpha_child_id);
+    let alpha_proxy_port = pick_free_port();
+    let mut alpha_proxy = spawn_proxy(&alpha_artifact, "http", alpha_proxy_port, &[]);
+    wait_for_path(
+        &mut alpha_proxy,
+        alpha_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+    assert_eq!(
+        wait_for_body(
+            &mut alpha_proxy,
+            alpha_proxy_port,
+            "/id",
+            Duration::from_secs(60)
+        ),
+        "alpha-original",
+        "replay should still use the frozen manifest content after the source files are gone"
+    );
+
+    stop_proxy(&mut alpha_proxy);
+    stop_proxy(&mut replay_admin_proxy);
+    replay_run.stop();
+}
+
+#[test]
+#[ignore = "requires docker; run manually or in CI"]
+fn framework_component_concurrent_create_serialization_live() {
+    ensure_internal_images();
+    let temp = temp_output_dir("framework-component-concurrency-");
+    let admin_port = pick_free_port();
+    let worker_port = pick_free_port();
+
+    fs::write(temp.path().join("admin.py"), FRAMEWORK_ADMIN_APP).expect("failed to write admin.py");
+    fs::write(temp.path().join("worker.py"), FRAMEWORK_WORKER_APP)
+        .expect("failed to write worker.py");
+    write_framework_admin_component(temp.path(), "admin.json5", true, admin_port);
+    write_json(
+        &temp.path().join("worker.json5"),
+        &json!({
+            "manifest_version": "0.3.0",
+            "config_schema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" }
+                },
+                "required": ["name"]
+            },
+            "program": {
+                "image": TEST_APP_IMAGE,
+                "entrypoint": ["python3", "-u", "-c", { "file": "./worker.py" }],
+                "env": {
+                    "NAME": "${config.name}",
+                    "PORT": worker_port.to_string()
+                },
+                "network": {
+                    "endpoints": [
+                        { "name": "http", "port": worker_port, "protocol": "http" }
+                    ]
+                }
+            },
+            "provides": {
+                "http": { "kind": "http", "endpoint": "http" }
+            },
+            "exports": {
+                "http": "http"
+            }
+        }),
+    );
+    let manifest = temp.path().join("root.json5");
+    write_json(
+        &manifest,
+        &json!({
+            "manifest_version": "0.3.0",
+            "slots": {
+                "realm": { "kind": "component", "optional": true }
+            },
+            "components": {
+                "admin": "./admin.json5"
+            },
+            "child_templates": {
+                "worker": {
+                    "manifest": "./worker.json5"
+                }
+            },
+            "bindings": [
+                { "to": "#admin.ctl", "from": "framework.component" }
+            ],
+            "exports": {
+                "admin_http": "#admin.http"
+            }
+        }),
+    );
+    let placement = temp.path().join("placement.json5");
+    write_json(
+        &placement,
+        &json!({
+            "schema": "amber.run.placement",
+            "version": 1,
+            "sites": {
+                "compose_local": { "kind": "compose" }
+            },
+            "defaults": {
+                "image": "compose_local"
+            }
+        }),
+    );
+
+    let storage_root = temp.path().join("state");
+    let mut run = run_manifest(&manifest, &placement, &storage_root);
+    let admin_proxy_port = pick_free_port();
+    let mut admin_proxy = spawn_proxy(
+        &run.site_artifact_dir("compose_local"),
+        "admin_http",
+        admin_proxy_port,
+        &[],
+    );
+    wait_for_path(
+        &mut admin_proxy,
+        admin_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+
+    let race_barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let race_request = json!({
+        "template": "worker",
+        "name": "job-race",
+        "config": {
+            "name": "race-winner"
+        }
+    });
+    let left_barrier = race_barrier.clone();
+    let left_request = race_request.clone();
+    let left = std::thread::spawn(move || {
+        left_barrier.wait();
+        framework_create_child_with_request(admin_proxy_port, &left_request)
+    });
+    let right_barrier = race_barrier.clone();
+    let right_request = race_request.clone();
+    let right = std::thread::spawn(move || {
+        right_barrier.wait();
+        framework_create_child_with_request(admin_proxy_port, &right_request)
+    });
+    race_barrier.wait();
+    let race_results = [
+        left.join().expect("left race request should return"),
+        right.join().expect("right race request should return"),
+    ];
+    assert_eq!(
+        race_results
+            .iter()
+            .filter(|(status, _)| *status == 200)
+            .count(),
+        1,
+        "exactly one same-name create should succeed: {race_results:?}"
+    );
+    let failure_body = race_results
+        .iter()
+        .find_map(|(status, body)| (*status == 502).then_some(body))
+        .expect("one same-name create should fail");
+    assert!(
+        failure_body.contains("name_conflict"),
+        "same-name race should report name_conflict, got: {failure_body}"
+    );
+
+    let control_state_path = framework_control_state_path(&run);
+    let race_child_id = wait_for_live_child(&control_state_path, "job-race");
+    let race_snapshot = framework_snapshot_via_admin(admin_proxy_port);
+    let race_component_count = race_snapshot["scenario"]["components"]
+        .as_array()
+        .expect("snapshot components should be an array")
+        .iter()
+        .filter(|component| component["moniker"].as_str() == Some("/job-race"))
+        .count();
+    assert_eq!(
+        race_component_count, 1,
+        "snapshot should contain exactly one child after the same-name race"
+    );
+
+    let distinct_barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let left_distinct_barrier = distinct_barrier.clone();
+    let distinct_left = std::thread::spawn(move || {
+        left_distinct_barrier.wait();
+        framework_create_child_with_request(
+            admin_proxy_port,
+            &json!({
+                "template": "worker",
+                "name": "job-a",
+                "config": {
+                    "name": "worker-a"
+                }
+            }),
+        )
+    });
+    let right_distinct_barrier = distinct_barrier.clone();
+    let distinct_right = std::thread::spawn(move || {
+        right_distinct_barrier.wait();
+        framework_create_child_with_request(
+            admin_proxy_port,
+            &json!({
+                "template": "worker",
+                "name": "job-b",
+                "config": {
+                    "name": "worker-b"
+                }
+            }),
+        )
+    });
+    distinct_barrier.wait();
+    let distinct_results = [
+        distinct_left
+            .join()
+            .expect("left distinct request should return"),
+        distinct_right
+            .join()
+            .expect("right distinct request should return"),
+    ];
+    assert!(
+        distinct_results.iter().all(|(status, _)| *status == 200),
+        "distinct-name creates should both succeed: {distinct_results:?}"
+    );
+
+    let job_a_id = wait_for_live_child(&control_state_path, "job-a");
+    let job_b_id = wait_for_live_child(&control_state_path, "job-b");
+    assert_ne!(race_child_id, job_a_id);
+    assert_ne!(race_child_id, job_b_id);
+    assert_ne!(job_a_id, job_b_id);
+
+    let job_a_artifact = framework_child_artifact(&run, "compose_local", job_a_id);
+    let job_b_artifact = framework_child_artifact(&run, "compose_local", job_b_id);
+    let job_a_proxy_port = pick_free_port();
+    let job_b_proxy_port = pick_free_port();
+    let mut job_a_proxy = spawn_proxy(&job_a_artifact, "http", job_a_proxy_port, &[]);
+    let mut job_b_proxy = spawn_proxy(&job_b_artifact, "http", job_b_proxy_port, &[]);
+    wait_for_path(
+        &mut job_a_proxy,
+        job_a_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+    wait_for_path(
+        &mut job_b_proxy,
+        job_b_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+    assert_eq!(
+        wait_for_body(
+            &mut job_a_proxy,
+            job_a_proxy_port,
+            "/id",
+            Duration::from_secs(60)
+        ),
+        "worker-a"
+    );
+    assert_eq!(
+        wait_for_body(
+            &mut job_b_proxy,
+            job_b_proxy_port,
+            "/id",
+            Duration::from_secs(60)
+        ),
+        "worker-b"
+    );
+
+    stop_proxy(&mut job_b_proxy);
+    stop_proxy(&mut job_a_proxy);
+    stop_proxy(&mut admin_proxy);
+    run.stop();
+}
+
+#[test]
+#[ignore = "run manually or in CI"]
+fn framework_component_create_to_unoffered_site_fails_deterministically_live() {
+    let temp = temp_output_dir("framework-component-placement-unsatisfied-");
+    let direct_worker_port = pick_free_port();
+
+    fs::write(temp.path().join("admin.py"), FRAMEWORK_ADMIN_APP).expect("failed to write admin.py");
+    fs::write(temp.path().join("worker.py"), FRAMEWORK_WORKER_APP)
+        .expect("failed to write worker.py");
+    write_framework_admin_component(temp.path(), "admin.json5", true, 8080);
+    write_framework_worker_component(
+        temp.path(),
+        "compose-worker.json5",
+        true,
+        "compose-worker",
+        8080,
+    );
+    write_framework_worker_component(
+        temp.path(),
+        "direct-worker.json5",
+        false,
+        "direct-worker",
+        direct_worker_port,
+    );
+
+    let compose_manifest =
+        framework_manifest_catalog_key(&temp.path().join("compose-worker.json5"));
+    let direct_manifest = framework_manifest_catalog_key(&temp.path().join("direct-worker.json5"));
+
+    let manifest = temp.path().join("root.json5");
+    write_json(
+        &manifest,
+        &json!({
+            "manifest_version": "0.3.0",
+            "slots": {
+                "realm": { "kind": "component", "optional": true }
+            },
+            "components": {
+                "admin": "./admin.json5"
+            },
+            "child_templates": {
+                "worker": {
+                    "allowed_manifests": [
+                        compose_manifest,
+                        direct_manifest
+                    ]
+                }
+            },
+            "bindings": [
+                { "to": "#admin.ctl", "from": "framework.component" }
+            ],
+            "exports": {
+                "admin_http": "#admin.http"
+            }
+        }),
+    );
+    let placement = temp.path().join("placement.json5");
+    write_json(
+        &placement,
+        &json!({
+            "schema": "amber.run.placement",
+            "version": 1,
+            "sites": {
+                "compose_local": { "kind": "compose" }
+            },
+            "defaults": {
+                "image": "compose_local"
+            }
+        }),
+    );
+
+    let storage_root = temp.path().join("state");
+    let output = amber_command()
+        .arg("run")
+        .arg(&manifest)
+        .arg("--placement")
+        .arg(&placement)
+        .arg("--storage-root")
+        .arg(&storage_root)
+        .output()
+        .expect("failed to run amber");
+    assert!(
+        !output.status.success(),
+        "run should fail deterministically when an open template allows a manifest that requires \
+         an unoffered site\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("program.path")
+            || stderr.contains("placement_unsatisfied")
+            || stderr.contains("direct_local"),
+        "failure should be operator-actionable, got stderr:\n{stderr}"
+    );
+
+    let runs_dir = storage_root.join("runs");
+    assert!(
+        !runs_dir.exists()
+            || fs::read_dir(&runs_dir)
+                .expect("runs dir should be readable")
+                .next()
+                .is_none(),
+        "deterministic placement failure must not leave partial run artifacts under {}",
+        runs_dir.display()
+    );
+}
+
+#[test]
+#[ignore = "requires docker; run manually or in CI"]
+fn framework_component_root_external_binding_live() {
+    ensure_internal_images();
+    let temp = temp_output_dir("framework-component-root-external-");
+    let catalog = HostHttpServer::start();
+    let catalog_url = docker_host_http_url(catalog.port())
+        .trim_end_matches('/')
+        .to_string();
+    let admin_port = pick_free_port();
+    let worker_port = pick_free_port();
+    let nested_admin_port = pick_free_port();
+
+    fs::write(temp.path().join("admin.py"), FRAMEWORK_ADMIN_APP).expect("failed to write admin.py");
+    fs::write(
+        temp.path().join("external_bind.py"),
+        FRAMEWORK_EXTERNAL_BIND_APP,
+    )
+    .expect("failed to write external_bind.py");
+    write_framework_admin_component(temp.path(), "root-admin.json5", true, admin_port);
+    write_framework_admin_component(temp.path(), "nested-admin.json5", true, nested_admin_port);
+    write_json(
+        &temp.path().join("external-worker.json5"),
+        &json!({
+            "manifest_version": "0.3.0",
+            "slots": {
+                "catalog_api": { "kind": "http" }
+            },
+            "program": {
+                "image": TEST_APP_IMAGE,
+                "entrypoint": ["python3", "-u", "-c", { "file": "./external_bind.py" }],
+                "env": {
+                    "NAME": "external-worker",
+                    "PORT": worker_port.to_string(),
+                    "UPSTREAM_URL": "${slots.catalog_api.url}"
+                },
+                "network": {
+                    "endpoints": [
+                        { "name": "http", "port": worker_port, "protocol": "http" }
+                    ]
+                }
+            },
+            "provides": {
+                "http": { "kind": "http", "endpoint": "http" }
+            },
+            "exports": {
+                "http": "http"
+            }
+        }),
+    );
+    write_json(
+        &temp.path().join("parent.json5"),
+        &json!({
+            "manifest_version": "0.3.0",
+            "slots": {
+                "realm": { "kind": "component", "optional": true }
+            },
+            "components": {
+                "admin": "./nested-admin.json5"
+            },
+            "child_templates": {
+                "worker": {
+                    "manifest": "./external-worker.json5"
+                }
+            },
+            "bindings": [
+                { "to": "#admin.ctl", "from": "framework.component" }
+            ],
+            "exports": {
+                "http": "#admin.http"
+            }
+        }),
+    );
+
+    let manifest = temp.path().join("root.json5");
+    write_json(
+        &manifest,
+        &json!({
+            "manifest_version": "0.3.0",
+            "slots": {
+                "realm": { "kind": "component", "optional": true },
+                "catalog_api": { "kind": "http" }
+            },
+            "program": {
+                "image": TEST_APP_IMAGE,
+                "entrypoint": ["sleep", "3600"]
+            },
+            "components": {
+                "admin": "./root-admin.json5",
+                "parent": "./parent.json5"
+            },
+            "child_templates": {
+                "worker": {
+                    "manifest": "./external-worker.json5"
+                }
+            },
+            "bindings": [
+                { "to": "#admin.ctl", "from": "framework.component" }
+            ],
+            "exports": {
+                "admin_http": "#admin.http",
+                "parent_http": "#parent.http"
+            }
+        }),
+    );
+    let placement = temp.path().join("placement.json5");
+    write_json(
+        &placement,
+        &json!({
+            "schema": "amber.run.placement",
+            "version": 1,
+            "sites": {
+                "compose_local": { "kind": "compose" }
+            },
+            "defaults": {
+                "image": "compose_local"
+            }
+        }),
+    );
+
+    let storage_root = temp.path().join("state");
+    let mut run = run_manifest_with_env(
+        &manifest,
+        &placement,
+        &storage_root,
+        &[("AMBER_EXTERNAL_SLOT_CATALOG_API_URL", catalog_url.as_str())],
+    );
+
+    wait_for_state_status(
+        &run.run_root,
+        "compose_local",
+        "running",
+        Duration::from_secs(60),
+    );
+
+    let root_proxy_port = pick_free_port();
+    let mut root_proxy = spawn_proxy(
+        &run.site_artifact_dir("compose_local"),
+        "admin_http",
+        root_proxy_port,
+        &[],
+    );
+    wait_for_path(
+        &mut root_proxy,
+        root_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+    assert_eq!(
+        wait_for_body(
+            &mut root_proxy,
+            root_proxy_port,
+            "/id",
+            Duration::from_secs(60)
+        ),
+        "admin"
+    );
+
+    let (create_status, create_response) = framework_create_child_with_request(
+        root_proxy_port,
+        &json!({
+            "template": "worker",
+            "name": "job-root-external",
+            "bindings": {
+                "catalog_api": {
+                    "selector": "external.catalog_api"
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        create_status, 200,
+        "root realm should be able to bind from external.catalog_api; response: {create_response}"
+    );
+    let child_id = wait_for_live_child(&framework_control_state_path(&run), "job-root-external");
+    let child_artifact = framework_child_artifact(&run, "compose_local", child_id);
+    let child_proxy_port = pick_free_port();
+    let mut child_proxy = spawn_proxy(&child_artifact, "http", child_proxy_port, &[]);
+    wait_for_path(
+        &mut child_proxy,
+        child_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+    assert_eq!(
+        wait_for_body(
+            &mut child_proxy,
+            child_proxy_port,
+            "/probe",
+            Duration::from_secs(60)
+        ),
+        r#"{"source":"external","item":"amber mug"}"#,
+        "dynamic child should consume the real external capability from the root realm"
+    );
+
+    let parent_proxy_port = pick_free_port();
+    let mut parent_proxy = spawn_proxy(
+        &run.site_artifact_dir("compose_local"),
+        "parent_http",
+        parent_proxy_port,
+        &[],
+    );
+    wait_for_path(
+        &mut parent_proxy,
+        parent_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+    assert_eq!(
+        wait_for_body(
+            &mut parent_proxy,
+            parent_proxy_port,
+            "/id",
+            Duration::from_secs(60)
+        ),
+        "admin"
+    );
+
+    let (forbidden_status, forbidden_response) = framework_create_child_with_request(
+        parent_proxy_port,
+        &json!({
+            "template": "worker",
+            "name": "job-parent-external",
+            "bindings": {
+                "catalog_api": {
+                    "selector": "external.catalog_api"
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        forbidden_status, 502,
+        "non-root realms should not bind external.catalog_api directly"
+    );
+    assert!(
+        forbidden_response.contains("external.catalog_api")
+            && forbidden_response.contains("not present in the authority realm"),
+        "non-root external bind failure should explain the realm boundary, got: \
+         {forbidden_response}"
+    );
+
+    stop_proxy(&mut parent_proxy);
+    stop_proxy(&mut child_proxy);
+    stop_proxy(&mut root_proxy);
+    run.stop();
+}
+
+#[test]
+#[ignore = "requires docker; run manually or in CI"]
+fn framework_component_nonweak_publication_barrier_live() {
+    ensure_internal_images();
+    let temp = temp_output_dir("framework-component-publication-barrier-");
+    let admin_port = pick_free_port();
+    let required_port = pick_free_port();
+    let consumer_port = pick_free_port();
+    let delayed_port = pick_free_port();
+    let delayed_url = docker_host_http_url(delayed_port)
+        .trim_end_matches('/')
+        .to_string();
+
+    fs::write(temp.path().join("admin.py"), FRAMEWORK_ADMIN_APP).expect("failed to write admin.py");
+    fs::write(temp.path().join("worker.py"), FRAMEWORK_WORKER_APP)
+        .expect("failed to write worker.py");
+    fs::write(
+        temp.path().join("barrier_probe.py"),
+        FRAMEWORK_BARRIER_PROBE_APP,
+    )
+    .expect("failed to write barrier_probe.py");
+    write_framework_admin_component(temp.path(), "admin.json5", true, admin_port);
+    write_framework_worker_component(
+        temp.path(),
+        "required-worker.json5",
+        true,
+        "required-upstream",
+        required_port,
+    );
+    write_json(
+        &temp.path().join("consumer.json5"),
+        &json!({
+            "manifest_version": "0.3.0",
+            "slots": {
+                "required_api": { "kind": "http" },
+                "weak_api": { "kind": "http" }
+            },
+            "program": {
+                "image": TEST_APP_IMAGE,
+                "entrypoint": ["python3", "-u", "-c", { "file": "./barrier_probe.py" }],
+                "env": {
+                    "NAME": "consumer",
+                    "PORT": consumer_port.to_string(),
+                    "REQUIRED_URL": "${slots.required_api.url}",
+                    "WEAK_URL": "${slots.weak_api.url}"
+                },
+                "network": {
+                    "endpoints": [
+                        { "name": "http", "port": consumer_port, "protocol": "http" }
+                    ]
+                }
+            },
+            "provides": {
+                "http": { "kind": "http", "endpoint": "http" }
+            },
+            "exports": {
+                "http": "http"
+            }
+        }),
+    );
+    let manifest = temp.path().join("root.json5");
+    write_json(
+        &manifest,
+        &json!({
+            "manifest_version": "0.3.0",
+            "slots": {
+                "realm": { "kind": "component", "optional": true },
+                "delayed_api": { "kind": "http" }
+            },
+            "program": {
+                "image": TEST_APP_IMAGE,
+                "entrypoint": ["sleep", "3600"]
+            },
+            "components": {
+                "admin": "./admin.json5"
+            },
+            "child_templates": {
+                "required": {
+                    "manifest": "./required-worker.json5"
+                },
+                "consumer": {
+                    "manifest": "./consumer.json5"
+                }
+            },
+            "bindings": [
+                { "to": "#admin.ctl", "from": "framework.component" }
+            ],
+            "exports": {
+                "admin_http": "#admin.http"
+            }
+        }),
+    );
+    let placement = temp.path().join("placement.json5");
+    write_json(
+        &placement,
+        &json!({
+            "schema": "amber.run.placement",
+            "version": 1,
+            "sites": {
+                "compose_local": { "kind": "compose" }
+            },
+            "defaults": {
+                "image": "compose_local"
+            }
+        }),
+    );
+
+    let storage_root = temp.path().join("state");
+    let mut run = run_manifest_with_env(
+        &manifest,
+        &placement,
+        &storage_root,
+        &[("AMBER_EXTERNAL_SLOT_DELAYED_API_URL", delayed_url.as_str())],
+    );
+    wait_for_state_status(
+        &run.run_root,
+        "compose_local",
+        "running",
+        Duration::from_secs(60),
+    );
+
+    let admin_proxy_port = pick_free_port();
+    let mut admin_proxy = spawn_proxy(
+        &run.site_artifact_dir("compose_local"),
+        "admin_http",
+        admin_proxy_port,
+        &[],
+    );
+    wait_for_path(
+        &mut admin_proxy,
+        admin_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+
+    let (required_status, required_response) = framework_create_child_with_request(
+        admin_proxy_port,
+        &json!({
+            "template": "required",
+            "name": "required"
+        }),
+    );
+    assert_eq!(
+        required_status, 200,
+        "required provider create should succeed; response: {required_response}"
+    );
+
+    let control_state_path = framework_control_state_path(&run);
+    wait_for_live_child(&control_state_path, "required");
+
+    let (consumer_status, consumer_response) = framework_create_child_with_request(
+        admin_proxy_port,
+        &json!({
+            "template": "consumer",
+            "name": "consumer",
+            "bindings": {
+                "required_api": {
+                    "selector": "children.required.exports.http"
+                },
+                "weak_api": {
+                    "selector": "external.delayed_api"
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        consumer_status, 200,
+        "consumer create should succeed without waiting on the weak binding; response: \
+         {consumer_response}"
+    );
+
+    let consumer_id = wait_for_live_child(&control_state_path, "consumer");
+    let consumer_artifact = framework_child_artifact(&run, "compose_local", consumer_id);
+    let consumer_proxy_port = pick_free_port();
+    let mut consumer_proxy = spawn_proxy(&consumer_artifact, "http", consumer_proxy_port, &[]);
+    wait_for_path(
+        &mut consumer_proxy,
+        consumer_proxy_port,
+        "/startup",
+        Duration::from_secs(60),
+    );
+    let startup: Value = serde_json::from_str(&wait_for_body(
+        &mut consumer_proxy,
+        consumer_proxy_port,
+        "/startup",
+        Duration::from_secs(60),
+    ))
+    .expect("startup payload should be valid json");
+    assert_eq!(
+        startup["required"]["ok"],
+        json!(true),
+        "required nonweak binding must be usable when the child first becomes live: {startup}"
+    );
+    assert_eq!(
+        startup["required"]["body"],
+        json!("required-upstream"),
+        "required startup probe should hit the required upstream: {startup}"
+    );
+    assert_eq!(
+        startup["weak"]["ok"],
+        json!(false),
+        "weak binding may still be absent during startup, but it must not block child liveness: \
+         {startup}"
+    );
+    assert!(
+        startup["weak"]["error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty()),
+        "weak startup probe should record its failure mode: {startup}"
+    );
+
+    stop_proxy(&mut consumer_proxy);
+    stop_proxy(&mut admin_proxy);
+    run.stop();
+}
+
+#[test]
+#[ignore = "requires docker + a working direct runtime sandbox; run manually or in CI"]
+fn framework_component_delegated_realm_cross_site_live() {
+    ensure_internal_images();
+    let temp = temp_output_dir("framework-component-delegated-realm-");
+    let delegate_port = pick_free_port();
+    let intruder_port = pick_free_port();
+
+    fs::write(temp.path().join("admin.py"), FRAMEWORK_ADMIN_APP).expect("failed to write admin.py");
+    fs::write(temp.path().join("app.py"), FRAMEWORK_MATRIX_APP).expect("failed to write app.py");
+    write_framework_admin_component(temp.path(), "delegate-admin.json5", false, delegate_port);
+    write_framework_admin_component(temp.path(), "intruder-admin.json5", false, intruder_port);
+    write_image_component(temp.path(), "provider.json5", "provider", 8080, &[], &[]);
+    write_image_component(
+        temp.path(),
+        "root-worker.json5",
+        "root-worker",
+        8080,
+        &[("upstream", "${slots.upstream.url}")],
+        &[],
+    );
+    write_image_component(
+        temp.path(),
+        "local-worker.json5",
+        "local-worker",
+        8080,
+        &[("upstream", "${slots.upstream.url}")],
+        &[],
+    );
+    write_json(
+        &temp.path().join("parent.json5"),
+        &json!({
+            "manifest_version": "0.3.0",
+            "slots": {
+                "realm": { "kind": "component", "optional": true }
+            },
+            "components": {
+                "delegate": "./delegate-admin.json5",
+                "intruder": "./intruder-admin.json5"
+            },
+            "child_templates": {
+                "worker": {
+                    "manifest": "./local-worker.json5"
+                }
+            },
+            "bindings": [
+                { "to": "#delegate.ctl", "from": "slots.realm" },
+                { "to": "#intruder.ctl", "from": "framework.component" }
+            ],
+            "exports": {
+                "delegate_http": "#delegate.http",
+                "intruder_http": "#intruder.http"
+            }
+        }),
+    );
+
+    let manifest = temp.path().join("root.json5");
+    write_json(
+        &manifest,
+        &json!({
+            "manifest_version": "0.3.0",
+            "components": {
+                "parent": "./parent.json5",
+                "provider": "./provider.json5"
+            },
+            "child_templates": {
+                "root_worker": {
+                    "manifest": "./root-worker.json5"
+                }
+            },
+            "bindings": [
+                { "to": "#parent.realm", "from": "framework.component" }
+            ],
+            "exports": {
+                "delegate_http": "#parent.delegate_http",
+                "intruder_http": "#parent.intruder_http",
+                "provider_http": "#provider.http"
+            }
+        }),
+    );
+    let placement = temp.path().join("placement.json5");
+    write_json(
+        &placement,
+        &json!({
+            "schema": "amber.run.placement",
+            "version": 1,
+            "sites": {
+                "compose_local": { "kind": "compose" },
+                "direct_local": { "kind": "direct" }
+            },
+            "defaults": {
+                "image": "compose_local",
+                "path": "direct_local"
+            },
+            "components": {
+                "/parent": "compose_local",
+                "/parent/delegate": "direct_local",
+                "/parent/intruder": "direct_local",
+                "/provider": "compose_local"
+            }
+        }),
+    );
+
+    let storage_root = temp.path().join("state");
+    let mut run = run_manifest(&manifest, &placement, &storage_root);
+
+    wait_for_state_status(
+        &run.run_root,
+        "compose_local",
+        "running",
+        Duration::from_secs(60),
+    );
+    wait_for_state_status(
+        &run.run_root,
+        "direct_local",
+        "running",
+        Duration::from_secs(60),
+    );
+
+    let delegate_proxy_port = pick_free_port();
+    let mut delegate_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_local"),
+        "delegate_http",
+        delegate_proxy_port,
+        &[],
+    );
+    wait_for_path(
+        &mut delegate_proxy,
+        delegate_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+
+    let intruder_proxy_port = pick_free_port();
+    let mut intruder_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_local"),
+        "intruder_http",
+        intruder_proxy_port,
+        &[],
+    );
+    wait_for_path(
+        &mut intruder_proxy,
+        intruder_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+
+    let (delegate_status, delegate_response) = framework_create_child_with_request(
+        delegate_proxy_port,
+        &json!({
+            "template": "root_worker",
+            "name": "sibling",
+            "bindings": {
+                "upstream": {
+                    "selector": "children.provider.exports.http"
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        delegate_status, 200,
+        "delegated authority should create in the forwarded realm; response: {delegate_response}"
+    );
+    let delegate_json: Value =
+        serde_json::from_str(&delegate_response).expect("delegate create response should be valid");
+    assert_eq!(
+        delegate_json["child"]["selector"].as_str(),
+        Some("children.sibling"),
+        "child selector should reflect the authority realm, not the transport caller"
+    );
+
+    let control_state_path = framework_control_state_path(&run);
+    let sibling_id = wait_for_live_child(&control_state_path, "sibling");
+    let sibling_artifact = framework_child_artifact(&run, "compose_local", sibling_id);
+    let sibling_proxy_port = pick_free_port();
+    let mut sibling_proxy = spawn_proxy(&sibling_artifact, "http", sibling_proxy_port, &[]);
+    wait_for_path(
+        &mut sibling_proxy,
+        sibling_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+    assert_eq!(
+        wait_for_body(
+            &mut sibling_proxy,
+            sibling_proxy_port,
+            "/call/upstream",
+            Duration::from_secs(60)
+        ),
+        "provider",
+        "selector resolution should happen in the authority realm visible to the delegated \
+         capability instance"
+    );
+
+    let (intruder_status, intruder_response) = framework_create_child_with_request(
+        intruder_proxy_port,
+        &json!({
+            "template": "worker",
+            "name": "blocked",
+            "bindings": {
+                "upstream": {
+                    "selector": "children.provider.exports.http"
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        intruder_status, 502,
+        "an unrelated child on the same site must not act in the delegated realm"
+    );
+    assert!(
+        intruder_response.contains("children.provider.exports.http")
+            && intruder_response.contains("not present in the authority realm"),
+        "intruder failure should explain that selector resolution stayed in its own realm, got: \
+         {intruder_response}"
+    );
+
+    let (destroy_status, destroy_response) =
+        framework_destroy_child_via_admin(delegate_proxy_port, "sibling");
+    assert_eq!(
+        destroy_status, 200,
+        "delegated destroy should succeed; response: {destroy_response}"
+    );
+    wait_for_framework_child_absent(
+        &control_state_path,
+        "sibling",
+        &[sibling_artifact
+            .parent()
+            .expect("sibling artifact should have a parent")
+            .to_path_buf()],
+        Duration::from_secs(60),
+    );
+
+    stop_proxy(&mut sibling_proxy);
+    stop_proxy(&mut intruder_proxy);
+    stop_proxy(&mut delegate_proxy);
     run.stop();
 }
 
@@ -1459,6 +2999,302 @@ fn framework_component_dynamic_children_teardown_with_run_live() {
         },
         "dynamic child teardown when the whole scenario stops",
     );
+}
+
+#[test]
+#[ignore = "requires a working direct runtime sandbox; run manually or in CI"]
+fn framework_component_destroy_of_provider_keeps_consumer_live() {
+    let temp = temp_output_dir("framework-component-destroy-provider-");
+    let admin_port = pick_free_port();
+    let provider_port = pick_free_port();
+    let consumer_port = pick_free_port();
+
+    fs::write(temp.path().join("admin.py"), FRAMEWORK_ADMIN_APP).expect("failed to write admin.py");
+    fs::write(temp.path().join("app.py"), FRAMEWORK_MATRIX_APP).expect("failed to write app.py");
+    fs::write(temp.path().join("worker.py"), FRAMEWORK_WORKER_APP)
+        .expect("failed to write worker.py");
+    write_framework_admin_component(temp.path(), "admin.json5", false, admin_port);
+    write_framework_worker_component(
+        temp.path(),
+        "producer.json5",
+        false,
+        "provider",
+        provider_port,
+    );
+    write_path_component(
+        temp.path(),
+        "consumer.json5",
+        "consumer",
+        consumer_port,
+        &[("upstream", "${slots.upstream.url}")],
+        &[],
+    );
+
+    let manifest = temp.path().join("root.json5");
+    write_json(
+        &manifest,
+        &json!({
+            "manifest_version": "0.3.0",
+            "slots": {
+                "realm": { "kind": "component", "optional": true }
+            },
+            "components": {
+                "admin": "./admin.json5"
+            },
+            "child_templates": {
+                "producer": { "manifest": "./producer.json5" },
+                "consumer": { "manifest": "./consumer.json5" }
+            },
+            "bindings": [
+                { "to": "#admin.ctl", "from": "framework.component" }
+            ],
+            "exports": {
+                "admin_http": "#admin.http"
+            }
+        }),
+    );
+    let placement = temp.path().join("placement.json5");
+    write_json(
+        &placement,
+        &json!({
+            "schema": "amber.run.placement",
+            "version": 1,
+            "sites": {
+                "direct_local": { "kind": "direct" }
+            },
+            "defaults": {
+                "path": "direct_local"
+            }
+        }),
+    );
+
+    let storage_root = temp.path().join("state");
+    let mut run = run_manifest(&manifest, &placement, &storage_root);
+
+    let proxy_port = pick_free_port();
+    let mut admin_proxy = spawn_proxy(
+        &run.site_artifact_dir("direct_local"),
+        "admin_http",
+        proxy_port,
+        &[],
+    );
+    wait_for_path(&mut admin_proxy, proxy_port, "/id", Duration::from_secs(60));
+
+    let (create_provider_status, create_provider_response) = http_get_with_timeout(
+        proxy_port,
+        "/create/producer/source",
+        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
+    )
+    .expect("producer create request should return an HTTP response");
+    assert_eq!(
+        create_provider_status, 200,
+        "producer create request should succeed"
+    );
+    let create_provider_json: Value = serde_json::from_str(&create_provider_response)
+        .expect("producer create response should be valid json");
+    assert_eq!(create_provider_json["child"]["name"], "source");
+
+    let control_state_path = framework_control_state_path(&run);
+    let source_id = wait_for_live_child(&control_state_path, "source");
+    let source_root = framework_child_artifact(&run, "direct_local", source_id)
+        .parent()
+        .expect("source artifact should have a parent")
+        .to_path_buf();
+
+    let (create_consumer_status, create_consumer_response) = framework_create_child_with_request(
+        proxy_port,
+        &json!({
+            "template": "consumer",
+            "name": "sink",
+            "bindings": {
+                "upstream": {
+                    "selector": "children.source.exports.http"
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        create_consumer_status, 200,
+        "consumer create request should succeed; response: {create_consumer_response}"
+    );
+    let create_consumer_json: Value = serde_json::from_str(&create_consumer_response)
+        .expect("consumer create response should be valid json");
+    assert_eq!(create_consumer_json["child"]["name"], "sink");
+
+    let sink_id = wait_for_live_child(&control_state_path, "sink");
+    let sink_artifact = framework_child_artifact(&run, "direct_local", sink_id);
+
+    let sink_proxy_port = pick_free_port();
+    let mut sink_proxy = spawn_proxy(&sink_artifact, "http", sink_proxy_port, &[]);
+    wait_for_path(
+        &mut sink_proxy,
+        sink_proxy_port,
+        "/id",
+        Duration::from_secs(60),
+    );
+    assert_eq!(
+        wait_for_body(
+            &mut sink_proxy,
+            sink_proxy_port,
+            "/id",
+            Duration::from_secs(60)
+        ),
+        "consumer"
+    );
+    assert_eq!(
+        wait_for_body(
+            &mut sink_proxy,
+            sink_proxy_port,
+            "/call/upstream",
+            Duration::from_secs(60)
+        ),
+        "provider",
+        "consumer should initially resolve the provider binding"
+    );
+
+    let (destroy_status, destroy_response) =
+        framework_destroy_child_via_admin(proxy_port, "source");
+    assert_eq!(
+        destroy_status, 200,
+        "provider destroy request should succeed; response: {destroy_response}"
+    );
+
+    wait_for_condition(
+        Duration::from_secs(60),
+        || {
+            !source_root.exists()
+                && read_json(&control_state_path)["live_children"]
+                    .as_array()
+                    .is_some_and(|children| children.iter().all(|child| child["name"] != "source"))
+        },
+        "provider child removal after destroy",
+    );
+
+    assert_eq!(
+        wait_for_body(
+            &mut sink_proxy,
+            sink_proxy_port,
+            "/id",
+            Duration::from_secs(60)
+        ),
+        "consumer",
+        "consumer should remain alive after destroying the provider"
+    );
+    wait_for_condition(
+        Duration::from_secs(60),
+        || match http_get_with_timeout(sink_proxy_port, "/call/upstream", Duration::from_secs(5)) {
+            Some((status, body)) => status != 200 || body != "provider",
+            None => true,
+        },
+        "consumer upstream route removal after provider destroy",
+    );
+
+    stop_proxy(&mut sink_proxy);
+    stop_proxy(&mut admin_proxy);
+    run.stop();
+}
+
+#[test]
+#[ignore = "requires docker + kind + kubectl + qemu + an Ubuntu 24.04 cloud image matching the \
+            host architecture; run manually or in CI"]
+fn framework_component_kind_root_export_live() {
+    ensure_internal_images();
+    let temp = temp_output_dir("framework-component-kind-root-");
+    let kubeconfig = temp.path().join("kubeconfig");
+    let kind_cluster = KindCluster::from_env_or_create(&kubeconfig);
+    ensure_kind_internal_images(&kind_cluster);
+    let kubeconfig_env = kind_cluster.kubeconfig.display().to_string();
+
+    let fixture = write_framework_matrix_fixture(temp.path(), &kind_cluster);
+    let storage_root = temp.path().join("state");
+    let mut run = run_manifest_with_env(
+        &fixture.manifest,
+        &fixture.placement,
+        &storage_root,
+        &[("KUBECONFIG", &kubeconfig_env)],
+    );
+
+    let compose_state = wait_for_state_status(
+        &run.run_root,
+        "compose_local",
+        "running",
+        Duration::from_secs(60),
+    );
+    let kind_state = wait_for_state_status(
+        &run.run_root,
+        "kind_local",
+        "running",
+        Duration::from_secs(120),
+    );
+    let direct_state = wait_for_state_status(
+        &run.run_root,
+        "direct_local",
+        "running",
+        Duration::from_secs(60),
+    );
+    let vm_state = wait_for_state_status(
+        &run.run_root,
+        "vm_local",
+        "running",
+        Duration::from_secs(240),
+    );
+    let site_state = |site_id: &str| match site_id {
+        "compose_local" => &compose_state,
+        "kind_local" => &kind_state,
+        "direct_local" => &direct_state,
+        "vm_local" => &vm_state,
+        _ => panic!("unknown site {site_id}"),
+    };
+
+    let control_state_path = framework_control_state_path(&run);
+    let creator_port = pick_free_port();
+    let mut creator_proxy = spawn_framework_proxy_for_site(
+        &run.site_artifact_dir("compose_local"),
+        "compose_admin_http",
+        creator_port,
+        site_state("compose_local"),
+    );
+    wait_for_path(
+        &mut creator_proxy,
+        creator_port,
+        "/id",
+        Duration::from_secs(240),
+    );
+    assert_eq!(
+        wait_for_body(
+            &mut creator_proxy,
+            creator_port,
+            "/id",
+            Duration::from_secs(30),
+        ),
+        "admin",
+    );
+
+    let (create_status, create_response) = http_get_with_timeout(
+        creator_port,
+        "/create/child_kind/job-kind",
+        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
+    )
+    .expect("create request should return an HTTP response");
+    assert_eq!(
+        create_status, 200,
+        "create request should succeed; response: {create_response}"
+    );
+    let child_id = wait_for_live_child(&control_state_path, "job-kind");
+
+    let root_artifact = framework_child_artifact(&run, "kind_local", child_id);
+    let root_port = pick_free_port();
+    let mut root_proxy =
+        spawn_framework_proxy_for_site(&root_artifact, "http", root_port, site_state("kind_local"));
+    wait_for_path(&mut root_proxy, root_port, "/id", Duration::from_secs(300));
+    assert_eq!(
+        wait_for_body(&mut root_proxy, root_port, "/id", Duration::from_secs(30)),
+        "child-kind-root"
+    );
+
+    stop_proxy(&mut root_proxy);
+    stop_proxy(&mut creator_proxy);
+    run.stop();
 }
 
 #[test]
