@@ -37,10 +37,12 @@ fn docker_smoke_component_reaches_public_internet_by_default() {
 
     let dir = tempdir().unwrap();
     let project = dir.path();
+    let helper_platform = build_helper_image();
     let router_platform = build_router_image();
     let provisioner_platform = build_provisioner_image();
     let images = internal_images();
     let platform = require_same_platform(&[
+        (&images.helper, helper_platform),
         (&images.router, router_platform),
         (&images.provisioner, provisioner_platform),
     ]);
@@ -157,6 +159,278 @@ fn docker_smoke_component_reaches_public_internet_by_default() {
 
 #[test]
 #[ignore = "requires docker + docker compose; run manually"]
+fn docker_smoke_component_default_egress_blocks_host_access() {
+    use std::{
+        io::{Read, Write},
+        net::{SocketAddr, TcpListener, TcpStream},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+
+    use tempfile::tempdir;
+
+    struct ComposeGuard {
+        project: PathBuf,
+    }
+
+    impl ComposeGuard {
+        fn new(project: &Path) -> Self {
+            Self {
+                project: project.to_path_buf(),
+            }
+        }
+    }
+
+    impl Drop for ComposeGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("docker")
+                .current_dir(&self.project)
+                .arg("compose")
+                .args([
+                    "down",
+                    "-v",
+                    "--remove-orphans",
+                    "--rmi",
+                    "local",
+                    "--timeout",
+                    "1",
+                ])
+                .status();
+        }
+    }
+
+    struct HostHttpServer {
+        port: u16,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl HostHttpServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
+                .expect("bind host http server");
+            let port = listener.local_addr().expect("host server addr").port();
+            listener
+                .set_nonblocking(true)
+                .expect("host listener should be nonblocking");
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_thread = Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                while !stop_thread.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let mut request = [0u8; 1024];
+                            let _ = stream.read(&mut request);
+                            let body = "adversarial-ok";
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: \
+                                 text/plain; charset=utf-8\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if let Ok(mut stream) = TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port)))
+                {
+                    let _ = stream.write_all(
+                        b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                    );
+                    let mut response = String::new();
+                    let _ = stream.read_to_string(&mut response);
+                    if response.contains("adversarial-ok") {
+                        return Self {
+                            port,
+                            stop,
+                            thread: Some(thread),
+                        };
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            panic!("timed out waiting for host http server on 127.0.0.1:{port}");
+        }
+
+        fn port(&self) -> u16 {
+            self.port
+        }
+    }
+
+    impl Drop for HostHttpServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            let _ = TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], self.port)));
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn docker_host_ip() -> String {
+        let output = Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "--add-host",
+                "host.docker.internal:host-gateway",
+                "busybox:1.36.1",
+                "sh",
+                "-lc",
+                "grep 'host.docker.internal' /etc/hosts | awk '{print $1}'",
+            ])
+            .output()
+            .expect("resolve docker host ip");
+        assert!(
+            output.status.success(),
+            "failed to resolve docker host ip\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    let dir = tempdir().unwrap();
+    let project = dir.path();
+    let host_server = HostHttpServer::start();
+    let host_url = format!("http://{}:{}/", docker_host_ip(), host_server.port());
+    let helper_platform = build_helper_image();
+    let router_platform = build_router_image();
+    let provisioner_platform = build_provisioner_image();
+    let images = internal_images();
+    let platform = require_same_platform(&[
+        (&images.helper, helper_platform),
+        (&images.router, router_platform),
+        (&images.provisioner, provisioner_platform),
+    ]);
+    ensure_image_platform("busybox:1.36.1", &platform);
+
+    let client_program = lower_test_program(
+        1,
+        json!({
+            "image": "busybox:1.36.1",
+            "entrypoint": ["sh", "-lc", "sleep infinity"],
+        }),
+    );
+
+    let root = Component {
+        id: ComponentId(0),
+        parent: None,
+        moniker: moniker("/"),
+        digest: digest(0),
+        config: None,
+        config_schema: None,
+        program: None,
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        metadata: None,
+        children: vec![ComponentId(1)],
+    };
+
+    let client = Component {
+        id: ComponentId(1),
+        parent: Some(ComponentId(0)),
+        moniker: moniker("/client"),
+        digest: digest(1),
+        config: None,
+        config_schema: None,
+        program: Some(client_program),
+        slots: BTreeMap::new(),
+        provides: BTreeMap::new(),
+        resources: BTreeMap::new(),
+        metadata: None,
+        children: Vec::new(),
+    };
+
+    let scenario = Scenario {
+        root: ComponentId(0),
+        components: vec![Some(root), Some(client)],
+        bindings: Vec::new(),
+        exports: Vec::new(),
+    };
+
+    let output = compile_output(scenario);
+    let yaml = render_compose(&output).expect("compose render ok");
+    fs::write(project.join(super::COMPOSE_FILENAME), yaml).unwrap();
+
+    let _compose_guard = ComposeGuard::new(project);
+    let compose = |args: &[&str]| {
+        let mut cmd = Command::new("docker");
+        cmd.current_dir(project).arg("compose").args(args);
+        cmd
+    };
+
+    let status = compose(&["up", "-d"]).status().unwrap();
+    assert!(status.success(), "docker compose up failed");
+
+    let public_probe = r#"timeout 5 nslookup example.com >/tmp/public-dns.txt 2>&1 && \
+        wget -qO- --timeout=3 --tries=1 http://example.com/ > /tmp/public-body.txt \
+        2>/tmp/public-wget.txt && grep -q 'Example Domain' /tmp/public-body.txt"#;
+    let host_probe = format!(
+        "wget -qO- --timeout=2 --tries=1 '{host_url}' > /tmp/host-body.txt 2>/tmp/host-wget.txt"
+    );
+
+    let mut public_ok = false;
+    let mut host_blocked = false;
+    for _ in 0..5 {
+        let public_output = compose(&["exec", "-T", "c1-client", "sh", "-lc", public_probe])
+            .output()
+            .unwrap();
+        public_ok = public_output.status.success();
+
+        let host_output = compose(&["exec", "-T", "c1-client", "sh", "-lc", host_probe.as_str()])
+            .output()
+            .unwrap();
+        host_blocked = !host_output.status.success();
+
+        if public_ok && host_blocked {
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    if !(public_ok && host_blocked) {
+        let compose_logs = compose(&["logs", "--no-color"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_else(|err| format!("failed to capture compose logs: {err}"));
+        let client_diag_cmd = format!(
+            "echo '=== public internet ==='; wget -O- --timeout=3 --tries=1 http://example.com/ \
+             2>&1 || true; echo; echo '=== host probe ==='; wget -O- --timeout=2 --tries=1 \
+             '{host_url}' 2>&1 || true"
+        );
+        let client_diag = compose(&[
+            "exec",
+            "-T",
+            "c1-client",
+            "sh",
+            "-lc",
+            client_diag_cmd.as_str(),
+        ])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_else(|err| format!("failed to capture client diagnostics: {err}"));
+        panic!(
+            "default Compose egress should reach the public internet while blocking direct host \
+             access\npublic_ok={public_ok}\nhost_blocked={host_blocked}\nclient \
+             diagnostics:\n{}\ncompose logs:\n{}",
+            client_diag, compose_logs
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires docker + docker compose; run manually"]
 fn docker_smoke_external_slot_routes_to_outside_service() {
     use tempfile::tempdir;
 
@@ -238,10 +512,12 @@ fn docker_smoke_external_slot_routes_to_outside_service() {
 
     let dir = tempdir().unwrap();
     let project = dir.path();
+    let helper_platform = build_helper_image();
     let router_platform = build_router_image();
     let provisioner_platform = build_provisioner_image();
     let images = internal_images();
     let platform = require_same_platform(&[
+        (&images.helper, helper_platform),
         (&images.router, router_platform),
         (&images.provisioner, provisioner_platform),
     ]);
@@ -414,10 +690,12 @@ fn docker_smoke_a2a_three_party_url_rewrite_routes_follow_up_call() {
 
     let dir = tempdir().unwrap();
     let project = dir.path();
+    let helper_platform = build_helper_image();
     let router_platform = build_router_image();
     let provisioner_platform = build_provisioner_image();
     let images = internal_images();
     let platform = require_same_platform(&[
+        (&images.helper, helper_platform),
         (&images.router, router_platform),
         (&images.provisioner, provisioner_platform),
     ]);
@@ -766,10 +1044,12 @@ fn docker_smoke_sidecar_restart_rejoins_mesh() {
 
     let dir = tempdir().unwrap();
     let project = dir.path();
+    let helper_platform = build_helper_image();
     let router_platform = build_router_image();
     let provisioner_platform = build_provisioner_image();
     let images = internal_images();
     let platform = require_same_platform(&[
+        (&images.helper, helper_platform),
         (&images.router, router_platform),
         (&images.provisioner, provisioner_platform),
     ]);

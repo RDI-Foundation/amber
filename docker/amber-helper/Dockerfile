@@ -72,7 +72,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     install -D -m 0755 /app/target/"${target}"/"${build_dir}"/amber-helper /out/amber-helper && \
     mkdir -p /out/amber/bin /out/amber/mesh
 
-FROM scratch
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    iproute2 \
+    iptables \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /out/amber-helper /amber-helper
 COPY --from=builder /out/amber /amber

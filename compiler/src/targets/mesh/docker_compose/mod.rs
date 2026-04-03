@@ -272,6 +272,8 @@ struct DependsOnCondition {
 struct ServiceNames {
     program: String,
     sidecar: String,
+    egress_network: String,
+    egress_init: String,
 }
 
 impl MeshServiceName for ServiceNames {
@@ -364,9 +366,12 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
     let names: HashMap<ComponentId, ServiceNames> =
         map_program_components(s, program_components, |id, local_name| {
             let base = service_base_name(id, local_name);
+            let sidecar = format!("{base}-net");
             ServiceNames {
                 program: base.clone(),
-                sidecar: format!("{base}-net"),
+                sidecar: sidecar.clone(),
+                egress_network: format!("amber_egress_{sidecar}"),
+                egress_init: format!("{sidecar}-egress-init"),
             }
         });
     let docker_mount_components: BTreeSet<ComponentId> =
@@ -707,6 +712,13 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
     // Emit services in stable (component id) order, sidecar then program.
     for id in program_components {
         let svc = names.get(id).unwrap();
+        compose
+            .networks
+            .entry(svc.egress_network.clone())
+            .or_insert_with(|| Network {
+                driver: "bridge".to_string(),
+                internal: false,
+            });
 
         let mut sidecar_service = Service::new(images.router.clone());
         sidecar_service.user = Some(format!("{ROUTER_RUNTIME_UID}:{ROUTER_RUNTIME_GID}"));
@@ -721,7 +733,7 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
             .insert(MESH_NETWORK_NAME.to_string(), EmptyMap::default());
         sidecar_service
             .networks
-            .insert(BOUNDARY_NETWORK_NAME.to_string(), EmptyMap::default());
+            .insert(svc.egress_network.clone(), EmptyMap::default());
         let sidecar_volume = mesh_volume_name(&svc.sidecar);
         compose
             .volumes
@@ -742,6 +754,19 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
         compose
             .services
             .insert(svc.sidecar.clone(), sidecar_service);
+
+        let mut egress_init_service = Service::new(images.helper.clone());
+        egress_init_service.user = Some("0:0".to_string());
+        egress_init_service.command = Some(vec!["install-default-egress-guard".to_string()]);
+        egress_init_service.network_mode = Some(format!("service:{}", svc.sidecar));
+        egress_init_service.cap_add.push("NET_ADMIN".to_string());
+        egress_init_service.depends_on =
+            build_depends_on(any_helper, vec![(svc.sidecar.clone(), "service_started")]);
+        egress_init_service.restart = Some("no".to_string());
+        apply_default_service_hardening(&mut egress_init_service);
+        compose
+            .services
+            .insert(svc.egress_init.clone(), egress_init_service);
 
         // depends_on: own sidecar + strong deps provider programs (+ amber-init for helper-backed services)
         let program_plan = program_plans.get(id).expect("program plan computed");
@@ -789,6 +814,7 @@ fn render_docker_compose_inner(scenario: &Scenario) -> DcResult<DockerComposeArt
             ));
         }
         deps.push((svc.sidecar.clone(), "service_started"));
+        deps.push((svc.egress_init.clone(), "service_completed_successfully"));
         if let Some(ds) = mesh_plan.strong_deps().get(id) {
             for dep in ds {
                 if let Some(dep_names) = names.get(dep) {

@@ -1,9 +1,11 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs,
     io::ErrorKind,
+    net::{IpAddr, ToSocketAddrs},
     path::Path,
+    process::Command,
     thread,
     time::{Duration, Instant},
 };
@@ -28,12 +30,38 @@ const RESOLVED_ENV_ENV: &str = "AMBER_RESOLVED_ENV_B64";
 const MOUNT_SPEC_ENV: &str = "AMBER_MOUNT_SPEC_B64";
 const DOCKER_MOUNT_PROXY_SPEC_ENV: &str = "AMBER_DOCKER_MOUNT_PROXY_SPEC_B64";
 const RUNTIME_TEMPLATE_CONTEXT_ENV: &str = "AMBER_RUNTIME_TEMPLATE_CONTEXT_B64";
+const IP_BIN: &str = "/usr/sbin/ip";
+const IPTABLES_BIN: &str = "/usr/sbin/iptables";
+const IP6TABLES_BIN: &str = "/usr/sbin/ip6tables";
+const DEFAULT_EGRESS_CHAIN: &str = "AMBER_EGRESS";
+const HOST_GATEWAY_NAME: &str = "host.docker.internal";
+const BLOCKED_IPV4_CIDRS: &[&str] = &[
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+];
+const BLOCKED_IPV6_CIDRS: &[&str] = &["fc00::/7", "fe80::/10"];
 
 #[derive(Debug, Deserialize, Serialize)]
 struct DockerMountProxySpec {
     path: String,
     tcp_host: String,
     tcp_port: u16,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct IpRouteEntry {
+    #[serde(default)]
+    dst: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct EgressRouteSnapshot {
+    connected_subnets: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -66,6 +94,13 @@ pub enum HelperError {
 }
 
 pub type Result<T> = std::result::Result<T, HelperError>;
+
+pub fn install_default_egress_guard() -> Result<()> {
+    let host_gateway_ips = resolve_host_gateway_ips();
+    install_egress_guard_family(IPTABLES_BIN, "-4", BLOCKED_IPV4_CIDRS, &host_gateway_ips)?;
+    install_egress_guard_family(IP6TABLES_BIN, "-6", BLOCKED_IPV6_CIDRS, &host_gateway_ips)?;
+    Ok(())
+}
 
 pub fn wait_for_mesh_config_scope(
     config_path: &Path,
@@ -121,6 +156,184 @@ fn mesh_scope_from_config(raw: &str) -> Result<Option<String>> {
         .pointer("/identity/mesh_scope")
         .and_then(Value::as_str)
         .map(str::to_owned))
+}
+
+fn install_egress_guard_family(
+    iptables_bin: &str,
+    family_flag: &str,
+    blocked_cidrs: &[&str],
+    host_gateway_ips: &BTreeSet<IpAddr>,
+) -> Result<()> {
+    let snapshot = read_route_snapshot(family_flag)?;
+    let blocked_destinations = blocked_destinations_for_family(
+        iptables_bin,
+        blocked_cidrs,
+        host_gateway_ips.iter().copied(),
+    );
+
+    run_command_allow_failure(
+        iptables_bin,
+        ["-w", "-D", "OUTPUT", "-j", DEFAULT_EGRESS_CHAIN],
+    )?;
+    run_command_allow_failure(iptables_bin, ["-w", "-F", DEFAULT_EGRESS_CHAIN])?;
+    run_command_allow_failure(iptables_bin, ["-w", "-X", DEFAULT_EGRESS_CHAIN])?;
+    if blocked_destinations.is_empty() {
+        return Ok(());
+    }
+    run_command(iptables_bin, ["-w", "-N", DEFAULT_EGRESS_CHAIN])?;
+    run_command(
+        iptables_bin,
+        ["-w", "-A", "OUTPUT", "-j", DEFAULT_EGRESS_CHAIN],
+    )?;
+    run_command(
+        iptables_bin,
+        ["-w", "-A", DEFAULT_EGRESS_CHAIN, "-o", "lo", "-j", "RETURN"],
+    )?;
+    for subnet in &snapshot.connected_subnets {
+        run_command(
+            iptables_bin,
+            [
+                "-w",
+                "-A",
+                DEFAULT_EGRESS_CHAIN,
+                "-d",
+                subnet.as_str(),
+                "-j",
+                "RETURN",
+            ],
+        )?;
+    }
+    for blocked_destination in blocked_destinations {
+        run_command(
+            iptables_bin,
+            [
+                "-w",
+                "-A",
+                DEFAULT_EGRESS_CHAIN,
+                "-d",
+                blocked_destination.as_str(),
+                "-j",
+                "REJECT",
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn read_route_snapshot(family_flag: &str) -> Result<EgressRouteSnapshot> {
+    let output = run_command(
+        IP_BIN,
+        ["-j", family_flag, "route", "show", "table", "main"],
+    )?;
+    let routes: Vec<IpRouteEntry> =
+        serde_json::from_slice(&output.stdout).map_err(|source| HelperError::Json {
+            name: "ip route output",
+            source,
+        })?;
+    Ok(route_snapshot_from_entries(&routes))
+}
+
+fn route_snapshot_from_entries(routes: &[IpRouteEntry]) -> EgressRouteSnapshot {
+    let mut connected_subnets = BTreeSet::new();
+
+    for route in routes {
+        match route.dst.as_deref() {
+            Some("default") => {}
+            Some(dst) if route.scope.as_deref() == Some("link") && !dst.trim().is_empty() => {
+                connected_subnets.insert(dst.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    EgressRouteSnapshot {
+        connected_subnets: connected_subnets.into_iter().collect(),
+    }
+}
+
+fn resolve_host_gateway_ips() -> BTreeSet<IpAddr> {
+    format!("{HOST_GATEWAY_NAME}:80")
+        .to_socket_addrs()
+        .map(|socket_addrs| socket_addrs.map(|addr| addr.ip()).collect())
+        .unwrap_or_default()
+}
+
+fn blocked_ips_for_family(
+    iptables_bin: &str,
+    blocked_ips: impl IntoIterator<Item = IpAddr>,
+) -> BTreeSet<IpAddr> {
+    blocked_ips
+        .into_iter()
+        .filter(|ip| match iptables_bin {
+            IPTABLES_BIN => ip.is_ipv4(),
+            IP6TABLES_BIN => ip.is_ipv6(),
+            _ => false,
+        })
+        .collect()
+}
+
+fn blocked_destinations_for_family(
+    iptables_bin: &str,
+    blocked_cidrs: &[&str],
+    host_gateway_ips: impl IntoIterator<Item = IpAddr>,
+) -> BTreeSet<String> {
+    let host_gateway_ips = blocked_ips_for_family(iptables_bin, host_gateway_ips);
+    let substitute_private_ipv4 = iptables_bin == IPTABLES_BIN
+        && host_gateway_ips
+            .iter()
+            .any(|ip| matches!(ip, IpAddr::V4(addr) if addr.octets()[0] == 192 && addr.octets()[1] == 168));
+
+    // Docker Desktop routes public DNS and host access through 192.168.x infrastructure, so
+    // replacing the broad 192.168/16 reject with the concrete host gateway IP preserves the host
+    // isolation invariant without cutting off normal internet egress.
+    let mut blocked_destinations = blocked_cidrs
+        .iter()
+        .filter(|cidr| !substitute_private_ipv4 || **cidr != "192.168.0.0/16")
+        .map(|cidr| (*cidr).to_string())
+        .collect::<BTreeSet<_>>();
+    blocked_destinations.extend(host_gateway_ips.into_iter().map(|ip| ip.to_string()));
+    blocked_destinations
+}
+
+fn run_command<'a>(
+    program: &str,
+    args: impl IntoIterator<Item = &'a str>,
+) -> Result<std::process::Output> {
+    let args = args.into_iter().collect::<Vec<_>>();
+    let output = Command::new(program).args(&args).output().map_err(|err| {
+        HelperError::Msg(format!(
+            "failed to run {} {}: {err}",
+            program,
+            args.join(" ")
+        ))
+    })?;
+    if output.status.success() {
+        return Ok(output);
+    }
+
+    Err(HelperError::Msg(format!(
+        "{} {} failed with status {}\nstdout:\n{}\nstderr:\n{}",
+        program,
+        args.join(" "),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )))
+}
+
+fn run_command_allow_failure<'a>(
+    program: &str,
+    args: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    let args = args.into_iter().collect::<Vec<_>>();
+    Command::new(program).args(&args).output().map_err(|err| {
+        HelperError::Msg(format!(
+            "failed to run {} {}: {err}",
+            program,
+            args.join(" ")
+        ))
+    })?;
+    Ok(())
 }
 
 impl From<ConfigError> for HelperError {
@@ -749,6 +962,92 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn blocked_ipv4_addresses_only_apply_to_iptables() {
+        let blocked_ips = blocked_ips_for_family(
+            IPTABLES_BIN,
+            [
+                "192.0.2.10".parse().unwrap(),
+                "2001:db8::1".parse().unwrap(),
+            ],
+        );
+
+        assert_eq!(blocked_ips, BTreeSet::from(["192.0.2.10".parse().unwrap()]));
+    }
+
+    #[test]
+    fn blocked_ipv6_addresses_only_apply_to_ip6tables() {
+        let blocked_ips = blocked_ips_for_family(
+            IP6TABLES_BIN,
+            [
+                "192.0.2.10".parse().unwrap(),
+                "2001:db8::1".parse().unwrap(),
+            ],
+        );
+
+        assert_eq!(
+            blocked_ips,
+            BTreeSet::from(["2001:db8::1".parse().unwrap()])
+        );
+    }
+
+    #[test]
+    fn route_snapshot_collects_link_subnets() {
+        let snapshot = route_snapshot_from_entries(&[
+            IpRouteEntry {
+                dst: Some("default".to_string()),
+                scope: None,
+            },
+            IpRouteEntry {
+                dst: Some("172.19.0.0/16".to_string()),
+                scope: Some("link".to_string()),
+            },
+            IpRouteEntry {
+                dst: Some("172.20.0.0/16".to_string()),
+                scope: Some("link".to_string()),
+            },
+        ]);
+
+        assert_eq!(
+            snapshot,
+            EgressRouteSnapshot {
+                connected_subnets: vec!["172.19.0.0/16".to_string(), "172.20.0.0/16".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn route_snapshot_ignores_non_link_routes_and_missing_values() {
+        let snapshot = route_snapshot_from_entries(&[
+            IpRouteEntry {
+                dst: Some("default".to_string()),
+                scope: None,
+            },
+            IpRouteEntry {
+                dst: Some("198.51.100.0/24".to_string()),
+                scope: Some("global".to_string()),
+            },
+            IpRouteEntry {
+                dst: None,
+                scope: Some("link".to_string()),
+            },
+        ]);
+
+        assert_eq!(snapshot, EgressRouteSnapshot::default());
+    }
+
+    #[test]
+    fn desktop_host_gateway_substitutes_for_broad_private_192_block() {
+        let blocked_destinations = blocked_destinations_for_family(
+            IPTABLES_BIN,
+            BLOCKED_IPV4_CIDRS,
+            ["192.168.65.254".parse().unwrap()],
+        );
+
+        assert!(blocked_destinations.contains("192.168.65.254"));
+        assert!(!blocked_destinations.contains("192.168.0.0/16"));
+    }
 
     fn encode_json_b64(value: &Value) -> String {
         let bytes = serde_json::to_vec(value).expect("json should serialize");
