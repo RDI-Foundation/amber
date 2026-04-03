@@ -43,6 +43,21 @@ fn env_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn port_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn reserve_test_port() -> SocketAddr {
+    let listener =
+        TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("listener should report its local address");
+    drop(listener);
+    addr
+}
+
 #[cfg(unix)]
 fn with_fake_compose_runtime<F>(script: &str, test: F)
 where
@@ -166,9 +181,13 @@ fn reserve_mesh_addresses_rewrites_ephemeral_override_port() {
 
 #[test]
 fn reserve_export_bindings_hold_reserved_ports_until_drop() {
+    let _port_guard = port_lock()
+        .lock()
+        .expect("port lock should not be poisoned");
+    let requested_port = reserve_test_port();
     let requested = [ExportBinding {
         export: "api".to_string(),
-        listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        listen: requested_port,
     }];
 
     let (bindings, listeners) =
@@ -190,14 +209,17 @@ fn reserve_export_bindings_hold_reserved_ports_until_drop() {
 
 #[tokio::test]
 async fn reserve_export_bindings_preserve_duplicate_export_listeners() {
+    let _port_guard = port_lock()
+        .lock()
+        .expect("port lock should not be poisoned");
     let requested = vec![
         ExportBinding {
             export: "api".to_string(),
-            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            listen: reserve_test_port(),
         },
         ExportBinding {
             export: "api".to_string(),
-            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            listen: reserve_test_port(),
         },
     ];
 

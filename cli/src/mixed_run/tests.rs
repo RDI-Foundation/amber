@@ -2311,6 +2311,39 @@ fn bridge_proxy_bind_and_probe_addresses_match_consumer_kind() {
 }
 
 #[test]
+fn host_service_addressing_matches_consumer_kind() {
+    assert_eq!(
+        host_service_bind_addr_for_consumer(SiteKind::Compose, 41000),
+        SocketAddr::from(([0, 0, 0, 0], 41000))
+    );
+    assert_eq!(
+        host_service_bind_addr_for_consumer(SiteKind::Kubernetes, 42000),
+        SocketAddr::from(([0, 0, 0, 0], 42000))
+    );
+    assert_eq!(
+        host_service_bind_addr_for_consumer(SiteKind::Direct, 43000),
+        SocketAddr::from(([127, 0, 0, 1], 43000))
+    );
+    assert_eq!(
+        host_service_bind_addr_for_consumer(SiteKind::Vm, 44000),
+        SocketAddr::from(([127, 0, 0, 1], 44000))
+    );
+    assert_eq!(
+        host_service_host_for_consumer(SiteKind::Compose),
+        "host.docker.internal"
+    );
+    assert_eq!(
+        host_service_host_for_consumer(SiteKind::Direct),
+        "127.0.0.1"
+    );
+    assert_eq!(host_service_host_for_consumer(SiteKind::Vm), "127.0.0.1");
+    assert_eq!(
+        host_service_host_for_consumer(SiteKind::Kubernetes),
+        container_host_for_consumer(SiteKind::Direct, SiteKind::Kubernetes)
+    );
+}
+
+#[test]
 fn bridge_proxy_external_url_uses_consumer_aware_host() {
     assert_eq!(
         bridge_proxy_external_url(44000, NetworkProtocol::Http, SiteKind::Compose)
@@ -2322,7 +2355,7 @@ fn bridge_proxy_external_url_uses_consumer_aware_host() {
             .expect("http bridge proxy url should be valid"),
         format!(
             "http://{}:45000",
-            bridge_proxy_host_for_consumer(SiteKind::Kubernetes)
+            host_service_host_for_consumer(SiteKind::Kubernetes)
         )
     );
 }

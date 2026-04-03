@@ -54,12 +54,14 @@ mod state;
 use self::{artifacts::*, preview::*, state::*};
 pub(crate) use self::{
     preview::build_vm_site_launch_preview,
-    state::{ensure_control_socket_link, vm_current_control_socket_path, write_vm_runtime_state},
+    state::{
+        ensure_control_socket_link, vm_current_control_socket_path,
+        vm_endpoint_forward_ready_timeout, write_vm_runtime_state,
+    },
 };
 
 const VM_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const VM_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(15);
-const VM_GUESTFWD_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const VM_QMP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 pub(crate) const TCG_VM_STARTUP_TIMEOUT: Duration = Duration::from_secs(720);
 
@@ -389,7 +391,11 @@ pub(crate) async fn run_vm_init(
                 component_config.as_ref().map(|(_, schema)| schema),
                 &runtime_context,
             )?;
-            wait_for_guestfwd_targets(component, &port_assignments, VM_GUESTFWD_READY_TIMEOUT)?;
+            wait_for_guestfwd_targets(
+                component,
+                &port_assignments,
+                vm_endpoint_forward_ready_timeout(),
+            )?;
             let vm_launch = build_vm_launch_plan(
                 VmHostContext {
                     runtime_root: &runtime_root,

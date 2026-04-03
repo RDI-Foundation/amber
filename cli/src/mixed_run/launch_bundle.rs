@@ -73,13 +73,12 @@ pub(super) fn materialize_launch_bundle(
                 .iter()
                 .any(|active| active == site_id)
         {
-            let listen_addr = SocketAddr::from(([127, 0, 0, 1], reserve_loopback_port()?));
+            let port = reserve_loopback_port()?;
+            let listen_addr =
+                crate::framework_component::ccs_listen_addr_for_site(site_plan.site.kind, port);
             framework_env.insert(
                 amber_mesh::FRAMEWORK_COMPONENT_CCS_URL_ENV.to_string(),
-                crate::framework_component::ccs_url_for_site(
-                    site_plan.site.kind,
-                    listen_addr.port(),
-                ),
+                crate::framework_component::ccs_url_for_site(site_plan.site.kind, port),
             );
             let plan_path = site_state_root.join("framework-ccs-plan.json");
             crate::framework_component::write_framework_ccs_plan(

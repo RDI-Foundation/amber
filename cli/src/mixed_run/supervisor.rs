@@ -1794,7 +1794,7 @@ pub(super) fn bridge_proxy_export_binding(export_name: &str, listen: SocketAddr)
 }
 
 pub(super) fn bridge_proxy_bind_addr(consumer_kind: SiteKind, port: u16) -> SocketAddr {
-    host_proxy_bind_addr(consumer_needs_host_wide_listener(consumer_kind), port)
+    host_service_bind_addr_for_consumer(consumer_kind, port)
 }
 
 pub(super) fn bridge_proxy_probe_addr(listen: SocketAddr) -> SocketAddr {
@@ -1806,7 +1806,7 @@ pub(super) fn bridge_proxy_external_url(
     protocol: NetworkProtocol,
     consumer_kind: SiteKind,
 ) -> Result<String> {
-    let host = bridge_proxy_host_for_consumer(consumer_kind);
+    let host = host_service_host_for_consumer(consumer_kind);
     Ok(match protocol {
         NetworkProtocol::Http | NetworkProtocol::Https => format!("http://{host}:{port}"),
         NetworkProtocol::Tcp => format!("tcp://{host}:{port}"),
@@ -1818,7 +1818,7 @@ pub(super) fn bridge_proxy_external_url(
     })
 }
 
-pub(super) fn bridge_proxy_host_for_consumer(consumer_kind: SiteKind) -> String {
+pub(crate) fn host_service_host_for_consumer(consumer_kind: SiteKind) -> String {
     match consumer_kind {
         SiteKind::Compose => CONTAINER_HOST_ALIAS.to_string(),
         SiteKind::Direct | SiteKind::Vm | SiteKind::Kubernetes => {
@@ -1829,6 +1829,13 @@ pub(super) fn bridge_proxy_host_for_consumer(consumer_kind: SiteKind) -> String 
 
 pub(super) fn consumer_needs_host_wide_listener(consumer_kind: SiteKind) -> bool {
     matches!(consumer_kind, SiteKind::Compose | SiteKind::Kubernetes)
+}
+
+pub(crate) fn host_service_bind_addr_for_consumer(
+    consumer_kind: SiteKind,
+    port: u16,
+) -> SocketAddr {
+    host_proxy_bind_addr(consumer_needs_host_wide_listener(consumer_kind), port)
 }
 
 pub(super) fn host_proxy_bind_addr(needs_host_wide_listener: bool, port: u16) -> SocketAddr {

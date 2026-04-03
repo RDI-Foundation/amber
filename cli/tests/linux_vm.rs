@@ -892,11 +892,15 @@ fn ensure_provisioned_image(profile: ProvisionProfile) -> Result<PathBuf, String
 }
 
 fn run_linux_guest_mixed_run_test(test_name: &str) -> Result<(), String> {
+    run_linux_guest_mixed_run_filter(test_name)
+}
+
+fn run_linux_guest_mixed_run_filter(test_filter: &str) -> Result<(), String> {
     run_linux_guest_test(
-        format!("linux-vm-{test_name}-"),
+        format!("linux-vm-{test_filter}-"),
         ProvisionProfile::MixedRun,
         &format!(
-            "cargo test -p amber-cli --test mixed_run {test_name} -- --ignored --nocapture \
+            "cargo test -p amber-cli --test mixed_run {test_filter} -- --ignored --nocapture \
              --test-threads=1"
         ),
     )
@@ -936,6 +940,13 @@ fn linux_vm_runs_mixed_run_tests() {
          --test-threads=1",
     )
     .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+#[ignore = "requires qemu on macOS; boots Ubuntu and runs the Linux framework_component live tests \
+            inside the guest"]
+fn linux_vm_runs_framework_component_live_tests() {
+    run_linux_guest_mixed_run_filter("framework_component_").unwrap_or_else(|err| panic!("{err}"));
 }
 
 #[test]

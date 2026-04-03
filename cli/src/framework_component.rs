@@ -60,6 +60,7 @@ use tokio::{net::TcpListener, signal, sync::Mutex};
 use crate::mixed_run::{
     BridgeProxyHandle, BridgeProxyKey, DesiredExportPeer, LaunchedSite, SiteActuatorPlan,
     SiteReceipt, clear_desired_links_for_consumer, clear_desired_links_for_provider,
+    host_service_bind_addr_for_consumer, host_service_host_for_consumer,
     launched_site_from_receipt, read_json as read_run_json, resolve_link_external_url_for_output,
     site_actuator_child_root_for_site, site_state_path, stop_bridge_proxies,
     update_desired_links_for_consumer, update_desired_links_for_provider,
@@ -316,13 +317,14 @@ pub(crate) fn control_state_service_url(listen_addr: SocketAddr) -> String {
     format!("http://{listen_addr}")
 }
 
-pub(crate) fn ccs_url_for_site(kind: amber_compiler::run_plan::SiteKind, port: u16) -> String {
+pub(crate) fn ccs_listen_addr_for_site(kind: SiteKind, port: u16) -> SocketAddr {
+    host_service_bind_addr_for_consumer(kind, port)
+}
+
+pub(crate) fn ccs_url_for_site(kind: SiteKind, port: u16) -> String {
     let host = match kind {
-        amber_compiler::run_plan::SiteKind::Direct | amber_compiler::run_plan::SiteKind::Vm => {
-            Ipv4Addr::LOCALHOST.to_string()
-        }
-        amber_compiler::run_plan::SiteKind::Compose
-        | amber_compiler::run_plan::SiteKind::Kubernetes => "host.docker.internal".to_string(),
+        SiteKind::Direct | SiteKind::Vm => Ipv4Addr::LOCALHOST.to_string(),
+        SiteKind::Compose | SiteKind::Kubernetes => host_service_host_for_consumer(kind),
     };
     format!("http://{host}:{port}")
 }
@@ -4587,6 +4589,45 @@ mod tests {
             serde_json::from_value(snapshot.scenario.clone()).expect("snapshot scenario");
         let placement = placement_from_snapshot(snapshot);
         compile_control_state_from_ir(scenario_ir, Some(&placement)).await
+    }
+
+    #[test]
+    fn framework_ccs_addressing_matches_site_runtime_topology() {
+        assert_eq!(
+            ccs_listen_addr_for_site(SiteKind::Direct, 41000),
+            SocketAddr::from(([127, 0, 0, 1], 41000))
+        );
+        assert_eq!(
+            ccs_url_for_site(SiteKind::Direct, 41000),
+            "http://127.0.0.1:41000"
+        );
+        assert_eq!(
+            ccs_listen_addr_for_site(SiteKind::Vm, 42000),
+            SocketAddr::from(([127, 0, 0, 1], 42000))
+        );
+        assert_eq!(
+            ccs_url_for_site(SiteKind::Vm, 42000),
+            "http://127.0.0.1:42000"
+        );
+        assert_eq!(
+            ccs_listen_addr_for_site(SiteKind::Compose, 43000),
+            SocketAddr::from(([0, 0, 0, 0], 43000))
+        );
+        assert_eq!(
+            ccs_url_for_site(SiteKind::Compose, 43000),
+            "http://host.docker.internal:43000"
+        );
+        assert_eq!(
+            ccs_listen_addr_for_site(SiteKind::Kubernetes, 44000),
+            SocketAddr::from(([0, 0, 0, 0], 44000))
+        );
+        assert_eq!(
+            ccs_url_for_site(SiteKind::Kubernetes, 44000),
+            format!(
+                "http://{}:44000",
+                host_service_host_for_consumer(SiteKind::Kubernetes)
+            )
+        );
     }
 
     async fn compile_empty_control_state() -> (TempDir, FrameworkControlState, PathBuf) {

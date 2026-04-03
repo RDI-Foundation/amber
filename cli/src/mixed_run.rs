@@ -70,7 +70,7 @@ use crate::{
     vm_runtime::{
         TCG_VM_STARTUP_TIMEOUT, VmLaunchPreview, VmRuntimeState, VmSiteLaunchPreview,
         build_vm_site_launch_preview, ensure_control_socket_link, vm_current_control_socket_path,
-        vm_uses_tcg_accel, write_vm_runtime_state,
+        vm_endpoint_forward_ready_timeout, vm_uses_tcg_accel, write_vm_runtime_state,
     },
 };
 mod launch_bundle;
@@ -4478,7 +4478,7 @@ async fn actuator_publish_child(
                 &Path::new(&child.artifact_root)
                     .join(".amber")
                     .join("vm-runtime.json"),
-                site_ready_timeout_for_kind(SiteKind::Vm),
+                vm_endpoint_forward_ready_timeout(),
                 &child_root.join("site.log"),
             )
             .await?;
@@ -4486,7 +4486,7 @@ async fn actuator_publish_child(
                 process.id(),
                 Path::new(&child.artifact_root),
                 &runtime_root,
-                site_ready_timeout_for_kind(SiteKind::Vm),
+                vm_endpoint_forward_ready_timeout(),
                 &child_root.join("site.log"),
             )?;
             let mut state = app.state.lock().await;
