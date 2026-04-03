@@ -3300,6 +3300,287 @@ fn framework_component_kind_root_export_live() {
 #[test]
 #[ignore = "requires docker + kind + kubectl + qemu + an Ubuntu 24.04 cloud image matching the \
             host architecture; run manually or in CI"]
+fn framework_component_kind_creator_compose_child_live() {
+    ensure_internal_images();
+    let temp = temp_output_dir("framework-component-kind-creator-compose-child-");
+    let kubeconfig = temp.path().join("kubeconfig");
+    let kind_cluster = KindCluster::from_env_or_create(&kubeconfig);
+    ensure_kind_internal_images(&kind_cluster);
+    let kubeconfig_env = kind_cluster.kubeconfig.display().to_string();
+
+    let fixture = write_framework_matrix_fixture(temp.path(), &kind_cluster);
+    let storage_root = temp.path().join("state");
+    let mut run = run_manifest_with_env(
+        &fixture.manifest,
+        &fixture.placement,
+        &storage_root,
+        &[("KUBECONFIG", &kubeconfig_env)],
+    );
+
+    let compose_state = wait_for_state_status(
+        &run.run_root,
+        "compose_local",
+        "running",
+        Duration::from_secs(60),
+    );
+    let kind_state = wait_for_state_status(
+        &run.run_root,
+        "kind_local",
+        "running",
+        Duration::from_secs(120),
+    );
+    let direct_state = wait_for_state_status(
+        &run.run_root,
+        "direct_local",
+        "running",
+        Duration::from_secs(60),
+    );
+    let vm_state = wait_for_state_status(
+        &run.run_root,
+        "vm_local",
+        "running",
+        Duration::from_secs(240),
+    );
+    let site_state = |site_id: &str| match site_id {
+        "compose_local" => &compose_state,
+        "kind_local" => &kind_state,
+        "direct_local" => &direct_state,
+        "vm_local" => &vm_state,
+        _ => panic!("unknown site {site_id}"),
+    };
+
+    let control_state_path = framework_control_state_path(&run);
+    let creator_port = pick_free_port();
+    let mut creator_proxy = spawn_framework_proxy_for_site(
+        &run.site_artifact_dir("kind_local"),
+        "kind_admin_http",
+        creator_port,
+        site_state("kind_local"),
+    );
+    wait_for_path(
+        &mut creator_proxy,
+        creator_port,
+        "/id",
+        Duration::from_secs(240),
+    );
+    assert_eq!(
+        wait_for_body(
+            &mut creator_proxy,
+            creator_port,
+            "/id",
+            Duration::from_secs(30),
+        ),
+        "admin",
+        "kind creator should expose the framework admin app"
+    );
+
+    let (create_status, create_response) = http_get_with_timeout(
+        creator_port,
+        "/create/child_compose/job-compose",
+        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
+    )
+    .expect("create request should return an HTTP response");
+    assert_eq!(
+        create_status, 200,
+        "create request should succeed; response: {create_response}"
+    );
+    let child_id = wait_for_live_child(&control_state_path, "job-compose");
+
+    let root_artifact = framework_child_artifact(&run, "compose_local", child_id);
+    let root_port = pick_free_port();
+    let mut root_proxy = spawn_framework_proxy_for_site(
+        &root_artifact,
+        "http",
+        root_port,
+        site_state("compose_local"),
+    );
+    wait_for_path(&mut root_proxy, root_port, "/id", Duration::from_secs(300));
+    assert_eq!(
+        wait_for_body(&mut root_proxy, root_port, "/id", Duration::from_secs(30)),
+        "child-compose-root"
+    );
+
+    stop_proxy(&mut root_proxy);
+    stop_proxy(&mut creator_proxy);
+    run.stop();
+}
+
+#[test]
+#[ignore = "requires docker + kind + kubectl + qemu + an Ubuntu 24.04 cloud image matching the \
+            host architecture; run manually or in CI"]
+fn framework_component_kind_creator_after_compose_churn_live() {
+    ensure_internal_images();
+    let temp = temp_output_dir("framework-component-kind-after-compose-churn-");
+    let kubeconfig = temp.path().join("kubeconfig");
+    let kind_cluster = KindCluster::from_env_or_create(&kubeconfig);
+    ensure_kind_internal_images(&kind_cluster);
+    let kubeconfig_env = kind_cluster.kubeconfig.display().to_string();
+
+    let fixture = write_framework_matrix_fixture(temp.path(), &kind_cluster);
+    let storage_root = temp.path().join("state");
+    let mut run = run_manifest_with_env(
+        &fixture.manifest,
+        &fixture.placement,
+        &storage_root,
+        &[("KUBECONFIG", &kubeconfig_env)],
+    );
+
+    let compose_state = wait_for_state_status(
+        &run.run_root,
+        "compose_local",
+        "running",
+        Duration::from_secs(60),
+    );
+    let kind_state = wait_for_state_status(
+        &run.run_root,
+        "kind_local",
+        "running",
+        Duration::from_secs(120),
+    );
+    let direct_state = wait_for_state_status(
+        &run.run_root,
+        "direct_local",
+        "running",
+        Duration::from_secs(60),
+    );
+    let vm_state = wait_for_state_status(
+        &run.run_root,
+        "vm_local",
+        "running",
+        Duration::from_secs(240),
+    );
+    let site_state = |site_id: &str| match site_id {
+        "compose_local" => &compose_state,
+        "kind_local" => &kind_state,
+        "direct_local" => &direct_state,
+        "vm_local" => &vm_state,
+        _ => panic!("unknown site {site_id}"),
+    };
+
+    let control_state_path = framework_control_state_path(&run);
+
+    let compose_creator_port = pick_free_port();
+    let mut compose_creator_proxy = spawn_framework_proxy_for_site(
+        &run.site_artifact_dir("compose_local"),
+        "compose_admin_http",
+        compose_creator_port,
+        site_state("compose_local"),
+    );
+    wait_for_path(
+        &mut compose_creator_proxy,
+        compose_creator_port,
+        "/id",
+        Duration::from_secs(240),
+    );
+    assert_eq!(
+        wait_for_body(
+            &mut compose_creator_proxy,
+            compose_creator_port,
+            "/id",
+            Duration::from_secs(30),
+        ),
+        "admin",
+        "compose creator should expose the framework admin app"
+    );
+
+    for template_case in FRAMEWORK_MATRIX_TEMPLATES {
+        let create_path = format!(
+            "/create/{}/{}",
+            template_case.template, template_case.child_name
+        );
+        let (create_status, create_response) = http_get_with_timeout(
+            compose_creator_port,
+            &create_path,
+            FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
+        )
+        .expect("compose churn create request should return an HTTP response");
+        assert_eq!(
+            create_status, 200,
+            "compose churn create request {create_path} should succeed; response: \
+             {create_response}"
+        );
+        let child_id = wait_for_live_child(&control_state_path, template_case.child_name);
+        let child_roots = template_case
+            .exports
+            .iter()
+            .map(|(site_id, _, _)| {
+                framework_child_artifact(&run, site_id, child_id)
+                    .parent()
+                    .expect("dynamic child artifact should have a parent")
+                    .to_path_buf()
+            })
+            .collect::<Vec<_>>();
+        let (destroy_status, destroy_response) =
+            framework_destroy_child_via_admin(compose_creator_port, template_case.child_name);
+        assert_eq!(
+            destroy_status, 200,
+            "compose churn destroy should succeed for {}; response: {destroy_response}",
+            template_case.child_name,
+        );
+        wait_for_framework_child_absent(
+            &control_state_path,
+            template_case.child_name,
+            &child_roots,
+            Duration::from_secs(300),
+        );
+    }
+    stop_proxy(&mut compose_creator_proxy);
+
+    let kind_creator_port = pick_free_port();
+    let mut kind_creator_proxy = spawn_framework_proxy_for_site(
+        &run.site_artifact_dir("kind_local"),
+        "kind_admin_http",
+        kind_creator_port,
+        site_state("kind_local"),
+    );
+    wait_for_path(
+        &mut kind_creator_proxy,
+        kind_creator_port,
+        "/id",
+        Duration::from_secs(240),
+    );
+    assert_eq!(
+        wait_for_body(
+            &mut kind_creator_proxy,
+            kind_creator_port,
+            "/id",
+            Duration::from_secs(30),
+        ),
+        "admin",
+        "kind creator should expose the framework admin app after compose churn"
+    );
+    let children_body = wait_for_body(
+        &mut kind_creator_proxy,
+        kind_creator_port,
+        "/children",
+        Duration::from_secs(30),
+    );
+    let children: Value =
+        serde_json::from_str(&children_body).expect("children response should be valid JSON");
+    assert_eq!(
+        children["children"],
+        Value::Array(Vec::new()),
+        "kind creator control path should be healthy after compose churn"
+    );
+
+    let (create_status, create_response) = http_get_with_timeout(
+        kind_creator_port,
+        "/create/child_compose/job-compose",
+        FRAMEWORK_MUTATION_REQUEST_TIMEOUT,
+    )
+    .expect("kind create request should return an HTTP response");
+    assert_eq!(
+        create_status, 200,
+        "kind creator create after compose churn should succeed; response: {create_response}"
+    );
+
+    stop_proxy(&mut kind_creator_proxy);
+    run.stop();
+}
+
+#[test]
+#[ignore = "requires docker + kind + kubectl + qemu + an Ubuntu 24.04 cloud image matching the \
+            host architecture; run manually or in CI"]
 fn framework_component_cross_backend_matrix_live() {
     ensure_internal_images();
     let temp = temp_output_dir("framework-component-matrix-");
@@ -3451,14 +3732,13 @@ fn framework_component_cross_backend_matrix_live() {
             }
             stop_proxy(&mut root_proxy);
 
+            let (destroy_status, destroy_response) =
+                framework_destroy_child_via_admin(creator_port, template_case.child_name);
             assert_eq!(
-                wait_for_body(
-                    &mut creator_proxy,
-                    creator_port,
-                    &format!("/destroy/{}", template_case.child_name),
-                    Duration::from_secs(300)
-                ),
-                "destroyed"
+                destroy_status, 200,
+                "destroy request for {} from {creator_site} should succeed; response: \
+                 {destroy_response}",
+                template_case.child_name,
             );
             wait_for_framework_child_absent(
                 &control_state_path,

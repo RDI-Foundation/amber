@@ -45,6 +45,7 @@ use miette::{Context as _, IntoDiagnostic as _, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use tokio::{
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::TcpListener as TokioTcpListener,
     sync::Mutex as AsyncMutex,
     time::{Instant, sleep},
@@ -1247,6 +1248,19 @@ fn dynamic_route_overlay_path(artifact_root: &Path) -> PathBuf {
         .join(DYNAMIC_ROUTE_OVERLAY_FILENAME)
 }
 
+fn write_dynamic_route_overlay_payload(
+    artifact_root: &Path,
+    payload: &StoredRouteOverlayPayload,
+) -> Result<()> {
+    let path = dynamic_route_overlay_path(artifact_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
+    }
+    write_json(&path, payload)
+}
+
 fn dynamic_proxy_exports_path(artifact_root: &Path) -> PathBuf {
     artifact_root
         .join(".amber")
@@ -1790,17 +1804,17 @@ fn dynamic_input_route_route_id(input: &DynamicInputRouteRecord, protocol: MeshP
         DynamicInputRouteTarget::ComponentProvide { provide } => {
             component_route_id(&input.provider_component, provide, protocol)
         }
-        DynamicInputRouteTarget::DynamicExport { export_name } => {
-            router_dynamic_export_route_id(&input.provider_component, export_name, protocol)
-        }
     }
 }
 
 fn dynamic_input_route_capability(input: &DynamicInputRouteRecord) -> String {
     match &input.target {
         DynamicInputRouteTarget::ComponentProvide { provide } => provide.clone(),
-        DynamicInputRouteTarget::DynamicExport { export_name } => export_name.clone(),
     }
+}
+
+fn is_compose_component_sidecar_service(service_name: &str) -> bool {
+    service_name.ends_with("-net")
 }
 
 fn dynamic_input_route_http_plugins(
@@ -1819,6 +1833,143 @@ fn dynamic_input_route_http_plugins(
         },
         protocol,
     )
+}
+
+fn overlay_peer_addr_map_from_ports(ports: &BTreeMap<String, u16>) -> BTreeMap<String, String> {
+    ports
+        .iter()
+        .map(|(component, port)| (component.clone(), format!("127.0.0.1:{port}")))
+        .collect()
+}
+
+fn overlay_issuer_sets(
+    routed_inputs: &[DynamicInputRouteRecord],
+) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    dynamic_route_issuer_grants(&[SiteActuatorChildRecord {
+        child_id: 0,
+        artifact_root: String::new(),
+        assigned_components: Vec::new(),
+        proxy_exports: BTreeMap::new(),
+        routed_inputs: routed_inputs.to_vec(),
+        process_pid: None,
+        published: false,
+    }])
+}
+
+fn overlay_upsert_peer(
+    peers: &mut Vec<MeshPeer>,
+    peer_identities: &BTreeMap<String, MeshIdentityPublic>,
+    peer_id: &str,
+) -> Result<()> {
+    if peers.iter().any(|peer| peer.id == peer_id) {
+        return Ok(());
+    }
+    let identity = peer_identities.get(peer_id).ok_or_else(|| {
+        miette::miette!("dynamic route overlay is missing mesh identity for peer {peer_id}")
+    })?;
+    peers.push(MeshPeer {
+        id: identity.id.clone(),
+        public_key: identity.public_key,
+    });
+    Ok(())
+}
+
+fn overlay_upsert_route(routes: &mut Vec<InboundRoute>, route: InboundRoute) {
+    if let Some(existing) = routes
+        .iter_mut()
+        .find(|existing| existing.route_id == route.route_id)
+    {
+        *existing = route;
+    } else {
+        routes.push(route);
+    }
+}
+
+fn routed_input_overlay_route(
+    input: &DynamicInputRouteRecord,
+    provider_peer_addr: &str,
+    allowed_issuers: Vec<String>,
+) -> Result<InboundRoute> {
+    let protocol = dynamic_input_route_mesh_protocol(input)?;
+    let (target_route_id, capability) = match &input.target {
+        DynamicInputRouteTarget::ComponentProvide { provide } => (
+            component_route_id(&input.provider_component, provide, protocol),
+            provide.clone(),
+        ),
+    };
+    Ok(InboundRoute {
+        route_id: dynamic_input_route_route_id(input, protocol),
+        capability: dynamic_input_route_capability(input),
+        capability_kind: Some(input.capability_kind.clone()),
+        capability_profile: input.capability_profile.clone(),
+        protocol,
+        http_plugins: dynamic_input_route_http_plugins(input, protocol),
+        target: InboundTarget::MeshForward {
+            peer_addr: provider_peer_addr.to_string(),
+            peer_id: input.provider_component.clone(),
+            route_id: target_route_id,
+            capability,
+        },
+        allowed_issuers,
+    })
+}
+
+fn augment_route_overlay_payload(
+    payload: &mut StoredRouteOverlayPayload,
+    proxy_exports: &BTreeMap<String, DynamicProxyExportRecord>,
+    routed_inputs: &[DynamicInputRouteRecord],
+    provider_peer_addrs: &BTreeMap<String, String>,
+    peer_identities: &BTreeMap<String, MeshIdentityPublic>,
+    allowed_issuers_by_route: Option<&BTreeMap<String, BTreeSet<String>>>,
+    skip_missing_providers: bool,
+) -> Result<()> {
+    for export in proxy_exports.values() {
+        overlay_upsert_peer(&mut payload.peers, peer_identities, &export.component)?;
+    }
+    add_dynamic_proxy_export_overlay_routes(
+        &mut payload.inbound_routes,
+        proxy_exports,
+        |export| {
+            provider_peer_addrs
+                .get(&export.component)
+                .cloned()
+                .ok_or_else(|| {
+                    miette::miette!(
+                        "dynamic route overlay is missing a live peer address for {}",
+                        export.component
+                    )
+                })
+        },
+    )?;
+
+    for input in routed_inputs {
+        let Some(provider_peer_addr) = provider_peer_addrs.get(&input.provider_component) else {
+            if skip_missing_providers {
+                continue;
+            }
+            return Err(miette::miette!(
+                "dynamic route overlay is missing a live peer address for {}",
+                input.provider_component
+            ));
+        };
+        overlay_upsert_peer(
+            &mut payload.peers,
+            peer_identities,
+            &input.provider_component,
+        )?;
+        let route_id =
+            dynamic_input_route_route_id(input, dynamic_input_route_mesh_protocol(input)?);
+        let allowed_issuers = allowed_issuers_by_route
+            .and_then(|issuers| issuers.get(&route_id))
+            .map(|issuers| issuers.iter().cloned().collect())
+            .unwrap_or_default();
+        overlay_upsert_route(
+            &mut payload.inbound_routes,
+            routed_input_overlay_route(input, provider_peer_addr, allowed_issuers)?,
+        );
+    }
+
+    Ok(())
 }
 
 fn routed_input_router_peer_addr(kind: SiteKind, router_mesh_port: Option<u16>) -> Result<String> {
@@ -1938,6 +2089,117 @@ fn rewrite_dynamic_routed_inputs_in_artifact(
         router_mesh_port,
     )?;
     write_json(&path, &mesh_plan)
+}
+
+fn build_filesystem_route_overlay_base(
+    artifact_root: &Path,
+    assigned_components: &[String],
+    provider_peer_addrs: &BTreeMap<String, String>,
+    peer_identities: &BTreeMap<String, MeshIdentityPublic>,
+) -> Result<StoredRouteOverlayPayload> {
+    let mesh_plan: MeshProvisionPlan = read_json(
+        &artifact_root.join("mesh-provision-plan.json"),
+        "mesh provision plan",
+    )?;
+    let kept_component_ids = assigned_components.iter().cloned().collect::<BTreeSet<_>>();
+    let mut router_target = mesh_plan
+        .targets
+        .iter()
+        .find(|target| matches!(target.kind, MeshProvisionTargetKind::Router))
+        .cloned()
+        .ok_or_else(|| {
+            miette::miette!(
+                "dynamic artifact {} is missing a router mesh target",
+                artifact_root.display()
+            )
+        })?;
+    filter_dynamic_router_target(&mut router_target, &kept_component_ids);
+    for route in &mut router_target.config.inbound {
+        if let InboundTarget::MeshForward {
+            peer_id, peer_addr, ..
+        } = &mut route.target
+            && let Some(resolved) = provider_peer_addrs.get(peer_id)
+        {
+            *peer_addr = resolved.clone();
+        }
+    }
+    let peers = router_target
+        .config
+        .peers
+        .iter()
+        .map(|peer| {
+            peer_identities.get(&peer.id).map(|identity| MeshPeer {
+                id: identity.id.clone(),
+                public_key: identity.public_key,
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            miette::miette!(
+                "dynamic artifact {} is missing a live mesh identity for one of its route peers",
+                artifact_root.display()
+            )
+        })?;
+    Ok(StoredRouteOverlayPayload {
+        peers,
+        inbound_routes: router_target.config.inbound,
+    })
+}
+
+fn write_direct_vm_startup_route_overlay_payload(
+    artifact_root: &Path,
+    _artifact_kind: &str,
+    routed_inputs: &[DynamicInputRouteRecord],
+    provider_peer_addrs: &BTreeMap<String, String>,
+    existing_site_peer_identities: &BTreeMap<String, MeshIdentityPublic>,
+) -> Result<()> {
+    if routed_inputs.is_empty() {
+        return Ok(());
+    }
+    let allowed_issuers = overlay_issuer_sets(routed_inputs)?;
+    let mut payload = StoredRouteOverlayPayload {
+        peers: Vec::new(),
+        inbound_routes: Vec::new(),
+    };
+    augment_route_overlay_payload(
+        &mut payload,
+        &BTreeMap::new(),
+        routed_inputs,
+        provider_peer_addrs,
+        existing_site_peer_identities,
+        Some(&allowed_issuers),
+        true,
+    )?;
+    if payload.inbound_routes.is_empty() {
+        return Ok(());
+    }
+    write_dynamic_route_overlay_payload(artifact_root, &payload)
+}
+
+fn write_direct_vm_live_route_overlay_payload(
+    artifact_root: &Path,
+    assigned_components: &[String],
+    proxy_exports: &BTreeMap<String, DynamicProxyExportRecord>,
+    routed_inputs: &[DynamicInputRouteRecord],
+    provider_peer_addrs: &BTreeMap<String, String>,
+    peer_identities: &BTreeMap<String, MeshIdentityPublic>,
+) -> Result<()> {
+    let mut payload = build_filesystem_route_overlay_base(
+        artifact_root,
+        assigned_components,
+        provider_peer_addrs,
+        peer_identities,
+    )?;
+    augment_route_overlay_payload(
+        &mut payload,
+        proxy_exports,
+        routed_inputs,
+        provider_peer_addrs,
+        peer_identities,
+        None,
+        false,
+    )?;
+    write_dynamic_route_overlay_payload(artifact_root, &payload)
 }
 
 fn ensure_dynamic_proxy_export_component_routes(
@@ -2165,20 +2427,6 @@ fn build_dynamic_compose_route_overlay_payload(
             )
         })?;
     filter_dynamic_router_target(&mut router_target, &kept_component_ids);
-    let component_mesh_ports = plan
-        .targets
-        .iter()
-        .filter(|target| {
-            matches!(target.kind, MeshProvisionTargetKind::Component)
-                && assigned.contains(target.config.identity.id.as_str())
-        })
-        .map(|target| {
-            (
-                target.config.identity.id.clone(),
-                target.config.mesh_listen.port(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
     let component_peer_addrs = plan
         .targets
         .iter()
@@ -2206,121 +2454,50 @@ fn build_dynamic_compose_route_overlay_payload(
             ))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
-    for export in proxy_exports.values() {
-        if !router_target
-            .config
-            .peers
-            .iter()
-            .any(|peer| peer.id == export.component)
+    for route in &mut router_target.config.inbound {
+        if let InboundTarget::MeshForward {
+            peer_id, peer_addr, ..
+        } = &mut route.target
+            && let Some(resolved) = component_peer_addrs.get(peer_id)
         {
-            router_target
-                .config
-                .peers
-                .push(amber_mesh::MeshPeerTemplate {
-                    id: export.component.clone(),
-                });
-        }
-    }
-    add_dynamic_proxy_export_overlay_routes(
-        &mut router_target.config.inbound,
-        proxy_exports,
-        |export| {
-            let relative_dir = component_mesh_dirs.get(&export.component).ok_or_else(|| {
-                miette::miette!(
-                    "compose child export provider {} is missing its mesh dir",
-                    export.component
-                )
-            })?;
-            let service_name = Path::new(relative_dir)
-                .file_name()
-                .and_then(|value| value.to_str())
-                .ok_or_else(|| {
-                    miette::miette!(
-                        "compose mesh dir {} has no terminal service name",
-                        relative_dir
-                    )
-                })?;
-            let mesh_port = component_mesh_ports.get(&export.component).ok_or_else(|| {
-                miette::miette!(
-                    "compose child export provider {} is missing its mesh port",
-                    export.component
-                )
-            })?;
-            Ok(format!("{service_name}:{mesh_port}"))
-        },
-    )?;
-    for input in routed_inputs {
-        let DynamicInputRouteTarget::ComponentProvide { provide } = &input.target else {
-            continue;
-        };
-        if !router_target
-            .config
-            .peers
-            .iter()
-            .any(|peer| peer.id == input.provider_component)
-        {
-            router_target
-                .config
-                .peers
-                .push(amber_mesh::MeshPeerTemplate {
-                    id: input.provider_component.clone(),
-                });
-        }
-        let protocol = dynamic_input_route_mesh_protocol(input)?;
-        let route = InboundRoute {
-            route_id: dynamic_input_route_route_id(input, protocol),
-            capability: dynamic_input_route_capability(input),
-            capability_kind: Some(input.capability_kind.clone()),
-            capability_profile: input.capability_profile.clone(),
-            protocol,
-            http_plugins: dynamic_input_route_http_plugins(input, protocol),
-            target: InboundTarget::MeshForward {
-                peer_addr: component_peer_addrs
-                    .get(&input.provider_component)
-                    .cloned()
-                    .ok_or_else(|| {
-                        miette::miette!(
-                            "compose routed-input provider {} is missing a live peer address",
-                            input.provider_component
-                        )
-                    })?,
-                peer_id: input.provider_component.clone(),
-                route_id: component_route_id(&input.provider_component, provide, protocol),
-                capability: provide.clone(),
-            },
-            allowed_issuers: Vec::new(),
-        };
-        if let Some(existing) = router_target
-            .config
-            .inbound
-            .iter_mut()
-            .find(|existing| existing.route_id == route.route_id)
-        {
-            *existing = route;
-        } else {
-            router_target.config.inbound.push(route);
+            *peer_addr = resolved.clone();
         }
     }
 
+    let component_mesh_scopes = plan
+        .targets
+        .iter()
+        .filter(|target| matches!(target.kind, MeshProvisionTargetKind::Component))
+        .map(|target| {
+            (
+                target.config.identity.id.clone(),
+                target.config.identity.mesh_scope.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut peer_identities = existing_site_peer_identities.clone();
+    for (component, relative_dir) in component_mesh_dirs {
+        let identity: MeshIdentitySecret = read_json(
+            &artifact_root
+                .join(relative_dir)
+                .join(MESH_IDENTITY_FILENAME),
+            "mesh identity",
+        )?;
+        peer_identities.insert(
+            component.clone(),
+            MeshIdentityPublic {
+                id: identity.id.clone(),
+                public_key: identity.public_key().into_diagnostic()?,
+                mesh_scope: component_mesh_scopes.get(component).cloned().flatten(),
+            },
+        );
+    }
     let peers = router_target
         .config
         .peers
         .iter()
         .map(|peer| {
-            if let Some(relative_dir) = component_mesh_dirs.get(&peer.id) {
-                let identity: MeshIdentitySecret = read_json(
-                    &artifact_root
-                        .join(relative_dir)
-                        .join(MESH_IDENTITY_FILENAME),
-                    "mesh identity",
-                )?;
-                let public_key = identity.public_key().into_diagnostic()?;
-                return Ok(MeshPeer {
-                    id: identity.id,
-                    public_key,
-                });
-            }
-            let identity = existing_site_peer_identities.get(&peer.id).ok_or_else(|| {
+            let identity = peer_identities.get(&peer.id).ok_or_else(|| {
                 miette::miette!(
                     "compose child router overlay peer {} is missing a live mesh identity",
                     peer.id
@@ -2333,10 +2510,21 @@ fn build_dynamic_compose_route_overlay_payload(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(StoredRouteOverlayPayload {
+    let allowed_issuers = overlay_issuer_sets(routed_inputs)?;
+    let mut payload = StoredRouteOverlayPayload {
         peers,
         inbound_routes: router_target.config.inbound,
-    })
+    };
+    augment_route_overlay_payload(
+        &mut payload,
+        proxy_exports,
+        routed_inputs,
+        &component_peer_addrs,
+        &peer_identities,
+        Some(&allowed_issuers),
+        false,
+    )?;
+    Ok(payload)
 }
 
 fn rewrite_compose_mesh_bind_mounts(
@@ -2805,6 +2993,14 @@ fn read_embedded_kubernetes_mesh_provision_plan(artifact_root: &Path) -> Result<
     })
 }
 
+fn read_kubernetes_runtime_mesh_provision_plan(artifact_root: &Path) -> Result<MeshProvisionPlan> {
+    let path = artifact_root.join("mesh-provision-plan.json");
+    if path.is_file() {
+        return read_json(&path, "mesh provision plan");
+    }
+    read_embedded_kubernetes_mesh_provision_plan(artifact_root)
+}
+
 fn write_embedded_kubernetes_mesh_provision_plan(
     artifact_root: &Path,
     plan: &MeshProvisionPlan,
@@ -2846,9 +3042,18 @@ fn write_embedded_kubernetes_mesh_provision_plan(
         .wrap_err_with(|| format!("failed to write {}", path.display()))
 }
 
-fn kubernetes_dynamic_apply_resource_kept(
-    artifact_root: &Path,
+fn kubernetes_resource_name(document: &serde_yaml::Value) -> Option<&str> {
+    document
+        .as_mapping()
+        .and_then(|root| root.get(yaml_string("metadata")))
+        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(|metadata| metadata.get(yaml_string("name")))
+        .and_then(serde_yaml::Value::as_str)
+}
+
+fn kubernetes_dynamic_apply_resource_kept_from_contents(
     resource: &str,
+    raw: &str,
     child_component_labels: &BTreeSet<String>,
 ) -> Result<bool> {
     if matches!(
@@ -2863,13 +3068,9 @@ fn kubernetes_dynamic_apply_resource_kept(
         return Ok(true);
     }
 
-    let path = artifact_root.join(resource);
-    let raw = fs::read_to_string(&path)
+    let document: serde_yaml::Value = serde_yaml::from_str(raw)
         .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read {}", path.display()))?;
-    let document: serde_yaml::Value = serde_yaml::from_str(&raw)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("invalid kubernetes resource {}", path.display()))?;
+        .wrap_err_with(|| format!("invalid kubernetes resource {resource}"))?;
     Ok(document
         .as_mapping()
         .and_then(|root| root.get(yaml_string("metadata")))
@@ -2881,36 +3082,35 @@ fn kubernetes_dynamic_apply_resource_kept(
         .is_some_and(|component_id| child_component_labels.contains(component_id)))
 }
 
-fn rewrite_dynamic_kubernetes_apply_bundle(
-    artifact_root: &Path,
+pub(crate) fn project_kubernetes_dynamic_child_artifact_files(
+    artifact_files: &BTreeMap<String, String>,
     component_ids: &[usize],
-) -> Result<()> {
+) -> Result<BTreeMap<String, String>> {
     let child_component_labels = component_ids
         .iter()
         .map(|component_id| format!("c{component_id}"))
         .collect::<BTreeSet<_>>();
-    let kustomization_path = artifact_root.join("kustomization.yaml");
-    let raw = fs::read_to_string(&kustomization_path)
+    let kustomization_path = "kustomization.yaml";
+    let raw = artifact_files.get(kustomization_path).ok_or_else(|| {
+        miette::miette!("dynamic kubernetes artifact snapshot is missing {kustomization_path}")
+    })?;
+    let mut document: serde_yaml::Value = serde_yaml::from_str(raw)
         .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read {}", kustomization_path.display()))?;
-    let mut document: serde_yaml::Value = serde_yaml::from_str(&raw)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("invalid kustomization {}", kustomization_path.display()))?;
+        .wrap_err_with(|| format!("invalid kustomization {kustomization_path}"))?;
     let root = document.as_mapping_mut().ok_or_else(|| {
-        miette::miette!(
-            "kustomization {} is not a YAML mapping",
-            kustomization_path.display()
-        )
+        miette::miette!("kustomization {kustomization_path} is not a YAML mapping")
     })?;
     let resources = root
         .get_mut(yaml_string("resources"))
         .and_then(serde_yaml::Value::as_sequence_mut)
         .ok_or_else(|| {
-            miette::miette!(
-                "kustomization {} is missing a resources sequence",
-                kustomization_path.display()
-            )
+            miette::miette!("kustomization {kustomization_path} is missing a resources sequence")
         })?;
+    let mut projected = artifact_files
+        .iter()
+        .filter(|(path, _)| !path.ends_with(".yaml") && path.as_str() != kustomization_path)
+        .map(|(path, contents)| (path.clone(), contents.clone()))
+        .collect::<BTreeMap<_, _>>();
     let mut kept_resources = Vec::new();
     let mut kept_resource_names = BTreeSet::new();
     for resource in resources
@@ -2918,29 +3118,23 @@ fn rewrite_dynamic_kubernetes_apply_bundle(
         .filter_map(serde_yaml::Value::as_str)
         .map(str::to_owned)
     {
-        if !kubernetes_dynamic_apply_resource_kept(
-            artifact_root,
+        let raw = artifact_files
+            .get(&resource)
+            .ok_or_else(|| miette::miette!("dynamic kubernetes artifact is missing {resource}"))?;
+        if !kubernetes_dynamic_apply_resource_kept_from_contents(
             &resource,
+            raw,
             &child_component_labels,
         )? {
             continue;
         }
-        let resource_path = artifact_root.join(&resource);
-        let raw = fs::read_to_string(&resource_path)
+        let document: serde_yaml::Value = serde_yaml::from_str(raw)
             .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read {}", resource_path.display()))?;
-        let document: serde_yaml::Value = serde_yaml::from_str(&raw)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("invalid kubernetes resource {}", resource_path.display()))?;
-        if let Some(name) = document
-            .as_mapping()
-            .and_then(|root| root.get(yaml_string("metadata")))
-            .and_then(serde_yaml::Value::as_mapping)
-            .and_then(|metadata| metadata.get(yaml_string("name")))
-            .and_then(serde_yaml::Value::as_str)
-        {
+            .wrap_err_with(|| format!("invalid kubernetes resource {resource}"))?;
+        if let Some(name) = kubernetes_resource_name(&document) {
             kept_resource_names.insert(name.to_string());
         }
+        projected.insert(resource.clone(), raw.clone());
         kept_resources.push(serde_yaml::Value::String(resource));
     }
     *resources = kept_resources;
@@ -2985,10 +3179,111 @@ fn rewrite_dynamic_kubernetes_apply_bundle(
 
     let rendered = serde_yaml::to_string(&document)
         .into_diagnostic()
-        .wrap_err_with(|| format!("failed to serialize {}", kustomization_path.display()))?;
-    fs::write(&kustomization_path, rendered)
+        .wrap_err_with(|| format!("failed to serialize {kustomization_path}"))?;
+    projected.insert(kustomization_path.to_string(), rendered);
+    Ok(projected)
+}
+
+fn project_kubernetes_dynamic_child_destroy_artifact_files(
+    artifact_files: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    let kustomization_path = "kustomization.yaml";
+    let raw = artifact_files.get(kustomization_path).ok_or_else(|| {
+        miette::miette!("dynamic kubernetes artifact snapshot is missing {kustomization_path}")
+    })?;
+    let mut document: serde_yaml::Value = serde_yaml::from_str(raw)
         .into_diagnostic()
-        .wrap_err_with(|| format!("failed to write {}", kustomization_path.display()))
+        .wrap_err_with(|| format!("invalid kustomization {kustomization_path}"))?;
+    let root = document.as_mapping_mut().ok_or_else(|| {
+        miette::miette!("kustomization {kustomization_path} is not a YAML mapping")
+    })?;
+    let resources = root
+        .get_mut(yaml_string("resources"))
+        .and_then(serde_yaml::Value::as_sequence_mut)
+        .ok_or_else(|| {
+            miette::miette!("kustomization {kustomization_path} is missing a resources sequence")
+        })?;
+    let mut projected = artifact_files
+        .iter()
+        .filter(|(path, _)| !path.ends_with(".yaml") && path.as_str() != kustomization_path)
+        .map(|(path, contents)| (path.clone(), contents.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let shared_paths = [
+        KUBERNETES_MESH_PROVISION_CONFIGMAP_PATH,
+        KUBERNETES_PROVISIONER_ROLE_PATH,
+        KUBERNETES_PROVISIONER_ROLEBINDING_PATH,
+        KUBERNETES_PROVISIONER_SERVICE_ACCOUNT_PATH,
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let mut kept_resources = Vec::new();
+    for resource in resources
+        .iter()
+        .filter_map(serde_yaml::Value::as_str)
+        .map(str::to_owned)
+    {
+        if shared_paths.contains(resource.as_str()) {
+            continue;
+        }
+        let raw = artifact_files
+            .get(&resource)
+            .ok_or_else(|| miette::miette!("dynamic kubernetes artifact is missing {resource}"))?;
+        projected.insert(resource.clone(), raw.clone());
+        kept_resources.push(serde_yaml::Value::String(resource));
+    }
+    *resources = kept_resources;
+
+    if let Some(generators) = root
+        .get_mut(yaml_string("secretGenerator"))
+        .and_then(serde_yaml::Value::as_sequence_mut)
+    {
+        generators.retain(|generator| {
+            generator
+                .as_mapping()
+                .and_then(|mapping| mapping.get(yaml_string("name")))
+                .and_then(serde_yaml::Value::as_str)
+                != Some(KUBERNETES_ROUTER_EXTERNAL_SECRET_NAME)
+        });
+    }
+
+    if let Some(replacements) = root
+        .get_mut(yaml_string("replacements"))
+        .and_then(serde_yaml::Value::as_sequence_mut)
+    {
+        replacements.clear();
+    }
+
+    let rendered = serde_yaml::to_string(&document)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to serialize {kustomization_path}"))?;
+    projected.insert(kustomization_path.to_string(), rendered);
+    Ok(projected)
+}
+
+fn read_artifact_snapshot(root: &Path) -> Result<BTreeMap<String, String>> {
+    walk_files(root)?
+        .into_iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(root)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to relativize {}", path.display()))?;
+            let relative = path_to_forward_slash_string(relative);
+            let contents = fs::read_to_string(&path)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+            Ok((relative, contents))
+        })
+        .collect()
+}
+
+fn rewrite_dynamic_kubernetes_apply_bundle(
+    artifact_root: &Path,
+    component_ids: &[usize],
+) -> Result<()> {
+    let files = read_artifact_snapshot(artifact_root)?;
+    let projected = project_kubernetes_dynamic_child_artifact_files(&files, component_ids)?;
+    replace_artifact_snapshot(artifact_root, &projected)
 }
 
 fn prepare_dynamic_kubernetes_child_artifact(
@@ -3083,54 +3378,113 @@ fn prepare_dynamic_kubernetes_child_artifact(
     rewrite_dynamic_kubernetes_apply_bundle(artifact_root, &site_plan.component_ids)
 }
 
-fn kubernetes_service_names_by_component_label(
+fn kubernetes_peer_addrs_for_artifact(artifact_root: &Path) -> Result<BTreeMap<String, String>> {
+    let mesh_plan = read_kubernetes_runtime_mesh_provision_plan(artifact_root)?;
+    mesh_plan
+        .targets
+        .iter()
+        .filter(|target| matches!(target.kind, MeshProvisionTargetKind::Component))
+        .map(|target| {
+            let MeshProvisionOutput::KubernetesSecret { name, .. } = &target.output else {
+                return Err(miette::miette!(
+                    "kubernetes artifact {} component {} does not use a kubernetes secret mesh \
+                     output",
+                    artifact_root.display(),
+                    target.config.identity.id
+                ));
+            };
+            let service_name = name.strip_suffix("-mesh").ok_or_else(|| {
+                miette::miette!(
+                    "kubernetes artifact {} component {} uses invalid mesh secret name {}",
+                    artifact_root.display(),
+                    target.config.identity.id,
+                    name
+                )
+            })?;
+            Ok((
+                target.config.identity.id.clone(),
+                format!("{service_name}:{}", target.config.mesh_listen.port()),
+            ))
+        })
+        .collect()
+}
+
+fn build_kubernetes_route_overlay_base(
     artifact_root: &Path,
-) -> Result<BTreeMap<String, String>> {
-    let services_root = artifact_root.join("04-services");
-    if !services_root.is_dir() {
-        return Ok(BTreeMap::new());
-    }
-    let mut service_names = BTreeMap::new();
-    for path in walk_files(&services_root)? {
-        let raw = fs::read_to_string(&path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read {}", path.display()))?;
-        let document: serde_yaml::Value = serde_yaml::from_str(&raw)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("invalid kubernetes service {}", path.display()))?;
-        let Some(root) = document.as_mapping() else {
-            continue;
-        };
-        if root
-            .get(yaml_string("kind"))
-            .and_then(serde_yaml::Value::as_str)
-            != Some("Service")
+    assigned_components: &[String],
+    provider_peer_addrs: &BTreeMap<String, String>,
+    peer_identities: &BTreeMap<String, MeshIdentityPublic>,
+) -> Result<StoredRouteOverlayPayload> {
+    let mesh_plan = read_kubernetes_runtime_mesh_provision_plan(artifact_root)?;
+    let kept_component_ids = assigned_components.iter().cloned().collect::<BTreeSet<_>>();
+    let mut router_target = mesh_plan
+        .targets
+        .iter()
+        .find(|target| matches!(target.kind, MeshProvisionTargetKind::Router))
+        .cloned()
+        .ok_or_else(|| {
+            miette::miette!(
+                "kubernetes artifact {} is missing a router mesh target",
+                artifact_root.display()
+            )
+        })?;
+    filter_dynamic_router_target(&mut router_target, &kept_component_ids);
+    for route in &mut router_target.config.inbound {
+        if let InboundTarget::MeshForward {
+            peer_id, peer_addr, ..
+        } = &mut route.target
+            && let Some(resolved) = provider_peer_addrs.get(peer_id)
         {
-            continue;
+            *peer_addr = resolved.clone();
         }
-        let Some(metadata) = root
-            .get(yaml_string("metadata"))
-            .and_then(serde_yaml::Value::as_mapping)
-        else {
-            continue;
-        };
-        let Some(name) = metadata
-            .get(yaml_string("name"))
-            .and_then(serde_yaml::Value::as_str)
-        else {
-            continue;
-        };
-        let Some(component_label) = metadata
-            .get(yaml_string("labels"))
-            .and_then(serde_yaml::Value::as_mapping)
-            .and_then(|labels| labels.get(yaml_string("amber.io/component-id")))
-            .and_then(serde_yaml::Value::as_str)
-        else {
-            continue;
-        };
-        service_names.insert(component_label.to_string(), name.to_string());
     }
-    Ok(service_names)
+    let peers = router_target
+        .config
+        .peers
+        .iter()
+        .map(|peer| {
+            peer_identities.get(&peer.id).map(|identity| MeshPeer {
+                id: identity.id.clone(),
+                public_key: identity.public_key,
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            miette::miette!(
+                "kubernetes artifact {} is missing a live mesh identity for one of its route peers",
+                artifact_root.display()
+            )
+        })?;
+    Ok(StoredRouteOverlayPayload {
+        peers,
+        inbound_routes: router_target.config.inbound,
+    })
+}
+
+fn write_kubernetes_live_route_overlay_payload(
+    artifact_root: &Path,
+    assigned_components: &[String],
+    proxy_exports: &BTreeMap<String, DynamicProxyExportRecord>,
+    routed_inputs: &[DynamicInputRouteRecord],
+    peer_identities: &BTreeMap<String, MeshIdentityPublic>,
+) -> Result<()> {
+    let provider_peer_addrs = kubernetes_peer_addrs_for_artifact(artifact_root)?;
+    let mut payload = build_kubernetes_route_overlay_base(
+        artifact_root,
+        assigned_components,
+        &provider_peer_addrs,
+        peer_identities,
+    )?;
+    augment_route_overlay_payload(
+        &mut payload,
+        proxy_exports,
+        routed_inputs,
+        &provider_peer_addrs,
+        peer_identities,
+        None,
+        false,
+    )?;
+    write_dynamic_route_overlay_payload(artifact_root, &payload)
 }
 
 fn kubernetes_network_policy_paths_by_component_label(
@@ -3360,7 +3714,6 @@ fn network_policy_peer_is_router(peer: &serde_yaml::Value) -> bool {
 fn dynamic_proxy_export_kubernetes_peer_addr(
     artifact_root: &Path,
     mesh_plan: &MeshProvisionPlan,
-    service_names: &BTreeMap<String, String>,
     export: &DynamicProxyExportRecord,
 ) -> Result<String> {
     let component_target = mesh_plan
@@ -3376,12 +3729,19 @@ fn dynamic_proxy_export_kubernetes_peer_addr(
                 export.component
             )
         })?;
-    let component_label = format!("c{}", export.component_id);
-    let service_name = service_names.get(&component_label).ok_or_else(|| {
-        miette::miette!(
-            "dynamic proxy export provider {} is missing a kubernetes service in {}",
+    let MeshProvisionOutput::KubernetesSecret { name, .. } = &component_target.output else {
+        return Err(miette::miette!(
+            "dynamic proxy export provider {} does not use a kubernetes secret mesh output in {}",
             export.component,
-            artifact_root.join("04-services").display()
+            artifact_root.display()
+        ));
+    };
+    let service_name = name.strip_suffix("-mesh").ok_or_else(|| {
+        miette::miette!(
+            "dynamic proxy export provider {} uses invalid mesh secret name {} in {}",
+            export.component,
+            name,
+            artifact_root.display()
         )
     })?;
     Ok(format!(
@@ -4033,19 +4393,11 @@ fn child_router_overlay_payload(
         }
     }
     if !proxy_exports.is_empty() {
-        let kubernetes_service_names = matches!(plan.kind, SiteKind::Kubernetes)
-            .then(|| kubernetes_service_names_by_component_label(artifact_root))
-            .transpose()?;
         add_dynamic_proxy_export_overlay_routes(&mut inbound_routes, &proxy_exports, |export| {
             match plan.kind {
-                SiteKind::Kubernetes => dynamic_proxy_export_kubernetes_peer_addr(
-                    artifact_root,
-                    &provision,
-                    kubernetes_service_names
-                        .as_ref()
-                        .expect("kubernetes service names must be loaded for kubernetes overlays"),
-                    export,
-                ),
+                SiteKind::Kubernetes => {
+                    dynamic_proxy_export_kubernetes_peer_addr(artifact_root, &provision, export)
+                }
                 SiteKind::Direct | SiteKind::Vm | SiteKind::Compose => peer_addr_by_id
                     .get(&export.component)
                     .map(ToString::to_string)
@@ -4198,8 +4550,6 @@ async fn reconcile_dynamic_site_router_overlays_for_children(
 
     let issuers_by_route_id = dynamic_route_issuer_grants(issuer_children)?;
     let component_peers = load_published_component_peers(&app.plan, issuer_children)?;
-    let endpoint = site_router_control_endpoint(&app.plan)?;
-
     for child in overlay_children {
         let artifact_root = Path::new(&child.artifact_root);
         let runtime_root = child_overlay_runtime_root(&app.plan, child);
@@ -4214,6 +4564,7 @@ async fn reconcile_dynamic_site_router_overlays_for_children(
         if inbound_routes.is_empty() {
             continue;
         }
+        let endpoint = site_router_control_endpoint(&app.plan)?;
         apply_route_overlay_with_retry(
             &endpoint,
             &dynamic_child_route_overlay_id(&app.plan, child.child_id),
@@ -4229,18 +4580,18 @@ async fn reconcile_dynamic_site_router_overlays_for_children(
 
 async fn apply_dynamic_site_router_overlay(
     plan: &SiteActuatorPlan,
-    child_id: u64,
-    artifact_root: &Path,
-    runtime_root: &Path,
+    child: &SiteActuatorChildRecord,
 ) -> Result<()> {
-    let (peers, inbound_routes) = child_router_overlay_payload(plan, artifact_root, runtime_root)?;
+    let artifact_root = Path::new(&child.artifact_root);
+    let runtime_root = child_overlay_runtime_root(plan, child);
+    let (peers, inbound_routes) = child_router_overlay_payload(plan, artifact_root, &runtime_root)?;
     if inbound_routes.is_empty() {
         return Ok(());
     }
     let endpoint = site_router_control_endpoint(plan)?;
     apply_route_overlay_with_retry(
         &endpoint,
-        &dynamic_child_route_overlay_id(plan, child_id),
+        &dynamic_child_route_overlay_id(plan, child.child_id),
         &peers,
         &inbound_routes,
         Duration::from_secs(30),
@@ -4248,11 +4599,14 @@ async fn apply_dynamic_site_router_overlay(
     .await
 }
 
-async fn revoke_dynamic_site_router_overlay(plan: &SiteActuatorPlan, child_id: u64) -> Result<()> {
+async fn revoke_dynamic_site_router_overlay(
+    plan: &SiteActuatorPlan,
+    child: &SiteActuatorChildRecord,
+) -> Result<()> {
     let endpoint = site_router_control_endpoint(plan)?;
     revoke_route_overlay_with_retry(
         &endpoint,
-        &dynamic_child_route_overlay_id(plan, child_id),
+        &dynamic_child_route_overlay_id(plan, child.child_id),
         Duration::from_secs(30),
     )
     .await
@@ -4301,6 +4655,16 @@ async fn actuator_prepare_child(
                 &site_plan,
                 app.plan.router_mesh_port,
             )?;
+            write_direct_vm_startup_route_overlay_payload(
+                &artifact_root,
+                "direct",
+                &site_plan.routed_inputs,
+                &overlay_peer_addr_map_from_ports(&local_direct_peer_ports_for_children(
+                    &app.plan,
+                    &published_children,
+                )?),
+                &local_direct_peer_identities_for_children(&app.plan, &published_children)?,
+            )?;
         }
         SiteKind::Vm => {
             filter_vm_stage_plan(&artifact_root, &site_plan.component_ids)?;
@@ -4313,6 +4677,16 @@ async fn actuator_prepare_child(
                 &artifact_root,
                 &site_plan,
                 app.plan.router_mesh_port,
+            )?;
+            write_direct_vm_startup_route_overlay_payload(
+                &artifact_root,
+                "vm",
+                &site_plan.routed_inputs,
+                &overlay_peer_addr_map_from_ports(&local_vm_peer_ports_for_children(
+                    &app.plan,
+                    &published_children,
+                )?),
+                &local_vm_peer_identities_for_children(&app.plan, &published_children)?,
             )?;
         }
         SiteKind::Compose => {
@@ -4404,6 +4778,9 @@ async fn actuator_publish_child(
                     .get(&app.plan.router_identity_id)
                     .and_then(|identity| identity.mesh_scope.as_deref()),
             )?;
+            if dynamic_route_overlay_path(Path::new(&child.artifact_root)).is_file() {
+                apply_dynamic_site_router_overlay(&app.plan, &child).await?;
+            }
             let runtime_root = site_actuator_child_runtime_root(&app.plan, child_id);
             let storage_root = site_actuator_child_storage_root(&app.plan, child_id);
             let child_root = site_actuator_child_root(&app.plan, child_id);
@@ -4436,6 +4813,22 @@ async fn actuator_publish_child(
                 &child_root.join("site.log"),
             )
             .await?;
+            let mut live_children = published_children.clone();
+            live_children.push(child.clone());
+            let live_peer_ports = overlay_peer_addr_map_from_ports(
+                &local_direct_peer_ports_for_children(&app.plan, &live_children)?,
+            );
+            let live_peer_identities =
+                local_direct_peer_identities_for_children(&app.plan, &live_children)?;
+            write_direct_vm_live_route_overlay_payload(
+                Path::new(&child.artifact_root),
+                &child.assigned_components,
+                &child.proxy_exports,
+                &child.routed_inputs,
+                &live_peer_ports,
+                &live_peer_identities,
+            )?;
+            apply_dynamic_site_router_overlay(&app.plan, &child).await?;
             let mut state = app.state.lock().await;
             {
                 let record = state
@@ -4470,6 +4863,9 @@ async fn actuator_publish_child(
                     .get(&app.plan.router_identity_id)
                     .and_then(|identity| identity.mesh_scope.as_deref()),
             )?;
+            if dynamic_route_overlay_path(Path::new(&child.artifact_root)).is_file() {
+                apply_dynamic_site_router_overlay(&app.plan, &child).await?;
+            }
             let runtime_root = site_actuator_child_runtime_root(&app.plan, child_id);
             let storage_root = site_actuator_child_storage_root(&app.plan, child_id);
             let child_root = site_actuator_child_root(&app.plan, child_id);
@@ -4511,6 +4907,22 @@ async fn actuator_publish_child(
                 vm_endpoint_forward_ready_timeout(),
                 &child_root.join("site.log"),
             )?;
+            let mut live_children = published_children.clone();
+            live_children.push(child.clone());
+            let live_peer_ports = overlay_peer_addr_map_from_ports(
+                &local_vm_peer_ports_for_children(&app.plan, &live_children)?,
+            );
+            let live_peer_identities =
+                local_vm_peer_identities_for_children(&app.plan, &live_children)?;
+            write_direct_vm_live_route_overlay_payload(
+                Path::new(&child.artifact_root),
+                &child.assigned_components,
+                &child.proxy_exports,
+                &child.routed_inputs,
+                &live_peer_ports,
+                &live_peer_identities,
+            )?;
+            apply_dynamic_site_router_overlay(&app.plan, &child).await?;
             let mut state = app.state.lock().await;
             {
                 let record = state
@@ -4535,6 +4947,7 @@ async fn actuator_publish_child(
                 &issuer_children,
             )
             .await?;
+            apply_dynamic_site_router_overlay(&app.plan, &child).await?;
             let metadata = load_dynamic_compose_child_metadata(Path::new(&child.artifact_root))?;
             let compose_project = app.plan.compose_project.as_deref().ok_or_else(|| {
                 miette::miette!(
@@ -4542,34 +4955,67 @@ async fn actuator_publish_child(
                     app.plan.site_id
                 )
             })?;
-            let status = compose_command(Some(compose_project), Path::new(&child.artifact_root))
-                .envs(app.plan.launch_env.clone())
-                .arg("up")
-                .arg("-d")
-                .args(&metadata.services)
-                .status()
-                .into_diagnostic()
-                .wrap_err_with(|| {
-                    format!("failed to publish compose site `{}`", app.plan.site_id)
-                })?;
-            if !status.success() {
-                return Err(miette::miette!(
-                    "compose site `{}` publish failed with status {status}",
-                    app.plan.site_id
-                ));
+            let (sidecar_services, workload_services): (Vec<_>, Vec<_>) = metadata
+                .services
+                .iter()
+                .cloned()
+                .partition(|service| is_compose_component_sidecar_service(service));
+            if !sidecar_services.is_empty() {
+                let status =
+                    compose_command(Some(compose_project), Path::new(&child.artifact_root))
+                        .envs(app.plan.launch_env.clone())
+                        .arg("up")
+                        .arg("-d")
+                        .args(&sidecar_services)
+                        .status()
+                        .into_diagnostic()
+                        .wrap_err_with(|| {
+                            format!(
+                                "failed to publish compose child sidecars on site `{}`",
+                                app.plan.site_id
+                            )
+                        })?;
+                if !status.success() {
+                    return Err(miette::miette!(
+                        "compose child sidecar publish on site `{}` failed with status {status}",
+                        app.plan.site_id
+                    ));
+                }
+                wait_for_compose_services_running(
+                    compose_project,
+                    Path::new(&child.artifact_root),
+                    &sidecar_services,
+                    site_ready_timeout_for_kind(SiteKind::Compose),
+                )
+                .await?;
+            }
+            if !workload_services.is_empty() {
+                let status =
+                    compose_command(Some(compose_project), Path::new(&child.artifact_root))
+                        .envs(app.plan.launch_env.clone())
+                        .arg("up")
+                        .arg("-d")
+                        .args(&workload_services)
+                        .status()
+                        .into_diagnostic()
+                        .wrap_err_with(|| {
+                            format!(
+                                "failed to publish compose child workloads on site `{}`",
+                                app.plan.site_id
+                            )
+                        })?;
+                if !status.success() {
+                    return Err(miette::miette!(
+                        "compose child workload publish on site `{}` failed with status {status}",
+                        app.plan.site_id
+                    ));
+                }
             }
             wait_for_compose_services_running(
                 compose_project,
                 Path::new(&child.artifact_root),
                 &metadata.readiness_services,
                 site_ready_timeout_for_kind(SiteKind::Compose),
-            )
-            .await?;
-            apply_dynamic_site_router_overlay(
-                &app.plan,
-                child_id,
-                Path::new(&child.artifact_root),
-                Path::new(&child.artifact_root),
             )
             .await?;
             let mut state = app.state.lock().await;
@@ -4603,13 +5049,17 @@ async fn actuator_publish_child(
                 ));
             }
             ensure_kubernetes_workloads_ready(&supervisor_plan)?;
-            apply_dynamic_site_router_overlay(
-                &app.plan,
-                child_id,
-                Path::new(&child.artifact_root),
-                Path::new(&child.artifact_root),
-            )
-            .await?;
+            let mut live_children = published_children.clone();
+            live_children.push(child.clone());
+            let live_peer_identities = local_kubernetes_peer_identities(&app.plan, &live_children)?;
+            write_kubernetes_live_route_overlay_payload(
+                artifact_root,
+                &child.assigned_components,
+                &child.proxy_exports,
+                &child.routed_inputs,
+                &live_peer_identities,
+            )?;
+            apply_dynamic_site_router_overlay(&app.plan, &child).await?;
             let mut state = app.state.lock().await;
             let record = state
                 .children
@@ -4619,6 +5069,11 @@ async fn actuator_publish_child(
             write_json(&app.state_path, &*state)?;
             drop(state);
             reconcile_dynamic_site_router_overlays(app).await?;
+            wait_for_kubernetes_site_router_ready(
+                &app.plan,
+                site_ready_timeout_for_kind(SiteKind::Kubernetes),
+            )
+            .await?;
         }
     }
 
@@ -4656,7 +5111,13 @@ async fn actuator_destroy_child(
             SiteKind::Direct | SiteKind::Vm | SiteKind::Compose | SiteKind::Kubernetes
         )
     {
-        revoke_dynamic_site_router_overlay(&app.plan, child_id).await?;
+        revoke_dynamic_site_router_overlay(
+            &app.plan,
+            child
+                .as_ref()
+                .expect("published child should be available for overlay revoke"),
+        )
+        .await?;
     }
     if let Some(pid) = child.as_ref().and_then(|child| child.process_pid) {
         terminate_pid(pid, site_ready_timeout_for_kind(app.plan.kind))?;
@@ -4701,33 +5162,50 @@ async fn actuator_destroy_child(
             }
         }
         SiteKind::Kubernetes => {
-            let desired = desired_site_plan.ok_or_else(|| {
-                miette::miette!(
-                    "kubernetes destroy for site `{}` is missing the desired site snapshot",
-                    app.plan.site_id
-                )
-            })?;
-            replace_artifact_snapshot(Path::new(&app.plan.artifact_dir), &desired.artifact_files)?;
-            let _ = prepare_kubernetes_site_artifact_for_apply(&app.plan)?;
+            let _ = desired_site_plan;
+            let child = child
+                .as_ref()
+                .ok_or_else(|| miette::miette!("site actuator child {child_id} is not prepared"))?;
+            let artifact_root = Path::new(&child.artifact_root);
+            let files = read_artifact_snapshot(artifact_root)?;
+            let destroy_bundle = project_kubernetes_dynamic_child_destroy_artifact_files(&files)?;
+            replace_artifact_snapshot(artifact_root, &destroy_bundle)?;
+            let supervisor_plan = prepare_kubernetes_artifact_for_apply(&app.plan, artifact_root)?;
+            let workloads = supervisor::kubernetes_expected_workloads(artifact_root)?;
             let status = kubectl_command(app.plan.context.as_deref())
-                .current_dir(&app.plan.artifact_dir)
-                .arg("apply")
+                .current_dir(artifact_root)
+                .arg("delete")
                 .arg("-k")
                 .arg(".")
-                .arg("--prune")
-                .arg("-l")
-                .arg("app.kubernetes.io/managed-by=amber")
+                .arg("--ignore-not-found=true")
                 .status()
                 .into_diagnostic()
                 .wrap_err_with(|| {
-                    format!("failed to reconcile kubernetes site `{}`", app.plan.site_id)
+                    format!(
+                        "failed to destroy kubernetes child on site `{}`",
+                        app.plan.site_id
+                    )
                 })?;
             if !status.success() {
                 return Err(miette::miette!(
-                    "kubernetes site `{}` reconcile failed with status {status}",
+                    "kubernetes child destroy on site `{}` failed with status {status}",
                     app.plan.site_id
                 ));
             }
+            wait_for_kubernetes_artifact_workloads_deleted(
+                app.plan.context.as_deref(),
+                supervisor_plan
+                    .kubernetes_namespace
+                    .as_deref()
+                    .expect("kubernetes supervisor plan should include a namespace"),
+                &workloads,
+                &app.plan.site_id,
+            )?;
+            wait_for_kubernetes_site_router_ready(
+                &app.plan,
+                site_ready_timeout_for_kind(SiteKind::Kubernetes),
+            )
+            .await?;
         }
         SiteKind::Direct | SiteKind::Vm => {
             if let Some(desired) = desired_site_plan.as_ref() {
@@ -4778,6 +5256,237 @@ fn replace_artifact_snapshot(root: &Path, files: &BTreeMap<String, String>) -> R
             .wrap_err_with(|| format!("failed to write {}", path.display()))?;
     }
     Ok(())
+}
+
+fn wait_for_named_kubernetes_resource_deleted(
+    context: Option<&str>,
+    namespace: &str,
+    resource_kind: &str,
+    name: &str,
+    label: &str,
+) -> Result<()> {
+    let resource = format!("{resource_kind}/{name}");
+    let timeout = format!("{}s", KUBERNETES_WORKLOAD_READY_TIMEOUT.as_secs().max(1));
+    let output = kubectl_command(context)
+        .args([
+            "-n",
+            namespace,
+            "wait",
+            "--for=delete",
+            "--timeout",
+            timeout.as_str(),
+            resource.as_str(),
+        ])
+        .output()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("{label}: wait for {resource} deletion"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.contains("not found") {
+        return Ok(());
+    }
+    let detail = if stderr.is_empty() {
+        format!("status {}", output.status)
+    } else {
+        stderr
+    };
+    Err(miette::miette!("{label} failed: {detail}"))
+}
+
+fn wait_for_kubernetes_artifact_workloads_deleted(
+    context: Option<&str>,
+    namespace: &str,
+    workloads: &supervisor::KubernetesArtifactWorkloads,
+    site_id: &str,
+) -> Result<()> {
+    let label = format!("wait for kubernetes child workload deletion on site `{site_id}`");
+    for job in &workloads.jobs {
+        wait_for_named_kubernetes_resource_deleted(context, namespace, "job", job, &label)?;
+    }
+    for deployment in &workloads.deployments {
+        wait_for_named_kubernetes_resource_deleted(
+            context,
+            namespace,
+            "deployment",
+            deployment,
+            &label,
+        )?;
+    }
+    Ok(())
+}
+
+async fn wait_for_kubernetes_site_router_ready(
+    plan: &SiteActuatorPlan,
+    timeout: Duration,
+) -> Result<()> {
+    debug_assert_eq!(plan.kind, SiteKind::Kubernetes);
+
+    let state_path = Path::new(&plan.site_state_root).join("manager-state.json");
+    let deadline = Instant::now() + timeout;
+    loop {
+        if state_path.is_file() {
+            let state: SiteManagerState = read_json(&state_path, "site manager state")?;
+            if matches!(state.status, SiteLifecycleStatus::Failed) {
+                return Err(miette::miette!(
+                    "kubernetes site `{}` failed while waiting for router recovery: {}",
+                    plan.site_id,
+                    state
+                        .last_error
+                        .unwrap_or_else(|| "unknown failure".to_string())
+                ));
+            }
+            if matches!(state.status, SiteLifecycleStatus::Running)
+                && let (Some(control), Some(mesh_addr)) = (
+                    state.router_control.as_deref(),
+                    state.router_mesh_addr.as_deref(),
+                )
+            {
+                let control_addr: SocketAddr =
+                    control.parse().into_diagnostic().wrap_err_with(|| {
+                        format!("invalid kubernetes router control addr `{control}`")
+                    })?;
+                let mesh_addr: SocketAddr =
+                    mesh_addr.parse().into_diagnostic().wrap_err_with(|| {
+                        format!("invalid kubernetes router mesh addr `{mesh_addr}`")
+                    })?;
+                if probe_kubernetes_router_identity(control_addr, Duration::from_millis(250))
+                    .await?
+                    && router_mesh_listener_ready(mesh_addr).await
+                {
+                    return Ok(());
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(miette::miette!(
+                "timed out waiting for kubernetes site `{}` router recovery",
+                plan.site_id
+            ));
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn probe_kubernetes_router_identity(addr: SocketAddr, timeout: Duration) -> Result<bool> {
+    let mut stream = match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(err))
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::NotConnected
+            ) =>
+        {
+            return Ok(false);
+        }
+        Ok(Err(err)) => {
+            return Err(miette::miette!(
+                "failed to connect to kubernetes router control at {addr}: {err}"
+            ));
+        }
+        Err(_) => return Ok(false),
+    };
+
+    let request = b"GET /identity HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    match tokio::time::timeout(timeout, stream.write_all(request)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err))
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::NotConnected
+            ) =>
+        {
+            return Ok(false);
+        }
+        Ok(Err(err)) => {
+            return Err(miette::miette!(
+                "failed to write kubernetes router identity probe to {addr}: {err}"
+            ));
+        }
+        Err(_) => return Ok(false),
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut buf = Vec::new();
+    loop {
+        if let Some(end) = find_header_end(&buf)
+            && let Some(content_length) = router_identity_probe_content_length(&buf[..end])?
+        {
+            let body_len = buf.len().saturating_sub(end + 4);
+            if body_len >= content_length {
+                return parse_router_identity_probe_response(&buf, end);
+            }
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(false);
+        };
+        let mut chunk = [0u8; 1024];
+        match tokio::time::timeout(remaining, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) => return Ok(false),
+            Ok(Ok(read)) => buf.extend_from_slice(&chunk[..read]),
+            Ok(Err(err))
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::NotConnected
+                ) =>
+            {
+                return Ok(false);
+            }
+            Ok(Err(err)) => {
+                return Err(miette::miette!(
+                    "failed to read kubernetes router identity probe from {addr}: {err}"
+                ));
+            }
+            Err(_) => return Ok(false),
+        }
+    }
+}
+
+fn router_identity_probe_content_length(header: &[u8]) -> Result<Option<usize>> {
+    let header = std::str::from_utf8(header)
+        .into_diagnostic()
+        .wrap_err("router identity probe returned a non-UTF-8 HTTP header")?;
+    Ok(header.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then_some(value.trim())
+            .and_then(|value| value.parse::<usize>().ok())
+    }))
+}
+
+fn parse_router_identity_probe_response(buf: &[u8], header_end: usize) -> Result<bool> {
+    let header = std::str::from_utf8(&buf[..header_end])
+        .into_diagnostic()
+        .wrap_err("router identity probe returned a non-UTF-8 HTTP header")?;
+    let status = header
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok());
+    if status != Some(200) {
+        return Ok(false);
+    }
+    let body = std::str::from_utf8(&buf[header_end + 4..])
+        .into_diagnostic()
+        .wrap_err("router identity probe returned a non-UTF-8 body")?;
+    Ok(serde_json::from_str::<MeshIdentityPublic>(body.trim()).is_ok())
 }
 
 fn filter_direct_stage_plan(artifact_root: &Path, component_ids: &[usize]) -> Result<()> {
@@ -5009,6 +5718,19 @@ fn local_direct_peer_ports(
     plan: &SiteActuatorPlan,
     state: &SiteActuatorState,
 ) -> Result<BTreeMap<String, u16>> {
+    let children = state
+        .children
+        .values()
+        .filter(|child| child.published)
+        .cloned()
+        .collect::<Vec<_>>();
+    local_direct_peer_ports_for_children(plan, &children)
+}
+
+fn local_direct_peer_ports_for_children(
+    plan: &SiteActuatorPlan,
+    children: &[SiteActuatorChildRecord],
+) -> Result<BTreeMap<String, u16>> {
     let site_runtime_root = Path::new(plan.runtime_root.as_deref().ok_or_else(|| {
         miette::miette!("direct site `{}` is missing its runtime root", plan.site_id)
     })?);
@@ -5026,7 +5748,7 @@ fn local_direct_peer_ports(
         Path::new(&plan.artifact_dir),
         site_runtime_root,
     )?);
-    for child in state.children.values().filter(|child| child.published) {
+    for child in children {
         peers.extend(direct_peer_ports_for_artifact(
             Path::new(&child.artifact_root),
             &site_actuator_child_runtime_root(plan, child.child_id),
@@ -5038,6 +5760,19 @@ fn local_direct_peer_ports(
 fn local_direct_peer_identities(
     plan: &SiteActuatorPlan,
     state: &SiteActuatorState,
+) -> Result<BTreeMap<String, MeshIdentityPublic>> {
+    let children = state
+        .children
+        .values()
+        .filter(|child| child.published)
+        .cloned()
+        .collect::<Vec<_>>();
+    local_direct_peer_identities_for_children(plan, &children)
+}
+
+fn local_direct_peer_identities_for_children(
+    plan: &SiteActuatorPlan,
+    children: &[SiteActuatorChildRecord],
 ) -> Result<BTreeMap<String, MeshIdentityPublic>> {
     let site_runtime_root = Path::new(plan.runtime_root.as_deref().ok_or_else(|| {
         miette::miette!("direct site `{}` is missing its runtime root", plan.site_id)
@@ -5056,7 +5791,7 @@ fn local_direct_peer_identities(
         Path::new(&plan.artifact_dir),
         site_runtime_root,
     )?);
-    for child in state.children.values().filter(|child| child.published) {
+    for child in children {
         peers.extend(direct_peer_identities_for_artifact(
             Path::new(&child.artifact_root),
             &site_actuator_child_runtime_root(plan, child.child_id),
@@ -5128,6 +5863,19 @@ fn local_vm_peer_ports(
     plan: &SiteActuatorPlan,
     state: &SiteActuatorState,
 ) -> Result<BTreeMap<String, u16>> {
+    let children = state
+        .children
+        .values()
+        .filter(|child| child.published)
+        .cloned()
+        .collect::<Vec<_>>();
+    local_vm_peer_ports_for_children(plan, &children)
+}
+
+fn local_vm_peer_ports_for_children(
+    plan: &SiteActuatorPlan,
+    children: &[SiteActuatorChildRecord],
+) -> Result<BTreeMap<String, u16>> {
     let site_runtime_root = Path::new(plan.runtime_root.as_deref().ok_or_else(|| {
         miette::miette!("vm site `{}` is missing its runtime root", plan.site_id)
     })?);
@@ -5142,7 +5890,7 @@ fn local_vm_peer_ports(
         Path::new(&plan.artifact_dir),
         site_runtime_root,
     )?);
-    for child in state.children.values().filter(|child| child.published) {
+    for child in children {
         peers.extend(vm_peer_ports_for_artifact(
             Path::new(&child.artifact_root),
             &site_actuator_child_runtime_root(plan, child.child_id),
@@ -5154,6 +5902,19 @@ fn local_vm_peer_ports(
 fn local_vm_peer_identities(
     plan: &SiteActuatorPlan,
     state: &SiteActuatorState,
+) -> Result<BTreeMap<String, MeshIdentityPublic>> {
+    let children = state
+        .children
+        .values()
+        .filter(|child| child.published)
+        .cloned()
+        .collect::<Vec<_>>();
+    local_vm_peer_identities_for_children(plan, &children)
+}
+
+fn local_vm_peer_identities_for_children(
+    plan: &SiteActuatorPlan,
+    children: &[SiteActuatorChildRecord],
 ) -> Result<BTreeMap<String, MeshIdentityPublic>> {
     let site_runtime_root = Path::new(plan.runtime_root.as_deref().ok_or_else(|| {
         miette::miette!("vm site `{}` is missing its runtime root", plan.site_id)
@@ -5171,7 +5932,7 @@ fn local_vm_peer_identities(
         Path::new(&plan.artifact_dir),
         site_runtime_root,
     )?);
-    for child in state.children.values().filter(|child| child.published) {
+    for child in children {
         peers.extend(vm_peer_identities_for_artifact(
             Path::new(&child.artifact_root),
             &site_actuator_child_runtime_root(plan, child.child_id),
@@ -5427,12 +6188,6 @@ fn prepare_kubernetes_artifact_for_apply(
         artifact_dir,
         Some(namespace),
     ))
-}
-
-fn prepare_kubernetes_site_artifact_for_apply(
-    plan: &SiteActuatorPlan,
-) -> Result<SiteSupervisorPlan> {
-    prepare_kubernetes_artifact_for_apply(plan, Path::new(&plan.artifact_dir))
 }
 
 fn kubernetes_namespace_name(run_id: &str, site_id: &str) -> String {

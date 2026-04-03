@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use base64::Engine as _;
 use tempfile::tempdir;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::*;
 use crate::framework_component::DynamicProxyExportRecord;
@@ -1176,6 +1177,128 @@ fn dynamic_route_issuer_grants_include_component_provide_inputs() {
 }
 
 #[test]
+fn direct_startup_route_overlay_does_not_require_materialized_child_mesh_files() {
+    let temp = tempdir().expect("tempdir should be created");
+    let artifact_root = temp.path().join("child-artifact");
+    fs::create_dir_all(&artifact_root).expect("child artifact dir should exist");
+    write_json(
+        &artifact_root.join("mesh-provision-plan.json"),
+        &MeshProvisionPlan {
+            version: "2".to_string(),
+            identity_seed: None,
+            existing_peer_identities: Vec::new(),
+            targets: vec![
+                amber_mesh::MeshProvisionTarget {
+                    kind: MeshProvisionTargetKind::Component,
+                    config: amber_mesh::MeshConfigTemplate {
+                        identity: amber_mesh::MeshIdentityTemplate {
+                            id: "/consumer".to_string(),
+                            mesh_scope: Some("scope".to_string()),
+                        },
+                        mesh_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+                        control_listen: None,
+                        control_allow: None,
+                        peers: vec![amber_mesh::MeshPeerTemplate {
+                            id: "/site/direct_local/router".to_string(),
+                        }],
+                        inbound: Vec::new(),
+                        outbound: vec![OutboundRoute {
+                            route_id: "placeholder".to_string(),
+                            slot: "upstream".to_string(),
+                            capability: "http".to_string(),
+                            capability_kind: Some("http".to_string()),
+                            capability_profile: None,
+                            protocol: MeshProtocol::Http,
+                            listen_port: 21000,
+                            listen_addr: None,
+                            peer_addr: "127.0.0.1:1".to_string(),
+                            peer_id: "/provider".to_string(),
+                            http_plugins: Vec::new(),
+                        }],
+                        transport: TransportConfig::NoiseIk {},
+                    },
+                    output: MeshProvisionOutput::Filesystem {
+                        dir: "mesh/components/c1-consumer".to_string(),
+                    },
+                },
+                amber_mesh::MeshProvisionTarget {
+                    kind: MeshProvisionTargetKind::Router,
+                    config: amber_mesh::MeshConfigTemplate {
+                        identity: amber_mesh::MeshIdentityTemplate {
+                            id: "/site/direct_local/router".to_string(),
+                            mesh_scope: Some("scope".to_string()),
+                        },
+                        mesh_listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+                        control_listen: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+                        control_allow: None,
+                        peers: Vec::new(),
+                        inbound: Vec::new(),
+                        outbound: Vec::new(),
+                        transport: TransportConfig::NoiseIk {},
+                    },
+                    output: MeshProvisionOutput::Filesystem {
+                        dir: "mesh/router".to_string(),
+                    },
+                },
+            ],
+        },
+    )
+    .expect("mesh provision plan should be written");
+
+    write_direct_vm_startup_route_overlay_payload(
+        &artifact_root,
+        "direct",
+        &[DynamicInputRouteRecord {
+            component: "/consumer".to_string(),
+            slot: "upstream".to_string(),
+            provider_component: "/provider".to_string(),
+            protocol: "http".to_string(),
+            capability_kind: "http".to_string(),
+            capability_profile: None,
+            target: DynamicInputRouteTarget::ComponentProvide {
+                provide: "http".to_string(),
+            },
+        }],
+        &BTreeMap::from([("/provider".to_string(), "127.0.0.1:25000".to_string())]),
+        &BTreeMap::from([(
+            "/provider".to_string(),
+            MeshIdentityPublic {
+                id: "/provider".to_string(),
+                public_key: [9; 32],
+                mesh_scope: Some("scope".to_string()),
+            },
+        )]),
+    )
+    .expect("startup overlay should be written without child mesh files in the artifact");
+
+    let overlay: StoredRouteOverlayPayload = read_json(
+        &dynamic_route_overlay_path(&artifact_root),
+        "site router overlay",
+    )
+    .expect("startup overlay should exist");
+    assert_eq!(overlay.peers.len(), 1);
+    assert_eq!(overlay.peers[0].id, "/provider");
+    let route = overlay
+        .inbound_routes
+        .iter()
+        .find(|route| route.route_id == component_route_id("/provider", "http", MeshProtocol::Http))
+        .expect("startup overlay should include the provider route");
+    let InboundTarget::MeshForward {
+        peer_addr,
+        peer_id,
+        route_id,
+        capability,
+    } = &route.target
+    else {
+        panic!("startup overlay should forward routed inputs over mesh");
+    };
+    assert_eq!(peer_addr, "127.0.0.1:25000");
+    assert_eq!(peer_id, "/provider");
+    assert_eq!(route_id, "component:/provider:http:http");
+    assert_eq!(capability, "http");
+}
+
+#[test]
 fn filter_dynamic_mesh_provision_plan_keeps_only_child_owned_router_routes() {
     let temp = tempdir().expect("tempdir should be created");
     let artifact_root = temp.path();
@@ -2184,6 +2307,179 @@ secretGenerator:
     assert!(!kustomization.contains("03-deployments/amber-router.yaml"));
     assert!(!kustomization.contains("03-deployments/c3-kind-admin.yaml"));
     assert!(!kustomization.contains("amber-router-external"));
+    assert!(
+        !deployments_dir.join("amber-router.yaml").exists(),
+        "dynamic kubernetes child artifact should delete unrelated router resources",
+    );
+    assert!(
+        !deployments_dir.join("c3-kind-admin.yaml").exists(),
+        "dynamic kubernetes child artifact should delete unrelated creator resources",
+    );
+    assert!(
+        !services_dir.join("amber-router.yaml").exists(),
+        "dynamic kubernetes child artifact should delete unrelated router services",
+    );
+    assert!(
+        !services_dir.join("c3-kind-admin.yaml").exists(),
+        "dynamic kubernetes child artifact should delete unrelated creator services",
+    );
+
+    let destroy_bundle = project_kubernetes_dynamic_child_destroy_artifact_files(
+        &read_artifact_snapshot(temp.path()).expect("prepared child artifact should be readable"),
+    )
+    .expect("destroy bundle should project");
+    let destroy_kustomization = destroy_bundle
+        .get("kustomization.yaml")
+        .expect("destroy bundle should include kustomization");
+    assert!(destroy_kustomization.contains("03-deployments/c7-kind-helper.yaml"));
+    assert!(destroy_kustomization.contains("02-rbac/amber-provisioner-job.yaml"));
+    assert!(!destroy_kustomization.contains("01-configmaps/amber-mesh-provision.yaml"));
+    assert!(!destroy_kustomization.contains("02-rbac/amber-provisioner-role.yaml"));
+    assert!(!destroy_kustomization.contains("02-rbac/amber-provisioner-rolebinding.yaml"));
+    assert!(!destroy_kustomization.contains("02-rbac/amber-provisioner-sa.yaml"));
+}
+
+#[test]
+fn kubernetes_peer_addrs_are_derived_from_mesh_secret_names() {
+    let temp = tempdir().expect("tempdir should be created");
+    let configmaps_dir = temp.path().join("01-configmaps");
+    fs::create_dir_all(&configmaps_dir).expect("configmaps dir should exist");
+
+    let mesh_plan = MeshProvisionPlan {
+        version: "2".to_string(),
+        identity_seed: None,
+        existing_peer_identities: Vec::new(),
+        targets: vec![amber_mesh::MeshProvisionTarget {
+            kind: MeshProvisionTargetKind::Component,
+            config: amber_mesh::MeshConfigTemplate {
+                identity: amber_mesh::MeshIdentityTemplate {
+                    id: "/job-compose/kind_helper".to_string(),
+                    mesh_scope: Some("scope".to_string()),
+                },
+                mesh_listen: SocketAddr::from(([127, 0, 0, 1], 23000)),
+                control_listen: None,
+                control_allow: None,
+                peers: Vec::new(),
+                inbound: Vec::new(),
+                outbound: Vec::new(),
+                transport: TransportConfig::NoiseIk {},
+            },
+            output: MeshProvisionOutput::KubernetesSecret {
+                name: "c7-kind-helper-mesh".to_string(),
+                namespace: None,
+            },
+        }],
+    };
+    let plan_json = serde_json::to_string_pretty(&mesh_plan).expect("mesh plan should serialize");
+    let indented_json = plan_json
+        .lines()
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(
+        configmaps_dir.join("amber-mesh-provision.yaml"),
+        format!(
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: amber-mesh-provision\ndata:\n  \
+             mesh-plan.json: |-\n{indented_json}\n"
+        ),
+    )
+    .expect("mesh provision configmap should be written");
+
+    let peer_addrs =
+        kubernetes_peer_addrs_for_artifact(temp.path()).expect("peer addrs should resolve");
+    assert_eq!(
+        peer_addrs
+            .get("/job-compose/kind_helper")
+            .map(String::as_str),
+        Some("c7-kind-helper:23000"),
+    );
+}
+
+#[test]
+fn kubernetes_dynamic_route_overlay_uses_runtime_plan_with_router_target() {
+    let temp = tempdir().expect("tempdir should be created");
+    let configmaps_dir = temp.path().join("01-configmaps");
+    fs::create_dir_all(&configmaps_dir).expect("configmaps dir should exist");
+
+    let component_target = amber_mesh::MeshProvisionTarget {
+        kind: MeshProvisionTargetKind::Component,
+        config: amber_mesh::MeshConfigTemplate {
+            identity: amber_mesh::MeshIdentityTemplate {
+                id: "/job-compose/kind_helper".to_string(),
+                mesh_scope: Some("scope".to_string()),
+            },
+            mesh_listen: SocketAddr::from(([127, 0, 0, 1], 23000)),
+            control_listen: None,
+            control_allow: None,
+            peers: Vec::new(),
+            inbound: Vec::new(),
+            outbound: Vec::new(),
+            transport: TransportConfig::NoiseIk {},
+        },
+        output: MeshProvisionOutput::KubernetesSecret {
+            name: "c7-kind-helper-mesh".to_string(),
+            namespace: None,
+        },
+    };
+    let embedded_plan = MeshProvisionPlan {
+        version: "2".to_string(),
+        identity_seed: None,
+        existing_peer_identities: Vec::new(),
+        targets: vec![component_target.clone()],
+    };
+    let runtime_plan = MeshProvisionPlan {
+        version: "2".to_string(),
+        identity_seed: None,
+        existing_peer_identities: Vec::new(),
+        targets: vec![
+            component_target,
+            amber_mesh::MeshProvisionTarget {
+                kind: MeshProvisionTargetKind::Router,
+                config: amber_mesh::MeshConfigTemplate {
+                    identity: amber_mesh::MeshIdentityTemplate {
+                        id: "/site/kind_local/router".to_string(),
+                        mesh_scope: Some("scope".to_string()),
+                    },
+                    mesh_listen: SocketAddr::from(([127, 0, 0, 1], 23001)),
+                    control_listen: None,
+                    control_allow: None,
+                    peers: Vec::new(),
+                    inbound: Vec::new(),
+                    outbound: Vec::new(),
+                    transport: TransportConfig::NoiseIk {},
+                },
+                output: MeshProvisionOutput::KubernetesSecret {
+                    name: "amber-router-mesh".to_string(),
+                    namespace: None,
+                },
+            },
+        ],
+    };
+    let embedded_json =
+        serde_json::to_string_pretty(&embedded_plan).expect("embedded plan should serialize");
+    let indented_json = embedded_json
+        .lines()
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(
+        configmaps_dir.join("amber-mesh-provision.yaml"),
+        format!(
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: amber-mesh-provision\ndata:\n  \
+             mesh-plan.json: |-\n{indented_json}\n"
+        ),
+    )
+    .expect("mesh provision configmap should be written");
+    write_json(&temp.path().join("mesh-provision-plan.json"), &runtime_plan)
+        .expect("runtime plan should be written");
+
+    build_kubernetes_route_overlay_base(
+        temp.path(),
+        &["/job-compose/kind_helper".to_string()],
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    )
+    .expect("runtime plan should supply the router target");
 }
 
 #[test]
@@ -2610,8 +2906,8 @@ fn prepare_kubernetes_site_artifact_for_apply_rewrites_runtime_artifact_state() 
         launch_env,
     };
 
-    let supervisor_plan =
-        prepare_kubernetes_site_artifact_for_apply(&plan).expect("artifact should be prepared");
+    let supervisor_plan = prepare_kubernetes_artifact_for_apply(&plan, temp.path())
+        .expect("artifact should be prepared");
 
     assert_eq!(
         supervisor_plan.kubernetes_namespace.as_deref(),
@@ -2913,4 +3209,126 @@ async fn stop_bridge_proxies_terminates_dynamic_children() {
         !pid_is_alive(pid),
         "bridge proxy cleanup should terminate the owned child process"
     );
+}
+
+#[tokio::test]
+async fn wait_for_kubernetes_site_router_ready_waits_for_live_discovery() {
+    let temp = tempdir().expect("tempdir should exist");
+    let site_state_root = temp.path().join("state").join("kind_local");
+    let artifact_dir = temp.path().join("artifact");
+    fs::create_dir_all(&site_state_root).expect("site state root should exist");
+    fs::create_dir_all(&artifact_dir).expect("artifact dir should exist");
+
+    let stale_control =
+        TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("stale control");
+    let stale_control_addr = stale_control.local_addr().expect("stale control addr");
+    drop(stale_control);
+    let stale_mesh = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("stale mesh");
+    let stale_mesh_addr = stale_mesh.local_addr().expect("stale mesh addr");
+    drop(stale_mesh);
+
+    write_json(
+        &site_state_root.join("manager-state.json"),
+        &test_site_state(
+            "run-test",
+            "kind_local",
+            SiteKind::Kubernetes,
+            &artifact_dir,
+            Some(&stale_control_addr.to_string()),
+            Some(&stale_mesh_addr.to_string()),
+        ),
+    )
+    .expect("initial site manager state should serialize");
+
+    let live_control = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("live control listener");
+    let live_control_addr = live_control.local_addr().expect("live control addr");
+    let live_mesh = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("live mesh listener");
+    let live_mesh_addr = live_mesh.local_addr().expect("live mesh addr");
+
+    let identity_body = serde_json::to_string(&MeshIdentityPublic {
+        id: "/site/kind_local/router".to_string(),
+        public_key: [7; 32],
+        mesh_scope: Some("mesh.scope.test".to_string()),
+    })
+    .expect("identity body should serialize");
+    let identity_response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        identity_body.len(),
+        identity_body
+    );
+
+    let control_task = tokio::spawn(async move {
+        let (mut stream, _) = live_control.accept().await.expect("control accept");
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request).await.expect("control read");
+        stream
+            .write_all(identity_response.as_bytes())
+            .await
+            .expect("control response should write");
+    });
+    let mesh_task = tokio::spawn(async move {
+        let _ = live_mesh.accept().await.expect("mesh accept");
+    });
+    let state_update_task = tokio::spawn({
+        let artifact_dir = artifact_dir.clone();
+        let site_state_root = site_state_root.clone();
+        async move {
+            sleep(Duration::from_millis(300)).await;
+            write_json(
+                &site_state_root.join("manager-state.json"),
+                &test_site_state(
+                    "run-test",
+                    "kind_local",
+                    SiteKind::Kubernetes,
+                    &artifact_dir,
+                    Some(&live_control_addr.to_string()),
+                    Some(&live_mesh_addr.to_string()),
+                ),
+            )
+            .expect("updated site manager state should serialize");
+        }
+    });
+
+    let started = Instant::now();
+    wait_for_kubernetes_site_router_ready(
+        &SiteActuatorPlan {
+            schema: SITE_ACTUATOR_PLAN_SCHEMA.to_string(),
+            version: SITE_ACTUATOR_PLAN_VERSION,
+            run_id: "run-test".to_string(),
+            mesh_scope: "mesh.scope.test".to_string(),
+            run_root: temp.path().display().to_string(),
+            site_id: "kind_local".to_string(),
+            kind: SiteKind::Kubernetes,
+            router_identity_id: "/site/kind_local/router".to_string(),
+            artifact_dir: artifact_dir.display().to_string(),
+            site_state_root: site_state_root.display().to_string(),
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            storage_root: None,
+            runtime_root: None,
+            router_mesh_port: None,
+            compose_project: None,
+            kubernetes_namespace: Some("amber-test".to_string()),
+            context: Some("kind-test".to_string()),
+            observability_endpoint: None,
+            launch_env: BTreeMap::new(),
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("router readiness wait should succeed once discovery updates");
+    assert!(
+        started.elapsed() >= Duration::from_millis(300),
+        "router readiness wait should not return while manager state still points at the stale \
+         endpoint"
+    );
+
+    state_update_task
+        .await
+        .expect("state update task should join");
+    control_task.await.expect("control task should join");
+    mesh_task.await.expect("mesh task should join");
 }

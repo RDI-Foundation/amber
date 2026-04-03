@@ -159,12 +159,15 @@ pub enum Error {
     #[diagnostic(code(manifest::invalid_realm_selector))]
     InvalidRealmSelector { selector: String, message: String },
 
-    #[error("manifest declares `child_templates` but no slot of kind `component`")]
+    #[error(
+        "manifest declares `child_templates` but neither exposes a `component` slot nor binds \
+         `framework.component` directly"
+    )]
     #[diagnostic(
         code(manifest::child_templates_require_component_slot),
         help(
             "Declare at least one `slots.<name>: {{ kind: \"component\" }}` on the manifest that \
-             owns the child templates."
+             owns the child templates, or bind `framework.component` directly from that manifest."
         )
     )]
     ChildTemplatesRequireComponentSlot,

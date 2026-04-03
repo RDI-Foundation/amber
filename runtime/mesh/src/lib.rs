@@ -352,6 +352,7 @@ pub fn router_dynamic_export_route_id(
 pub fn framework_cap_instance_id(
     authority_realm_moniker: &str,
     consumer_moniker: &str,
+    consumer_component_key: &str,
     slot: &str,
     capability: &str,
 ) -> String {
@@ -360,6 +361,8 @@ pub fn framework_cap_instance_id(
     hasher.update(authority_realm_moniker.as_bytes());
     hasher.update(b"\0");
     hasher.update(consumer_moniker.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(consumer_component_key.as_bytes());
     hasher.update(b"\0");
     hasher.update(slot.as_bytes());
     hasher.update(b"\0");

@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
 use amber_manifest::{
-    CapabilityDecl, CapabilityKind, FrameworkCapabilityName, Manifest, ManifestDigest, ProvideDecl,
-    RealmSelector, RuntimeBackend, SlotDecl, framework_capability,
+    CapabilityDecl, CapabilityKind, ExportTarget, FrameworkCapabilityName, Manifest,
+    ManifestDigest, ProvideDecl, RealmSelector, RuntimeBackend, SlotDecl, framework_capability,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
@@ -1126,6 +1126,7 @@ fn validate_child_templates(scenario: &Scenario) -> Result<(), ScenarioIrError> 
                         )));
                     }
                 }
+                validate_allowed_manifest_interfaces(scenario, component, name, keys)?;
             }
         }
     }
@@ -1141,6 +1142,68 @@ fn validate_child_templates(scenario: &Scenario) -> Result<(), ScenarioIrError> 
     }
 
     Ok(())
+}
+
+fn validate_allowed_manifest_interfaces(
+    scenario: &Scenario,
+    component: &Component,
+    template_name: &str,
+    keys: &[String],
+) -> Result<(), ScenarioIrError> {
+    let Some((first_key, rest)) = keys.split_first() else {
+        return Ok(());
+    };
+    let expected = manifest_root_interface(
+        &scenario
+            .manifest_catalog
+            .get(first_key)
+            .expect("validated manifest catalog key should exist")
+            .manifest,
+    )?;
+    for key in rest {
+        let actual = manifest_root_interface(
+            &scenario
+                .manifest_catalog
+                .get(key)
+                .expect("validated manifest catalog key should exist")
+                .manifest,
+        )?;
+        if actual != expected {
+            return Err(invalid_scenario(format!(
+                "component {} child template `{template_name}` has incompatible allowed manifests \
+                 `{first_key}` and `{key}`; open-template interfaces must agree on root config, \
+                 slots, and exports",
+                component.moniker.as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn manifest_root_interface(manifest: &Manifest) -> Result<Value, ScenarioIrError> {
+    let exports = manifest
+        .exports()
+        .iter()
+        .map(|(name, target)| {
+            let encoded = match target {
+                ExportTarget::SelfProvide(provide) => {
+                    json!({ "target": "self_provide", "provide": provide })
+                }
+                ExportTarget::SelfSlot(slot) => json!({ "target": "self_slot", "slot": slot }),
+                ExportTarget::ChildExport { child, export } => {
+                    json!({ "target": "child_export", "child": child, "export": export })
+                }
+                _ => json!({ "target": format!("{target:?}") }),
+            };
+            (name.to_string(), encoded)
+        })
+        .collect::<BTreeMap<_, _>>();
+    serde_json::to_value(json!({
+        "config_schema": manifest.config_schema(),
+        "slots": manifest.slots(),
+        "exports": exports,
+    }))
+    .map_err(|err| invalid_scenario(format!("failed to encode child template interface: {err}")))
 }
 
 fn validate_bindings(scenario: &Scenario) -> Result<(), ScenarioIrError> {
@@ -1402,8 +1465,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ComponentExportTargetIr, SCENARIO_IR_SCHEMA, SCENARIO_IR_VERSION, ScenarioIr,
-        ScenarioIrError,
+        ChildTemplateIr, ComponentExportTargetIr, ComponentIr, ManifestCatalogEntryIr,
+        SCENARIO_IR_SCHEMA, SCENARIO_IR_VERSION, ScenarioIr, ScenarioIrError,
     };
     use crate::{
         BindingEdge, BindingFrom, ChildTemplate, ChildTemplateLimits, Component, ComponentId,
@@ -1805,6 +1868,126 @@ mod tests {
         assert_eq!(
             roundtripped.manifest_catalog.get(&catalog_key),
             scenario.manifest_catalog.get(&catalog_key)
+        );
+    }
+
+    #[test]
+    fn scenario_ir_rejects_open_templates_with_incompatible_allowed_manifest_interfaces() {
+        let alpha: amber_manifest::Manifest = r#"
+            {
+              manifest_version: "0.1.0",
+              config_schema: {
+                type: "object",
+                properties: {
+                  alpha_only: { type: "string" }
+                }
+              },
+              slots: {
+                realm: { kind: "component" }
+              },
+              provides: {
+                api: { kind: "http", endpoint: "http" }
+              },
+              program: {
+                path: "/bin/echo",
+                args: ["alpha"],
+                network: { endpoints: [{ name: "http", port: 8080, protocol: "http" }] }
+              },
+              exports: {
+                api: "provides.api"
+              },
+            }
+        "#
+        .parse()
+        .expect("alpha manifest");
+        let beta: amber_manifest::Manifest = r#"
+            {
+              manifest_version: "0.1.0",
+              config_schema: {
+                type: "object",
+                properties: {
+                  beta_only: { type: "integer" }
+                }
+              },
+              slots: {
+                db: { kind: "http" }
+              },
+              provides: {
+                api: { kind: "http", endpoint: "http" }
+              },
+              program: {
+                path: "/bin/echo",
+                args: ["beta"],
+                network: { endpoints: [{ name: "http", port: 8080, protocol: "http" }] }
+              },
+              exports: {
+                api: "provides.api"
+              },
+            }
+        "#
+        .parse()
+        .expect("beta manifest");
+        let alpha_key = "file:///templates/alpha.json5".to_string();
+        let beta_key = "file:///templates/beta.json5".to_string();
+
+        let err = Scenario::try_from(ScenarioIr {
+            schema: SCENARIO_IR_SCHEMA.to_string(),
+            version: SCENARIO_IR_VERSION,
+            root: 0,
+            components: vec![ComponentIr {
+                id: 0,
+                moniker: "/".to_string(),
+                parent: None,
+                children: Vec::new(),
+                resolved_url: None,
+                digest: ManifestDigest::new([0u8; 32]),
+                config: None,
+                config_schema: None,
+                program: None,
+                slots: BTreeMap::from([("realm".to_string(), slot_decl("component"))]),
+                provides: BTreeMap::new(),
+                exports: BTreeMap::new(),
+                resources: BTreeMap::new(),
+                child_templates: BTreeMap::from([(
+                    "worker".to_string(),
+                    ChildTemplateIr {
+                        manifest: None,
+                        allowed_manifests: Some(vec![alpha_key.clone(), beta_key.clone()]),
+                        config: BTreeMap::new(),
+                        bindings: BTreeMap::new(),
+                        visible_exports: None,
+                        limits: None,
+                        possible_backends: Vec::new(),
+                    },
+                )]),
+                metadata: None,
+            }],
+            bindings: Vec::new(),
+            exports: Vec::new(),
+            manifest_catalog: BTreeMap::from([
+                (
+                    alpha_key.clone(),
+                    ManifestCatalogEntryIr {
+                        source_ref: alpha_key.clone(),
+                        digest: alpha.digest(),
+                        manifest: alpha,
+                    },
+                ),
+                (
+                    beta_key.clone(),
+                    ManifestCatalogEntryIr {
+                        source_ref: beta_key.clone(),
+                        digest: beta.digest(),
+                        manifest: beta,
+                    },
+                ),
+            ]),
+        })
+        .expect_err("incompatible open-template interfaces should be rejected");
+
+        assert!(
+            err.to_string().contains("incompatible allowed manifests"),
+            "unexpected error: {err}",
         );
     }
 

@@ -51,7 +51,7 @@ fn child_template_requires_exactly_one_manifest_source() {
 }
 
 #[test]
-fn child_templates_do_not_allow_framework_component_binding_without_component_slot() {
+fn child_templates_allow_direct_framework_component_binding_without_component_slot() {
     let raw = parse_raw(
         r##"
         {
@@ -74,9 +74,8 @@ fn child_templates_do_not_allow_framework_component_binding_without_component_sl
         "##,
     );
 
-    let err = raw.validate().unwrap_err();
-
-    assert!(matches!(err, Error::ChildTemplatesRequireComponentSlot));
+    raw.validate()
+        .expect("direct framework.component binding should authorize child templates");
 }
 
 #[test]

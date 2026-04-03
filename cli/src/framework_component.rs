@@ -15,7 +15,8 @@ use amber_compiler::{
     reporter::CompiledScenario,
     run_plan::{
         ActiveSiteCapabilities, PlacementDefaults, PlacementFile, RunLink, RunPlan,
-        RunPlanActivationState, SiteDefinition, SiteKind, build_run_plan_with_activation,
+        RunPlanActivationState, SiteDefinition, SiteKind, build_site_plan_subset,
+        plan_dynamic_fragment,
     },
 };
 use amber_manifest::{
@@ -61,7 +62,8 @@ use crate::mixed_run::{
     BridgeProxyHandle, BridgeProxyKey, DesiredExportPeerOverlay, DesiredExternalSlotOverlay,
     LaunchedSite, SiteActuatorPlan, SiteReceipt, clear_desired_overlay_for_consumer,
     clear_desired_overlay_for_provider, host_service_bind_addr_for_consumer,
-    host_service_host_for_consumer, launched_site_from_receipt, read_json as read_run_json,
+    host_service_host_for_consumer, launched_site_from_receipt,
+    project_kubernetes_dynamic_child_artifact_files, read_json as read_run_json,
     resolve_link_external_url_for_output, site_actuator_child_root_for_site, site_state_path,
     stop_bridge_proxies, update_desired_overlay_for_consumer, update_desired_overlay_for_provider,
 };
@@ -180,11 +182,10 @@ pub(crate) struct DynamicInputRouteRecord {
     pub(crate) target: DynamicInputRouteTarget,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "route_kind", rename_all = "snake_case")]
 pub(crate) enum DynamicInputRouteTarget {
     ComponentProvide { provide: String },
-    DynamicExport { export_name: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -511,6 +512,7 @@ pub(crate) fn describe_template(
         .ok_or_else(|| {
             protocol_error(ProtocolErrorCode::UnknownTemplate, "unknown child template")
         })?;
+    let manifest_catalog_key = template_interface_manifest_catalog_key(template)?;
     let manifest = template_manifest_description(&scenario, template)?;
     let bindable_sources = bindable_source_candidates(
         &scenario,
@@ -518,8 +520,10 @@ pub(crate) fn describe_template(
         state,
         ComponentId(authority_realm_id),
     )?;
-    let template_config = template_config_fields(&scenario, template)?;
-    let template_bindings = template_binding_fields(&scenario, template)?;
+    let template_config =
+        template_config_fields_for_manifest(&scenario, template, manifest_catalog_key)?;
+    let template_bindings =
+        template_binding_fields_for_manifest(&scenario, template, manifest_catalog_key)?;
 
     let config = template_config
         .iter()
@@ -557,9 +561,15 @@ pub(crate) fn describe_template(
                             candidates: Vec::new(),
                         },
                         TemplateBinding::Open { optional } => {
-                            let slot_decl = root_template_slot_decl(&scenario, template, name)?;
+                            let slot_decl = root_template_slot_decl_for_manifest(
+                                &scenario,
+                                template,
+                                manifest_catalog_key,
+                                name,
+                            )?;
                             let candidates = bindable_sources
                                 .iter()
+                                .filter(|candidate| !candidate.sources.is_empty())
                                 .filter(|candidate| {
                                     source_compatible(
                                         slot_decl.decl.clone(),
@@ -588,7 +598,7 @@ pub(crate) fn describe_template(
         config,
         bindings,
         exports: TemplateExportsDescription {
-            visible: visible_exports(template, &scenario),
+            visible: visible_exports_for_manifest(template, &scenario, manifest_catalog_key),
         },
         limits: TemplateLimits {
             max_live_children: template
@@ -712,8 +722,8 @@ struct SyntheticSourceRecord {
 
 #[derive(Clone)]
 struct DynamicChildOutputSource {
-    export_name: String,
     provider_component: String,
+    provide: String,
     protocol: String,
     capability_kind: String,
     capability_profile: Option<String>,
@@ -736,7 +746,13 @@ async fn prepare_child_record(
             protocol_error(ProtocolErrorCode::UnknownTemplate, "unknown child template")
         })?;
     validate_child_name_available(state, authority_realm_id, &request.name)?;
-    validate_template_limits(state, authority_realm_id, &request.name, template)?;
+    validate_template_limits(
+        state,
+        authority_realm_id,
+        request.template.as_str(),
+        &request.name,
+        template,
+    )?;
     let bindable_sources = bindable_source_candidates(
         &live_scenario,
         &current_live_scenario_ir,
@@ -744,9 +760,19 @@ async fn prepare_child_record(
         authority_realm,
     )?;
     let selected_manifest_catalog_key = select_manifest_catalog_key(template, request)?;
-    let rendered_config = build_child_config(&live_scenario, template, request)?;
-    let resolved_bindings =
-        resolve_template_bindings(&live_scenario, template, request, &bindable_sources)?;
+    let rendered_config = build_child_config(
+        &live_scenario,
+        template,
+        &selected_manifest_catalog_key,
+        request,
+    )?;
+    let resolved_bindings = resolve_template_bindings(
+        &live_scenario,
+        template,
+        &selected_manifest_catalog_key,
+        request,
+        &bindable_sources,
+    )?;
     let child_id = allocate_child_id(state);
     let (wrapper_manifest, synthetic_sources) = build_wrapper_manifest(
         state,
@@ -788,37 +814,40 @@ async fn prepare_child_record(
         outputs,
     };
 
-    let mut temporary = state.clone();
-    let mut temporary_child = child.clone();
-    temporary_child.state = ChildState::Live;
-    temporary.live_children.push(temporary_child);
-    let planned = rebuild_live_run_plan(&temporary)?;
-    child.assignments =
-        child_fragment_assignments(&planned, child.fragment.as_ref().expect("fragment set"));
-    let allowed_dynamic_sites = run_plan_activation_from_state(state).dynamic_enabled_sites;
-    if let Some(disallowed_site) = child
-        .assignments
-        .values()
-        .find(|site_id| !allowed_dynamic_sites.contains(*site_id))
-    {
-        return Err(protocol_error(
+    let fragment = child.fragment.as_ref().expect("fragment set");
+    let fragment_component_ids = fragment
+        .components
+        .iter()
+        .map(|component| ComponentId(component.id))
+        .collect::<BTreeSet<_>>();
+    let combined_scenario = scenario_with_fragment(&current_live_scenario_ir, fragment)?;
+    let planned = plan_dynamic_fragment(
+        &combined_scenario,
+        &fragment_component_ids,
+        &placement_file_from_state(state),
+        &run_plan_activation_from_state(state),
+        &live_assignment_map(state),
+    )
+    .map_err(|err| {
+        protocol_error(
             ProtocolErrorCode::PlacementUnsatisfied,
-            &format!(
-                "child placement selected site `{disallowed_site}`, but the frozen run plan does \
-                 not allow dynamic workloads there"
-            ),
-        ));
-    }
-    child.overlays =
-        dynamic_overlay_records(&planned, child.fragment.as_ref().expect("fragment set"));
+            &format!("child placement could not be satisfied: {err}"),
+        )
+    })?;
+    child.assignments = planned.assignments;
+    child.overlays = dynamic_overlay_records(&planned.incident_links, fragment);
+    let mut live_assignments = live_assignment_map(state);
+    live_assignments.extend(child.assignments.clone());
     let routed_inputs = dynamic_input_route_records(
-        &planned,
-        child.fragment.as_ref().expect("fragment set"),
+        &combined_scenario,
+        &live_assignments,
+        fragment,
         &resolved_bindings,
     );
     child.site_plans = dynamic_site_plans(
-        &planned,
-        child.fragment.as_ref().expect("fragment set"),
+        &planned.site_plans,
+        &child.assignments,
+        fragment,
         &child.outputs,
         &child.overlays,
         &routed_inputs,
@@ -974,6 +1003,7 @@ fn validate_child_name_available(
 fn validate_template_limits(
     state: &FrameworkControlState,
     authority_realm_id: usize,
+    template_name: &str,
     child_name: &str,
     template: &ChildTemplate,
 ) -> std::result::Result<(), ProtocolErrorResponse> {
@@ -986,12 +1016,15 @@ fn validate_template_limits(
             .live_children
             .iter()
             .filter(|child| child.authority_realm_id == authority_realm_id)
+            .filter(|child| child.template_name.as_deref() == Some(template_name))
             .filter(|child| child_counts_toward_template_limits(child))
             .count() as u32;
         if live >= limit {
             return Err(protocol_error(
                 ProtocolErrorCode::NameConflict,
-                &format!("authority realm already has the maximum of {limit} live children"),
+                &format!(
+                    "template `{template_name}` already has the maximum of {limit} live children"
+                ),
             ));
         }
     }
@@ -1058,9 +1091,11 @@ fn select_manifest_catalog_key(
 fn build_child_config(
     scenario: &Scenario,
     template: &ChildTemplate,
+    selected_manifest_catalog_key: &str,
     request: &CreateChildRequest,
 ) -> std::result::Result<Option<serde_json::Value>, ProtocolErrorResponse> {
-    let template_config = template_config_fields(scenario, template)?;
+    let template_config =
+        template_config_fields_for_manifest(scenario, template, selected_manifest_catalog_key)?;
     for key in request.config.keys() {
         if !template_config.contains_key(key.as_str()) {
             return Err(protocol_error(
@@ -1101,10 +1136,12 @@ fn build_child_config(
 fn resolve_template_bindings(
     scenario: &Scenario,
     template: &ChildTemplate,
+    selected_manifest_catalog_key: &str,
     request: &CreateChildRequest,
     bindable_sources: &[BindableSourceCandidate],
 ) -> std::result::Result<Vec<ResolvedTemplateBinding>, ProtocolErrorResponse> {
-    let template_bindings = template_binding_fields(scenario, template)?;
+    let template_bindings =
+        template_binding_fields_for_manifest(scenario, template, selected_manifest_catalog_key)?;
     for key in request.bindings.keys() {
         if !template_bindings.contains_key(key.as_str()) {
             return Err(protocol_error(
@@ -1117,7 +1154,13 @@ fn resolve_template_bindings(
     template_bindings
         .iter()
         .map(|(slot_name, field)| {
-            let slot_decl = root_template_slot_decl(scenario, template, slot_name)?.clone();
+            let slot_decl = root_template_slot_decl_for_manifest(
+                scenario,
+                template,
+                selected_manifest_catalog_key,
+                slot_name,
+            )?
+            .clone();
             let candidate = match field {
                 TemplateBinding::Prefilled { selector } => {
                     Some(find_bindable_source(bindable_sources, selector.as_str())?)
@@ -1271,7 +1314,7 @@ fn build_wrapper_manifest(
         }
     }
 
-    let exports = visible_exports(template, scenario)
+    let exports = visible_exports_for_manifest(template, scenario, selected_manifest_catalog_key)
         .into_iter()
         .map(|export_name| {
             let target = format!("#{child_name}.{export_name}")
@@ -1396,24 +1439,9 @@ fn transition_child_state(
     Ok(())
 }
 
-fn child_fragment_assignments(
-    run_plan: &RunPlan,
-    fragment: &LiveScenarioFragment,
-) -> BTreeMap<String, String> {
-    fragment
-        .components
-        .iter()
-        .filter_map(|component| {
-            run_plan
-                .assignments
-                .get(component.moniker.as_str())
-                .map(|site_id| (component.moniker.clone(), site_id.clone()))
-        })
-        .collect()
-}
-
 fn dynamic_site_plans(
-    desired_run_plan: &RunPlan,
+    desired_site_plans: &BTreeMap<String, amber_compiler::run_plan::RunSitePlan>,
+    assignments: &BTreeMap<String, String>,
     fragment: &LiveScenarioFragment,
     outputs: &BTreeMap<String, OutputHandleRecord>,
     overlays: &[DynamicOverlayRecord],
@@ -1430,7 +1458,7 @@ fn dynamic_site_plans(
         .map(|component| (component.id, component.moniker.as_str()))
         .collect::<BTreeMap<_, _>>();
     let mut site_plans = Vec::new();
-    for (site_id, desired_site_plan) in &desired_run_plan.sites {
+    for (site_id, desired_site_plan) in desired_site_plans {
         let component_ids = desired_site_plan
             .scenario_ir
             .components
@@ -1460,7 +1488,7 @@ fn dynamic_site_plans(
                         return None;
                     };
                     let moniker = child_monikers.get(component)?;
-                    (desired_run_plan.assignments.get(*moniker)? == site_id).then_some((
+                    (assignments.get(*moniker)? == site_id).then_some((
                         *component,
                         *moniker,
                         provide.as_str(),
@@ -1530,21 +1558,36 @@ fn dynamic_site_plans(
             })?;
             proxy_exports.insert(link.export_name.clone(), export);
         }
+        let artifact_files = if desired_site_plan.site.kind == SiteKind::Kubernetes {
+            project_kubernetes_dynamic_child_artifact_files(
+                &desired_site_plan.artifact_files,
+                &component_ids,
+            )
+            .map_err(|err| {
+                protocol_error(
+                    ProtocolErrorCode::ControlStateUnavailable,
+                    &format!(
+                        "failed to project kubernetes child artifact for site `{site_id}`: {err}"
+                    ),
+                )
+            })?
+        } else {
+            desired_site_plan.artifact_files.clone()
+        };
         site_plans.push(DynamicSitePlanRecord {
             site_id: site_id.clone(),
             kind: desired_site_plan.site.kind,
             router_identity_id: desired_site_plan.router_identity_id.clone(),
             component_ids,
             assigned_components,
-            artifact_files: desired_site_plan.artifact_files.clone(),
+            artifact_files,
             desired_artifact_files: desired_site_plan.artifact_files.clone(),
             proxy_exports,
             routed_inputs: routed_inputs
                 .iter()
                 .filter(|input| input.component == child_monikers[&fragment.root_component_id])
                 .filter(|input| {
-                    desired_run_plan
-                        .assignments
+                    assignments
                         .get(input.component.as_str())
                         .is_some_and(|assigned_site| assigned_site == site_id)
                 })
@@ -1556,7 +1599,8 @@ fn dynamic_site_plans(
 }
 
 fn dynamic_input_route_records(
-    run_plan: &RunPlan,
+    scenario: &Scenario,
+    assignments: &BTreeMap<String, String>,
     fragment: &LiveScenarioFragment,
     resolved_bindings: &[ResolvedTemplateBinding],
 ) -> Vec<DynamicInputRouteRecord> {
@@ -1567,66 +1611,55 @@ fn dynamic_input_route_records(
     else {
         return Vec::new();
     };
-    let Some(child_site) = run_plan.assignments.get(root_component.moniker.as_str()) else {
+    let Some(child_site) = assignments.get(root_component.moniker.as_str()) else {
         return Vec::new();
     };
-    let fragment_component_ids = fragment
+    let fragment_components = fragment
         .components
         .iter()
-        .map(|component| component.id)
+        .map(|component| component.moniker.as_str())
         .collect::<BTreeSet<_>>();
-
     resolved_bindings
         .iter()
         .filter_map(|binding| {
-            if let Some(dynamic_output) = binding.dynamic_child_output.as_ref() {
-                let provider_site = run_plan
-                    .assignments
-                    .get(dynamic_output.provider_component.as_str())?;
-                if provider_site == child_site {
-                    return Some(DynamicInputRouteRecord {
-                        component: root_component.moniker.clone(),
-                        slot: binding.slot_name.clone(),
-                        provider_component: dynamic_output.provider_component.clone(),
-                        protocol: dynamic_output.protocol.clone(),
-                        capability_kind: dynamic_output.capability_kind.clone(),
-                        capability_profile: dynamic_output.capability_profile.clone(),
-                        target: DynamicInputRouteTarget::DynamicExport {
-                            export_name: dynamic_output.export_name.clone(),
-                        },
-                    });
+            let component_source = binding.dynamic_child_output.clone().or_else(|| {
+                let ResolvedBindingSource {
+                    from: BindingFrom::Component(ProvideRef { component, name }),
+                    ..
+                } = binding.sources.first()?.clone()
+                else {
+                    return None;
+                };
+                if binding.sources.len() != 1 {
+                    return None;
                 }
-            }
-
-            let [source] = binding.sources.as_slice() else {
-                return None;
-            };
-            let BindingFrom::Component(provide) = &source.from else {
-                return None;
-            };
-            if fragment_component_ids.contains(&provide.component.0) {
-                return None;
-            }
-            let provider_component = run_plan
-                .base_scenario
-                .components
-                .iter()
-                .find(|component| component.id == provide.component.0)
-                .map(|component| component.moniker.clone())?;
-            let provider_site = run_plan.assignments.get(provider_component.as_str())?;
-            (provider_site == child_site).then_some(DynamicInputRouteRecord {
-                component: root_component.moniker.clone(),
-                slot: binding.slot_name.clone(),
-                provider_component,
-                protocol: match binding.slot_decl.decl.kind.transport() {
-                    CapabilityTransport::Http => "http".to_string(),
+                let provider_component = scenario.component(component).moniker.to_string();
+                let protocol = match binding.slot_decl.decl.kind.transport() {
+                    CapabilityTransport::Http => "http",
                     CapabilityTransport::NonNetwork => return None,
                     _ => return None,
-                },
-                capability_kind: binding.slot_decl.decl.kind.to_string(),
-                capability_profile: binding.slot_decl.decl.profile.clone(),
+                };
+                Some(DynamicChildOutputSource {
+                    provider_component,
+                    provide: name,
+                    protocol: protocol.to_string(),
+                    capability_kind: binding.slot_decl.decl.kind.to_string(),
+                    capability_profile: binding.slot_decl.decl.profile.clone(),
+                })
+            })?;
+            let provider_site = assignments.get(component_source.provider_component.as_str())?;
+            if fragment_components.contains(component_source.provider_component.as_str()) {
+                return None;
+            }
+            (provider_site == child_site).then(|| DynamicInputRouteRecord {
+                component: root_component.moniker.clone(),
+                slot: binding.slot_name.clone(),
+                provider_component: component_source.provider_component,
+                protocol: component_source.protocol,
+                capability_kind: component_source.capability_kind,
+                capability_profile: component_source.capability_profile,
                 target: DynamicInputRouteTarget::ComponentProvide {
-                    provide: provide.name.clone(),
+                    provide: component_source.provide,
                 },
             })
         })
@@ -1688,7 +1721,7 @@ fn dynamic_proxy_export_record(
 }
 
 fn dynamic_overlay_records(
-    run_plan: &RunPlan,
+    links: &[RunLink],
     fragment: &LiveScenarioFragment,
 ) -> Vec<DynamicOverlayRecord> {
     let child_monikers = fragment
@@ -1697,7 +1730,7 @@ fn dynamic_overlay_records(
         .map(|component| component.moniker.as_str())
         .collect::<BTreeSet<_>>();
     let mut overlays = Vec::new();
-    for link in &run_plan.links {
+    for link in links {
         let consumer_in_child = child_monikers.contains(link.consumer_component.as_str());
         let provider_in_child = child_monikers.contains(link.provider_component.as_str());
         if consumer_in_child || provider_in_child {
@@ -2119,6 +2152,7 @@ fn collect_capability_instance_from_binding(
     let cap_instance_id = framework_cap_instance_id(
         authority_realm_moniker.as_str(),
         recipient_component_moniker.as_str(),
+        &binding.to.component.to_string(),
         &binding.to.slot,
         capability,
     );
@@ -2235,24 +2269,58 @@ fn run_plan_activation_from_state(state: &FrameworkControlState) -> RunPlanActiv
     }
 }
 
-fn rebuild_live_run_plan(
-    state: &FrameworkControlState,
-) -> std::result::Result<RunPlan, ProtocolErrorResponse> {
-    let compiled = CompiledScenario::from_ir(live_scenario_ir(state)?).map_err(|err| {
+fn live_assignment_map(state: &FrameworkControlState) -> BTreeMap<String, String> {
+    let mut assignments = state.placement.assignments.clone();
+    for child in state
+        .live_children
+        .iter()
+        .filter(|child| child_is_visible(child))
+    {
+        assignments.extend(child.assignments.clone());
+    }
+    assignments
+}
+
+fn scenario_with_fragment(
+    current_live_scenario_ir: &ScenarioIr,
+    fragment: &LiveScenarioFragment,
+) -> std::result::Result<Scenario, ProtocolErrorResponse> {
+    let mut scenario_ir = current_live_scenario_ir.clone();
+    scenario_ir.components.extend(fragment.components.clone());
+    scenario_ir.bindings.extend(
+        fragment
+            .bindings
+            .iter()
+            .map(|binding| binding.binding.clone()),
+    );
+    for component in &mut scenario_ir.components {
+        component.children.clear();
+    }
+    let parent_edges = scenario_ir
+        .components
+        .iter()
+        .filter_map(|component| component.parent.map(|parent| (parent, component.id)))
+        .collect::<Vec<_>>();
+    for (parent, child) in parent_edges {
+        let parent_component = scenario_ir
+            .components
+            .iter_mut()
+            .find(|component| component.id == parent)
+            .ok_or_else(|| {
+                protocol_error(
+                    ProtocolErrorCode::ControlStateUnavailable,
+                    &format!(
+                        "live fragment references missing parent component id {parent} for child \
+                         {child}"
+                    ),
+                )
+            })?;
+        parent_component.children.push(child);
+    }
+    Scenario::try_from(scenario_ir).map_err(|err| {
         protocol_error(
-            ProtocolErrorCode::PlacementUnsatisfied,
-            &format!("failed to materialize live scenario for placement: {err}"),
-        )
-    })?;
-    build_run_plan_with_activation(
-        &compiled,
-        Some(&placement_file_from_state(state)),
-        Some(&run_plan_activation_from_state(state)),
-    )
-    .map_err(|err| {
-        protocol_error(
-            ProtocolErrorCode::PlacementUnsatisfied,
-            &format!("child placement could not be satisfied: {err}"),
+            ProtocolErrorCode::ControlStateUnavailable,
+            &format!("failed to materialize combined live scenario: {err}"),
         )
     })
 }
@@ -2348,6 +2416,37 @@ fn decode_live_scenario(
 }
 
 fn normalize_scenario_ir_order(scenario_ir: &mut ScenarioIr) {
+    scenario_ir.components.sort_by(|left, right| {
+        left.moniker
+            .cmp(&right.moniker)
+            .then(left.id.cmp(&right.id))
+    });
+    let id_map = scenario_ir
+        .components
+        .iter()
+        .enumerate()
+        .map(|(new_id, component)| (component.id, new_id))
+        .collect::<BTreeMap<_, _>>();
+    scenario_ir.root = *id_map
+        .get(&scenario_ir.root)
+        .expect("snapshot root component should remain present");
+
+    for component in &mut scenario_ir.components {
+        component.id = *id_map
+            .get(&component.id)
+            .expect("snapshot component id should remain present");
+        component.parent = component.parent.map(|parent| {
+            *id_map
+                .get(&parent)
+                .expect("snapshot parent component id should remain present")
+        });
+        for child in &mut component.children {
+            *child = *id_map
+                .get(child)
+                .expect("snapshot child component id should remain present");
+        }
+    }
+
     let monikers = scenario_ir
         .components
         .iter()
@@ -2360,9 +2459,79 @@ fn normalize_scenario_ir_order(scenario_ir: &mut ScenarioIr) {
             left_moniker.cmp(right_moniker)
         });
     }
+    for binding in &mut scenario_ir.bindings {
+        match &mut binding.from {
+            BindingFromIr::Component { component, .. }
+            | BindingFromIr::Resource { component, .. } => {
+                *component = *id_map
+                    .get(component)
+                    .expect("snapshot binding source component id should remain present");
+            }
+            BindingFromIr::Framework {
+                authority_realm, ..
+            } => {
+                *authority_realm = *id_map
+                    .get(authority_realm)
+                    .expect("snapshot framework authority realm should remain present");
+            }
+            BindingFromIr::External { slot } => {
+                slot.component = *id_map
+                    .get(&slot.component)
+                    .expect("snapshot external slot component id should remain present");
+            }
+        }
+        binding.to.component = *id_map
+            .get(&binding.to.component)
+            .expect("snapshot binding target component id should remain present");
+    }
+    scenario_ir.bindings.sort_by(|left, right| {
+        binding_sort_key(left, &monikers).cmp(&binding_sort_key(right, &monikers))
+    });
+    for export in &mut scenario_ir.exports {
+        export.from.component = *id_map
+            .get(&export.from.component)
+            .expect("snapshot export source component id should remain present");
+    }
     scenario_ir
         .exports
         .sort_by(|left, right| left.name.cmp(&right.name));
+}
+
+fn binding_sort_key(binding: &BindingIr, monikers: &BTreeMap<usize, String>) -> String {
+    let source = match &binding.from {
+        BindingFromIr::Component { component, provide } => format!(
+            "component:{}:{provide}",
+            monikers.get(component).map(String::as_str).unwrap_or("/")
+        ),
+        BindingFromIr::Resource {
+            component,
+            resource,
+        } => format!(
+            "resource:{}:{resource}",
+            monikers.get(component).map(String::as_str).unwrap_or("/")
+        ),
+        BindingFromIr::Framework {
+            capability,
+            authority_realm,
+        } => format!(
+            "framework:{}:{capability}",
+            monikers
+                .get(authority_realm)
+                .map(String::as_str)
+                .unwrap_or("/")
+        ),
+        BindingFromIr::External { slot } => format!("external:{}:{}", slot.component, slot.slot),
+    };
+    format!(
+        "{}:{}:{}:{}",
+        monikers
+            .get(&binding.to.component)
+            .map(String::as_str)
+            .unwrap_or("/"),
+        binding.to.slot,
+        source,
+        binding.weak
+    )
 }
 
 fn live_child_component_owner(state: &FrameworkControlState, component_id: usize) -> Option<u64> {
@@ -2473,7 +2642,7 @@ fn bindable_source_candidates(
                 decl: output.decl.clone(),
                 sources: output_sources_from_record(output)?,
                 source_child_id: Some(child.child_id),
-                dynamic_child_output: dynamic_child_output_source(child, export_name, output),
+                dynamic_child_output: dynamic_child_output_source(child, output),
             });
         }
     }
@@ -2761,13 +2930,9 @@ fn child_alias<'a>(parent_moniker: &str, child_moniker: &'a str) -> Option<&'a s
 
 fn dynamic_child_output_source(
     child: &LiveChildRecord,
-    export_name: &str,
     output: &OutputHandleRecord,
 ) -> Option<DynamicChildOutputSource> {
-    let BindingFromIr::Component {
-        component,
-        provide: _,
-    } = output.sources.first()?.from.clone()
+    let BindingFromIr::Component { component, provide } = output.sources.first()?.from.clone()
     else {
         return None;
     };
@@ -2785,8 +2950,8 @@ fn dynamic_child_output_source(
         _ => return None,
     };
     Some(DynamicChildOutputSource {
-        export_name: export_name.to_string(),
         provider_component,
+        provide,
         protocol: protocol.to_string(),
         capability_kind: output.decl.kind.to_string(),
         capability_profile: output.decl.profile.clone(),
@@ -2837,43 +3002,53 @@ fn runtime_backend_name(backend: &amber_manifest::RuntimeBackend) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn root_template_manifest<'a>(
-    scenario: &'a Scenario,
-    template: &'a ChildTemplate,
-) -> std::result::Result<&'a Manifest, ProtocolErrorResponse> {
-    let key = template
+fn template_interface_manifest_catalog_key(
+    template: &ChildTemplate,
+) -> std::result::Result<&str, ProtocolErrorResponse> {
+    template
         .manifest
-        .as_ref()
+        .as_deref()
         .or_else(|| {
             template
                 .allowed_manifests
                 .as_ref()
                 .and_then(|keys| keys.first())
+                .map(String::as_str)
         })
         .ok_or_else(|| {
             protocol_error(
                 ProtocolErrorCode::ControlStateUnavailable,
                 "child template is missing its frozen manifest catalog key",
             )
-        })?;
+        })
+}
+
+fn root_template_manifest_for_key<'a>(
+    scenario: &'a Scenario,
+    manifest_catalog_key: &str,
+) -> std::result::Result<&'a Manifest, ProtocolErrorResponse> {
     scenario
         .manifest_catalog
-        .get(key)
+        .get(manifest_catalog_key)
         .map(|entry| &entry.manifest)
         .ok_or_else(|| {
             protocol_error(
                 ProtocolErrorCode::ControlStateUnavailable,
-                "child template root manifest is missing from the frozen manifest catalog entry",
+                &format!(
+                    "child template root manifest `{manifest_catalog_key}` is missing from the \
+                     frozen manifest catalog"
+                ),
             )
         })
 }
 
-fn template_config_fields(
+fn template_config_fields_for_manifest(
     scenario: &Scenario,
     template: &ChildTemplate,
+    manifest_catalog_key: &str,
 ) -> std::result::Result<BTreeMap<String, TemplateConfigField>, ProtocolErrorResponse> {
     let mut fields = template.config.clone();
-    let manifest = root_template_manifest(scenario, template)?;
+    let manifest = root_template_manifest_for_key(scenario, manifest_catalog_key)?;
     let Some(schema) = manifest.config_schema() else {
         return Ok(fields);
     };
@@ -2901,12 +3076,13 @@ fn template_config_fields(
     Ok(fields)
 }
 
-fn template_binding_fields(
+fn template_binding_fields_for_manifest(
     scenario: &Scenario,
     template: &ChildTemplate,
+    manifest_catalog_key: &str,
 ) -> std::result::Result<BTreeMap<String, TemplateBinding>, ProtocolErrorResponse> {
     let mut fields = template.bindings.clone();
-    let manifest = root_template_manifest(scenario, template)?;
+    let manifest = root_template_manifest_for_key(scenario, manifest_catalog_key)?;
     for (name, slot) in manifest.slots() {
         fields
             .entry(name.to_string())
@@ -2917,12 +3093,13 @@ fn template_binding_fields(
     Ok(fields)
 }
 
-fn root_template_slot_decl<'a>(
+fn root_template_slot_decl_for_manifest<'a>(
     scenario: &'a Scenario,
-    template: &'a ChildTemplate,
+    _template: &'a ChildTemplate,
+    manifest_catalog_key: &str,
     slot_name: &str,
 ) -> std::result::Result<&'a amber_manifest::SlotDecl, ProtocolErrorResponse> {
-    root_template_manifest(scenario, template)?
+    root_template_manifest_for_key(scenario, manifest_catalog_key)?
         .slots()
         .get(slot_name)
         .ok_or_else(|| {
@@ -2933,21 +3110,17 @@ fn root_template_slot_decl<'a>(
         })
 }
 
-fn visible_exports(template: &ChildTemplate, scenario: &Scenario) -> Vec<String> {
+fn visible_exports_for_manifest(
+    template: &ChildTemplate,
+    scenario: &Scenario,
+    manifest_catalog_key: &str,
+) -> Vec<String> {
     if let Some(visible) = template.visible_exports.as_ref() {
         return visible.clone();
     }
-    let Some(key) = template.manifest.as_ref().or_else(|| {
-        template
-            .allowed_manifests
-            .as_ref()
-            .and_then(|keys| keys.first())
-    }) else {
-        return Vec::new();
-    };
     scenario
         .manifest_catalog
-        .get(key)
+        .get(manifest_catalog_key)
         .map(|entry| {
             entry
                 .manifest
@@ -3285,25 +3458,22 @@ fn full_site_plan_record(
 
 fn desired_site_plan_map(
     state: &FrameworkControlState,
+    site_ids: &BTreeSet<String>,
 ) -> std::result::Result<BTreeMap<String, DynamicSitePlanRecord>, ProtocolErrorResponse> {
-    let planned = build_run_plan_with_activation(
-        &CompiledScenario::from_ir(live_scenario_ir(state)?).map_err(|err| {
-            protocol_error(
-                ProtocolErrorCode::ControlStateUnavailable,
-                &format!("failed to materialize live scenario for desired site plans: {err}"),
-            )
-        })?,
-        Some(&placement_file_from_state(state)),
-        Some(&run_plan_activation_from_state(state)),
+    let planned = build_site_plan_subset(
+        &decode_live_scenario(state)?,
+        &placement_file_from_state(state),
+        &run_plan_activation_from_state(state),
+        &live_assignment_map(state),
+        site_ids,
     )
     .map_err(|err| {
         protocol_error(
             ProtocolErrorCode::ControlStateUnavailable,
-            &format!("failed to rebuild desired site plans: {err}"),
+            &format!("failed to rebuild desired site plans for affected sites: {err}"),
         )
     })?;
     Ok(planned
-        .sites
         .iter()
         .map(|(site_id, site_plan)| (site_id.clone(), full_site_plan_record(site_id, site_plan)))
         .collect())
@@ -3844,7 +4014,7 @@ async fn retract_child_overlays(
     Ok(())
 }
 
-fn child_site_publish_order(child: &LiveChildRecord) -> Vec<String> {
+fn child_site_publish_waves(child: &LiveChildRecord) -> Vec<Vec<String>> {
     let site_ids = child
         .site_plans
         .iter()
@@ -3879,36 +4049,42 @@ fn child_site_publish_order(child: &LiveChildRecord) -> Vec<String> {
         .iter()
         .filter(|(_, deps)| deps.is_empty())
         .map(|(site_id, _)| site_id.clone())
-        .collect::<Vec<_>>();
-    let mut order = Vec::with_capacity(site_ids.len());
+        .collect::<BTreeSet<_>>();
+    let mut waves = Vec::new();
     let mut scheduled = BTreeSet::new();
-    while let Some(site_id) = ready.pop() {
-        if !scheduled.insert(site_id.clone()) {
-            continue;
-        }
-        order.push(site_id.clone());
-        for consumer in outgoing
-            .get(&site_id)
-            .into_iter()
-            .flat_map(|sites| sites.iter())
-        {
-            let deps = incoming
-                .get_mut(consumer)
-                .expect("consumer dependencies should be tracked");
-            deps.remove(&site_id);
-            if deps.is_empty() {
-                ready.push(consumer.clone());
+    while !ready.is_empty() {
+        let wave = ready.iter().cloned().collect::<Vec<_>>();
+        let mut next_ready = BTreeSet::new();
+        for site_id in &wave {
+            if !scheduled.insert(site_id.clone()) {
+                continue;
+            }
+            for consumer in outgoing
+                .get(site_id)
+                .into_iter()
+                .flat_map(|sites| sites.iter())
+            {
+                let deps = incoming
+                    .get_mut(consumer)
+                    .expect("consumer dependencies should be tracked");
+                deps.remove(site_id);
+                if deps.is_empty() {
+                    next_ready.insert(consumer.clone());
+                }
             }
         }
-        ready.sort_by(|left, right| right.cmp(left));
+        waves.push(wave);
+        ready = next_ready;
     }
 
-    for site_id in site_ids {
-        if scheduled.insert(site_id.clone()) {
-            order.push(site_id);
-        }
+    let remaining = site_ids
+        .into_iter()
+        .filter(|site_id| scheduled.insert(site_id.clone()))
+        .collect::<Vec<_>>();
+    if !remaining.is_empty() {
+        waves.push(remaining);
     }
-    order
+    waves
 }
 
 fn cloned_child_record(
@@ -3969,22 +4145,58 @@ async fn continue_create_committed_hidden(
     let site_plans = child
         .site_plans
         .iter()
-        .map(|site_plan| (site_plan.site_id.clone(), site_plan))
+        .map(|site_plan| (site_plan.site_id.clone(), site_plan.clone()))
         .collect::<BTreeMap<_, _>>();
     let child_sites = site_plans.keys().cloned().collect::<BTreeSet<_>>();
     let links = child_link_records(&child);
     let mut published_child_sites = BTreeSet::new();
-    for site_id in child_site_publish_order(&child) {
-        for link in links.iter().filter(|link| link.consumer_site == site_id) {
-            let provider_ready = !child_sites.contains(&link.provider_site)
-                || published_child_sites.contains(&link.provider_site);
-            if provider_ready {
-                publish_link_overlays(app, &child, link).await?;
+    for wave in child_site_publish_waves(&child) {
+        for site_id in &wave {
+            for link in links.iter().filter(|link| link.consumer_site == *site_id) {
+                let provider_ready = !child_sites.contains(&link.provider_site)
+                    || published_child_sites.contains(&link.provider_site);
+                if provider_ready {
+                    publish_link_overlays(app, &child, link).await?;
+                }
             }
         }
-        let site_plan = site_plans.get(&site_id).expect("site plan should exist");
-        publish_child_on_site(app, child.child_id, site_plan).await?;
-        published_child_sites.insert(site_id);
+        let mut publish_tasks = tokio::task::JoinSet::new();
+        for site_id in &wave {
+            let app = app.clone();
+            let child_id = child.child_id;
+            let site_plan = site_plans
+                .get(site_id)
+                .expect("site plan should exist for wave site")
+                .clone();
+            let site_id = site_id.clone();
+            publish_tasks.spawn(async move {
+                publish_child_on_site(&app, child_id, &site_plan)
+                    .await
+                    .map(|_| site_id)
+            });
+        }
+        let mut first_error = None;
+        let mut published_wave_sites = Vec::new();
+        while let Some(result) = publish_tasks.join_next().await {
+            match result {
+                Ok(Ok(site_id)) => published_wave_sites.push(site_id),
+                Ok(Err(err)) if first_error.is_none() => first_error = Some(err),
+                Ok(Err(_)) => {}
+                Err(err) if first_error.is_none() => {
+                    first_error = Some(protocol_error(
+                        ProtocolErrorCode::PublishFailed,
+                        &format!("site publish task failed: {err}"),
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        for site_id in published_wave_sites {
+            published_child_sites.insert(site_id);
+        }
     }
     publish_child_overlays(app, &child).await?;
 
@@ -4017,16 +4229,40 @@ async fn continue_destroy_retracted(
     };
     let desired_site_plans = {
         let state = app.control_state.lock().await;
-        desired_site_plan_map(&state)?
+        desired_site_plan_map(
+            &state,
+            &child
+                .site_plans
+                .iter()
+                .map(|site_plan| site_plan.site_id.clone())
+                .collect(),
+        )?
     };
-    for site_plan in &child.site_plans {
-        destroy_child_on_site(
-            app,
-            child.child_id,
-            &site_plan.site_id,
-            desired_site_plans.get(&site_plan.site_id).cloned(),
-        )
-        .await?;
+    let mut destroy_tasks = tokio::task::JoinSet::new();
+    for site_plan in child.site_plans.clone() {
+        let app = app.clone();
+        let desired_site_plan = desired_site_plans.get(&site_plan.site_id).cloned();
+        destroy_tasks.spawn(async move {
+            destroy_child_on_site(&app, child.child_id, &site_plan.site_id, desired_site_plan).await
+        });
+    }
+    let mut first_error = None;
+    while let Some(result) = destroy_tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) if first_error.is_none() => first_error = Some(err),
+            Ok(Err(_)) => {}
+            Err(err) if first_error.is_none() => {
+                first_error = Some(protocol_error(
+                    ProtocolErrorCode::PublishFailed,
+                    &format!("site destroy task failed: {err}"),
+                ));
+            }
+            Err(_) => {}
+        }
+    }
+    if let Some(err) = first_error {
+        return Err(err);
     }
 
     let mut state = app.control_state.lock().await;
@@ -4794,6 +5030,7 @@ mod tests {
     use std::fs;
 
     use amber_compiler::run_plan::build_run_plan;
+    use amber_mesh::component_protocol::BindingInput;
     use tempfile::TempDir;
     use url::Url;
 
@@ -4871,6 +5108,310 @@ mod tests {
             serde_json::from_value(snapshot.scenario.clone()).expect("snapshot scenario");
         let placement = placement_from_snapshot(snapshot);
         compile_control_state_from_ir(scenario_ir, Some(&placement)).await
+    }
+
+    #[tokio::test]
+    async fn same_site_dynamic_child_output_bindings_reuse_provider_component_routes() {
+        let dir = TempDir::new().expect("temp dir");
+        let required_path = dir.path().join("required.json5");
+        let consumer_path = dir.path().join("consumer.json5");
+        let root_path = dir.path().join("root.json5");
+        write_file(
+            &required_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                image: "python:3.13-alpine",
+                entrypoint: ["python3", "-c", "print('required')"],
+                network: {
+                  endpoints: [{ name: "http", port: 8080, protocol: "http" }]
+                }
+              },
+              provides: {
+                http: { kind: "http", endpoint: "http" }
+              },
+              exports: {
+                http: "http"
+              }
+            }
+            "#,
+        );
+        write_file(
+            &consumer_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              slots: {
+                required_api: { kind: "http" }
+              },
+              program: {
+                image: "python:3.13-alpine",
+                entrypoint: ["python3", "-c", "print('consumer')"],
+                network: {
+                  endpoints: [{ name: "http", port: 8081, protocol: "http" }]
+                }
+              },
+              provides: {
+                http: { kind: "http", endpoint: "http" }
+              },
+              exports: {
+                http: "http"
+              }
+            }
+            "#,
+        );
+        write_file(
+            &root_path,
+            &format!(
+                r##"
+                {{
+                  manifest_version: "0.3.0",
+                  slots: {{
+                    realm: {{ kind: "component", optional: true }}
+                  }},
+                  program: {{
+                    image: "python:3.13-alpine",
+                    entrypoint: ["python3", "-c", "print('root')"]
+                  }},
+                  child_templates: {{
+                    required: {{
+                      manifest: "{required}"
+                    }},
+                    consumer: {{
+                      manifest: "{consumer}"
+                    }}
+                  }}
+                }}
+                "##,
+                required = file_url(&required_path),
+                consumer = file_url(&consumer_path),
+            ),
+        );
+        let placement = PlacementFile {
+            schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+            version: amber_compiler::run_plan::PLACEMENT_VERSION,
+            sites: BTreeMap::from([(
+                "compose_local".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Compose,
+                    context: None,
+                },
+            )]),
+            defaults: PlacementDefaults {
+                image: Some("compose_local".to_string()),
+                ..PlacementDefaults::default()
+            },
+            components: BTreeMap::new(),
+        };
+        let state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
+        let state_path = dir.path().join("control-state.json");
+        write_control_state(&state_path, &state).expect("state should write");
+        let root_authority = state.base_scenario.root;
+        let app = test_control_state_app(&dir, state, state_path);
+        let actuators = install_success_site_actuator(&app).await;
+
+        execute_create_child(
+            &app,
+            root_authority,
+            CreateChildRequest {
+                template: "required".to_string(),
+                name: "required".to_string(),
+                manifest: None,
+                config: BTreeMap::new(),
+                bindings: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect("required child should create");
+        execute_create_child(
+            &app,
+            root_authority,
+            CreateChildRequest {
+                template: "consumer".to_string(),
+                name: "consumer".to_string(),
+                manifest: None,
+                config: BTreeMap::new(),
+                bindings: BTreeMap::from([(
+                    "required_api".to_string(),
+                    BindingInput {
+                        selector: Some("children.required.exports.http".to_string()),
+                        handle: None,
+                    },
+                )]),
+            },
+        )
+        .await
+        .expect("consumer child should create");
+
+        let state = app.control_state.lock().await.clone();
+        let consumer = state
+            .live_children
+            .iter()
+            .find(|child| child.name == "consumer")
+            .expect("consumer child should be recorded");
+        for site_plan in &consumer.site_plans {
+            assert_eq!(site_plan.routed_inputs.len(), 1);
+            assert_eq!(site_plan.routed_inputs[0].component, "/consumer");
+            assert_eq!(site_plan.routed_inputs[0].slot, "required_api");
+            assert_eq!(site_plan.routed_inputs[0].provider_component, "/required");
+            assert_eq!(site_plan.routed_inputs[0].protocol, "http");
+            assert_eq!(site_plan.routed_inputs[0].capability_kind, "http");
+            assert_eq!(
+                site_plan.routed_inputs[0].target,
+                DynamicInputRouteTarget::ComponentProvide {
+                    provide: "http".to_string()
+                },
+                "same-site child exports should reuse the provider component route instead of \
+                 inventing a synthetic dynamic-export hop",
+            );
+        }
+
+        for actuator in actuators {
+            actuator.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn same_site_static_child_export_bindings_reuse_provider_component_routes() {
+        let dir = TempDir::new().expect("temp dir");
+        let provider_path = dir.path().join("provider.json5");
+        let consumer_path = dir.path().join("consumer.json5");
+        let root_path = dir.path().join("root.json5");
+        write_file(
+            &provider_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                image: "python:3.13-alpine",
+                entrypoint: ["python3", "-c", "print('provider')"],
+                network: {
+                  endpoints: [{ name: "http", port: 8080, protocol: "http" }]
+                }
+              },
+              provides: {
+                http: { kind: "http", endpoint: "http" }
+              },
+              exports: {
+                http: "http"
+              }
+            }
+            "#,
+        );
+        write_file(
+            &consumer_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              slots: {
+                upstream: { kind: "http" }
+              },
+              program: {
+                image: "python:3.13-alpine",
+                entrypoint: ["python3", "-c", "print('consumer')"],
+                network: {
+                  endpoints: [{ name: "http", port: 8081, protocol: "http" }]
+                }
+              },
+              provides: {
+                http: { kind: "http", endpoint: "http" }
+              },
+              exports: {
+                http: "http"
+              }
+            }
+            "#,
+        );
+        write_json(
+            &root_path,
+            &json!({
+                "manifest_version": "0.3.0",
+                "slots": {
+                    "realm": { "kind": "component", "optional": true }
+                },
+                "components": {
+                    "provider": file_url(&provider_path)
+                },
+                "child_templates": {
+                    "consumer": {
+                        "manifest": file_url(&consumer_path)
+                    }
+                },
+                "exports": {
+                    "provider_http": "#provider.http"
+                }
+            }),
+        )
+        .expect("root manifest should write");
+        let placement = PlacementFile {
+            schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+            version: amber_compiler::run_plan::PLACEMENT_VERSION,
+            sites: BTreeMap::from([(
+                "compose_local".to_string(),
+                SiteDefinition {
+                    kind: SiteKind::Compose,
+                    context: None,
+                },
+            )]),
+            defaults: PlacementDefaults {
+                image: Some("compose_local".to_string()),
+                ..PlacementDefaults::default()
+            },
+            components: BTreeMap::new(),
+        };
+        let state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
+        let state_path = dir.path().join("control-state.json");
+        write_control_state(&state_path, &state).expect("state should write");
+        let root_authority = state.base_scenario.root;
+        let app = test_control_state_app(&dir, state, state_path);
+        let actuators = install_success_site_actuator(&app).await;
+
+        execute_create_child(
+            &app,
+            root_authority,
+            CreateChildRequest {
+                template: "consumer".to_string(),
+                name: "consumer".to_string(),
+                manifest: None,
+                config: BTreeMap::new(),
+                bindings: BTreeMap::from([(
+                    "upstream".to_string(),
+                    BindingInput {
+                        selector: Some("children.provider.exports.http".to_string()),
+                        handle: None,
+                    },
+                )]),
+            },
+        )
+        .await
+        .expect("consumer child should create");
+
+        let state = app.control_state.lock().await.clone();
+        let consumer = state
+            .live_children
+            .iter()
+            .find(|child| child.name == "consumer")
+            .expect("consumer child should be recorded");
+        for site_plan in &consumer.site_plans {
+            assert_eq!(site_plan.routed_inputs.len(), 1);
+            assert_eq!(site_plan.routed_inputs[0].component, "/consumer");
+            assert_eq!(site_plan.routed_inputs[0].slot, "upstream");
+            assert_eq!(site_plan.routed_inputs[0].provider_component, "/provider");
+            assert_eq!(site_plan.routed_inputs[0].protocol, "http");
+            assert_eq!(site_plan.routed_inputs[0].capability_kind, "http");
+            assert_eq!(
+                site_plan.routed_inputs[0].target,
+                DynamicInputRouteTarget::ComponentProvide {
+                    provide: "http".to_string()
+                },
+                "same-site static child exports should reuse the provider component route",
+            );
+        }
+
+        for actuator in actuators {
+            actuator.abort();
+        }
     }
 
     #[test]
@@ -5084,6 +5625,180 @@ mod tests {
         handles
     }
 
+    async fn install_barrier_destroy_site_actuator(
+        app: &ControlStateApp,
+    ) -> (
+        Vec<tokio::task::JoinHandle<()>>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+        Arc<tokio::sync::Barrier>,
+    ) {
+        let offered_sites = {
+            let state = app.control_state.lock().await;
+            state
+                .placement
+                .offered_sites
+                .iter()
+                .map(|(site_id, site)| (site_id.clone(), site.kind))
+                .collect::<Vec<_>>()
+        };
+        let barrier = Arc::new(tokio::sync::Barrier::new(offered_sites.len() + 1));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handles = Vec::with_capacity(offered_sites.len());
+        for (site_id, site_kind) in offered_sites {
+            let site_state_root = Path::new(&app.state_root).join(&site_id);
+            fs::create_dir_all(&site_state_root).expect("site state root should exist");
+            let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .expect("actuator listener");
+            let listen_addr = listener.local_addr().expect("actuator addr");
+            write_json(
+                &site_state_root.join("site-actuator-plan.json"),
+                &SiteActuatorPlan {
+                    schema: "amber.run.site_actuator_plan".to_string(),
+                    version: 1,
+                    run_id: "test-run".to_string(),
+                    mesh_scope: "test-mesh".to_string(),
+                    run_root: app.run_root.display().to_string(),
+                    site_id: site_id.clone(),
+                    kind: site_kind,
+                    router_identity_id: format!("/site/{site_id}/router"),
+                    artifact_dir: site_state_root.join("artifact").display().to_string(),
+                    site_state_root: site_state_root.display().to_string(),
+                    listen_addr,
+                    storage_root: None,
+                    runtime_root: None,
+                    router_mesh_port: None,
+                    compose_project: None,
+                    kubernetes_namespace: None,
+                    context: None,
+                    observability_endpoint: None,
+                    launch_env: BTreeMap::new(),
+                },
+            )
+            .expect("site actuator plan should write");
+            let start_tx = tx.clone();
+            let destroy_barrier = barrier.clone();
+            let site_id_for_destroy = site_id.clone();
+            let app = Router::new()
+                .route(
+                    "/v1/children/{child_id}/prepare",
+                    post(|| async { StatusCode::NO_CONTENT }),
+                )
+                .route(
+                    "/v1/children/{child_id}/publish",
+                    post(|| async { StatusCode::NO_CONTENT }),
+                )
+                .route(
+                    "/v1/children/{child_id}/destroy",
+                    post(move || {
+                        let start_tx = start_tx.clone();
+                        let destroy_barrier = destroy_barrier.clone();
+                        let site_id = site_id_for_destroy.clone();
+                        async move {
+                            start_tx
+                                .send(site_id)
+                                .expect("destroy start notification should send");
+                            destroy_barrier.wait().await;
+                            StatusCode::NO_CONTENT
+                        }
+                    }),
+                );
+            handles.push(tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("site actuator should serve");
+            }));
+        }
+        (handles, rx, barrier)
+    }
+
+    async fn install_barrier_publish_site_actuator(
+        app: &ControlStateApp,
+    ) -> (
+        Vec<tokio::task::JoinHandle<()>>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+        Arc<tokio::sync::Barrier>,
+    ) {
+        let offered_sites = {
+            let state = app.control_state.lock().await;
+            state
+                .placement
+                .offered_sites
+                .iter()
+                .map(|(site_id, site)| (site_id.clone(), site.kind))
+                .collect::<Vec<_>>()
+        };
+        let barrier = Arc::new(tokio::sync::Barrier::new(offered_sites.len() + 1));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handles = Vec::with_capacity(offered_sites.len());
+        for (site_id, site_kind) in offered_sites {
+            let site_state_root = Path::new(&app.state_root).join(&site_id);
+            fs::create_dir_all(&site_state_root).expect("site state root should exist");
+            let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .expect("actuator listener");
+            let listen_addr = listener.local_addr().expect("actuator addr");
+            write_json(
+                &site_state_root.join("site-actuator-plan.json"),
+                &SiteActuatorPlan {
+                    schema: "amber.run.site_actuator_plan".to_string(),
+                    version: 1,
+                    run_id: "test-run".to_string(),
+                    mesh_scope: "test-mesh".to_string(),
+                    run_root: app.run_root.display().to_string(),
+                    site_id: site_id.clone(),
+                    kind: site_kind,
+                    router_identity_id: format!("/site/{site_id}/router"),
+                    artifact_dir: site_state_root.join("artifact").display().to_string(),
+                    site_state_root: site_state_root.display().to_string(),
+                    listen_addr,
+                    storage_root: None,
+                    runtime_root: None,
+                    router_mesh_port: None,
+                    compose_project: None,
+                    kubernetes_namespace: None,
+                    context: None,
+                    observability_endpoint: None,
+                    launch_env: BTreeMap::new(),
+                },
+            )
+            .expect("site actuator plan should write");
+            let start_tx = tx.clone();
+            let publish_barrier = barrier.clone();
+            let site_id_for_publish = site_id.clone();
+            let app = Router::new()
+                .route(
+                    "/v1/children/{child_id}/prepare",
+                    post(|| async { StatusCode::NO_CONTENT }),
+                )
+                .route(
+                    "/v1/children/{child_id}/publish",
+                    post(move || {
+                        let start_tx = start_tx.clone();
+                        let publish_barrier = publish_barrier.clone();
+                        let site_id = site_id_for_publish.clone();
+                        async move {
+                            start_tx
+                                .send(site_id)
+                                .expect("publish start notification should send");
+                            publish_barrier.wait().await;
+                            StatusCode::NO_CONTENT
+                        }
+                    }),
+                )
+                .route(
+                    "/v1/children/{child_id}/destroy",
+                    post(|| async { StatusCode::NO_CONTENT }),
+                );
+            handles.push(tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("site actuator should serve");
+            }));
+        }
+        (handles, rx, barrier)
+    }
+
     #[tokio::test]
     async fn create_snapshot_and_destroy_exact_child() {
         let dir = TempDir::new().expect("temp dir");
@@ -5123,7 +5838,33 @@ mod tests {
             ),
         );
 
-        let mut state = compile_control_state(&root_path).await;
+        let placement = PlacementFile {
+            schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+            version: amber_compiler::run_plan::PLACEMENT_VERSION,
+            sites: BTreeMap::from([
+                (
+                    "direct_a".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Direct,
+                        context: None,
+                    },
+                ),
+                (
+                    "direct_b".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Direct,
+                        context: None,
+                    },
+                ),
+            ]),
+            defaults: PlacementDefaults {
+                path: Some("direct_a".to_string()),
+                ..PlacementDefaults::default()
+            },
+            components: BTreeMap::from([("/job-b".to_string(), "direct_b".to_string())]),
+        };
+
+        let mut state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
         let state_path = dir.path().join("control-state.json");
         write_control_state(&state_path, &state).expect("state should write");
         let root_authority = state.base_scenario.root;
@@ -5331,6 +6072,7 @@ mod tests {
                 r#"
                 {{
                   manifest_version: "0.3.0",
+                  program: {{ path: "/bin/echo", args: ["root"] }},
                   slots: {{
                     realm: {{ kind: "component", optional: true }}
                   }},
@@ -5716,6 +6458,147 @@ mod tests {
         assert_eq!(snapshot_err.code, ProtocolErrorCode::ScopeNotAllowed);
     }
 
+    #[tokio::test]
+    async fn destroy_and_recreate_same_child_name_gets_a_new_capability_instance_id() {
+        let dir = TempDir::new().expect("temp dir");
+        let root_path = dir.path().join("root.json5");
+        let parent_path = dir.path().join("parent.json5");
+        let worker_path = dir.path().join("worker.json5");
+        write_file(
+            &worker_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              slots: {
+                realm: { kind: "component", optional: true }
+              },
+              program: {
+                path: "/bin/echo",
+                args: ["worker", "${slots.realm.url}"],
+                network: { endpoints: [{ name: "http", port: 8080 }] }
+              },
+              provides: { http: { kind: "http", endpoint: "http" } },
+              exports: { http: "provides.http" },
+            }
+            "#,
+        );
+        write_file(
+            &parent_path,
+            &format!(
+                r#"
+                {{
+                  manifest_version: "0.3.0",
+                  slots: {{
+                    realm: {{ kind: "component", optional: true }}
+                  }},
+                  program: {{
+                    path: "/bin/echo",
+                    args: ["parent", "${{slots.realm.url}}"],
+                    network: {{ endpoints: [{{ name: "http", port: 8081 }}] }}
+                  }},
+                  provides: {{ http: {{ kind: "http", endpoint: "http" }} }},
+                  exports: {{ http: "provides.http" }},
+                  child_templates: {{
+                    worker: {{
+                      manifest: "{worker}",
+                      bindings: {{
+                        realm: "slots.realm"
+                      }}
+                    }}
+                  }},
+                }}
+                "#,
+                worker = file_url(&worker_path),
+            ),
+        );
+        write_file(
+            &root_path,
+            &format!(
+                r##"
+                {{
+                  manifest_version: "0.3.0",
+                  program: {{ path: "/bin/echo", args: ["root"] }},
+                  components: {{
+                    parent: "{parent}"
+                  }},
+                  bindings: [
+                    {{ to: "#parent.realm", from: "framework.component" }}
+                  ],
+                }}
+                "##,
+                parent = file_url(&parent_path),
+            ),
+        );
+
+        let mut state = compile_control_state(&root_path).await;
+        let state_path = dir.path().join("control-state.json");
+        write_control_state(&state_path, &state).expect("state should write");
+        let base = Scenario::try_from(state.base_scenario.clone()).expect("base scenario");
+        let parent_id = base
+            .components_iter()
+            .find(|(_, component)| component.moniker.as_str() == "/parent")
+            .map(|(id, _)| id.0)
+            .expect("parent component should exist");
+
+        create_child(
+            &mut state,
+            parent_id,
+            CreateChildRequest {
+                template: "worker".to_string(),
+                name: "delegate".to_string(),
+                manifest: None,
+                config: BTreeMap::new(),
+                bindings: BTreeMap::new(),
+            },
+            &state_path,
+        )
+        .await
+        .expect("first delegate create should succeed");
+        let first_cap_instance_id = state
+            .capability_instances
+            .values()
+            .find(|record| record.recipient_component_moniker == "/parent/delegate")
+            .map(|record| record.cap_instance_id.clone())
+            .expect("first delegate capability instance should exist");
+
+        destroy_child(&mut state, parent_id, "delegate", &state_path)
+            .await
+            .expect("destroy should succeed");
+        assert!(
+            !state
+                .capability_instances
+                .values()
+                .any(|record| record.recipient_component_moniker == "/parent/delegate"),
+            "destroy should revoke the first child lifetime's capability instance",
+        );
+
+        create_child(
+            &mut state,
+            parent_id,
+            CreateChildRequest {
+                template: "worker".to_string(),
+                name: "delegate".to_string(),
+                manifest: None,
+                config: BTreeMap::new(),
+                bindings: BTreeMap::new(),
+            },
+            &state_path,
+        )
+        .await
+        .expect("second delegate create should succeed");
+        let second_cap_instance_id = state
+            .capability_instances
+            .values()
+            .find(|record| record.recipient_component_moniker == "/parent/delegate")
+            .map(|record| record.cap_instance_id.clone())
+            .expect("second delegate capability instance should exist");
+
+        assert_ne!(
+            first_cap_instance_id, second_cap_instance_id,
+            "recreating the same child name must mint a new framework capability instance id",
+        );
+    }
+
     #[test]
     fn framework_auth_header_must_match_expected_token() {
         let mut headers = HeaderMap::new();
@@ -6066,6 +6949,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn max_live_children_is_scoped_per_template() {
+        let dir = TempDir::new().expect("temp dir");
+        let root_path = dir.path().join("root.json5");
+        write_file(
+            &root_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              program: { path: "/bin/echo", args: ["root"] },
+              slots: {
+                realm: { kind: "component", optional: true }
+              }
+            }
+            "#,
+        );
+
+        let mut state = compile_control_state(&root_path).await;
+        let root_authority = state.base_scenario.root;
+        let mut alpha_child = empty_live_child(root_authority, "job-a", 1, ChildState::Live);
+        alpha_child.template_name = Some("alpha".to_string());
+        state.live_children = vec![alpha_child];
+
+        let template = ChildTemplate {
+            manifest: Some("file:///templates/worker.json5".to_string()),
+            allowed_manifests: None,
+            config: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+            visible_exports: None,
+            limits: Some(amber_scenario::ChildTemplateLimits {
+                max_live_children: Some(1),
+                name_pattern: None,
+            }),
+            possible_backends: Vec::new(),
+        };
+
+        validate_template_limits(&state, root_authority, "beta", "job-c", &template)
+            .expect("beta should still have capacity when only alpha is full");
+
+        let err = validate_template_limits(&state, root_authority, "alpha", "job-c", &template)
+            .expect_err("second alpha child should hit the per-template limit");
+        assert_eq!(err.code, ProtocolErrorCode::NameConflict);
+        assert!(
+            err.message.contains("template `alpha`"),
+            "error should name the saturated template, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_is_stable_across_dynamic_create_order() {
+        let dir = TempDir::new().expect("temp dir");
+        let root_path = dir.path().join("root.json5");
+        let child_path = dir.path().join("child.json5");
+        write_file(
+            &child_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                path: "/bin/echo",
+                args: ["child"],
+                network: { endpoints: [{ name: "out", port: 8080, protocol: "http" }] }
+              },
+              provides: { out: { kind: "http", endpoint: "out" } },
+              exports: { out: "provides.out" },
+            }
+            "#,
+        );
+        write_file(
+            &root_path,
+            &format!(
+                r#"
+                {{
+                  manifest_version: "0.3.0",
+                  program: {{ path: "/bin/echo", args: ["root"] }},
+                  slots: {{
+                    realm: {{ kind: "component", optional: true }}
+                  }},
+                  child_templates: {{
+                    worker: {{ manifest: "{child}" }}
+                  }},
+                }}
+                "#,
+                child = file_url(&child_path),
+            ),
+        );
+        let placement = PlacementFile {
+            schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+            version: amber_compiler::run_plan::PLACEMENT_VERSION,
+            sites: BTreeMap::from([
+                (
+                    "direct_a".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Direct,
+                        context: None,
+                    },
+                ),
+                (
+                    "direct_b".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Direct,
+                        context: None,
+                    },
+                ),
+            ]),
+            defaults: PlacementDefaults {
+                path: Some("direct_a".to_string()),
+                ..PlacementDefaults::default()
+            },
+            components: BTreeMap::from([
+                ("/job-a".to_string(), "direct_a".to_string()),
+                ("/job-b".to_string(), "direct_b".to_string()),
+            ]),
+        };
+        let mut state_a = compile_control_state_with_placement(&root_path, Some(&placement)).await;
+        let mut state_b = compile_control_state_with_placement(&root_path, Some(&placement)).await;
+        let state_path_a = dir.path().join("control-state-a.json");
+        let state_path_b = dir.path().join("control-state-b.json");
+        write_control_state(&state_path_a, &state_a).expect("state A should write");
+        write_control_state(&state_path_b, &state_b).expect("state B should write");
+        let root_authority = state_a.base_scenario.root;
+
+        for (state, state_path, names) in [
+            (&mut state_a, &state_path_a, ["job-a", "job-b"]),
+            (&mut state_b, &state_path_b, ["job-b", "job-a"]),
+        ] {
+            for name in names {
+                create_child(
+                    state,
+                    root_authority,
+                    CreateChildRequest {
+                        template: "worker".to_string(),
+                        name: name.to_string(),
+                        manifest: None,
+                        config: BTreeMap::new(),
+                        bindings: BTreeMap::new(),
+                    },
+                    state_path,
+                )
+                .await
+                .unwrap_or_else(|err| panic!("create {name} should succeed: {err:?}"));
+            }
+        }
+
+        let snapshot_a = snapshot(&state_a, root_authority).expect("snapshot A should succeed");
+        let snapshot_b = snapshot(&state_b, root_authority).expect("snapshot B should succeed");
+        assert_eq!(
+            snapshot_a.scenario, snapshot_b.scenario,
+            "snapshot scenario should be normalized independent of create order",
+        );
+        assert_eq!(
+            snapshot_a.placement, snapshot_b.placement,
+            "snapshot placement should be normalized independent of create order",
+        );
+    }
+
+    #[tokio::test]
     async fn create_rejects_unoffered_backend_without_committing_child_state() {
         let dir = TempDir::new().expect("temp dir");
         let root_path = dir.path().join("root.json5");
@@ -6212,6 +7252,264 @@ mod tests {
                 .count(),
             1,
             "snapshot should remain clean after the same-name race",
+        );
+        for actuator in actuators {
+            actuator.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn destroy_retracted_tears_down_sites_concurrently() {
+        let dir = TempDir::new().expect("temp dir");
+        let root_path = dir.path().join("root.json5");
+        write_file(
+            &root_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                path: "/bin/sh",
+                args: ["-c", "sleep 1"]
+              }
+            }
+            "#,
+        );
+
+        let placement = PlacementFile {
+            schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+            version: amber_compiler::run_plan::PLACEMENT_VERSION,
+            sites: BTreeMap::from([
+                (
+                    "compose_local".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Compose,
+                        context: None,
+                    },
+                ),
+                (
+                    "direct_local".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Direct,
+                        context: None,
+                    },
+                ),
+            ]),
+            defaults: PlacementDefaults {
+                path: Some("direct_local".to_string()),
+                image: Some("compose_local".to_string()),
+                ..PlacementDefaults::default()
+            },
+            components: BTreeMap::new(),
+        };
+
+        let state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
+        let state_path = dir.path().join("control-state.json");
+        write_control_state(&state_path, &state).expect("state should write");
+        let root_authority = state.base_scenario.root;
+        let app = test_control_state_app(&dir, state, state_path);
+        let (actuators, mut destroy_starts, barrier) =
+            install_barrier_destroy_site_actuator(&app).await;
+        {
+            let mut state = app.control_state.lock().await;
+            state.live_children.push(LiveChildRecord {
+                child_id: 7,
+                authority_realm_id: root_authority,
+                name: "job-compose".to_string(),
+                state: ChildState::DestroyRetracted,
+                template_name: Some("fixture".to_string()),
+                selected_manifest_catalog_key: None,
+                fragment: None,
+                assignments: BTreeMap::new(),
+                site_plans: vec![
+                    DynamicSitePlanRecord {
+                        site_id: "compose_local".to_string(),
+                        kind: SiteKind::Compose,
+                        router_identity_id: "/site/compose_local/router".to_string(),
+                        component_ids: Vec::new(),
+                        assigned_components: Vec::new(),
+                        artifact_files: BTreeMap::new(),
+                        desired_artifact_files: BTreeMap::new(),
+                        proxy_exports: BTreeMap::new(),
+                        routed_inputs: Vec::new(),
+                    },
+                    DynamicSitePlanRecord {
+                        site_id: "direct_local".to_string(),
+                        kind: SiteKind::Direct,
+                        router_identity_id: "/site/direct_local/router".to_string(),
+                        component_ids: Vec::new(),
+                        assigned_components: Vec::new(),
+                        artifact_files: BTreeMap::new(),
+                        desired_artifact_files: BTreeMap::new(),
+                        proxy_exports: BTreeMap::new(),
+                        routed_inputs: Vec::new(),
+                    },
+                ],
+                overlay_ids: Vec::new(),
+                overlays: Vec::new(),
+                outputs: BTreeMap::new(),
+            });
+        }
+
+        let destroy = tokio::spawn({
+            let app = app.clone();
+            async move { continue_destroy_retracted(&app, 7).await }
+        });
+
+        let first = tokio::time::timeout(Duration::from_secs(5), destroy_starts.recv())
+            .await
+            .expect("first destroy should start in time")
+            .expect("first destroy notification should arrive");
+        let second = tokio::time::timeout(Duration::from_secs(5), destroy_starts.recv())
+            .await
+            .expect("second destroy should start in time")
+            .expect("second destroy notification should arrive");
+        assert_ne!(
+            first, second,
+            "destroy should reach both site actuators before either completes"
+        );
+
+        barrier.wait().await;
+        destroy
+            .await
+            .expect("destroy task should join")
+            .expect("destroy should succeed");
+
+        let recovered = app.control_state.lock().await.clone();
+        assert!(
+            recovered.live_children.is_empty(),
+            "successful destroy should remove the child after concurrent site teardown",
+        );
+        for actuator in actuators {
+            actuator.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn create_committed_hidden_publishes_independent_sites_concurrently() {
+        let dir = TempDir::new().expect("temp dir");
+        let root_path = dir.path().join("root.json5");
+        write_file(
+            &root_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              program: {
+                path: "/bin/sh",
+                args: ["-c", "sleep 1"]
+              }
+            }
+            "#,
+        );
+
+        let placement = PlacementFile {
+            schema: amber_compiler::run_plan::PLACEMENT_SCHEMA.to_string(),
+            version: amber_compiler::run_plan::PLACEMENT_VERSION,
+            sites: BTreeMap::from([
+                (
+                    "compose_local".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Compose,
+                        context: None,
+                    },
+                ),
+                (
+                    "direct_local".to_string(),
+                    SiteDefinition {
+                        kind: SiteKind::Direct,
+                        context: None,
+                    },
+                ),
+            ]),
+            defaults: PlacementDefaults {
+                path: Some("direct_local".to_string()),
+                image: Some("compose_local".to_string()),
+                ..PlacementDefaults::default()
+            },
+            components: BTreeMap::new(),
+        };
+
+        let state = compile_control_state_with_placement(&root_path, Some(&placement)).await;
+        let state_path = dir.path().join("control-state.json");
+        write_control_state(&state_path, &state).expect("state should write");
+        let root_authority = state.base_scenario.root;
+        let app = test_control_state_app(&dir, state, state_path);
+        let (actuators, mut publish_starts, barrier) =
+            install_barrier_publish_site_actuator(&app).await;
+        {
+            let mut state = app.control_state.lock().await;
+            state.live_children.push(LiveChildRecord {
+                child_id: 7,
+                authority_realm_id: root_authority,
+                name: "job-compose".to_string(),
+                state: ChildState::CreateCommittedHidden,
+                template_name: Some("fixture".to_string()),
+                selected_manifest_catalog_key: None,
+                fragment: None,
+                assignments: BTreeMap::new(),
+                site_plans: vec![
+                    DynamicSitePlanRecord {
+                        site_id: "compose_local".to_string(),
+                        kind: SiteKind::Compose,
+                        router_identity_id: "/site/compose_local/router".to_string(),
+                        component_ids: Vec::new(),
+                        assigned_components: Vec::new(),
+                        artifact_files: BTreeMap::new(),
+                        desired_artifact_files: BTreeMap::new(),
+                        proxy_exports: BTreeMap::new(),
+                        routed_inputs: Vec::new(),
+                    },
+                    DynamicSitePlanRecord {
+                        site_id: "direct_local".to_string(),
+                        kind: SiteKind::Direct,
+                        router_identity_id: "/site/direct_local/router".to_string(),
+                        component_ids: Vec::new(),
+                        assigned_components: Vec::new(),
+                        artifact_files: BTreeMap::new(),
+                        desired_artifact_files: BTreeMap::new(),
+                        proxy_exports: BTreeMap::new(),
+                        routed_inputs: Vec::new(),
+                    },
+                ],
+                overlay_ids: Vec::new(),
+                overlays: Vec::new(),
+                outputs: BTreeMap::new(),
+            });
+        }
+
+        let publish = tokio::spawn({
+            let app = app.clone();
+            async move { continue_create_committed_hidden(&app, 7).await }
+        });
+
+        let first = tokio::time::timeout(Duration::from_secs(5), publish_starts.recv())
+            .await
+            .expect("first publish should start in time")
+            .expect("first publish notification should arrive");
+        let second = tokio::time::timeout(Duration::from_secs(5), publish_starts.recv())
+            .await
+            .expect("second publish should start in time")
+            .expect("second publish notification should arrive");
+        assert_ne!(
+            first, second,
+            "create should reach both independent site actuators before either completes"
+        );
+
+        barrier.wait().await;
+        publish
+            .await
+            .expect("publish task should join")
+            .expect("publish should succeed");
+
+        let recovered = app.control_state.lock().await.clone();
+        let child = recovered
+            .live_children
+            .iter()
+            .find(|child| child.child_id == 7)
+            .expect("child should remain present");
+        assert_eq!(
+            child.state,
+            ChildState::Live,
+            "successful concurrent site publication should promote the child to live",
         );
         for actuator in actuators {
             actuator.abort();
@@ -6723,6 +8021,14 @@ mod tests {
                 "{site_id} should also publish its internal routed link export",
             );
         }
+        assert!(
+            child
+                .site_plans
+                .iter()
+                .all(|site_plan| site_plan.routed_inputs.is_empty()),
+            "bindings that stay inside the created fragment must remain intra-fragment wiring, \
+             not site-router routed inputs",
+        );
     }
 
     #[tokio::test]

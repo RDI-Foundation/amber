@@ -1036,11 +1036,17 @@ mod tests {
         sync::Arc,
     };
 
-    use amber_manifest::Manifest;
+    use amber_manifest::{Manifest, ManifestRef};
+    use amber_mesh::{FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV, FRAMEWORK_COMPONENT_CCS_URL_ENV};
+    use amber_resolver::Resolver;
     use amber_scenario::{BindingEdge, Component, Moniker, Scenario};
+    use tempfile::TempDir;
+    use url::Url;
 
     use super::*;
     use crate::{
+        CompileOptions, Compiler, DigestStore,
+        reporter::CompiledScenario,
         slots::{SlotObject, SlotValue},
         targets::storage::{StorageIdentity, StorageMount},
     };
@@ -1085,6 +1091,14 @@ mod tests {
         }
     }
 
+    fn write_file(path: &Path, contents: &str) {
+        std::fs::write(path, contents).expect("fixture file should write");
+    }
+
+    fn file_url(path: &Path) -> Url {
+        Url::from_file_path(path).expect("fixture path should convert to file url")
+    }
+
     #[test]
     fn resolve_helper_entrypoint_payload_rewrites_relative_program() {
         let payload = base64::engine::general_purpose::STANDARD.encode(
@@ -1104,6 +1118,92 @@ mod tests {
         assert_eq!(entrypoint[0], "/workspace/app/./bin/server");
         assert_eq!(entrypoint[1], "--port");
         assert_eq!(entrypoint[2], "8080");
+    }
+
+    #[test]
+    fn direct_router_passthrough_includes_framework_ccs_auth() {
+        let dir = TempDir::new().expect("temp dir");
+        let root_path = dir.path().join("root.json5");
+        let admin_path = dir.path().join("admin.json5");
+
+        write_file(
+            &admin_path,
+            r#"
+            {
+              manifest_version: "0.3.0",
+              slots: {
+                ctl: { kind: "component" }
+              },
+              program: {
+                path: "/bin/echo",
+                args: ["admin", "${slots.ctl.url}"],
+                network: { endpoints: [{ name: "http", port: 8080, protocol: "http" }] }
+              },
+              provides: { http: { kind: "http", endpoint: "http" } },
+              exports: { http: "provides.http" }
+            }
+            "#,
+        );
+        write_file(
+            &root_path,
+            &format!(
+                r##"
+                {{
+                  manifest_version: "0.3.0",
+                  slots: {{
+                    realm: {{ kind: "component", optional: true }}
+                  }},
+                  components: {{
+                    admin: "{admin}"
+                  }},
+                  bindings: [
+                    {{ to: "#admin.ctl", from: "framework.component" }}
+                  ],
+                  exports: {{
+                    admin_http: "#admin.http"
+                  }}
+                }}
+                "##,
+                admin = file_url(&admin_path),
+            ),
+        );
+
+        let compiler = Compiler::new(Resolver::new(), DigestStore::default());
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let output = runtime
+            .block_on(compiler.compile(
+                ManifestRef::from_url(file_url(&root_path)),
+                CompileOptions::default(),
+            ))
+            .expect("fixture should compile");
+        let compiled = CompiledScenario::from_compile_output(&output)
+            .expect("fixture should materialize compiled scenario");
+        let artifact = emit_direct_artifact(&compiled, false).expect("direct artifact");
+        let direct_plan: DirectPlan = serde_json::from_str(
+            artifact
+                .files
+                .get(Path::new(DIRECT_PLAN_FILENAME))
+                .expect("direct plan should be emitted"),
+        )
+        .expect("direct plan should deserialize");
+        let router = direct_plan
+            .router
+            .expect("framework.component binding should force a router");
+
+        assert!(
+            router
+                .env_passthrough
+                .iter()
+                .any(|env_var| env_var == FRAMEWORK_COMPONENT_CCS_URL_ENV),
+            "router must receive the framework CCS URL env passthrough",
+        );
+        assert!(
+            router
+                .env_passthrough
+                .iter()
+                .any(|env_var| env_var == FRAMEWORK_COMPONENT_CCS_AUTH_TOKEN_ENV),
+            "router must receive the framework CCS auth env passthrough",
+        );
     }
 
     #[test]

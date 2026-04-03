@@ -7,7 +7,7 @@ use amber_json5 as json5;
 use amber_manifest::{
     BindingSource as ManifestBindingSource, BindingTarget as ManifestBindingTarget, CapabilityKind,
     ChildTemplateAllowedManifests, ChildTemplateDecl, ComponentDecl, Manifest, ManifestRef,
-    MountSource, NetworkProtocol, Program as ManifestProgram, RuntimeBackend, SlotDecl,
+    MountSource, NetworkProtocol, Program as ManifestProgram, SlotDecl,
 };
 use amber_scenario::{
     BindingEdge, BindingFrom, Component, ComponentId, ProvideRef, Scenario, ScenarioExport,
@@ -61,6 +61,13 @@ pub struct RunPlan {
     pub sites: BTreeMap<String, RunSitePlan>,
     pub links: Vec<RunLink>,
     pub startup_waves: Vec<Vec<String>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DynamicFragmentPlan {
+    pub assignments: BTreeMap<String, String>,
+    pub incident_links: Vec<RunLink>,
+    pub site_plans: BTreeMap<String, RunSitePlan>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -558,6 +565,80 @@ pub fn build_unmanaged_export(
     })
 }
 
+pub fn plan_dynamic_fragment(
+    scenario: &Scenario,
+    fragment_components: &BTreeSet<ComponentId>,
+    placement: &PlacementFile,
+    activation: &RunPlanActivationState,
+    existing_assignments: &BTreeMap<String, String>,
+) -> Result<DynamicFragmentPlan, RunPlanError> {
+    let planning =
+        resolve_dynamic_planning_state(scenario, placement, activation, existing_assignments)?;
+    let fragment_monikers = fragment_components
+        .iter()
+        .map(|component_id| graph::component_path(scenario, *component_id))
+        .collect::<BTreeSet<_>>();
+    let incident_links = planning
+        .links
+        .iter()
+        .filter(|link| {
+            fragment_monikers.contains(link.provider_component.as_str())
+                || fragment_monikers.contains(link.consumer_component.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let affected_sites = planning
+        .assignments_by_component
+        .iter()
+        .filter_map(|(component_id, site_id)| {
+            fragment_components
+                .contains(component_id)
+                .then_some(site_id.clone())
+        })
+        .chain(
+            incident_links
+                .iter()
+                .flat_map(|link| [link.provider_site.clone(), link.consumer_site.clone()]),
+        )
+        .collect::<BTreeSet<_>>();
+    let site_plans = render_site_plan_subset(
+        scenario,
+        &planning,
+        affected_sites.iter().map(String::as_str),
+    )?;
+    let assignments = fragment_components
+        .iter()
+        .filter_map(|component_id| {
+            planning
+                .assignments_by_component
+                .get(component_id)
+                .map(|site_id| {
+                    (
+                        graph::component_path(scenario, *component_id),
+                        site_id.clone(),
+                    )
+                })
+        })
+        .collect();
+    Ok(DynamicFragmentPlan {
+        assignments,
+        incident_links,
+        site_plans,
+    })
+}
+
+pub fn build_site_plan_subset(
+    scenario: &Scenario,
+    placement: &PlacementFile,
+    activation: &RunPlanActivationState,
+    existing_assignments: &BTreeMap<String, String>,
+    site_ids: &BTreeSet<String>,
+) -> Result<BTreeMap<String, RunSitePlan>, RunPlanError> {
+    let planning =
+        resolve_dynamic_planning_state(scenario, placement, activation, existing_assignments)?;
+    render_site_plan_subset(scenario, &planning, site_ids.iter().map(String::as_str))
+}
+
 fn resolve_assignments(
     scenario: &Scenario,
     site_definitions: &BTreeMap<String, SiteDefinition>,
@@ -602,6 +683,166 @@ fn resolve_assignments(
         assignments.insert(component_id, site_id);
     }
     Ok(assignments)
+}
+
+#[derive(Clone, Debug)]
+struct DynamicPlanningState {
+    mesh_scope: String,
+    offered_sites: BTreeMap<String, SiteDefinition>,
+    active_site_capabilities: BTreeMap<String, ActiveSiteCapabilities>,
+    assignments_by_component: BTreeMap<ComponentId, String>,
+    links: Vec<RunLink>,
+}
+
+fn resolve_dynamic_planning_state(
+    scenario: &Scenario,
+    placement: &PlacementFile,
+    activation: &RunPlanActivationState,
+    existing_assignments: &BTreeMap<String, String>,
+) -> Result<DynamicPlanningState, RunPlanError> {
+    let offered_sites = placement_site_definitions(Some(placement));
+    validate_activation_override(&offered_sites, activation)?;
+
+    let mut explicit_components = placement.components.clone();
+    explicit_components.extend(existing_assignments.clone());
+    let assignments_by_component = resolve_assignments(
+        scenario,
+        &offered_sites,
+        &placement.defaults,
+        explicit_components,
+    )?;
+    validate_storage_locality(scenario, &assignments_by_component)?;
+
+    let active_sites = activation
+        .dynamic_enabled_sites
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if let Some(site_id) = assignments_by_component
+        .values()
+        .find(|site_id| !active_sites.contains(site_id.as_str()))
+    {
+        return Err(RunPlanError::Other(format!(
+            "component placement selected site `{site_id}`, but the frozen activation state does \
+             not allow dynamic workloads there"
+        )));
+    }
+
+    let endpoint_plan = build_endpoint_plan(scenario)
+        .map_err(|err| RunPlanError::Other(format!("failed to build endpoint plan: {err}")))?;
+    let mesh_plan = build_mesh_plan(
+        scenario,
+        &endpoint_plan,
+        MeshOptions {
+            backend_label: "dynamic plan",
+        },
+    )
+    .map_err(|err| RunPlanError::Other(format!("failed to build dynamic mesh plan: {err}")))?;
+    let links = build_cross_site_links(scenario, &mesh_plan, &assignments_by_component);
+
+    Ok(DynamicPlanningState {
+        mesh_scope: scenario_mesh_scope(&ScenarioIr::from(scenario))?,
+        offered_sites,
+        active_site_capabilities: activation.active_site_capabilities.clone(),
+        assignments_by_component,
+        links,
+    })
+}
+
+fn render_site_plan_subset<'a>(
+    scenario: &Scenario,
+    planning: &DynamicPlanningState,
+    site_ids: impl IntoIterator<Item = &'a str>,
+) -> Result<BTreeMap<String, RunSitePlan>, RunPlanError> {
+    let links_by_provider_site =
+        planning
+            .links
+            .iter()
+            .fold(BTreeMap::<String, Vec<RunLink>>::new(), |mut acc, link| {
+                acc.entry(link.provider_site.clone())
+                    .or_default()
+                    .push(link.clone());
+                acc
+            });
+    let links_by_consumer_site =
+        planning
+            .links
+            .iter()
+            .fold(BTreeMap::<String, Vec<RunLink>>::new(), |mut acc, link| {
+                acc.entry(link.consumer_site.clone())
+                    .or_default()
+                    .push(link.clone());
+                acc
+            });
+    let component_ids_by_site = planning.assignments_by_component.iter().fold(
+        BTreeMap::<String, Vec<ComponentId>>::new(),
+        |mut acc, (component_id, site_id)| {
+            acc.entry(site_id.clone()).or_default().push(*component_id);
+            acc
+        },
+    );
+
+    let mut site_plans = BTreeMap::new();
+    for site_id in site_ids {
+        let site = planning
+            .offered_sites
+            .get(site_id)
+            .cloned()
+            .ok_or_else(|| RunPlanError::UnknownSite {
+                site_id: site_id.to_string(),
+            })?;
+        let mut program_components = component_ids_by_site
+            .get(site_id)
+            .cloned()
+            .unwrap_or_default();
+        program_components.sort();
+        let site_scenario = build_site_scenario(
+            scenario,
+            site_id,
+            &program_components,
+            &links_by_provider_site
+                .get(site_id)
+                .cloned()
+                .unwrap_or_default(),
+            &links_by_consumer_site
+                .get(site_id)
+                .cloned()
+                .unwrap_or_default(),
+            &planning.assignments_by_component,
+        )?;
+        let scenario_ir = ScenarioIr::from(&site_scenario);
+        let site_compiled = CompiledScenario::from_ir(scenario_ir.clone())
+            .map_err(|err| RunPlanError::Other(format!("failed to derive site scenario: {err}")))?;
+        let artifact_files = render_site_artifact_files(
+            site.kind,
+            &site_compiled,
+            &site_router_identity_id(site_id),
+            &planning.mesh_scope,
+            planning
+                .active_site_capabilities
+                .get(site_id)
+                .is_some_and(|capabilities| {
+                    capabilities.cross_site_routing
+                        || capabilities.dynamic_workloads
+                        || capabilities.privileged_control
+                }),
+        )?;
+        let assigned_components = program_components
+            .iter()
+            .map(|component_id| graph::component_path(scenario, *component_id))
+            .collect();
+        site_plans.insert(
+            site_id.to_string(),
+            RunSitePlan {
+                site,
+                router_identity_id: site_router_identity_id(site_id),
+                assigned_components,
+                scenario_ir,
+                artifact_files,
+            },
+        );
+    }
+    Ok(site_plans)
 }
 
 fn placement_component_overrides(placement: Option<&PlacementFile>) -> BTreeMap<String, String> {
@@ -744,7 +985,6 @@ fn default_placement_defaults() -> PlacementDefaults {
 struct FrozenChildTemplateSpec {
     manifest: Option<String>,
     allowed_manifests: Option<Vec<String>>,
-    possible_backends: Vec<RuntimeBackend>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -772,7 +1012,6 @@ fn analyze_standby_sites(
     defaults: &PlacementDefaults,
 ) -> Result<BTreeSet<String>, RunPlanError> {
     let mut requested_sites = BTreeSet::new();
-    let mut requested_kinds = BTreeSet::new();
 
     for template in collect_frozen_child_templates(scenario)? {
         match (
@@ -787,7 +1026,7 @@ fn analyze_standby_sites(
                     key,
                 )?);
             }
-            (None, Some(keys)) if template.possible_backends.is_empty() => {
+            (None, Some(keys)) => {
                 for key in keys {
                     requested_sites.extend(analyze_manifest_root_sites(
                         &scenario.manifest_catalog,
@@ -797,26 +1036,10 @@ fn analyze_standby_sites(
                     )?);
                 }
             }
-            (None, Some(_)) => {
-                requested_kinds.extend(
-                    template
-                        .possible_backends
-                        .into_iter()
-                        .map(site_kind_for_runtime_backend),
-                );
-            }
             (Some(_), Some(_)) | (None, None) => {
                 unreachable!("scenario IR validation enforces child-template manifest shape")
             }
         }
-    }
-
-    for kind in requested_kinds {
-        requested_sites.extend(
-            site_definitions
-                .iter()
-                .filter_map(|(site_id, site)| (site.kind == kind).then_some(site_id.clone())),
-        );
     }
 
     Ok(requested_sites)
@@ -832,7 +1055,6 @@ fn collect_frozen_child_templates(
             FrozenChildTemplateSpec {
                 manifest: template.manifest.clone(),
                 allowed_manifests: template.allowed_manifests.clone(),
-                possible_backends: template.possible_backends.clone(),
             }
         }));
     }
@@ -886,7 +1108,6 @@ fn freeze_manifest_child_template(
     Ok(FrozenChildTemplateSpec {
         manifest,
         allowed_manifests,
-        possible_backends: template.possible_backends.clone(),
     })
 }
 
@@ -1259,16 +1480,6 @@ fn validate_manifest_program_support(
                 supported: "program.image workloads",
             })
         }
-    }
-}
-
-fn site_kind_for_runtime_backend(backend: RuntimeBackend) -> SiteKind {
-    match backend {
-        RuntimeBackend::Direct => SiteKind::Direct,
-        RuntimeBackend::Vm => SiteKind::Vm,
-        RuntimeBackend::Compose => SiteKind::Compose,
-        RuntimeBackend::Kubernetes => SiteKind::Kubernetes,
-        _ => unreachable!("new runtime backend kind requires run-plan support"),
     }
 }
 
@@ -2161,6 +2372,43 @@ mod tests {
         let frozen_plan = build_run_plan(&frozen, None).expect("frozen run plan should build");
         assert_eq!(frozen_plan.standby_sites, plan.standby_sites);
         assert_eq!(frozen_plan.initial_active_sites, plan.initial_active_sites);
+    }
+
+    #[tokio::test]
+    async fn bounded_templates_use_manifest_analysis_even_with_possible_backends_hints() {
+        let dir = tmp_dir("run-plan-standby-bounded-template-");
+        let worker = dir.path().join("worker.json5");
+        let root = dir.path().join("root.json5");
+
+        write(&worker, dynamic_worker_manifest());
+        write(
+            &root,
+            r#"{
+  manifest_version: "0.3.0",
+  slots: { realm: { kind: "component", optional: true } },
+  child_templates: {
+    worker: {
+      allowed_manifests: ["./worker.json5"],
+      possible_backends: ["compose"]
+    }
+  },
+  program: {
+    image: "busybox:1.36.1",
+    entrypoint: ["sh", "-c", "sleep 30"],
+    network: { endpoints: [{ name: "http", port: 8080, protocol: "http" }] }
+  },
+  provides: { api: { kind: "http", endpoint: "http" } },
+  exports: { api: "api" }
+}"#,
+        );
+
+        let compiled = compile(&root).await;
+        let plan = build_run_plan(&compiled, None).expect("run plan should build");
+        assert!(
+            plan.standby_sites.contains(&"direct_local".to_string()),
+            "bounded templates should activate standby sites from their frozen manifests even \
+             when possible_backends is also present",
+        );
     }
 
     #[tokio::test]

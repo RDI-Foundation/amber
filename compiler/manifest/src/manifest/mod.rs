@@ -334,12 +334,17 @@ fn validate_no_ambiguous_capability(
 fn validate_child_templates(
     child_templates: &BTreeMap<TemplateName, ChildTemplateDecl>,
     slots: &BTreeMap<SlotName, SlotDecl>,
-    _bindings: &[RawBinding],
+    bindings: &[RawBinding],
 ) -> Result<(), Error> {
+    let declares_component_slot = slots
+        .values()
+        .any(|slot| slot.decl.kind == CapabilityKind::Component);
+    let directly_binds_framework_component = bindings.iter().any(|binding| {
+        binding.from == BindingSourceRef::Framework && binding.capability == "component"
+    });
     if !child_templates.is_empty()
-        && !slots
-            .values()
-            .any(|slot| slot.decl.kind == CapabilityKind::Component)
+        && !declares_component_slot
+        && !directly_binds_framework_component
     {
         return Err(Error::ChildTemplatesRequireComponentSlot);
     }
