@@ -247,6 +247,7 @@ fn compose_emits_otelcol_agent_and_wires_router_otel_env() {
     ));
 
     let sidecar = service(&compose, "c0-component-net");
+    let egress_init = service(&compose, "c0-component-net-egress-init");
     assert!(
         compose
             .networks
@@ -255,9 +256,35 @@ fn compose_emits_otelcol_agent_and_wires_router_otel_env() {
         "{yaml}"
     );
     assert!(
+        compose
+            .networks
+            .get("amber_egress_c0-component-net")
+            .is_some_and(|network| !network.internal),
+        "{yaml}"
+    );
+    assert!(
+        sidecar
+            .networks
+            .contains_key("amber_egress_c0-component-net"),
+        "{yaml}"
+    );
+    assert!(
         !sidecar.networks.contains_key(super::BOUNDARY_NETWORK_NAME),
         "{yaml}"
     );
+    assert_eq!(
+        egress_init.network_mode.as_deref(),
+        Some("service:c0-component-net"),
+        "{yaml}"
+    );
+    assert_eq!(egress_init.user.as_deref(), Some("0:0"), "{yaml}");
+    assert!(
+        egress_init.cap_add.iter().any(|cap| cap == "NET_ADMIN"),
+        "{yaml}"
+    );
+    assert_eq!(egress_init.restart.as_deref(), Some("no"), "{yaml}");
+    assert_depends_on(egress_init, "c0-component-net", "service_started");
+    assert!(egress_init.read_only != Some(true), "{yaml}");
     assert_eq!(
         env_value(sidecar, "OTEL_TRACES_SAMPLER").as_deref(),
         Some("always_on"),
@@ -276,6 +303,11 @@ fn compose_emits_otelcol_agent_and_wires_router_otel_env() {
     assert!(env_value(sidecar, "AMBER_LOG_FORMAT").is_none(), "{yaml}");
 
     let program = service(&compose, "c0-component");
+    assert_depends_on(
+        program,
+        "c0-component-net-egress-init",
+        "service_completed_successfully",
+    );
     assert_eq!(
         env_value(program, "OTEL_TRACES_SAMPLER").as_deref(),
         Some("always_on"),

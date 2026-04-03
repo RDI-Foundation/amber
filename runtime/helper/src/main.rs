@@ -14,7 +14,9 @@ use std::{
     os::unix::process::{CommandExt, ExitStatusExt},
 };
 
-use amber_helper::{HelperError, RunPlan, build_run_plan, wait_for_mesh_config_scope};
+use amber_helper::{
+    HelperError, RunPlan, build_run_plan, install_default_egress_guard, wait_for_mesh_config_scope,
+};
 use amber_mesh::telemetry::{
     COMPONENT_MONIKER_ENV, OtlpIdentity, OtlpInstallMode, SCENARIO_SCOPE_ENV, SubscriberFormat,
     SubscriberOptions, init_otel_tracer, init_subscriber, observability_log_scope_name,
@@ -139,6 +141,13 @@ fn run_main() -> Result<ExitCode, HelperError> {
             )?;
             Ok(ExitCode::SUCCESS)
         }
+        "install-default-egress-guard" => {
+            if args.next().is_some() {
+                return Err(usage_error());
+            }
+            install_default_egress_guard()?;
+            Ok(ExitCode::SUCCESS)
+        }
         _ => Err(usage_error()),
     }
 }
@@ -146,7 +155,7 @@ fn run_main() -> Result<ExitCode, HelperError> {
 fn usage_error() -> HelperError {
     HelperError::Msg(
         "usage: amber-helper <install DEST|run|wait-mesh-config CONFIG EXPECTED_SCOPE \
-         [TIMEOUT_SECONDS]>"
+         [TIMEOUT_SECONDS]|install-default-egress-guard>"
             .to_string(),
     )
 }
